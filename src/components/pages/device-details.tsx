@@ -176,6 +176,9 @@ export function DeviceDetails({ device }: { device: Device }) {
               <div className="flex items-center gap-1">
                 <Input
                   name="refreshRate"
+                  type="number"
+                  min={0}
+                  max={100}
                   value={deviceDetails.values.refreshRate}
                   onChange={(event) => {
                     deviceDetails.setFieldValue(
