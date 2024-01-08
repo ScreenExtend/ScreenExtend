@@ -36,7 +36,7 @@ const AuthLayout = ({
               />
               <div>
                 <h1 className="text-3xl font-bold mt-8 max-w-96 ">
-                  Dashify is device management
+                  ScreenExtend is device management
                 </h1>
                 <p className="text-lg mt-4">
                   All your connected devices in one place.
@@ -57,7 +57,7 @@ const AuthLayout = ({
             >
               <path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" />
             </svg>
-            Dashify
+            ScreenExtend
           </div>
         </div>
         <div className="lg:p-8">{children}</div>

@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button";
 import {
   ChevronLeft,
-  Home,
+  UserRoundPlus,
   Info,
   MonitorSmartphone,
   Settings,
@@ -20,8 +20,8 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
       <div className="space-y-4 h-full flex flex-col">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
-            <h2 className="text-2xl font-semibold tracking-tight py-4">
-              Dashify
+            <h2 className="text-4xl font-medium tracking-tight py-4">
+              ScreenExtend
             </h2>
             <ChevronLeft
               size={20}
@@ -40,8 +40,8 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
                 }
                 className="w-full justify-start text-base py-6"
               >
-                <Home size={15} className="mr-2 h-6 w-6" />
-                Homepage
+                <UserRoundPlus size={15} className="mr-2 h-6 w-6" />
+                Add Device
               </Button>
             </Link>
             <Link className="block" to="/devices">
@@ -52,7 +52,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
                 className="w-full justify-start text-base py-6"
               >
                 <MonitorSmartphone size={15} className="mr-2 h-6 w-6" />
-                Devices
+                Edit Device
               </Button>
             </Link>
             <Link className="block" to="/settings">
@@ -68,9 +68,11 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
             </Link>
           </div>
         </div>
-        <div className="flex items-center justify-center gap-3 py-4">
+        <div className="flex items-center justify-center gap-1 py-4">
           <Info size={15} />
-          <a>Terms and Conditions Apply</a>
+          <Link to={"/terms"} className="underline">
+            Terms and Conditions
+          </Link>
         </div>
       </div>
     </div>

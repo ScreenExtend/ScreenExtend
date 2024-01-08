@@ -9,6 +9,29 @@ import {
 } from "@/components/ui/table";
 import { DeviceDetails } from "@/components/pages/device-details";
 
+const devices = Array(7)
+  .fill({})
+  .map((_, index) => ({
+    name: `Device ${index + 1}`,
+    ip: `192.168.1.${Math.floor(Math.random() * 255) + 1}`,
+    os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][
+      Math.floor(Math.random() * 6)
+    ],
+    scale: Math.floor(Math.random() * 100) + 1,
+    orientation: Math.random() > 0.5 ? "Portrait" : "Landscape",
+    refreshRate: Math.floor(Math.random() * 100) + 1,
+    screenSize: "1080x1920",
+    isAudioActive: Math.random() > 0.5,
+    isVedioActive: Math.random() > 0.5,
+    isKeyboardActive: Math.random() > 0.5,
+    isMouseActive: Math.random() > 0.5,
+    isCameraActive: Math.random() > 0.5,
+    isMicrophoneActive: Math.random() > 0.5,
+    isClipboardActive: Math.random() > 0.5,
+  }));
+
+export type Device = (typeof devices)[0];
+
 export default function Devices() {
   return (
     <Layout>
@@ -32,37 +55,20 @@ export default function Devices() {
               </TableRow>
             </TableHeader>
             <TableBody className="border-t">
-              {Array(7)
-                .fill("")
-                .map((_, index) => (
-                  <TableRow key={index}>
-                    <TableCell>Device {index + 1}</TableCell>
-                    <TableCell>
-                      192.168.1.{Math.floor(Math.random() * 255) + 1}
-                    </TableCell>
-                    <TableCell>
-                      {
-                        [
-                          "Windows",
-                          "MacOS",
-                          "Linux",
-                          "Android",
-                          "iOS",
-                          "iPadOS",
-                        ][Math.floor(Math.random() * 6)]
-                      }
-                    </TableCell>
-                    <TableCell>100%</TableCell>
-                    <TableCell>
-                      {Math.random() > 0.5 ? "Portrait" : "Landscape"}
-                    </TableCell>
-                    <TableCell>60 Hz</TableCell>
-                    <TableCell>1080x1920</TableCell>
-                    <TableCell className="text-center">
-                      <DeviceDetails />
-                    </TableCell>
-                  </TableRow>
-                ))}
+              {devices.map((device, index) => (
+                <TableRow key={index}>
+                  <TableCell>{device.name}</TableCell>
+                  <TableCell>{device.ip}</TableCell>
+                  <TableCell>{device.os}</TableCell>
+                  <TableCell>{device.scale}%</TableCell>
+                  <TableCell>{device.orientation}</TableCell>
+                  <TableCell>{device.refreshRate} Hz</TableCell>
+                  <TableCell>{device.screenSize}</TableCell>
+                  <TableCell className="text-center">
+                    <DeviceDetails device={device} />
+                  </TableCell>
+                </TableRow>
+              ))}
             </TableBody>
           </Table>
         </div>

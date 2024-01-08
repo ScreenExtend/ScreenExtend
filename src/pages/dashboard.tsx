@@ -7,7 +7,7 @@ import { Modal } from "flowbite-react";
 import { Button } from "@/components/ui/button";
 
 export default function Dashboard() {
-  const [value, setValue] = useState("https://dashify.vercel.app/dashboard");
+  const [value, setValue] = useState("https://ScreenExtend.vercel.app/dashboard");
 
   return (
     <Layout>
