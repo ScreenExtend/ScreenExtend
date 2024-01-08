@@ -171,10 +171,25 @@ export function DeviceDetails({ device }: { device: Device }) {
             />
           </div>
           <div>
-            <Label className="block my-2">
-              Refresh Rate - ({deviceDetails.values.refreshRate} Hz)
+            <Label className="my-2 flex items-center gap-4">
+              Refresh Rate -{" "}
+              <div className="flex items-center gap-1">
+                <Input
+                  name="refreshRate"
+                  value={deviceDetails.values.refreshRate}
+                  onChange={(event) => {
+                    deviceDetails.setFieldValue(
+                      "refreshRate",
+                      event.target.value
+                    );
+                  }}
+                  className="w-10 px-1 text-center"
+                />{" "}
+                Hz
+              </div>
             </Label>
             <Slider
+              value={[deviceDetails.values.refreshRate]}
               defaultValue={[deviceDetails.values.refreshRate]}
               onValueChange={(value) => {
                 deviceDetails.setFieldValue("refreshRate", value);
