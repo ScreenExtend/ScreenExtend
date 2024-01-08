@@ -11,6 +11,7 @@ import Settings from "./pages/settings";
 import Devices from "./pages/devices";
 import SignUp from "./pages/signup";
 import ForgotPassword from "./pages/forgot-password";
+import Terms from "./pages/terms";
 
 const router = createBrowserRouter(
   createRoutesFromElements(
@@ -21,6 +22,7 @@ const router = createBrowserRouter(
       <Route path="/dashboard" element={<Dashboard />} />
       <Route path="/devices" element={<Devices />} />
       <Route path="/settings" element={<Settings />} />
+      <Route path="/terms" element={<Terms />} />
     </>
   )
 );

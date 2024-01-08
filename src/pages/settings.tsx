@@ -1,8 +1,13 @@
 import Layout from "@/layout/layout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { useState } from "react";
 
 export default function Settings() {
+  const [isPublic, setIsPublic] = useState(true);
+
   return (
     <Layout>
       <div className="p-8">
@@ -21,13 +26,20 @@ export default function Settings() {
                     Toggle Public
                   </p>
                 </div>
-                <Switch />
+                <Switch checked={isPublic} onCheckedChange={setIsPublic} />
               </div>
-              <div></div>
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <Input
+                  type="password"
+                  placeholder="Password"
+                  disabled={isPublic}
+                />
+                <Button disabled={isPublic}>Save Password</Button>
+              </div>
             </CardContent>
           </Card>
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="">
           <Card>
             <CardHeader>
               <CardTitle>Online / Offline</CardTitle>
@@ -37,22 +49,6 @@ export default function Settings() {
                 <div className="flex-1 space-y-1">
                   <p className="text-sm font-medium leading-none">
                     Toggle Online
-                  </p>
-                </div>
-                <Switch />
-              </div>
-              <div></div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader>
-              <CardTitle>Device Management</CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-4">
-              <div className=" flex items-center space-x-4 border-b p-3 px-0">
-                <div className="flex-1 space-y-1">
-                  <p className="text-sm font-medium leading-none">
-                    Add a new device
                   </p>
                 </div>
                 <Switch />
