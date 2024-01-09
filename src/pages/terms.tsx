@@ -1,6 +1,6 @@
 const Terms = () => {
   return (
-    <div className="py-6">
+    <div className="py-6 p-20">
       <h1 className="text-4xl font-semibold text-center">
         Terms and Conditions
       </h1>
