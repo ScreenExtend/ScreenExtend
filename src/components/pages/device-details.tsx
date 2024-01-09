@@ -94,7 +94,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           }}
         />
         <SheetHeader>
-          <SheetTitle>Device</SheetTitle>
+          <SheetTitle>Edit Device</SheetTitle>
         </SheetHeader>
         <div className="grid gap-4 py-4">
           <div className="flex gap-4">
@@ -109,7 +109,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               />
             </div>
             <div className="flex-1">
-              <Label>Oreintation</Label>
+              <Label>Orientation</Label>
               <Select
                 name="orientation"
                 defaultValue={deviceDetails.values.orientation?.toLowerCase()}
@@ -130,6 +130,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           <div>
             <Label>Device IP</Label>
             <Input
+              disabled={true}
               placeholder="182.167.99.1"
               name={device.ip}
               value={deviceDetails.values.ip}
@@ -140,6 +141,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           <div>
             <Label>Device OS</Label>
             <Input
+              disabled={true}
               placeholder="00-B0-D0-63-C2-26"
               name={device.os}
               value={deviceDetails.values.os}
@@ -150,6 +152,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           <div>
             <Label>Screen Size</Label>
             <Input
+              disabled={true}
               placeholder="1080x1920"
               name="screenSize"
               value={deviceDetails.values.screenSize}
@@ -166,19 +169,21 @@ export function DeviceDetails({ device }: { device: Device }) {
               onValueChange={(value) => {
                 deviceDetails.setFieldValue("scale", value);
               }}
-              max={100}
-              step={1}
+              min={25}
+              max={200}
+              step={25}
             />
           </div>
           <div>
-            <Label className="my-2 flex items-center gap-4">
+            <Label className="my-2 flex items-center gap-1">
               Refresh Rate -{" "}
               <div className="flex items-center gap-1">
                 <Input
                   name="refreshRate"
                   type="number"
-                  min={0}
-                  max={100}
+                  min={60}
+                  max={360}
+                  step={1}
                   value={deviceDetails.values.refreshRate}
                   onChange={(event) => {
                     deviceDetails.setFieldValue(
@@ -197,7 +202,8 @@ export function DeviceDetails({ device }: { device: Device }) {
               onValueChange={(value) => {
                 deviceDetails.setFieldValue("refreshRate", value);
               }}
-              max={100}
+              min={60}
+              max={360}
               step={1}
             />
           </div>
