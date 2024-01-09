@@ -4,11 +4,18 @@ import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useState } from "react";
-import { Eye, EyeOff } from "lucide-react";
+import { Eye, EyeOff, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 export default function Settings() {
   const [isPrivate, setIsPrivate] = useState(false);
+  const [isOnline, setIsOnline] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
   function togglePasswordVisibility() {
@@ -37,11 +44,6 @@ export default function Settings() {
                 <Switch checked={isPrivate} onCheckedChange={setIsPrivate} />
               </div>
               <div className="flex items-center space-x-4 p-3 px-0">
-                {/* <Input
-                  type="password"
-                  placeholder="Password"
-                  disabled={!isPrivate}
-                /> */}
                 <div className="relative outline-none flex-1">
                   <Input
                     type={showPassword ? "text" : "password"}
@@ -82,12 +84,35 @@ export default function Settings() {
               <div className=" flex items-center space-x-4 border-b p-3 px-0">
                 <div className="flex-1 space-y-1">
                   <p className="text-sm font-medium leading-none">
-                    Toggle Online
+                    Toggle Offline
                   </p>
                 </div>
-                <Switch />
+                <Switch checked={isOnline} onCheckedChange={setIsOnline} />
               </div>
-              <div></div>
+              <div className="flex items-center gap-4">
+                <div className="grid grid-cols-2 gap-4 flex-grow">
+                  <Input
+                    placeholder="Network name"
+                    type="text"
+                    disabled={!isOnline}
+                  />
+                  <Input
+                    placeholder="Network password"
+                    type="password"
+                    disabled={!isOnline}
+                  />
+                </div>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild className="cursor-pointer">
+                      <Info size={15} />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>I will configure this later</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
             </CardContent>
           </Card>
         </div>
