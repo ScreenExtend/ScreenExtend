@@ -17,10 +17,15 @@ export default function Settings() {
   const [isPrivate, setIsPrivate] = useState(false);
   const [isOnline, setIsOnline] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [showNetPassword, setShowNetPassword] = useState(false);
 
-  function togglePasswordVisibility() {
+  function togglePasswordVisibility(type: "password" | "netPassword") {
     if (!isPrivate) return;
-    setShowPassword((prev) => !prev);
+    if (type === "password") {
+      setShowPassword((prev) => !prev);
+    } else {
+      setShowNetPassword((prev) => !prev);
+    }
   }
 
   return (
@@ -60,12 +65,12 @@ export default function Settings() {
                     {showPassword ? (
                       <EyeOff
                         className="h-5 w-5"
-                        onClick={togglePasswordVisibility}
+                        onClick={() => togglePasswordVisibility("password")}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
-                        onClick={togglePasswordVisibility}
+                        onClick={() => togglePasswordVisibility("password")}
                       />
                     )}
                   </div>
@@ -96,11 +101,36 @@ export default function Settings() {
                     type="text"
                     disabled={!isOnline}
                   />
-                  <Input
-                    placeholder="Network password"
-                    type="password"
-                    disabled={!isOnline}
-                  />
+                  <div className="relative outline-none">
+                    <Input
+                      type={showNetPassword ? "text" : "password"}
+                      placeholder="Network password"
+                      className="outline-none"
+                      disabled={!isOnline}
+                    />
+                    <div
+                      className={cn(
+                        "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
+                        !isOnline && "cursor-not-allowed"
+                      )}
+                    >
+                      {showNetPassword ? (
+                        <EyeOff
+                          className="h-5 w-5"
+                          onClick={() =>
+                            togglePasswordVisibility("netPassword")
+                          }
+                        />
+                      ) : (
+                        <Eye
+                          className="h-5 w-5"
+                          onClick={() =>
+                            togglePasswordVisibility("netPassword")
+                          }
+                        />
+                      )}
+                    </div>
+                  </div>
                 </div>
                 <TooltipProvider>
                   <Tooltip>
