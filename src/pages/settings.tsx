@@ -20,10 +20,11 @@ export default function Settings() {
   const [showNetPassword, setShowNetPassword] = useState(false);
 
   function togglePasswordVisibility(type: "password" | "netPassword") {
-    if (!isPrivate) return;
     if (type === "password") {
+      if (!isPrivate) return;
       setShowPassword((prev) => !prev);
     } else {
+      if (!isOnline) return;
       setShowNetPassword((prev) => !prev);
     }
   }
