@@ -6,18 +6,18 @@ import { cn } from "@/lib/utils";
 import { ModeToggle } from "@/components/mode-toggle";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
-  const [isSideBarOpen, setIsSideBarOpen] = useState(false);
+  const [isSideBarOpen, setIsSideBarOpen] = useState(true);
 
   return (
-    <div className="grid lg:grid-cols-5 h-screen">
+    <div className="flex h-screen">
       <Sidebar
         setIsSideBarOpen={setIsSideBarOpen}
         className={cn(
-          "absolute w-full max-w-96 bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-300",
+          "absolute w-96 bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-300 max-w-full",
           isSideBarOpen ? "-left-96 lg:left-0" : "left-0 lg:left-0"
         )}
       />
-      <div className="col-span-3 lg:col-span-4 lg:border-l h-screen flex flex-col">
+      <div className="flex-grow lg:border-l h-screen flex flex-col">
         <div className="flex items-center justify-between px-4 py-2 border-b">
           <div
             className="cursor-pointer"

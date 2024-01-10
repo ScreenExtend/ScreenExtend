@@ -19,7 +19,7 @@ export default function Dashboard() {
       <div className="flex flex-col items-center h-full justify-center">
         <div className="hidden lg:flex flex-col lg:flex-row items-center justify-center space-y-4 lg:space-y-0 lg:space-x-8">
           <AudioCode />
-          <div className="border-r h-[40%]"></div>
+          <div className="border-r h-[120%]"></div>
           <VideoCode />
         </div>
         <Carousel className="w-full max-w-xs lg:hidden">
@@ -49,7 +49,7 @@ const AudioCode = () => {
       <h2 className="text-2xl font-bold text-center mb-2">Audio</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={256}
+          size={2000}
           style={{
             height: "auto",
             maxWidth: "100%",
@@ -92,7 +92,7 @@ const VideoCode = () => {
       <h2 className="text-2xl font-bold text-center mb-2">Video</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={256}
+          size={2000}
           style={{
             height: "auto",
             maxWidth: "100%",

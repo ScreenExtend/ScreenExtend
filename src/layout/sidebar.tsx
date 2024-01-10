@@ -17,7 +17,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
 
   return (
     <div className={className}>
-      <div className="space-y-4 h-full flex flex-col">
+      <div className="space-y-4 h-full flex flex-col w-full border">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
             <h2 className="text-4xl font-medium tracking-tight py-4">
