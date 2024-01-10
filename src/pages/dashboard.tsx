@@ -17,8 +17,9 @@ export default function Dashboard() {
   return (
     <Layout>
       <div className="flex flex-col items-center h-full justify-center">
-        <div className="hidden lg:flex flex-col lg:flex-row items-center justify-center space-y-4 lg:space-y-0 lg:space-x-4">
+        <div className="hidden lg:flex flex-col lg:flex-row items-center justify-center space-y-4 lg:space-y-0 lg:space-x-8">
           <AudioCode />
+          <div className="border-r h-[40%]"></div>
           <VideoCode />
         </div>
         <Carousel className="w-full max-w-xs lg:hidden">
