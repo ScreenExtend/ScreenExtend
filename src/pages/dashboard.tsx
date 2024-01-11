@@ -49,7 +49,7 @@ const AudioCode = () => {
       <h2 className="text-2xl font-bold text-center mb-2">Audio</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={2000}
+          size={180}
           style={{
             height: "auto",
             maxWidth: "100%",
@@ -92,7 +92,7 @@ const VideoCode = () => {
       <h2 className="text-2xl font-bold text-center mb-2">Video</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={2000}
+          size={180}
           style={{
             height: "auto",
             maxWidth: "100%",
