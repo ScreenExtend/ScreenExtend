@@ -46,10 +46,10 @@ const AudioCode = () => {
 
   return (
     <div className="p-1">
-      <h2 className="text-2xl font-bold text-center mb-2">Audio</h2>
+      <h2 className="text-2xl font-bold text-center mb-2">Public Domain</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={180}
+          size={500}
           style={{
             height: "auto",
             maxWidth: "100%",
@@ -89,10 +89,10 @@ const VideoCode = () => {
   );
   return (
     <div className="p-1">
-      <h2 className="text-2xl font-bold text-center mb-2">Video</h2>
+      <h2 className="text-2xl font-bold text-center mb-2">Local Network</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
-          size={180}
+          size={500}
           style={{
             height: "auto",
             maxWidth: "100%",
