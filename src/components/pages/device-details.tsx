@@ -80,7 +80,7 @@ export function DeviceDetails({ device }: { device: Device }) {
         <Button variant="outline">Edit Device</Button>
       </SheetTrigger>
       <SheetContent
-        className="min-w-[350px]"
+        className="min-w-[350px] overflow-y-auto"
         onInteractOutside={considerClosing}
         onEscapeKeyDown={considerClosing}
         onOpenAutoFocus={(event) => {

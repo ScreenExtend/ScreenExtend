@@ -15,7 +15,7 @@ const AuthLayout = ({
 }) => {
   return (
     <>
-      <div className="container relative h-screen flex-col items-center justify-start md:grid lg:max-w-none lg:grid-cols-2 lg:px-0">
+      <div className="container relative h-screen flex-col items-center justify-start md:grid lg:max-w-none lg:grid-cols-2 md:grid-cols-1 lg:px-0">
         <Link
           to={navData.href}
           className={cn(
@@ -44,7 +44,7 @@ const AuthLayout = ({
               </div>
             </div>
           </div>
-          <div className="relative z-20 flex items-center text-lg font-medium">
+          <div className="relative z-20 flex items-center text-lg font-medium text-primary">
             <svg
               xmlns="http://www.w3.org/2000/svg"
               viewBox="0 0 24 24"
