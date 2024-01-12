@@ -30,7 +30,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <AvatarFallback>CN</AvatarFallback>
           </Avatar>
         </div>
-        <div className="h-full flex-grow">{children}</div>
+        <div className="h-full flex-grow overflow-y-auto">{children}</div>
         <div className="flex items-center justify-end p-4 border-t">
           <div className="flex items-center space-x-2">
             <ModeToggle />
