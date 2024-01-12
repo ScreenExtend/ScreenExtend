@@ -13,17 +13,17 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       <Sidebar
         setIsSideBarOpen={setIsSideBarOpen}
         className={cn(
-          "absolute w-96 bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-300 max-w-full",
-          isSideBarOpen ? "-left-96 lg:left-0" : "left-0 lg:left-0"
+          "absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-300 max-w-full",
+          isSideBarOpen ? "-left-96 fixed w-0" : "left-0 fixed w-96"
         )}
       />
-      <div className="flex-grow lg:border-l h-screen flex flex-col">
+      <div className="flex-1 h-screen flex flex-col">
         <div className="flex items-center justify-between px-4 py-2 border-b">
           <div
             className="cursor-pointer"
             onClick={() => setIsSideBarOpen((prev) => !prev)}
           >
-            <AlignLeft size={24} className="lg:hidden" />
+            <AlignLeft size={24} className="" />
           </div>
           <Avatar>
             <AvatarImage src="https://github.com/shadcn.png" alt="@shadcn" />
