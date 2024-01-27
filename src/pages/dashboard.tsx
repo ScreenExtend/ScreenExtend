@@ -90,7 +90,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
   return (
     <div className="p-1">
       <h2 className="text-2xl font-bold text-center mb-2">{name}</h2>
-      <Card className="max-w-96 mx-auto w-full p-1">
+      <Card className="max-w-96 min-w-72 mx-auto w-full p-1">
         <QRCode
           size={500}
           style={{

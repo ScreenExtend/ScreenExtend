@@ -17,7 +17,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           isSideBarOpen ? "-left-96 fixed w-0" : "left-0 fixed w-96"
         )}
       />
-      <div className="flex-1 h-screen flex flex-col">
+      <div className="flex-1 h-screen flex flex-col overflow-auto">
         <div className="flex items-center justify-between px-4 py-2 border-b">
           <div
             className="cursor-pointer"
