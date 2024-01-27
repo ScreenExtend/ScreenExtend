@@ -1,32 +1,14 @@
-import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { Link } from "react-router-dom";
 import illustration from "@/assets/illustration.svg";
+import { ModeToggle } from "@/components/mode-toggle";
 
-const AuthLayout = ({
-  navData,
-  children,
-}: {
-  navData?: {
-    label: string;
-    href: string;
-  };
-  children: React.ReactNode;
-}) => {
+const AuthLayout = ({ children }: { children: React.ReactNode }) => {
   return (
     <>
       <div className="container relative h-screen flex-col items-center justify-start md:grid lg:max-w-none lg:grid-cols-2 md:grid-cols-1 lg:px-0">
-        {navData && (
-          <Link
-            to={navData.href}
-            className={cn(
-              buttonVariants({ variant: "ghost" }),
-              "absolute right-4 top-4 md:right-8 md:top-8"
-            )}
-          >
-            {navData.label}
-          </Link>
-        )}
+        <div className={cn("absolute right-4 top-4 md:right-8 md:top-8")}>
+          <ModeToggle />
+        </div>
         <div className="relative hidden h-full flex-col bg-muted p-10 text-white lg:flex dark:border-r">
           <div className="absolute inset-0 bg-[#00120B] flex items-center justify-center">
             <div className="text-center">
