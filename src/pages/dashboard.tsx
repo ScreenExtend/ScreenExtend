@@ -12,44 +12,84 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
+import { cn } from "@/lib/utils";
 
 export default function Dashboard() {
+  const [qrValues] = useState([
+    {
+      title: "Public Domain",
+      value: "https://ScreenExtend.vercel.app/dashboard",
+    },
+    {
+      title: "Local Network",
+      value: "https://ScreenExtend.vercel.app/dashboard",
+    },
+    {
+      title: "Public Domain",
+      value: "https://ScreenExtend.vercel.app/dashboard",
+    },
+  ]);
+
+  // Uncomment this to use the state and comment the above state
+
+  // const [qrValues] = useState<
+  //   {
+  //     title: string;
+  //     value: string;
+  //   }[]
+  // >([]);
+
   return (
     <Layout>
       <div className="p-8">
         <h2 className="text-2xl font-semibold">QR Codes</h2>
       </div>
       <div className="flex flex-col items-center justify-center">
-        <div className="hidden lg:flex flex-col lg:flex-row items-center justify-center space-y-4 lg:space-y-0 lg:space-x-8">
-          <AudioCode />
-          <div className="border-r h-[120%]"></div>
-          <VideoCode />
+        <div className="hidden lg:flex flex-col lg:flex-row items-center justify-around space-y-4 lg:space-y-0 lg:space-x-8 px-10">
+          {qrValues.length ? (
+            qrValues.map((qrValue, index) => (
+              <>
+                <QrDisplay name={qrValue.title} url={qrValue.value} />
+                <div
+                  className={cn(
+                    "border-r h-[120%]",
+                    index === qrValues.length - 1 && "hidden"
+                  )}
+                ></div>
+              </>
+            ))
+          ) : (
+            <div className="h-[120%] lg:block text-slate-400">
+              Please create join Wifi to continue
+            </div>
+          )}
         </div>
-        <Carousel className="w-full max-w-xs lg:hidden">
-          <CarouselContent>
-            <CarouselItem>
-              <VideoCode />
-            </CarouselItem>
-            <CarouselItem>
-              <AudioCode />
-            </CarouselItem>
-          </CarouselContent>
-          <CarouselPrevious />
-          <CarouselNext />
-        </Carousel>
+        {qrValues.length ? (
+          <Carousel className="w-full max-w-xs lg:hidden">
+            <CarouselContent>
+              {qrValues.map((qrValue) => (
+                <CarouselItem>
+                  <QrDisplay name={qrValue.title} url={qrValue.value} />
+                </CarouselItem>
+              ))}
+            </CarouselContent>
+            <CarouselPrevious />
+            <CarouselNext />
+          </Carousel>
+        ) : (
+          <div className="text-slate-400 lg:hidden">
+            Please create join Wifi to continue
+          </div>
+        )}
       </div>
     </Layout>
   );
 }
 
-const AudioCode = () => {
-  const [audValue, setAudValue] = useState(
-    "https://ScreenExtend.vercel.app/dashboard"
-  );
-
+const QrDisplay = ({ name, url }: { name: string; url: string }) => {
   return (
     <div className="p-1">
-      <h2 className="text-2xl font-bold text-center mb-2">Public Domain</h2>
+      <h2 className="text-2xl font-bold text-center mb-2">{name}</h2>
       <Card className="max-w-96 mx-auto w-full p-1">
         <QRCode
           size={500}
@@ -59,7 +99,7 @@ const AudioCode = () => {
             width: "100%",
             borderRadius: "0.275rem",
           }}
-          value={audValue}
+          value={url}
           viewBox={`0 0 256 256`}
         />
       </Card>
@@ -68,62 +108,19 @@ const AudioCode = () => {
           <input
             className="w-full p-2 border-none rounded-md bg-transparent"
             type="text"
-            value={audValue}
-            onChange={(e) => setAudValue(e.target.value)}
+            value={url}
+            disabled
           />
           <button
             className="p-2 border-l"
             onClick={() => {
-              navigator.clipboard.writeText(audValue);
+              navigator.clipboard.writeText(url);
             }}
           >
             <Copy size={15} />
           </button>
         </div>
-        <QrModalComponent value={audValue} />
-      </Card>
-    </div>
-  );
-};
-
-const VideoCode = () => {
-  const [vidValue, setVidValue] = useState(
-    "https://ScreenExtend.vercel.app/dashboard"
-  );
-  return (
-    <div className="p-1">
-      <h2 className="text-2xl font-bold text-center mb-2">Local Network</h2>
-      <Card className="max-w-96 mx-auto w-full p-1">
-        <QRCode
-          size={500}
-          style={{
-            height: "auto",
-            maxWidth: "100%",
-            width: "100%",
-            borderRadius: "0.275rem",
-          }}
-          value={vidValue}
-          viewBox={`0 0 256 256`}
-        />
-      </Card>
-      <Card className="max-w-96 mx-auto w-full p- mt-4 space-y-3 border-none">
-        <div className="flex items-center justify-between border rounded-md">
-          <input
-            className="w-full p-2 border-none rounded-md bg-transparent"
-            type="text"
-            value={vidValue}
-            onChange={(e) => setVidValue(e.target.value)}
-          />
-          <button
-            className="p-2 border-l"
-            onClick={() => {
-              navigator.clipboard.writeText(vidValue);
-            }}
-          >
-            <Copy size={15} />
-          </button>
-        </div>
-        <QrModalComponent value={vidValue} />
+        <QrModalComponent value={url} />
       </Card>
     </div>
   );
