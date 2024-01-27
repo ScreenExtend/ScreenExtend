@@ -7,7 +7,7 @@ const AuthLayout = ({
   navData,
   children,
 }: {
-  navData: {
+  navData?: {
     label: string;
     href: string;
   };
@@ -16,15 +16,17 @@ const AuthLayout = ({
   return (
     <>
       <div className="container relative h-screen flex-col items-center justify-start md:grid lg:max-w-none lg:grid-cols-2 md:grid-cols-1 lg:px-0">
-        <Link
-          to={navData.href}
-          className={cn(
-            buttonVariants({ variant: "ghost" }),
-            "absolute right-4 top-4 md:right-8 md:top-8"
-          )}
-        >
-          {navData.label}
-        </Link>
+        {navData && (
+          <Link
+            to={navData.href}
+            className={cn(
+              buttonVariants({ variant: "ghost" }),
+              "absolute right-4 top-4 md:right-8 md:top-8"
+            )}
+          >
+            {navData.label}
+          </Link>
+        )}
         <div className="relative hidden h-full flex-col bg-muted p-10 text-white lg:flex dark:border-r">
           <div className="absolute inset-0 bg-[#00120B] flex items-center justify-center">
             <div className="text-center">
