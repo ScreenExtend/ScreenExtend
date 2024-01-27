@@ -8,6 +8,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { DeviceDetails } from "@/components/pages/device-details";
+import { buttonVariants } from "@/components/ui/button";
+import { Link } from "react-router-dom";
+import { cn } from "@/lib/utils";
+import { Plus } from "lucide-react";
 
 const devices = Array(7)
   .fill({})
@@ -44,7 +48,7 @@ export default function Devices() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-[100px]">Device Name</TableHead>
+                <TableHead className="w-[150px]">Device Name</TableHead>
                 <TableHead>IP</TableHead>
                 <TableHead>OS</TableHead>
                 <TableHead>Scale</TableHead>
@@ -71,6 +75,17 @@ export default function Devices() {
               ))}
             </TableBody>
           </Table>
+          {!devices.length && (
+            <div className="w-full flex items-center justify-center py-4">
+              <Link
+                to="/dashboard"
+                className={cn(buttonVariants({ variant: "secondary" }))}
+              >
+                <Plus className="mr-2" size={16} />
+                Add a device to get started
+              </Link>
+            </div>
+          )}
         </div>
       </div>
     </Layout>

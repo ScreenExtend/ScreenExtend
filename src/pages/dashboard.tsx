@@ -16,7 +16,10 @@ import {
 export default function Dashboard() {
   return (
     <Layout>
-      <div className="flex flex-col items-center h-full justify-center">
+      <div className="p-8">
+        <h2 className="text-2xl font-semibold">QR Codes</h2>
+      </div>
+      <div className="flex flex-col items-center justify-center">
         <div className="hidden lg:flex flex-col lg:flex-row items-center justify-center space-y-4 lg:space-y-0 lg:space-x-8">
           <AudioCode />
           <div className="border-r h-[120%]"></div>
