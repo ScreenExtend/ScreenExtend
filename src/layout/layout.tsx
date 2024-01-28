@@ -1,9 +1,10 @@
 import React, { useState } from "react";
 import { Sidebar } from "./sidebar";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+
 import { AlignLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ModeToggle } from "@/components/mode-toggle";
+import { ProfileMenu } from "@/components/profile-menu";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [isSideBarOpen, setIsSideBarOpen] = useState(false);
@@ -25,10 +26,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           >
             <AlignLeft size={24} className="" />
           </div>
-          <Avatar>
-            <AvatarImage src="https://github.com/shadcn.png" alt="@shadcn" />
-            <AvatarFallback>CN</AvatarFallback>
-          </Avatar>
+          <ProfileMenu />
         </div>
         <div className="h-full flex-grow overflow-y-auto w-full overflow-hidden">
           {children}
