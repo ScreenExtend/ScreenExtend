@@ -12,7 +12,7 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
-import { cn } from "@/lib/utils";
+// import { cn } from "@/lib/utils";
 
 export default function Dashboard() {
   const [qrValues] = useState([
@@ -44,19 +44,11 @@ export default function Dashboard() {
       <div className="p-8">
         <h2 className="text-2xl font-semibold">QR Codes</h2>
       </div>
-      <div className="flex flex-col items-center justify-center">
-        <div className="hidden lg:flex flex-col lg:flex-row items-center justify-around space-y-4 lg:space-y-0 lg:space-x-8 px-10">
+      <div className="w-full overflow-hidden box-border">
+        <div className="px-10 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
           {qrValues.length ? (
-            qrValues.map((qrValue, index) => (
-              <>
-                <QrDisplay name={qrValue.title} url={qrValue.value} />
-                <div
-                  className={cn(
-                    "border-r h-[120%]",
-                    index === qrValues.length - 1 && "hidden"
-                  )}
-                ></div>
-              </>
+            qrValues.map((qrValue) => (
+              <QrDisplay name={qrValue.title} url={qrValue.value} />
             ))
           ) : (
             <div className="h-[120%] lg:block text-slate-400">
@@ -65,7 +57,7 @@ export default function Dashboard() {
           )}
         </div>
         {qrValues.length ? (
-          <Carousel className="w-full max-w-xs lg:hidden">
+          <Carousel className="w-full max-w-xs lg:hidden mx-auto">
             <CarouselContent>
               {qrValues.map((qrValue) => (
                 <CarouselItem>
@@ -88,7 +80,7 @@ export default function Dashboard() {
 
 const QrDisplay = ({ name, url }: { name: string; url: string }) => {
   return (
-    <div className="p-1">
+    <div className="p-1 mx-auto">
       <h2 className="text-2xl font-bold text-center mb-2">{name}</h2>
       <Card className="max-w-96 min-w-72 mx-auto w-full p-1">
         <QRCode
