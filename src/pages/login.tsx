@@ -1,18 +1,10 @@
 import { GuestLoginModal } from "@/components/guest-login-modal";
 import { UserAuthForm } from "@/components/pages/user-auth-form";
-// import { buttonVariants } from "@/components/ui/button";
 import AuthLayout from "@/layout/auth-layout";
-// import { cn } from "@/lib/utils";
-import { Link } from "react-router-dom";
 
 export default function Login() {
   return (
-    <AuthLayout
-    // navData={{
-    //   label: "Sign Up",
-    //   href: "/signup",
-    // }}
-    >
+    <AuthLayout>
       <div className="mx-auto flex w-full flex-col space-y-6 sm:w-[350px] h-screen justify-center md:h-full">
         <div className="flex flex-col space-y-2">
           <h1 className="text-2xl font-semibold tracking-tight text-left">
@@ -20,14 +12,6 @@ export default function Login() {
           </h1>
         </div>
         <UserAuthForm />
-        <p className="text-sm text-muted-foreground">
-          <Link
-            to="/forgot-password"
-            className="underline underline-offset-4 hover:text-primary"
-          >
-            Forgot your password?
-          </Link>
-        </p>
         <div className="relative">
           <div className="absolute inset-0 flex items-center">
             <span className="w-full border-t" />
@@ -41,5 +25,5 @@ export default function Login() {
         </div>
       </div>
     </AuthLayout>
-  );
+    );
 }

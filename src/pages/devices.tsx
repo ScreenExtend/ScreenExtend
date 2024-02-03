@@ -80,7 +80,7 @@ export default function Devices() {
               <Link
                 to="/dashboard"
                 className={cn(buttonVariants({ variant: "secondary" }))}
-              >
+                >
                 <Plus className="mr-2" size={16} />
                 Add a device to get started
               </Link>

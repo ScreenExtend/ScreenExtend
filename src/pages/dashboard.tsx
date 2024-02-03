@@ -12,10 +12,13 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
-// import { cn } from "@/lib/utils";
+//import { cn } from "@/lib/utils";
+import { writeText } from '@tauri-apps/api/clipboard';
+
+//import { Command } from '@tauri-apps/api/shell';
 
 export default function Dashboard() {
-  const [qrValues] = useState([
+  const [qrValues] = useState<{title: string, value: string}[]>([
     {
       title: "Public Domain",
       value: "https://ScreenExtend.vercel.app/dashboard",
@@ -30,31 +33,21 @@ export default function Dashboard() {
     },
   ]);
 
-  // Uncomment this to use the state and comment the above state
-
-  // const [qrValues] = useState<
-  //   {
-  //     title: string;
-  //     value: string;
-  //   }[]
-  // >([]);
-
   return (
     <Layout>
       <div className="p-8">
-        <h2 className="text-2xl font-semibold">QR Codes</h2>
+        <h2 className="flex justify-center text-5xl font-semibold">What network is your device connected to?</h2>
       </div>
       <div className="w-full overflow-hidden box-border">
         <div className="px-10 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
           {qrValues.length ? (
             qrValues.map((qrValue) => (
-              <QrDisplay name={qrValue.title} url={qrValue.value} />
-            ))
-          ) : (
-            <div className="h-[120%] lg:block text-slate-400">
-              Please create join Wifi to continue
-            </div>
-          )}
+              <QrDisplay name={qrValue.title} url={qrValue.value} />              ))
+              ) : (
+                <div className="h-[120%] lg:block text-slate-400">
+                  Please create or join a network (one can be created through settings)
+                </div>
+                )}
         </div>
         {qrValues.length ? (
           <Carousel className="w-full max-w-xs lg:hidden mx-auto">
@@ -63,19 +56,19 @@ export default function Dashboard() {
                 <CarouselItem>
                   <QrDisplay name={qrValue.title} url={qrValue.value} />
                 </CarouselItem>
-              ))}
+                ))}
             </CarouselContent>
             <CarouselPrevious />
             <CarouselNext />
           </Carousel>
-        ) : (
-          <div className="text-slate-400 lg:hidden">
-            Please create join Wifi to continue
-          </div>
-        )}
+          ) : (
+            <div className="text-slate-400 lg:hidden">
+              Please create or join a network (one can be created through settings)
+            </div>
+            )}
       </div>
     </Layout>
-  );
+    );
 }
 
 const QrDisplay = ({ name, url }: { name: string; url: string }) => {
@@ -86,7 +79,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
         <QRCode
           size={500}
           style={{
-            height: "auto",
+          height: "auto",
             maxWidth: "100%",
             width: "100%",
             borderRadius: "0.275rem",
@@ -105,8 +98,11 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
           />
           <button
             className="p-2 border-l"
-            onClick={() => {
-              navigator.clipboard.writeText(url);
+            onClick={async () => {
+              await writeText(url);
+              {/*const command = Command.sidecar("ffmpeg", ["-h"]);*/}
+              {/*const output = await command.execute();*/}
+              {/*await writeText(output.stdout);*/}
             }}
           >
             <Copy size={15} />
@@ -115,7 +111,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
         <QrModalComponent value={url} />
       </Card>
     </div>
-  );
+    );
 };
 
 function QrModalComponent({ value }: { value: string }) {
@@ -123,24 +119,24 @@ function QrModalComponent({ value }: { value: string }) {
 
   return (
     <>
-      <Button onClick={() => setOpenModal(true)} className="w-full ">
-        Expand QR{" "}
-      </Button>
-      <Modal dismissible show={openModal} onClose={() => setOpenModal(false)}>
-        <Modal.Body className="">
-          <QRCode
-            size={256}
-            style={{
-              height: "auto",
-              maxWidth: "100%",
-              width: "100%",
-              borderRadius: "0.275rem",
-            }}
-            value={value}
-            viewBox={`0 0 256 256`}
-          />
-        </Modal.Body>
-      </Modal>
+    <Button onClick={() => setOpenModal(true)} className="w-full ">
+      Expand QR{" "}
+    </Button>
+    <Modal dismissible show={openModal} onClose={() => setOpenModal(false)}>
+      <Modal.Body className="">
+        <QRCode
+          size={256}
+          style={{
+          height: "auto",
+            maxWidth: "100%",
+            width: "100%",
+            borderRadius: "0.275rem",
+          }}
+          value={value}
+          viewBox={`0 0 256 256`}
+        />
+      </Modal.Body>
+    </Modal>
     </>
-  );
+    );
 }
