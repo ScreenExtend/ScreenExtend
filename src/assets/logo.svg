@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg viewBox="403.8964 160.9413 451.2 399.95" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <style type="text/css">
+            .st0{fill:#0E0E11;}
+            .st1{display:none;}
+            .st2{fill:#AA64FC;}
+            .st3{fill:#DCFF4A;}
+            .st4{fill:#D6F1ED;}
+            .st5{fill:#EEFFFC;}
+            .st6{fill:#FA7BE9;}
+            .st7{fill:#FCFCFC;}
+            .st8{fill:#316CFF;}
+            .st9{opacity:0.05;fill:#FFFFFF;stroke:#FFFFFF;stroke-miterlimit:10;}
+            .st10{fill:#FDFFFF;}
+            .st11{fill:#CED8D5;}
+            .st12{fill:#E4F2EF;}
+            .st13{fill:#FFFFFF;}
+            .st14{opacity:0.3;fill:none;stroke:#FDFFFF;stroke-width:2;stroke-miterlimit:10;}
+            .st15{fill:none;stroke:#FFFFFF;stroke-miterlimit:10;}
+            .st16{fill:none;stroke:#FFFFFF;stroke-miterlimit:10;stroke-dasharray:4.9888,4.9888;}
+            .st17{fill:none;stroke:#FFFFFF;stroke-miterlimit:10;stroke-dasharray:4.8095,4.8095;}
+            .st18{font-family:'Gilroy-Regular';}
+            .st19{font-size:35px;}
+        </style>
+    </defs>
+    <g transform="matrix(1, 0, 0, 1, -770.503662109375, -339.08873748779297)">
+        <path class="st4" d="M1174.4,746.74V512.03c0-6.63,5.37-12,12-12h294.71c6.63,0,12,5.37,12,12v234.72c0,6.63-5.37,12-12,12H1186.4 C1179.78,758.74,1174.4,753.37,1174.4,746.74z"/>
+        <path class="st8" d="M1239.4,809.23V574.52c0-6.63,5.37-12,12-12h294.71c6.63,0,12,5.37,12,12v234.72c0,6.63-5.37,12-12,12H1251.4 C1244.77,821.23,1239.4,815.86,1239.4,809.23z"/>
+        <path class="st3" d="M1306.89,883.97V657.26c0-8.84,7.16-16,16-16h286.71c8.84,0,16,7.16,16,16v226.72c0,8.84-7.16,16-16,16 h-286.71C1314.05,899.97,1306.89,892.81,1306.89,883.97z"/>
+    </g>
+</svg>

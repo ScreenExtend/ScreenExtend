@@ -21,7 +21,7 @@ import { Slider } from "../ui/slider";
 import { Checkbox } from "../ui/checkbox";
 import { Device } from "@/pages/devices";
 import { useFormik } from "formik";
-import { useState } from "react";
+import React, { useState } from "react";
 import { useToast } from "@/components/ui/use-toast";
 import {
   AlertDialog,
@@ -46,8 +46,8 @@ export function DeviceDetails({ device }: { device: Device }) {
     },
     onSubmit: (values) => {
       toast({
-        title: "Device updated",
-        description: "Your device has been updated.",
+        title: "Device Settings Updated",
+        description: "Your device settings have been updated.",
       });
       console.log(values);
     },

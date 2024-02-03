@@ -1,6 +1,5 @@
 import React, { useState } from "react";
 import { Sidebar } from "./sidebar";
-
 import { AlignLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ModeToggle } from "@/components/mode-toggle";
@@ -16,14 +15,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         className={cn(
           "absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-300 max-w-full",
           isSideBarOpen ? "-left-96 fixed w-0" : "left-0 fixed w-96"
-        )}
+          )}
       />
       <div className="flex-1 h-screen flex flex-col overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2 border-b">
           <div
             className="cursor-pointer"
             onClick={() => setIsSideBarOpen((prev) => !prev)}
-          >
+            >
             <AlignLeft size={24} className="" />
           </div>
           <ProfileMenu />
@@ -38,5 +37,5 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </div>
     </div>
-  );
+    );
 }
