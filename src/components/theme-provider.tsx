@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import React, { createContext, useContext, useEffect, useState } from "react";
+import { appWindow } from "@tauri-apps/api/window";
 
 type Theme = "dark" | "light" | "system";
 
@@ -30,22 +31,25 @@ export function ThemeProvider({
     () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
   );
 
+  appWindow.onThemeChanged(({ payload: newTheme }) => {
+    setTheme(newTheme);
+  });
+
   useEffect(() => {
-    const root = window.document.documentElement;
+    async function fetchTheme() {
+      const root = window.document.documentElement;
 
-    root.classList.remove("light", "dark");
+      root.classList.remove("light", "dark");
 
-    if (theme === "system") {
-      const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
-        .matches
-        ? "dark"
-        : "light";
+      if (theme === "system") {
+        const systemTheme = await appWindow.theme() || "light";
+        root.classList.add(systemTheme);
+        return;
+      }
 
-      root.classList.add(systemTheme);
-      return;
+      root.classList.add(theme);
     }
-
-    root.classList.add(theme);
+    fetchTheme();
   }, [theme]);
 
   const value = {
