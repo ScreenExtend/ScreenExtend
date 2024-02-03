@@ -15,9 +15,16 @@
       }
     </style>
     <script>
-      document.addEventListener("contextmenu", event => event.preventDefault());
-      document.documentElement.addEventListener("click", function (event) {
+      document.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+      });
+      document.documentElement.addEventListener("click", (event) => {
         if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
+          event.preventDefault();
+        }
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "F5" || (event.ctrlKey && event.key === "r")) {
           event.preventDefault();
         }
       });
