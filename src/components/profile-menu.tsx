@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useNavigate } from "react-router-dom";
-import defaultUser from "./default.jpg";
+import defaultUser from "@/assets/default.jpg";
 
 export function ProfileMenu() {
   const navigate = useNavigate();
