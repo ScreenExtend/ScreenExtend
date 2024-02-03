@@ -33,15 +33,11 @@ export default App;
 
 
 /* Things to do:
-- Change messages
-- Logos
 - Tauri config
-- Home screen graphic
-- window.location.replace() routing
-- User icon on click
-- Change user icon
-- Unnecessary code throughout
-- Don't show again guest modal
+- (better) Home screen graphic
+- Help guide
+- Logo with name
+- Cite user icon and Qudusayo
 - Dark mode on change
 - System dark mode window theme
 - Get dark mode and other html ones better natively
