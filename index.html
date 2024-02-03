@@ -28,6 +28,12 @@
           event.preventDefault();
         }
       });
+      document.addEventListener("dragover", function(event) {
+        event.preventDefault();
+      });
+      document.addEventListener("drop", function(event) {
+        event.preventDefault();
+      });
     </script>
   </head>
 
