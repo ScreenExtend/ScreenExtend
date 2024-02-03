@@ -12,10 +12,10 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
-//import { cn } from "@/lib/utils";
 import { writeText } from '@tauri-apps/api/clipboard';
+import { Link } from "react-router-dom";
 
-//import { Command } from '@tauri-apps/api/shell';
+// import { Command } from '@tauri-apps/api/shell';
 
 export default function Dashboard() {
   const [qrValues] = useState<{title: string, value: string}[]>([
@@ -42,10 +42,11 @@ export default function Dashboard() {
         <div className="px-10 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
           {qrValues.length ? (
             qrValues.map((qrValue) => (
-              <QrDisplay name={qrValue.title} url={qrValue.value} />              ))
+              <QrDisplay name={qrValue.title} url={qrValue.value} />
+            ))
               ) : (
                 <div className="h-[120%] lg:block text-slate-400">
-                  Please create or join a network (one can be created through settings)
+                  Please create or join a network (one can be created through <Link to={"/settings"} className="underline">settings</Link>)
                 </div>
                 )}
         </div>
@@ -63,7 +64,7 @@ export default function Dashboard() {
           </Carousel>
           ) : (
             <div className="text-slate-400 lg:hidden">
-              Please create or join a network (one can be created through settings)
+              Please create or join a network (one can be created through <Link to={"/settings"} className="underline">settings</Link>)
             </div>
             )}
       </div>
