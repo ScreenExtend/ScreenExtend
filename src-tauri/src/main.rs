@@ -2,7 +2,8 @@
 #[macro_use]
 
 extern crate lazy_static;
-extern crate pnet;
+//extern crate pnet;
+extern crate local_ip_address;
 
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::channel;
@@ -194,8 +195,12 @@ fn stop_hosted_network() -> bool {
 
 #[tauri::command]
 fn list_ips() {
-    for iface in pnet::datalink::interfaces() {
-        println!("{:?}", iface.ips);
+//    for iface in pnet::datalink::interfaces() {
+//        println!("{:?}", iface.ips);
+//    }
+    let network_interfaces = local_ip_address::list_afinet_netifas().unwrap();
+    for (name, ip) in network_interfaces.iter() {
+        println!("{}:\t{:?}", name, ip);
     }
 }
 
