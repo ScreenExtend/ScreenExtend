@@ -2,6 +2,7 @@
 #[macro_use]
 
 extern crate lazy_static;
+extern crate pnet;
 
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::channel;
@@ -191,9 +192,16 @@ fn stop_hosted_network() -> bool {
     }
 }
 
+#[tauri::command]
+fn list_ips() {
+    for iface in pnet::datalink::interfaces() {
+        println!("{:?}", iface.ips);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![start_hosted_network, stop_hosted_network])
+        .invoke_handler(tauri::generate_handler![start_hosted_network, stop_hosted_network, list_ips])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
