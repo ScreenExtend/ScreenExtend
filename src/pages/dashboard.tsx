@@ -105,7 +105,8 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
               {/*const command = Command.sidecar("ffmpeg", ["-h"]);*/}
               {/*const output = await command.execute();*/}
               {/*await writeText(output.stdout);*/}
-              console.log(invoke("start_hosted_network", {ssid: "lol2dvs", password: "kjhVBHNJ9876"}));
+              await invoke("list_ips");
+              /*console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("")}`, password: "screenextend"}));*/
             }}
           >
             <Copy size={15} />
@@ -125,8 +126,9 @@ function QrModalComponent({ value }: { value: string }) {
     <Button onClick={() => setOpenModal(true)} className="w-full ">
       Expand QR{" "}
     </Button>
-    <Modal dismissible show={openModal} onClose={() => {
-      setOpenModal(false);invoke("stop_hosted_network")
+    <Modal dismissible show={openModal} onClose={async () => {
+      setOpenModal(false);
+      console.log(await invoke("stop_hosted_network"));
     }}>
       <Modal.Body className="">
         <QRCode
