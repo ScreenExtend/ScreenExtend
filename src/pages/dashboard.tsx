@@ -12,10 +12,11 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
-import { writeText } from '@tauri-apps/api/clipboard';
+import { writeText } from "@tauri-apps/api/clipboard";
 import { Link } from "react-router-dom";
 
-// import { Command } from '@tauri-apps/api/shell';
+import { invoke } from "@tauri-apps/api/tauri";
+// import { Command } from "@tauri-apps/api/shell";
 
 export default function Dashboard() {
   const [qrValues] = useState<{title: string, value: string}[]>([
@@ -104,6 +105,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
               {/*const command = Command.sidecar("ffmpeg", ["-h"]);*/}
               {/*const output = await command.execute();*/}
               {/*await writeText(output.stdout);*/}
+              console.log(invoke("start_hosted_network", {ssid: "lol2dvs", password: "kjhVBHNJ9876"}));
             }}
           >
             <Copy size={15} />
@@ -123,7 +125,9 @@ function QrModalComponent({ value }: { value: string }) {
     <Button onClick={() => setOpenModal(true)} className="w-full ">
       Expand QR{" "}
     </Button>
-    <Modal dismissible show={openModal} onClose={() => setOpenModal(false)}>
+    <Modal dismissible show={openModal} onClose={() => {
+      setOpenModal(false);invoke("stop_hosted_network")
+    }}>
       <Modal.Body className="">
         <QRCode
           size={256}
