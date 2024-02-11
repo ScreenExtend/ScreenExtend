@@ -4,6 +4,7 @@
 extern crate lazy_static;
 //extern crate pnet;
 extern crate local_ip_address;
+use std::net::IpAddr;
 
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::channel;
@@ -200,7 +201,9 @@ fn list_ips() {
 //    }
     let network_interfaces = local_ip_address::list_afinet_netifas().unwrap();
     for (name, ip) in network_interfaces.iter() {
-        println!("{}:\t{:?}", name, ip);
+        if matches!(ip, IpAddr::V4(_)) {
+            println!("{}:\t{:?}", name, ip);
+        }
     }
 }
 
