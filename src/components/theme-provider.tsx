@@ -30,10 +30,7 @@ export function ThemeProvider({
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
   );
-
-  appWindow.onThemeChanged(({ payload: newTheme }) => {
-    setTheme(newTheme);
-  });
+  localStorage.setItem(storageKey, theme);
 
   useEffect(() => {
     async function fetchTheme() {
@@ -51,7 +48,15 @@ export function ThemeProvider({
     }
     fetchTheme();
   }, [theme]);
-
+  
+  appWindow.onThemeChanged(async ({ payload: newTheme }) => {
+    if (localStorage.getItem(storageKey) === "system") {
+      const root = window.document.documentElement;
+      root.classList.remove("light", "dark");
+      root.classList.add(newTheme);
+    }
+  });
+  
   const value = {
     theme,
     setTheme: (theme: Theme) => {

@@ -106,7 +106,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
               {/*const output = await command.execute();*/}
               {/*await writeText(output.stdout);*/}
               await invoke("list_ips");
-              /*console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("")}`, password: "screenextend"}));*/
+              {/*console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("")}`, password: "screenextend"}));*/}
             }}
           >
             <Copy size={15} />

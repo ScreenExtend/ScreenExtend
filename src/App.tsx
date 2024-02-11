@@ -41,4 +41,5 @@ export default App;
 - Dark mode on change
 - System dark mode window theme
 - Get dark mode and other html ones better natively
+- Only one instance running
 */
