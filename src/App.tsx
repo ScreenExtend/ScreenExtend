@@ -38,8 +38,5 @@ export default App;
 - Help guide
 - Logo with name
 - Cite user icon and Qudusayo
-- Dark mode on change
-- System dark mode window theme
-- Get dark mode and other html ones better natively
 - Only one instance running
 */
