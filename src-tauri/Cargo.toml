@@ -6,12 +6,11 @@ authors = ["Sarvesh Madullapalli"]
 edition = "2021"
 categories = ["gui", "os", "network-programming", "multimedia"]
 keywords = ["screen-mirror", "desktop-extension", "multi-display", "offline", "free"]
-#documentation — URL of the package documentation.
-#readme — Path to the package’s README file.
-#homepage — URL of the package homepage.
-#repository — URL of the package source repository.
-#license — The package license.
-#license-file — Path to the text of the license.
+license-file = "LICENSE"
+repository = "https://github.com/EpicCodeWizard/ScreenExtend"
+homepage = "https://screen-extend.tech/"
+documentation = "https://screen-extend.tech/docs/"
+# readme — Path to the package’s README file.
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
