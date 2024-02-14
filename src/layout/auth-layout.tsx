@@ -2,6 +2,7 @@ import { cn } from "@/lib/utils";
 import illustration from "@/assets/illustration.svg";
 import logo from "@/assets/logo.svg";
 import { ModeToggle } from "@/components/mode-toggle";
+import React from "react";
 
 const AuthLayout = ({ children }: { children: React.ReactNode }) => {
   return (

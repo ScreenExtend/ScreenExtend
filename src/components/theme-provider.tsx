@@ -24,7 +24,7 @@ const ThemeProviderContext = createContext<ThemeProviderState>(initialState);
 export function ThemeProvider({
   children,
   defaultTheme = "system",
-  storageKey = "vite-ui-theme",
+  storageKey = "screenextend-theme",
   ...props
 }: ThemeProviderProps) {
   const [theme, setTheme] = useState<Theme>(
@@ -49,7 +49,7 @@ export function ThemeProvider({
     fetchTheme();
   }, [theme]);
   
-  appWindow.onThemeChanged(async ({ payload: newTheme }) => {
+  appWindow.onThemeChanged(({ payload: newTheme }) => {
     if (localStorage.getItem(storageKey) === "system") {
       const root = window.document.documentElement;
       root.classList.remove("light", "dark");
@@ -65,7 +65,7 @@ export function ThemeProvider({
     },
   };
 
-  return (
+    return (
     <ThemeProviderContext.Provider {...props} value={value}>
       {children}
     </ThemeProviderContext.Provider>

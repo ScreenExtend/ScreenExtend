@@ -50,6 +50,7 @@ export function DeviceDetails({ device }: { device: Device }) {
         description: "Your device settings have been updated.",
       });
       console.log(values);
+      setOpen(false);
     },
   });
 
