@@ -3,7 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import React, { useState } from "react";
+import { useState } from "react";
 import { Eye, EyeOff, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -12,18 +12,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
-import { useNavigate } from "react-router-dom";
 
 export default function Settings() {
   const [isPrivate, setIsPrivate] = useState(false);
@@ -31,7 +19,6 @@ export default function Settings() {
   const [showPassword, setShowPassword] = useState(false);
   const [showNetPassword, setShowNetPassword] = useState(false);
   const [showAccountPassword, setShowAccountPassword] = useState(false);
-  const navigate = useNavigate();
 
   function togglePasswordVisibility(type: "password" | "netPassword" | "accountPassword") {
     if (type === "password") {
@@ -133,8 +120,8 @@ export default function Settings() {
                     className={cn(
                       "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
                       !isOnline && "cursor-not-allowed"
-                      )}
-                    >
+                    )}
+                  >
                     {showNetPassword ? (
                       <EyeOff
                         className="h-5 w-5"
@@ -145,7 +132,7 @@ export default function Settings() {
                           className="h-5 w-5"
                           onClick={() => togglePasswordVisibility("netPassword")}
                         />
-                        )}
+                    )}
                   </div>
                 </div>
                 <Button disabled={!isOnline}>Save Password</Button>
@@ -184,50 +171,10 @@ export default function Settings() {
                 </div>
                 <Button>Save Password</Button>
               </div>
-              <DeleteDevice
-                onClick={() => {
-                  navigate("/")
-                }}
-              />
             </CardContent>
           </Card>
         </div>
       </div>
     </Layout>
   );
-}
-
-export function DeleteDevice(
-  props: React.ComponentPropsWithoutRef<typeof Button>
-) {
-  return (
-    <AlertDialog>
-      <AlertDialogTrigger asChild>
-        <Button
-          className="flex-1 bg-red-600 hover:bg-red-700 text-white"
-          variant="outline"
-          >
-          Delete Account
-        </Button>
-      </AlertDialogTrigger>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
-          <AlertDialogDescription>
-            This action cannot be undone. This will permanently delete your
-            account and remove your local preference data.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            className="bg-red-600 hover:bg-red-700 text-white"
-            onClick={props.onClick}
-          >
-            Continue
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-    );
 }

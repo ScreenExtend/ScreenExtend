@@ -13,7 +13,7 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 import { writeText } from "@tauri-apps/api/clipboard";
-import { Link } from "react-router-dom";
+// import { Link } from "react-router-dom";
 
 import { invoke } from "@tauri-apps/api/tauri";
 // import { Command } from "@tauri-apps/api/shell";
@@ -21,17 +21,13 @@ import { invoke } from "@tauri-apps/api/tauri";
 export default function Dashboard() {
   const [qrValues] = useState<{title: string, value: string}[]>([
     {
-      title: "Public Domain",
-      value: "https://ScreenExtend.vercel.app/dashboard",
+      title: "Same As Current Device",
+      value: "http://188.112.14.93:5000/",
     },
     {
-      title: "Local Network",
-      value: "https://ScreenExtend.vercel.app/dashboard",
-    },
-    {
-      title: "Public Domain",
-      value: "https://ScreenExtend.vercel.app/dashboard",
-    },
+      title: "Any Other Network",
+      value: "https://screenextend.tech/sess/wjduqhsj",
+    }
   ]);
 
   return (
@@ -47,9 +43,9 @@ export default function Dashboard() {
             ))
               ) : (
                 <div className="h-[120%] lg:block text-slate-400">
-                  Please create or join a network (one can be created through <Link to={"/settings"} className="underline">settings</Link>)
+                  Please join a network.)
                 </div>
-                )}
+              )}
         </div>
         {qrValues.length ? (
           <Carousel className="w-full max-w-xs lg:hidden mx-auto">
@@ -65,7 +61,8 @@ export default function Dashboard() {
           </Carousel>
           ) : (
             <div className="text-slate-400 lg:hidden">
-              Please create or join a network (one can be created through <Link to={"/settings"} className="underline">settings</Link>)
+              Please join a network.
+              {/*  (one can be created through <Link to={"/settings"} className="underline">settings</Link>) */}
             </div>
             )}
       </div>
