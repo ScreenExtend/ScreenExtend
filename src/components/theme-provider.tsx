@@ -1,12 +1,12 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { appWindow } from "@tauri-apps/api/window";
+import { AuthProviderContext } from "@/components/auth-provider";
 
 type Theme = "dark" | "light" | "system";
 
 type ThemeProviderProps = {
   children: React.ReactNode;
   defaultTheme?: Theme;
-  storageKey?: string;
 };
 
 type ThemeProviderState = {
@@ -24,13 +24,12 @@ const ThemeProviderContext = createContext<ThemeProviderState>(initialState);
 export function ThemeProvider({
   children,
   defaultTheme = "system",
-  storageKey = "screenextend-theme",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<Theme>(
-    () => (localStorage.getItem(storageKey) as Theme) || defaultTheme
-  );
-  localStorage.setItem(storageKey, theme);
+  // @ts-ignore
+  const { currentUser } = useContext(AuthProviderContext);
+  const [theme, setTheme] = useState<Theme>(defaultTheme);
+  localStorage.setItem(currentUser.username + "-theme", theme);
 
   useEffect(() => {
     async function fetchTheme() {
@@ -48,24 +47,26 @@ export function ThemeProvider({
     }
     fetchTheme();
   }, [theme]);
-  
+
   appWindow.onThemeChanged(({ payload: newTheme }) => {
-    if (localStorage.getItem(storageKey) === "system") {
+    if (localStorage.getItem(currentUser.username + "-theme") === "system") {
       const root = window.document.documentElement;
       root.classList.remove("light", "dark");
       root.classList.add(newTheme);
+      setTheme(newTheme);
+      setTheme("system");
     }
   });
-  
+
   const value = {
     theme,
     setTheme: (theme: Theme) => {
-      localStorage.setItem(storageKey, theme);
+      localStorage.setItem(currentUser.username + "-theme", theme);
       setTheme(theme);
     },
   };
 
-    return (
+  return (
     <ThemeProviderContext.Provider {...props} value={value}>
       {children}
     </ThemeProviderContext.Provider>

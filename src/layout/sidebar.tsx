@@ -2,7 +2,7 @@ import { Button } from "@/components/ui/button";
 import {
   ChevronLeft,
   UserRoundPlus,
-  Info,
+//  Info,
   MonitorSmartphone,
   Settings,
 } from "lucide-react";
@@ -69,12 +69,12 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
             </Link>
           </div>
         </div>
-        <div className="flex items-center justify-center gap-1 py-4">
-          <Info size={15} />
-          <Link to={"/terms"} className="underline">
-            Terms and Conditions
-          </Link>
-        </div>
+        {/*<div className="flex items-center justify-center gap-1 py-4">*/}
+        {/*  <Info size={15} />*/}
+        {/*  <Link to={"/terms"} className="underline">*/}
+        {/*    Terms and Conditions*/}
+        {/*  </Link>*/}
+        {/*</div>*/}
       </div>
     </div>
   );

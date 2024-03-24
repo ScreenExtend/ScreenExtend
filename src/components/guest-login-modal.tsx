@@ -14,11 +14,12 @@ import { useNavigate } from "react-router-dom";
 
 export function GuestLoginModal() {
     const navigate = useNavigate();
+    Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
     
     return (
         <AlertDialog>
             <AlertDialogTrigger asChild>
-                <Button variant="outline" size={"sm"} className="w-full justify-center">
+                <Button variant="outline" size={"sm"} className="w-full justify-center" id={"guestLogin"}>
                     Login as Guest
                 </Button>
             </AlertDialogTrigger>
