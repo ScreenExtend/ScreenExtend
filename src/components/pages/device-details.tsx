@@ -102,7 +102,7 @@ export function DeviceDetails({ device }: { device: Device }) {
             <div className="flex-1">
               <Label>Device Name</Label>
               <Input
-                placeholder="Device One"
+                placeholder="Device Name"
                 name="name"
                 value={deviceDetails.values.name}
                 onChange={deviceDetails.handleChange}
@@ -118,10 +118,10 @@ export function DeviceDetails({ device }: { device: Device }) {
                   deviceDetails.setFieldValue("orientation", value);
                 }}
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger className="w-full border-2">
                   <SelectValue placeholder="Orientation" />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent className="cursor-pointer">
                   <SelectItem value="portrait">Portrait</SelectItem>
                   <SelectItem value="landscape">Landscape</SelectItem>
                 </SelectContent>

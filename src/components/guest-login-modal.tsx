@@ -10,11 +10,13 @@ import {
     AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 export function GuestLoginModal() {
     const navigate = useNavigate();
-    Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
+    const [dontShowAgain, setDontShowAgain] = useState(true);
     
     return (
         <AlertDialog>
@@ -31,6 +33,19 @@ export function GuestLoginModal() {
                         to save your preferences.
                     </AlertDialogDescription>
                 </AlertDialogHeader>
+                <div className="flex items-center space-x-2 mb-4">
+                    <Checkbox
+                        id="dontShowAgain"
+                        checked={dontShowAgain}
+                        onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+                    />
+                    <label
+                        htmlFor="dontShowAgain"
+                        className="text-sm text-muted-foreground cursor-pointer"
+                    >
+                        Don't show this message again
+                    </label>
+                </div>
                 <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
                     <AlertDialogAction onClick={() => navigate("/dashboard")}>
