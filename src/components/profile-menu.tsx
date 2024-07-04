@@ -22,9 +22,14 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { useTheme } from "@/components/theme-provider";
+import { AuthProviderContext } from "@/components/auth-provider";
+import { useContext } from "react";
 
 export function ProfileMenu() {
   const navigate = useNavigate();
+  const { setTheme } = useTheme();
+  const { currentUser } = useContext(AuthProviderContext);
 
   return (
     <DropdownMenu>
@@ -40,7 +45,11 @@ export function ProfileMenu() {
         <DropdownMenuGroup>
           <DropdownMenuItem
             className="cursor-pointer"
-            onClick={() => navigate("/")}
+            onClick={() => {
+              setTheme("system");
+              Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
+              navigate("/");
+            }}
           >
             <LogOut className="mr-2 h-4 w-4" />
             <span>Log Out</span>
@@ -66,7 +75,11 @@ export function ProfileMenu() {
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
                   <AlertDialogAction
                     className="bg-red-600 hover:bg-red-700 text-white"
-                    onClick={() => navigate("/")}
+                    onClick={() => {
+                      Object.keys(localStorage).filter(x => x.startsWith(currentUser.username)).forEach(x => localStorage.removeItem(x));
+                      Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
+                      navigate("/");
+                    }}
                   >
                     Continue
                   </AlertDialogAction>

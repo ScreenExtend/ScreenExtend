@@ -15,7 +15,7 @@ import { Eye, EyeOff } from "lucide-react";
 import { useState, useContext } from "react";
 import { AuthProviderContext } from "@/components/auth-provider";
 import { useNavigate } from "react-router-dom";
-import { useTheme } from "@/components/theme-provider";
+import { useTheme, Theme } from "@/components/theme-provider";
 
 const formSchema = z.object({
   username: z.string(),
@@ -34,22 +34,22 @@ export function UserAuthForm() {
     },
   });
   const [showPassword, setShowPassword] = useState(false);
-  // @ts-ignore
   const { setCurrentUser } = useContext(AuthProviderContext);
 
   function onSubmit(values: z.infer<typeof formSchema>) {
     setError(false);
     if (values.username.length == 0) {
-      // @ts-ignore
-      document.getElementById("guestLogin").click();
+      const guestLogin = document.getElementById("guestLogin");
+      if (guestLogin) {
+        guestLogin.click();
+      }
     } else {
       if (!Object.keys(localStorage).some(x => x.startsWith(values.username)) || localStorage.getItem(values.username + "-password") === values.password) {
         setCurrentUser({username: values.username, password: values.password});
         localStorage.setItem(values.username + "-username", values.username);
         localStorage.setItem(values.username + "-password", values.password);
         localStorage.setItem(values.username + "-theme", localStorage.getItem(values.username + "-theme") || theme);
-        // @ts-ignore
-        setTheme(localStorage.getItem(values.username + "-theme"));
+        setTheme((localStorage.getItem(values.username + "-theme") || theme) as Theme);
         navigate("/dashboard");
       } else {
         setError(true);
@@ -71,7 +71,13 @@ export function UserAuthForm() {
             <FormItem className="text-left space-y-0">
               <FormLabel>Username</FormLabel>
               <FormControl>
-                <Input placeholder="JohnDoe" {...field} autoComplete={"off"} />
+                <Input
+                  type={"text"}
+                  placeholder="Username"
+                  className="outline-none"
+                  autoComplete={"off"}
+                  {...field}
+                />
               </FormControl>
               <FormMessage />
             </FormItem>

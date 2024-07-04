@@ -17,7 +17,7 @@ const devices = Array(7)
   .fill({})
   .map((_, index) => ({
     name: `Device ${index + 1}`,
-    ip: `192.168.1.${Math.floor(Math.random() * 255) + 1}`,
+    ip: `192.168.${Math.floor(Math.random() * 255) + 1}.${Math.floor(Math.random() * 255) + 1}`,
     os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][
       Math.floor(Math.random() * 6)
     ],
