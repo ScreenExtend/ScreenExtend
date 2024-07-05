@@ -1,3 +1,5 @@
+import { Link } from "react-router-dom";
+import { cn } from "@/lib/utils";
 import Layout from "@/layout/layout";
 import {
   Table,
@@ -9,8 +11,6 @@ import {
 } from "@/components/ui/table";
 import { DeviceDetails } from "@/components/pages/device-details";
 import { buttonVariants } from "@/components/ui/button";
-import { Link } from "react-router-dom";
-import { cn } from "@/lib/utils";
 import { Plus } from "lucide-react";
 
 const devices = Array(7)
@@ -80,7 +80,7 @@ export default function Devices() {
               <Link
                 to="/dashboard"
                 className={cn(buttonVariants({ variant: "secondary" }))}
-                >
+              >
                 <Plus className="mr-2" size={16} />
                 Add a device to get started
               </Link>

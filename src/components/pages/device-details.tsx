@@ -1,3 +1,6 @@
+import React, { useState } from "react";
+import { Slider } from "../ui/slider";
+import { Checkbox } from "../ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -17,11 +20,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Slider } from "../ui/slider";
-import { Checkbox } from "../ui/checkbox";
-import { Device } from "@/pages/devices";
-import { useFormik } from "formik";
-import React, { useState } from "react";
 import { useToast } from "@/components/ui/use-toast";
 import {
   AlertDialog,
@@ -34,6 +32,8 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Device } from "@/pages/devices";
+import { useFormik } from "formik";
 
 export function DeviceDetails({ device }: { device: Device }) {
   const [open, setOpen] = useState(false);
@@ -54,8 +54,7 @@ export function DeviceDetails({ device }: { device: Device }) {
     },
   });
 
-  // @ts-expect-error type mismatch
-  const considerClosing = (event) => {
+  const considerClosing = (event: CustomEvent<{originalEvent: PointerEvent}> | CustomEvent<{originalEvent: FocusEvent}> | KeyboardEvent) => {
     event.preventDefault();
     if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
       setOpen(false);
@@ -88,12 +87,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           event.preventDefault();
         }}
       >
-        <SheetClose
-          asChild
-          onClick={() => {
-            alert("close");
-          }}
-        />
+        <SheetClose asChild />
         <SheetHeader>
           <SheetTitle>Edit Device</SheetTitle>
         </SheetHeader>
@@ -107,6 +101,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 value={deviceDetails.values.name}
                 onChange={deviceDetails.handleChange}
                 onBlur={deviceDetails.handleBlur}
+                hoverLabel={false}
               />
             </div>
             <div className="flex-1">
@@ -137,6 +132,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               value={deviceDetails.values.ip}
               onChange={deviceDetails.handleChange}
               onBlur={deviceDetails.handleBlur}
+              hoverLabel={false}
             />
           </div>
           <div>
@@ -148,6 +144,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               value={deviceDetails.values.os}
               onChange={deviceDetails.handleChange}
               onBlur={deviceDetails.handleBlur}
+              hoverLabel={false}
             />
           </div>
           <div>
@@ -159,6 +156,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               value={deviceDetails.values.screenSize}
               onChange={deviceDetails.handleChange}
               onBlur={deviceDetails.handleBlur}
+              hoverLabel={false}
             />
           </div>
           <div>
@@ -193,6 +191,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                     );
                   }}
                   className="w-10 px-1 text-center"
+                  hoverLabel={false}
                 />{" "}
                 Hz
               </div>
@@ -303,18 +302,14 @@ export function DeviceDetails({ device }: { device: Device }) {
   );
 }
 
-const CheckSelect = ({
-  name,
-  checked,
-  onCheckedChange,
-}: {
-  name: string;
-  checked: boolean;
-  onCheckedChange: (checked: boolean) => void;
-}) => {
+const CheckSelect = ({ name, checked, onCheckedChange }: { name: string, checked: boolean, onCheckedChange: (checked: boolean) => void }) => {
   return (
     <div className="flex items-center space-x-2 flex-1">
-      <Checkbox id={name} checked={checked} onCheckedChange={onCheckedChange} />
+      <Checkbox
+        id={name}
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+      />
       <Label
         htmlFor={name}
         className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 capitalize"
@@ -325,9 +320,7 @@ const CheckSelect = ({
   );
 };
 
-export function DeleteDevice(
-  props: React.ComponentPropsWithoutRef<typeof Button>
-) {
+export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
@@ -360,17 +353,7 @@ export function DeleteDevice(
   );
 }
 
-function CloseConfirmationDialog({
-  isOpen,
-  isOpenHandler,
-  acceptWarning,
-  declineWarning,
-}: {
-  isOpen: boolean;
-  acceptWarning: () => void;
-  declineWarning: () => void;
-  isOpenHandler: (isOpen: boolean) => void;
-}) {
+function CloseConfirmationDialog({ isOpen, isOpenHandler, acceptWarning, declineWarning }: { isOpen: boolean, acceptWarning: () => void, declineWarning: () => void, isOpenHandler: (isOpen: boolean) => void }) {
   return (
     <AlertDialog open={isOpen} onOpenChange={isOpenHandler}>
       <AlertDialogContent>

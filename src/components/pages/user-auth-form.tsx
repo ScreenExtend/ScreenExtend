@@ -1,3 +1,5 @@
+import { useState, useContext } from "react";
+import { useNavigate } from "react-router-dom";
 import { Input } from "../ui/input";
 import { Button } from "@/components/ui/button";
 import {
@@ -8,23 +10,23 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import { Eye, EyeOff } from "lucide-react";
+import { AuthProviderContext } from "@/components/auth-provider";
+import { useTheme, Theme } from "@/components/theme-provider";
+import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useForm } from "react-hook-form";
-import { Eye, EyeOff } from "lucide-react";
-import { useState, useContext } from "react";
-import { AuthProviderContext } from "@/components/auth-provider";
-import { useNavigate } from "react-router-dom";
-import { useTheme, Theme } from "@/components/theme-provider";
 
 const formSchema = z.object({
   username: z.string(),
   password: z.string(),
 });
 export function UserAuthForm() {
-  const navigate = useNavigate();
-  const [error, setError] = useState(false);
+  const { setCurrentUser } = useContext(AuthProviderContext);
   const { theme, setTheme } = useTheme();
+  const navigate = useNavigate();
+
+  const [error, setError] = useState(false);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -34,15 +36,11 @@ export function UserAuthForm() {
     },
   });
   const [showPassword, setShowPassword] = useState(false);
-  const { setCurrentUser } = useContext(AuthProviderContext);
 
   function onSubmit(values: z.infer<typeof formSchema>) {
     setError(false);
     if (values.username.length == 0) {
-      const guestLogin = document.getElementById("guestLogin");
-      if (guestLogin) {
-        guestLogin.click();
-      }
+      document.getElementById("guestLogin")!.click();
     } else {
       if (!Object.keys(localStorage).some(x => x.startsWith(values.username)) || localStorage.getItem(values.username + "-password") === values.password) {
         setCurrentUser({username: values.username, password: values.password});
@@ -57,10 +55,6 @@ export function UserAuthForm() {
     }
   }
 
-  function togglePasswordVisibility() {
-    setShowPassword((prev) => !prev);
-  }
-
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-3">
@@ -72,10 +66,11 @@ export function UserAuthForm() {
               <FormLabel>Username</FormLabel>
               <FormControl>
                 <Input
-                  type={"text"}
+                  type="text"
                   placeholder="Username"
                   className="outline-none"
-                  autoComplete={"off"}
+                  autoComplete="off"
+                  hoverLabel={false}
                   {...field}
                 />
               </FormControl>
@@ -90,30 +85,31 @@ export function UserAuthForm() {
             <FormItem className="space-y-0 text-left">
               <FormLabel>Password</FormLabel>
               <FormControl>
-                <div className="relative outline-none" style={{marginBottom: "10px"}}>
+                <div className="relative outline-none" style={{ marginBottom: "10px" }}>
                   <Input
                     type={showPassword ? "text" : "password"}
                     placeholder="Password"
                     className="outline-none"
-                    autoComplete={"off"}
+                    autoComplete="off"
+                    hoverLabel={false}
                     {...field}
                   />
                   <div className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer">
                     {showPassword ? (
                       <EyeOff
                         className="h-5 w-5"
-                        onClick={togglePasswordVisibility}
+                        onClick={() => setShowPassword((prev) => !prev)}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
-                        onClick={togglePasswordVisibility}
+                        onClick={() => setShowPassword((prev) => !prev)}
                       />
                     )}
                   </div>
                 </div>
               </FormControl>
-              <FormMessage style={{ display: (error ? "initial" : "none"), fontWeight: "bolder"}} className={"text-red-500"}>Please enter the correct password.</FormMessage>
+              <FormMessage style={{ display: (error ? "initial" : "none"), fontWeight: "bolder" }} className="text-red-500">Please enter the correct password.</FormMessage>
             </FormItem>
           )}
         />

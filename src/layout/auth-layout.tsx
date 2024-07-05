@@ -1,14 +1,13 @@
-import { cn } from "@/lib/utils";
+import React from "react";
+import { ModeToggle } from "@/components/mode-toggle";
 import illustration from "@/assets/illustration.svg";
 import logo from "@/assets/logo.svg";
-import { ModeToggle } from "@/components/mode-toggle";
-import React from "react";
 
 const AuthLayout = ({ children }: { children: React.ReactNode }) => {
   return (
     <>
     <div className="container relative h-screen flex-col items-center justify-start md:grid lg:max-w-none lg:grid-cols-2 md:grid-cols-1 lg:px-0">
-      <div className={cn("absolute right-4 top-4 md:right-8 md:top-8")}>
+      <div className="absolute right-4 top-4 md:right-8 md:top-8">
         <ModeToggle />
       </div>
       <div className="relative hidden h-full flex-col bg-muted p-10 text-white lg:flex dark:border-r">
@@ -18,10 +17,10 @@ const AuthLayout = ({ children }: { children: React.ReactNode }) => {
               src={illustration}
               alt="Illustration"
               className="object-cover"
-              style={{width: "28rem"}}
+              style={{ width: "28rem" }}
             />
             <div>
-              <h1 className="text-3xl font-bold" style={{maxWidth: "26rem"}}>
+              <h1 className="text-3xl font-bold" style={{ maxWidth: "26rem" }}>
                 ScreenExtend: The easiest way to extend your screen.
               </h1>
               <p className="text-lg mt-4">
@@ -35,7 +34,7 @@ const AuthLayout = ({ children }: { children: React.ReactNode }) => {
             src={logo}
             alt="Logo"
             className="object-cover"
-            style={{width: "2rem", marginRight: "10px"}}
+            style={{ width: "2rem", marginRight: "10px" }}
           />
           ScreenExtend
         </div>

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
-import { appWindow } from "@tauri-apps/api/window";
 import { AuthProviderContext } from "@/components/auth-provider";
+import { appWindow } from "@tauri-apps/api/window";
 
 export type Theme = "dark" | "light" | "system";
 
@@ -27,6 +27,7 @@ export function ThemeProvider({
   ...props
 }: ThemeProviderProps) {
   const { currentUser } = useContext(AuthProviderContext);
+  
   const [theme, setTheme] = useState<Theme>(defaultTheme);
   localStorage.setItem(currentUser.username + "-theme", theme);
 
@@ -44,10 +45,10 @@ export function ThemeProvider({
 
       root.classList.add(theme);
     }
-    fetchTheme();
+    void fetchTheme();
   }, [theme]);
 
-  appWindow.onThemeChanged(({ payload: newTheme }) => {
+  void appWindow.onThemeChanged(({ payload: newTheme }) => {
     if (localStorage.getItem(currentUser.username + "-theme") === "system") {
       const root = window.document.documentElement;
       root.classList.remove("light", "dark");
