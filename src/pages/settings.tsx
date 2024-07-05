@@ -1,11 +1,15 @@
+import React, { useState, useContext } from "react";
+import { cn } from "@/lib/utils";
 import Layout from "@/layout/layout";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle
+} from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import React, { useState, useContext } from "react";
-import { Eye, EyeOff, Info } from "lucide-react";
-import { cn } from "@/lib/utils";
 import {
   Tooltip,
   TooltipContent,
@@ -13,9 +17,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { AuthProviderContext } from "@/components/auth-provider";
+import { Eye, EyeOff, Info } from "lucide-react";
 
 export default function Settings() {
-  const { currentUser, setCurrentUser } = useContext(AuthProviderContext);
+  const {currentUser, setCurrentUser} = useContext(AuthProviderContext);
+
   const [isPrivate, setIsPrivate] = useState(false);
   const [isOnline, setIsOnline] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -64,7 +70,10 @@ export default function Settings() {
                     Toggle Private
                   </p>
                 </div>
-                <Switch checked={isPrivate} onCheckedChange={setIsPrivate} />
+                <Switch
+                  checked={isPrivate}
+                  onCheckedChange={setIsPrivate}
+                />
               </div>
               <div className="flex items-center space-x-4 p-3 px-0">
                 <div className="relative outline-none flex-1">
@@ -111,7 +120,10 @@ export default function Settings() {
                     Toggle Offline
                   </p>
                 </div>
-                <Switch checked={isOnline} onCheckedChange={setIsOnline} />
+                <Switch
+                  checked={isOnline}
+                  onCheckedChange={setIsOnline}
+                />
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild className="cursor-pointer">
@@ -143,7 +155,7 @@ export default function Settings() {
                     disabled={!isOnline}
                     value={networkPassword}
                     hoverLabel={true}
-                    onChange={(e) => {setNetworkPassword(e.target.value)}}
+                    onChange={(e) => setNetworkPassword(e.target.value)}
                   />
                   <div
                     className={cn(
@@ -156,11 +168,11 @@ export default function Settings() {
                         className="h-5 w-5"
                         onClick={() => togglePasswordVisibility("netPassword")}
                       />
-                      ) : (
-                        <Eye
-                          className="h-5 w-5"
-                          onClick={() => togglePasswordVisibility("netPassword")}
-                        />
+                    ) : (
+                      <Eye
+                        className="h-5 w-5"
+                        onClick={() => togglePasswordVisibility("netPassword")}
+                      />
                     )}
                   </div>
                 </div>
@@ -182,13 +194,11 @@ export default function Settings() {
                     placeholder="Password"
                     className="outline-none"
                     defaultValue={accountPassword}
-                    onChange={(e) => {setAccountPassword(e.target.value)}}
+                    onChange={(e) => setAccountPassword(e.target.value)}
                     id={"changePasswordInput"}
                     hoverLabel={true}
                   />
-                  <div
-                    className={"absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer"}
-                  >
+                  <div className={"absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer"}>
                     {showAccountPassword ? (
                       <EyeOff
                         className="h-5 w-5"
@@ -203,7 +213,7 @@ export default function Settings() {
                   </div>
                 </div>
                 <Button onClick={() => {
-                  setCurrentUser({username: currentUser.username, password: accountPassword})
+                  setCurrentUser({username: currentUser.username, password: accountPassword});
                   setShowAccountPassword(false);
                 }}>Save Password</Button>
               </div>

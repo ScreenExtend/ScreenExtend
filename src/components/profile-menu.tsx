@@ -1,3 +1,5 @@
+import { useContext } from "react";
+import { useNavigate } from "react-router-dom";
 import { LogOut, Trash2 } from "lucide-react";
 import {
   DropdownMenu,
@@ -9,7 +11,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { useNavigate } from "react-router-dom";
 import defaultUser from "@/assets/default.jpg";
 import {
   AlertDialog,
@@ -24,12 +25,11 @@ import {
 } from "@/components/ui/alert-dialog";
 import { useTheme } from "@/components/theme-provider";
 import { AuthProviderContext } from "@/components/auth-provider";
-import { useContext } from "react";
 
 export function ProfileMenu() {
-  const navigate = useNavigate();
-  const { setTheme } = useTheme();
   const { currentUser } = useContext(AuthProviderContext);
+  const { setTheme } = useTheme();
+  const navigate = useNavigate();
 
   return (
     <DropdownMenu>
@@ -61,7 +61,7 @@ export function ProfileMenu() {
             <Trash2 className="mr-2 h-4 w-4" />
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <span style={{color: "red"}}><b>Delete Account</b></span>
+                <span style={{ color: "red" }}><b>Delete Account</b></span>
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>

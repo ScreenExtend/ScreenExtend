@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useContext } from "react";
 import { Sidebar } from "./sidebar";
-import { AlignLeft } from "lucide-react";
 import { ModeToggle } from "@/components/mode-toggle";
 import { ProfileMenu } from "@/components/profile-menu";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { AuthProviderContext } from "@/components/auth-provider";
+import { AlignLeft } from "lucide-react";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentUser } = useContext(AuthProviderContext);
@@ -13,7 +13,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     localStorage.setItem(currentUser.username + "-isSideBarOpen", "true");
   }
 
-  const [isSideBarOpen, setIsSideBarOpen] = useState(JSON.parse(localStorage.getItem(currentUser.username + "-isSideBarOpen") || "true"));
+  const [isSideBarOpen, setIsSideBarOpen] = useState(JSON.parse(localStorage.getItem(currentUser.username + "-isSideBarOpen")!));
   const [firstTime, setFirstTime] = useState(true);
   const [doneOpening, setDoneOpening] = useState(false);
 
@@ -31,44 +31,51 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   }, [defaultSize]);
 
   useEffect(() => {
-    const sideBar = document.getElementById("sideBar");
+    const sideBar = document.getElementById("sideBar")!;
     localStorage.setItem(currentUser.username + "-isSideBarOpen", isSideBarOpen.toString());
-    if (sideBar) {
-      if (!isSideBarOpen) {
-        sideBar.animate(
-          [
-            { flexGrow: defaultSize },
-            { flexGrow: 0 }
-          ],
-          {
-            duration: firstTime ? 0 : 250
-          }
-        );
-        sideBar.style.flexGrow = "0";
-        setDoneOpening(true);
-      } else if (doneOpening) {
-        sideBar.animate(
-          [
-            { flexGrow: 0 },
-            { flexGrow: defaultSize }
-          ],
-          {
-            duration: 250
-          }
-        );
-        sideBar.style.flexGrow = defaultSize.toString();
-        setDoneOpening(false);
-      }
+    if (!isSideBarOpen) {
+      sideBar.animate(
+        [
+          { flexGrow: defaultSize },
+          { flexGrow: 0 }
+        ],
+        {
+          duration: firstTime ? 0 : 250
+        }
+      );
+      sideBar.style.flexGrow = "0";
+      setDoneOpening(true);
+    } else if (doneOpening) {
+      sideBar.animate(
+        [
+          { flexGrow: 0 },
+          { flexGrow: defaultSize }
+        ],
+        {
+          duration: 250
+        }
+      );
+      sideBar.style.flexGrow = defaultSize.toString();
+      setDoneOpening(false);
     }
     setFirstTime(false);
   }, [isSideBarOpen]);
 
   return (
-    <ResizablePanelGroup className="flex h-screen" direction={"horizontal"}>
-      <ResizablePanel minSize={minSize} maxSize={maxSize} defaultSize={defaultSize} id={"sideBar"} onResize={(width) => { setDefaultSize(width);console.log(width) }}>
+    <ResizablePanelGroup
+      className="flex h-screen"
+      direction="horizontal"
+    >
+      <ResizablePanel
+        minSize={minSize}
+        maxSize={maxSize}
+        defaultSize={defaultSize}
+        id="sideBar"
+        onResize={(width) => setDefaultSize(width)}
+      >
         <Sidebar
-          setIsSideBarOpen={console.log}
-          className={ "absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0" }
+          setIsSideBarOpen={() => {}}
+          className="absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0"
         />
       </ResizablePanel>
       <ResizableHandle withHandle style={(isSideBarOpen ? {} : {display: "none"})} />
@@ -78,8 +85,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <div
               className="cursor-pointer"
               onClick={() => setIsSideBarOpen((prev: boolean) => !prev)}
-              >
-              <AlignLeft size={24} className="" />
+            >
+              <AlignLeft size={24} />
             </div>
             <ProfileMenu />
           </div>

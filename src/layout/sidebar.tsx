@@ -1,3 +1,5 @@
+import React from "react";
+import { Link, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   ChevronLeft,
@@ -6,8 +8,6 @@ import {
   MonitorSmartphone,
   Settings,
 } from "lucide-react";
-import React from "react";
-import { Link, useLocation } from "react-router-dom";
 
 interface SidebarProps extends React.HTMLAttributes<HTMLDivElement> {
   setIsSideBarOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -21,7 +21,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
       <div className="space-y-4 h-full flex flex-col w-full border-r">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
-            <h2 className="text-4xl font-medium tracking-tight py-4" style={{marginLeft: "-0.5rem"}}>
+            <h2 className="text-4xl font-medium tracking-tight py-4" style={{ marginLeft: "-0.5rem" }}>
               ScreenExtend
             </h2>
             <ChevronLeft
@@ -34,10 +34,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
             <Link className="block" to="/dashboard">
               <Button
                 variant={
-                  !["/settings", "/devices"].includes(location.pathname) &&
-                  location.pathname !== "/"
-                    ? "secondary"
-                    : "ghost"
+                  !["/settings", "/devices", "/"].includes(location.pathname) ? "secondary" : "ghost"
                 }
                 className="w-full justify-start text-base py-6"
               >
@@ -71,7 +68,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
         </div>
         {/*<div className="flex items-center justify-center gap-1 py-4">*/}
         {/*  <Info size={15} />*/}
-        {/*  <Link to={"/terms"} className="underline">*/}
+        {/*  <Link to="/terms" className="underline">*/}
         {/*    Terms and Conditions*/}
         {/*  </Link>*/}
         {/*</div>*/}

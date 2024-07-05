@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
     AlertDialog,
     AlertDialogAction,
@@ -11,8 +13,6 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
 
 export function GuestLoginModal() {
     const navigate = useNavigate();
@@ -21,7 +21,7 @@ export function GuestLoginModal() {
     return (
         <AlertDialog>
             <AlertDialogTrigger asChild>
-                <Button variant="outline" size={"sm"} className="w-full justify-center" id={"guestLogin"}>
+                <Button variant="outline" size="sm" className="w-full justify-center" id="guestLogin">
                     Login as Guest
                 </Button>
             </AlertDialogTrigger>
