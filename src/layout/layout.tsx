@@ -7,16 +7,13 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/componen
 import { AuthProviderContext } from "@/components/auth-provider";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
-  // @ts-ignore
   const { currentUser } = useContext(AuthProviderContext);
 
-  // @ts-ignore
-  if (JSON.parse(localStorage.getItem(currentUser.username + "-isSideBarOpen")) === null) {
+  if (localStorage.getItem(currentUser.username + "-isSideBarOpen") === null) {
     localStorage.setItem(currentUser.username + "-isSideBarOpen", "true");
   }
 
-  // @ts-ignore
-  const [isSideBarOpen, setIsSideBarOpen] = useState(JSON.parse(localStorage.getItem(currentUser.username + "-isSideBarOpen")));
+  const [isSideBarOpen, setIsSideBarOpen] = useState(JSON.parse(localStorage.getItem(currentUser.username + "-isSideBarOpen") || "true"));
   const [firstTime, setFirstTime] = useState(true);
   const [doneOpening, setDoneOpening] = useState(false);
 
@@ -27,18 +24,18 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     setMaxSize(40000/window.innerWidth);
   }, true);
 
-  // @ts-ignore
-  const [defaultSize, setDefaultSize] = useState(parseFloat(localStorage.getItem(currentUser.username + "-defaultSize")) || 27500/window.innerWidth);
+  const [defaultSize, setDefaultSize] = useState(parseFloat(localStorage.getItem(currentUser.username + "-defaultSize") || 27500/window.innerWidth + ""));
   localStorage.setItem(currentUser.username + "-defaultSize", defaultSize.toString());
   useEffect(() => {
     localStorage.setItem(currentUser.username + "-defaultSize", defaultSize.toString());
   }, [defaultSize]);
 
   useEffect(() => {
+    const sideBar = document.getElementById("sideBar");
     localStorage.setItem(currentUser.username + "-isSideBarOpen", isSideBarOpen.toString());
-    if (document.getElementById("sideBar")) {
+    if (sideBar) {
       if (!isSideBarOpen) {
-        document.getElementById("sideBar")?.animate(
+        sideBar.animate(
           [
             { flexGrow: defaultSize },
             { flexGrow: 0 }
@@ -47,11 +44,10 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             duration: firstTime ? 0 : 250
           }
         );
-        // @ts-ignore
-        document.getElementById("sideBar").style.flexGrow = "0";
+        sideBar.style.flexGrow = "0";
         setDoneOpening(true);
       } else if (doneOpening) {
-        document.getElementById("sideBar")?.animate(
+        sideBar.animate(
           [
             { flexGrow: 0 },
             { flexGrow: defaultSize }
@@ -60,8 +56,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             duration: 250
           }
         );
-        // @ts-ignore
-        document.getElementById("sideBar").style.flexGrow = defaultSize.toString();
+        sideBar.style.flexGrow = defaultSize.toString();
         setDoneOpening(false);
       }
     }
