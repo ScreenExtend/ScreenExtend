@@ -1,0 +1,141 @@
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::channel;
+use std::sync::Mutex;
+
+use windows::core::{Result, HSTRING}; // IInspectable,  
+use windows::Devices::WiFiDirect::{WiFiDirectAdvertisementPublisher, WiFiDirectAdvertisementPublisherStatus, WiFiDirectAdvertisementPublisherStatusChangedEventArgs}; // WiFiDirectConnectionListener, WiFiDirectConnectionRequestedEventArgs, WiFiDirectConnectionStatus, WiFiDirectDevice, WiFiDirectError, 
+use windows::Foundation::TypedEventHandler; // AsyncOperationCompletedHandler, AsyncStatus, 
+use windows::Security::Credentials::PasswordCredential;
+
+//fn start_listener(tx: Sender<String>) -> Result<()> {
+//    let listener = WiFiDirectConnectionListener::new()?;
+//    let connection_requested_callback = TypedEventHandler::<
+//        WiFiDirectConnectionListener,
+//        WiFiDirectConnectionRequestedEventArgs,
+//    >::new(move |_sender, args| {
+//        let request = args
+//            .as_ref()
+//            .expect("args == None in connection requested callback")
+//            .GetConnectionRequest()?;
+//        let device_info = request.DeviceInformation()?;
+//        let device_id = device_info.Id()?;
+//        let wifi_direct_device = WiFiDirectDevice::FromIdAsync(&device_id)?;
+//        let async_operation_completed_callback =
+//            AsyncOperationCompletedHandler::<WiFiDirectDevice>::new(|async_operation, status| {
+//                if status == AsyncStatus::Completed {
+//                    let wfd_device = async_operation
+//                        .as_ref()
+//                        .expect("No device in WiFiDirectDevice AsyncOperation callback")
+//                        .GetResults()?;
+////                    println!("{}", wfd_device.GetConnectionEndpointPairs()?.GetAt(0)?.LocalHostName()?.DisplayName()?);
+//                    let connection_status_changed_callback = TypedEventHandler::<
+//                        WiFiDirectDevice,
+//                        IInspectable,
+//                    >::new(
+//                        |sender, _inspectable| {
+//                            let status = sender
+//                                .as_ref()
+//                                .expect("No sender in connection status changed handler")
+//                                .ConnectionStatus()?;
+//                            match status {
+//                                WiFiDirectConnectionStatus::Disconnected => {
+//                                    let _device_id = sender
+//                                        .as_ref()
+//                                        .expect("No sender in connection status changed handler")
+//                                        .DeviceId()?;
+//                                }
+//                                _ => (),
+//                            }
+//                            Ok(())
+//                        },
+//                    );
+//                    let _event_registration_token =
+//                        wfd_device.ConnectionStatusChanged(&connection_status_changed_callback);
+//                }
+//                Ok(())
+//            });
+//        wifi_direct_device.SetCompleted(&async_operation_completed_callback)?;
+//        Ok(())
+//    });
+//    listener.ConnectionRequested(&connection_requested_callback)?;
+//    Ok(())
+//}
+
+fn start(ssid: &str, password: &str, success_tx: Sender<bool>) -> Result<WiFiDirectAdvertisementPublisher> {
+    let publisher = WiFiDirectAdvertisementPublisher::new()?;
+    
+    let _ssid = HSTRING::from(ssid);
+    let password_credential = PasswordCredential::new()?;
+    password_credential.SetPassword(&HSTRING::from(password))?;
+    
+    let publisher_status_changed_callback = TypedEventHandler::<WiFiDirectAdvertisementPublisher, WiFiDirectAdvertisementPublisherStatusChangedEventArgs>::new(move |_sender, args| {
+        let status = args.as_ref().expect("args == None in status change callback").Status()?;
+        match status {
+//            WiFiDirectAdvertisementPublisherStatus::Created => println!("Hosted network created"),
+//            WiFiDirectAdvertisementPublisherStatus::Stopped => println!("Hosted network stopped"),
+            WiFiDirectAdvertisementPublisherStatus::Started => {
+//                start_listener(message_tx.clone())?;
+                success_tx.send(true).expect("Failed to send status")
+            }
+            WiFiDirectAdvertisementPublisherStatus::Aborted => {
+//                let err = match args.as_ref().expect("args == None in status change callback").Error().expect("Couldn't get error")
+//                {
+//                    WiFiDirectError::RadioNotAvailable => "Radio not available",
+//                    WiFiDirectError::ResourceInUse => "Resource in use",
+//                    _ => "No WiFi Direct-capable card or other error"
+//                };
+//                println!("Hosted network aborted: {}", err);
+                success_tx.send(false).expect("Failed to send status")
+            }
+            _ => ()
+        }
+        Ok(())
+    });
+    publisher.StatusChanged(&publisher_status_changed_callback)?;
+    
+    let advertisement = publisher.Advertisement().expect("Error getting advertisement");
+    advertisement.SetIsAutonomousGroupOwnerEnabled(true)?;
+    
+    let legacy_settings = advertisement.LegacySettings()?;
+    legacy_settings.SetIsEnabled(true)?;
+    legacy_settings.SetSsid(&_ssid)?;
+    legacy_settings.SetPassphrase(&password_credential)?;
+    
+    publisher.Start()?;
+    Ok(publisher)
+}
+
+lazy_static! {
+    static ref STOP_HOSTED_NETWORK: Mutex<Option<Box<dyn Fn() + Send + 'static>>> = Mutex::new(None);
+}
+
+pub fn start_hosted_network(ssid: &str, password: &str) -> bool {
+    let (success_tx, success_rx) = channel::<bool>();
+    let publisher = match start(ssid, password, success_tx.clone()) {
+        Ok(publisher) => publisher,
+        Err(_err) => return false
+    };
+    let wlan_hosted_network_helper = Mutex::new(publisher);
+    let mut stop_func = STOP_HOSTED_NETWORK.lock().unwrap();
+    *stop_func = Some(Box::new(move || {
+        let publisher = wlan_hosted_network_helper.lock().expect("Couldn't lock publisher mutex.");
+        match publisher.Status() {
+            Ok(status) => if status == WiFiDirectAdvertisementPublisherStatus::Started {
+                match publisher.Stop() {
+                    _ => ()
+                }
+            }
+            _ => ()
+        };
+    }));
+    success_rx.recv().unwrap()
+}
+
+pub fn stop_hosted_network() -> bool {
+    if let Some(ref stop_func) = *STOP_HOSTED_NETWORK.lock().unwrap() {
+        stop_func();
+        true
+    } else {
+        false
+    }
+}
