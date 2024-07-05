@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from "react";
 import { appWindow } from "@tauri-apps/api/window";
 import { AuthProviderContext } from "@/components/auth-provider";
 
-type Theme = "dark" | "light" | "system";
+export type Theme = "dark" | "light" | "system";
 
 type ThemeProviderProps = {
   children: React.ReactNode;
@@ -26,7 +26,6 @@ export function ThemeProvider({
   defaultTheme = "system",
   ...props
 }: ThemeProviderProps) {
-  // @ts-ignore
   const { currentUser } = useContext(AuthProviderContext);
   const [theme, setTheme] = useState<Theme>(defaultTheme);
   localStorage.setItem(currentUser.username + "-theme", theme);

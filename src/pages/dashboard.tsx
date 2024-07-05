@@ -1,6 +1,6 @@
 import { Card } from "@/components/ui/card";
 import Layout from "@/layout/layout";
-import { useState } from "react";
+import {useEffect, useState } from "react";
 import QRCode from "react-qr-code";
 import { Copy } from "lucide-react";
 import { Modal } from "flowbite-react";
@@ -13,9 +13,10 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 import { writeText } from "@tauri-apps/api/clipboard";
+import { listen } from "@tauri-apps/api/event";
 // import { Link } from "react-router-dom";
 
-import { invoke } from "@tauri-apps/api/tauri";
+//import { invoke } from "@tauri-apps/api/tauri";
 // import { Command } from "@tauri-apps/api/shell";
 
 export default function Dashboard() {
@@ -43,7 +44,7 @@ export default function Dashboard() {
             ))
               ) : (
                 <div className="h-[120%] lg:block text-slate-400">
-                  Please join a network.)
+                  Please join a network or create one via settings.
                 </div>
               )}
         </div>
@@ -97,14 +98,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
           />
           <button
             className="p-2 border-l"
-            onClick={async () => {
-              await writeText(url);
-              {/*const command = Command.sidecar("ffmpeg", ["-h"]);*/}
-              {/*const output = await command.execute();*/}
-              {/*await writeText(output.stdout);*/}
-              await invoke("list_ips");
-              {/*console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("")}`, password: "screenextend"}));*/}
-            }}
+            onClick={async () => { await writeText(url) }}
           >
             <Copy size={15} />
           </button>
@@ -118,26 +112,51 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
 function QrModalComponent({ value }: { value: string }) {
   const [openModal, setOpenModal] = useState(false);
 
+  useEffect(() => {
+    if (openModal) {
+      setTimeout(() => {
+        const modalInnerBody = document.getElementsByClassName("max-w-2xl")[0];
+        modalInnerBody.removeAttribute("class");
+      }, 0);
+    }
+  }, [openModal]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    async function listenToWindowResize() {
+      unlisten = await listen<string>("tauri://resize", () => {
+        let qrCode = document.getElementById("mainQRCode");
+        if (qrCode) {
+          qrCode.style.height = (window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
+        }
+      });
+    }
+    listenToWindowResize();
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   return (
     <>
     <Button onClick={() => setOpenModal(true)} className="w-full ">
       Expand QR{" "}
     </Button>
-    <Modal dismissible show={openModal} onClose={async () => {
-      setOpenModal(false);
-      console.log(await invoke("stop_hosted_network"));
-    }}>
-      <Modal.Body className="">
+    <Modal dismissible show={openModal} onClose={() => { setOpenModal(false) }}>
+      <Modal.Body id={"mainQRCodeOuter"}>
         <QRCode
           size={256}
           style={{
-          height: "auto",
+            height: window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2,
             maxWidth: "100%",
             width: "100%",
-            borderRadius: "0.275rem",
+            borderRadius: "0.275rem"
           }}
           value={value}
           viewBox={`0 0 256 256`}
+          id={"mainQRCode"}
         />
       </Modal.Body>
     </Modal>

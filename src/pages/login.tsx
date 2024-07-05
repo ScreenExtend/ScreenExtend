@@ -8,7 +8,7 @@ export default function Login() {
       <div className="mx-auto flex w-full flex-col space-y-6 sm:w-[350px] h-screen justify-center md:h-full">
         <div className="flex flex-col space-y-2">
           <h1 className="text-2xl font-semibold tracking-tight text-left">
-            Get Started
+            Login or Sign Up
           </h1>
         </div>
         <UserAuthForm />

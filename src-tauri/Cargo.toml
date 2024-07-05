@@ -39,6 +39,7 @@ features = [
     "Foundation",
     "Foundation_Collections",
     "Networking",
+    "Networking_Connectivity",
     "Security_Credentials",
     "Win32_Foundation",
     "Win32_Security",

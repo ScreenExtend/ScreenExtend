@@ -19,6 +19,16 @@
         height: 100%;
         overflow: hidden;
       }
+      button, input {
+        transition: all 200ms ease-in-out !important;
+      }
+      #mainQRCodeOuter {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+      }
+      #mainQRCodeOuter::-webkit-scrollbar {
+        display: none;
+      }
     </style>
     <script>
       document.addEventListener("contextmenu", (event) => {
