@@ -9,6 +9,7 @@ extern crate local_ip_address;
 mod windows_utils;
 
 use windows_utils::hosted_network;
+use tauri::Window;
 
 #[tauri::command]
 fn start_hosted_network(ssid: &str, password: &str) -> bool {
@@ -18,6 +19,12 @@ fn start_hosted_network(ssid: &str, password: &str) -> bool {
 #[tauri::command]
 fn stop_hosted_network() -> bool {
     hosted_network::stop_hosted_network()
+}
+
+#[tauri::command]
+fn fetch_urls(window: Window) {
+    let _ = window.emit("local_url", "https://192.168.88.1:8000/");
+    let _ = window.emit("global_url", "https://screenextend.tech/sess/abcdefgh");
 }
 
 extern crate ping;
@@ -88,7 +95,7 @@ fn main() {
             println!("{}, {argv:?}, {cwd}", app.package_info().name);
             app.emit_all("single-instance", Payload { args: argv, cwd }).unwrap();
         }))
-        .invoke_handler(tauri::generate_handler![start_hosted_network, stop_hosted_network, list_ips])
+        .invoke_handler(tauri::generate_handler![start_hosted_network, stop_hosted_network, list_ips, fetch_urls])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

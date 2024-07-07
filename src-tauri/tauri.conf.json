@@ -45,7 +45,9 @@
         "resizable": true,
         "title": "Screen Extend",
         "width": 1200,
-        "height": 675
+        "height": 675,
+        "minWidth": 1050,
+        "minHeight": 650
       }
     ]
   }

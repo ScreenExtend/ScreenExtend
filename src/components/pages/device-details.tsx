@@ -49,8 +49,8 @@ export function DeviceDetails({ device }: { device: Device }) {
         title: "Device Settings Updated",
         description: "Your device settings have been updated.",
       });
-      console.log(values);
       setOpen(false);
+      void values;
     },
   });
 
@@ -108,7 +108,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               <Label>Orientation</Label>
               <Select
                 name="orientation"
-                defaultValue={deviceDetails.values.orientation?.toLowerCase()}
+                defaultValue={deviceDetails.values.orientation}
                 onValueChange={(value) => {
                   deviceDetails.setFieldValue("orientation", value);
                 }}
@@ -117,8 +117,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                   <SelectValue placeholder="Orientation" />
                 </SelectTrigger>
                 <SelectContent className="cursor-pointer">
-                  <SelectItem value="portrait">Portrait</SelectItem>
-                  <SelectItem value="landscape">Landscape</SelectItem>
+                  <SelectItem value="Portrait">Portrait</SelectItem>
+                  <SelectItem value="Landscape">Landscape</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -321,6 +321,8 @@ const CheckSelect = ({ name, checked, onCheckedChange }: { name: string, checked
 };
 
 export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
+  const [dontShowAgain, setDontShowAgain] = useState(true);
+
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
@@ -333,12 +335,24 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
       </AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
+          <AlertDialogTitle>Remove Device</AlertDialogTitle>
           <AlertDialogDescription>
-            This action cannot be undone. This will permanently delete your
-            device and remove your data from our servers.
+            This action cannot be undone. The device will immediately lose be disconnect. It can reconnect for future sessions.
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <div className="flex items-center space-x-2 mb-4">
+            <Checkbox
+                id="dontShowAgain"
+                checked={dontShowAgain}
+                onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+            />
+            <label
+                htmlFor="dontShowAgain"
+                className="text-sm text-muted-foreground cursor-pointer"
+            >
+                Don't show this message again
+            </label>
+        </div>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
@@ -354,16 +368,30 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
 }
 
 function CloseConfirmationDialog({ isOpen, isOpenHandler, acceptWarning, declineWarning }: { isOpen: boolean, acceptWarning: () => void, declineWarning: () => void, isOpenHandler: (isOpen: boolean) => void }) {
+  const [dontShowAgain, setDontShowAgain] = useState(true);
+
   return (
     <AlertDialog open={isOpen} onOpenChange={isOpenHandler}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Warning!</AlertDialogTitle>
+          <AlertDialogTitle>Edit Device</AlertDialogTitle>
           <AlertDialogDescription>
-            You have unsaved changes. Are you sure you want to close as this
-            will discard your changes?
+            You have unsaved changes. Clicking continue will discard your edits.
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <div className="flex items-center space-x-2 mb-4">
+          <Checkbox
+            id="dontShowAgain"
+            checked={dontShowAgain}
+            onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+          />
+          <label
+            htmlFor="dontShowAgain"
+            className="text-sm text-muted-foreground cursor-pointer"
+          >
+            Don't show this message again
+          </label>
+        </div>
         <AlertDialogFooter>
           <AlertDialogCancel onClick={declineWarning}>Cancel</AlertDialogCancel>
           <AlertDialogAction

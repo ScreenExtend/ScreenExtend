@@ -44,18 +44,18 @@ export default App;
 
 /*
 Fixes:
-- Notification for various actions (logged in, change account settings, etc)
-- On click tool tip show tool tip (also less delay on hover)
-- Save preference for guest login
-  - Don't show modal again
-  - Save preferences on logout (change message too)
-- Arrow collapse side bar
-- Auto collapse side bar when screen is too small
-- Slight white border on textboxes
+- Save preference for guest login and in general
+- Cleaning Up
+  - Same indentation everywhere
+  - Better variable names
+  - Optimize imports
+  - Optimize useState actions
 
 Release Actions:
 - Tauri config
 - Github action tauri automatic build
+- Spell check all variables
+- License at the top of each file (and/or copyright)
 
 Metadata:
 - https://screenextend.tech/sess/wjduqhsj (build and url)
@@ -73,6 +73,8 @@ Future Fixes:
 - Export/import system data
 - Cite tauri and other libraries used + terms and conditions
 - Only one instance running (test on mac/linux)
+- Ban device by browser/IP
+- Resizable side bar
 
 Ffmpeg Usage:
 const command = Command.sidecar("ffmpeg", ["-h"]);
@@ -84,6 +86,13 @@ console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.fro
 
 Get Theme Without State:
 ((theme === "system") ? ((window.document.documentElement.classList.toString() === "light") ? ("LIGHT") : ("DARK")) : (theme === "light") ? ("LIGHT") : ("DARK"))
+
+Add Attribute to Window (auth-provider.tsx):
+declare global {
+    interface Window {
+        changeSidebarState: () => void;
+    }
+};
 
 Library Order:
 react

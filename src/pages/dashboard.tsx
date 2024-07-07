@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useState } from "react";
 import { Link } from "react-router-dom";
 import { Card } from "@/components/ui/card";
 import Layout from "@/layout/layout";
@@ -15,18 +15,37 @@ import { Modal } from "flowbite-react";
 import QRCode from "react-qr-code";
 import { writeText } from "@tauri-apps/api/clipboard";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/tauri";
 
 export default function Dashboard() {
-  const [qrValues] = useState<{ title: string, value: string }[]>([
+  const [, forceUpdate] = useReducer(x => x + 1, 0);
+  const [qrValues, setQrValues] = useState<{ title: string, value: string }[]>([
     {
       title: "Same As Current Device",
-      value: "http://188.112.14.93:5000/",
+      value: "",
     },
     {
       title: "Any Other Network",
-      value: "https://screenextend.tech/sess/wjduqhsj",
+      value: "",
     }
   ]);
+
+  useEffect(() => {
+    async function fetchURLs() {
+      await listen("local_url", (event) => {
+        qrValues[0].value = event.payload as string;
+        setQrValues(qrValues);
+        forceUpdate();
+      });
+      await listen("global_url", (event) => {
+        qrValues[1].value = event.payload as string;
+        setQrValues(qrValues);
+        forceUpdate();
+      });
+      await invoke("fetch_urls");
+    }
+    void fetchURLs();
+  }, []);
 
   return (
     <Layout>
@@ -44,7 +63,7 @@ export default function Dashboard() {
             ))
           ) : (
             <div className="h-[120%] lg:block text-slate-400">
-              Please join a network or create one through <Link to={"/settings"} className="underline">settings</Link>.
+              Please join a network or create one through <Link to="/settings" className="underline">settings</Link>.
             </div>
           )}
         </div>
@@ -65,7 +84,7 @@ export default function Dashboard() {
           </Carousel>
         ) : (
           <div className="text-slate-400 lg:hidden">
-            Please join a network or create one through <Link to={"/settings"} className="underline">settings</Link>.
+            Please join a network or create one through <Link to="/settings" className="underline">settings</Link>.
           </div>
         )}
       </div>
@@ -122,7 +141,7 @@ function QrModalComponent({ value }: { value: string }) {
     let unlisten: (() => void) | undefined;
     async function listenToWindowResize() {
       unlisten = await listen<string>("tauri://resize", () => {
-        let qrCode = document.getElementById("mainQRCode");
+        const qrCode = document.getElementById("mainQRCode");
         if (qrCode) {
           qrCode.style.height = (window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
         }

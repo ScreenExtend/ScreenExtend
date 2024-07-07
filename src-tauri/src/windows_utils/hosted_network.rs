@@ -102,6 +102,7 @@ fn start(ssid: &str, password: &str, success_tx: Sender<bool>) -> Result<WiFiDir
     legacy_settings.SetPassphrase(&password_credential)?;
     
     publisher.Start()?;
+
     Ok(publisher)
 }
 
