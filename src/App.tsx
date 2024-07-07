@@ -55,7 +55,7 @@ Release Actions:
 - Tauri config
 - Github action tauri automatic build
 - Spell check all variables
-- License at the top of each file (and/or copyright)
+- Copyright at the top of each file (or license)
 
 Metadata:
 - https://screenextend.tech/sess/wjduqhsj (build and url)
