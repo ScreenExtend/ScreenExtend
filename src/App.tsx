@@ -92,7 +92,7 @@ declare global {
     interface Window {
         changeSidebarState: () => void;
     }
-};
+}
 
 Library Order:
 react
