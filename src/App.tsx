@@ -54,7 +54,7 @@ Fixes:
 Release Actions:
 - Tauri config
 - Github action tauri automatic build
-- Spell check all variables
+- Spell check all text
 - Copyright at the top of each file (or license)
 
 Metadata:
