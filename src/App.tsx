@@ -70,7 +70,7 @@ Future Fixes:
 - Better storage instead of just local storage
 - Home screen graphic
 - Actual system notifications if window isn't focussed (and notifs for device joining)
-- Export/import system data
+- Export/import user data
 - Cite tauri and other libraries used + terms and conditions
 - Only one instance running (test on mac/linux)
 - Ban device by browser/IP
