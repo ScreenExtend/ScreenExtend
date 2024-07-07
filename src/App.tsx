@@ -100,6 +100,6 @@ react-router-dom
 cn
 ./ ui elements
 @ ui elements
-ui element imports
+any ui element
 contexts/etc
 */
