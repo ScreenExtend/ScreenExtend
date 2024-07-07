@@ -91,6 +91,8 @@
 
   button, input {
     transition: all 200ms ease-in-out !important;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
   }
 
   #mainQRCodeOuter {

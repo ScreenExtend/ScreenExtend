@@ -5,6 +5,7 @@ import { ProfileMenu } from "@/components/profile-menu";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { AuthProviderContext } from "@/components/auth-provider";
 import { AlignLeft } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentUser } = useContext(AuthProviderContext);
@@ -18,22 +19,35 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const [doneOpening, setDoneOpening] = useState(false);
 
   const [minSize, setMinSize] = useState(27500/window.innerWidth);
-  const [maxSize, setMaxSize] = useState(40000/window.innerWidth);
-  window.addEventListener("resize", function() {
-    setMinSize(27500/window.innerWidth);
-    setMaxSize(40000/window.innerWidth);
-  }, true);
+//  const [maxSize, setMaxSize] = useState(40000/window.innerWidth);
+  void listen<string>("tauri://resize", () => {
+    if (parseFloat(document.getElementById("sideBar")!.style.flexGrow) > 0) {
+      setMinSize(27500/window.innerWidth);
+//      setMaxSize(40000/window.innerWidth);
+    }
+  });
+
+//  const arrow = document.getElementById("hideArrow")!;
+//  const innerSideBar = document.getElementById("innerSidebar")!;
+//  void listen<string>("tauri://resize", () => {
+//    if (arrow.getBoundingClientRect().width > 0) {
+//      setIsSideBarOpen(false);
+//      innerSideBar.style.display = "none";
+//    }
+//  });
 
   const [defaultSize, setDefaultSize] = useState(parseFloat(localStorage.getItem(currentUser.username + "-defaultSize") || 27500/window.innerWidth + ""));
+  const [previousDefaultSize, setPreviousDefaultSize] = useState(defaultSize);
   localStorage.setItem(currentUser.username + "-defaultSize", defaultSize.toString());
   useEffect(() => {
     localStorage.setItem(currentUser.username + "-defaultSize", defaultSize.toString());
   }, [defaultSize]);
 
   useEffect(() => {
-    const sideBar = document.getElementById("sideBar")!;
     localStorage.setItem(currentUser.username + "-isSideBarOpen", isSideBarOpen.toString());
+    const sideBar = document.getElementById("sideBar")!;
     if (!isSideBarOpen) {
+      setPreviousDefaultSize(defaultSize);
       sideBar.animate(
         [
           { flexGrow: defaultSize },
@@ -44,18 +58,20 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         }
       );
       sideBar.style.flexGrow = "0";
+      setDefaultSize(0);
       setDoneOpening(true);
     } else if (doneOpening) {
       sideBar.animate(
         [
           { flexGrow: 0 },
-          { flexGrow: defaultSize }
+          { flexGrow: previousDefaultSize }
         ],
         {
           duration: 250
         }
       );
-      sideBar.style.flexGrow = defaultSize.toString();
+      sideBar.style.flexGrow = previousDefaultSize.toString();
+      setDefaultSize(previousDefaultSize);
       setDoneOpening(false);
     }
     setFirstTime(false);
@@ -68,17 +84,14 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     >
       <ResizablePanel
         minSize={minSize}
-        maxSize={maxSize}
+        maxSize={minSize} // maxSize
         defaultSize={defaultSize}
         id="sideBar"
         onResize={(width) => setDefaultSize(width)}
       >
-        <Sidebar
-          setIsSideBarOpen={() => {}}
-          className="absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0"
-        />
+        <Sidebar />
       </ResizablePanel>
-      <ResizableHandle withHandle style={(isSideBarOpen ? {} : {display: "none"})} />
+      <ResizableHandle style={(isSideBarOpen ? {} : {display: "none"})} disabled={true} /> {/* withHandle */}
       <ResizablePanel>
         <div className="flex-1 h-screen flex flex-col overflow-hidden">
           <div className="flex items-center justify-between px-4 py-2 border-b">

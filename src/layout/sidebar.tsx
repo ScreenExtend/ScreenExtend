@@ -1,4 +1,3 @@
-import React from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
@@ -9,15 +8,11 @@ import {
   Settings,
 } from "lucide-react";
 
-interface SidebarProps extends React.HTMLAttributes<HTMLDivElement> {
-  setIsSideBarOpen: React.Dispatch<React.SetStateAction<boolean>>;
-}
-
-export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
+export function Sidebar() {
   const location = useLocation();
 
   return (
-    <div className={className}>
+    <div className="absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0" id="innerSidebar">
       <div className="space-y-4 h-full flex flex-col w-full border-r">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
@@ -27,7 +22,7 @@ export function Sidebar({ className, setIsSideBarOpen }: SidebarProps) {
             <ChevronLeft
               size={20}
               className="lg:hidden cursor-pointer"
-              onClick={() => setIsSideBarOpen((prev) => !prev)}
+              id="hideArrow"
             />
           </div>
           <div className="space-y-1">

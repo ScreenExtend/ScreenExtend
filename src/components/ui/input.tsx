@@ -1,15 +1,9 @@
 import * as React from "react"
 
-import { cn } from "@/lib/utils"
+import { cn, useFocus } from "@/lib/utils"
 
 export interface InputProps
   extends React.InputHTMLAttributes<HTMLInputElement> {hoverLabel: boolean}
-
-const useFocus = <T extends HTMLElement>() => {
-    const inputRef = React.useRef<T>(null);
-    const setInputFocus = () => {inputRef.current && inputRef.current.focus()};
-    return { inputRef, setInputFocus };
-}
 
 const Input = React.forwardRef<HTMLInputElement, InputProps>(
   ({ hoverLabel, id, className, placeholder, disabled, ...props }) => {
