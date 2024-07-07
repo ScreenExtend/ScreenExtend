@@ -87,7 +87,7 @@ console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.fro
 Get Theme Without State:
 ((theme === "system") ? ((window.document.documentElement.classList.toString() === "light") ? ("LIGHT") : ("DARK")) : (theme === "light") ? ("LIGHT") : ("DARK"))
 
-Add Attribute to Window (auth-provider.tsx):
+Add Attribute to Window (add to auth-provider.tsx):
 declare global {
     interface Window {
         changeSidebarState: () => void;
