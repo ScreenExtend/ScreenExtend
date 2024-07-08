@@ -31,6 +31,7 @@ import {
 import { AuthProviderContext } from "@/components/auth-provider";
 import { Eye, EyeOff, Info } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
+import { invoke } from "@tauri-apps/api/tauri";
 
 export default function Settings() {
   const {currentUser, setCurrentUser} = useContext(AuthProviderContext);
@@ -57,6 +58,9 @@ export default function Settings() {
     let value = e.target.value;
     if (!/^[a-zA-Z0-9 ]+$/.test(value)) {
       value = value.replace(/[^a-zA-Z0-9 ]/g, "");
+    }
+    if (value.length > 32) {
+      value = value.substring(0, 32);
     }
     if (value.startsWith("ScreenExtend")) {
       setHostedNetworkName(value);
@@ -96,7 +100,6 @@ export default function Settings() {
                     placeholder="Password"
                     className="outline-none"
                     hoverLabel={true}
-                    value={sessionPassword}
                     onChange={(e) => setSessionPassword(e.target.value)}
                   />
                   <div className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer">
@@ -141,7 +144,30 @@ export default function Settings() {
                 </div>
                 <Switch
                   checked={hostedNetworkOn}
-                  onCheckedChange={setHostedNetworkOn}
+                  onCheckedChange={async () => {
+                    if (!hostedNetworkOn) {
+                      const success = await invoke("start_hosted_network", {ssid: hostedNetworkName, password: hostedNetworkPassword});
+                      if (success) {
+                        setHostedNetworkOn(true);
+                        toast({
+                          title: "Network Creation Success",
+                          description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
+                        });
+                      } else {
+                        toast({
+                          title: "Network Creation Failure",
+                          description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card.",
+                        });
+                      }
+                    } else {
+                      await invoke("stop_hosted_network");
+                      setHostedNetworkOn(false);
+                      toast({
+                        title: "Network Stop Success",
+                        description: "The hosted network has successfully been stopped. All devices have been disconnected.",
+                      });
+                    }
+                  }}
                 />
                 <TooltipProvider>
                   <Tooltip delayDuration={100} open={hostedNetworkTooltipOpen} onOpenChange={(state) => setHostedNetworkTooltipOpen(state)}>
@@ -165,12 +191,11 @@ export default function Settings() {
                     type="text"
                     placeholder="Network Name"
                     className="outline-none"
-                    disabled={!hostedNetworkOn}
                     value={hostedNetworkName}
+                    disabled={!hostedNetworkOn}
                     onChange={handleNetworkNameChange}
                     onBlur={() => setHostedNetworkName((prev) => prev.trim())}
                     hoverLabel={true}
-                    maxLength={32}
                   />
                 </div>
                 <div className="relative outline-none flex-1">
@@ -179,11 +204,10 @@ export default function Settings() {
                     placeholder="Network Password"
                     className="outline-none"
                     disabled={!hostedNetworkOn}
-                    value={hostedNetworkPassword}
-                    hoverLabel={true}
                     onChange={(e) => setHostedNetworkPassword(e.target.value)}
                     minLength={8}
                     maxLength={63}
+                    hoverLabel={true}
                   />
                   <div
                     className={cn(
@@ -310,14 +334,23 @@ export default function Settings() {
             </AlertDialogCancel>
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
-              onClick={() => {
+              onClick={async () => {
                 setOldHostedNetworkName(hostedNetworkName);
                 setOldHostedNetworkPassword(hostedNetworkPassword);
+                await invoke("stop_hosted_network");
+                const success = await invoke("start_hosted_network", {ssid: hostedNetworkName, password: hostedNetworkPassword});
                 setHostedNetworkModalOpen(false);
-                toast({
-                     title: "Network Settings Updated",
-                     description: "Your network settings have been updated.",
-                 });
+                if (success) {
+                  toast({
+                    title: "Network Settings Update Success",
+                    description: "The network settings have successfully been updated.",
+                  });
+                } else {
+                  toast({
+                    title: "Network Settings Update Failure",
+                    description: "The was an error in updating the network settings.",
+                  });
+                }
               }}
             >
               Continue
