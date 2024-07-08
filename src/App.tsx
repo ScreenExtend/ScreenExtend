@@ -45,7 +45,6 @@ export default App;
 /*
 Fixes:
 - Save preference for guest login and in general
-- Hook everything up (hook reference)
 - Cleaning Up
   - Same indentation everywhere
   - Better variable names
