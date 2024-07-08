@@ -1,6 +1,8 @@
 import { useContext } from "react";
 import { useNavigate } from "react-router-dom";
+
 import { LogOut, Trash2 } from "lucide-react";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -10,8 +12,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import defaultUser from "@/assets/default.jpg";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,8 +23,11 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+
 import { useTheme } from "@/components/theme-provider";
 import { AuthProviderContext } from "@/components/auth-provider";
+import { cn } from "@/lib/utils";
+import defaultUser from "@/assets/default.jpg";
 
 export function ProfileMenu() {
   const { currentUser } = useContext(AuthProviderContext);
@@ -55,11 +58,15 @@ export function ProfileMenu() {
             <span>Log Out</span>
           </DropdownMenuItem>
           <DropdownMenuItem
-            className="cursor-pointer"
+            className={cn(
+              "cursor-pointer",
+              currentUser.username.length === 0 && "cursor-not-allowed"
+            )}
             onClick={(event) => event.preventDefault()}
+            disabled={currentUser.username.length === 0}
           >
             <Trash2 className="mr-2 h-4 w-4" />
-            <AlertDialog>
+            <AlertDialog open={currentUser.username.length === 0 ? false : undefined}>
               <AlertDialogTrigger asChild>
                 <span style={{ color: "red" }}><b>Delete Account</b></span>
               </AlertDialogTrigger>
@@ -75,8 +82,7 @@ export function ProfileMenu() {
                   <AlertDialogAction
                     className="bg-red-600 hover:bg-red-700 text-white"
                     onClick={() => {
-                      Object.keys(localStorage).filter(x => x.startsWith(currentUser.username)).forEach(x => localStorage.removeItem(x));
-                      Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
+                      Object.keys(localStorage).filter(x => x.startsWith(currentUser.username + "-")).forEach(x => localStorage.removeItem(x));
                       navigate("/");
                     }}
                   >

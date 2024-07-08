@@ -1,10 +1,11 @@
 import React, { useState, useContext } from "react";
-import { cn } from "@/lib/utils";
+
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Eye, EyeOff, Info } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -28,10 +29,11 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+
 import { AuthProviderContext } from "@/components/auth-provider";
-import { Eye, EyeOff, Info } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import { invoke } from "@tauri-apps/api/tauri";
+import { cn } from "@/lib/utils";
 
 export default function Settings() {
   const {currentUser, setCurrentUser} = useContext(AuthProviderContext);

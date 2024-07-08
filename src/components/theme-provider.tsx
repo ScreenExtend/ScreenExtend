@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
+
 import { AuthProviderContext } from "@/components/auth-provider";
 import { appWindow } from "@tauri-apps/api/window";
 

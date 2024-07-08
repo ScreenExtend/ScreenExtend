@@ -1,8 +1,10 @@
 import { useNavigate } from "react-router-dom";
+
 import { ArrowLeft } from "lucide-react";
 
 const Terms = () => {
   const navigate = useNavigate();
+  
   return (
     <div className="py-6 p-20">
       <button

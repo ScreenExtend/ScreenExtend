@@ -1,8 +1,12 @@
 import { useEffect, useReducer, useState } from "react";
 import { Link } from "react-router-dom";
-import { Card } from "@/components/ui/card";
+
 import Layout from "@/layout/layout";
+import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Copy } from "lucide-react";
+import { Modal } from "flowbite-react";
+import QRCode from "react-qr-code";
 import {
   Carousel,
   CarouselContent,
@@ -10,9 +14,7 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "@/components/ui/carousel";
-import { Copy } from "lucide-react";
-import { Modal } from "flowbite-react";
-import QRCode from "react-qr-code";
+
 import { writeText } from "@tauri-apps/api/clipboard";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
