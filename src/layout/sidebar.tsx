@@ -1,11 +1,12 @@
 import { Link, useLocation } from "react-router-dom";
+
 import { Button } from "@/components/ui/button";
 import {
   ChevronLeft,
   UserRoundPlus,
-//  Info,
   MonitorSmartphone,
   Settings,
+  // Info
 } from "lucide-react";
 
 export function Sidebar() {

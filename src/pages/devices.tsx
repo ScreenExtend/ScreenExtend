@@ -1,6 +1,9 @@
 import { Link } from "react-router-dom";
-import { cn } from "@/lib/utils";
+
 import Layout from "@/layout/layout";
+import { DeviceDetails } from "@/components/pages/device-details";
+import { buttonVariants } from "@/components/ui/button";
+import { Plus } from "lucide-react";
 import {
   Table,
   TableBody,
@@ -9,9 +12,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { DeviceDetails } from "@/components/pages/device-details";
-import { buttonVariants } from "@/components/ui/button";
-import { Plus } from "lucide-react";
+
+import { cn } from "@/lib/utils";
 
 const devices = Array(7)
   .fill({})

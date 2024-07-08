@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useContext } from "react";
+
 import { Sidebar } from "./sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
 import { ProfileMenu } from "@/components/profile-menu";
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
-import { AuthProviderContext } from "@/components/auth-provider";
 import { AlignLeft } from "lucide-react";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+
+import { AuthProviderContext } from "@/components/auth-provider";
 import { listen } from "@tauri-apps/api/event";
 
 export default function Layout({ children }: { children: React.ReactNode }) {

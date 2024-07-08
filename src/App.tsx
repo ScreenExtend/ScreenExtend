@@ -5,11 +5,13 @@ import {
   createMemoryRouter,
   createRoutesFromElements,
 } from "react-router-dom";
+
 import Login from "./pages/login";
 import Dashboard from "./pages/dashboard";
 import Settings from "./pages/settings";
 import Devices from "./pages/devices";
 import Terms from "./pages/terms";
+
 import { AuthProviderContext } from "@/components/auth-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import "non.geist";
@@ -43,14 +45,6 @@ export default App;
 
 
 /*
-Fixes:
-- Save preferences for actions (guest login and in general)
-- Cleaning Up
-  - Same indentation everywhere
-  - Better variable names
-  - Optimize imports
-  - Optimize useState actions
-
 Release Actions:
 - Tauri config
 - Github action tauri automatic build
@@ -60,6 +54,16 @@ Release Actions:
 Metadata:
 - https://screenextend.tech/sess/wjduqhsj (build and url)
 - Network Name - ScreenExtend{10 random alphanumeric characters} with settable password
+
+Information Saved:
+- Username
+- Password
+- Theme
+- Sidebar Open
+- Device Preferences
+- Session Password
+- Hosted Network Name/Password
+- Don't Show Again Modals
 
 Website Fixes:
 - Meta tag info for SEO

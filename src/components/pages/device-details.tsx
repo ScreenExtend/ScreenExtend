@@ -1,9 +1,18 @@
 import React, { useState } from "react";
+
 import { Slider } from "../ui/slider";
 import { Checkbox } from "../ui/checkbox";
+import { Device } from "@/pages/devices";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Sheet,
   SheetContent,
@@ -13,14 +22,6 @@ import {
   SheetTrigger,
   SheetClose,
 } from "@/components/ui/sheet";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useToast } from "@/components/ui/use-toast";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -32,7 +33,8 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Device } from "@/pages/devices";
+
+import { useToast } from "@/components/ui/use-toast";
 import { useFormik } from "formik";
 
 export function DeviceDetails({ device }: { device: Device }) {
