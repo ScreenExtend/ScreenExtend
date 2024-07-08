@@ -81,9 +81,6 @@ const command = Command.sidecar("ffmpeg", ["-h"]);
 const output = await command.execute();
 await writeText(output.stdout);
 
-Hosted Network Usage:
-console.log(await invoke("start_hosted_network", {ssid: `ScreenExtend${Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("")}`, password: "screenextend"}));
-
 Get Theme Without State:
 ((theme === "system") ? ((window.document.documentElement.classList.toString() === "light") ? ("LIGHT") : ("DARK")) : (theme === "light") ? ("LIGHT") : ("DARK"))
 
