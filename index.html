@@ -6,10 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Screen Extend</title>
     <script>
-      document.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-      });
-      document.documentElement.addEventListener("click", (event) => {
+      document.addEventListener("contextmenu", event => event.preventDefault());
+      document.addEventListener("click", (event) => {
         if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
           event.preventDefault();
         }
@@ -19,12 +17,8 @@
           event.preventDefault();
         }
       });
-      document.addEventListener("dragover", function(event) {
-        event.preventDefault();
-      });
-      document.addEventListener("drop", function(event) {
-        event.preventDefault();
-      });
+      document.addEventListener("dragover", event => event.preventDefault());
+      document.addEventListener("drop", event => event.preventDefault());
     </script>
   </head>
   <body>

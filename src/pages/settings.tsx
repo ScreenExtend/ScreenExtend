@@ -1,11 +1,16 @@
-import React, { useState, useContext } from "react";
+import React, { useState, useContext, useEffect } from "react";
 
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Eye, EyeOff, Info } from "lucide-react";
+import { Eye, EyeOff, Info, RefreshCw } from "lucide-react";
+import {
+  InputOTP,
+  InputOTPGroup,
+  InputOTPSlot,
+} from "@/components/ui/input-otp";
 import {
   Card,
   CardContent,
@@ -30,30 +35,31 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { AuthProviderContext } from "@/components/auth-provider";
+import { getPrivateIpAddresses, startHostedNetwork, stopHostedNetwork } from "@/lib/bindings";
+import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
-import { invoke } from "@tauri-apps/api/tauri";
 import { cn } from "@/lib/utils";
 
 export default function Settings() {
-  const {currentUser, setCurrentUser} = useContext(AuthProviderContext);
+  const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
+  const user = getUser(currentUser)!;
 
-  const [sessionPassword, setSessionPassword] = useState("");
-  const [showSessionPassword, setShowSessionPassword] = useState(false);
-  const [oldSessionPassword, setOldSessionPassword] = useState(sessionPassword);
+  const characters = "0123456789";
+  const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp) ? window.otp : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
+  const [spin, setSpin] = useState(false);
 
-  const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
+  const [hostedNetworkOn, setHostedNetworkOn] = useState(window.hostedNetworkOn);
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
-  const [hostedNetworkName, setHostedNetworkName] = useState("ScreenExtend");
-  const [hostedNetworkPassword, setHostedNetworkPassword] = useState("ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!");
+  const [hostedNetworkName, setHostedNetworkName] = useState(user.hostedNetworkCredentials.name);
+  const [hostedNetworkPassword, setHostedNetworkPassword] = useState(user.hostedNetworkCredentials.password);
   const [oldHostedNetworkName, setOldHostedNetworkName] = useState(hostedNetworkName);
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState(hostedNetworkPassword);
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
   const [hostedNetworkModalOpen, setHostedNetworkModalOpen] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
 
-  const [accountPassword, setAccountPassword] = useState(currentUser.password);
+  const [accountPassword, setAccountPassword] = useState(user.password);
   const [showAccountPassword, setShowAccountPassword] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -71,17 +77,46 @@ export default function Settings() {
     }
   };
 
-  function togglePasswordVisibility(type: "sessionPassword" | "accountPassword" | "hostedNetworkPassword") {
-    if (type === "sessionPassword") {
-      setShowSessionPassword((prev) => !prev);
-    } else if (type === "accountPassword") {
-      if (currentUser.username.length === 0) return;
-      setShowAccountPassword((prev) => !prev);
+  const togglePasswordVisibility = (type: "sessionPassword" | "accountPassword" | "hostedNetworkPassword") => {
+    if (type === "accountPassword") {
+      if (currentUser.length === 0) return;
+      setShowAccountPassword(prev => !prev);
     } else {
       if (!hostedNetworkOn) return;
-      setShowHostedNetworkPassword((prev) => !prev);
+      setShowHostedNetworkPassword(prev => !prev);
     }
   }
+
+  const startHostedNetworkWithIP = async (name: string, password: string) => {
+    const ips1 = await getPrivateIpAddresses();
+    const success = await startHostedNetwork(name, password);
+    const ips2 = await getPrivateIpAddresses();
+    if (success && ips2.length - ips1.length === 1) {
+      console.log(ips2.filter(ip => !ips1.includes(ip))[0]);
+      return true;
+    } else {
+      await stopHostedNetwork();
+      return false;
+    }
+  }
+
+  useEffect(() => {
+    if (spin) {
+      const timer = setTimeout(() => {
+        setSpin(false);
+        setOtp([...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [spin]);
+
+  useEffect(() => {
+    updateUser(currentUser, {hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
+  }, [hostedNetworkName, hostedNetworkPassword]);
+
+  useEffect(() => {
+    window.otp = otp;
+  }, [otp]);
 
   return (
     <Layout>
@@ -92,44 +127,38 @@ export default function Settings() {
         <div className="mb-4">
           <Card>
             <CardHeader>
-              <CardTitle>Session Settings</CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-4">
-              <div className="flex items-center space-x-4 p-3 px-0">
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type={showSessionPassword ? "text" : "password"}
-                    placeholder="Password"
-                    className="outline-none"
-                    hoverLabel={true}
-                    onChange={(e) => setSessionPassword(e.target.value)}
-                  />
-                  <div className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer">
-                    {showSessionPassword ? (
-                      <EyeOff
-                        className="h-5 w-5"
-                        onClick={() => togglePasswordVisibility("sessionPassword")}
-                      />
-                    ) : (
-                      <Eye
-                        className="h-5 w-5"
-                        onClick={() => togglePasswordVisibility("sessionPassword")}
-                      />
-                    )}
-                  </div>
-                </div>
-                <Button onClick={() => {
-                    if (sessionPassword !== oldSessionPassword) {
-                      setOldSessionPassword(sessionPassword);
-                      toast({
-                        title: "Session Settings Updated",
-                        description: "Your session settings have been updated.",
-                      });
-                    }
+              <CardTitle className="flex flex-row items-center">
+                Session OTP
+                <RefreshCw
+                  className={cn(
+                    "ml-3 cursor-pointer transition-transform",
+                    spin ? "animate-spin pointer-events-none" : ""
+                  )}
+                  onClick={() => {
+                    setSpin(true);
                   }}
-                >Save Password</Button>
-              </div>
-            </CardContent>
+                  size={18}
+                  style={{ animationDuration: "500ms" }}
+                />
+              </CardTitle>
+              <InputOTP
+                maxLength={6}
+                value={otp}
+                containerClassName={
+                  spin ? "opacity-50" : "opacity-100"
+                }
+                disabled
+              >
+                <InputOTPGroup>
+                  <InputOTPSlot index={0} />
+                  <InputOTPSlot index={1} />
+                  <InputOTPSlot index={2} />
+                  <InputOTPSlot index={3} />
+                  <InputOTPSlot index={4} />
+                  <InputOTPSlot index={5} />
+                </InputOTPGroup>
+              </InputOTP>
+            </CardHeader>
           </Card>
         </div>
         <div className="mb-4">
@@ -148,7 +177,9 @@ export default function Settings() {
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
                     if (!hostedNetworkOn) {
-                      const success = await invoke("start_hosted_network", {ssid: hostedNetworkName, password: hostedNetworkPassword});
+                      window.hostedNetworkOn = true;
+                      await stopHostedNetwork();
+                      const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
                         setHostedNetworkOn(true);
                         toast({
@@ -162,7 +193,12 @@ export default function Settings() {
                         });
                       }
                     } else {
-                      await invoke("stop_hosted_network");
+                      window.hostedNetworkOn = false;
+                      await stopHostedNetwork();
+                      if (hostedNetworkPassword.length < 8) {
+                        setHostedNetworkPassword(oldHostedNetworkPassword);
+                      }
+                      setShowHostedNetworkPassword(false);
                       setHostedNetworkOn(false);
                       toast({
                         title: "Network Stop Success",
@@ -185,7 +221,7 @@ export default function Settings() {
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0",
-                  !hostedNetworkOn && "cursor-not-allowed"
+                  !hostedNetworkOn && "cursor-not-allowed select-none"
                 )}
               >
                 <div className="relative outline-none flex-1">
@@ -196,7 +232,7 @@ export default function Settings() {
                     value={hostedNetworkName}
                     disabled={!hostedNetworkOn}
                     onChange={handleNetworkNameChange}
-                    onBlur={() => setHostedNetworkName((prev) => prev.trim())}
+                    onBlur={() => setHostedNetworkName(hostedNetworkName.trim())}
                     hoverLabel={true}
                   />
                 </div>
@@ -204,9 +240,13 @@ export default function Settings() {
                   <Input
                     type={showHostedNetworkPassword ? "text" : "password"}
                     placeholder="Network Password"
-                    className="outline-none"
+                    className={cn(
+                      "outline-none",
+                      hostedNetworkPassword.length < 8 && "border-red-500 focus:ring-red-500"
+                    )}
+                    value={hostedNetworkPassword}
                     disabled={!hostedNetworkOn}
-                    onChange={(e) => setHostedNetworkPassword(e.target.value)}
+                    onChange={event => setHostedNetworkPassword(event.target.value)}
                     minLength={8}
                     maxLength={63}
                     hoverLabel={true}
@@ -214,25 +254,46 @@ export default function Settings() {
                   <div
                     className={cn(
                       "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
-                      !hostedNetworkOn && "cursor-not-allowed"
+                      !hostedNetworkOn && "cursor-not-allowed select-none"
                     )}
                   >
                     {showHostedNetworkPassword ? (
                       <EyeOff
                         className="h-5 w-5"
+                        style={{ opacity: hostedNetworkOn ? 1 : 0.5 }}
                         onClick={() => togglePasswordVisibility("hostedNetworkPassword")}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
+                        style={{ opacity: hostedNetworkOn ? 1 : 0.5 }}
                         onClick={() => togglePasswordVisibility("hostedNetworkPassword")}
                       />
                     )}
                   </div>
+                  <p className="text-red-500 text-xs mt-1" style={{ position: "absolute", display: (hostedNetworkPassword.length < 8 ? "initial": "none") }}>A password must have at least 8 characters</p>
                 </div>
-                <Button disabled={!hostedNetworkOn} onClick={() => {
+                <Button disabled={!hostedNetworkOn || hostedNetworkPassword.length < 8} onClick={async () => {
                     if (hostedNetworkName !== oldHostedNetworkName || hostedNetworkPassword !== oldHostedNetworkPassword) {
-                      setHostedNetworkModalOpen(true);
+                      if (!getUser(currentUser)!.dontShowAgain.editNetwork) {
+                        setHostedNetworkModalOpen(true);
+                      } else {
+                        await stopHostedNetwork();
+                        const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
+                        if (success) {
+                          setOldHostedNetworkName(hostedNetworkName);
+                          setOldHostedNetworkPassword(hostedNetworkPassword);
+                          toast({
+                            title: "Network Settings Update Success",
+                            description: "The network settings have successfully been updated.",
+                          });
+                        } else {
+                          toast({
+                            title: "Network Settings Update Failure",
+                            description: "The was an error in updating the network settings.",
+                          });
+                        }
+                      }
                     }
                   }}
                 >
@@ -251,7 +312,7 @@ export default function Settings() {
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0",
-                  currentUser.username.length === 0 && "cursor-not-allowed"
+                  currentUser.length === 0 && "cursor-not-allowed select-none"
                  )}
               >
                 <div className="relative outline-none flex-1">
@@ -260,34 +321,36 @@ export default function Settings() {
                     placeholder="Password"
                     className="outline-none"
                     defaultValue={accountPassword}
-                    onChange={(e) => setAccountPassword(e.target.value)}
-                    disabled={currentUser.username.length === 0}
+                    onChange={event => setAccountPassword(event.target.value)}
+                    disabled={currentUser.length === 0}
                     id="changePasswordInput"
                     hoverLabel={true}
                   />
                   <div
                     className={cn(
                       "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
-                      currentUser.username.length === 0 && "cursor-not-allowed"
+                      currentUser.length === 0 && "cursor-not-allowed select-none"
                     )}
                   >
                     {showAccountPassword ? (
                       <EyeOff
                         className="h-5 w-5"
+                        style={{ opacity: currentUser.length === 0 ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility("accountPassword")}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
+                        style={{ opacity: currentUser.length === 0 ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility("accountPassword")}
                       />
                     )}
                   </div>
                 </div>
-                <Button disabled={currentUser.username.length === 0} onClick={() => {
-                  setCurrentUser({username: currentUser.username, password: accountPassword});
+                <Button disabled={currentUser.length === 0} onClick={() => {
                   setShowAccountPassword(false);
-                  if (currentUser.password !== accountPassword) {
+                  if (getUser(currentUser)!.password !== accountPassword) {
+                    updateUser(currentUser, { password: accountPassword });
                     toast({
                       title: "Account Settings Updated",
                       description: "Your account settings have been updated.",
@@ -309,14 +372,14 @@ export default function Settings() {
           <AlertDialogHeader>
             <AlertDialogTitle>Change network settings?</AlertDialogTitle>
             <AlertDialogDescription>
-              This action will cause devices on the network to be disconnected. They will need to rejoin the network with the new ssid and/or password.
+              This action will cause devices on the network to be disconnected. They will need to rejoin the network with the new name and/or password.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="flex items-center space-x-2 mb-4">
             <Checkbox
               id="dontShowAgain"
               checked={dontShowAgain}
-              onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+              onCheckedChange={checked => setDontShowAgain(checked === true)}
             />
             <label
               htmlFor="dontShowAgain"
@@ -327,6 +390,7 @@ export default function Settings() {
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={() => {
+                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editNetwork: dontShowAgain}});
                 setHostedNetworkName(oldHostedNetworkName);
                 setHostedNetworkPassword(oldHostedNetworkName);
                 setHostedNetworkModalOpen(false);
@@ -337,12 +401,13 @@ export default function Settings() {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                setOldHostedNetworkName(hostedNetworkName);
-                setOldHostedNetworkPassword(hostedNetworkPassword);
-                await invoke("stop_hosted_network");
-                const success = await invoke("start_hosted_network", {ssid: hostedNetworkName, password: hostedNetworkPassword});
+                await stopHostedNetwork();
+                const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
+                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editNetwork: dontShowAgain}});
                 if (success) {
+                  setOldHostedNetworkName(hostedNetworkName);
+                  setOldHostedNetworkPassword(hostedNetworkPassword);
                   toast({
                     title: "Network Settings Update Success",
                     description: "The network settings have successfully been updated.",

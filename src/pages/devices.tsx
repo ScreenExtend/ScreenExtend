@@ -1,9 +1,16 @@
+import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { DeviceDetails } from "@/components/pages/device-details";
 import { buttonVariants } from "@/components/ui/button";
-import { Plus } from "lucide-react";
+import { Plus, Info } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Table,
   TableBody,
@@ -13,38 +20,40 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
+import { type Device } from "@/components/auth-provider";
+import { listen, emit } from "@tauri-apps/api/event";
 import { cn } from "@/lib/utils";
 
-const devices = Array(7)
-  .fill({})
-  .map((_, index) => ({
-    name: `Device ${index + 1}`,
-    ip: `192.168.${Math.floor(Math.random() * 255) + 1}.${Math.floor(Math.random() * 255) + 1}`,
-    os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][
-      Math.floor(Math.random() * 6)
-    ],
-    scale: Math.floor(Math.random() * 100) + 1,
-    orientation: Math.random() > 0.5 ? "Portrait" : "Landscape",
-    refreshRate: Math.floor(Math.random() * 100) + 1,
-    screenSize: "1080x1920",
-    isAudioActive: Math.random() > 0.5,
-    isVedioActive: Math.random() > 0.5,
-    isKeyboardActive: Math.random() > 0.5,
-    isMouseActive: Math.random() > 0.5,
-    isCameraActive: Math.random() > 0.5,
-    isMicrophoneActive: Math.random() > 0.5,
-    isClipboardActive: Math.random() > 0.5,
-  }));
-
-export type Device = (typeof devices)[0];
-
 export default function Devices() {
+  const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
+  const [devices, setDevices] = useState<Device[]>([]);
+
+  useEffect(() => {
+    const start_listener = async () => {
+      await listen("device_join", event => setDevices(prev => [...prev, event.payload as Device]));
+      await emit("device_ready");
+    }
+    void start_listener();
+  }, []);
+
   return (
     <Layout>
       <div className="p-8">
         <div className="mb-6">
-          <h2 className="text-2xl font-semibold">Connected Devices</h2>
-          <p className="text-gray-500">7 devices connected.</p>
+          <div className="flex items-center">
+            <h2 className="text-2xl font-semibold">Connected Devices</h2>
+            <TooltipProvider>
+              <Tooltip delayDuration={100} open={devicesTooltipOpen} onOpenChange={state => setDevicesTooltipOpen(state)}>
+                <TooltipTrigger asChild className="cursor-pointer top-1/2 ml-1.5" onClick={() => setDevicesTooltipOpen(true)}>
+                  <Info size={15} />
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>The arrangement of extended displays can be modified in your system's display settings.{"\u00a0"}</p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+          <p className="text-gray-500">{ devices.length } device{ devices.length !== 1 && "s" } connected</p>
         </div>
         <div>
           <Table>

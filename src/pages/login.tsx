@@ -20,7 +20,7 @@ export default function Login() {
             <span className="bg-background px-2 text-muted-foreground">Or</span>
           </div>
         </div>
-        <div className="flex justify-center">
+        <div className="justify-center">
           <GuestLoginModal />
         </div>
       </div>

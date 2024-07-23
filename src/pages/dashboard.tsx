@@ -16,35 +16,44 @@ import {
 } from "@/components/ui/carousel";
 
 import { writeText } from "@tauri-apps/api/clipboard";
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/tauri";
+import { appWindow } from "@tauri-apps/api/window";
+import { listen, emit } from "@tauri-apps/api/event";
 
 export default function Dashboard() {
   const [, forceUpdate] = useReducer(x => x + 1, 0);
   const [qrValues, setQrValues] = useState<{ title: string, value: string }[]>([
     {
-      title: "Same As Current Device",
+      title: "Local Hosted Network",
       value: "",
     },
     {
-      title: "Any Other Network",
-      value: "",
+      title: "Same As Current Device",
+      value: "d",
+    },
+    {
+      title: "Any Wifi Network",
+      value: "d",
     }
   ]);
 
   useEffect(() => {
-    async function fetchURLs() {
-      await listen("local_url", (event) => {
+    const fetchURLs = async () => {
+      await listen("hosted_url", (event) => {
         qrValues[0].value = event.payload as string;
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("global_url", (event) => {
+      await listen("local_url", (event) => {
         qrValues[1].value = event.payload as string;
         setQrValues(qrValues);
         forceUpdate();
       });
-      await invoke("fetch_urls");
+      await listen("global_url", (event) => {
+        qrValues[2].value = event.payload as string;
+        setQrValues(qrValues);
+        forceUpdate();
+      });
+      await emit("dashboard_ready");
     }
     void fetchURLs();
   }, []);
@@ -54,20 +63,24 @@ export default function Dashboard() {
       <div className="p-8">
         <h2 className="flex justify-center text-5xl font-semibold">What network is your device connected to?</h2>
       </div>
-      <div className="w-full overflow-hidden box-border">
-        <div className="px-10 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
-          {qrValues.length ? (
-            qrValues.map((qrValue) => (
-              <QrDisplay
-                name={qrValue.title}
-                url={qrValue.value}
-              />
-            ))
-          ) : (
-            <div className="h-[120%] lg:block text-slate-400">
-              Please join a network or create one through <Link to="/settings" className="underline">settings</Link>.
-            </div>
-          )}
+      <div className="w-full overflow-hidden box-border mb-10">
+        <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
+          {
+            qrValues.some(qr => qr.value.length > 0) ? (
+              qrValues.map((qrValue) => (
+                qrValue.value.length > 0 && (
+                  <QrDisplay
+                    name={qrValue.title}
+                    url={qrValue.value}
+                  />
+                )
+              ))
+            ) : (
+              <div className="h-[120%] lg:block text-slate-700 dark:text-slate-300 text-lg">
+                Please join a network or start a hosted network in <Link to="/settings" className="underline">settings</Link>.
+              </div>
+            )
+          }
         </div>
         {qrValues.length ? (
           <Carousel className="w-full max-w-xs lg:hidden mx-auto">
@@ -124,7 +137,7 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
         <QrModalComponent value={url} />
       </Card>
     </div>
-    );
+  );
 };
 
 function QrModalComponent({ value }: { value: string }) {
@@ -141,8 +154,8 @@ function QrModalComponent({ value }: { value: string }) {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    async function listenToWindowResize() {
-      unlisten = await listen<string>("tauri://resize", () => {
+    const listenToWindowResize = async () => {
+      unlisten = await appWindow.onResized(() => {
         const qrCode = document.getElementById("mainQRCode");
         if (qrCode) {
           qrCode.style.height = (window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";

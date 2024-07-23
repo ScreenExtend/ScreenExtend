@@ -1,8 +1,7 @@
-import React, { useState } from "react";
+import React, { useState, useContext } from "react";
 
 import { Slider } from "../ui/slider";
 import { Checkbox } from "../ui/checkbox";
-import { Device } from "@/pages/devices";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,12 +33,15 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
+import { AuthProviderContext, updateUser, getUser, type Device } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { useFormik } from "formik";
 
 export function DeviceDetails({ device }: { device: Device }) {
   const [open, setOpen] = useState(false);
   const [warningDialogOpen, setWarningDialogOpen] = useState(false);
+  const [dontShowAgain, setDontShowAgain] = useState(true);
+  const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
 
   const deviceDetails = useFormik({
@@ -61,17 +63,26 @@ export function DeviceDetails({ device }: { device: Device }) {
     if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
       setOpen(false);
     } else {
-      setWarningDialogOpen(true);
+      if (getUser(currentUser)!.dontShowAgain.editDevice) {
+        setOpen(false);
+      } else {
+        setWarningDialogOpen(true);
+      }
     }
   };
 
   const openChangeHandler = (open: boolean) => {
-    if (open) setOpen(open);
-    if (!open) {
+    if (open) {
+      setOpen(true);
+    } else {
       if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
-        setOpen(open);
+        setOpen(false);
       } else {
-        setWarningDialogOpen(true);
+        if (getUser(currentUser)!.dontShowAgain.editDevice) {
+          setOpen(false);
+        } else {
+          setWarningDialogOpen(true);
+        }
       }
     }
   };
@@ -85,9 +96,7 @@ export function DeviceDetails({ device }: { device: Device }) {
         className="min-w-[350px] overflow-y-auto"
         onInteractOutside={considerClosing}
         onEscapeKeyDown={considerClosing}
-        onOpenAutoFocus={(event) => {
-          event.preventDefault();
-        }}
+        trapFocus={true}
       >
         <SheetClose asChild />
         <SheetHeader>
@@ -142,7 +151,7 @@ export function DeviceDetails({ device }: { device: Device }) {
             <Input
               disabled={true}
               placeholder="00-B0-D0-63-C2-26"
-              name={device.os}
+              name="OS"
               value={deviceDetails.values.os}
               onChange={deviceDetails.handleChange}
               onBlur={deviceDetails.handleBlur}
@@ -204,69 +213,14 @@ export function DeviceDetails({ device }: { device: Device }) {
               onValueChange={(value) => {
                 deviceDetails.setFieldValue("refreshRate", value);
               }}
-              min={60}
-              max={360}
+              min={15}
+              max={500}
               step={1}
             />
           </div>
-          <div className="flex gap-4">
-            <CheckSelect
-              name="audio"
-              checked={deviceDetails.values.isAudioActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isAudioActive", checked);
-              }}
-            />
-            <CheckSelect
-              name="video"
-              checked={deviceDetails.values.isVedioActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isVedioActive", checked);
-              }}
-            />
-          </div>
-          <div className="flex gap-4">
-            <CheckSelect
-              name="camera"
-              checked={deviceDetails.values.isCameraActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isCameraActive", checked);
-              }}
-            />
-            <CheckSelect
-              name="microphone"
-              checked={deviceDetails.values.isMicrophoneActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isMicrophoneActive", checked);
-              }}
-            />
-          </div>
-          <div className="flex gap-4">
-            <CheckSelect
-              name="keyboard"
-              checked={deviceDetails.values.isKeyboardActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isKeyboardActive", checked);
-              }}
-            />
-            <CheckSelect
-              name="mouse"
-              checked={deviceDetails.values.isMouseActive}
-              onCheckedChange={(checked) => {
-                deviceDetails.setFieldValue("isMouseActive", checked);
-              }}
-            />
-          </div>
-          <CheckSelect
-            name="clipboard"
-            checked={deviceDetails.values.isClipboardActive}
-            onCheckedChange={(checked) => {
-              deviceDetails.setFieldValue("isClipboardActive", checked);
-            }}
-          />
         </div>
         <SheetFooter>
-          <div className="flex gap-4 w-full">
+          <div className="flex gap-4 w-full mt-3">
             <DeleteDevice
               onClick={() => {
                 toast({
@@ -287,40 +241,71 @@ export function DeviceDetails({ device }: { device: Device }) {
             </Button>
           </div>
         </SheetFooter>
-        <CloseConfirmationDialog
-          isOpen={warningDialogOpen}
-          isOpenHandler={setWarningDialogOpen}
-          acceptWarning={() => {
-            setWarningDialogOpen(false);
-            setOpen(false);
-            deviceDetails.resetForm();
-          }}
-          declineWarning={() => {
-            setWarningDialogOpen(false);
-          }}
-        />
       </SheetContent>
+      <AlertDialog open={warningDialogOpen} onOpenChange={setWarningDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Edit Device</AlertDialogTitle>
+            <AlertDialogDescription>
+              You have unsaved changes. Clicking continue will discard your edits.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="flex items-center space-x-2 mb-4">
+            <Checkbox
+              id="dontShowAgain"
+              checked={dontShowAgain}
+              onCheckedChange={checked => setDontShowAgain(checked === true)}
+            />
+            <label
+              htmlFor="dontShowAgain"
+              className="text-sm text-muted-foreground cursor-pointer"
+            >
+              Don't show this message again
+            </label>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => {
+                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editDevice: dontShowAgain}});
+                setWarningDialogOpen(false);
+              }}
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 hover:bg-red-700 text-white"
+              onClick={() => {
+                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editDevice: dontShowAgain}});
+                setWarningDialogOpen(false);
+                setOpen(false);
+                deviceDetails.resetForm();
+              }}
+            >
+              Continue
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Sheet>
   );
 }
 
-const CheckSelect = ({ name, checked, onCheckedChange }: { name: string, checked: boolean, onCheckedChange: (checked: boolean) => void }) => {
-  return (
-    <div className="flex items-center space-x-2 flex-1">
-      <Checkbox
-        id={name}
-        checked={checked}
-        onCheckedChange={onCheckedChange}
-      />
-      <Label
-        htmlFor={name}
-        className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 capitalize"
-      >
-        {name}
-      </Label>
-    </div>
-  );
-};
+//const CheckSelect = ({ name, checked, onCheckedChange }: { name: string, checked: boolean, onCheckedChange: (checked: boolean) => void }) => {
+//  return (
+//    <div className="flex items-center space-x-2 flex-1">
+//      <Checkbox
+//        id={name}
+//        checked={checked}
+//        onCheckedChange={onCheckedChange}
+//      />
+//      <Label
+//        htmlFor={name}
+//        className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:select-none peer-disabled:opacity-70 capitalize"
+//      >
+//        {name}
+//      </Label>
+//    </div>
+//  );
+//};
 
 export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
   const [dontShowAgain, setDontShowAgain] = useState(true);
@@ -343,49 +328,10 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="flex items-center space-x-2 mb-4">
-            <Checkbox
-                id="dontShowAgain"
-                checked={dontShowAgain}
-                onCheckedChange={(checked) => setDontShowAgain(checked === true)}
-            />
-            <label
-                htmlFor="dontShowAgain"
-                className="text-sm text-muted-foreground cursor-pointer"
-            >
-                Don't show this message again
-            </label>
-        </div>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            className="bg-red-600 hover:bg-red-700 text-white"
-            onClick={props.onClick}
-          >
-            Continue
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  );
-}
-
-function CloseConfirmationDialog({ isOpen, isOpenHandler, acceptWarning, declineWarning }: { isOpen: boolean, acceptWarning: () => void, declineWarning: () => void, isOpenHandler: (isOpen: boolean) => void }) {
-  const [dontShowAgain, setDontShowAgain] = useState(true);
-
-  return (
-    <AlertDialog open={isOpen} onOpenChange={isOpenHandler}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Edit Device</AlertDialogTitle>
-          <AlertDialogDescription>
-            You have unsaved changes. Clicking continue will discard your edits.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <div className="flex items-center space-x-2 mb-4">
           <Checkbox
             id="dontShowAgain"
             checked={dontShowAgain}
-            onCheckedChange={(checked) => setDontShowAgain(checked === true)}
+            onCheckedChange={checked => setDontShowAgain(checked === true)}
           />
           <label
             htmlFor="dontShowAgain"
@@ -395,10 +341,10 @@ function CloseConfirmationDialog({ isOpen, isOpenHandler, acceptWarning, decline
           </label>
         </div>
         <AlertDialogFooter>
-          <AlertDialogCancel onClick={declineWarning}>Cancel</AlertDialogCancel>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             className="bg-red-600 hover:bg-red-700 text-white"
-            onClick={acceptWarning}
+            onClick={props.onClick}
           >
             Continue
           </AlertDialogAction>
