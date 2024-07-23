@@ -1,8 +1,9 @@
 import { useContext } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { LogOut, Trash2 } from "lucide-react";
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { ReactSVG } from "react-svg";
+import { LogOut, Trash2, RotateCcw } from "lucide-react";
+import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,23 +25,37 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
+import { AuthProviderContext, updateUser, deleteUser } from "@/components/auth-provider";
+import { stopHostedNetwork, removeAllDisplays } from "@/lib/bindings";
 import { useTheme } from "@/components/theme-provider";
-import { AuthProviderContext } from "@/components/auth-provider";
+import { useToast } from "@/components/ui/use-toast";
+import { appWindow } from "@tauri-apps/api/window";
 import { cn } from "@/lib/utils";
-import defaultUser from "@/assets/default.jpg";
 
 export function ProfileMenu() {
   const { currentUser } = useContext(AuthProviderContext);
   const { setTheme } = useTheme();
+  const { dismiss } = useToast();
   const navigate = useNavigate();
+
+  void appWindow.onCloseRequested(async () => {
+    deleteUser("");
+    await stopHostedNetwork();
+    await removeAllDisplays();
+    window.otp = "";
+    window.hostedNetworkOn = false;
+    setTheme("system");
+    dismiss();
+    navigate("/");
+    window.close();
+  });
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Avatar className="cursor-pointer">
-          <AvatarImage src={defaultUser} alt="@shadcn" />
-          <AvatarFallback>User</AvatarFallback>
-        </Avatar>
+        <AvatarWrapper className="cursor-pointer">
+          <ReactSVG src="/src/assets/default.svg" />
+        </AvatarWrapper>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-56">
         <DropdownMenuLabel>My Account</DropdownMenuLabel>
@@ -48,9 +63,14 @@ export function ProfileMenu() {
         <DropdownMenuGroup>
           <DropdownMenuItem
             className="cursor-pointer"
-            onClick={() => {
+            onClick={async () => {
+              deleteUser("");
+              await stopHostedNetwork();
+              await removeAllDisplays();
+              window.otp = "";
+              window.hostedNetworkOn = false;
               setTheme("system");
-              Object.keys(localStorage).filter(x => x.startsWith("-")).forEach(x => localStorage.removeItem(x));
+              dismiss();
               navigate("/");
             }}
           >
@@ -60,13 +80,28 @@ export function ProfileMenu() {
           <DropdownMenuItem
             className={cn(
               "cursor-pointer",
-              currentUser.username.length === 0 && "cursor-not-allowed"
+              currentUser.length === 0 && "cursor-not-allowed select-none"
             )}
-            onClick={(event) => event.preventDefault()}
-            disabled={currentUser.username.length === 0}
+            onClick={() => {
+              if (currentUser.length !== 0) {
+                updateUser(currentUser, {dontShowAgain: {editDevice: false, removeDevice: false, editNetwork: false}});
+              }
+            }}
+            disabled={currentUser.length === 0}
+          >
+            <RotateCcw className="mr-2 h-4 w-4" />
+            <span>Reset Modal Preferences</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className={cn(
+              "cursor-pointer",
+              currentUser.length === 0 && "cursor-not-allowed select-none"
+            )}
+            onClick={event => event.preventDefault()}
+            disabled={currentUser.length === 0}
           >
             <Trash2 className="mr-2 h-4 w-4" />
-            <AlertDialog open={currentUser.username.length === 0 ? false : undefined}>
+            <AlertDialog open={currentUser.length === 0 ? false : undefined}>
               <AlertDialogTrigger asChild>
                 <span style={{ color: "red" }}><b>Delete Account</b></span>
               </AlertDialogTrigger>
@@ -81,8 +116,14 @@ export function ProfileMenu() {
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
                   <AlertDialogAction
                     className="bg-red-600 hover:bg-red-700 text-white"
-                    onClick={() => {
-                      Object.keys(localStorage).filter(x => x.startsWith(currentUser.username + "-")).forEach(x => localStorage.removeItem(x));
+                    onClick={async () => {
+                      deleteUser(currentUser);
+                      await stopHostedNetwork();
+                      await removeAllDisplays();
+                      window.otp = "";
+                      window.hostedNetworkOn = false;
+                      setTheme("system");
+                      dismiss();
                       navigate("/");
                     }}
                   >

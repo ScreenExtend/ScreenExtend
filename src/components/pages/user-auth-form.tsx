@@ -13,11 +13,13 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 
-import { AuthProviderContext } from "@/components/auth-provider";
-import { useTheme, Theme } from "@/components/theme-provider";
+import { AuthProviderContext, getUser, createUser } from "@/components/auth-provider";
+import { useTheme, type Theme } from "@/components/theme-provider";
 import { useForm } from "react-hook-form";
+import { setup } from "@/lib/bindings";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
+import { cn } from "@/lib/utils";
 
 const formSchema = z.object({
   username: z.string(),
@@ -39,17 +41,21 @@ export function UserAuthForm() {
   });
   const [showPassword, setShowPassword] = useState(false);
 
-  function onSubmit(values: z.infer<typeof formSchema>) {
+  const onSubmit = async (values: z.infer<typeof formSchema>) => {
     setError(false);
     if (values.username.length == 0) {
       document.getElementById("guestLogin")!.click();
     } else {
-      if (!Object.keys(localStorage).some(x => x.startsWith(values.username)) || localStorage.getItem(values.username + "-password") === values.password) {
-        setCurrentUser({username: values.username, password: values.password});
-        localStorage.setItem(values.username + "-username", values.username);
-        localStorage.setItem(values.username + "-password", values.password);
-        localStorage.setItem(values.username + "-theme", localStorage.getItem(values.username + "-theme") || theme);
-        setTheme((localStorage.getItem(values.username + "-theme") || theme) as Theme);
+      const user = getUser(values.username);
+      if (!user) {
+        createUser({username: values.username, password: values.password, theme});
+        setCurrentUser(values.username);
+        await setup();
+        navigate("/dashboard");
+      } else if (user.password === values.password) {
+        setCurrentUser(values.username);
+        setTheme(user.theme as Theme);
+        await setup();
         navigate("/dashboard");
       } else {
         setError(true);
@@ -87,11 +93,14 @@ export function UserAuthForm() {
             <FormItem className="space-y-0 text-left">
               <FormLabel>Password</FormLabel>
               <FormControl>
-                <div className="relative outline-none" style={{ marginBottom: "10px" }}>
+                <div className="relative outline-none" style={{ marginBottom: "20px" }}>
                   <Input
                     type={showPassword ? "text" : "password"}
                     placeholder="Password"
-                    className="outline-none"
+                    className={cn(
+                          "outline-none",
+                      error && "border-red-500 focus:ring-red-500"
+                    )}
                     autoComplete="off"
                     hoverLabel={false}
                     {...field}
@@ -100,18 +109,18 @@ export function UserAuthForm() {
                     {showPassword ? (
                       <EyeOff
                         className="h-5 w-5"
-                        onClick={() => setShowPassword((prev) => !prev)}
+                        onClick={() => setShowPassword(prev => !prev)}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
-                        onClick={() => setShowPassword((prev) => !prev)}
+                        onClick={() => setShowPassword(prev => !prev)}
                       />
                     )}
                   </div>
+                  <p style={{ display: (error ? "initial" : "none"), position: "absolute", marginTop: "3px" }} className="text-red-500 text-xs">Incorrect password</p>
                 </div>
               </FormControl>
-              <FormMessage style={{ display: (error ? "initial" : "none"), fontWeight: "bolder" }} className="text-red-500">Please enter the correct password.</FormMessage>
             </FormItem>
           )}
         />

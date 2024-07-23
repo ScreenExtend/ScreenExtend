@@ -35,20 +35,30 @@
         "icons/icon.ico"
       ]
     },
+    "cli": {
+      "subcommands": {
+        "hostednetwork": {
+          "args": [
+            {
+              "name": "ssid",
+              "index": 1,
+              "takesValue": true
+            },
+            {
+              "name": "password",
+              "index": 2,
+              "takesValue": true
+            }
+          ]
+        },
+        "installdrivers": {
+          "args": []
+        }
+      }
+    },
     "security": {
       "csp": null
     },
-    "windows": [
-      {
-        "label": "screenExtend",
-        "maximized": true,
-        "resizable": true,
-        "title": "Screen Extend",
-        "width": 1200,
-        "height": 675,
-        "minWidth": 1050,
-        "minHeight": 650
-      }
-    ]
+    "windows": []
   }
 }

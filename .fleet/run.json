@@ -1,0 +1,10 @@
+{
+    "configurations": [
+        {
+            "name": "Tauri Dev",
+            "type": "command",
+            "program": "C:\\Program Files\\nodejs\\pnpm.cmd",
+            "args": ["tauri", "dev"]
+        }
+    ]
+}
