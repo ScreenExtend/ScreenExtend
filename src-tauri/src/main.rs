@@ -6,8 +6,8 @@ use rand::Rng;
 use serde::Serialize;
 use specta::collect_types;
 use specta::Type;
-use std::path::Path;
 use std::process::Command as StdCommand;
+use tauri::api::process::Command as TauriCommand;
 use tauri::Manager;
 use tauri::Window;
 use tauri::WindowBuilder;
@@ -119,8 +119,6 @@ fn main() {
                                         _ => {}
                                     }
                                 }
-                                println!("{}", ssid);
-                                println!("{}", password);
                                 let mut set_cmd = StdCommand::new("netsh");
                                 set_cmd.args(&[
                                     "wlan",
@@ -135,49 +133,75 @@ fn main() {
                                 start_cmd.args(&["wlan", "start", "hostednetwork"]);
                                 let _ = start_cmd.output();
                                 app.app_handle().exit(0);
-                            } else {
-                                let exe_path = match std::env::current_exe() {
-                                    Ok(exe_path) => {
-                                        exe_path.into_os_string().into_string().unwrap()
-                                    }
-                                    _ => "".to_string(),
-                                };
-                                let exe_dir =
-                                    Path::new(&exe_path).parent().unwrap().to_str().unwrap();
-                                let mut remove_cmd =
-                                    StdCommand::new(exe_dir.to_string() + "nefconc.exe");
-                                remove_cmd.args(&[
-                                    "--remove-device-node",
-                                    "--hardware-id",
-                                    "Root\\VirtualDisplayDriver",
-                                    "--class-guid",
-                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                ]);
-                                let _ = remove_cmd.output();
-                                let mut create_cmd =
-                                    StdCommand::new(exe_dir.to_string() + "nefconc.exe");
-                                create_cmd.args(&[
-                                    "--create-device-node",
-                                    "--class-name",
-                                    "Display",
-                                    "--class-guid",
-                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                    "--hardware-id",
-                                    "Root\\VirtualDisplayDriver",
-                                ]);
-                                let _ = create_cmd.output();
-                                let mut install_cmd =
-                                    StdCommand::new(exe_dir.to_string() + "nefconc.exe");
-                                install_cmd.args(&[
-                                    "--install-driver",
-                                    "--inf-path",
-                                    app.path_resolver()
-                                        .resolve_resource("VirtualDisplayDriver.inf")
-                                        .unwrap()
-                                        .to_str()
-                                        .unwrap(),
-                                ]);
-                                let _ = install_cmd.output();
+                            } else if command.name == "installdrivers" {
+                                let cert_root_cmd = TauriCommand::new("certutil")
+                                    .current_dir(app.path_resolver().resource_dir().unwrap())
+                                    .args(&[
+                                        "-addstore",
+                                        "-f",
+                                        "root",
+                                        app.path_resolver()
+                                            .resolve_resource("ScreenExtend.cer")
+                                            .unwrap()
+                                            .to_str()
+                                            .unwrap(),
+                                    ]);
+                                let a = cert_root_cmd.output();
+                                println!("{:?}", a.unwrap().stdout);
+                                let cert_publisher_cmd = TauriCommand::new("certutil")
+                                    .current_dir(app.path_resolver().resource_dir().unwrap())
+                                    .args(&[
+                                        "-addstore",
+                                        "-f",
+                                        "TrustedPublisher",
+                                        app.path_resolver()
+                                            .resolve_resource("ScreenExtend.cer")
+                                            .unwrap()
+                                            .to_str()
+                                            .unwrap(),
+                                    ]);
+                                let b = cert_publisher_cmd.output();
+                                println!("{:?}", b.unwrap().stdout);
+                                let remove_cmd = TauriCommand::new_sidecar("nefconc")
+                                    .expect("Couldn't find nefconc")
+                                    .current_dir(app.path_resolver().resource_dir().unwrap())
+                                    .args(&[
+                                        "--remove-device-node",
+                                        "--hardware-id",
+                                        "Root\\VirtualDisplayDriver",
+                                        "--class-guid",
+                                        "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                    ]);
+                                let c = remove_cmd.output();
+                                println!("{:?}", c.unwrap().stdout);
+                                let create_cmd = TauriCommand::new_sidecar("nefconc")
+                                    .expect("Couldn't find nefconc")
+                                    .current_dir(app.path_resolver().resource_dir().unwrap())
+                                    .args(&[
+                                        "--create-device-node",
+                                        "--class-name",
+                                        "Display",
+                                        "--class-guid",
+                                        "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                        "--hardware-id",
+                                        "Root\\VirtualDisplayDriver",
+                                    ]);
+                                let d = create_cmd.output();
+                                println!("{:?}", d.unwrap().stdout);
+                                let install_cmd = TauriCommand::new_sidecar("nefconc")
+                                    .expect("Couldn't find nefconc")
+                                    .current_dir(app.path_resolver().resource_dir().unwrap())
+                                    .args(&[
+                                        "--install-driver",
+                                        "--inf-path",
+                                        app.path_resolver()
+                                            .resolve_resource("VirtualDisplayDriver.inf")
+                                            .unwrap()
+                                            .to_str()
+                                            .unwrap(),
+                                    ]);
+                                let e = install_cmd.output();
+                                println!("{:?}", e.unwrap().stdout);
                                 app.app_handle().exit(0);
                             }
                         }

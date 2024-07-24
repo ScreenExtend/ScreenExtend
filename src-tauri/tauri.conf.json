@@ -6,15 +6,36 @@
     "distDir": "../dist"
   },
   "package": {
-    "productName": "Screen Extend",
+    "productName": "ScreenExtend",
     "version": "1.0.0"
   },
   "tauri": {
     "allowlist": {
       "all": false,
       "shell": {
-        "all": false,
-        "open": true
+        "all": true,
+        "scope": [
+          {
+            "name": "nefconc",
+            "sidecar": true,
+            "args": true
+          },
+          {
+            "name": "certutil",
+            "cmd": "certutil",
+            "args": true
+          },
+          {
+            "name": "screenextend",
+            "cmd": "screenextend",
+            "args": true
+          },
+          {
+            "name": "netsh",
+            "cmd": "netsh",
+            "args": true
+          }
+        ]
       },
       "clipboard": {
         "all": false,
@@ -33,6 +54,15 @@
         "icons/128x128.png",
         "icons/128x128@2x.png",
         "icons/icon.ico"
+      ],
+      "externalBin": [
+        "nefconc"
+      ],
+      "resources": [
+        "VirtualDisplayDriver.dll",
+        "VirtualDisplayDriver.cat",
+        "VirtualDisplayDriver.inf",
+        "ScreenExtend.cer"
       ]
     },
     "cli": {
