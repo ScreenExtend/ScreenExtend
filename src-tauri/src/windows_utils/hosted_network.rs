@@ -4,6 +4,7 @@ use std::process::Command as StdCommand;
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use tauri::api::process::Command as TauriCommand;
 use tauri::State;
 use windows::core::{Result, HSTRING};
 use windows::Devices::WiFiDirect::{
@@ -115,18 +116,18 @@ fn start_legacy_hosted_network_(name: &str, password: &str) -> bool {
 }
 
 fn stop_legacy_hosted_network_() -> bool {
-    StdCommand::new("netsh")
+    TauriCommand::new("netsh")
         .args(&["wlan", "stop", "hostednetwork"])
         .status()
         .map_or(false, |status| status.success())
 }
 
 fn is_legacy_hosted_network_() -> bool {
-    StdCommand::new("netsh")
+    TauriCommand::new("netsh")
         .args(&["wlan", "show", "hostednetwork"])
         .output()
         .map_or(false, |output| {
-            let output_str = String::from_utf8_lossy(&output.stdout);
+            let output_str = output.stdout;
             output_str.contains("Status")
                 && output_str
                     .split("Status")
@@ -135,11 +136,11 @@ fn is_legacy_hosted_network_() -> bool {
 }
 
 fn supports_legacy_hosted_network_() -> bool {
-    StdCommand::new("netsh")
+    TauriCommand::new("netsh")
         .args(&["wlan", "show", "drivers"])
         .output()
         .map_or(false, |output| {
-            let output_str = String::from_utf8_lossy(&output.stdout);
+            let output_str = output.stdout;
             output_str.contains("Hosted network supported")
                 && output_str
                     .split("Hosted network supported")

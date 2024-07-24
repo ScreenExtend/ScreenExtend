@@ -50,8 +50,10 @@ Fixes:
 - Install drivers dialog
 - Only push main.rs after checking
 - For client - dialog page from modal example, otp input, full screen webrtc on interaction (https://github.com/redpangilinan/credenza.git)
+- Disable buttons on modal until action is done
 
 Release Actions:
+- Remove ts::export on build
 - Tauri config
 - Github action tauri automatic build
 - Spell check all text
@@ -79,6 +81,7 @@ Future Fixes:
 - Bluetooth support
 - Audio support
 - Standardize async mutex support
+- Remote diagnostics
 - Auto updates
 - Walkthrough app with Joyride:
 import Joyride from "react-joyride";

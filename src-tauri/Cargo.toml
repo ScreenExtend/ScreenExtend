@@ -18,7 +18,7 @@ documentation = "https://screen-extend.tech/docs/"
 tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
-tauri = { version = "1.5", features = [ "cli", "clipboard-write-text", "shell-open" ] }
+tauri = { version = "1.5", features = [ "shell-all", "cli", "clipboard-write-text", "process-command-api" ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 local-ip-address = "0.5.7"
