@@ -6,11 +6,10 @@ import {
   createRoutesFromElements,
 } from "react-router-dom";
 
-import Login from "./pages/login";
-import Dashboard from "./pages/dashboard";
-import Settings from "./pages/settings";
-import Devices from "./pages/devices";
-import Terms from "./pages/terms";
+import Login from "@/pages/login";
+import Dashboard from "@/pages/dashboard";
+import Settings from "@/pages/settings";
+import Devices from "@/pages/devices";
 
 import { AuthProviderContext } from "@/components/auth-provider";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -23,7 +22,6 @@ const router = createMemoryRouter(
       <Route path="/dashboard" element={<Dashboard />} />
       <Route path="/devices" element={<Devices />} />
       <Route path="/settings" element={<Settings />} />
-      <Route path="/terms" element={<Terms />} />
     </>
   )
 );
@@ -44,36 +42,42 @@ export default App;
 
 
 /*
-Fixes:
-- Add option to disable public screenextend.app sessions
-- Rate limit server (password)
-- Install drivers dialog
-- Only push main.rs after checking
-- For client - dialog page from modal example, otp input, full screen webrtc on interaction (https://github.com/redpangilinan/credenza.git)
-- Disable buttons on modal until action is done
-
-Release Actions:
-- Remove ts::export on build
-- Tauri config
-- Github action tauri automatic build
-- Spell check all text
-- Copyright at the top of each file (or license)
-- Cite tauri and other libraries used + terms and conditions
-- Post install script for drivers
-- Run SourceGraph - compare code against public repos and check
-- Run GitGaurdian - ensure no api keys or other private information is being pushed
-
-Website Fixes:
-- Meta tag info for SEO
-- Help guide
-- Logo with name
+Tasks:
+- Build up app/social media
+  - Ask the airdrop guy
+- Build website
+  - Rate limit client after 5 tries
+  - For client - dialog page from modal example, otp input, full screen webrtc on interaction (https://github.com/redpangilinan/credenza.git)
+  - Number input for OTP on iOS
+  - Disable buttons on modal until action is done
+  - Meta tag info for SEO
+- Push code
+  - Move as much code out of main.rs as possible
+  - Describe LICENSE
+  - Write README
+    - Future changelog
+  - Spell check all text
+  - Add Copyright at top of each file
+  - Run SourceGraph - compare code against public repos and check
+  - Run GitGaurdian - ensure no api keys or other private information is being pushed
+- Release Build
+  - Remove ts::export on build and remove command line for non-windows
+  - Optimize dependencies and Tauri config
+  - Use Github action tauri automatic build
+- Main app
+  - Uninstall script
+  - WebRTC + website server
+  - Edit device
+  - Other platform implementations
 
 Future Fixes:
+- GPU video encoding support
+- Add option to disable public screenextend.app sessions
 - Better storage instead of just local storage
 - Home screen graphic
 - Actual system notifications if window isn't focussed
 - Export/import user data
-- Only one instance running
+- Only one instance running IMPORTANT
 - Ban device by browser/IP
 - Resizable side bar
 - HDR Support: https://github.com/itsmikethetech/Virtual-Display-Driver, BetterDisplay
@@ -92,11 +96,6 @@ scrollToFirstStep
 showProgress
 showSkipButton
 
-Ffmpeg Usage:
-const command = Command.sidecar("ffmpeg", ["-h"]);
-const output = await command.execute();
-await writeText(output.stdout);
-
 Get Theme Without State:
 window.document.documentElement.classList.toString()
 
@@ -104,7 +103,6 @@ Library Order:
 react
 react-router-dom
 cn
-./ ui elements
 @ ui elements
 any ui element
 contexts/etc

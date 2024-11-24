@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, updateUser, getUser, type Device } from "@/components/auth-provider";
+import { emit } from "@tauri-apps/api/event";
 import { useToast } from "@/components/ui/use-toast";
 import { useFormik } from "formik";
 
@@ -41,6 +42,7 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [open, setOpen] = useState(false);
   const [warningDialogOpen, setWarningDialogOpen] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
+  const [inProgress, setInProgress] = useState(false);
   const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
 
@@ -48,13 +50,18 @@ export function DeviceDetails({ device }: { device: Device }) {
     initialValues: {
       ...device,
     },
-    onSubmit: (values) => {
+    onSubmit: async (values) => {
+      setInProgress(true);
+      console.log("UPDATE:");
+      console.log(values);
+      await new Promise(r => setTimeout(r, 2000));
+      await emit("device_modify", deviceDetails.values);
+      setInProgress(false);
       toast({
         title: "Device Settings Updated",
         description: "Your device settings have been updated.",
       });
       setOpen(false);
-      void values;
     },
   });
 
@@ -113,6 +120,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 onChange={deviceDetails.handleChange}
                 onBlur={deviceDetails.handleBlur}
                 hoverLabel={false}
+                disabled={inProgress}
               />
             </div>
             <div className="flex-1">
@@ -123,6 +131,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 onValueChange={(value) => {
                   deviceDetails.setFieldValue("orientation", value);
                 }}
+                disabled={inProgress}
               >
                 <SelectTrigger className="w-full border-2">
                   <SelectValue placeholder="Orientation" />
@@ -182,6 +191,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               min={25}
               max={200}
               step={25}
+              disabled={inProgress}
             />
           </div>
           <div>
@@ -203,6 +213,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                   }}
                   className="w-10 px-1 text-center"
                   hoverLabel={false}
+                  disabled={inProgress}
                 />{" "}
                 Hz
               </div>
@@ -216,19 +227,27 @@ export function DeviceDetails({ device }: { device: Device }) {
               min={15}
               max={500}
               step={1}
+              disabled={inProgress}
             />
           </div>
         </div>
         <SheetFooter>
           <div className="flex gap-4 w-full mt-3">
             <DeleteDevice
-              onClick={() => {
+              onClick={async () => {
+                setInProgress(true);
+                console.log("REMOVE:");
+                console.log(deviceDetails.values);
+                await new Promise(r => setTimeout(r, 2000));
+                await emit("device_remove", deviceDetails.values);
+                setInProgress(false);
                 toast({
-                  title: "Device removed",
-                  description: "Your device has been removed from the list.",
+                  title: "Device Removed",
+                  description: "Your device has been removed.",
                 });
                 setOpen(false);
               }}
+              disabled={inProgress}
             />
             <Button
               className="flex-1 text-white"
@@ -236,6 +255,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               onClick={() => {
                 deviceDetails.handleSubmit();
               }}
+              disabled={inProgress}
             >
               Save changes
             </Button>
@@ -316,6 +336,7 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
         <Button
           className="flex-1 bg-red-600 hover:bg-red-700 text-white"
           variant="outline"
+          disabled={props.disabled}
         >
           Remove Device
         </Button>

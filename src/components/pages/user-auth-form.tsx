@@ -1,7 +1,7 @@
 import { useState, useContext } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { Input } from "../ui/input";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Eye, EyeOff } from "lucide-react";
 import {
@@ -12,11 +12,21 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, getUser, createUser } from "@/components/auth-provider";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { useForm } from "react-hook-form";
-import { setup } from "@/lib/bindings";
+import { setup, installDrivers } from "@/lib/bindings";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { cn } from "@/lib/utils";
@@ -31,6 +41,8 @@ export function UserAuthForm() {
   const navigate = useNavigate();
 
   const [error, setError] = useState(false);
+  const [setupError, setSetupError] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -43,20 +55,28 @@ export function UserAuthForm() {
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
     setError(false);
-    if (values.username.length == 0) {
+    if (values.username.length === 0) {
       document.getElementById("guestLogin")!.click();
     } else {
       const user = getUser(values.username);
       if (!user) {
         createUser({username: values.username, password: values.password, theme});
         setCurrentUser(values.username);
-        await setup();
-        navigate("/dashboard");
+        const success = await setup();
+        if (success) {
+          navigate("/dashboard");
+        } else {
+          setSetupError(true);
+        }
       } else if (user.password === values.password) {
         setCurrentUser(values.username);
         setTheme(user.theme as Theme);
-        await setup();
-        navigate("/dashboard");
+        const success = await setup();
+        if (success) {
+          navigate("/dashboard");
+        } else {
+          setSetupError(true);
+        }
       } else {
         setError(true);
       }
@@ -128,6 +148,31 @@ export function UserAuthForm() {
           Submit
         </Button>
       </form>
+      <AlertDialog open={setupError}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Driver Setup Error</AlertDialogTitle>
+            <AlertDialogDescription>
+              There was an error while attepting to intialize drivers. This often occurs due to the drivers not being installed. <b>Click the button below to install the necessary drivers and certificates.</b> If this error is recurring, contact support at <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>support@screenextend.app</a>.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={loading} onClick={() => setSetupError(false)}>Go Back</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white"
+              onClick={async () => {
+                setLoading(true);
+                await installDrivers();
+                setLoading(false);
+                setSetupError(false);
+              }}
+              disabled={loading}
+            >
+              Install Drivers
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Form>
   );
 }

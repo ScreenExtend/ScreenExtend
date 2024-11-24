@@ -28,11 +28,11 @@ export default function Dashboard() {
     },
     {
       title: "Same As Current Device",
-      value: "d",
+      value: "http://192.137.12.1:5000/session/sjahsebs",
     },
     {
       title: "Any Wifi Network",
-      value: "d",
+      value: "http://screenextend.app/session/sjahsebs",
     }
   ]);
 

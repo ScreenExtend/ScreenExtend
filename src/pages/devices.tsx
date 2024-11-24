@@ -31,6 +31,8 @@ export default function Devices() {
   useEffect(() => {
     const start_listener = async () => {
       await listen("device_join", event => setDevices(prev => [...prev, event.payload as Device]));
+      await listen("device_modify", event => setDevices(prev => prev.map(device => device.ip === (event.payload as Device).ip ? (event.payload as Device) : device)));
+      await listen("device_remove", event => setDevices(prev => prev.filter(device => device.ip !== (event.payload as Device).ip)));
       await emit("device_ready");
     }
     void start_listener();

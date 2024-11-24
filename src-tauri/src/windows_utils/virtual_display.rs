@@ -29,15 +29,16 @@ pub fn install_drivers() -> bool {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayConfig) -> Result<bool, ()> {
+pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayConfig) -> Result<i32, ()> {
     let mut client = state.driver_client.lock().await;
+    let id = client.new_id(None).unwrap();
     let mode = Mode {
         width: config.width,
         height: config.height,
         refresh_rates: vec![config.refresh_rate],
     };
     let new_monitor = Monitor {
-        id: client.new_id(None).unwrap(),
+        id,
         enabled: true,
         name: Some(config.name),
         modes: vec![mode],
@@ -45,11 +46,11 @@ pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayCo
     match client.add(new_monitor) {
         Ok(()) => {
             match client.notify().await {
-                Ok(()) => Ok(true),
-                Err(_) => Ok(false)
+                Ok(()) => Ok(id as i32),
+                Err(_) => Ok(-1)
             }
         },
-        Err(_) => Ok(false)
+        Err(_) => Ok(-1)
     }
 }
 
