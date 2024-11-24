@@ -1,8 +1,8 @@
-import { useContext } from "react";
+import { useContext, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { ReactSVG } from "react-svg";
-import { LogOut, Trash2, RotateCcw } from "lucide-react";
+import { LogOut, Trash2, RotateCcw, Loader2 } from "lucide-react";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import {
   DropdownMenu,
@@ -30,31 +30,39 @@ import { stopHostedNetwork, removeAllDisplays } from "@/lib/bindings";
 import { useTheme } from "@/components/theme-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { appWindow } from "@tauri-apps/api/window";
+import defaultLogo from "@/assets/default.svg";
 import { cn } from "@/lib/utils";
 
 export function ProfileMenu() {
   const { currentUser } = useContext(AuthProviderContext);
+  const [closing, setClosing] = useState(false);
   const { setTheme } = useTheme();
   const { dismiss } = useToast();
   const navigate = useNavigate();
 
   void appWindow.onCloseRequested(async () => {
-    deleteUser("");
+    setClosing(true);
     await stopHostedNetwork();
     await removeAllDisplays();
     window.otp = "";
     window.hostedNetworkOn = false;
-    setTheme("system");
+    deleteUser("");
     dismiss();
-    navigate("/");
+    setTheme("system");
     window.close();
   });
 
   return (
     <DropdownMenu>
+      <div className="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 9999 }}>
+        <div className="rounded-lg p-6 flex flex-col items-center">
+          <Loader2 className="animate-spin text-white mb-4" size={48} />
+          <p className="text-xl font-semibold text-white">Closing</p>
+        </div>
+      </div>
       <DropdownMenuTrigger asChild>
         <AvatarWrapper className="cursor-pointer">
-          <ReactSVG src="/src/assets/default.svg" />
+          <ReactSVG src={defaultLogo} />
         </AvatarWrapper>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-56">

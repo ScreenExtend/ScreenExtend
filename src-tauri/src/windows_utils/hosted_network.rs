@@ -14,7 +14,7 @@ use windows::Devices::WiFiDirect::{
 use windows::Foundation::TypedEventHandler;
 use windows::Security::Credentials::PasswordCredential;
 
-fn start(
+fn start_wifi_direct_(
     name: &str,
     password: &str,
     success_tx: Sender<bool>,
@@ -61,80 +61,6 @@ fn start(
     Ok(publisher)
 }
 
-fn start_hosted_network_(state: State<'_, AppState>, name: &str, password: &str) -> bool {
-    let (success_tx, success_rx) = channel::<bool>();
-    let publisher = match start(name, password, success_tx.clone()) {
-        Ok(publisher) => publisher,
-        Err(_err) => return false,
-    };
-    let wlan_hosted_network_helper = Arc::new(Mutex::new(publisher));
-    let mut stop_func = state.stop_hosted_network.lock().unwrap();
-    *stop_func = Some(Box::new(move || {
-        let publisher = wlan_hosted_network_helper.lock().unwrap();
-        match publisher.Status() {
-            Ok(status) => {
-                if status == WiFiDirectAdvertisementPublisherStatus::Started {
-                    match publisher.Stop() {
-                        _ => (),
-                    }
-                }
-            }
-            _ => (),
-        };
-    }));
-    success_rx.recv().unwrap()
-}
-
-fn is_hosted_network_(state: State<'_, AppState>) -> bool {
-    if let Some(ref _stop_func) = *state.stop_hosted_network.lock().unwrap() {
-        true
-    } else {
-        false
-    }
-}
-
-fn stop_hosted_network_(state: State<'_, AppState>) -> bool {
-    if let Some(ref stop_func) = *state.stop_hosted_network.lock().unwrap() {
-        stop_func();
-        true
-    } else {
-        false
-    }
-}
-
-fn start_legacy_hosted_network_(name: &str, password: &str) -> bool {
-    let exe_path = match std::env::current_exe() {
-        Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
-        _ => "".to_string(),
-    };
-    let mut cmd = StdCommand::new(exe_path);
-    cmd.arg("hostednetwork");
-    cmd.arg(name);
-    cmd.arg(password);
-    let _ = Command::new(cmd).output();
-    true
-}
-
-fn stop_legacy_hosted_network_() -> bool {
-    TauriCommand::new("netsh")
-        .args(&["wlan", "stop", "hostednetwork"])
-        .status()
-        .map_or(false, |status| status.success())
-}
-
-fn is_legacy_hosted_network_() -> bool {
-    TauriCommand::new("netsh")
-        .args(&["wlan", "show", "hostednetwork"])
-        .output()
-        .map_or(false, |output| {
-            let output_str = output.stdout;
-            output_str.contains("Status")
-                && output_str
-                    .split("Status")
-                    .any(|s| s.trim().starts_with(": Started"))
-        })
-}
-
 fn supports_legacy_hosted_network_() -> bool {
     TauriCommand::new("netsh")
         .args(&["wlan", "show", "drivers"])
@@ -153,20 +79,44 @@ fn supports_legacy_hosted_network_() -> bool {
 pub fn start_hosted_network(state: State<'_, AppState>, name: &str, password: &str) -> bool {
     let use_legacy = supports_legacy_hosted_network_();
     if use_legacy {
-        start_legacy_hosted_network_(name, password)
+        let exe_path = match std::env::current_exe() {
+            Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
+            _ => "".to_string(),
+        };
+        let mut cmd = StdCommand::new(exe_path);
+        cmd.arg("hostednetwork");
+        cmd.arg(name);
+        cmd.arg(password);
+        let _ = Command::new(cmd).output();
+        TauriCommand::new("netsh")
+            .args(&["wlan", "show", "hostednetwork"])
+            .output()
+            .map_or(false, |output| {
+                let output_str = output.stdout;
+                output_str.contains("Status") && output_str.split("Status").any(|s| s.trim().starts_with(": Started"))
+            })
     } else {
-        start_hosted_network_(state, name, password)
-    }
-}
-
-#[tauri::command]
-#[specta::specta]
-pub fn is_hosted_network(state: State<'_, AppState>) -> bool {
-    let use_legacy = supports_legacy_hosted_network_();
-    if use_legacy {
-        is_legacy_hosted_network_()
-    } else {
-        is_hosted_network_(state)
+        let (success_tx, success_rx) = channel::<bool>();
+        let publisher = match start_wifi_direct_(name, password, success_tx.clone()) {
+            Ok(publisher) => publisher,
+            Err(_err) => return false,
+        };
+        let wlan_hosted_network_helper = Arc::new(Mutex::new(publisher));
+        let mut stop_func = state.stop_hosted_network.lock().unwrap();
+        *stop_func = Some(Box::new(move || {
+            let publisher = wlan_hosted_network_helper.lock().unwrap();
+            match publisher.Status() {
+                Ok(status) => {
+                    if status == WiFiDirectAdvertisementPublisherStatus::Started {
+                        match publisher.Stop() {
+                            _ => (),
+                        }
+                    }
+                }
+                _ => (),
+            };
+        }));
+        success_rx.recv().unwrap()
     }
 }
 
@@ -175,8 +125,16 @@ pub fn is_hosted_network(state: State<'_, AppState>) -> bool {
 pub fn stop_hosted_network(state: State<'_, AppState>) -> bool {
     let use_legacy = supports_legacy_hosted_network_();
     if use_legacy {
-        stop_legacy_hosted_network_()
+        TauriCommand::new("netsh")
+            .args(&["wlan", "stop", "hostednetwork"])
+            .status()
+            .map_or(false, |status| status.success())
     } else {
-        stop_hosted_network_(state)
+        if let Some(ref stop_func) = *state.stop_hosted_network.lock().unwrap() {
+            stop_func();
+            true
+        } else {
+            false
+        }
     }
 }

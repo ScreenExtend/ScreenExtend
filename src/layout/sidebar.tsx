@@ -5,8 +5,7 @@ import {
   ChevronLeft,
   UserRoundPlus,
   MonitorSmartphone,
-  Settings,
-  // Info
+  Settings
 } from "lucide-react";
 
 export function Sidebar() {
@@ -62,12 +61,6 @@ export function Sidebar() {
             </Link>
           </div>
         </div>
-        {/*<div className="flex items-center justify-center gap-1 py-4">*/}
-        {/*  <Info size={15} />*/}
-        {/*  <Link to="/terms" className="underline">*/}
-        {/*    Terms and Conditions*/}
-        {/*  </Link>*/}
-        {/*</div>*/}
       </div>
     </div>
   );

@@ -80,41 +80,16 @@ fn main() {
                 Ok(matches) => {
                     match matches.subcommand {
                         Some(command) => {
-                            // let mut program = String::new();
-                            // let mut args = Vec::new();
-                            // for (key, arg_data) in &command.matches.args {
-                            //     match key.as_str() {
-                            //         "exe" => {
-                            //             program = global_utils::trim_string(arg_data.value.to_string());
-                            //         },
-                            //         "arg" => {
-                            //             if let Some(arg_array) = arg_data.value.as_array() {
-                            //                 for arg in arg_array {
-                            //                     args.push(global_utils::trim_string(arg.to_string()));
-                            //                 }
-                            //             }
-                            //         },
-                            //         _ => {}
-                            //     }
-                            // }
-                            // let mut cmd = StdCommand::new(program);
-                            // cmd.args(args);
-                            // let _ = cmd.output();
-                            // app.app_handle().exit(0);
                             if command.name == "hostednetwork" {
                                 let mut ssid = String::new();
                                 let mut password = String::new();
                                 for (key, arg_data) in &command.matches.args {
                                     match key.as_str() {
                                         "ssid" => {
-                                            ssid = global_utils::trim_string(
-                                                arg_data.value.to_string(),
-                                            );
+                                            ssid = arg_data.value.as_str().map(|s| s.to_string()).expect("No password");
                                         }
                                         "password" => {
-                                            password = global_utils::trim_string(
-                                                arg_data.value.to_string(),
-                                            );
+                                            password = arg_data.value.as_str().map(|s| s.to_string()).expect("No password");
                                         }
                                         _ => {}
                                     }
@@ -213,7 +188,6 @@ fn main() {
                                     get_devices,
                                     global_utils::get_private_ip_addresses,
                                     hosted_network::start_hosted_network,
-                                    hosted_network::is_hosted_network,
                                     hosted_network::stop_hosted_network,
                                     virtual_display::install_drivers,
                                     virtual_display::create_display,
@@ -248,7 +222,6 @@ fn main() {
             get_devices,
             global_utils::get_private_ip_addresses,
             hosted_network::start_hosted_network,
-            hosted_network::is_hosted_network,
             hosted_network::stop_hosted_network,
             virtual_display::install_drivers,
             virtual_display::create_display,

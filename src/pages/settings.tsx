@@ -49,7 +49,7 @@ export default function Settings() {
   const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp) ? window.otp : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
   const [spin, setSpin] = useState(false);
 
-  const [hostedNetworkOn, setHostedNetworkOn] = useState(window.hostedNetworkOn);
+  const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState(user.hostedNetworkCredentials.name);
   const [hostedNetworkPassword, setHostedNetworkPassword] = useState(user.hostedNetworkCredentials.password);
@@ -99,6 +99,10 @@ export default function Settings() {
       return false;
     }
   }
+
+  useEffect(() => {
+    setHostedNetworkOn(window.hostedNetworkOn);
+  }, []);
 
   useEffect(() => {
     if (spin) {

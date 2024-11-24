@@ -22,13 +22,3 @@ pub fn get_private_ip_addresses() -> Vec<String> {
     }
     private_ips
 }
-
-pub fn trim_string(mut value: String) -> String {
-    if !value.is_empty() {
-        value.pop();
-    }
-    if value.len() > 1 {
-        value.remove(0);
-    }
-    value
-}

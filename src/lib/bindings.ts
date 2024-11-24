@@ -30,10 +30,6 @@ export function startHostedNetwork(name: string, password: string) {
     return invoke()<boolean>("start_hosted_network", { name,password })
 }
 
-export function isHostedNetwork() {
-    return invoke()<boolean>("is_hosted_network")
-}
-
 export function stopHostedNetwork() {
     return invoke()<boolean>("stop_hosted_network")
 }
@@ -43,7 +39,7 @@ export function installDrivers() {
 }
 
 export function createDisplay(config: VirtualDisplayConfig) {
-    return invoke()<boolean>("create_display", { config })
+    return invoke()<number>("create_display", { config })
 }
 
 export function updateDisplay(displayId: number, config: VirtualDisplayConfig) {

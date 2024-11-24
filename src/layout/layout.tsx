@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useContext } from "react";
 
-import { Sidebar } from "./sidebar";
+import { Sidebar } from "@/layout/sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
 import { ProfileMenu } from "@/components/profile-menu";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
