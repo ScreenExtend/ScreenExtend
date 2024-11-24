@@ -59,7 +59,7 @@ export function DeviceDetails({ device }: { device: Device }) {
       setInProgress(false);
       toast({
         title: "Device Settings Updated",
-        description: "Your device settings have been updated.",
+        description: "Your device settings have successfully been updated.",
       });
       setOpen(false);
     },
@@ -243,7 +243,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 setInProgress(false);
                 toast({
                   title: "Device Removed",
-                  description: "Your device has been removed.",
+                  description: "Your device has been successfully removed.",
                 });
                 setOpen(false);
               }}

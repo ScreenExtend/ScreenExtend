@@ -65,10 +65,26 @@ Tasks:
   - Optimize dependencies and Tauri config
   - Use Github action tauri automatic build
 - Main app
-  - Uninstall script
-  - WebRTC + website server
   - Edit device
+  - WebRTC + website server
   - Other platform implementations
+
+device:
+setup()
+startHostedNetwork(name: string, password: string)
+stopHostedNetwork()
+installDrivers()
+createDisplay(config: VirtualDisplayConfig)
+updateDisplay(displayId: number, config: VirtualDisplayConfig)
+removeDisplay(displayId: number)
+removeAllDisplays()
+
+global:
+getPrivateIpAddresses()
+
+testing:
+fetchUrls()
+getDevices()
 
 Future Fixes:
 - GPU video encoding support
@@ -78,6 +94,7 @@ Future Fixes:
 - Actual system notifications if window isn't focussed
 - Export/import user data
 - Only one instance running IMPORTANT
+- Uninstall script drivers IMPORTANT
 - Ban device by browser/IP
 - Resizable side bar
 - HDR Support: https://github.com/itsmikethetech/Virtual-Display-Driver, BetterDisplay

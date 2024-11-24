@@ -1,15 +1,21 @@
-//pub mod hosted_network;
-//
-//use std::process::Command;
-//
-//fn command_exists(cmd: &str) -> bool {
-//    Command::new("which")
-//        .arg(cmd)
-//        .output()
-//        .map(|output| output.status.success())
-//        .unwrap_or(false)
-//}
-//
-//pub async fn setup() -> bool {
-//    command_exists("nmcli")
-//}
+pub mod hosted_network;
+pub mod virtual_display;
+
+use std::process::Command;
+
+pub struct AppState {
+}
+
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn setup(app_handle: tauri::AppHandle) -> bool {
+    command_exists("nmcli")
+}
