@@ -79,6 +79,8 @@ updateDisplay(displayId: number, config: VirtualDisplayConfig)
 removeDisplay(displayId: number)
 removeAllDisplays()
 
+type VirtualDisplayConfig = { name: string; width: number; height: number; refresh_rate: number }
+
 global:
 getPrivateIpAddresses()
 

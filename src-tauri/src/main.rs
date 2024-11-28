@@ -28,12 +28,12 @@ mod linux_utils;
 #[cfg(target_os = "linux")]
 use linux_utils::*;
 
-#[tauri::command]
-#[specta::specta]
-fn fetch_urls(window: Window) {
-    let _ = window.emit("local_url", "https://192.168.88.1:8000/");
-    let _ = window.emit("global_url", "https://screenextend.app/session/abcdefgh");
-}
+//#[tauri::command]
+//#[specta::specta]
+//fn fetch_urls(window: Window) {
+//    let _ = window.emit("local_url", "https://192.168.88.1:8000/");
+//    let _ = window.emit("global_url", "https://screenextend.app/session/abcdefgh");
+//}
 
 #[derive(Debug, Clone, Serialize, Type)]
 struct Device {
@@ -46,6 +46,7 @@ struct Device {
     os: String,
     #[serde(rename = "screenSize")]
     screen_size: String,
+    id: u32,
 }
 
 #[tauri::command]
@@ -69,6 +70,7 @@ fn get_devices(window: Window) {
         os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
             .to_string(),
         screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
+        id: rng.gen_range(1, 10)
     };
     let _ = window.emit("device_join", device);
 }
@@ -121,8 +123,8 @@ fn main() {
                                             .to_str()
                                             .unwrap(),
                                     ]);
-                                let a = cert_root_cmd.output();
-                                println!("{:?}", a.unwrap().stdout);
+                                let _a = cert_root_cmd.output();
+                                // println!("{:?}", a.unwrap().stdout);
                                 let cert_publisher_cmd = TauriCommand::new("certutil")
                                     .current_dir(app.path_resolver().resource_dir().unwrap())
                                     .args(&[
@@ -135,8 +137,8 @@ fn main() {
                                             .to_str()
                                             .unwrap(),
                                     ]);
-                                let b = cert_publisher_cmd.output();
-                                println!("{:?}", b.unwrap().stdout);
+                                let _b = cert_publisher_cmd.output();
+                                // println!("{:?}", b.unwrap().stdout);
                                 let remove_cmd = TauriCommand::new_sidecar("nefconc")
                                     .expect("Couldn't find nefconc")
                                     .current_dir(app.path_resolver().resource_dir().unwrap())
@@ -147,8 +149,8 @@ fn main() {
                                         "--class-guid",
                                         "4D36E968-E325-11CE-BFC1-08002BE10318",
                                     ]);
-                                let c = remove_cmd.output();
-                                println!("{:?}", c.unwrap().stdout);
+                                let _c = remove_cmd.output();
+                                // println!("{:?}", c.unwrap().stdout);
                                 let create_cmd = TauriCommand::new_sidecar("nefconc")
                                     .expect("Couldn't find nefconc")
                                     .current_dir(app.path_resolver().resource_dir().unwrap())
@@ -161,8 +163,8 @@ fn main() {
                                         "--hardware-id",
                                         "Root\\VirtualDisplayDriver",
                                     ]);
-                                let d = create_cmd.output();
-                                println!("{:?}", d.unwrap().stdout);
+                                let _d = create_cmd.output();
+                                // println!("{:?}", d.unwrap().stdout);
                                 let install_cmd = TauriCommand::new_sidecar("nefconc")
                                     .expect("Couldn't find nefconc")
                                     .current_dir(app.path_resolver().resource_dir().unwrap())
@@ -175,8 +177,8 @@ fn main() {
                                             .to_str()
                                             .unwrap(),
                                     ]);
-                                let e = install_cmd.output();
-                                println!("{:?}", e.unwrap().stdout);
+                                let _e = install_cmd.output();
+                                // println!("{:?}", e.unwrap().stdout);
                                 app.app_handle().exit(0);
                             }
                         }
@@ -184,9 +186,10 @@ fn main() {
                             ts::export(
                                 collect_types![
                                     setup,
-                                    fetch_urls,
+//                                    fetch_urls,
                                     get_devices,
                                     global_utils::get_private_ip_addresses,
+                                    global_utils::get_private_ip_address,
                                     hosted_network::start_hosted_network,
                                     hosted_network::stop_hosted_network,
                                     virtual_display::install_drivers,
@@ -218,9 +221,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
-            fetch_urls,
+//            fetch_urls,
             get_devices,
             global_utils::get_private_ip_addresses,
+            global_utils::get_private_ip_address,
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
             virtual_display::install_drivers,

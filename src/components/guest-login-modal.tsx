@@ -15,6 +15,7 @@ import {
 
 import { AuthProviderContext, createUser } from "@/components/auth-provider";
 import { setup, installDrivers } from "@/lib/bindings";
+import { generateSlug } from "@/lib/utils";
 import { useTheme } from "@/components/theme-provider";
 
 export function GuestLoginModal() {
@@ -31,6 +32,8 @@ export function GuestLoginModal() {
         setCurrentUser("");
         const success = await setup();
         if (success) {
+          window.slug = generateSlug();
+          delete window.qrValues;
           navigate("/dashboard");
         } else {
           setError(true);

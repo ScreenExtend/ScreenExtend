@@ -72,8 +72,8 @@ export default function Devices() {
               </TableRow>
             </TableHeader>
             <TableBody className="border-t">
-              {devices.map((device, index) => (
-                <TableRow key={index}>
+              {devices.map((device) => (
+                <TableRow key={device.id}>
                   <TableCell>{device.name}</TableCell>
                   <TableCell>{device.ip}</TableCell>
                   <TableCell>{device.os}</TableCell>

@@ -29,7 +29,7 @@ import { useForm } from "react-hook-form";
 import { setup, installDrivers } from "@/lib/bindings";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { cn } from "@/lib/utils";
+import { cn, generateSlug } from "@/lib/utils";
 
 const formSchema = z.object({
   username: z.string(),
@@ -64,6 +64,8 @@ export function UserAuthForm() {
         setCurrentUser(values.username);
         const success = await setup();
         if (success) {
+          window.slug = generateSlug();
+          delete window.qrValues;
           navigate("/dashboard");
         } else {
           setSetupError(true);
@@ -73,6 +75,8 @@ export function UserAuthForm() {
         setTheme(user.theme as Theme);
         const success = await setup();
         if (success) {
+          window.slug = generateSlug();
+          delete window.qrValues;
           navigate("/dashboard");
         } else {
           setSetupError(true);

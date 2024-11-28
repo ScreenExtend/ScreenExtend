@@ -14,16 +14,16 @@ export function setup() {
     return invoke()<boolean>("setup")
 }
 
-export function fetchUrls() {
-    return invoke()<null>("fetch_urls")
-}
-
 export function getDevices() {
     return invoke()<null>("get_devices")
 }
 
 export function getPrivateIpAddresses() {
     return invoke()<string[]>("get_private_ip_addresses")
+}
+
+export function getPrivateIpAddress() {
+    return invoke()<string>("get_private_ip_address")
 }
 
 export function startHostedNetwork(name: string, password: string) {
