@@ -38,6 +38,7 @@ import {
 import { getPrivateIpAddresses, startHostedNetwork, stopHostedNetwork } from "@/lib/bindings";
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
+import { emit } from "@tauri-apps/api/event";
 import { cn } from "@/lib/utils";
 
 export default function Settings() {
@@ -92,10 +93,11 @@ export default function Settings() {
     const success = await startHostedNetwork(name, password);
     const ips2 = await getPrivateIpAddresses();
     if (success && ips2.length - ips1.length === 1) {
-      console.log(ips2.filter(ip => !ips1.includes(ip))[0]);
+      await emit("hosted_url", "http://" + ips2.filter(ip => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
       return true;
     } else {
       await stopHostedNetwork();
+      await emit("hosted_url", "");
       return false;
     }
   }
@@ -183,6 +185,7 @@ export default function Settings() {
                     if (!hostedNetworkOn) {
                       window.hostedNetworkOn = true;
                       await stopHostedNetwork();
+                      await emit("hosted_url", "");
                       const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
                         setHostedNetworkOn(true);
@@ -199,6 +202,7 @@ export default function Settings() {
                     } else {
                       window.hostedNetworkOn = false;
                       await stopHostedNetwork();
+                      await emit("hosted_url", "");
                       if (hostedNetworkPassword.length < 8) {
                         setHostedNetworkPassword(oldHostedNetworkPassword);
                       }
@@ -283,6 +287,7 @@ export default function Settings() {
                         setHostedNetworkModalOpen(true);
                       } else {
                         await stopHostedNetwork();
+                        await emit("hosted_url", "");
                         const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                         if (success) {
                           setOldHostedNetworkName(hostedNetworkName);
@@ -406,6 +411,7 @@ export default function Settings() {
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
                 await stopHostedNetwork();
+                await emit("hosted_url", "");
                 const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
                 updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editNetwork: dontShowAgain}});

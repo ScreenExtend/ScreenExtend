@@ -1,4 +1,5 @@
 use local_ip_address::list_afinet_netifas;
+use local_ip_address::local_ip;
 use std::net::IpAddr;
 
 #[tauri::command]
@@ -21,4 +22,15 @@ pub fn get_private_ip_addresses() -> Vec<String> {
         }
     }
     private_ips
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_private_ip_address() -> String {
+    let local_ip = local_ip();
+    if let Err(_err) = local_ip {
+        "".to_string()
+    } else {
+        local_ip.unwrap().to_string()
+    }
 }

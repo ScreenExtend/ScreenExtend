@@ -18,23 +18,27 @@ import {
 import { writeText } from "@tauri-apps/api/clipboard";
 import { appWindow } from "@tauri-apps/api/window";
 import { listen, emit } from "@tauri-apps/api/event";
+import { getPrivateIpAddress } from "@/lib/bindings";
 
 export default function Dashboard() {
   const [, forceUpdate] = useReducer(x => x + 1, 0);
-  const [qrValues, setQrValues] = useState<{ title: string, value: string }[]>([
+  const [qrValues, setQrValues] = useState<{ title: string, value: string }[]>(window.qrValues || [
     {
       title: "Local Hosted Network",
       value: "",
     },
     {
       title: "Same As Current Device",
-      value: "http://192.137.12.1:5000/session/sjahsebs",
+      value: "",
     },
     {
       title: "Any Wifi Network",
-      value: "http://screenextend.app/session/sjahsebs",
+      value: "",
     }
   ]);
+  useEffect(() => {
+    window.qrValues = qrValues;
+  }, [qrValues]);
 
   useEffect(() => {
     const fetchURLs = async () => {
@@ -43,17 +47,57 @@ export default function Dashboard() {
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("local_url", (event) => {
-        qrValues[1].value = event.payload as string;
+      await listen("local_url", async (event) => {
+        const privateIp = await getPrivateIpAddress();
+        if (privateIp.length > 0) {
+          qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
+        } else {
+          qrValues[1].value = "";
+          qrValues[2].value = "";
+        }
         setQrValues(qrValues);
         forceUpdate();
       });
       await listen("global_url", (event) => {
-        qrValues[2].value = event.payload as string;
+        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
         setQrValues(qrValues);
         forceUpdate();
       });
       await emit("dashboard_ready");
+      const privateIp = await getPrivateIpAddress();
+      if (privateIp.length > 0) {
+        qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
+      } else {
+        qrValues[1].value = "";
+        qrValues[2].value = "";
+      }
+      setQrValues(qrValues);
+      forceUpdate();
+      window.addEventListener("online", async () => {
+        if ((await fetch("https://screenextend.app/")).ok) {
+          qrValues[2].value = "https://screenextend.app/session/" + window.slug;
+        } else {
+          qrValues[2].value = "";
+        }
+        setQrValues(qrValues);
+        forceUpdate();
+      });
+      window.addEventListener("offline", async () => {
+        if ((await fetch("https://screenextend.app/")).ok) {
+          qrValues[2].value = "https://screenextend.app/session/" + window.slug;
+        } else {
+          qrValues[2].value = "";
+        }
+        setQrValues(qrValues);
+        forceUpdate();
+      });
+      if ((await fetch("https://screenextend.app/")).ok) {
+        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
+      } else {
+        qrValues[2].value = "";
+      }
+      setQrValues(qrValues);
+      forceUpdate();
     }
     void fetchURLs();
   }, []);
