@@ -7,7 +7,8 @@ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 import { AuthProviderContext, getUser, updateUser } from "@/components/auth-provider";
-import { appWindow } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+const appWindow = getCurrentWebviewWindow();
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentUser } = useContext(AuthProviderContext);

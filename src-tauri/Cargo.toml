@@ -12,22 +12,33 @@ homepage = "https://screen-extend.tech/"
 documentation = "https://screen-extend.tech/docs/"
 # readme — Path to the package’s README file.
 
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1.5", features = [ "shell-all", "cli", "clipboard-write-text", "process-command-api" ] }
+tauri = { version = "2.0.0-rc.15", features = ["unstable", "specta"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 local-ip-address = "0.5.7"
 rand = "0.3"
-specta = "1"
-tauri-specta = { version = "1", features = ["typescript"] }
+specta = "=2.0.0-rc.20"
+tauri-specta = { version = "=2.0.0-rc.20", features = ["derive", "typescript"] }
 elevated-command = "1.1"
 driver-ipc = { path = "C:/Users/sarve/fleet/virtual-display-rs/rust/driver-ipc" }
 tokio = { version = "1", features = [ "full" ] }
+tauri-plugin-shell = "2"
+specta-typescript = "0.0.7"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-process = "2"
+tauri-plugin-cli = "2"
+tauri-plugin-single-instance = "2.0.0"
+tauri-plugin-http = "2.0.0"
 
 [dependencies.windows]
 version = "0.44.0"

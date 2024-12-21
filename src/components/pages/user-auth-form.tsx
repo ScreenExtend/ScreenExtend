@@ -26,7 +26,7 @@ import {
 import { AuthProviderContext, getUser, createUser } from "@/components/auth-provider";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { useForm } from "react-hook-form";
-import { setup, installDrivers } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { cn, generateSlug } from "@/lib/utils";
@@ -62,7 +62,7 @@ export function UserAuthForm() {
       if (!user) {
         createUser({username: values.username, password: values.password, theme});
         setCurrentUser(values.username);
-        const success = await setup();
+        const success = await commands.setup();
         if (success) {
           window.slug = generateSlug();
           delete window.qrValues;
@@ -73,7 +73,7 @@ export function UserAuthForm() {
       } else if (user.password === values.password) {
         setCurrentUser(values.username);
         setTheme(user.theme as Theme);
-        const success = await setup();
+        const success = await commands.setup();
         if (success) {
           window.slug = generateSlug();
           delete window.qrValues;
@@ -166,7 +166,7 @@ export function UserAuthForm() {
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={async () => {
                 setLoading(true);
-                await installDrivers();
+                await commands.installDrivers();
                 setLoading(false);
                 setSetupError(false);
               }}

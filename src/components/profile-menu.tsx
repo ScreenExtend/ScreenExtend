@@ -26,12 +26,13 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, updateUser, deleteUser } from "@/components/auth-provider";
-import { stopHostedNetwork, removeAllDisplays } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { useTheme } from "@/components/theme-provider";
 import { useToast } from "@/components/ui/use-toast";
-import { appWindow } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import defaultLogo from "@/assets/default.svg";
 import { cn } from "@/lib/utils";
+const appWindow = getCurrentWebviewWindow();
 
 export function ProfileMenu() {
   const { currentUser } = useContext(AuthProviderContext);
@@ -42,14 +43,14 @@ export function ProfileMenu() {
 
   void appWindow.onCloseRequested(async () => {
     setClosing(true);
-    await stopHostedNetwork();
-    await removeAllDisplays();
+    await commands.stopHostedNetwork();
+    await commands.removeAllDisplays();
     window.otp = "";
     window.hostedNetworkOn = false;
     deleteUser("");
     dismiss();
     setTheme("system");
-    window.close();
+    await appWindow.destroy();
   });
 
   return (
@@ -73,8 +74,8 @@ export function ProfileMenu() {
             className="cursor-pointer"
             onClick={async () => {
               deleteUser("");
-              await stopHostedNetwork();
-              await removeAllDisplays();
+              await commands.stopHostedNetwork();
+              await commands.removeAllDisplays();
               window.otp = "";
               window.hostedNetworkOn = false;
               setTheme("system");
@@ -126,8 +127,8 @@ export function ProfileMenu() {
                     className="bg-red-600 hover:bg-red-700 text-white"
                     onClick={async () => {
                       deleteUser(currentUser);
-                      await stopHostedNetwork();
-                      await removeAllDisplays();
+                      await commands.stopHostedNetwork();
+                      await commands.removeAllDisplays();
                       window.otp = "";
                       window.hostedNetworkOn = false;
                       setTheme("system");
