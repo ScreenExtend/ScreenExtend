@@ -35,7 +35,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { getPrivateIpAddresses, startHostedNetwork, stopHostedNetwork } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { emit } from "@tauri-apps/api/event";
@@ -47,7 +47,7 @@ export default function Settings() {
   const user = getUser(currentUser)!;
 
   const characters = "0123456789";
-  const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp) ? window.otp : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
+  const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp!) ? window.otp! : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
   const [spin, setSpin] = useState(false);
 
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
@@ -89,21 +89,21 @@ export default function Settings() {
   }
 
   const startHostedNetworkWithIP = async (name: string, password: string) => {
-    const ips1 = await getPrivateIpAddresses();
-    const success = await startHostedNetwork(name, password);
-    const ips2 = await getPrivateIpAddresses();
+    const ips1 = await commands.getPrivateIpAddresses();
+    const success = await commands.startHostedNetwork(name, password);
+    const ips2 = await commands.getPrivateIpAddresses();
     if (success && ips2.length - ips1.length === 1) {
-      await emit("hosted_url", "http://" + ips2.filter(ip => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
+      await emit("hosted_url", "http://" + ips2.filter((ip: string) => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
       return true;
     } else {
-      await stopHostedNetwork();
+      await commands.stopHostedNetwork();
       await emit("hosted_url", "");
       return false;
     }
   }
 
   useEffect(() => {
-    setHostedNetworkOn(window.hostedNetworkOn);
+    setHostedNetworkOn(window.hostedNetworkOn!);
   }, []);
 
   useEffect(() => {
@@ -184,7 +184,7 @@ export default function Settings() {
                   onCheckedChange={async () => {
                     if (!hostedNetworkOn) {
                       window.hostedNetworkOn = true;
-                      await stopHostedNetwork();
+                      await commands.stopHostedNetwork();
                       await emit("hosted_url", "");
                       const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
@@ -201,7 +201,7 @@ export default function Settings() {
                       }
                     } else {
                       window.hostedNetworkOn = false;
-                      await stopHostedNetwork();
+                      await commands.stopHostedNetwork();
                       await emit("hosted_url", "");
                       if (hostedNetworkPassword.length < 8) {
                         setHostedNetworkPassword(oldHostedNetworkPassword);
@@ -286,7 +286,7 @@ export default function Settings() {
                       if (!getUser(currentUser)!.dontShowAgain.editNetwork) {
                         setHostedNetworkModalOpen(true);
                       } else {
-                        await stopHostedNetwork();
+                        await commands.stopHostedNetwork();
                         await emit("hosted_url", "");
                         const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                         if (success) {
@@ -410,7 +410,7 @@ export default function Settings() {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                await stopHostedNetwork();
+                await commands.stopHostedNetwork();
                 await emit("hosted_url", "");
                 const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);

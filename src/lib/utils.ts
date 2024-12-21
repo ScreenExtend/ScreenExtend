@@ -1,8 +1,15 @@
-import React from "react";
-
-import React, { useState, useEffect, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
+
+declare global {
+    interface Window {
+        hostedNetworkOn?: boolean;
+        otp?: string;
+        slug?: string;
+        qrValues?: { title: string, value: string }[];
+    }
+}
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -30,17 +37,19 @@ export function generateSlug() {
     return result;
 }
 
-export function useInterval(callback, delay) {
-    const savedCallback = useRef();
+export function useInterval(callback: () => void, delay: number | null): void {
+    const savedCallback = useRef<() => void>();
     useEffect(() => {
         savedCallback.current = callback;
     }, [callback]);
     useEffect(() => {
         function func() {
-            savedCallback.current();
+            if (savedCallback.current) {
+                savedCallback.current();
+            }
         }
         if (delay !== null) {
-            let id = setInterval(func, delay);
+            const id = setInterval(func, delay);
             return () => clearInterval(id);
         }
     }, [delay]);

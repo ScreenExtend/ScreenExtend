@@ -1,10 +1,11 @@
 use crate::windows_utils::AppState;
 use elevated_command::Command;
+use tauri::AppHandle;
+use tauri_plugin_shell::ShellExt;
 use std::process::Command as StdCommand;
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use tauri::api::process::Command as TauriCommand;
 use tauri::State;
 use windows::core::{Result, HSTRING};
 use windows::Devices::WiFiDirect::{
@@ -61,23 +62,17 @@ fn start_wifi_direct_(
     Ok(publisher)
 }
 
-fn supports_legacy_hosted_network_() -> bool {
-    TauriCommand::new("netsh")
-        .args(&["wlan", "show", "drivers"])
-        .output()
-        .map_or(false, |output| {
-            let output_str = output.stdout;
-            output_str.contains("Hosted network supported")
-                && output_str
-                    .split("Hosted network supported")
-                    .any(|s| s.trim().starts_with(": Yes"))
-        })
+fn supports_legacy_hosted_network_(app: AppHandle) -> bool {
+    let output = tauri::async_runtime::block_on(async {
+        app.shell().command("netsh").args(&["wlan", "show", "drivers"]).output().await
+    });
+    output.map_or(false, |output| String::from_utf8_lossy(&output.stdout).contains("Hosted network supported") && String::from_utf8_lossy(&output.stdout).split("Hosted network supported").any(|s| s.trim().starts_with(": Yes")))
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn start_hosted_network(state: State<'_, AppState>, name: &str, password: &str) -> bool {
-    let use_legacy = supports_legacy_hosted_network_();
+pub fn start_hosted_network(app: AppHandle, state: State<'_, AppState>, name: &str, password: &str) -> bool {
+    let use_legacy = supports_legacy_hosted_network_(app.clone());
     if use_legacy {
         let exe_path = match std::env::current_exe() {
             Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
@@ -88,13 +83,10 @@ pub fn start_hosted_network(state: State<'_, AppState>, name: &str, password: &s
         cmd.arg(name);
         cmd.arg(password);
         let _ = Command::new(cmd).output();
-        TauriCommand::new("netsh")
-            .args(&["wlan", "show", "hostednetwork"])
-            .output()
-            .map_or(false, |output| {
-                let output_str = output.stdout;
-                output_str.contains("Status") && output_str.split("Status").any(|s| s.trim().starts_with(": Started"))
-            })
+        let output = tauri::async_runtime::block_on(async {
+            app.shell().command("netsh").args(&["wlan", "show", "hostednetwork"]).output().await
+        });
+        output.map_or(false, |output| String::from_utf8_lossy(&output.stdout).contains("Status") && String::from_utf8_lossy(&output.stdout).split("Status").any(|s| s.trim().starts_with(": Started")))
     } else {
         let (success_tx, success_rx) = channel::<bool>();
         let publisher = match start_wifi_direct_(name, password, success_tx.clone()) {
@@ -122,13 +114,13 @@ pub fn start_hosted_network(state: State<'_, AppState>, name: &str, password: &s
 
 #[tauri::command]
 #[specta::specta]
-pub fn stop_hosted_network(state: State<'_, AppState>) -> bool {
-    let use_legacy = supports_legacy_hosted_network_();
+pub fn stop_hosted_network(app: AppHandle, state: State<'_, AppState>) -> bool {
+    let use_legacy = supports_legacy_hosted_network_(app.clone());
     if use_legacy {
-        TauriCommand::new("netsh")
-            .args(&["wlan", "stop", "hostednetwork"])
-            .status()
-            .map_or(false, |status| status.success())
+        let status = tauri::async_runtime::block_on(async {
+            app.shell().command("netsh").args(&["wlan", "stop", "hostednetwork"]).status().await.unwrap()
+        });
+        status.success()
     } else {
         if let Some(ref stop_func) = *state.stop_hosted_network.lock().unwrap() {
             stop_func();

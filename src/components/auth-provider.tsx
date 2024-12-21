@@ -2,13 +2,6 @@ import React, { createContext } from "react";
 // @ts-ignore
 import * as localStorageDBModule from "localstoragedb";
 
-declare global {
-  interface Window {
-    hostedNetworkOn: boolean;
-    otp: string;
-  }
-}
-
 export type AuthContextType = {
   currentUser: string,
   setCurrentUser: React.Dispatch<React.SetStateAction<string>>

@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, createUser } from "@/components/auth-provider";
-import { setup, installDrivers } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { generateSlug } from "@/lib/utils";
 import { useTheme } from "@/components/theme-provider";
 
@@ -30,7 +30,7 @@ export function GuestLoginModal() {
       <Button variant="outline" size="sm" className="w-full justify-center" onClick={async () => {
         createUser({username: "", password: "", theme});
         setCurrentUser("");
-        const success = await setup();
+        const success = await commands.setup();
         if (success) {
           window.slug = generateSlug();
           delete window.qrValues;
@@ -56,7 +56,7 @@ export function GuestLoginModal() {
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={async () => {
                 setLoading(true);
-                await installDrivers();
+                await commands.installDrivers();
                 setLoading(false);
                 setError(false);
               }}

@@ -2,69 +2,36 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
   },
-  "package": {
-    "productName": "ScreenExtend",
-    "version": "1.0.0"
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "VirtualDisplayDriver.dll",
+      "VirtualDisplayDriver.cat",
+      "VirtualDisplayDriver.inf",
+      "ScreenExtend.cer"
+    ],
+    "publisher": "Sarvesh Madullapalli",
+    "copyright": "© 2024 Sarvesh Madullapalli All Rights Reserved",
+    "category": "Utility",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "nefconc"
+    ]
   },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "shell": {
-        "all": true,
-        "scope": [
-          {
-            "name": "nefconc",
-            "sidecar": true,
-            "args": true
-          },
-          {
-            "name": "certutil",
-            "cmd": "certutil",
-            "args": true
-          },
-          {
-            "name": "screenextend",
-            "cmd": "screenextend",
-            "args": true
-          },
-          {
-            "name": "netsh",
-            "cmd": "netsh",
-            "args": true
-          }
-        ]
-      },
-      "clipboard": {
-        "all": false,
-        "writeText": true
-      }
-    },
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.screen.extend",
-      "publisher": "Sarvesh Madullapalli",
-      "copyright": "© 2024 Sarvesh Madullapalli All Rights Reserved",
-      "category": "Utility",
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.ico"
-      ],
-      "externalBin": [
-        "nefconc"
-      ],
-      "resources": [
-        "VirtualDisplayDriver.dll",
-        "VirtualDisplayDriver.cat",
-        "VirtualDisplayDriver.inf",
-        "ScreenExtend.cer"
-      ]
-    },
+  "productName": "ScreenExtend",
+  "mainBinaryName": "ScreenExtend",
+  "version": "1.0.0",
+  "identifier": "com.screen.extend",
+  "plugins": {
     "cli": {
       "subcommands": {
         "hostednetwork": {
@@ -85,10 +52,12 @@
           "args": []
         }
       }
-    },
+    }
+  },
+  "app": {
+    "windows": [],
     "security": {
       "csp": null
-    },
-    "windows": []
+    }
   }
 }

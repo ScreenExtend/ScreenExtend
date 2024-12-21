@@ -15,10 +15,11 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
-import { writeText } from "@tauri-apps/api/clipboard";
-import { appWindow } from "@tauri-apps/api/window";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen, emit } from "@tauri-apps/api/event";
-import { getPrivateIpAddress } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
+const appWindow = getCurrentWebviewWindow();
 
 export default function Dashboard() {
   const [, forceUpdate] = useReducer(x => x + 1, 0);
@@ -47,8 +48,8 @@ export default function Dashboard() {
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("local_url", async (event) => {
-        const privateIp = await getPrivateIpAddress();
+      await listen("local_url", async () => {
+        const privateIp = await commands.getPrivateIpAddress();
         if (privateIp.length > 0) {
           qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
         } else {
@@ -58,13 +59,13 @@ export default function Dashboard() {
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("global_url", (event) => {
+      await listen("global_url", () => {
         qrValues[2].value = "https://screenextend.app/session/" + window.slug;
         setQrValues(qrValues);
         forceUpdate();
       });
       await emit("dashboard_ready");
-      const privateIp = await getPrivateIpAddress();
+      const privateIp = await commands.getPrivateIpAddress();
       if (privateIp.length > 0) {
         qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
       } else {
