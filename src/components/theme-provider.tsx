@@ -13,12 +13,12 @@ type ThemeProviderProps = {
 
 type ThemeProviderState = {
   theme: Theme;
-  setTheme: (theme: Theme) => void;
+  setTheme: (theme: Theme) => Promise<void>;
 };
 
 const initialState: ThemeProviderState = {
   theme: "system",
-  setTheme: () => null,
+  setTheme: () => Promise.resolve()
 };
 
 const ThemeProviderContext = createContext<ThemeProviderState>(initialState);
@@ -31,7 +31,7 @@ export function ThemeProvider({
   const { currentUser } = useContext(AuthProviderContext);
   
   const [theme, setTheme] = useState<Theme>(defaultTheme);
-  updateUser(currentUser, { theme });
+  void updateUser(currentUser, { theme });
 
   useEffect(() => {
     const fetchTheme = async () => {
@@ -50,8 +50,8 @@ export function ThemeProvider({
     void fetchTheme();
   }, [theme]);
 
-  void appWindow.onThemeChanged(({ payload: newTheme }) => {
-    if (getUser(currentUser)!.theme === "system") {
+  void appWindow.onThemeChanged(async ({ payload: newTheme }) => {
+    if ((await getUser(currentUser))!.theme === "system") {
       const root = window.document.documentElement;
       root.classList.remove("light", "dark");
       root.classList.add(newTheme);
@@ -62,8 +62,8 @@ export function ThemeProvider({
 
   const value = {
     theme,
-    setTheme: (theme: Theme) => {
-      updateUser(currentUser, { theme });
+    setTheme: async (theme: Theme) => {
+      await updateUser(currentUser, { theme });
       setTheme(theme);
     },
   };

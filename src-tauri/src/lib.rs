@@ -105,6 +105,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = app.get_webview_window("main").expect("no main window").set_focus();
         }))
+        .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             if let Ok(matches) = app.cli().matches() {

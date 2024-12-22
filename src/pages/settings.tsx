@@ -44,7 +44,6 @@ import { cn } from "@/lib/utils";
 export default function Settings() {
   const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
-  const user = getUser(currentUser)!;
 
   const characters = "0123456789";
   const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp!) ? window.otp! : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
@@ -52,15 +51,15 @@ export default function Settings() {
 
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
-  const [hostedNetworkName, setHostedNetworkName] = useState(user.hostedNetworkCredentials.name);
-  const [hostedNetworkPassword, setHostedNetworkPassword] = useState(user.hostedNetworkCredentials.password);
+  const [hostedNetworkName, setHostedNetworkName] = useState("ScreenExtend");
+  const [hostedNetworkPassword, setHostedNetworkPassword] = useState("12345678");
   const [oldHostedNetworkName, setOldHostedNetworkName] = useState(hostedNetworkName);
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState(hostedNetworkPassword);
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
   const [hostedNetworkModalOpen, setHostedNetworkModalOpen] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
 
-  const [accountPassword, setAccountPassword] = useState(user.password);
+  const [accountPassword, setAccountPassword] = useState("");
   const [showAccountPassword, setShowAccountPassword] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -104,6 +103,15 @@ export default function Settings() {
 
   useEffect(() => {
     setHostedNetworkOn(window.hostedNetworkOn!);
+    async function updateText() {
+      const user = (await getUser(currentUser))!;
+      setHostedNetworkName(user.hostedNetworkCredentials.name);
+      setHostedNetworkPassword(user.hostedNetworkCredentials.password);
+      setOldHostedNetworkName(hostedNetworkName);
+      setOldHostedNetworkPassword(hostedNetworkPassword);
+      setAccountPassword(user.password);
+    }
+    void updateText();
   }, []);
 
   useEffect(() => {
@@ -117,7 +125,7 @@ export default function Settings() {
   }, [spin]);
 
   useEffect(() => {
-    updateUser(currentUser, {hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
+    void updateUser(currentUser, {hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword]);
 
   useEffect(() => {
@@ -183,12 +191,12 @@ export default function Settings() {
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
                     if (!hostedNetworkOn) {
-                      window.hostedNetworkOn = true;
                       await commands.stopHostedNetwork();
                       await emit("hosted_url", "");
                       const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
                         setHostedNetworkOn(true);
+                        window.hostedNetworkOn = true;
                         toast({
                           title: "Network Creation Success",
                           description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
@@ -283,7 +291,7 @@ export default function Settings() {
                 </div>
                 <Button disabled={!hostedNetworkOn || hostedNetworkPassword.length < 8} onClick={async () => {
                     if (hostedNetworkName !== oldHostedNetworkName || hostedNetworkPassword !== oldHostedNetworkPassword) {
-                      if (!getUser(currentUser)!.dontShowAgain.editNetwork) {
+                      if (!(await getUser(currentUser))!.dontShowAgain.editNetwork) {
                         setHostedNetworkModalOpen(true);
                       } else {
                         await commands.stopHostedNetwork();
@@ -356,10 +364,10 @@ export default function Settings() {
                     )}
                   </div>
                 </div>
-                <Button disabled={currentUser.length === 0} onClick={() => {
+                <Button disabled={currentUser.length === 0} onClick={async () => {
                   setShowAccountPassword(false);
-                  if (getUser(currentUser)!.password !== accountPassword) {
-                    updateUser(currentUser, { password: accountPassword });
+                  if ((await getUser(currentUser))!.password !== accountPassword) {
+                    await updateUser(currentUser, { password: accountPassword });
                     toast({
                       title: "Account Settings Updated",
                       description: "Your account settings have been updated.",
@@ -398,8 +406,8 @@ export default function Settings() {
             </label>
           </div>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => {
-                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editNetwork: dontShowAgain}});
+            <AlertDialogCancel onClick={async () => {
+                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editNetwork: dontShowAgain}});
                 setHostedNetworkName(oldHostedNetworkName);
                 setHostedNetworkPassword(oldHostedNetworkName);
                 setHostedNetworkModalOpen(false);
@@ -414,7 +422,7 @@ export default function Settings() {
                 await emit("hosted_url", "");
                 const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
-                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editNetwork: dontShowAgain}});
+                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editNetwork: dontShowAgain}});
                 if (success) {
                   setOldHostedNetworkName(hostedNetworkName);
                   setOldHostedNetworkPassword(hostedNetworkPassword);

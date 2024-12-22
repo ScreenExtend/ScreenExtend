@@ -200,10 +200,11 @@ function QrModalComponent({ value }: { value: string }) {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const listenToWindowResize = async () => {
-      unlisten = await appWindow.onResized(() => {
+      unlisten = await appWindow.onResized(({ payload: size }) => {
         const qrCode = document.getElementById("mainQRCode");
         if (qrCode) {
-          qrCode.style.height = (window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
+          console.log((size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2));
+          qrCode.style.height = (size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
         }
       });
     }
