@@ -28,7 +28,7 @@ export function GuestLoginModal() {
   return (
     <>
       <Button variant="outline" size="sm" className="w-full justify-center" onClick={async () => {
-        createUser({username: "", password: "", theme});
+        await createUser({username: "", password: "", theme});
         setCurrentUser("");
         const success = await commands.setup();
         if (success) {

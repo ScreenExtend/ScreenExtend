@@ -1,6 +1,5 @@
 import React, { createContext } from "react";
-// @ts-ignore
-import * as localStorageDBModule from "localstoragedb";
+import { Store } from "@tauri-apps/plugin-store";
 
 export type AuthContextType = {
   currentUser: string,
@@ -55,33 +54,20 @@ export const defaultUser: User = {
 
 export const AuthProviderContext = createContext<AuthContextType>({ currentUser: "", setCurrentUser: () => {} });
 
-// @ts-ignore
-export const UserDB = new localStorageDBModule.default("screenextend");
+const UserDB = await Store.load("config.json");
 
-if (!UserDB.tableExists("users")) {
-  UserDB.createTable("users", ["username", "password", "theme", "sidebarOpen", "devices", "sessionPassword", "hostedNetworkCredentials", "dontShowAgain"]);
-  UserDB.commit();
-}
-
-export const createUser = (information: Partial<User>): void => {
-  const results = UserDB.insert("users", { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend" + (information.username ? "-" + information.username : ""), password: "ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!"}, ...information });
-  UserDB.commit();
-  return results;
+export const createUser = async (information: Partial<User>) => {
+  return await UserDB.set(information.username!, { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend" + (information.username ? "-" + information.username : ""), password: "ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!"}, ...information });
 };
 
-export const getUser = (username: string) => {
-  const results = UserDB.queryAll("users", {query: {username}});
-  return results.length > 0 ? (results[0] as User) : null;
+export const getUser = async (username: string) => {
+  return await UserDB.get<User>(username);
 };
 
-export const updateUser = (username: string, information: Partial<Omit<User, "username">>) => {
-  const results = UserDB.update("users", { username }, (user: User) => {return { ...user, ...information }});
-  UserDB.commit();
-  return results;
+export const updateUser = async (username: string, information: Partial<Omit<User, "username">>) => {
+  return await UserDB.set(username, { ...await getUser(username), ...information });
 };
 
-export const deleteUser = (username: string) => {
-  const results = UserDB.deleteRows("users", { username });
-  UserDB.commit();
-  return results;
+export const deleteUser = async (username: string) => {
+  return await UserDB.delete(username);
 };

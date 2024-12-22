@@ -65,12 +65,12 @@ export function DeviceDetails({ device }: { device: Device }) {
     },
   });
 
-  const considerClosing = (event: CustomEvent<{originalEvent: PointerEvent}> | CustomEvent<{originalEvent: FocusEvent}> | KeyboardEvent) => {
+  const considerClosing = async (event: CustomEvent<{originalEvent: PointerEvent}> | CustomEvent<{originalEvent: FocusEvent}> | KeyboardEvent) => {
     event.preventDefault();
     if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
       setOpen(false);
     } else {
-      if (getUser(currentUser)!.dontShowAgain.editDevice) {
+      if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
         setOpen(false);
       } else {
         setWarningDialogOpen(true);
@@ -78,14 +78,14 @@ export function DeviceDetails({ device }: { device: Device }) {
     }
   };
 
-  const openChangeHandler = (open: boolean) => {
+  const openChangeHandler = async (open: boolean) => {
     if (open) {
       setOpen(true);
     } else {
       if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
         setOpen(false);
       } else {
-        if (getUser(currentUser)!.dontShowAgain.editDevice) {
+        if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
           setOpen(false);
         } else {
           setWarningDialogOpen(true);
@@ -284,8 +284,8 @@ export function DeviceDetails({ device }: { device: Device }) {
             </label>
           </div>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => {
-                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editDevice: dontShowAgain}});
+            <AlertDialogCancel onClick={async () => {
+                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editDevice: dontShowAgain}});
                 setWarningDialogOpen(false);
               }}
             >
@@ -293,8 +293,8 @@ export function DeviceDetails({ device }: { device: Device }) {
             </AlertDialogCancel>
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
-              onClick={() => {
-                updateUser(currentUser, {dontShowAgain: {...getUser(currentUser)!.dontShowAgain, editDevice: dontShowAgain}});
+              onClick={async () => {
+                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editDevice: dontShowAgain}});
                 setWarningDialogOpen(false);
                 setOpen(false);
                 deviceDetails.resetForm();

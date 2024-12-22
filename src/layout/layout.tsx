@@ -13,19 +13,26 @@ const appWindow = getCurrentWebviewWindow();
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentUser } = useContext(AuthProviderContext);
 
-  const [sidebarOpen, setSidebarOpen] = useState(getUser(currentUser)!.sidebarOpen);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [firstTime, setFirstTime] = useState(true);
   const [doneOpening, setDoneOpening] = useState(false);
 
   const [sidebarSize, setSidebarSize] = useState(27500/window.innerWidth);
-  void appWindow.onResized(() => {
+  void appWindow.onResized(({ payload: size }) => {
     if (parseFloat(document.getElementById("sidebar")!.style.flexGrow) > 0) {
-      setSidebarSize(27500/window.innerWidth);
+      setSidebarSize(27500/size.width);
     }
   });
 
   useEffect(() => {
-    updateUser(currentUser, { sidebarOpen });
+    async function updateSidebarOpen() {
+      setSidebarOpen((await getUser(currentUser))!.sidebarOpen);
+    }
+    void updateSidebarOpen();
+  }, []);
+
+  useEffect(() => {
+    void updateUser(currentUser, { sidebarOpen });
     const sidebar = document.getElementById("sidebar")!;
     if (!sidebarOpen) {
       sidebar.animate(

@@ -58,9 +58,9 @@ export function UserAuthForm() {
     if (values.username.length === 0) {
       document.getElementById("guestLogin")!.click();
     } else {
-      const user = getUser(values.username);
+      const user = await getUser(values.username);
       if (!user) {
-        createUser({username: values.username, password: values.password, theme});
+        await createUser({username: values.username, password: values.password, theme});
         setCurrentUser(values.username);
         const success = await commands.setup();
         if (success) {
@@ -72,7 +72,7 @@ export function UserAuthForm() {
         }
       } else if (user.password === values.password) {
         setCurrentUser(values.username);
-        setTheme(user.theme as Theme);
+        await setTheme(user.theme as Theme);
         const success = await commands.setup();
         if (success) {
           window.slug = generateSlug();

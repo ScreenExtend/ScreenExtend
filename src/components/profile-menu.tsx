@@ -47,9 +47,9 @@ export function ProfileMenu() {
     await commands.removeAllDisplays();
     window.otp = "";
     window.hostedNetworkOn = false;
-    deleteUser("");
+    await deleteUser("");
     dismiss();
-    setTheme("system");
+    await setTheme("system");
     await appWindow.destroy();
   });
 
@@ -73,12 +73,12 @@ export function ProfileMenu() {
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={async () => {
-              deleteUser("");
+              await deleteUser("");
               await commands.stopHostedNetwork();
               await commands.removeAllDisplays();
               window.otp = "";
               window.hostedNetworkOn = false;
-              setTheme("system");
+              await setTheme("system");
               dismiss();
               navigate("/");
             }}
@@ -91,9 +91,9 @@ export function ProfileMenu() {
               "cursor-pointer",
               currentUser.length === 0 && "cursor-not-allowed select-none"
             )}
-            onClick={() => {
+            onClick={async () => {
               if (currentUser.length !== 0) {
-                updateUser(currentUser, {dontShowAgain: {editDevice: false, removeDevice: false, editNetwork: false}});
+                await updateUser(currentUser, {dontShowAgain: {editDevice: false, removeDevice: false, editNetwork: false}});
               }
             }}
             disabled={currentUser.length === 0}
@@ -126,12 +126,12 @@ export function ProfileMenu() {
                   <AlertDialogAction
                     className="bg-red-600 hover:bg-red-700 text-white"
                     onClick={async () => {
-                      deleteUser(currentUser);
+                      await deleteUser(currentUser);
                       await commands.stopHostedNetwork();
                       await commands.removeAllDisplays();
                       window.otp = "";
                       window.hostedNetworkOn = false;
-                      setTheme("system");
+                      await setTheme("system");
                       dismiss();
                       navigate("/");
                     }}
