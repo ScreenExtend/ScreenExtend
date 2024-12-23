@@ -345,7 +345,7 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
         <AlertDialogHeader>
           <AlertDialogTitle>Remove Device</AlertDialogTitle>
           <AlertDialogDescription>
-            This action cannot be undone. The device will immediately lose be disconnect. It can reconnect for future sessions.
+            This action cannot be undone. The device will immediately disconnect but can reconnect for future sessions.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="flex items-center space-x-2 mb-4">
