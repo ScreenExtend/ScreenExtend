@@ -122,7 +122,7 @@ export default function Dashboard() {
               ))
             ) : (
               <div className="h-[120%] lg:block text-slate-700 dark:text-slate-300 text-lg">
-                Please join a network or start a hosted network in <Link to="/settings" className="underline">settings</Link>.
+                Join or <b><Link to="/settings" className="underline">Create</Link></b> a Network (none were found)
               </div>
             )
           }
@@ -144,7 +144,7 @@ export default function Dashboard() {
           </Carousel>
         ) : (
           <div className="text-slate-400 lg:hidden">
-            Please join a network or create one through <Link to="/settings" className="underline">settings</Link>.
+            Join or <b><Link to="/settings" className="underline">Create</Link></b> a Network (none were found)
           </div>
         )}
       </div>

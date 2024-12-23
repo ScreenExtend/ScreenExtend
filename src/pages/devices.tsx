@@ -55,7 +55,7 @@ export default function Devices() {
               </Tooltip>
             </TooltipProvider>
           </div>
-          <p className="text-gray-500">{ devices.length } device{ devices.length !== 1 && "s" } connected</p>
+          <p className="text-gray-500">{ devices.length } Device{ devices.length !== 1 && "s" } Connected</p>
         </div>
         <div>
           <Table>
@@ -95,7 +95,7 @@ export default function Devices() {
                 className={cn(buttonVariants({ variant: "secondary" }))}
               >
                 <Plus className="mr-2" size={16} />
-                Add a device to get started
+                Connect a Device
               </Link>
             </div>
           )}
