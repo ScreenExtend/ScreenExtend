@@ -5,10 +5,9 @@ mod global_utils;
 use rand::Rng;
 use serde::{Serialize, Deserialize};
 use specta_typescript::Typescript;
-use tauri_specta::{collect_commands, Builder};
+use tauri_specta::{collect_commands, Builder, Event, collect_events};
 use specta::Type;
 use tauri::Manager;
-//use tauri::WindowBuilder;
 use tauri_plugin_shell::ShellExt;
 use tauri::path::BaseDirectory;
 use tauri_plugin_cli::CliExt;
@@ -29,14 +28,71 @@ mod linux_utils;
 #[cfg(target_os = "linux")]
 use linux_utils::*;
 
-//#[tauri::command]
-//#[specta::specta]
-//fn fetch_urls(window: Window) {
-//    let _ = window.emit("local_url", "https://192.168.88.1:8000/");
-//    let _ = window.emit("global_url", "https://screenextend.app/session/abcdefgh");
-//}
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct HostedURL(String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct LocalURL(String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct GlobalURL(String);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceJoin(Device);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceModify(Device);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceModifyAction(Device);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceRemove(Device);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceRemoveAction(Device);
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct NetworkChange(String);
+
+/*
+stop -> stop hosted netowrk and server
+ip -> start server
+listen for hostedurl stop or IP, then:
+    const ips1 = await commands.getPrivateIpAddresses();
+    const success = await commands.startHostedNetwork(name, password);
+    const ips2 = await commands.getPrivateIpAddresses();
+    if (success && ips2.length - ips1.length === 1) {
+      await emit("hosted_url", "http://" + ips2.filter((ip: string) => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
+      return true;
+    } else {
+      await commands.stopHostedNetwork();
+      await emit("hosted_url", "");
+      return false;
+    }
+
+on network change, check previous IP server was running on and internet connection
+    const updateURLs = async () => {
+      const privateIp = await commands.getPrivateIpAddress();
+      if (privateIp.length > 0) {
+        qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
+      } else {
+        qrValues[1].value = "";
+      }
+      try {
+        let response = await fetch("https://screenextend.app/", {cache: "no-store"});
+        if (!response.ok) throw response.statusText;
+        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
+      } catch (e) {
+        console.error(e);
+        qrValues[2].value = "";
+      }
+      setQrValues(qrValues);
+      forceUpdate();
+    }
+*/
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 struct Device {
     ip: String,
     name: String,
@@ -47,7 +103,6 @@ struct Device {
     os: String,
     #[serde(rename = "screenSize")]
     screen_size: String,
-    id: u32,
 }
 
 #[tauri::command]
@@ -70,8 +125,7 @@ fn get_devices(app: tauri::AppHandle) {
         refresh_rate: rng.gen_range(15, 500),
         os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
             .to_string(),
-        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
-        id: rng.gen_range(1, 10)
+        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501))
     };
     let _ = app.emit("device_join", device);
 }
@@ -89,6 +143,17 @@ pub fn run() {
             virtual_display::update_display,
             virtual_display::remove_display,
             virtual_display::remove_all_displays
+        ])
+        .events(collect_events![
+            HostedURL,
+            LocalURL,
+            GlobalURL,
+            DeviceJoin,
+            DeviceModify,
+            DeviceModifyAction,
+            DeviceRemove,
+            DeviceRemoveAction,
+            NetworkChange
         ]);
 
     #[cfg(debug_assertions)]
@@ -98,7 +163,6 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
-//        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_http::init())
@@ -150,7 +214,7 @@ pub fn run() {
                         )
                         .min_inner_size(1050.0, 650.0)
                         .inner_size(1200.0, 675.0)
-                        .title("Screen Extend")
+                        .title("ScreenExtend")
                         .resizable(true)
                         .maximized(true)
                         .build()?;

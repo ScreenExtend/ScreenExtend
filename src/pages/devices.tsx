@@ -21,7 +21,7 @@ import {
 } from "@/components/ui/table";
 
 import { type Device } from "@/components/auth-provider";
-import { listen, emit } from "@tauri-apps/api/event";
+import { events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 export default function Devices() {
@@ -30,10 +30,9 @@ export default function Devices() {
 
   useEffect(() => {
     const start_listener = async () => {
-      await listen("device_join", event => setDevices(prev => [...prev, event.payload as Device]));
-      await listen("device_modify", event => setDevices(prev => prev.map(device => device.ip === (event.payload as Device).ip ? (event.payload as Device) : device)));
-      await listen("device_remove", event => setDevices(prev => prev.filter(device => device.ip !== (event.payload as Device).ip)));
-      await emit("device_ready");
+      await events.deviceJoin.listen(event => setDevices(prev => [...prev, event.payload as Device]));
+      await events.deviceModify.listen(event => setDevices(prev => prev.map(device => device.ip === (event.payload as Device).ip ? (event.payload as Device) : device)));
+      await events.deviceRemove.listen(event => setDevices(prev => prev.filter(device => device.ip !== (event.payload as Device).ip)));
     }
     void start_listener();
   }, []);

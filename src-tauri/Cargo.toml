@@ -1,22 +1,20 @@
 [package]
 name = "screenextend"
 version = "1.0.0"
-description = "Screen Extend"
+description = "ScreenExtend"
 authors = ["Sarvesh Madullapalli"]
 edition = "2021"
 categories = ["gui", "os", "network-programming", "multimedia"]
 keywords = ["screen-mirror", "desktop-extension", "multi-display", "offline", "free"]
 license-file = "LICENSE"
-repository = "https://github.com/EpicCodeWizard/ScreenExtend"
-homepage = "https://screen-extend.tech/"
-documentation = "https://screen-extend.tech/docs/"
+repository = "https://github.com/ScreenExtend/ScreenExtend"
+homepage = "https://screenextend.app/"
+documentation = "https://screenextend.app/docs/"
 # readme — Path to the package’s README file.
 
 [lib]
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -32,10 +30,9 @@ tauri-specta = { version = "=2.0.0-rc.20", features = ["derive", "typescript"] }
 elevated-command = "1.1"
 driver-ipc = { path = "C:/Users/sarve/fleet/virtual-display-rs/rust/driver-ipc" }
 tokio = { version = "1", features = [ "full" ] }
-tauri-plugin-shell = "2"
 specta-typescript = "0.0.7"
+tauri-plugin-shell = "2"
 tauri-plugin-clipboard-manager = "2"
-tauri-plugin-process = "2"
 tauri-plugin-cli = "2"
 tauri-plugin-single-instance = "2.0.0"
 tauri-plugin-http = "2.0.0"
@@ -62,6 +59,3 @@ features = [
     "Win32_System_Ole",
     "Win32_UI_Shell",
 ]
-
-[features]
-custom-protocol = ["tauri/custom-protocol"]

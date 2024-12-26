@@ -35,10 +35,9 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { commands } from "@/lib/bindings";
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
-import { emit } from "@tauri-apps/api/event";
+import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 export default function Settings() {
@@ -92,11 +91,13 @@ export default function Settings() {
     const success = await commands.startHostedNetwork(name, password);
     const ips2 = await commands.getPrivateIpAddresses();
     if (success && ips2.length - ips1.length === 1) {
-      await emit("hosted_url", "http://" + ips2.filter((ip: string) => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
+      const set1 = new Set(ips1);
+      await events.hostedUrl.emit(ips2.find(item => !set1.has(item))!);
+      await new Promise(events.hostedUrl.once);
       return true;
     } else {
-      await commands.stopHostedNetwork();
-      await emit("hosted_url", "");
+      await events.hostedUrl.emit("stop");
+      await new Promise(events.hostedUrl.once);
       return false;
     }
   }
@@ -191,8 +192,8 @@ export default function Settings() {
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
                     if (!hostedNetworkOn) {
-                      await commands.stopHostedNetwork();
-                      await emit("hosted_url", "");
+                      await events.hostedUrl.emit("stop");
+                      await new Promise(events.hostedUrl.once);
                       const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
                         setHostedNetworkOn(true);
@@ -209,8 +210,8 @@ export default function Settings() {
                       }
                     } else {
                       window.hostedNetworkOn = false;
-                      await commands.stopHostedNetwork();
-                      await emit("hosted_url", "");
+                      await events.hostedUrl.emit("stop");
+                      await new Promise(events.hostedUrl.once);
                       if (hostedNetworkPassword.length < 8) {
                         setHostedNetworkPassword(oldHostedNetworkPassword);
                       }
@@ -294,8 +295,8 @@ export default function Settings() {
                       if (!(await getUser(currentUser))!.dontShowAgain.editNetwork) {
                         setHostedNetworkModalOpen(true);
                       } else {
-                        await commands.stopHostedNetwork();
-                        await emit("hosted_url", "");
+                        await events.hostedUrl.emit("stop");
+                        await new Promise(events.hostedUrl.once);
                         const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                         if (success) {
                           setOldHostedNetworkName(hostedNetworkName);
@@ -418,8 +419,8 @@ export default function Settings() {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                await commands.stopHostedNetwork();
-                await emit("hosted_url", "");
+                await events.hostedUrl.emit("stop");
+                await new Promise(events.hostedUrl.once);
                 const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
                 await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editNetwork: dontShowAgain}});

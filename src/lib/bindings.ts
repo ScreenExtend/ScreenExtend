@@ -63,6 +63,27 @@ async removeAllDisplays() : Promise<Result<boolean, null>> {
 /** user-defined events **/
 
 
+export const events = __makeEvents__<{
+deviceJoin: DeviceJoin,
+deviceModify: DeviceModify,
+deviceModifyAction: DeviceModifyAction,
+deviceRemove: DeviceRemove,
+deviceRemoveAction: DeviceRemoveAction,
+globalUrl: GlobalURL,
+hostedUrl: HostedURL,
+localUrl: LocalURL,
+networkChange: NetworkChange
+}>({
+deviceJoin: "device-join",
+deviceModify: "device-modify",
+deviceModifyAction: "device-modify-action",
+deviceRemove: "device-remove",
+deviceRemoveAction: "device-remove-action",
+globalUrl: "global-url",
+hostedUrl: "hosted-url",
+localUrl: "local-url",
+networkChange: "network-change"
+})
 
 /** user-defined constants **/
 
@@ -70,64 +91,74 @@ async removeAllDisplays() : Promise<Result<boolean, null>> {
 
 /** user-defined types **/
 
+export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; os: string; screenSize: string }
+export type DeviceJoin = Device
+export type DeviceModify = Device
+export type DeviceModifyAction = Device
+export type DeviceRemove = Device
+export type DeviceRemoveAction = Device
+export type GlobalURL = string
+export type HostedURL = string
+export type LocalURL = string
+export type NetworkChange = string
 export type VirtualDisplayConfig = { name: string; width: number; height: number; refresh_rate: number }
 
 /** tauri-specta globals **/
 
 import {
 	invoke as TAURI_INVOKE,
-//	Channel as TAURI_CHANNEL,
+	Channel as TAURI_CHANNEL,
 } from "@tauri-apps/api/core";
-//import * as TAURI_API_EVENT from "@tauri-apps/api/event";
-//import { type WebviewWindow as __WebviewWindow__ } from "@tauri-apps/api/webviewWindow";
+import * as TAURI_API_EVENT from "@tauri-apps/api/event";
+import { type WebviewWindow as __WebviewWindow__ } from "@tauri-apps/api/webviewWindow";
 
-//type __EventObj__<T> = {
-//	listen: (
-//		cb: TAURI_API_EVENT.EventCallback<T>,
-//	) => ReturnType<typeof TAURI_API_EVENT.listen<T>>;
-//	once: (
-//		cb: TAURI_API_EVENT.EventCallback<T>,
-//	) => ReturnType<typeof TAURI_API_EVENT.once<T>>;
-//	emit: null extends T
-//		? (payload?: T) => ReturnType<typeof TAURI_API_EVENT.emit>
-//		: (payload: T) => ReturnType<typeof TAURI_API_EVENT.emit>;
-//};
+type __EventObj__<T> = {
+	listen: (
+		cb: TAURI_API_EVENT.EventCallback<T>,
+	) => ReturnType<typeof TAURI_API_EVENT.listen<T>>;
+	once: (
+		cb: TAURI_API_EVENT.EventCallback<T>,
+	) => ReturnType<typeof TAURI_API_EVENT.once<T>>;
+	emit: null extends T
+		? (payload?: T) => ReturnType<typeof TAURI_API_EVENT.emit>
+		: (payload: T) => ReturnType<typeof TAURI_API_EVENT.emit>;
+};
 
 export type Result<T, E> =
 	| { status: "ok"; data: T }
 	| { status: "error"; error: E };
 
-//function __makeEvents__<T extends Record<string, any>>(
-//	mappings: Record<keyof T, string>,
-//) {
-//	return new Proxy(
-//		{} as unknown as {
-//			[K in keyof T]: __EventObj__<T[K]> & {
-//				(handle: __WebviewWindow__): __EventObj__<T[K]>;
-//			};
-//		},
-//		{
-//			get: (_, event) => {
-//				const name = mappings[event as keyof T];
-//
-//				return new Proxy((() => {}) as any, {
-//					apply: (_, __, [window]: [__WebviewWindow__]) => ({
-//						listen: (arg: any) => window.listen(name, arg),
-//						once: (arg: any) => window.once(name, arg),
-//						emit: (arg: any) => window.emit(name, arg),
-//					}),
-//					get: (_, command: keyof __EventObj__<any>) => {
-//						switch (command) {
-//							case "listen":
-//								return (arg: any) => TAURI_API_EVENT.listen(name, arg);
-//							case "once":
-//								return (arg: any) => TAURI_API_EVENT.once(name, arg);
-//							case "emit":
-//								return (arg: any) => TAURI_API_EVENT.emit(name, arg);
-//						}
-//					},
-//				});
-//			},
-//		},
-//	);
-//}
+function __makeEvents__<T extends Record<string, any>>(
+	mappings: Record<keyof T, string>,
+) {
+	return new Proxy(
+		{} as unknown as {
+			[K in keyof T]: __EventObj__<T[K]> & {
+				(handle: __WebviewWindow__): __EventObj__<T[K]>;
+			};
+		},
+		{
+			get: (_, event) => {
+				const name = mappings[event as keyof T];
+
+				return new Proxy((() => {}) as any, {
+					apply: (_, __, [window]: [__WebviewWindow__]) => ({
+						listen: (arg: any) => window.listen(name, arg),
+						once: (arg: any) => window.once(name, arg),
+						emit: (arg: any) => window.emit(name, arg),
+					}),
+					get: (_, command: keyof __EventObj__<any>) => {
+						switch (command) {
+							case "listen":
+								return (arg: any) => TAURI_API_EVENT.listen(name, arg);
+							case "once":
+								return (arg: any) => TAURI_API_EVENT.once(name, arg);
+							case "emit":
+								return (arg: any) => TAURI_API_EVENT.emit(name, arg);
+						}
+					},
+				});
+			},
+		},
+	);
+}

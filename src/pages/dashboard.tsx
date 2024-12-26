@@ -17,8 +17,7 @@ import {
 
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { listen, emit } from "@tauri-apps/api/event";
-import { commands } from "@/lib/bindings";
+import { commands, events } from "@/lib/bindings";
 const appWindow = getCurrentWebviewWindow();
 
 export default function Dashboard() {
@@ -42,65 +41,27 @@ export default function Dashboard() {
   }, [qrValues]);
 
   useEffect(() => {
-    const fetchURLs = async () => {
-      await listen("hosted_url", (event) => {
-        qrValues[0].value = event.payload as string;
+    const listenURLs = async () => {
+      await events.hostedUrl.listen(event => {
+        if (event.payload === "stop" || !event.payload.startsWith("http")) return;
+        qrValues[0].value = event.payload;
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("local_url", async () => {
-        const privateIp = await commands.getPrivateIpAddress();
-        if (privateIp.length > 0) {
-          qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
-        } else {
-          qrValues[1].value = "";
-          qrValues[2].value = "";
-        }
+      await events.localUrl.listen(event => {
+        qrValues[1].value = event.payload;
         setQrValues(qrValues);
         forceUpdate();
       });
-      await listen("global_url", () => {
-        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
+      await events.globalUrl.listen(event => {
+        qrValues[2].value = event.payload;
         setQrValues(qrValues);
         forceUpdate();
       });
-      await emit("dashboard_ready");
-      const privateIp = await commands.getPrivateIpAddress();
-      if (privateIp.length > 0) {
-        qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
-      } else {
-        qrValues[1].value = "";
-        qrValues[2].value = "";
-      }
-      setQrValues(qrValues);
-      forceUpdate();
-      window.addEventListener("online", async () => {
-        if ((await fetch("https://screenextend.app/")).ok) {
-          qrValues[2].value = "https://screenextend.app/session/" + window.slug;
-        } else {
-          qrValues[2].value = "";
-        }
-        setQrValues(qrValues);
-        forceUpdate();
-      });
-      window.addEventListener("offline", async () => {
-        if ((await fetch("https://screenextend.app/")).ok) {
-          qrValues[2].value = "https://screenextend.app/session/" + window.slug;
-        } else {
-          qrValues[2].value = "";
-        }
-        setQrValues(qrValues);
-        forceUpdate();
-      });
-      if ((await fetch("https://screenextend.app/")).ok) {
-        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
-      } else {
-        qrValues[2].value = "";
-      }
-      setQrValues(qrValues);
-      forceUpdate();
+      window.addEventListener("online", () => {events.networkChange.emit("")}); // SWITCH TO RUST
+      window.addEventListener("offline", () => {events.networkChange.emit("")}); // SWITCH TO RUST
     }
-    void fetchURLs();
+    void listenURLs();
   }, []);
 
   return (
@@ -203,7 +164,6 @@ function QrModalComponent({ value }: { value: string }) {
       unlisten = await appWindow.onResized(({ payload: size }) => {
         const qrCode = document.getElementById("mainQRCode");
         if (qrCode) {
-          console.log((size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2));
           qrCode.style.height = (size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
         }
       });

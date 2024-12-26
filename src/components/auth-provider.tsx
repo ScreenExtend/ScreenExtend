@@ -68,6 +68,8 @@ export const updateUser = async (username: string, information: Partial<Omit<Use
   return await UserDB.set(username, { ...await getUser(username), ...information });
 };
 
+window.UserDB = UserDB;
+
 export const deleteUser = async (username: string) => {
   return await UserDB.delete(username);
 };
