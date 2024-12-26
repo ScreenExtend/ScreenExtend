@@ -3,10 +3,11 @@ use serde::{Serialize, Deserialize};
 use crate::windows_utils::AppState;
 use driver_ipc::{Monitor, Mode};
 use elevated_command::Command;
+use tauri_specta::Event;
 use specta::Type;
 use tauri::State;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct VirtualDisplayConfig {
     pub name: String,
     pub width: u32,

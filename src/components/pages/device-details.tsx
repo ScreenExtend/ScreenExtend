@@ -34,8 +34,8 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, updateUser, getUser, type Device } from "@/components/auth-provider";
-import { emit } from "@tauri-apps/api/event";
 import { useToast } from "@/components/ui/use-toast";
+import { events } from "@/lib/bindings";
 import { useFormik } from "formik";
 
 export function DeviceDetails({ device }: { device: Device }) {
@@ -52,10 +52,8 @@ export function DeviceDetails({ device }: { device: Device }) {
     },
     onSubmit: async (values) => {
       setInProgress(true);
-      console.log("UPDATE:");
-      console.log(values);
-      await new Promise(r => setTimeout(r, 2000));
-      await emit("device_modify", deviceDetails.values);
+      await events.deviceModifyAction.emit(values);
+      await new Promise(events.deviceModify.once);
       setInProgress(false);
       toast({
         title: "Device Settings Updated",
@@ -236,10 +234,8 @@ export function DeviceDetails({ device }: { device: Device }) {
             <DeleteDevice
               onClick={async () => {
                 setInProgress(true);
-                console.log("REMOVE:");
-                console.log(deviceDetails.values);
-                await new Promise(r => setTimeout(r, 2000));
-                await emit("device_remove", deviceDetails.values);
+                await events.deviceRemoveAction.emit(deviceDetails.values);
+                await new Promise(events.deviceRemove.once);
                 setInProgress(false);
                 toast({
                   title: "Device Removed",
