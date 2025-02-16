@@ -100,7 +100,7 @@ export type DeviceRemoveAction = Device
 export type GlobalURL = string
 export type HostedURL = string
 export type LocalURL = string
-export type NetworkChange = string
+export type NetworkChange = null
 export type VirtualDisplayConfig = { name: string; width: number; height: number; refresh_rate: number }
 
 /** tauri-specta globals **/

@@ -12,6 +12,7 @@ use tauri_plugin_shell::ShellExt;
 use tauri::path::BaseDirectory;
 use tauri_plugin_cli::CliExt;
 use tauri::Emitter;
+mod server;
 
 #[cfg(target_os = "windows")]
 mod windows_utils;
@@ -53,7 +54,7 @@ pub struct DeviceRemove(Device);
 pub struct DeviceRemoveAction(Device);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct NetworkChange(String);
+pub struct NetworkChange;
 
 /*
 stop -> stop hosted netowrk and server
@@ -180,7 +181,7 @@ pub fn run() {
                         for (key, arg_data) in &command.matches.args {
                             match key.as_str() {
                                 "ssid" => {
-                                    ssid = arg_data.value.as_str().map(|s| s.to_string()).expect("No password");
+                                    ssid = arg_data.value.as_str().map(|s| s.to_string()).expect("No ssid");
                                 }
                                 "password" => {
                                     password = arg_data.value.as_str().map(|s| s.to_string()).expect("No password");
@@ -197,16 +198,23 @@ pub fn run() {
                     Some(command) if command.name == "installdrivers" => {
                         tauri::async_runtime::block_on(async {
                             let resource_path = |file: &str| app.path().resolve(file, BaseDirectory::Resource).unwrap().into_os_string().into_string().unwrap();
-                            app.shell().command("certutil").args(&["-addstore", "-f", "root", &resource_path("ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("certutil").args(&["-addstore", "-f", "TrustedPublisher", &resource_path("ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
+                            app.shell().command("certutil").args(&["-addstore", "-f", "root", &resource_path("resources/ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
+                            app.shell().command("certutil").args(&["-addstore", "-f", "TrustedPublisher", &resource_path("resources/ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
                             app.shell().command("nefconc").args(&["--remove-device-node", "--hardware-id", "Root\\VirtualDisplayDriver", "--class-guid", "4D36E968-E325-11CE-BFC1-08002BE10318"]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
                             app.shell().command("nefconc").args(&["--create-device-node", "--class-name", "Display", "--class-guid", "4D36E968-E325-11CE-BFC1-08002BE10318", "--hardware-id", "Root\\VirtualDisplayDriver"]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("nefconc").args(&["--install-driver", "--inf-path", &resource_path("VirtualDisplayDriver.inf")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
+                            app.shell().command("nefconc").args(&["--install-driver", "--inf-path", &resource_path("resources/VirtualDisplayDriver.inf")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
                         });
                         app.handle().exit(0);
                     }
                     _ => {
                         builder.mount_events(app);
+                        HostedURL::listen(app, |event| {
+                            if event.payload.0 == "stop" {
+                                // stop server
+                            } else if !event.payload.0.starts_with("http") {
+                                // start server on ip/port
+                            }
+                        });
                         tauri::WebviewWindowBuilder::new(
                             app,
                             "main".to_string(),

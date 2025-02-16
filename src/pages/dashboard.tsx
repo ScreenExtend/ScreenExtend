@@ -58,8 +58,8 @@ export default function Dashboard() {
         setQrValues(qrValues);
         forceUpdate();
       });
-      window.addEventListener("online", () => {events.networkChange.emit("")}); // SWITCH TO RUST
-      window.addEventListener("offline", () => {events.networkChange.emit("")}); // SWITCH TO RUST
+      window.addEventListener("online", () => {events.networkChange.emit()});
+      window.addEventListener("offline", () => {events.networkChange.emit()});
     }
     void listenURLs();
   }, []);
