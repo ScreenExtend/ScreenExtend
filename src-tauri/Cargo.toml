@@ -6,7 +6,7 @@ authors = ["Sarvesh Madullapalli"]
 edition = "2021"
 categories = ["gui", "os", "network-programming", "multimedia"]
 keywords = ["screen-mirror", "desktop-extension", "multi-display", "offline", "free"]
-license-file = "LICENSE"
+license-file = "../LICENSE"
 repository = "https://github.com/ScreenExtend/ScreenExtend"
 homepage = "https://screenextend.app/"
 documentation = "https://screenextend.app/docs/"
@@ -37,6 +37,7 @@ tauri-plugin-cli = "2"
 tauri-plugin-single-instance = "2.0.0"
 tauri-plugin-http = "2.0.0"
 tauri-plugin-store = "2.0.0"
+axum = "0.7.9"
 
 [dependencies.windows]
 version = "0.44.0"
