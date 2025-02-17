@@ -45,9 +45,9 @@ export function GuestLoginModal() {
       <AlertDialog open={error}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Driver Setup Error</AlertDialogTitle>
+            <AlertDialogTitle>Setup Error</AlertDialogTitle>
             <AlertDialogDescription>
-              There was an error while attepting to intialize drivers. This often occurs due to the drivers not being installed. <b>Click the button below to install the necessary drivers and certificates.</b> If this error is recurring, contact support at <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>support@screenextend.app</a>.
+              There was an error while attepting to start ScreenExtend. This often occurs due to core drivers or libraries not being installed. <b>Click the button below to install the missing components.</b> If this error is recurring, contact support at <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>support@screenextend.app</a>.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

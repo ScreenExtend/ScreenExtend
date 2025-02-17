@@ -3,8 +3,7 @@ pub mod virtual_display;
 
 use std::process::Command;
 
-pub struct AppState {
-}
+pub struct AppState {}
 
 fn command_exists(cmd: &str) -> bool {
     Command::new("which")

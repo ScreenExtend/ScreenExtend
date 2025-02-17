@@ -144,17 +144,19 @@ export default function Settings() {
             <CardHeader>
               <CardTitle className="flex flex-row items-center">
                 Session OTP
-                <RefreshCw
-                  className={cn(
-                    "ml-3 cursor-pointer transition-transform",
-                    spin ? "animate-spin pointer-events-none" : ""
-                  )}
-                  onClick={() => {
-                    setSpin(true);
-                  }}
-                  size={18}
-                  style={{ animationDuration: "500ms" }}
-                />
+                <Button variant="ghost" className="ml-2 w-7 h-7 p-0">
+                  <RefreshCw
+                    className={cn(
+                      "cursor-pointer transition-transform",
+                      spin ? "animate-spin pointer-events-none" : ""
+                    )}
+                    onClick={() => {
+                      setSpin(true);
+                    }}
+                    size={15}
+                    style={{ animationDuration: "500ms" }}
+                  />
+                </Button>
               </CardTitle>
               <InputOTP
                 maxLength={6}

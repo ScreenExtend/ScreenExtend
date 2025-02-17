@@ -1,5 +1,8 @@
 use axum::Router;
-use std::{net::SocketAddr, sync::{Arc, Mutex}};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::task;
 
 pub struct Server {

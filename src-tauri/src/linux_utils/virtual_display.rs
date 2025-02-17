@@ -1,5 +1,5 @@
 use crate::linux_utils::AppState;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
 
@@ -19,13 +19,20 @@ pub fn install_drivers() -> bool {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayConfig) -> Result<i32, ()> {
+pub async fn create_display(
+    state: State<'_, AppState>,
+    config: VirtualDisplayConfig,
+) -> Result<i32, ()> {
     Ok(1)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_display(state: State<'_, AppState>, display_id: u32, config: VirtualDisplayConfig) -> Result<bool, ()> {
+pub async fn update_display(
+    state: State<'_, AppState>,
+    display_id: u32,
+    config: VirtualDisplayConfig,
+) -> Result<bool, ()> {
     Ok(true)
 }
 

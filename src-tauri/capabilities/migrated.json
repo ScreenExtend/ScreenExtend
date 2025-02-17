@@ -33,12 +33,26 @@
           "cmd": "netsh",
           "name": "netsh",
           "sidecar": false
+        },
+        {
+          "args": true,
+          "cmd": "control",
+          "name": "control",
+          "sidecar": false
+        },
+        {
+          "args": true,
+          "cmd": "open",
+          "name": "open",
+          "sidecar": false
         }
       ]
     },
     "shell:allow-open",
     "clipboard-manager:allow-write-text",
     "core:window:allow-destroy",
-    "store:default"
+    "store:default",
+    "os:default",
+    "os:default"
   ]
 }
