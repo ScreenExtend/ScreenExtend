@@ -1,11 +1,11 @@
-use std::process::Command as StdCommand;
-use serde::{Serialize, Deserialize};
 use crate::windows_utils::AppState;
-use driver_ipc::{Monitor, Mode};
+use driver_ipc::{Mode, Monitor};
 use elevated_command::Command;
-use tauri_specta::Event;
+use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::process::Command as StdCommand;
 use tauri::State;
+use tauri_specta::Event;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct VirtualDisplayConfig {
@@ -20,7 +20,7 @@ pub struct VirtualDisplayConfig {
 pub fn install_drivers() -> bool {
     let exe_path = match std::env::current_exe() {
         Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
-        _ => {"".to_string()}
+        _ => "".to_string(),
     };
     let mut cmd = StdCommand::new(exe_path);
     cmd.arg("installdrivers");
@@ -30,7 +30,10 @@ pub fn install_drivers() -> bool {
 
 #[tauri::command]
 #[specta::specta]
-pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayConfig) -> Result<i32, ()> {
+pub async fn create_display(
+    state: State<'_, AppState>,
+    config: VirtualDisplayConfig,
+) -> Result<i32, ()> {
     let mut client = state.driver_client.lock().await;
     let id = client.new_id(None).unwrap();
     let mode = Mode {
@@ -45,19 +48,21 @@ pub async fn create_display(state: State<'_, AppState>, config: VirtualDisplayCo
         modes: vec![mode],
     };
     match client.add(new_monitor) {
-        Ok(()) => {
-            match client.notify().await {
-                Ok(()) => Ok(id as i32),
-                Err(_) => Ok(-1)
-            }
+        Ok(()) => match client.notify().await {
+            Ok(()) => Ok(id as i32),
+            Err(_) => Ok(-1),
         },
-        Err(_) => Ok(-1)
+        Err(_) => Ok(-1),
     }
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn update_display(state: State<'_, AppState>, display_id: u32, config: VirtualDisplayConfig) -> Result<bool, ()> {
+pub async fn update_display(
+    state: State<'_, AppState>,
+    display_id: u32,
+    config: VirtualDisplayConfig,
+) -> Result<bool, ()> {
     let mut client = state.driver_client.lock().await;
     if let Some(monitor) = client.find_monitor_mut_unchecked(display_id) {
         monitor.name = Some(config.name);

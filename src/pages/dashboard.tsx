@@ -67,7 +67,7 @@ export default function Dashboard() {
   return (
     <Layout>
       <div className="p-8">
-        <h2 className="flex justify-center text-5xl font-semibold">What network is your device connected to?</h2>
+        <h2 className="flex justify-center text-4xl font-semibold">What network is your device connected to?</h2>
       </div>
       <div className="w-full overflow-hidden box-border mb-10">
         <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">

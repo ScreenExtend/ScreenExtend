@@ -1,17 +1,16 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-
 mod global_utils;
 
 use rand::Rng;
-use serde::{Serialize, Deserialize};
-use specta_typescript::Typescript;
-use tauri_specta::{collect_commands, Builder, Event, collect_events};
+use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::Manager;
-use tauri_plugin_shell::ShellExt;
+use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
-use tauri_plugin_cli::CliExt;
 use tauri::Emitter;
+use tauri::Manager;
+use tauri_plugin_cli::CliExt;
+use tauri_plugin_shell::ShellExt;
+use tauri_specta::{collect_commands, collect_events, Builder, Event};
 mod server;
 
 #[cfg(target_os = "windows")]
@@ -126,7 +125,7 @@ fn get_devices(app: tauri::AppHandle) {
         refresh_rate: rng.gen_range(15, 500),
         os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
             .to_string(),
-        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501))
+        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
     };
     let _ = app.emit("device_join", device);
 }
@@ -134,7 +133,8 @@ fn get_devices(app: tauri::AppHandle) {
 pub fn run() {
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
-            setup, get_devices,
+            setup,
+            get_devices,
             global_utils::get_private_ip_addresses,
             global_utils::get_private_ip_address,
             hosted_network::start_hosted_network,
@@ -163,12 +163,16 @@ pub fn run() {
         .expect("Failed to export typescript bindings");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            let _ = app.get_webview_window("main").expect("no main window").set_focus();
+            let _ = app
+                .get_webview_window("main")
+                .expect("no main window")
+                .set_focus();
         }))
         .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(builder.invoke_handler())
@@ -181,28 +185,118 @@ pub fn run() {
                         for (key, arg_data) in &command.matches.args {
                             match key.as_str() {
                                 "ssid" => {
-                                    ssid = arg_data.value.as_str().map(|s| s.to_string()).expect("No ssid");
+                                    ssid = arg_data
+                                        .value
+                                        .as_str()
+                                        .map(|s| s.to_string())
+                                        .expect("No ssid");
                                 }
                                 "password" => {
-                                    password = arg_data.value.as_str().map(|s| s.to_string()).expect("No password");
+                                    password = arg_data
+                                        .value
+                                        .as_str()
+                                        .map(|s| s.to_string())
+                                        .expect("No password");
                                 }
                                 _ => {}
                             }
                         }
                         tauri::async_runtime::block_on(async {
-                            app.shell().command("netsh").args(&["wlan", "set", "hostednetwork", "mode=allow", &format!("ssid={}", ssid), &format!("key={}", password)]).output().await.unwrap();
-                            app.shell().command("netsh").args(&["wlan", "start", "hostednetwork"]).output().await.unwrap();
+                            app.shell()
+                                .command("netsh")
+                                .args(&[
+                                    "wlan",
+                                    "set",
+                                    "hostednetwork",
+                                    "mode=allow",
+                                    &format!("ssid={}", ssid),
+                                    &format!("key={}", password),
+                                ])
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("netsh")
+                                .args(&["wlan", "start", "hostednetwork"])
+                                .output()
+                                .await
+                                .unwrap();
                         });
                         app.handle().exit(0);
                     }
                     Some(command) if command.name == "installdrivers" => {
                         tauri::async_runtime::block_on(async {
-                            let resource_path = |file: &str| app.path().resolve(file, BaseDirectory::Resource).unwrap().into_os_string().into_string().unwrap();
-                            app.shell().command("certutil").args(&["-addstore", "-f", "root", &resource_path("resources/ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("certutil").args(&["-addstore", "-f", "TrustedPublisher", &resource_path("resources/ScreenExtend.cer")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("nefconc").args(&["--remove-device-node", "--hardware-id", "Root\\VirtualDisplayDriver", "--class-guid", "4D36E968-E325-11CE-BFC1-08002BE10318"]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("nefconc").args(&["--create-device-node", "--class-name", "Display", "--class-guid", "4D36E968-E325-11CE-BFC1-08002BE10318", "--hardware-id", "Root\\VirtualDisplayDriver"]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
-                            app.shell().command("nefconc").args(&["--install-driver", "--inf-path", &resource_path("resources/VirtualDisplayDriver.inf")]).current_dir(app.path().resource_dir().unwrap()).output().await.unwrap();
+                            let resource_path = |file: &str| {
+                                app.path()
+                                    .resolve(file, BaseDirectory::Resource)
+                                    .unwrap()
+                                    .into_os_string()
+                                    .into_string()
+                                    .unwrap()
+                            };
+                            app.shell()
+                                .command("certutil")
+                                .args(&[
+                                    "-addstore",
+                                    "-f",
+                                    "root",
+                                    &resource_path("resources/ScreenExtend.cer"),
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("certutil")
+                                .args(&[
+                                    "-addstore",
+                                    "-f",
+                                    "TrustedPublisher",
+                                    &resource_path("resources/ScreenExtend.cer"),
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("nefconc")
+                                .args(&[
+                                    "--remove-device-node",
+                                    "--hardware-id",
+                                    "Root\\VirtualDisplayDriver",
+                                    "--class-guid",
+                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("nefconc")
+                                .args(&[
+                                    "--create-device-node",
+                                    "--class-name",
+                                    "Display",
+                                    "--class-guid",
+                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                    "--hardware-id",
+                                    "Root\\VirtualDisplayDriver",
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("nefconc")
+                                .args(&[
+                                    "--install-driver",
+                                    "--inf-path",
+                                    &resource_path("resources/VirtualDisplayDriver.inf"),
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
                         });
                         app.handle().exit(0);
                     }

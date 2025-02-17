@@ -3,8 +3,8 @@ import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { DeviceDetails } from "@/components/pages/device-details";
-import { buttonVariants } from "@/components/ui/button";
-import { Plus, Info } from "lucide-react";
+import { buttonVariants, Button } from "@/components/ui/button";
+import { Plus, Info, ExternalLink } from "lucide-react";
 import {
   Tooltip,
   TooltipContent,
@@ -21,12 +21,16 @@ import {
 } from "@/components/ui/table";
 
 import { type Device } from "@/components/auth-provider";
+import { useToast } from "@/components/ui/use-toast";
+import { Command } from "@tauri-apps/plugin-shell";
+import { type } from "@tauri-apps/plugin-os";
 import { events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
+  const { toast } = useToast();
 
   useEffect(() => {
     const start_listener = async () => {
@@ -53,6 +57,23 @@ export default function Devices() {
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
+            <div className="flex-grow"></div>
+            <Button variant="secondary" size="sm" onClick={async () => {
+              const osType = type();
+              if (osType === "windows") {
+                await Command.create("control", ["desk.cpl"]).execute();
+              } else if (osType === "macos") {
+                await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).execute();
+              } else {
+                toast({
+                  title: "Unable to Open Display Settings",
+                  description: "Please adjust your display settings manually.",
+                });
+              }
+            }}>
+              <ExternalLink className="mr-2" size={16} />
+              Display Settings
+            </Button>
           </div>
           <p className="text-gray-500">{ devices.length } Device{ devices.length !== 1 && "s" } Connected</p>
         </div>
