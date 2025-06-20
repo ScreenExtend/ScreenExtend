@@ -12,3 +12,9 @@ pub fn start_hosted_network(state: State<'_, AppState>, name: &str, password: &s
 pub fn stop_hosted_network(state: State<'_, AppState>) -> bool {
     true
 }
+
+#[tauri::command]
+#[specta::specta]
+pub fn is_hosted_network(state: State<'_, AppState>) -> bool {
+    true
+}

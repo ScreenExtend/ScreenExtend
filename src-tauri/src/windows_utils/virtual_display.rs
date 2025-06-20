@@ -1,9 +1,12 @@
-use crate::windows_utils::AppState;
+use super::AppState;
 use driver_ipc::{Mode, Monitor};
 use elevated_command::Command;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use tauri::path::BaseDirectory;
+use tauri::Manager;
 use std::process::Command as StdCommand;
+use tauri::AppHandle;
 use tauri::State;
 use tauri_specta::Event;
 
@@ -17,14 +20,27 @@ pub struct VirtualDisplayConfig {
 
 #[tauri::command]
 #[specta::specta]
-pub fn install_drivers() -> bool {
+pub fn install_drivers(app: AppHandle) -> bool {
+    let resource_path = |file: &str| {
+        app.path()
+            .resolve(file, BaseDirectory::Resource)
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap()
+    };
     let exe_path = match std::env::current_exe() {
         Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
         _ => "".to_string(),
     };
     let mut cmd = StdCommand::new(exe_path);
     cmd.arg("installdrivers");
-    let _ = Command::new(cmd).output();
+    let mut admincmd = Command::new(cmd);
+    let mut fincmd = admincmd.name("ScreenExtend".to_string());
+    if let Ok(icon_bytes) = std::fs::read(&resource_path("icons/icon.icns")) {
+        fincmd = fincmd.icon(icon_bytes);
+    }
+    let _ = fincmd.output().unwrap();
     true
 }
 

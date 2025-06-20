@@ -11,17 +11,20 @@ async setup() : Promise<boolean> {
 async getDevices() : Promise<void> {
     await TAURI_INVOKE("get_devices");
 },
-async getPrivateIpAddresses() : Promise<string[]> {
-    return await TAURI_INVOKE("get_private_ip_addresses");
+async setCurrentUser(currentUser: string) : Promise<void> {
+    await TAURI_INVOKE("set_current_user", { currentUser });
 },
-async getPrivateIpAddress() : Promise<string> {
-    return await TAURI_INVOKE("get_private_ip_address");
+async getNetworkAdapters() : Promise<NetworkInfo[]> {
+    return await TAURI_INVOKE("get_network_adapters");
 },
 async startHostedNetwork(name: string, password: string) : Promise<boolean> {
     return await TAURI_INVOKE("start_hosted_network", { name, password });
 },
 async stopHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("stop_hosted_network");
+},
+async isHostedNetwork() : Promise<boolean> {
+    return await TAURI_INVOKE("is_hosted_network");
 },
 async installDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("install_drivers");
@@ -69,9 +72,6 @@ deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
-globalUrl: GlobalURL,
-hostedUrl: HostedURL,
-localUrl: LocalURL,
 networkChange: NetworkChange
 }>({
 deviceJoin: "device-join",
@@ -79,9 +79,6 @@ deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
-globalUrl: "global-url",
-hostedUrl: "hosted-url",
-localUrl: "local-url",
 networkChange: "network-change"
 })
 
@@ -97,10 +94,8 @@ export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
-export type GlobalURL = string
-export type HostedURL = string
-export type LocalURL = string
 export type NetworkChange = null
+export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
 export type VirtualDisplayConfig = { name: string; width: number; height: number; refresh_rate: number }
 
 /** tauri-specta globals **/

@@ -1,5 +1,6 @@
 pub mod hosted_network;
 pub mod virtual_display;
+pub mod networking;
 
 use std::process::Command;
 

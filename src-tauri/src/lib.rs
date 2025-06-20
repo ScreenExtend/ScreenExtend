@@ -1,5 +1,4 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-mod global_utils;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -29,15 +28,6 @@ mod linux_utils;
 use linux_utils::*;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct HostedURL(String);
-
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct LocalURL(String);
-
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct GlobalURL(String);
-
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct DeviceJoin(Device);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
@@ -54,43 +44,6 @@ pub struct DeviceRemoveAction(Device);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct NetworkChange;
-
-/*
-stop -> stop hosted netowrk and server
-ip -> start server
-listen for hostedurl stop or IP, then:
-    const ips1 = await commands.getPrivateIpAddresses();
-    const success = await commands.startHostedNetwork(name, password);
-    const ips2 = await commands.getPrivateIpAddresses();
-    if (success && ips2.length - ips1.length === 1) {
-      await emit("hosted_url", "http://" + ips2.filter((ip: string) => !ips1.includes(ip))[0] + ":5000/session/" + window.slug);
-      return true;
-    } else {
-      await commands.stopHostedNetwork();
-      await emit("hosted_url", "");
-      return false;
-    }
-
-on network change, check previous IP server was running on and internet connection
-    const updateURLs = async () => {
-      const privateIp = await commands.getPrivateIpAddress();
-      if (privateIp.length > 0) {
-        qrValues[1].value = "http://" + privateIp + ":5000/session/" + window.slug;
-      } else {
-        qrValues[1].value = "";
-      }
-      try {
-        let response = await fetch("https://screenextend.app/", {cache: "no-store"});
-        if (!response.ok) throw response.statusText;
-        qrValues[2].value = "https://screenextend.app/session/" + window.slug;
-      } catch (e) {
-        console.error(e);
-        qrValues[2].value = "";
-      }
-      setQrValues(qrValues);
-      forceUpdate();
-    }
-*/
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 struct Device {
@@ -135,10 +88,11 @@ pub fn run() {
         .commands(collect_commands![
             setup,
             get_devices,
-            global_utils::get_private_ip_addresses,
-            global_utils::get_private_ip_address,
+            set_current_user,
+            networking::get_network_adapters,
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
+            hosted_network::is_hosted_network,
             virtual_display::install_drivers,
             virtual_display::create_display,
             virtual_display::update_display,
@@ -146,9 +100,6 @@ pub fn run() {
             virtual_display::remove_all_displays
         ])
         .events(collect_events![
-            HostedURL,
-            LocalURL,
-            GlobalURL,
             DeviceJoin,
             DeviceModify,
             DeviceModifyAction,
@@ -157,10 +108,10 @@ pub fn run() {
             NetworkChange
         ]);
 
-    #[cfg(debug_assertions)]
+//    #[cfg(debug_assertions)]
     builder
         .export(Typescript::default(), "../src/lib/bindings.ts")
-        .expect("Failed to export typescript bindings");
+        .expect("error while exporting typescript bindings");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
@@ -168,12 +119,6 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_http::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            let _ = app
-                .get_webview_window("main")
-                .expect("no main window")
-                .set_focus();
-        }))
         .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
@@ -189,14 +134,14 @@ pub fn run() {
                                         .value
                                         .as_str()
                                         .map(|s| s.to_string())
-                                        .expect("No ssid");
+                                        .expect("no ssid");
                                 }
                                 "password" => {
                                     password = arg_data
                                         .value
                                         .as_str()
                                         .map(|s| s.to_string())
-                                        .expect("No password");
+                                        .expect("no password");
                                 }
                                 _ => {}
                             }
@@ -301,14 +246,20 @@ pub fn run() {
                         app.handle().exit(0);
                     }
                     _ => {
-                        builder.mount_events(app);
-                        HostedURL::listen(app, |event| {
-                            if event.payload.0 == "stop" {
-                                // stop server
-                            } else if !event.payload.0.starts_with("http") {
-                                // start server on ip/port
+                        match tokio::task::block_in_place(|| std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 5363)))) {
+                            Ok(_) => {
+                                tauri::async_runtime::spawn(async move {
+                                    let app = axum::Router::new().route("/", axum::routing::get(|| async { "ScreenExtend Echo Server" }));
+                                    axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 5363))).serve(app.into_make_service()).await.unwrap();
+                                });
                             }
-                        });
+                            Err(_) => {
+                                std::process::exit(0);
+                            }
+                        }
+                        // first time - iter over networks and ip addresses, host server on ip/port, if successful then break, otherwise continue, if all ips are out, show blurred qr code and error (underlying qr code is blank)
+                        // store list of interface indexes stored and remove/add based on network changes (use wim api for it, not web browser but see)
+                        builder.mount_events(app);
                         tauri::WebviewWindowBuilder::new(
                             app,
                             "main".to_string(),

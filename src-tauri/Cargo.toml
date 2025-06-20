@@ -18,19 +18,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+rerun_except = "1.0.0"
 
 [dependencies]
-tauri = { version = "2.0.0-rc.15", features = ["unstable", "specta"] }
+tauri = { version = "2.0", features = ["unstable", "specta"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 local-ip-address = "0.5.7"
 rand = "0.3"
-specta = "=2.0.0-rc.20"
-tauri-specta = { version = "=2.0.0-rc.20", features = ["derive", "typescript"] }
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta-typescript = "0.0.9"
+specta = "=2.0.0-rc.22"
 elevated-command = "1.1"
 driver-ipc = { path = "C:/Users/sarve/fleet/virtual-display-rs/rust/driver-ipc" }
 tokio = { version = "1", features = [ "full" ] }
-specta-typescript = "0.0.7"
 tauri-plugin-shell = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-cli = "2"
@@ -39,6 +40,13 @@ tauri-plugin-http = "2.0.0"
 tauri-plugin-store = "2.0.0"
 axum = "0.7.9"
 tauri-plugin-os = "2"
+scopeguard = "1.2.0"
+notify = "8.0.0"
+futures = "0.3.31"
+axum-server = "0.7.2"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+anyhow = "1.0.98"
+wmi = "0.17.2"
 
 [dependencies.windows]
 version = "0.44.0"
@@ -50,6 +58,7 @@ features = [
     "Foundation_Collections",
     "Networking",
     "Networking_Connectivity",
+    "Networking_NetworkOperators",
     "Security_Credentials",
     "Win32_Foundation",
     "Win32_Security",

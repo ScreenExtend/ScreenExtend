@@ -20,7 +20,6 @@ export type User = {
   username: string,
   password: string,
   theme: string,
-  sidebarOpen: boolean,
   devices: Device[],
   sessionPassword: string,
   hostedNetworkCredentials: {
@@ -29,7 +28,6 @@ export type User = {
   },
   dontShowAgain: {
     editDevice: boolean,
-    removeDevice: boolean,
     editNetwork: boolean
   }
 };
@@ -38,7 +36,6 @@ export const defaultUser: User = {
   username: "",
   password: "",
   theme: "system",
-  sidebarOpen: true,
   devices: [],
   sessionPassword: "",
   hostedNetworkCredentials: {
@@ -47,7 +44,6 @@ export const defaultUser: User = {
   },
   dontShowAgain: {
     editDevice: false,
-    removeDevice: false,
     editNetwork: false
   }
 };
@@ -57,7 +53,7 @@ export const AuthProviderContext = createContext<AuthContextType>({ currentUser:
 const UserDB = await Store.load("config.json");
 
 export const createUser = async (information: Partial<User>) => {
-  return await UserDB.set(information.username!, { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend" + (information.username ? "-" + information.username : ""), password: "ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!"}, ...information });
+  return await UserDB.set(information.username!, { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend-" + (information.username !== "GUESTGUESTGUESTGUESTGUEST" ? information.username : "Guest"), password: "ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!"}, ...information });
 };
 
 export const getUser = async (username: string) => {
@@ -65,7 +61,8 @@ export const getUser = async (username: string) => {
 };
 
 export const updateUser = async (username: string, information: Partial<Omit<User, "username">>) => {
-  return await UserDB.set(username, { ...await getUser(username), ...information });
+  if ((await getUser(username))!.username === username)
+    return await UserDB.set(username, { ...await getUser(username), ...information });
 };
 
 export const deleteUser = async (username: string) => {

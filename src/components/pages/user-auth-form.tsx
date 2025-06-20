@@ -23,13 +23,14 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 
-import { AuthProviderContext, getUser, createUser } from "@/components/auth-provider";
+import { AuthProviderContext, getUser, createUser, deleteUser } from "@/components/auth-provider";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { useTheme, type Theme } from "@/components/theme-provider";
-import { useForm } from "react-hook-form";
-import { commands } from "@/lib/bindings";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
 import { cn, generateSlug } from "@/lib/utils";
+import { commands } from "@/lib/bindings";
+import { useForm } from "react-hook-form";
+import { z } from "zod";
 
 const formSchema = z.object({
   username: z.string(),
@@ -37,6 +38,7 @@ const formSchema = z.object({
 });
 export function UserAuthForm() {
   const { setCurrentUser } = useContext(AuthProviderContext);
+  const { windowAuthValues: [authValues, setAuthValues], windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSlug: [, setSlug], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
   const { theme, setTheme } = useTheme();
   const navigate = useNavigate();
 
@@ -54,35 +56,40 @@ export function UserAuthForm() {
   const [showPassword, setShowPassword] = useState(false);
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
+    setAuthValues(values);
     setError(false);
     if (values.username.length === 0) {
       document.getElementById("guestLogin")!.click();
     } else {
       const user = await getUser(values.username);
-      if (!user) {
-        await createUser({username: values.username, password: values.password, theme});
-        setCurrentUser(values.username);
-        const success = await commands.setup();
-        if (success) {
-          window.slug = generateSlug();
-          delete window.qrValues;
-          navigate("/dashboard");
-        } else {
-          setSetupError(true);
-        }
-      } else if (user.password === values.password) {
-        setCurrentUser(values.username);
-        await setTheme(user.theme as Theme);
-        const success = await commands.setup();
-        if (success) {
-          window.slug = generateSlug();
-          delete window.qrValues;
-          navigate("/dashboard");
-        } else {
-          setSetupError(true);
-        }
-      } else {
+      if (user && user.password !== values.password) {
         setError(true);
+      } else {
+        let success;
+        if (!loaded) {
+          success = await commands.setup();
+          setLoaded(success);
+        } else {
+          success = loaded;
+        }
+        if (success) {
+          setOtp("");
+          setHostedNetworkOn(false);
+          setSlug(generateSlug());
+          await commands.removeAllDisplays();
+          await deleteUser("GUESTGUESTGUESTGUESTGUEST");
+          setQrValues([]);
+          if (!user) {
+            await createUser({username: values.username, password: values.password, theme});
+          } else {
+            await setTheme(user.theme as Theme);
+          }
+          setCurrentUser(values.username);
+          await commands.setCurrentUser(values.username);
+          navigate("/dashboard");
+        } else {
+          setSetupError(true);
+        }
       }
     }
   }
@@ -95,7 +102,7 @@ export function UserAuthForm() {
           name="username"
           render={({ field }) => (
             <FormItem className="text-left space-y-0">
-              <FormLabel>Username</FormLabel>
+              <FormLabel>Username <span style={{ color: "red" }}>*</span></FormLabel>
               <FormControl>
                 <Input
                   type="text"
@@ -103,6 +110,7 @@ export function UserAuthForm() {
                   className="outline-none"
                   autoComplete="off"
                   hoverLabel={false}
+                  maxLength={19}
                   {...field}
                 />
               </FormControl>
@@ -148,6 +156,19 @@ export function UserAuthForm() {
             </FormItem>
           )}
         />
+        {/* <div className="flex items-center space-x-2 mb-4">
+          <Checkbox
+            id="rememberMe"
+            checked={rememberMe}
+            onCheckedChange={checked => setRememberMe(checked === true)}
+          />
+          <label
+            htmlFor="rememberMe"
+            className="text-sm text-muted-foreground cursor-pointer"
+          >
+            Keep me logged in
+          </label>
+        </div> */}
         <Button className="w-full" type="submit">
           Submit
         </Button>
@@ -167,8 +188,10 @@ export function UserAuthForm() {
               onClick={async () => {
                 setLoading(true);
                 await commands.installDrivers();
+                await new Promise(resolve => setTimeout(resolve, 5000));
                 setLoading(false);
                 setSetupError(false);
+                await onSubmit(authValues);
               }}
               disabled={loading}
             >

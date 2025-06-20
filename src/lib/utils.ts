@@ -4,23 +4,20 @@ import { twMerge } from "tailwind-merge";
 
 declare global {
     interface Window {
-        hostedNetworkOn?: boolean;
-        otp?: string;
-        slug?: string;
-        qrValues?: { title: string, value: string }[];
+        sidebarSize: number;
     }
 }
 
 export function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
+    return twMerge(clsx(inputs));
 }
 
 export function useFocus<T extends HTMLElement>() {
   const inputRef = React.useRef<T>(null);
   const setInputFocus = () => {
-    if (inputRef.current) {
-      inputRef.current.focus();
-    }
+      if (inputRef.current) {
+          inputRef.current.focus();
+      }
   };
   return { inputRef, setInputFocus };
 }
@@ -31,14 +28,14 @@ export function generateSlug() {
     const charactersLength = characters.length;
     let counter = 0;
     while (counter < 8) {
-      result += characters.charAt(Math.floor(Math.random() * charactersLength));
-      counter += 1;
+        result += characters.charAt(Math.floor(Math.random() * charactersLength));
+        counter += 1;
     }
     return result;
 }
 
 export function useInterval(callback: () => void, delay: number | null): void {
-    const savedCallback = useRef<() => void>();
+    const savedCallback = useRef<() => void>(() => {});
     useEffect(() => {
         savedCallback.current = callback;
     }, [callback]);

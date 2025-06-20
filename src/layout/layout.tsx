@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useContext } from "react";
+import React, { useState, useEffect } from "react";
 
 import { Sidebar } from "@/layout/sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
@@ -6,15 +6,11 @@ import { ProfileMenu } from "@/components/profile-menu";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
-import { AuthProviderContext, getUser, updateUser } from "@/components/auth-provider";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 const appWindow = getCurrentWebviewWindow();
 
 export default function Layout({ children }: { children: React.ReactNode }) {
-  const { currentUser } = useContext(AuthProviderContext);
-
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [firstTime, setFirstTime] = useState(true);
   const [doneOpening, setDoneOpening] = useState(false);
 
   const [sidebarSize, setSidebarSize] = useState(27500/window.innerWidth);
@@ -25,14 +21,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   });
 
   useEffect(() => {
-    async function updateSidebarOpen() {
-      setSidebarOpen((await getUser(currentUser))!.sidebarOpen);
-    }
-    void updateSidebarOpen();
-  }, []);
-
-  useEffect(() => {
-    void updateUser(currentUser, { sidebarOpen });
     const sidebar = document.getElementById("sidebar")!;
     if (!sidebarOpen) {
       sidebar.animate(
@@ -41,7 +29,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           { flexGrow: 0 }
         ],
         {
-          duration: firstTime ? 0 : 250
+          duration: 250
         }
       );
       sidebar.style.flexGrow = "0";
@@ -60,7 +48,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       sidebar.style.flexGrow = sidebarSize.toString();
       setDoneOpening(false);
     }
-    setFirstTime(false);
   }, [sidebarOpen]);
 
   return (

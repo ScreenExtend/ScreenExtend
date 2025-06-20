@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useState, useContext } from "react";
 import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
@@ -15,49 +15,18 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { commands, events } from "@/lib/bindings";
+import { GlobalProviderContext } from "@/components/global-provider";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { events } from "@/lib/bindings";
 const appWindow = getCurrentWebviewWindow();
 
 export default function Dashboard() {
-  const [, forceUpdate] = useReducer(x => x + 1, 0);
-  const [qrValues, setQrValues] = useState<{ title: string, value: string }[]>(window.qrValues || [
-    {
-      title: "Local Hosted Network",
-      value: "",
-    },
-    {
-      title: "Same As Current Device",
-      value: "",
-    },
-    {
-      title: "Any Wifi Network",
-      value: "",
-    }
-  ]);
-  useEffect(() => {
-    window.qrValues = qrValues;
-  }, [qrValues]);
+  const { windowQrValues: [qrValues] } = useContext(GlobalProviderContext);
 
   useEffect(() => {
     const listenURLs = async () => {
-      await events.hostedUrl.listen(event => {
-        if (event.payload === "stop" || !event.payload.startsWith("http")) return;
-        qrValues[0].value = event.payload;
-        setQrValues(qrValues);
-        forceUpdate();
-      });
-      await events.localUrl.listen(event => {
-        qrValues[1].value = event.payload;
-        setQrValues(qrValues);
-        forceUpdate();
-      });
-      await events.globalUrl.listen(event => {
-        qrValues[2].value = event.payload;
-        setQrValues(qrValues);
-        forceUpdate();
-      });
+      // logic for qrValues
       window.addEventListener("online", () => {events.networkChange.emit()});
       window.addEventListener("offline", () => {events.networkChange.emit()});
     }
@@ -89,7 +58,15 @@ export default function Dashboard() {
           }
         </div>
         {qrValues.length ? (
-          <Carousel className="w-full max-w-xs lg:hidden mx-auto">
+          <Carousel className="w-full max-w-xs lg:hidden mx-auto" style={{ msOverflowStyle: "none", scrollbarWidth: "none", overflow: "-moz-scrollbars-none", overflowX: "scroll" }} id={"mainCarousel"}>
+            <style>{`
+              #mainCarousel::-webkit-scrollbar {
+                display: none;
+                background: transparent;
+                width: 0;
+                height: 0;
+              }
+            `}</style>
             <CarouselContent>
               {qrValues.map((qrValue) => (
                 <CarouselItem>

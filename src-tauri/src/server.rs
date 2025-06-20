@@ -26,10 +26,10 @@ impl Server {
         self.router = Some(router);
     }
 
-    pub async fn start(&self) -> Result<(), bool> {
+    pub async fn start(&self) -> bool {
         let addr = match format!("{}:{}", self.host, self.port).parse::<SocketAddr>() {
             Ok(addr) => addr,
-            Err(_) => return Err(false),
+            Err(_) => return false,
         };
 
         let is_running = Arc::clone(&self.is_running);
@@ -37,14 +37,14 @@ impl Server {
         {
             let mut running_guard = is_running.lock().unwrap();
             if *running_guard {
-                return Err(false);
+                return false;
             }
             *running_guard = true;
         }
 
         let app = match &self.router {
             Some(router) => router.clone(),
-            None => return Err(false),
+            None => return false,
         };
 
         task::spawn(async move {
@@ -52,17 +52,12 @@ impl Server {
             axum::serve(listener, app).await.unwrap();
         });
 
-        Ok(())
+        true
     }
 
-    pub fn stop(&self) -> Result<(), String> {
+    pub fn stop(&self) {
         let mut running_guard = self.is_running.lock().unwrap();
-        if !*running_guard {
-            return Err("Server is not running".to_string());
-        }
-
+        if !*running_guard {}
         *running_guard = false;
-        println!("Server stopped.");
-        Ok(())
     }
 }
