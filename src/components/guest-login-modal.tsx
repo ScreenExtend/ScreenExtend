@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, createUser } from "@/components/auth-provider";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { commands } from "@/lib/bindings";
 import { generateSlug } from "@/lib/utils";
 import { useTheme } from "@/components/theme-provider";
@@ -23,17 +24,29 @@ export function GuestLoginModal() {
   const { setCurrentUser } = useContext(AuthProviderContext);
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
-  const { theme } = useTheme();
+  const { theme, setTheme } = useTheme();
+  const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSlug: [, setSlug], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
 
   return (
     <>
-      <Button variant="outline" size="sm" className="w-full justify-center" onClick={async () => {
-        await createUser({username: "", password: "", theme});
-        setCurrentUser("");
-        const success = await commands.setup();
+      <Button variant="outline" size="sm" className="w-full justify-center" id="guestLogin" onClick={async () => {
+        let success;
+        if (!loaded) {
+          success = await commands.setup();
+          setLoaded(success);
+        } else {
+          success = loaded;
+        }
         if (success) {
-          window.slug = generateSlug();
-          delete window.qrValues;
+          setOtp("");
+          setHostedNetworkOn(false);
+          setSlug(generateSlug());
+          await commands.removeAllDisplays();
+          setQrValues([]);
+          await createUser({username: "GUESTGUESTGUESTGUESTGUEST", password: "", theme});
+          setTheme(theme);
+          setCurrentUser("GUESTGUESTGUESTGUESTGUEST");
+          await commands.setCurrentUser("GUESTGUESTGUESTGUESTGUEST");
           navigate("/dashboard");
         } else {
           setError(true);
@@ -57,8 +70,10 @@ export function GuestLoginModal() {
               onClick={async () => {
                 setLoading(true);
                 await commands.installDrivers();
+                await new Promise(resolve => setTimeout(resolve, 5000));
                 setLoading(false);
                 setError(false);
+                document.getElementById("guestLogin")!.click();
               }}
               disabled={loading}
             >

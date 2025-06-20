@@ -15,7 +15,7 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
             id={id}
             placeholder={" "}
             className={cn(
-              "bg-transparent rounded-lg appearance-none peer flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0",
+              "bg-transparent appearance-none peer flex h-10 w-full border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0 rounded-md",
               className
             )}
             ref={inputRef}
@@ -32,7 +32,7 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
             id={id}
             placeholder={placeholder}
             className={cn(
-              "bg-transparent rounded-lg appearance-none peer flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 rounded-lg border bg-card text-card-foreground shadow-sm focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0",
+              "bg-transparent appearance-none peer flex h-10 w-full border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0 rounded-lg bg-card text-card-foreground shadow-sm",
               className
             )}
             ref={inputRef}

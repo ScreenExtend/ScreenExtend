@@ -29,7 +29,7 @@ export function ThemeProvider({
   ...props
 }: ThemeProviderProps) {
   const { currentUser } = useContext(AuthProviderContext);
-  
+
   const [theme, setTheme] = useState<Theme>(defaultTheme);
   void updateUser(currentUser, { theme });
 

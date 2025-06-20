@@ -1,7 +1,7 @@
 import React, { useState, useContext } from "react";
 
-import { Slider } from "../ui/slider";
-import { Checkbox } from "../ui/checkbox";
+import { Slider } from "@/components/ui/slider";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -324,8 +324,6 @@ export function DeviceDetails({ device }: { device: Device }) {
 //};
 
 export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
-  const [dontShowAgain, setDontShowAgain] = useState(true);
-
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
@@ -344,19 +342,6 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
             This action cannot be undone. The device will immediately disconnect but can reconnect for future sessions.
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="flex items-center space-x-2 mb-4">
-          <Checkbox
-            id="dontShowAgain"
-            checked={dontShowAgain}
-            onCheckedChange={checked => setDontShowAgain(checked === true)}
-          />
-          <label
-            htmlFor="dontShowAgain"
-            className="text-sm text-muted-foreground cursor-pointer"
-          >
-            Don't show this message again
-          </label>
-        </div>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction

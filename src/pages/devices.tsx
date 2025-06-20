@@ -29,7 +29,17 @@ import { cn } from "@/lib/utils";
 
 export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
-  const [devices, setDevices] = useState<Device[]>([]);
+  const [devices, setDevices] = useState<Device[]>([
+    {
+      ip: "192.168.88.34",
+      name: "Laptop",
+      scale: 1,
+      orientation: "Portrait",
+      refreshRate: 60,
+      os: "Windows",
+      screenSize: "1920x1080"
+    }
+  ]);
   const { toast } = useToast();
 
   useEffect(() => {

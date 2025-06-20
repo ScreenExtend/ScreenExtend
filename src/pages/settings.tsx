@@ -36,19 +36,20 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { useToast } from "@/components/ui/use-toast";
-import { commands, events } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 export default function Settings() {
   const { currentUser } = useContext(AuthProviderContext);
+  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
 
   const characters = "0123456789";
-  const [otp, setOtp] = React.useState(/^[A-Z0-9]{6}$/.test(window.otp!) ? window.otp! : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
+  setOtp(/^[A-Z0-9]{6}$/.test(otp!) ? otp! : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
   const [spin, setSpin] = useState(false);
 
-  const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState("ScreenExtend");
   const [hostedNetworkPassword, setHostedNetworkPassword] = useState("12345678");
@@ -63,9 +64,6 @@ export default function Settings() {
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
-    if (!/^[a-zA-Z0-9 ]+$/.test(value)) {
-      value = value.replace(/[^a-zA-Z0-9 ]/g, "");
-    }
     if (value.length > 32) {
       value = value.substring(0, 32);
     }
@@ -78,7 +76,7 @@ export default function Settings() {
 
   const togglePasswordVisibility = (type: "sessionPassword" | "accountPassword" | "hostedNetworkPassword") => {
     if (type === "accountPassword") {
-      if (currentUser.length === 0) return;
+      if (currentUser === "GUESTGUESTGUESTGUESTGUEST") return;
       setShowAccountPassword(prev => !prev);
     } else {
       if (!hostedNetworkOn) return;
@@ -86,24 +84,7 @@ export default function Settings() {
     }
   }
 
-  const startHostedNetworkWithIP = async (name: string, password: string) => {
-    const ips1 = await commands.getPrivateIpAddresses();
-    const success = await commands.startHostedNetwork(name, password);
-    const ips2 = await commands.getPrivateIpAddresses();
-    if (success && ips2.length - ips1.length === 1) {
-      const set1 = new Set(ips1);
-      await events.hostedUrl.emit(ips2.find(item => !set1.has(item))!);
-      await new Promise(events.hostedUrl.once);
-      return true;
-    } else {
-      await events.hostedUrl.emit("stop");
-      await new Promise(events.hostedUrl.once);
-      return false;
-    }
-  }
-
   useEffect(() => {
-    setHostedNetworkOn(window.hostedNetworkOn!);
     async function updateText() {
       const user = (await getUser(currentUser))!;
       setHostedNetworkName(user.hostedNetworkCredentials.name);
@@ -128,10 +109,6 @@ export default function Settings() {
   useEffect(() => {
     void updateUser(currentUser, {hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword]);
-
-  useEffect(() => {
-    window.otp = otp;
-  }, [otp]);
 
   return (
     <Layout>
@@ -194,29 +171,26 @@ export default function Settings() {
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
                     if (!hostedNetworkOn) {
-                      await events.hostedUrl.emit("stop");
-                      await new Promise(events.hostedUrl.once);
-                      const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
+                      await commands.stopHostedNetwork();
+                      const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
                         setHostedNetworkOn(true);
-                        window.hostedNetworkOn = true;
                         toast({
                           title: "Network Creation Success",
                           description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
                         });
                       } else {
+                        await commands.stopHostedNetwork();
+                        setHostedNetworkOn(false);
                         toast({
                           title: "Network Creation Failure",
-                          description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card.",
+                          description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card, such as hotspot.",
                         });
                       }
                     } else {
-                      window.hostedNetworkOn = false;
-                      await events.hostedUrl.emit("stop");
-                      await new Promise(events.hostedUrl.once);
-                      if (hostedNetworkPassword.length < 8) {
-                        setHostedNetworkPassword(oldHostedNetworkPassword);
-                      }
+                      await commands.stopHostedNetwork();
+                      setHostedNetworkName(oldHostedNetworkName);
+                      setHostedNetworkPassword(oldHostedNetworkPassword);
                       setShowHostedNetworkPassword(false);
                       setHostedNetworkOn(false);
                       toast({
@@ -297,9 +271,8 @@ export default function Settings() {
                       if (!(await getUser(currentUser))!.dontShowAgain.editNetwork) {
                         setHostedNetworkModalOpen(true);
                       } else {
-                        await events.hostedUrl.emit("stop");
-                        await new Promise(events.hostedUrl.once);
-                        const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
+                        await commands.stopHostedNetwork();
+                        const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
                         if (success) {
                           setOldHostedNetworkName(hostedNetworkName);
                           setOldHostedNetworkPassword(hostedNetworkPassword);
@@ -308,6 +281,8 @@ export default function Settings() {
                             description: "The network settings have successfully been updated.",
                           });
                         } else {
+                          setHostedNetworkName(oldHostedNetworkName);
+                          setHostedNetworkPassword(oldHostedNetworkPassword);
                           toast({
                             title: "Network Settings Update Failure",
                             description: "The was an error in updating the network settings.",
@@ -332,7 +307,7 @@ export default function Settings() {
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0",
-                  currentUser.length === 0 && "cursor-not-allowed select-none"
+                  currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
                  )}
               >
                 <div className="relative outline-none flex-1">
@@ -342,32 +317,32 @@ export default function Settings() {
                     className="outline-none"
                     defaultValue={accountPassword}
                     onChange={event => setAccountPassword(event.target.value)}
-                    disabled={currentUser.length === 0}
+                    disabled={currentUser === "GUESTGUESTGUESTGUESTGUEST"}
                     id="changePasswordInput"
                     hoverLabel={true}
                   />
                   <div
                     className={cn(
                       "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
-                      currentUser.length === 0 && "cursor-not-allowed select-none"
+                      currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
                     )}
                   >
                     {showAccountPassword ? (
                       <EyeOff
                         className="h-5 w-5"
-                        style={{ opacity: currentUser.length === 0 ? 0.5 : 1 }}
+                        style={{ opacity: currentUser === "GUESTGUESTGUESTGUESTGUEST" ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility("accountPassword")}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
-                        style={{ opacity: currentUser.length === 0 ? 0.5 : 1 }}
+                        style={{ opacity: currentUser === "GUESTGUESTGUESTGUESTGUEST" ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility("accountPassword")}
                       />
                     )}
                   </div>
                 </div>
-                <Button disabled={currentUser.length === 0} onClick={async () => {
+                <Button disabled={currentUser === "GUESTGUESTGUESTGUESTGUEST"} onClick={async () => {
                   setShowAccountPassword(false);
                   if ((await getUser(currentUser))!.password !== accountPassword) {
                     await updateUser(currentUser, { password: accountPassword });
@@ -421,9 +396,8 @@ export default function Settings() {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                await events.hostedUrl.emit("stop");
-                await new Promise(events.hostedUrl.once);
-                const success = await startHostedNetworkWithIP(hostedNetworkName, hostedNetworkPassword);
+                await commands.stopHostedNetwork();
+                const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
                 await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editNetwork: dontShowAgain}});
                 if (success) {
@@ -434,6 +408,8 @@ export default function Settings() {
                     description: "The network settings have successfully been updated.",
                   });
                 } else {
+                  setHostedNetworkName(oldHostedNetworkName);
+                  setHostedNetworkPassword(oldHostedNetworkPassword);
                   toast({
                     title: "Network Settings Update Failure",
                     description: "The was an error in updating the network settings.",
