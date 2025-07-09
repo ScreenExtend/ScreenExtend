@@ -8,11 +8,11 @@ export const commands = {
 async setup() : Promise<boolean> {
     return await TAURI_INVOKE("setup");
 },
-async getDevices() : Promise<void> {
-    await TAURI_INVOKE("get_devices");
-},
 async setCurrentUser(currentUser: string) : Promise<void> {
     await TAURI_INVOKE("set_current_user", { currentUser });
+},
+async exitApp() : Promise<void> {
+    await TAURI_INVOKE("exit_app");
 },
 async getNetworkAdapters() : Promise<NetworkInfo[]> {
     return await TAURI_INVOKE("get_network_adapters");

@@ -16,8 +16,6 @@ import { AuthProviderContext, deleteUser } from "@/components/auth-provider";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
-import { useTheme } from "@/components/theme-provider";
-import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
@@ -56,17 +54,15 @@ function App() {
   const [authValues, setAuthValues] = useState({ username: "", password: "" });
 
   const [closing, setClosing] = useState(false);
-  const { setTheme } = useTheme();
-  const { dismiss } = useToast();
 
   void appWindow.onCloseRequested(async () => {
     setClosing(true);
-    await commands.stopHostedNetwork();
-    await commands.removeAllDisplays();
-    dismiss();
-    await setTheme("system");
     await deleteUser("GUESTGUESTGUESTGUESTGUEST");
-    await appWindow.destroy();
+    try {
+      await commands.removeAllDisplays();
+    } finally {
+      await commands.exitApp();
+    }
   });
 
   return (

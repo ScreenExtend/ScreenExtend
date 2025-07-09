@@ -42,7 +42,8 @@ export function UserAuthForm() {
   const { theme, setTheme } = useTheme();
   const navigate = useNavigate();
 
-  const [error, setError] = useState(false);
+  const [usernameError, setUsernameError] = useState(false);
+  const [passwordError, setPasswordError] = useState(false);
   const [setupError, setSetupError] = useState(false);
   const [loading, setLoading] = useState(false);
 
@@ -57,13 +58,14 @@ export function UserAuthForm() {
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
     setAuthValues(values);
-    setError(false);
+    setUsernameError(false);
+    setPasswordError(false);
     if (values.username.length === 0) {
-      document.getElementById("guestLogin")!.click();
+      setUsernameError(true);
     } else {
       const user = await getUser(values.username);
       if (user && user.password !== values.password) {
-        setError(true);
+        setPasswordError(true);
       } else {
         let success;
         if (!loaded) {
@@ -104,15 +106,18 @@ export function UserAuthForm() {
             <FormItem className="text-left space-y-0">
               <FormLabel>Username <span style={{ color: "red" }}>*</span></FormLabel>
               <FormControl>
-                <Input
-                  type="text"
-                  placeholder="Username"
-                  className="outline-none"
-                  autoComplete="off"
-                  hoverLabel={false}
-                  maxLength={19}
-                  {...field}
-                />
+                <div className="relative outline-none" style={{ marginBottom: "20px" }}>
+                  <Input
+                    type="text"
+                    placeholder="Username"
+                    className={cn("outline-none", usernameError && "border-red-500 focus:ring-red-500")}
+                    autoComplete="off"
+                    hoverLabel={false}
+                    maxLength={19}
+                    {...field}
+                  />
+                  <p style={{ display: (usernameError ? "initial" : "none"), position: "absolute", marginTop: "3px" }} className="text-red-500 text-xs">Invalid username (try logging in as guest instead)</p>
+                </div>
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -129,10 +134,7 @@ export function UserAuthForm() {
                   <Input
                     type={showPassword ? "text" : "password"}
                     placeholder="Password"
-                    className={cn(
-                          "outline-none",
-                      error && "border-red-500 focus:ring-red-500"
-                    )}
+                    className={cn("outline-none", passwordError && "border-red-500 focus:ring-red-500")}
                     autoComplete="off"
                     hoverLabel={false}
                     {...field}
@@ -150,7 +152,7 @@ export function UserAuthForm() {
                       />
                     )}
                   </div>
-                  <p style={{ display: (error ? "initial" : "none"), position: "absolute", marginTop: "3px" }} className="text-red-500 text-xs">Incorrect password</p>
+                  <p style={{ display: (passwordError ? "initial" : "none"), position: "absolute", marginTop: "3px" }} className="text-red-500 text-xs">Incorrect password</p>
                 </div>
               </FormControl>
             </FormItem>

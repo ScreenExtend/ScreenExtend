@@ -3,10 +3,10 @@ use driver_ipc::{Mode, Monitor};
 use elevated_command::Command;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::path::BaseDirectory;
-use tauri::Manager;
 use std::process::Command as StdCommand;
+use tauri::path::BaseDirectory;
 use tauri::AppHandle;
+use tauri::Manager;
 use tauri::State;
 use tauri_specta::Event;
 

@@ -15,22 +15,27 @@ use windows::Devices::WiFiDirect::{
 use windows::Foundation::TypedEventHandler;
 use windows::Security::Credentials::PasswordCredential;
 
-use windows::Networking::{
-    Connectivity::*,
-    NetworkOperators::*,
-};
+use windows::Networking::{Connectivity::*, NetworkOperators::*};
 
 fn start_wifi_direct_(
     name: &str,
     password: &str,
     success_tx: Sender<bool>,
 ) -> Result<WiFiDirectAdvertisementPublisher> {
-    let connection_profile = NetworkInformation::GetInternetConnectionProfile().expect("error while getting connection profile");
-    let tethering_manager = NetworkOperatorTetheringManager::CreateFromConnectionProfile(&connection_profile).expect("error while cretaing connection profile");
-    let initial_state = tethering_manager.TetheringOperationalState().expect("error while finding operational state");
-    if initial_state != windows::Networking::NetworkOperators::TetheringOperationalState(2)  {
+    let connection_profile = NetworkInformation::GetInternetConnectionProfile()
+        .expect("error while getting connection profile");
+    let tethering_manager =
+        NetworkOperatorTetheringManager::CreateFromConnectionProfile(&connection_profile)
+            .expect("error while cretaing connection profile");
+    let initial_state = tethering_manager
+        .TetheringOperationalState()
+        .expect("error while finding operational state");
+    if initial_state != windows::Networking::NetworkOperators::TetheringOperationalState(2) {
         success_tx.send(false).expect("error while sending status");
-        return Err(windows::core::Error::new(windows::core::HRESULT(1), windows::core::HSTRING::from("error while starting hotspot")));
+        return Err(windows::core::Error::new(
+            windows::core::HRESULT(1),
+            "error while starting hotspot",
+        ));
     }
 
     let publisher = WiFiDirectAdvertisementPublisher::new()?;
@@ -43,10 +48,7 @@ fn start_wifi_direct_(
         WiFiDirectAdvertisementPublisher,
         WiFiDirectAdvertisementPublisherStatusChangedEventArgs,
     >::new(move |_sender, args| {
-        let status = args
-            .as_ref()
-            .expect("no args")
-            .Status()?;
+        let status = args.as_ref().expect("no args").Status()?;
         match status {
             WiFiDirectAdvertisementPublisherStatus::Started => {
                 success_tx.send(true).expect("error while sending status")
@@ -131,7 +133,7 @@ pub fn start_hosted_network(
             Err(_) => {
                 *state.hosted_network_running.lock().unwrap() = false;
                 return *state.hosted_network_running.lock().unwrap();
-            },
+            }
         };
         if !success_rx.recv().unwrap() {
             *state.hosted_network_running.lock().unwrap() = false;
