@@ -1,6 +1,6 @@
 pub mod hosted_network;
-pub mod virtual_display;
 pub mod networking;
+pub mod virtual_display;
 
 pub struct AppState {}
 

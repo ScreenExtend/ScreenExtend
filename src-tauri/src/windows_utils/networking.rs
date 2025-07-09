@@ -1,10 +1,10 @@
-use tauri::{AppHandle, State};
-use wmi::{COMLibrary, WMIConnection};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri_specta::Event;
+use std::collections::HashMap;
+use tauri::{AppHandle, State};
 use tauri_plugin_store::StoreExt;
+use tauri_specta::Event;
+use wmi::{COMLibrary, WMIConnection};
 
 use super::hosted_network::is_hosted_network;
 use super::AppState;
@@ -74,7 +74,10 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
     let mut ip_map: HashMap<u32, Vec<&NetIPAddress>> = HashMap::new();
     for ip in &ip_addresses {
         if let Some(interface_index) = ip.interface_index {
-            ip_map.entry(interface_index).or_insert_with(Vec::new).push(ip);
+            ip_map
+                .entry(interface_index)
+                .or_insert_with(Vec::new)
+                .push(ip);
         }
     }
 
@@ -89,12 +92,18 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         .iter()
         .filter_map(|adapter| {
             if let Some(interface_index) = adapter.interface_index {
-                let network_name = if adapter.driver_description.as_deref() == Some("Microsoft Wi-Fi Direct Virtual Adapter") {
+                let network_name = if adapter.driver_description.as_deref()
+                    == Some("Microsoft Wi-Fi Direct Virtual Adapter")
+                {
                     if is_hosted_network(app.clone(), state.clone()) {
                         let temporary_name = match app.store("config.json") {
                             Ok(config) => {
-                                if let Some(user_data) = config.get(state.current_user.lock().unwrap().clone()) {
-                                    if let Some(credentials) = user_data.get("hostedNetworkCredentials") {
+                                if let Some(user_data) =
+                                    config.get(state.current_user.lock().unwrap().clone())
+                                {
+                                    if let Some(credentials) =
+                                        user_data.get("hostedNetworkCredentials")
+                                    {
                                         if let Some(name) = credentials.get("name") {
                                             name.as_str().unwrap_or("Unknown").to_string()
                                         } else {
@@ -107,9 +116,7 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
                                     "Unknown".to_string()
                                 }
                             }
-                            Err(_) => {
-                                "Unknown".to_string()
-                            }
+                            Err(_) => "Unknown".to_string(),
                         };
                         if temporary_name == "Unknown" {
                             if state.current_user.lock().unwrap().len() > 0 {
@@ -131,11 +138,13 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
                     }
                 };
                 let ip_addresses = if let Some(ips) = ip_map.get(&interface_index) {
-                    let ipv4_addresses: Vec<String> = ips.iter()
+                    let ipv4_addresses: Vec<String> = ips
+                        .iter()
                         .filter(|ip| ip.address_family == Some(2))
                         .filter_map(|ip| ip.ip_address.clone())
                         .collect();
-                    let ipv6_addresses: Vec<String> = ips.iter()
+                    let ipv6_addresses: Vec<String> = ips
+                        .iter()
                         .filter(|ip| ip.address_family == Some(23))
                         .filter_map(|ip| ip.ip_address.clone())
                         .collect();

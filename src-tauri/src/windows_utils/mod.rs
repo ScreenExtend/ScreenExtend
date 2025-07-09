@@ -1,12 +1,12 @@
 pub mod hosted_network;
-pub mod virtual_display;
 pub mod networking;
+pub mod virtual_display;
 
 use driver_ipc::DriverClient;
 use std::sync::Mutex;
 use tauri::Manager;
-use tokio::sync::Mutex as TokioMutex;
 use tauri::State;
+use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
     pub driver_client: TokioMutex<DriverClient>,

@@ -1,16 +1,16 @@
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-
-use rand::Rng;
+//use rand::Rng;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
-use tauri::Emitter;
+//use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_shell::ShellExt;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
-mod server;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use fs4::fs_std::FileExt;
+use std::fs::OpenOptions;
 
 #[cfg(target_os = "windows")]
 mod windows_utils;
@@ -58,37 +58,45 @@ struct Device {
     screen_size: String,
 }
 
+//#[tauri::command]
+//#[specta::specta]
+//fn get_devices(app: tauri::AppHandle) {
+//    let mut rng = rand::thread_rng();
+//    let device = Device {
+//        ip: format!(
+//            "192.168.{}.{}",
+//            rng.gen_range(1, 256),
+//            rng.gen_range(1, 256)
+//        ),
+//        name: format!("Device {}", rng.gen_range(1, 10)),
+//        scale: rng.gen_range(1, 9) * 25,
+//        orientation: if rng.gen_range(0, 2) == 1 {
+//            "Portrait".to_string()
+//        } else {
+//            "Landscape".to_string()
+//        },
+//        refresh_rate: rng.gen_range(15, 500),
+//        os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
+//            .to_string(),
+//        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
+//    };
+//    let _ = app.emit("device_join", device);
+//}
+
 #[tauri::command]
 #[specta::specta]
-fn get_devices(app: tauri::AppHandle) {
-    let mut rng = rand::thread_rng();
-    let device = Device {
-        ip: format!(
-            "192.168.{}.{}",
-            rng.gen_range(1, 256),
-            rng.gen_range(1, 256)
-        ),
-        name: format!("Device {}", rng.gen_range(1, 10)),
-        scale: rng.gen_range(1, 9) * 25,
-        orientation: if rng.gen_range(0, 2) == 1 {
-            "Portrait".to_string()
-        } else {
-            "Landscape".to_string()
-        },
-        refresh_rate: rng.gen_range(15, 500),
-        os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
-            .to_string(),
-        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
-    };
-    let _ = app.emit("device_join", device);
+fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             setup,
-            get_devices,
+//            get_devices,
             set_current_user,
+            exit_app,
             networking::get_network_adapters,
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
@@ -114,6 +122,7 @@ pub fn run() {
         .expect("error while exporting typescript bindings");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_shell::init())
@@ -246,16 +255,39 @@ pub fn run() {
                         app.handle().exit(0);
                     }
                     _ => {
-                        match tokio::task::block_in_place(|| std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 5363)))) {
-                            Ok(_) => {
-                                tauri::async_runtime::spawn(async move {
-                                    let app = axum::Router::new().route("/", axum::routing::get(|| async { "ScreenExtend Echo Server" }));
-                                    axum_server::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 5363))).serve(app.into_make_service()).await.unwrap();
-                                });
+                        let lock_file_path = app.path().resource_dir().unwrap().join("app.lock");
+                        let file = OpenOptions::new().write(true).create(true).open(lock_file_path);
+                        let mut result = true;
+                        if let Err(_) = file {
+                            result = app.dialog()
+                                .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
+                                .title("ScreenExtend")
+                                .buttons(MessageDialogButtons::OkCancel)
+                                .blocking_show();
+                        } else if let Ok(file) = file {
+                            let try_lock = file.try_lock_exclusive();
+                            if let Err(_) = try_lock {
+                                result = app.dialog()
+                                    .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
+                                    .title("ScreenExtend")
+                                    .buttons(MessageDialogButtons::OkCancel)
+                                    .blocking_show();
+                            } else if let Ok(can_lock) = try_lock {
+                                if can_lock {
+                                    tauri::async_runtime::spawn(async move {
+                                        let _ = file.lock_exclusive();
+                                    });
+                                } else {
+                                    result = app.dialog()
+                                        .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
+                                        .title("ScreenExtend")
+                                        .buttons(MessageDialogButtons::OkCancel)
+                                        .blocking_show();
+                                }
                             }
-                            Err(_) => {
-                                std::process::exit(0);
-                            }
+                        }
+                        if !result {
+                            std::process::exit(0);
                         }
                         // first time - iter over networks and ip addresses, host server on ip/port, if successful then break, otherwise continue, if all ips are out, show blurred qr code and error (underlying qr code is blank)
                         // store list of interface indexes stored and remove/add based on network changes (use wim api for it, not web browser but see)
