@@ -75,12 +75,12 @@ export function UserAuthForm() {
           success = loaded;
         }
         if (success) {
-          setOtp("");
+          setOtp([...Array(6)].reduce(a=>a+"0123456789"[~~(Math.random()*"0123456789".length)], ""));
           setHostedNetworkOn(false);
           setSlug(generateSlug());
           await commands.removeAllDisplays();
           await deleteUser("GUESTGUESTGUESTGUESTGUEST");
-          setQrValues([]);
+          setQrValues([{ title: "Local Hosted Network", value: "https://screenextend.app/ascsa" }, { title: "Same As Current Device", value: "https://screenextend.app/adb" }, { title: "Any Wifi Network", value: "https://screenextend.app/" }]);
           if (!user) {
             await createUser({username: values.username, password: values.password, theme});
           } else {
@@ -184,9 +184,9 @@ export function UserAuthForm() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={loading} onClick={() => setSetupError(false)}>Go Back</AlertDialogCancel>
+            <AlertDialogCancel disabled={loading} onClick={() => setSetupError(false)} className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50">Go Back</AlertDialogCancel>
             <AlertDialogAction
-              className="bg-blue-600 hover:bg-blue-700 text-white"
+              className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {
                 setLoading(true);
                 await commands.installDrivers();

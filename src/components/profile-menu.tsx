@@ -1,4 +1,4 @@
-import { useContext } from "react";
+import { useContext, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { ReactSVG } from "react-svg";
@@ -39,6 +39,8 @@ export function ProfileMenu() {
   const { dismiss } = useToast();
   const navigate = useNavigate();
   const { windowAuthValues: [, setAuthValues], windowLoaded: [, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSlug: [, setSlug], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
+  const [disabled, setDisabled] = useState(false);
+  const [open, setOpen] = useState(false);
 
   const logout = async () => {
     await commands.stopHostedNetwork();
@@ -95,12 +97,18 @@ export function ProfileMenu() {
               "cursor-pointer",
               currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
             )}
-            onClick={event => event.preventDefault()}
+            onClick={(event: React.MouseEvent<HTMLDivElement>) => {
+              event.preventDefault();
+            }}
             disabled={currentUser === "GUESTGUESTGUESTGUESTGUEST"}
           >
             <Trash2 className="mr-2 h-4 w-4" />
-            <AlertDialog open={currentUser === "GUESTGUESTGUESTGUESTGUEST" ? false : undefined}>
-              <AlertDialogTrigger asChild>
+            <AlertDialog open={currentUser === "GUESTGUESTGUESTGUESTGUEST" ? false : open}>
+              <AlertDialogTrigger asChild onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
+                event.preventDefault();
+                setDisabled(false);
+                setOpen(true);
+              }}>
                 <span style={{ color: "red" }}><b>Delete Account</b></span>
               </AlertDialogTrigger>
               <AlertDialogContent>
@@ -111,14 +119,18 @@ export function ProfileMenu() {
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogCancel disabled={disabled} className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50" onClick={() => setOpen(false)}>Cancel</AlertDialogCancel>
                   <AlertDialogAction
-                    className="bg-red-600 hover:bg-red-700 text-white"
-                    onClick={async () => {
+                    className="bg-red-600 hover:bg-red-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
+                    onClick={async (event: React.MouseEvent<HTMLButtonElement>) => {
+                      event.preventDefault();
+                      setDisabled(true);
                       await logout();
                       await deleteUser(currentUser);
+                      setOpen(false);
                       navigate("/");
                     }}
+                    disabled={disabled}
                   >
                     Continue
                   </AlertDialogAction>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useContext } from "react";
 
 import { Sidebar } from "@/layout/sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
@@ -7,11 +7,13 @@ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { GlobalProviderContext } from "@/components/global-provider";
 const appWindow = getCurrentWebviewWindow();
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [doneOpening, setDoneOpening] = useState(false);
+  const { windowOtp: [otp] } = useContext(GlobalProviderContext);
 
   const [sidebarSize, setSidebarSize] = useState(27500/window.innerWidth);
   void appWindow.onResized(({ payload: size }) => {
@@ -85,6 +87,10 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             {children}
           </div>
           <div className="flex items-center justify-end p-4 border-t">
+            <div className="flex items-center space-x-2 mx-2 text-lg">
+              <p>Session OTP: {otp}</p>
+            </div>
+            <div className="flex-1"></div>
             <div className="flex items-center space-x-2">
               <ModeToggle />
             </div>

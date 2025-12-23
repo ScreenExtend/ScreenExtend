@@ -23,6 +23,7 @@ const appWindow = getCurrentWebviewWindow();
 
 export default function Dashboard() {
   const { windowQrValues: [qrValues] } = useContext(GlobalProviderContext);
+  console.log(qrValues);
 
   useEffect(() => {
     const listenURLs = async () => {
@@ -165,6 +166,7 @@ function QrModalComponent({ value }: { value: string }) {
         dismissible
         show={openModal}
         onClose={() => setOpenModal(false)}
+        className="bg-black bg-opacity-75"
       >
         <Modal.Body id="mainQRCodeOuter">
           <QRCode

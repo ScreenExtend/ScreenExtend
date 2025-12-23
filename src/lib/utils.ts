@@ -1,10 +1,15 @@
 import React, { useEffect, useRef } from "react";
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { commands } from "./bindings";
+
+window.commands = commands;
 
 declare global {
     interface Window {
         sidebarSize: number;
+        otp: string;
+        commands: any;
     }
 }
 
@@ -13,13 +18,13 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 export function useFocus<T extends HTMLElement>() {
-  const inputRef = React.useRef<T>(null);
-  const setInputFocus = () => {
-      if (inputRef.current) {
-          inputRef.current.focus();
-      }
-  };
-  return { inputRef, setInputFocus };
+    const inputRef = React.useRef<T>(null);
+    const setInputFocus = () => {
+        if (inputRef.current) {
+            inputRef.current.focus();
+        }
+    };
+    return { inputRef, setInputFocus };
 }
 
 export function generateSlug() {
