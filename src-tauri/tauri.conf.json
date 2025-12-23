@@ -3,7 +3,7 @@
   "productName": "ScreenExtend",
   "mainBinaryName": "ScreenExtend",
   "version": "1.0.0",
-  "identifier": "com.screenextend.app",
+  "identifier": "com.epiccodewizard.screenextend",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",

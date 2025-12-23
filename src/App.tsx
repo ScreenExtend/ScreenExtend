@@ -36,20 +36,7 @@ function App() {
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [otp, setOtp] = useState("");
   const [slug, setSlug] = useState("");
-  const [qrValues, setQrValues] = useState([
-    {
-      title: "Local Hosted Network",
-      value: "https://screenextend.app/ascsa",
-    },
-    {
-      title: "Same As Current Device",
-      value: "https://screenextend.app/adb",
-    },
-    {
-      title: "Any Wifi Network",
-      value: "https://screenextend.app/",
-    }
-  ] as { title: string; value: string; }[]);
+  const [qrValues, setQrValues] = useState([] as { title: string; value: string; }[]);
   const [loaded, setLoaded] = useState(false);
   const [authValues, setAuthValues] = useState({ username: "", password: "" });
 

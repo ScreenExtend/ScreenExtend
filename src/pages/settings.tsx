@@ -46,10 +46,7 @@ export default function Settings() {
   const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
 
-  const characters = "0123456789";
-  setOtp(/^[A-Z0-9]{6}$/.test(otp!) ? otp! : [...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
   const [spin, setSpin] = useState(false);
-
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState("ScreenExtend");
   const [hostedNetworkPassword, setHostedNetworkPassword] = useState("12345678");
@@ -57,6 +54,8 @@ export default function Settings() {
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState(hostedNetworkPassword);
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
   const [hostedNetworkModalOpen, setHostedNetworkModalOpen] = useState(false);
+  const [disabled, setDisabled] = useState(false);
+  const [inputDisabled, setInputDisabled] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
 
   const [accountPassword, setAccountPassword] = useState("");
@@ -79,7 +78,7 @@ export default function Settings() {
       if (currentUser === "GUESTGUESTGUESTGUESTGUEST") return;
       setShowAccountPassword(prev => !prev);
     } else {
-      if (!hostedNetworkOn) return;
+      if ((!hostedNetworkOn || inputDisabled)) return;
       setShowHostedNetworkPassword(prev => !prev);
     }
   }
@@ -100,7 +99,7 @@ export default function Settings() {
     if (spin) {
       const timer = setTimeout(() => {
         setSpin(false);
-        setOtp([...Array(6)].reduce(a=>a+characters[~~(Math.random()*characters.length)], ""));
+        setOtp([...Array(6)].reduce(a=>a+"0123456789"[~~(Math.random()*"0123456789".length)], ""));
       }, 500);
       return () => clearTimeout(timer);
     }
@@ -170,7 +169,7 @@ export default function Settings() {
                 <Switch
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
-                    if (!hostedNetworkOn) {
+                    if ((!hostedNetworkOn || inputDisabled)) {
                       await commands.stopHostedNetwork();
                       const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
                       if (success) {
@@ -214,7 +213,7 @@ export default function Settings() {
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0",
-                  !hostedNetworkOn && "cursor-not-allowed select-none"
+                  (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none"
                 )}
               >
                 <div className="relative outline-none flex-1">
@@ -223,7 +222,7 @@ export default function Settings() {
                     placeholder="Network Name"
                     className="outline-none"
                     value={hostedNetworkName}
-                    disabled={!hostedNetworkOn}
+                    disabled={(!hostedNetworkOn || inputDisabled)}
                     onChange={handleNetworkNameChange}
                     onBlur={() => setHostedNetworkName(hostedNetworkName.trim())}
                     hoverLabel={true}
@@ -238,7 +237,7 @@ export default function Settings() {
                       hostedNetworkPassword.length < 8 && "border-red-500 focus:ring-red-500"
                     )}
                     value={hostedNetworkPassword}
-                    disabled={!hostedNetworkOn}
+                    disabled={(!hostedNetworkOn || inputDisabled)}
                     onChange={event => setHostedNetworkPassword(event.target.value)}
                     minLength={8}
                     maxLength={63}
@@ -247,7 +246,7 @@ export default function Settings() {
                   <div
                     className={cn(
                       "absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
-                      !hostedNetworkOn && "cursor-not-allowed select-none"
+                      (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none"
                     )}
                   >
                     {showHostedNetworkPassword ? (
@@ -266,13 +265,16 @@ export default function Settings() {
                   </div>
                   <p className="text-red-500 text-xs mt-1" style={{ position: "absolute", display: (hostedNetworkPassword.length < 8 ? "initial": "none") }}>A password must have at least 8 characters</p>
                 </div>
-                <Button disabled={!hostedNetworkOn || hostedNetworkPassword.length < 8} onClick={async () => {
+                <Button disabled={(!hostedNetworkOn || inputDisabled) || hostedNetworkPassword.length < 8} onClick={async () => {
                     if (hostedNetworkName !== oldHostedNetworkName || hostedNetworkPassword !== oldHostedNetworkPassword) {
                       if (!(await getUser(currentUser))!.dontShowAgain.editNetwork) {
+                        setDisabled(false);
                         setHostedNetworkModalOpen(true);
                       } else {
+                        setInputDisabled(true);
                         await commands.stopHostedNetwork();
                         const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+                        setInputDisabled(false);
                         if (success) {
                           setOldHostedNetworkName(hostedNetworkName);
                           setOldHostedNetworkPassword(hostedNetworkPassword);
@@ -385,17 +387,22 @@ export default function Settings() {
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={async () => {
+                setDisabled(true);
                 await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editNetwork: dontShowAgain}});
                 setHostedNetworkName(oldHostedNetworkName);
                 setHostedNetworkPassword(oldHostedNetworkName);
                 setHostedNetworkModalOpen(false);
               }}
+              disabled={disabled}
+              className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
             >
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              className="bg-red-600 hover:bg-red-700 text-white"
+              className="bg-red-600 hover:bg-red-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
+              disabled={disabled}
               onClick={async () => {
+                setDisabled(true);
                 await commands.stopHostedNetwork();
                 const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
