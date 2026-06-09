@@ -58,8 +58,8 @@ export default function Settings() {
   const [inputDisabled, setInputDisabled] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
 
-  const [accountPassword, setAccountPassword] = useState("");
-  const [showAccountPassword, setShowAccountPassword] = useState(false);
+  const [_accountPassword, setAccountPassword] = useState("");
+  const [_showAccountPassword, setShowAccountPassword] = useState(false);
   const [accountName, setAccountName] = useState("");
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
