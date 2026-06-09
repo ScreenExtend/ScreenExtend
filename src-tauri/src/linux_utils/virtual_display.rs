@@ -1,49 +1,28 @@
-use crate::linux_utils::AppState;
-use serde::{Deserialize, Serialize};
-use specta::Type;
-use tauri::State;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct VirtualDisplayConfig {
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-    pub refresh_rate: u32,
+use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
+
+#[derive(Debug)]
+pub struct LinuxVirtualDisplay;
+
+impl LinuxVirtualDisplay {
+    pub fn new_shared() -> Option<SharedVirtualDisplay> {
+        Some(Arc::new(Self))
+    }
 }
 
-#[tauri::command]
-#[specta::specta]
-pub fn install_drivers() -> bool {
-    true
-}
+impl VirtualDisplayController for LinuxVirtualDisplay {
+    fn create_display(
+        &self,
+        _name: String,
+        _width: u32,
+        _height: u32,
+        _refresh_rate: u32,
+    ) -> Result<u32, String> {
+        Err("virtual displays are not yet implemented on Linux".to_string())
+    }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn create_display(
-    state: State<'_, AppState>,
-    config: VirtualDisplayConfig,
-) -> Result<i32, ()> {
-    Ok(1)
-}
+    fn remove_display(&self, _id: u32) {}
 
-#[tauri::command]
-#[specta::specta]
-pub async fn update_display(
-    state: State<'_, AppState>,
-    display_id: u32,
-    config: VirtualDisplayConfig,
-) -> Result<bool, ()> {
-    Ok(true)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn remove_display(state: State<'_, AppState>, display_id: u32) -> Result<bool, ()> {
-    Ok(true)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn remove_all_displays(state: State<'_, AppState>) -> Result<bool, ()> {
-    Ok(true)
+    fn remove_all_displays(&self) {}
 }

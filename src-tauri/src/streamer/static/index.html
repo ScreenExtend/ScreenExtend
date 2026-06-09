@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+        <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+        <title>ScreenExtend Session</title>
+        <link rel="stylesheet" href="/styles.css" />
+    </head>
+    <body>
+        <div id="join">
+            <div class="join-wrap">
+                <div class="brand" id="brand">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+                    </svg>
+                    <span>ScreenExtend</span>
+                </div>
+                <div class="col">
+                    <div class="card2">
+                        <div class="loading" id="loading"><div class="spin"></div><p>Connecting</p></div>
+                        <div class="head">
+                            <h2 class="title">Join a Session</h2>
+                            <p class="desc">Enter the OTP from the settings screen</p>
+                        </div>
+                        <form id="joinForm" autocomplete="off" novalidate>
+                            <div class="field">
+                                <label for="session">Session ID<span class="req">*</span></label>
+                                <input class="inp" id="session" type="text" maxlength="12" placeholder="ABCDEF987654" oninput="this.value = this.value.toUpperCase()" />
+                            </div>
+                            <div class="field">
+                                <label for="name">Device Name<span class="req">*</span></label>
+                                <input class="inp" id="name" type="text" maxlength="20" placeholder="Laptop" />
+                            </div>
+                            <div class="field">
+                                <label>OTP<span class="req">*</span></label>
+                                <div class="otp" id="otp">
+                                    <input inputmode="numeric" autocomplete="one-time-code" maxlength="1" />
+                                    <input inputmode="numeric" autocomplete="off" maxlength="1" />
+                                    <input inputmode="numeric" autocomplete="off" maxlength="1" />
+                                    <input inputmode="numeric" autocomplete="off" maxlength="1" />
+                                    <input inputmode="numeric" autocomplete="off" maxlength="1" />
+                                    <input inputmode="numeric" autocomplete="off" maxlength="1" />
+                                </div>
+                            </div>
+                            <button class="btn" id="connect" type="submit" disabled>Connect</button>
+                        </form>
+                        <div class="err" id="errorMessage" role="alert"></div>
+                    </div>
+                    <div class="foot">
+                        For persistent errors, please <a href="mailto:support@screenextend.app">contact us</a> with your device information.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <canvas id="canvas"></canvas>
+        <video id="video" autoplay playsinline muted></video>
+        <button id="unmute">Tap to start playback</button>
+
+        <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
+            <div class="card">
+                <h2>Switch to HTTPS for low-latency mode</h2>
+                <p>This page is on an insecure (HTTP) connection, so the browser blocks the WebCodecs fast path. Open the secure version for lowest latency.</p>
+                <div class="row">
+                    <button id="goHttps">Switch to HTTPS</button>
+                    <button id="dismiss">Stay on HTTP</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const video = document.getElementById('video');
+            let canvas = document.getElementById('canvas');
+            const unmuteBtn = document.getElementById('unmute');
+            const modal = document.getElementById('modal');
+            const errEl = document.getElementById('errorMessage');
+            const loadingEl = document.getElementById('loading');
+
+            const canWebCodecs = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && ('VideoDecoder' in window) && (typeof RTCRtpScriptTransform !== 'undefined') && (typeof canvas.transferControlToOffscreen === 'function');
+
+            let pc = null;
+            let worker = null;
+            let watchdog = null;
+            let statsPoll = null;
+            let usingFallback = false;
+            let joinData = null;
+            let reconfigPoll = null;
+            let reconfigEpoch = null;
+            let kickEpoch = null;
+            let reconfiguring = false;
+            let kicked = false;
+
+            function showError(msg) {
+                errEl.textContent = msg || '';
+                errEl.classList.toggle('show', !!msg);
+                if (msg) {
+                    isLive = false;
+                    loadingEl.classList.remove('show');
+                    joinEl.style.display = '';
+                    joinEl.classList.remove('hide');
+                    connectBtn.disabled = false;
+                    validate();
+                }
+            }
+            function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
+            function showVideo() { video.style.display = 'block'; canvas.style.display = 'none'; }
+
+            function freshCanvas() {
+                const replacement = document.createElement('canvas');
+                replacement.id = 'canvas';
+                canvas.replaceWith(replacement);
+                canvas = replacement;
+                if (viewportFallback) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
+                return canvas;
+            }
+
+            let isLive = false;
+            function onStreamLive() {
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                reconfiguring = false;
+                loadingEl.classList.remove('show');
+                if (isLive) { startReconfigPoll(); return; }
+                isLive = true;
+                showError('');
+                joinEl.classList.add('hide');
+                setTimeout(() => { joinEl.style.display = 'none'; }, 450);
+                goFullscreen();
+                attachFsGestureListeners();
+                startReconfigPoll();
+            }
+
+            async function startReconfigPoll() {
+                if (reconfigPoll) return;
+                if (reconfigEpoch === null) {
+                    try {
+                        const r = await fetch('/reconfig');
+                        if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; }
+                    } catch (_) {}
+                }
+                reconfigPoll = setInterval(async () => {
+                    if (reconfiguring || kicked) return;
+                    try {
+                        const r = await fetch('/reconfig');
+                        if (!r.ok) return;
+                        const j = await r.json();
+                        if (kickEpoch !== null && j.kick !== kickEpoch) {
+                            kickEpoch = j.kick;
+                            kickDevice();
+                            return;
+                        }
+                        kickEpoch = j.kick;
+                        if (reconfigEpoch !== null && j.epoch !== reconfigEpoch) {
+                            reconfigEpoch = j.epoch;
+                            reconfigure();
+                        } else {
+                            reconfigEpoch = j.epoch;
+                        }
+                    } catch (_) {}
+                }, 1000);
+            }
+
+            function kickDevice() {
+                if (kicked) return;
+                kicked = true;
+                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                if (worker) { worker.terminate(); worker = null; }
+                try { if (pc) pc.close(); } catch (_) {}
+                pc = null;
+                isLive = false;
+                if (fullscreenElement() && document.exitFullscreen) { try { document.exitFullscreen(); } catch (_) {} }
+                inFullscreen = false;
+                showError('You have been removed from this session.');
+            }
+
+            function reconfigure() {
+                if (reconfiguring) return;
+                reconfiguring = true;
+                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                if (worker) { worker.terminate(); worker = null; }
+                try { if (pc) pc.close(); } catch (_) {}
+                pc = null;
+                usingFallback = false;
+                start(true);
+            }
+
+            let inFullscreen = false;
+            function fullscreenElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+            function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
+            function goFullscreen() {
+                if (inFullscreen || fullscreenElement()) { inFullscreen = true; teardownFsListeners(); return; }
+                const el = liveEl();
+                const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+                if (req) {
+                    try {
+                        const r = req.call(el);
+                        if (r && r.then) r.then(() => { inFullscreen = true; teardownFsListeners(); }).catch(() => applyViewportFallback());
+                        else { inFullscreen = true; teardownFsListeners(); }
+                    } catch (_) { applyViewportFallback(); }
+                } else if (video.webkitEnterFullscreen && (usingFallback || el === video)) {
+                    try {
+                        if (video.readyState >= 1) { video.webkitEnterFullscreen(); inFullscreen = true; teardownFsListeners(); }
+                        else applyViewportFallback();
+                    } catch (_) { applyViewportFallback(); }
+                } else {
+                    applyViewportFallback();
+                }
+            }
+
+            let viewportFallback = false;
+            function sizeToViewport() {
+                const w = window.innerWidth + 'px';
+                const h = window.innerHeight + 'px';
+                canvas.style.width = w; canvas.style.height = h;
+                video.style.width = w; video.style.height = h;
+            }
+            function applyViewportFallback() {
+                if (viewportFallback) return;
+                viewportFallback = true;
+                inFullscreen = true;
+                teardownFsListeners();
+                sizeToViewport();
+                window.addEventListener('resize', sizeToViewport, { passive: true });
+                window.addEventListener('orientationchange', sizeToViewport, { passive: true });
+            }
+            function teardownFsListeners() {
+                window.removeEventListener('pointerdown', goFullscreen);
+                window.removeEventListener('touchend', goFullscreen);
+                window.removeEventListener('click', goFullscreen);
+                window.removeEventListener('keydown', goFullscreen);
+            }
+            function attachFsGestureListeners() {
+                window.addEventListener('pointerdown', goFullscreen, { passive: true });
+                window.addEventListener('touchend', goFullscreen, { passive: true });
+                window.addEventListener('click', goFullscreen, { passive: true });
+                window.addEventListener('keydown', goFullscreen);
+            }
+
+            let leaveSent = false;
+            function sendLeave() {
+                if (leaveSent || !isLive || reconfiguring) return;
+                leaveSent = true;
+                try { navigator.sendBeacon('/leave'); } catch (_) {}
+                try { if (pc) pc.close(); } catch (_) {}
+            }
+            window.addEventListener('pagehide', sendLeave);
+            window.addEventListener('beforeunload', sendLeave);
+
+            async function getIceServers() {
+                try {
+                    const r = await fetch('/ice-config');
+                    if (r.ok) return (await r.json()).iceServers || [];
+                } catch (_) {}
+                return [];
+            }
+
+            function waitForIceGathering(pc) {
+                if (pc.iceGatheringState === 'complete') return Promise.resolve();
+                return new Promise((resolve) => {
+                    const check = () => {
+                        if (pc.iceGatheringState === 'complete') {
+                            pc.removeEventListener('icegatheringstatechange', check);
+                            resolve();
+                        }
+                    };
+                    pc.addEventListener('icegatheringstatechange', check);
+                    setTimeout(resolve, 3000);
+                });
+            }
+
+            function tryPlay() {
+                const p = video.play();
+                if (p && p.catch) {
+                    p.catch(() => {
+                        unmuteBtn.style.display = 'block';
+                        unmuteBtn.onclick = () => video.play().then(() => { unmuteBtn.style.display = 'none'; }).catch(() => {});
+                    });
+                }
+            }
+
+            function fallbackToVideo(reason) {
+                if (usingFallback) return;
+                usingFallback = true;
+                console.warn('falling back to <video>:', reason);
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                if (worker) { worker.terminate(); worker = null; }
+                try { if (pc) pc.close(); } catch (_) {}
+                pc = null;
+                start(false);
+            }
+
+            async function start(preferWebCodecs) {
+                try {
+                    const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
+
+                    const iceServers = await getIceServers();
+                    pc = new RTCPeerConnection({ iceServers });
+                    const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+
+                    if (webcodecs) {
+                        worker = new Worker('/transform-worker.js');
+                        worker.onmessage = (m) => {
+                            if (m.data.type === 'rendered') {
+                                onStreamLive();
+                            } else if (m.data.type === 'decodeerror') {
+                                console.warn('[webcodecs] decode error:', m.data.message);
+                            } else if (m.data.type === 'configerror') {
+                                console.error('[webcodecs] configure() failed for codec', m.data.codec, ':', m.data.message);
+                                fallbackToVideo('VideoDecoder.configure failed: ' + m.data.message);
+                            } else if (m.data.type === 'backlog') {
+                                console.warn('[webcodecs] decoder backlog (' + m.data.size + '); dropping to freshest frame');
+                            } else if (m.data.type === 'transformstart') {
+                                console.log('[webcodecs] onrtctransform FIRED — readable=' + m.data.hasReadable + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                            } else if (m.data.type === 'firstframe') {
+                                console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                            } else if (m.data.type === 'stats') {
+                                console.log('[webcodecs] stats', m.data);
+                            }
+                        };
+                        const off = freshCanvas().transferControlToOffscreen();
+                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                        showCanvas();
+                    }
+
+                    pc.ontrack = (e) => {
+                        if (e.track.kind !== 'video') return;
+
+                        if (webcodecs) {
+                            showCanvas();
+                            statsPoll = setInterval(() => {
+                                if (worker) worker.postMessage({ type: 'stats' });
+                                if (pc) pc.getStats().then((rep) => {
+                                    let foundInbound = false, pair = null;
+                                    rep.forEach((s) => {
+                                        if (s.type === 'inbound-rtp' && (s.kind === 'video' || s.mediaType === 'video' || s.kind === undefined)) {
+                                            foundInbound = true;
+                                            console.log('[webcodecs] inbound-rtp bytes=' + s.bytesReceived +
+                                                ' packets=' + (s.packetsReceived || 0) +
+                                                ' LOST=' + (s.packetsLost || 0) +
+                                                ' nack=' + (s.nackCount || 0) +
+                                                ' framesRecv=' + (s.framesReceived || 0) +
+                                                ' framesDropped=' + (s.framesDropped || 0) +
+                                                ' decoded=' + (s.framesDecoded || 0) +
+                                                ' keyDec=' + (s.keyFramesDecoded || 0) +
+                                                ' pliSent=' + (s.pliCount || 0));
+                                        }
+                                        if (s.type === 'candidate-pair' && (s.nominated || s.selected)) {
+                                            pair = s.state + ' rtt=' + (s.currentRoundTripTime || '?');
+                                        }
+                                    });
+                                    if (!foundInbound) console.log('[webcodecs] NO inbound-rtp stat yet; candidate-pair=' + pair);
+                                }).catch((err) => console.log('[webcodecs] getStats failed', err));
+                            }, 1000);
+                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 8s'), 8000);
+                        } else {
+                            video.srcObject = e.streams[0];
+                            try {
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 40;
+                            } catch (_) {}
+                            showVideo();
+                            tryPlay();
+                        }
+                    };
+
+                    const localPc = pc;
+                    pc.oniceconnectionstatechange = () => {
+                        if (pc !== localPc) return;
+                        const s = pc.iceConnectionState;
+                        if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
+                            onStreamLive();
+                        } else if (s === 'failed') {
+                            showError('Connection failed.');
+                        }
+                    };
+                    pc.onconnectionstatechange = () => {
+                        if (pc !== localPc || reconfiguring) return;
+                        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                            showError('Disconnected, reload the page to reconnect.');
+                        }
+                    };
+
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    await waitForIceGathering(pc);
+
+                    const resp = await fetch('/whep', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            sessionId: joinData.sessionId,
+                            otp: joinData.otp,
+                            deviceName: joinData.deviceName,
+                            os: joinData.os,
+                            refreshRate: joinData.refreshRate,
+                            width: joinData.width,
+                            height: joinData.height,
+                            sdp: pc.localDescription.sdp,
+                        }),
+                    });
+                    if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
+                    if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    await pc.setRemoteDescription({ type: 'answer', sdp: await resp.text() });
+                } catch (err) {
+                    console.error(err);
+                    const isAuthError = /Invalid session ID or OTP/.test(err.message);
+                    if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
+                        fallbackToVideo('setup error: ' + err.message);
+                    } else if (reconfiguring && isLive) {
+                        reconfiguring = false;
+                        startReconfigPoll();
+                    } else {
+                        showError(err.message);
+                    }
+                }
+            }
+
+            async function httpsUrl() {
+                let httpsPort = 8443;
+                try {
+                    const r = await fetch('/net-config');
+                    if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
+                } catch (_) {}
+                const u = new URL(location.href);
+                u.protocol = 'https:';
+                u.port = httpsPort;
+                if (joinData) {
+                    if (joinData.sessionId) u.searchParams.set('id', joinData.sessionId);
+                    if (joinData.deviceName) u.searchParams.set('name', joinData.deviceName);
+                    if (joinData.otp) u.searchParams.set('otp', joinData.otp);
+                }
+                return u.toString();
+            }
+            async function offerHttpsUpgrade() {
+                loadingEl.classList.remove('show');
+                const href = await httpsUrl();
+                document.getElementById('goHttps').onclick = () => { location.href = href; };
+                document.getElementById('dismiss').onclick = () => {
+                    modal.classList.remove('show');
+                    loadingEl.classList.add('show');
+                    start(false);
+                };
+                modal.classList.add('show');
+            }
+
+            function beginStreaming() {
+                if (location.protocol === 'http:' && !canWebCodecs) offerHttpsUpgrade();
+                else start(true);
+            }
+
+            const VALID_RE = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/;
+            const joinEl = document.getElementById('join');
+            const sessionInput = document.getElementById('session');
+            const nameInput = document.getElementById('name');
+            const connectBtn = document.getElementById('connect');
+            const otpInputs = Array.from(document.querySelectorAll('#otp input'));
+
+            document.getElementById('brand').addEventListener('click', () => {
+                window.open('https://screenextend.app/', '_blank');
+            });
+
+            const otpValue = () => otpInputs.map((i) => i.value).join('');
+
+            function detectOs() {
+                const ua = navigator.userAgent || '';
+                const p = navigator.platform || '';
+                if (/iPhone|iPad|iPod/.test(ua) || (p === 'MacIntel' && navigator.maxTouchPoints > 1)) return 'iOS';
+                if (/Android/.test(ua)) return 'Android';
+                if (/Win/.test(p) || /Windows/.test(ua)) return 'Windows';
+                if (/Mac/.test(p) || /Macintosh/.test(ua)) return 'macOS';
+                if (/Linux/.test(p) || /Linux/.test(ua)) return 'Linux';
+                return 'Unknown';
+            }
+
+            function getRefreshRate(samples = 180) {
+                return new Promise((resolve) => {
+                    const times = [];
+                    function frame(t) {
+                        times.push(t);
+                        if (times.length < samples) {
+                            requestAnimationFrame(frame);
+                            return;
+                        }
+                        const intervals = [];
+                        for (let i = 1; i < times.length; i++) {
+                            intervals.push(times[i] - times[i - 1]);
+                        }
+                        intervals.sort((a, b) => a - b);
+                        const median = intervals[Math.floor(intervals.length / 2)];
+                        resolve(Math.round(1000 / median));
+                    }
+                    requestAnimationFrame(frame);
+                });
+            }
+
+            function validate() {
+                const ok = otpValue().length === 6 && nameInput.value.trim().length > 0 && VALID_RE.test(sessionInput.value.trim());
+                connectBtn.disabled = !ok;
+            }
+
+            (function prefillFromUrl() {
+                const params = new URL(window.location.href).searchParams;
+
+                const id = params.get('id');
+                if (id && VALID_RE.test(id)) { sessionInput.value = id; sessionInput.disabled = true; }
+
+                const name = params.get('name');
+                if (name) nameInput.value = name.slice(0, 20);
+
+                const otp = (params.get('otp') || '').replace(/\D/g, '').slice(0, otpInputs.length);
+                for (let k = 0; k < otp.length; k++) {
+                    otpInputs[k].value = otp[k];
+                    otpInputs[k].classList.add('filled');
+                }
+
+                if (params.has('otp') || params.has('name')) {
+                    const clean = new URL(window.location.href);
+                    clean.searchParams.delete('otp');
+                    clean.searchParams.delete('name');
+                    history.replaceState(null, '', clean.toString());
+                }
+
+                validate();
+            })();
+
+            otpInputs.forEach((input, i) => {
+                input.addEventListener('input', () => {
+                    input.value = input.value.replace(/\D/g, '').slice(0, 1);
+                    input.classList.toggle('filled', input.value !== '');
+                    if (input.value && i < otpInputs.length - 1) otpInputs[i + 1].focus();
+                    validate();
+                });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Backspace' && !input.value && i > 0) {
+                        e.preventDefault();
+                        const prev = otpInputs[i - 1];
+                        prev.value = ''; prev.classList.remove('filled'); prev.focus();
+                        validate();
+                    } else if (e.key === 'ArrowLeft' && i > 0) {
+                        e.preventDefault(); otpInputs[i - 1].focus();
+                    } else if (e.key === 'ArrowRight' && i < otpInputs.length - 1) {
+                        e.preventDefault(); otpInputs[i + 1].focus();
+                    }
+                });
+                input.addEventListener('paste', (e) => {
+                    e.preventDefault();
+                    const digits = (e.clipboardData || window.clipboardData).getData('text')
+                        .replace(/\D/g, '').slice(0, otpInputs.length - i);
+                    for (let k = 0; k < digits.length; k++) {
+                        otpInputs[i + k].value = digits[k];
+                        otpInputs[i + k].classList.add('filled');
+                    }
+                    otpInputs[Math.min(i + digits.length, otpInputs.length - 1)].focus();
+                    validate();
+                });
+            });
+
+            sessionInput.addEventListener('input', validate);
+            nameInput.addEventListener('input', validate);
+
+            const refreshRatePromise = getRefreshRate().catch(() => 0);
+
+            document.getElementById('joinForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                if (connectBtn.disabled) return;
+
+                joinData = {
+                    sessionId: sessionInput.value.trim(),
+                    deviceName: nameInput.value.trim(),
+                    otp: otpValue(),
+                    os: detectOs(),
+                    refreshRate: 0,
+                    width: window.screen.width,
+                    height: window.screen.height,
+                };
+
+                showError('');
+                kicked = false;
+                leaveSent = false;
+                reconfigEpoch = null;
+                kickEpoch = null;
+                connectBtn.disabled = true;
+                loadingEl.classList.add('show');
+
+                joinData.refreshRate = await refreshRatePromise || 0;
+                console.log('[join] connecting with', joinData);
+
+                beginStreaming();
+            });
+        </script>
+    </body>
+</html>

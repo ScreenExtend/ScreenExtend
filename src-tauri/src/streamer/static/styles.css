@@ -1,0 +1,356 @@
+:root {
+    color-scheme: dark;
+}
+
+html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    color: #e6e9ef;
+    font: 14px / 1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+#video, #canvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+    background: #000;
+    display: none;
+}
+
+#unmute {
+    position: fixed;
+    bottom: 16px;
+    left: 50%;
+    z-index: 11;
+    display: none;
+    padding: .6rem 1rem;
+    border: 0;
+    border-radius: 10px;
+    background: #2a6df0;
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    transform: translateX(-50%);
+}
+
+#modal {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgba(0, 0, 0, 0.66);
+}
+
+#modal.show {
+    display: flex;
+}
+
+#modal .card {
+    max-width: 430px;
+    background: #14171d;
+    border: 1px solid #2a2f3a;
+    border-radius: 14px;
+    padding: 1.25rem 1.4rem;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+#modal h2 {
+    margin: 0 0 .55rem;
+    font-size: 16px;
+    color: #e6e9ef;
+}
+
+#modal p {
+    margin: 0 0 1rem;
+    color: #aab2c2;
+}
+
+#modal .row {
+    display: flex;
+    gap: .6rem;
+    flex-wrap: wrap;
+}
+
+#modal button {
+    padding: .55rem 1rem;
+    border: 0;
+    border-radius: 9px;
+    font-size: 14px;
+    cursor: pointer;
+}
+
+#goHttps {
+    background: #2a6df0;
+    color: #fff;
+}
+
+#dismiss {
+    background: #2a2f3a;
+    color: #cdd3df;
+}
+
+#join {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    padding: 1.5rem;
+    overflow: auto;
+    background: #0a0c10;
+}
+
+#join.hide {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .45s ease;
+}
+
+.join-wrap {
+    display: flex;
+    width: 100%;
+    max-width: 384px;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.col {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.brand {
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: .5rem;
+    width: fit-content;
+    padding: .45rem .7rem;
+    font-weight: 500;
+    cursor: pointer;
+    color: #e6e9ef;
+    background: #14171d;
+    border: 1px solid #2a2f3a;
+    border-radius: 12px;
+    transition: border-color .15s, background .15s;
+}
+
+.brand:hover {
+    border-color: #3a4150;
+    background: #181c23;
+}
+
+.brand svg {
+    width: 16px;
+    height: 16px;
+    flex: none;
+}
+
+.card2 {
+    position: relative;
+    background: #14171d;
+    border: 1px solid #2a2f3a;
+    border-radius: 14px;
+    padding: 1.5rem;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+.card2 .head {
+    text-align: center;
+    margin-bottom: 1.5rem;
+}
+
+.card2 .title {
+    font-size: 20px;
+    font-weight: 600;
+    color: #e6e9ef;
+    margin: 0 0 .35rem;
+}
+
+.card2 .desc {
+    font-size: 13px;
+    color: #aab2c2;
+    margin: 0;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: .55rem;
+    margin-bottom: 1.25rem;
+}
+
+.field label {
+    font-size: 13px;
+    font-weight: 500;
+    color: #e6e9ef;
+}
+
+.field label .req {
+    color: #ef4444;
+    margin-left: 1px;
+}
+
+.inp {
+    width: 100%;
+    box-sizing: border-box;
+    height: 38px;
+    padding: 0 .7rem;
+    background: #0e1116;
+    border: 1px solid #2a2f3a;
+    border-radius: 9px;
+    color: #e6e9ef;
+    font-size: 14px;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+}
+
+.inp::placeholder {
+    color: #5b6373;
+}
+
+.inp:focus {
+    border-color: #2a6df0;
+    box-shadow: 0 0 0 3px rgba(42, 109, 240, 0.25);
+}
+
+.inp:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+}
+
+.otp {
+    display: flex;
+    gap: .4rem;
+}
+
+.otp input {
+    flex: 1;
+    min-width: 0;
+    height: 44px;
+    padding: 0;
+    text-align: center;
+    background: #0e1116;
+    border: 1px solid #2a2f3a;
+    border-radius: 9px;
+    color: #e6e9ef;
+    font-size: 18px;
+    font-weight: 600;
+    outline: none;
+    caret-color: #2a6df0;
+    transition: border-color .15s, box-shadow .15s;
+}
+
+.otp input:focus {
+    border-color: #2a6df0;
+    box-shadow: 0 0 0 3px rgba(42, 109, 240, 0.25);
+}
+
+.otp input.filled {
+    border-color: #3a4150;
+}
+
+.btn {
+    width: 100%;
+    height: 40px;
+    border: 0;
+    border-radius: 9px;
+    background: #2a6df0;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, opacity .15s;
+}
+
+.btn:hover:not(:disabled) {
+    background: #245fd0;
+}
+
+.btn:disabled {
+    opacity: .5;
+    cursor: not-allowed;
+}
+
+.err {
+    display: none;
+    margin-top: 1rem;
+    padding: .55rem .7rem;
+    border-radius: 9px;
+    background: rgba(60, 20, 24, 0.6);
+    border: 1px solid #5b2a2e;
+    color: #ffb3b3;
+    font-size: 13px;
+    text-align: center;
+    text-wrap: balance;
+}
+
+.err.show {
+    display: block;
+}
+
+.foot {
+    text-align: center;
+    font-size: 12px;
+    color: #8b93a3;
+    text-wrap: balance;
+}
+
+.foot a {
+    color: #aab2c2;
+    text-decoration: underline;
+    text-underline-offset: 4px;
+}
+
+.foot a:hover {
+    color: #fff;
+}
+
+.loading {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: .5rem;
+    z-index: 2;
+    border-radius: 14px;
+    background: rgba(20, 23, 29, 0.6);
+    backdrop-filter: blur(4px);
+}
+
+.loading.show {
+    display: flex;
+}
+
+.loading .spin {
+    width: 40px;
+    height: 40px;
+    border: 3px solid #2a3140;
+    border-top-color: #2a6df0;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+
+.loading p {
+    font-size: 18px;
+    font-weight: 600;
+    color: #e6e9ef;
+    margin: 0;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}

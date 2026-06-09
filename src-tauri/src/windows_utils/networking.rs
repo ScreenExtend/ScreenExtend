@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::collections::HashMap;
-use tauri::{AppHandle, State};
+use std::time::Duration;
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_store::StoreExt;
 use tauri_specta::Event;
 use wmi::{COMLibrary, WMIConnection};
@@ -37,7 +38,7 @@ struct NetConnectionProfile {
     name: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event, PartialEq)]
 pub struct NetworkInfo {
     pub network_name: String,
     pub interface_index: u32,
@@ -92,9 +93,7 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         .iter()
         .filter_map(|adapter| {
             if let Some(interface_index) = adapter.interface_index {
-                let network_name = if adapter.driver_description.as_deref()
-                    == Some("Microsoft Wi-Fi Direct Virtual Adapter")
-                {
+                let network_name = if adapter.driver_description.as_deref() == Some("Microsoft Wi-Fi Direct Virtual Adapter") {
                     if is_hosted_network(app.clone(), state.clone()) {
                         let temporary_name = match app.store("config.json") {
                             Ok(config) => {
@@ -164,4 +163,42 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         .collect();
 
     network_infos
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn watch_for_network_changes(app: AppHandle) {
+    std::thread::spawn(move || {
+        let _com = match COMLibrary::new() {
+            Ok(com) => com,
+            Err(error) => {
+                println!("[network-watcher] failed to initialize COM: {error:?}");
+                return;
+            }
+        };
+
+        let mut previous = get_network_adapters(app.clone(), app.state::<AppState>());
+        println!("[network-watcher] initial network adapters: {previous:?}");
+        apply(&app, previous.clone());
+
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let current = get_network_adapters(app.clone(), app.state::<AppState>());
+            if current != previous {
+                println!("[network-watcher] network adapters changed: {current:?}");
+                previous = current.clone();
+                apply(&app, current);
+            }
+        }
+    });
+}
+
+fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
+    use tauri_specta::Event;
+    let state = app.state::<AppState>();
+    *state.network_adapters.lock().unwrap() = adapters;
+    super::sync_streamers(&state);
+    if let Err(e) = crate::NetworkChange.emit(app) {
+        eprintln!("[network-watcher] failed to emit NetworkChange: {e:?}");
+    }
 }

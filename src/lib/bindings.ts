@@ -11,11 +11,20 @@ async setup() : Promise<boolean> {
 async setCurrentUser(currentUser: string) : Promise<void> {
     await TAURI_INVOKE("set_current_user", { currentUser });
 },
+async setSessionCredentials(sessionId: string, otp: string) : Promise<void> {
+    await TAURI_INVOKE("set_session_credentials", { sessionId, otp });
+},
 async exitApp() : Promise<void> {
     await TAURI_INVOKE("exit_app");
 },
+async getUsername() : Promise<string> {
+    return await TAURI_INVOKE("get_username");
+},
 async getNetworkAdapters() : Promise<NetworkInfo[]> {
     return await TAURI_INVOKE("get_network_adapters");
+},
+async watchForNetworkChanges() : Promise<void> {
+    await TAURI_INVOKE("watch_for_network_changes");
 },
 async startHostedNetwork(name: string, password: string) : Promise<boolean> {
     return await TAURI_INVOKE("start_hosted_network", { name, password });
@@ -29,37 +38,11 @@ async isHostedNetwork() : Promise<boolean> {
 async installDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("install_drivers");
 },
-async createDisplay(config: VirtualDisplayConfig) : Promise<Result<number, null>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("create_display", { config }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
+async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number) : Promise<void> {
+    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality });
 },
-async updateDisplay(displayId: number, config: VirtualDisplayConfig) : Promise<Result<boolean, null>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("update_display", { displayId, config }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async removeDisplay(displayId: number) : Promise<Result<boolean, null>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_display", { displayId }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-async removeAllDisplays() : Promise<Result<boolean, null>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("remove_all_displays") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
+async removeDeviceOverride(ip: string) : Promise<void> {
+    await TAURI_INVOKE("remove_device_override", { ip });
 }
 }
 
@@ -88,7 +71,7 @@ networkChange: "network-change"
 
 /** user-defined types **/
 
-export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; os: string; screenSize: string }
+export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device
@@ -96,7 +79,6 @@ export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
-export type VirtualDisplayConfig = { name: string; width: number; height: number; refresh_rate: number }
 
 /** tauri-specta globals **/
 

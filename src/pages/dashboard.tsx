@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import Layout from "@/layout/layout";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Copy } from "lucide-react";
+import { Copy, Check } from "lucide-react";
 import { Modal } from "flowbite-react";
 import QRCode from "react-qr-code";
 import {
@@ -18,21 +18,10 @@ import {
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { events } from "@/lib/bindings";
 const appWindow = getCurrentWebviewWindow();
 
 export default function Dashboard() {
   const { windowQrValues: [qrValues] } = useContext(GlobalProviderContext);
-  console.log(qrValues);
-
-  useEffect(() => {
-    const listenURLs = async () => {
-      // logic for qrValues
-      window.addEventListener("online", () => {events.networkChange.emit()});
-      window.addEventListener("offline", () => {events.networkChange.emit()});
-    }
-    void listenURLs();
-  }, []);
 
   return (
     <Layout>
@@ -92,6 +81,16 @@ export default function Dashboard() {
 }
 
 const QrDisplay = ({ name, url }: { name: string; url: string }) => {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
   return (
     <div className="p-1 mx-auto">
       <h2 className="text-2xl font-bold text-center mb-2">{name}</h2>
@@ -113,9 +112,19 @@ const QrDisplay = ({ name, url }: { name: string; url: string }) => {
           />
           <button
             className="p-2 border-l"
-            onClick={async () => await writeText(url)}
+            onClick={handleCopy}
+            aria-label={copied ? "Copied" : "Copy URL"}
           >
-            <Copy size={15} />
+            <span className="relative grid place-items-center" style={{ width: 15, height: 15 }}>
+              <Copy
+                size={15}
+                className={`col-start-1 row-start-1 transition-all duration-200 ${copied ? "scale-50 opacity-0" : "scale-100 opacity-100"}`}
+              />
+              <Check
+                size={15}
+                className={`col-start-1 row-start-1 text-green-500 transition-all duration-200 ${copied ? "scale-100 opacity-100" : "scale-50 opacity-0"}`}
+              />
+            </span>
           </button>
         </div>
         <QrModalComponent value={url} />

@@ -60,6 +60,7 @@ export default function Settings() {
 
   const [accountPassword, setAccountPassword] = useState("");
   const [showAccountPassword, setShowAccountPassword] = useState(false);
+  const [accountName, setAccountName] = useState("");
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -91,6 +92,7 @@ export default function Settings() {
       setOldHostedNetworkName(hostedNetworkName);
       setOldHostedNetworkPassword(hostedNetworkPassword);
       setAccountPassword(user.password);
+      setAccountName(user.name);
     }
     void updateText();
   }, []);
@@ -204,8 +206,8 @@ export default function Settings() {
                     <TooltipTrigger asChild className="cursor-pointer" onClick={() => setHostedNetworkTooltipOpen(true)}>
                       <Info size={15} />
                     </TooltipTrigger>
-                    <TooltipContent>
-                      <p>You can create a local network that other devices can join. This is useful for speed or if no other networks are available.{"\u00a0\u00a0\u00a0"}</p>
+                    <TooltipContent className="max-w-[220px]">
+                      <p>Host a local network for devices to join, useful for speed or when no other network is available.</p>
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
@@ -306,7 +308,37 @@ export default function Settings() {
               <CardTitle>Account Settings</CardTitle>
             </CardHeader>
             <CardContent className="grid gap-4">
-              <div
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <div className="relative outline-none flex-1">
+                  <Input
+                    type="text"
+                    placeholder="Name"
+                    className="outline-none"
+                    value={accountName}
+                    onChange={event => setAccountName(event.target.value)}
+                    maxLength={19}
+                    hoverLabel={true}
+                  />
+                </div>
+                <Button onClick={async () => {
+                  const trimmed = accountName.trim();
+                  if (trimmed.length === 0) {
+                    setAccountName((await getUser(currentUser))!.name);
+                    return;
+                  }
+                  if ((await getUser(currentUser))!.name !== trimmed) {
+                    setAccountName(trimmed);
+                    await updateUser(currentUser, { name: trimmed });
+                    toast({
+                      title: "Account Settings Updated",
+                      description: "Your name has been updated.",
+                    });
+                  }
+                }}>
+                  Save Name
+                </Button>
+              </div>
+              {/*<div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0",
                   currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
@@ -356,7 +388,7 @@ export default function Settings() {
                 }}>
                   Save Password
                 </Button>
-              </div>
+              </div>*/}
             </CardContent>
           </Card>
         </div>
