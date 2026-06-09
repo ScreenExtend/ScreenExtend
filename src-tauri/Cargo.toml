@@ -1,6 +1,6 @@
 [package]
 name = "screenextend"
-version = "1.0.0"
+version = "0.1.0"
 description = "ScreenExtend"
 authors = ["Sarvesh Madullapalli"]
 edition = "2021"
@@ -53,10 +53,16 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webrtc = "0.17"
+log = "0.4.22"
+thiserror = "2.0.3"
+owo-colors = "4.1.0"
+lazy_format = "2.0.3"
+joinery = "3.1.0"
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 
 [target.'cfg(windows)'.dependencies]
-driver-ipc = { path = "C:/Users/sarve/fleet/virtual-display-rs/rust/driver-ipc" }
 windows-capture = "2"
+winreg = "0.52.0"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -80,7 +86,6 @@ features = [
     "Win32_System_Ole",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
-    "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
