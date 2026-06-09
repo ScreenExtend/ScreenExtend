@@ -3,6 +3,7 @@ pub mod hosted_network;
 pub mod networking;
 pub mod streamer;
 pub mod virtual_display;
+pub mod driver_ipc;
 
 use elevated_command::Command;
 use std::collections::HashMap;

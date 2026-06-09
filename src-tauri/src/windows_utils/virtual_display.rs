@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use driver_ipc::{Mode, Monitor, sync::DriverClient};
+use crate::driver_ipc::{Mode, Monitor, sync::DriverClient};
 
 use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
 
