@@ -4,13 +4,14 @@ use specta::Type;
 use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
 //use tauri::Emitter;
-use tauri::Manager;
-use tauri_plugin_cli::CliExt;
-use tauri_plugin_shell::ShellExt;
-use tauri_specta::{collect_commands, collect_events, Builder, Event};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use fs4::fs_std::FileExt;
 use std::fs::OpenOptions;
+use tauri::Manager;
+use tauri_plugin_cli::CliExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_shell::ShellExt;
+use tauri_specta::{collect_commands, collect_events, Builder, Event};
+mod streamer;
 
 #[cfg(target_os = "windows")]
 mod windows_utils;
@@ -46,16 +47,44 @@ pub struct DeviceRemoveAction(Device);
 pub struct NetworkChange;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-struct Device {
-    ip: String,
-    name: String,
-    scale: u32,
-    orientation: String,
+pub struct Device {
+    pub ip: String,
+    pub name: String,
+    pub scale: u32,
+    pub orientation: String,
     #[serde(rename = "refreshRate")]
-    refresh_rate: u32,
-    os: String,
+    pub refresh_rate: u32,
+    #[serde(rename = "videoScale")]
+    pub video_scale: u32,
+    #[serde(rename = "videoQuality")]
+    pub video_quality: u32,
+    pub os: String,
     #[serde(rename = "screenSize")]
-    screen_size: String,
+    pub screen_size: String,
+}
+
+impl Device {
+    pub fn defaults(info: crate::streamer::session::DeviceInfo) -> Self {
+        let refresh_rate = if info.refresh_rate == 0 {
+            60
+        } else {
+            info.refresh_rate.clamp(
+                crate::streamer::server::MIN_REFRESH_RATE,
+                crate::streamer::server::MAX_REFRESH_RATE,
+            )
+        };
+        Self {
+            ip: info.ip,
+            name: info.name,
+            scale: 100,
+            orientation: "Landscape".to_string(),
+            refresh_rate,
+            video_scale: 100,
+            video_quality: 23,
+            os: info.os,
+            screen_size: info.screen_size,
+        }
+    }
 }
 
 //#[tauri::command]
@@ -86,7 +115,20 @@ struct Device {
 #[tauri::command]
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        windows_utils::remove_all_displays(&state.virtual_display);
+    }
     app.exit(0);
+}
+
+#[tauri::command]
+#[specta::specta]
+fn get_username() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "User".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,18 +136,19 @@ pub fn run() {
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             setup,
-//            get_devices,
+            //            get_devices,
             set_current_user,
+            set_session_credentials,
             exit_app,
+            get_username,
             networking::get_network_adapters,
+            networking::watch_for_network_changes,
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
             hosted_network::is_hosted_network,
-            virtual_display::install_drivers,
-            virtual_display::create_display,
-            virtual_display::update_display,
-            virtual_display::remove_display,
-            virtual_display::remove_all_displays
+            install_drivers,
+            set_device_override,
+            remove_device_override
         ])
         .events(collect_events![
             DeviceJoin,
@@ -116,7 +159,7 @@ pub fn run() {
             NetworkChange
         ]);
 
-//    #[cfg(debug_assertions)]
+    //    #[cfg(debug_assertions)]
     builder
         .export(Typescript::default(), "../src/lib/bindings.ts")
         .expect("error while exporting typescript bindings");
@@ -289,8 +332,6 @@ pub fn run() {
                         if !result {
                             std::process::exit(0);
                         }
-                        // first time - iter over networks and ip addresses, host server on ip/port, if successful then break, otherwise continue, if all ips are out, show blurred qr code and error (underlying qr code is blank)
-                        // store list of interface indexes stored and remove/add based on network changes (use wim api for it, not web browser but see)
                         builder.mount_events(app);
                         tauri::WebviewWindowBuilder::new(
                             app,

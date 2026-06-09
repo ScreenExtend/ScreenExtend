@@ -12,12 +12,15 @@ export type Device = {
   scale: number;
   orientation: "Portrait" | "Landscape";
   refreshRate: number;
+  videoScale: number;
+  videoQuality: number;
   os: string;
   screenSize: string;
 };
 
 export type User = {
   username: string,
+  name: string,
   password: string,
   theme: string,
   devices: Device[],
@@ -34,6 +37,7 @@ export type User = {
 
 export const defaultUser: User = {
   username: "",
+  name: "",
   password: "",
   theme: "system",
   devices: [],

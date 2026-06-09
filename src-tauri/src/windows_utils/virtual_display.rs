@@ -1,119 +1,57 @@
-use super::AppState;
-use driver_ipc::{Mode, Monitor};
-use elevated_command::Command;
-use serde::{Deserialize, Serialize};
-use specta::Type;
-use std::process::Command as StdCommand;
-use tauri::path::BaseDirectory;
-use tauri::AppHandle;
-use tauri::Manager;
-use tauri::State;
-use tauri_specta::Event;
+use std::sync::{Arc, Mutex};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct VirtualDisplayConfig {
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-    pub refresh_rate: u32,
+use driver_ipc::{Mode, Monitor, sync::DriverClient};
+
+use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
+
+#[derive(Debug)]
+pub struct WindowsVirtualDisplay {
+    client: Mutex<DriverClient>,
 }
 
-#[tauri::command]
-#[specta::specta]
-pub fn install_drivers(app: AppHandle) -> bool {
-    let resource_path = |file: &str| {
-        app.path()
-            .resolve(file, BaseDirectory::Resource)
-            .unwrap()
-            .into_os_string()
-            .into_string()
-            .unwrap()
-    };
-    let exe_path = match std::env::current_exe() {
-        Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
-        _ => "".to_string(),
-    };
-    let mut cmd = StdCommand::new(exe_path);
-    cmd.arg("installdrivers");
-    let mut admincmd = Command::new(cmd);
-    let mut fincmd = admincmd.name("ScreenExtend".to_string());
-    if let Ok(icon_bytes) = std::fs::read(&resource_path("icons/icon.icns")) {
-        fincmd = fincmd.icon(icon_bytes);
-    }
-    let _ = fincmd.output().unwrap();
-    true
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn create_display(
-    state: State<'_, AppState>,
-    config: VirtualDisplayConfig,
-) -> Result<i32, ()> {
-    let mut client = state.driver_client.lock().await;
-    let id = client.new_id(None).unwrap();
-    let mode = Mode {
-        width: config.width,
-        height: config.height,
-        refresh_rates: vec![config.refresh_rate],
-    };
-    let new_monitor = Monitor {
-        id,
-        enabled: true,
-        name: Some(config.name),
-        modes: vec![mode],
-    };
-    match client.add(new_monitor) {
-        Ok(()) => match client.notify().await {
-            Ok(()) => Ok(id as i32),
-            Err(_) => Ok(-1),
-        },
-        Err(_) => Ok(-1),
+impl WindowsVirtualDisplay {
+    pub fn new_shared() -> Option<SharedVirtualDisplay> {
+        let mut client = DriverClient::new().ok()?;
+        client.remove_all();
+        let _ = client.notify();
+        Some(Arc::new(Self {
+            client: Mutex::new(client),
+        }))
     }
 }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn update_display(
-    state: State<'_, AppState>,
-    display_id: u32,
-    config: VirtualDisplayConfig,
-) -> Result<bool, ()> {
-    let mut client = state.driver_client.lock().await;
-    if let Some(monitor) = client.find_monitor_mut_unchecked(display_id) {
-        monitor.name = Some(config.name);
-        monitor.modes = vec![Mode {
-            width: config.width,
-            height: config.height,
-            refresh_rates: vec![config.refresh_rate],
-        }];
-        if let Err(_) = client.notify().await {
-            return Ok(false);
+impl VirtualDisplayController for WindowsVirtualDisplay {
+    fn create_display(
+        &self,
+        name: String,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+    ) -> Result<u32, String> {
+        let mut client = self.client.lock().unwrap();
+        client.refresh_state();
+        let id = client.new_id(None).ok_or_else(|| "no free display id".to_string())?;
+        let mode = Mode { width, height, refresh_rates: vec![refresh_rate] };
+        let monitor = Monitor { id, enabled: true, name: Some(name), modes: vec![mode] };
+        client.add(monitor).map_err(|e| format!("add monitor: {e}"))?;
+        client.notify().map_err(|e| format!("notify driver: {e}"))?;
+        Ok(id)
+    }
+
+    fn remove_display(&self, id: u32) {
+        let mut client = self.client.lock().unwrap();
+        client.refresh_state();
+        client.remove(&[id]);
+        if let Err(e) = client.notify() {
+            eprintln!("virtual_display: notify after remove({id}) failed: {e:?}");
         }
-        Ok(true)
-    } else {
-        Ok(false)
     }
-}
 
-#[tauri::command]
-#[specta::specta]
-pub async fn remove_display(state: State<'_, AppState>, display_id: u32) -> Result<bool, ()> {
-    let mut client = state.driver_client.lock().await;
-    client.remove(&[display_id]);
-    match client.notify().await {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn remove_all_displays(state: State<'_, AppState>) -> Result<bool, ()> {
-    let mut client = state.driver_client.lock().await;
-    client.remove_all();
-    match client.notify().await {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
+    fn remove_all_displays(&self) {
+        let mut client = self.client.lock().unwrap();
+        client.remove_all();
+        if let Err(e) = client.notify() {
+            eprintln!("virtual_display: notify after remove_all failed: {e:?}");
+        }
     }
 }

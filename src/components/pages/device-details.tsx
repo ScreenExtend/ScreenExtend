@@ -35,7 +35,7 @@ import {
 
 import { AuthProviderContext, updateUser, getUser, type Device } from "@/components/auth-provider";
 import { useToast } from "@/components/ui/use-toast";
-import { events } from "@/lib/bindings";
+import { commands, events } from "@/lib/bindings";
 import { useFormik } from "formik";
 
 export function DeviceDetails({ device }: { device: Device }) {
@@ -43,6 +43,8 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [warningDialogOpen, setWarningDialogOpen] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
   const [inProgress, setInProgress] = useState(false);
+  const [tempRate, setTempRate] = useState(device.refreshRate);
+  const [tempQuality, setTempQuality] = useState(device.videoQuality);
   const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
 
@@ -52,8 +54,22 @@ export function DeviceDetails({ device }: { device: Device }) {
     },
     onSubmit: async (values) => {
       setInProgress(true);
-      await events.deviceModifyAction.emit(values);
-      await new Promise(events.deviceModify.once);
+      const normalized: Device = {
+        ...values,
+        scale: Number(values.scale),
+        refreshRate: Number(values.refreshRate),
+        videoScale: Number(values.videoScale),
+        videoQuality: Number(values.videoQuality),
+      };
+      await commands.setDeviceOverride(
+        normalized.ip,
+        normalized.scale,
+        normalized.orientation,
+        normalized.refreshRate,
+        normalized.videoScale,
+        normalized.videoQuality
+      );
+      await events.deviceModify.emit(normalized);
       setInProgress(false);
       toast({
         title: "Device Settings Updated",
@@ -70,6 +86,7 @@ export function DeviceDetails({ device }: { device: Device }) {
     } else {
       if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
         setOpen(false);
+        deviceDetails.resetForm({ values: device });
       } else {
         setWarningDialogOpen(true);
       }
@@ -85,6 +102,7 @@ export function DeviceDetails({ device }: { device: Device }) {
       } else {
         if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
           setOpen(false);
+          deviceDetails.resetForm({ values: device });
         } else {
           setWarningDialogOpen(true);
         }
@@ -125,6 +143,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               <Label>Orientation</Label>
               <Select
                 name="orientation"
+                value={deviceDetails.values.orientation}
                 defaultValue={deviceDetails.values.orientation}
                 onValueChange={(value) => {
                   deviceDetails.setFieldValue("orientation", value);
@@ -182,9 +201,10 @@ export function DeviceDetails({ device }: { device: Device }) {
               Scale - ({deviceDetails.values.scale}%)
             </Label>
             <Slider
+              value={[deviceDetails.values.scale]}
               defaultValue={[deviceDetails.values.scale]}
               onValueChange={(value) => {
-                deviceDetails.setFieldValue("scale", value);
+                deviceDetails.setFieldValue("scale", value[0]);
               }}
               min={25}
               max={200}
@@ -199,8 +219,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                 <Input
                   name="refreshRate"
                   type="number"
-                  min={60}
-                  max={360}
+                  min={15}
+                  max={500}
                   step={1}
                   value={deviceDetails.values.refreshRate}
                   onChange={(event) => {
@@ -209,7 +229,21 @@ export function DeviceDetails({ device }: { device: Device }) {
                       event.target.value
                     );
                   }}
-                  className="w-10 px-1 text-center"
+                  onFocus={(event) => {
+                    setTempRate(parseInt(event.target.value));
+                  }}
+                  onBlur={(event) => {
+                    const value = parseInt(event.target.value.trim());
+                    if (!(value >= 15 && value <= 500)) {
+                      deviceDetails.setFieldValue(
+                        "refreshRate",
+                        tempRate
+                      );
+                    } else {
+                      setTempRate(value);
+                    }
+                  }}
+                  className="w-12 px-1 text-center"
                   hoverLabel={false}
                   disabled={inProgress}
                 />{" "}
@@ -220,13 +254,80 @@ export function DeviceDetails({ device }: { device: Device }) {
               value={[deviceDetails.values.refreshRate]}
               defaultValue={[deviceDetails.values.refreshRate]}
               onValueChange={(value) => {
-                deviceDetails.setFieldValue("refreshRate", value);
+                deviceDetails.setFieldValue("refreshRate", value[0]);
+                setTempRate(value[0]);
               }}
               min={15}
               max={500}
+              step={5}
+              disabled={inProgress}
+            />
+          </div>
+          <div>
+            <Label className="block my-2">
+              Video Scale - ({deviceDetails.values.videoScale}%)
+            </Label>
+            <Slider
+              value={[deviceDetails.values.videoScale]}
+              defaultValue={[deviceDetails.values.videoScale]}
+              onValueChange={(value) => {
+                deviceDetails.setFieldValue("videoScale", value[0]);
+              }}
+              min={10}
+              max={100}
+              step={5}
+              disabled={inProgress}
+            />
+          </div>
+          <div>
+            <Label className="my-2 flex items-center gap-1">
+              Video Quality -{" "}
+              <div className="flex items-center gap-1">
+                <Input
+                  name="videoQuality"
+                  type="number"
+                  min={1}
+                  max={51}
+                  step={1}
+                  value={deviceDetails.values.videoQuality}
+                  onChange={(event) => {
+                    deviceDetails.setFieldValue(
+                      "videoQuality",
+                      event.target.value
+                    );
+                  }}
+                  onFocus={(event) => {
+                    setTempQuality(parseInt(event.target.value));
+                  }}
+                  onBlur={(event) => {
+                    const value = parseInt(event.target.value.trim());
+                    if (!(value >= 1 && value <= 51)) {
+                      deviceDetails.setFieldValue("videoQuality", tempQuality);
+                    } else {
+                      setTempQuality(value);
+                    }
+                  }}
+                  className="w-12 px-1 text-center"
+                  hoverLabel={false}
+                  disabled={inProgress}
+                />
+              </div>
+            </Label>
+            <Slider
+              value={[deviceDetails.values.videoQuality]}
+              defaultValue={[deviceDetails.values.videoQuality]}
+              onValueChange={(value) => {
+                deviceDetails.setFieldValue("videoQuality", value[0]);
+                setTempQuality(value[0]);
+              }}
+              min={1}
+              max={51}
               step={1}
               disabled={inProgress}
             />
+            <p className="text-sm text-muted-foreground mt-2">
+              Higher values encode faster but lower the quality. Pick the highest value that still looks good to you.
+            </p>
           </div>
         </div>
         <SheetFooter>
@@ -234,8 +335,8 @@ export function DeviceDetails({ device }: { device: Device }) {
             <DeleteDevice
               onClick={async () => {
                 setInProgress(true);
-                await events.deviceRemoveAction.emit(deviceDetails.values);
-                await new Promise(events.deviceRemove.once);
+                await commands.removeDeviceOverride(device.ip);
+                await events.deviceRemove.emit(device);
                 setInProgress(false);
                 toast({
                   title: "Device Removed",
@@ -293,7 +394,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editDevice: dontShowAgain}});
                 setWarningDialogOpen(false);
                 setOpen(false);
-                deviceDetails.resetForm();
+                deviceDetails.resetForm({ values: device });
               }}
             >
               Continue

@@ -1,8 +1,7 @@
-import { useContext, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useContext, useEffect, useState } from "react";
 
 import { ReactSVG } from "react-svg";
-import { LogOut, Trash2, RotateCcw } from "lucide-react";
+import { Power, Trash2, RotateCcw } from "lucide-react";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import {
   DropdownMenu,
@@ -25,35 +24,24 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { GlobalProviderContext, GlobalContextDefault } from "@/components/global-provider";
-import { AuthProviderContext, updateUser, deleteUser } from "@/components/auth-provider";
+import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { commands } from "@/lib/bindings";
-import { useTheme } from "@/components/theme-provider";
-import { useToast } from "@/components/ui/use-toast";
 import defaultLogo from "@/assets/default.svg";
-import { cn } from "@/lib/utils";
 
 export function ProfileMenu() {
   const { currentUser } = useContext(AuthProviderContext);
-  const { setTheme } = useTheme();
-  const { dismiss } = useToast();
-  const navigate = useNavigate();
-  const { windowAuthValues: [, setAuthValues], windowLoaded: [, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSlug: [, setSlug], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
+  const { windowClosing: [, setClosing] } = useContext(GlobalProviderContext);
   const [disabled, setDisabled] = useState(false);
   const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
 
-  const logout = async () => {
-    await commands.stopHostedNetwork();
-    await commands.removeAllDisplays();
-    setHostedNetworkOn(GlobalContextDefault.hostedNetworkOn);
-    setOtp(GlobalContextDefault.otp);
-    setSlug(GlobalContextDefault.slug);
-    setQrValues(GlobalContextDefault.qrValues);
-    setLoaded(GlobalContextDefault.loaded);
-    setAuthValues(GlobalContextDefault.authValues);
-    await setTheme("system");
-    dismiss();
-  };
+  useEffect(() => {
+    void (async () => {
+      const user = await getUser(currentUser);
+      if (user) setName(user.name);
+    })();
+  }, [currentUser]);
 
   return (
     <DropdownMenu>
@@ -63,59 +51,51 @@ export function ProfileMenu() {
         </AvatarWrapper>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-56">
-        <DropdownMenuLabel>My Account</DropdownMenuLabel>
+        <DropdownMenuLabel>{name || "My Account"}</DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={async () => {
-              await logout();
-              await deleteUser("GUESTGUESTGUESTGUESTGUEST");
-              navigate("/");
+              setClosing(true);
+              await commands.stopHostedNetwork();
+              await commands.exitApp();
             }}
           >
-            <LogOut className="mr-2 h-4 w-4" />
-            <span>Log Out</span>
+            <Power className="mr-2 h-4 w-4" />
+            <span>Exit App</span>
           </DropdownMenuItem>
           <DropdownMenuItem
-            className={cn(
-              "cursor-pointer",
-              currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
-            )}
+            className="cursor-pointer"
             onClick={async () => {
               if (currentUser.length !== 0) {
                 await updateUser(currentUser, {dontShowAgain: {editDevice: false, editNetwork: false}});
               }
             }}
-            disabled={currentUser === "GUESTGUESTGUESTGUESTGUEST"}
           >
             <RotateCcw className="mr-2 h-4 w-4" />
-            <span>Reset Modal Preferences</span>
+            <span>Reset Preferences</span>
           </DropdownMenuItem>
           <DropdownMenuItem
-            className={cn(
-              "cursor-pointer",
-              currentUser === "GUESTGUESTGUESTGUESTGUEST" && "cursor-not-allowed select-none"
-            )}
+            className="cursor-pointer"
             onClick={(event: React.MouseEvent<HTMLDivElement>) => {
               event.preventDefault();
             }}
-            disabled={currentUser === "GUESTGUESTGUESTGUESTGUEST"}
           >
             <Trash2 className="mr-2 h-4 w-4" />
-            <AlertDialog open={currentUser === "GUESTGUESTGUESTGUESTGUEST" ? false : open}>
+            <AlertDialog open={open}>
               <AlertDialogTrigger asChild onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
                 event.preventDefault();
                 setDisabled(false);
                 setOpen(true);
               }}>
-                <span style={{ color: "red" }}><b>Delete Account</b></span>
+                <span style={{ color: "red" }}><b>Uninstall App</b></span>
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>Delete Account</AlertDialogTitle>
+                  <AlertDialogTitle>Uninstall App</AlertDialogTitle>
                   <AlertDialogDescription>
-                    This action cannot be undone. This will permanently delete your account and remove your local preference data.
+                    This will uninstall ScreenExtend and remove its drivers and local data from this computer. This action cannot be undone.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -125,10 +105,8 @@ export function ProfileMenu() {
                     onClick={async (event: React.MouseEvent<HTMLButtonElement>) => {
                       event.preventDefault();
                       setDisabled(true);
-                      await logout();
-                      await deleteUser(currentUser);
+                      // TODO: implement app uninstall logic
                       setOpen(false);
-                      navigate("/");
                     }}
                     disabled={disabled}
                   >

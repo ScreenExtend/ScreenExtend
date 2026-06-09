@@ -1,3 +1,5 @@
+### WARNING: current builds only support Windows and Nvidia GPUs and are not widely tested. use at your own risk.
+
 # ScreenExtend
 > Extend your screen. Extend your possibilities. Unlock ultimate productivity.
 
@@ -10,7 +12,7 @@ A free, cross-platform desktop-extension solution that transforms any device int
 Built with Rust and Typescript.
 
 ## Under the Hood
-The frontend is built using React.js and ShadCN UI. The interface connects to the Rust backend using Tauri. It uses virtual displays and WebRTC to simulate an extended monitor. The app also has a local account system; no application data is stored on ScreenExtend servers.
+The frontend is built using React.js and ShadCN UI. The interface connects to the Rust backend using Tauri. It uses virtual displays and WebRTC to simulate an extended monitor.
 
 ## Copyright and License
 This project is licensed using the GNU Affero GPL. Any code from ScreenExtend that is incorporated in other projects must include the original copyright notice and license text. All code must remain public and accessible to users. Any changes made to the code must be clearly indicated. Developers can freely contribute code to the main repository via pull requests. Inquiries should be sent to [hi@screenextend.app](mailto:hi@screenextend.app).

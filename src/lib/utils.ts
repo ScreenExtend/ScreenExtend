@@ -1,7 +1,9 @@
 import React, { useEffect, useRef } from "react";
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { commands } from "./bindings";
+import { commands, type NetworkInfo } from "./bindings";
+
+const STREAMER_HTTP_PORT = 8080;
 
 window.commands = commands;
 
@@ -25,6 +27,27 @@ export function useFocus<T extends HTMLElement>() {
         }
     };
     return { inputRef, setInputFocus };
+}
+
+export async function buildQrValues(sessionId: string): Promise<{ title: string; value: string }[]> {
+  if (!sessionId) return [];
+  let adapters: NetworkInfo[] = [];
+  try {
+    adapters = await commands.getNetworkAdapters();
+  } catch {
+    return [];
+  }
+  const isIpv4 = (ip: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
+  return adapters
+    .map((adapter) => {
+      const ipv4 = adapter.ip_addresses.find(isIpv4);
+      if (!ipv4) return null;
+      return {
+        title: adapter.network_name,
+        value: `http://${ipv4}:${STREAMER_HTTP_PORT}/?id=${sessionId}`,
+      };
+    })
+    .filter((entry): entry is { title: string; value: string } => entry !== null);
 }
 
 export function generateSlug() {
