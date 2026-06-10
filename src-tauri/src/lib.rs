@@ -1,6 +1,7 @@
 //use rand::Rng;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+#[cfg(debug_assertions)]
 use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
 //use tauri::Emitter;
@@ -160,10 +161,17 @@ pub fn run() {
             NetworkChange
         ]);
 
-    //    #[cfg(debug_assertions)]
-    builder
-        .export(Typescript::default(), "../src/lib/bindings.ts")
-        .expect("error while exporting typescript bindings");
+    #[cfg(debug_assertions)]
+    {
+        builder
+            .export(Typescript::default(), "../src/lib/bindings.ts")
+            .expect("error while exporting typescript bindings");
+        let bindings_path = "../src/lib/bindings.ts";
+        let contents = std::fs::read_to_string(bindings_path)
+            .expect("error while reading typescript bindings");
+        std::fs::write(bindings_path, format!("// @ts-nocheck\n{contents}"))
+            .expect("error while writing typescript bindings");
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -358,7 +366,9 @@ pub fn run() {
                         app.handle().exit(0);
                     }
                     _ => {
-                        let lock_file_path = app.path().resource_dir().unwrap().join("app.lock");
+                        let lock_dir = app.path().app_local_data_dir().unwrap();
+                        let _ = std::fs::create_dir_all(&lock_dir);
+                        let lock_file_path = lock_dir.join("screenextend.lock");
                         let file = OpenOptions::new().write(true).create(true).open(lock_file_path);
                         let mut result = true;
                         if let Err(_) = file {
