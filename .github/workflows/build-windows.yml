@@ -52,7 +52,6 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
-  # Runs once after both matrix targets have uploaded their assets.
   finalize-release:
     needs: build-windows
     runs-on: ubuntu-latest
@@ -70,7 +69,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # e.g. ScreenExtend_0.1.1_x64-setup.exe -> ScreenExtend_x64-setup.exe
           release_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
             --jq ".[] | select(.tag_name == \"app-v${VERSION}\") | .id")
           if [ -z "$release_id" ]; then
@@ -86,8 +84,14 @@ jobs:
             fi
           done
 
+      - name: publish release and mark as latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release edit "app-v${VERSION}" --draft=false --latest
+
       - name: move 'latest' tag onto the released commit
         run: |
-          # Keeps the immutable app-v${VERSION} tag and adds a rolling 'latest' tag.
           git tag -f latest "${GITHUB_SHA}"
           git push -f origin latest
