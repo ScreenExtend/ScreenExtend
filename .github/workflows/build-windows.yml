@@ -51,3 +51,43 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  # Runs once after both matrix targets have uploaded their assets.
+  finalize-release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read app version
+        id: version
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      - name: strip version from release asset filenames
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # e.g. ScreenExtend_0.1.1_x64-setup.exe -> ScreenExtend_x64-setup.exe
+          release_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq ".[] | select(.tag_name == \"app-v${VERSION}\") | .id")
+          if [ -z "$release_id" ]; then
+            echo "::error::No release found for tag app-v${VERSION}"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+            --jq '.[] | "\(.id) \(.name)"' | while read -r id name; do
+            newname=${name//_${VERSION}_/_}
+            if [ "$name" != "$newname" ]; then
+              echo "Renaming $name -> $newname"
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${id}" -f name="$newname" >/dev/null
+            fi
+          done
+
+      - name: move 'latest' tag onto the released commit
+        run: |
+          # Keeps the immutable app-v${VERSION} tag and adds a rolling 'latest' tag.
+          git tag -f latest "${GITHUB_SHA}"
+          git push -f origin latest
