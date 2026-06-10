@@ -1,11 +1,10 @@
 import { useContext, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 
 import { Loader2 } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
-  AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
   AlertDialogFooter,
@@ -20,13 +19,13 @@ import { buildQrValues } from "@/lib/utils";
 import { useTheme, type Theme } from "@/components/theme-provider";
 
 export default function Bootstrap() {
-  const navigate = useNavigate();
   const { setCurrentUser } = useContext(AuthProviderContext);
   const { theme, setTheme } = useTheme();
   const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [firstTime, setFirstTime] = useState(true);
   const running = useRef(false);
 
   const start = async () => {
@@ -58,9 +57,16 @@ export default function Bootstrap() {
       }
       setCurrentUser(username);
       await commands.setCurrentUser(username);
-      navigate("/dashboard", { replace: true });
+      document.getElementById("dashlink")!.click();
     } else {
-      setError(true);
+      if (firstTime) {
+        await commands.installDrivers();
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        setFirstTime(false);
+        start();
+      } else {
+        setError(true);
+      }
     }
   };
 
@@ -73,6 +79,7 @@ export default function Bootstrap() {
 
   return (
     <div className="h-screen w-full flex flex-col items-center justify-center">
+      <Link to="/dashboard" id="dashlink"></Link>
       <Loader2 className="animate-spin mb-4" size={48} />
       <p className="text-xl font-semibold">Starting ScreenExtend</p>
       <AlertDialog open={error}>
@@ -84,7 +91,6 @@ export default function Bootstrap() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={loading} onClick={() => setError(false)} className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50">Go Back</AlertDialogCancel>
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {

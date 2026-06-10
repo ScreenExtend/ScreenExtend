@@ -137,6 +137,32 @@ pub fn install_drivers(app: tauri::AppHandle) -> bool {
     true
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn remove_drivers(app: tauri::AppHandle) -> bool {
+    let resource_path = |file: &str| {
+        app.path()
+            .resolve(file, BaseDirectory::Resource)
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap()
+    };
+    let exe_path = match std::env::current_exe() {
+        Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
+        _ => "".to_string(),
+    };
+    let mut cmd = StdCommand::new(exe_path);
+    cmd.arg("removedrivers");
+    let mut admincmd = Command::new(cmd);
+    let mut fincmd = admincmd.name("ScreenExtend".to_string());
+    if let Ok(icon_bytes) = std::fs::read(&resource_path("icons/icon.icns")) {
+        fincmd = fincmd.icon(icon_bytes);
+    }
+    let _ = fincmd.output().unwrap();
+    true
+}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();

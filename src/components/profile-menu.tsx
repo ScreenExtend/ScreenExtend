@@ -89,13 +89,13 @@ export function ProfileMenu() {
                 setDisabled(false);
                 setOpen(true);
               }}>
-                <span style={{ color: "red" }}><b>Uninstall App</b></span>
+                <span style={{ color: "red" }}><b>Uninstall Drivers</b></span>
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>Uninstall App</AlertDialogTitle>
+                  <AlertDialogTitle>Uninstall Drivers</AlertDialogTitle>
                   <AlertDialogDescription>
-                    This will uninstall ScreenExtend and remove its drivers and local data from this computer. This action cannot be undone.
+                    This will remove ScreenExtend drivers and associated local data from this computer. This action cannot be undone.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -105,8 +105,11 @@ export function ProfileMenu() {
                     onClick={async (event: React.MouseEvent<HTMLButtonElement>) => {
                       event.preventDefault();
                       setDisabled(true);
-                      // TODO: implement app uninstall logic
+                      await commands.removeDrivers();
                       setOpen(false);
+                      setClosing(true);
+                      await commands.stopHostedNetwork();
+                      await commands.exitApp();
                     }}
                     disabled={disabled}
                   >
