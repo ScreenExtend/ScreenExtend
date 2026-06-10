@@ -8,3 +8,7 @@
 
 # AI documentation
 src/streamer/ai-docs/
+
+# Code-signing private key material
+self-signed-cert.pem
+self-signed-key.pem
