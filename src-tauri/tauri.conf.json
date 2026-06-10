@@ -58,6 +58,9 @@
         },
         "installdrivers": {
           "args": []
+        },
+        "removedrivers": {
+          "args": []
         }
       }
     }

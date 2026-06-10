@@ -75,7 +75,9 @@ function App() {
 
   void appWindow.onCloseRequested(async () => {
     setClosing(true);
-    await commands.stopHostedNetwork();
+    if (loaded) {
+      await commands.stopHostedNetwork();
+    }
     await commands.exitApp();
   });
 

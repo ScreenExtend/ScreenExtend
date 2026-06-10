@@ -147,6 +147,7 @@ pub fn run() {
             hosted_network::stop_hosted_network,
             hosted_network::is_hosted_network,
             install_drivers,
+            remove_drivers,
             set_device_override,
             remove_device_override
         ])
@@ -289,6 +290,65 @@ pub fn run() {
                                     "--install-driver",
                                     "--inf-path",
                                     &resource_path("resources/VirtualDisplayDriver.inf"),
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                        });
+                        app.handle().exit(0);
+                    }
+                    Some(command) if command.name == "removedrivers" => {
+                        tauri::async_runtime::block_on(async {
+                            let resource_path = |file: &str| {
+                                app.path()
+                                    .resolve(file, BaseDirectory::Resource)
+                                    .unwrap()
+                                    .into_os_string()
+                                    .into_string()
+                                    .unwrap()
+                            };
+                            app.shell()
+                                .command("nefconc")
+                                .args(&[
+                                    "--remove-device-node",
+                                    "--hardware-id",
+                                    "Root\\VirtualDisplayDriver",
+                                    "--class-guid",
+                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("nefconc")
+                                .args(&[
+                                    "--uninstall-driver",
+                                    "--inf-path",
+                                    &resource_path("resources/VirtualDisplayDriver.inf"),
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("certutil")
+                                .args(&[
+                                    "-delstore",
+                                    "root",
+                                    "ScreenExtend",
+                                ])
+                                .current_dir(app.path().resource_dir().unwrap())
+                                .output()
+                                .await
+                                .unwrap();
+                            app.shell()
+                                .command("certutil")
+                                .args(&[
+                                    "-delstore",
+                                    "TrustedPublisher",
+                                    "ScreenExtend",
                                 ])
                                 .current_dir(app.path().resource_dir().unwrap())
                                 .output()

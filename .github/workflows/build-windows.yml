@@ -3,7 +3,7 @@ name: 'build-windows'
 on:
   push:
     branches:
-      - main
+      - release
   workflow_dispatch:
 
 jobs:
