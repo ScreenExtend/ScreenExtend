@@ -25,10 +25,9 @@ export default function Bootstrap() {
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [firstTime, setFirstTime] = useState(true);
   const running = useRef(false);
 
-  const start = async () => {
+  const start = async (tryInstall: boolean) => {
     let success;
     if (!loaded) {
       success = await commands.setup();
@@ -59,11 +58,10 @@ export default function Bootstrap() {
       await commands.setCurrentUser(username);
       document.getElementById("dashlink")!.click();
     } else {
-      if (firstTime) {
+      if (tryInstall) {
         await commands.installDrivers();
         await new Promise(resolve => setTimeout(resolve, 5000));
-        setFirstTime(false);
-        start();
+        start(false);
       } else {
         setError(true);
       }
@@ -73,7 +71,7 @@ export default function Bootstrap() {
   useEffect(() => {
     if (running.current) return;
     running.current = true;
-    void start();
+    void start(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -99,7 +97,7 @@ export default function Bootstrap() {
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 setLoading(false);
                 setError(false);
-                await start();
+                await start(false);
               }}
               disabled={loading}
             >
