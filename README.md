@@ -32,13 +32,13 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 ```
    Client browser                    Host (ScreenExtend desktop app)
- ┌────────────────┐   WHEP/HTTPS    ┌──────────────────────────────────┐
- │  open URL /     │ ───────────────▶│  axum server (per network IP)     │
+ ┌─────────────────┐    WHEP/HTTPS   ┌───────────────────────────────────┐
+ │  open URL /     │                 │  axum server (per network IP)     │
  │  scan QR + OTP  │                 │   • validates session ID + OTP    │
  │                 │                 │   • creates a virtual display     │
- │  <video> via    │◀─ WebRTC ───────│   • captures + NVENC‑encodes it   │
- │  WebCodecs      │   (H.264)       │   • streams via WebRTC            │
- └────────────────┘                 └──────────────────────────────────┘
+ │  <video> via    │     WebRTC      │   • captures + NVENC‑encodes it   │
+ │  WebCodecs      │     (H.264)     │   • streams via WebRTC            │
+ └─────────────────┘                 └───────────────────────────────────┘
 ```
 
 1. On launch the host generates a session ID and an OTP, and starts a small HTTPS server bound to each network adapter.
@@ -82,16 +82,9 @@ For a deeper dive, see the inline module docs under `src-tauri/src/streamer/` an
 
 ## Platform support
 
-| | Host (runs the app) | Client (joins via browser) |
-| --- | --- | --- |
-| **Windows** | ✅ Supported (NVIDIA GPU required) | ✅ Any modern browser |
-| **macOS** | 🚧 Scaffolded, not functional | ✅ Any modern browser |
-| **Linux** | 🚧 Scaffolded, not functional | ✅ Any modern browser |
-| **iOS / Android** | — | ✅ Any modern browser |
-
 The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA only.
 
-**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. The virtual display driver used to create extended monitors requires Windows 10 2004+. Both 64‑bit (x86‑64) and 32‑bit (x86) editions are supported.
+**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. The virtual display driver (credits to [https://github.com/MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs)) used to create extended monitors requires Windows 10 2004+. Both 64‑bit (x86‑64) and 32‑bit (x86) editions are supported.
 
 ### Hardware encoder support
 
