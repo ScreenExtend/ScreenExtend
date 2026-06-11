@@ -97,6 +97,7 @@
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
+                    if (locked) stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
                     joinEl.style.display = '';
@@ -113,7 +114,7 @@
                 replacement.id = 'canvas';
                 canvas.replaceWith(replacement);
                 canvas = replacement;
-                if (viewportFallback) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
+                if (locked && !currentFullscreenEl()) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
                 return canvas;
             }
 
@@ -128,8 +129,7 @@
                 showError('');
                 joinEl.classList.add('hide');
                 setTimeout(() => { joinEl.style.display = 'none'; }, 450);
-                goFullscreen();
-                attachFsGestureListeners();
+                startLock();
                 startReconfigPoll();
             }
 
@@ -173,8 +173,7 @@
                 try { if (pc) pc.close(); } catch (_) {}
                 pc = null;
                 isLive = false;
-                if (fullscreenElement() && document.exitFullscreen) { try { document.exitFullscreen(); } catch (_) {} }
-                inFullscreen = false;
+                stopLock();
                 showError('You have been removed from this session.');
             }
 
@@ -191,56 +190,164 @@
                 start(true);
             }
 
-            let inFullscreen = false;
-            function fullscreenElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
-            function goFullscreen() {
-                if (inFullscreen || fullscreenElement()) { inFullscreen = true; teardownFsListeners(); return; }
-                const el = liveEl();
-                const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
-                if (req) {
-                    try {
-                        const r = req.call(el);
-                        if (r && r.then) r.then(() => { inFullscreen = true; teardownFsListeners(); }).catch(() => applyViewportFallback());
-                        else { inFullscreen = true; teardownFsListeners(); }
-                    } catch (_) { applyViewportFallback(); }
-                } else if (video.webkitEnterFullscreen && (usingFallback || el === video)) {
-                    try {
-                        if (video.readyState >= 1) { video.webkitEnterFullscreen(); inFullscreen = true; teardownFsListeners(); }
-                        else applyViewportFallback();
-                    } catch (_) { applyViewportFallback(); }
-                } else {
-                    applyViewportFallback();
-                }
-            }
 
-            let viewportFallback = false;
+            const LOCK_KEYS = ['Escape', 'MetaLeft', 'MetaRight', 'AltLeft', 'AltRight', 'F11'];
+            const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'keydown', 'wheel'];
+            let wakeLockSentinel = null;
+            let visibilityHandler = null;
+            let beforeUnloadHandler = null;
+            let fullscreenHandler = null;
+            let gestureHandler = null;
+            let viewportHandler = null;
+            let locked = false;
+
+            function enterFullscreen(el) {
+                if (el.requestFullscreen) return el.requestFullscreen();
+                if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
+                if (el.mozRequestFullScreen) return el.mozRequestFullScreen();
+                if (el.msRequestFullscreen) return el.msRequestFullscreen();
+                if (el === video && el.webkitEnterFullscreen) { try { el.webkitEnterFullscreen(); } catch (_) {} }
+                return Promise.resolve();
+            }
+            function currentFullscreenEl() {
+                return document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement || null;
+            }
             function sizeToViewport() {
                 const w = window.innerWidth + 'px';
                 const h = window.innerHeight + 'px';
                 canvas.style.width = w; canvas.style.height = h;
                 video.style.width = w; video.style.height = h;
             }
-            function applyViewportFallback() {
-                if (viewportFallback) return;
-                viewportFallback = true;
-                inFullscreen = true;
-                teardownFsListeners();
+            function clearViewportSize() {
+                canvas.style.width = ''; canvas.style.height = '';
+                video.style.width = ''; video.style.height = '';
+            }
+            async function acquireWakeLock() {
+                if (!('wakeLock' in navigator)) return;
+                try {
+                    if (wakeLockSentinel) { await wakeLockSentinel.release(); wakeLockSentinel = null; }
+                    wakeLockSentinel = await navigator.wakeLock.request('screen');
+                    wakeLockSentinel.addEventListener('release', () => { wakeLockSentinel = null; });
+                } catch (_) {}
+            }
+            async function acquireKeyboardLock() {
+                if (navigator.keyboard && navigator.keyboard.lock) {
+                    try { await navigator.keyboard.lock(LOCK_KEYS); } catch (_) {}
+                }
+            }
+            function acquirePointerLock(el) {
+                try {
+                    if (el.requestPointerLock) el.requestPointerLock();
+                    else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
+                    else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
+                    else { el.style.cursor = 'none'; el.style.userSelect = 'none'; el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none'; el.style.msUserSelect = 'none'; }
+                } catch (_) {}
+            }
+
+            function enterViewportMode() {
                 sizeToViewport();
-                window.addEventListener('resize', sizeToViewport, { passive: true });
-                window.addEventListener('orientationchange', sizeToViewport, { passive: true });
+                if (!viewportHandler) {
+                    viewportHandler = () => { if (!currentFullscreenEl()) sizeToViewport(); };
+                    window.addEventListener('resize', viewportHandler, { passive: true });
+                    window.addEventListener('orientationchange', viewportHandler, { passive: true });
+                }
+                if (!gestureHandler) {
+                    gestureHandler = () => {
+                        if (!locked || currentFullscreenEl()) return;
+                        enterFullscreen(liveEl()).catch(() => {});
+                    };
+                    GESTURE_EVENTS.forEach((ev) => window.addEventListener(ev, gestureHandler, { passive: true, capture: true }));
+                }
             }
-            function teardownFsListeners() {
-                window.removeEventListener('pointerdown', goFullscreen);
-                window.removeEventListener('touchend', goFullscreen);
-                window.removeEventListener('click', goFullscreen);
-                window.removeEventListener('keydown', goFullscreen);
+            function exitViewportMode() {
+                if (viewportHandler) {
+                    window.removeEventListener('resize', viewportHandler);
+                    window.removeEventListener('orientationchange', viewportHandler);
+                    viewportHandler = null;
+                }
+                if (gestureHandler) {
+                    GESTURE_EVENTS.forEach((ev) => window.removeEventListener(ev, gestureHandler, { capture: true }));
+                    gestureHandler = null;
+                }
             }
-            function attachFsGestureListeners() {
-                window.addEventListener('pointerdown', goFullscreen, { passive: true });
-                window.addEventListener('touchend', goFullscreen, { passive: true });
-                window.addEventListener('click', goFullscreen, { passive: true });
-                window.addEventListener('keydown', goFullscreen);
+
+            async function startLock() {
+                locked = true;
+                const el = liveEl();
+                el.tabIndex = -1;
+                el.focus();
+
+                if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
+                visibilityHandler = async () => {
+                    if (!locked || document.visibilityState !== 'visible') return;
+                    await acquireWakeLock();
+                    await acquireKeyboardLock();
+                    if (!currentFullscreenEl()) { try { await enterFullscreen(liveEl()); } catch (_) {} }
+                };
+                document.addEventListener('visibilitychange', visibilityHandler);
+
+                const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
+                if (fullscreenHandler) fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
+                fullscreenHandler = async () => {
+                    if (!locked) return;
+                    if (currentFullscreenEl()) {
+                        exitViewportMode();
+                        clearViewportSize();
+                        acquirePointerLock(liveEl());
+                        await acquireKeyboardLock();
+                        await acquireWakeLock();
+                    } else {
+                        enterViewportMode();
+                        try { await enterFullscreen(liveEl()); } catch (_) {}
+                    }
+                };
+                fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
+
+                if (beforeUnloadHandler) window.removeEventListener('beforeunload', beforeUnloadHandler);
+                beforeUnloadHandler = (e) => { if (locked) { e.preventDefault(); e.returnValue = ''; } };
+                window.addEventListener('beforeunload', beforeUnloadHandler);
+
+                await acquireWakeLock();
+                await enterFullscreen(el).catch(() => {});
+
+                if (currentFullscreenEl()) {
+                    exitViewportMode();
+                    clearViewportSize();
+                    await new Promise((r) => setTimeout(r, 120));
+                    acquirePointerLock(liveEl());
+                    await acquireKeyboardLock();
+                } else {
+                    enterViewportMode();
+                }
+            }
+
+            async function stopLock() {
+                locked = false;
+                const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
+                if (fullscreenHandler) { fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler)); fullscreenHandler = null; }
+                if (visibilityHandler) { document.removeEventListener('visibilitychange', visibilityHandler); visibilityHandler = null; }
+                if (beforeUnloadHandler) { window.removeEventListener('beforeunload', beforeUnloadHandler); beforeUnloadHandler = null; }
+                exitViewportMode();
+                clearViewportSize();
+
+                if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+
+                if (wakeLockSentinel) { try { await wakeLockSentinel.release(); } catch (_) {} wakeLockSentinel = null; }
+
+                if (document.exitPointerLock) document.exitPointerLock();
+                else if (document.mozExitPointerLock) document.mozExitPointerLock();
+                else if (document.webkitExitPointerLock) document.webkitExitPointerLock();
+                [canvas, video].forEach((el) => { el.style.cursor = ''; el.style.userSelect = ''; el.style.webkitUserSelect = ''; el.style.mozUserSelect = ''; el.style.msUserSelect = ''; });
+
+                if (currentFullscreenEl()) {
+                    try {
+                        if (document.exitFullscreen) await document.exitFullscreen();
+                        else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
+                        else if (document.mozCancelFullScreen) await document.mozCancelFullScreen();
+                        else if (document.msExitFullscreen) await document.msExitFullscreen();
+                    } catch (_) {}
+                }
             }
 
             let leaveSent = false;
