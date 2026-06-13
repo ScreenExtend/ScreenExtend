@@ -452,7 +452,7 @@ mod test {
 
         let events: Vec<_> = stream.collect().await;
 
-        println!("{:?}", events);
+        tprintln!("{:?}", events);
 
         assert!(
             matches!(events[..], [Err(error::ReceiveError(ref e))] if e.kind() == io::ErrorKind::BrokenPipe)

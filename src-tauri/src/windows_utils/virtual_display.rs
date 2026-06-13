@@ -46,7 +46,7 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         client.refresh_state();
         client.remove(&[id]);
         if let Err(e) = client.notify() {
-            eprintln!("virtual_display: notify after remove({id}) failed: {e:?}");
+            teprintln!("virtual_display: notify after remove({id}) failed: {e:?}");
         }
     }
 
@@ -54,7 +54,7 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         let mut client = self.client.lock().unwrap();
         client.remove_all();
         if let Err(e) = client.notify() {
-            eprintln!("virtual_display: notify after remove_all failed: {e:?}");
+            teprintln!("virtual_display: notify after remove_all failed: {e:?}");
         }
     }
 }

@@ -27,7 +27,7 @@ pub fn load_or_generate(
                 .with_context(|| format!("reading TLS cert from {c}"))?;
             let key_pem = std::fs::read(k)
                 .with_context(|| format!("reading TLS key from {k}"))?;
-            println!("TLS: using operator-provided certificate (cert={c}, key={k})");
+            tprintln!("TLS: using operator-provided certificate (cert={c}, key={k})");
             Ok(TlsMaterial { cert_pem, key_pem, self_signed: false })
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -54,7 +54,7 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
         if let (Ok(cert_pem), Ok(key_pem)) =
             (std::fs::read(&cert_file), std::fs::read(&key_file))
         {
-            println!(
+            tprintln!(
                 "TLS: reusing cached dev self-signed certificate ({})",
                 cert_file.display()
             );
@@ -63,7 +63,7 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
     }
 
     let sans = subject_alt_names(extra_sans);
-    println!("TLS: generating dev self-signed certificate (SANs: {sans:?})");
+    tprintln!("TLS: generating dev self-signed certificate (SANs: {sans:?})");
 
     let mut params = rcgen::CertificateParams::new(sans)
         .context("building self-signed certificate params")?;
@@ -79,7 +79,7 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
     let key_pem = key_pair.serialize_pem().into_bytes();
 
     if let Err(e) = cache_dev_cert(&cert_file, &cert_pem, &key_file, &key_pem) {
-        eprintln!("TLS: could not cache dev cert ({e}); it will be regenerated next launch");
+        teprintln!("TLS: could not cache dev cert ({e}); it will be regenerated next launch");
     }
 
     Ok(TlsMaterial { cert_pem, key_pem, self_signed: true })

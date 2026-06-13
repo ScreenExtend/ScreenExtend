@@ -140,7 +140,7 @@ impl Encoder {
             return Err(e);
         }
 
-        println!(
+        tprintln!(
             "Intel Quick Sync (oneVPL) H.264 encoder initialized (D3D11 / ULL): {}x{} (coded {}x{})@{}, \
              bitrate_bps={}, rc={}, qp={:?}, profile={:?}, intra_refresh={}, low_power=on, async_depth=1, gop_ref_dist=1",
             this.config.width,
@@ -360,7 +360,7 @@ impl Encoder {
             "MFXVideoENCODE_Reset",
         )?;
         self.enc_param = par;
-        println!("Intel Quick Sync bitrate reconfigured (bitrate_bps={bps})");
+        tprintln!("Intel Quick Sync bitrate reconfigured (bitrate_bps={bps})");
         Ok(())
     }
 
@@ -692,7 +692,7 @@ fn create_session(vpl: &Vpl) -> Result<mfxSession> {
         Ok(session) => {
             let mut ver: u32 = 0;
             let _ = unsafe { (vpl.MFXQueryVersion)(session, &mut ver) };
-            println!(
+            tprintln!(
                 "oneVPL session created: HW impl via D3D11, api_version={}.{}",
                 ver >> 16,
                 ver & 0xFFFF
@@ -723,7 +723,7 @@ pub(crate) fn create_intel_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceC
                     .unwrap_or(desc.Description.len())],
             );
             if !is_software && name.to_uppercase().contains("INTEL") {
-                println!("selected Intel adapter for Quick Sync (index={i}, name={name})");
+                tprintln!("selected Intel adapter for Quick Sync (index={i}, name={name})");
                 chosen = Some(adapter);
                 break;
             }
@@ -761,7 +761,7 @@ pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Res
     const FRAMES: u32 = 300;
     const BITRATE: u32 = 10_000_000;
 
-    println!(
+    tprintln!(
         "Intel Quick Sync: encoding synthetic pattern to Annex-B: path={path}, {WIDTH}x{HEIGHT}@{FPS}, {FRAMES} frames"
     );
 
@@ -789,11 +789,11 @@ pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Res
         file.write_all(&au)
             .with_context(|| format!("writing frame {i}"))?;
         if i % 60 == 0 || i == FRAMES - 1 {
-            println!("Intel encoded frame={i} (au_bytes={}, total_bytes={total})", au.len());
+            tprintln!("Intel encoded frame={i} (au_bytes={}, total_bytes={total})", au.len());
         }
     }
     file.flush().context("flushing output file")?;
-    println!("Intel wrote Annex-B H.264: path={path}, frames={FRAMES}, total_bytes={total}");
+    tprintln!("Intel wrote Annex-B H.264: path={path}, frames={FRAMES}, total_bytes={total}");
     Ok(())
 }
 

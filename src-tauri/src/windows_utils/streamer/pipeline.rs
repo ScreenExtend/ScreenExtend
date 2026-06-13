@@ -72,10 +72,10 @@ fn apply_pending_bitrate(
     }
     match backend.set_bitrate(pending) {
         Ok(()) => {
-            println!("adapting bitrate: {} -> {pending} bps", *current);
+            tprintln!("adapting bitrate: {} -> {pending} bps", *current);
             *current = pending;
         }
-        Err(e) => eprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
     }
 }
 
@@ -184,7 +184,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                         .context(format!("monitor device name for DXGI fallback: {e}")));
                 }
             };
-            eprintln!(
+            teprintln!(
                 "WGC capture failed for display {}: {wgc_err:#}; \
                  falling back to DXGI Desktop Duplication on {device_name}",
                 info.index
@@ -227,7 +227,7 @@ impl SessionCapture {
         match self.control.take() {
             Some(SessionControl::Wgc(control)) => {
                 if let Err(e) = control.stop() {
-                    eprintln!("pipeline: stopping session capture failed: {e:?}");
+                    teprintln!("pipeline: stopping session capture failed: {e:?}");
                 }
             }
             Some(SessionControl::Dxgi(control)) => control.stop(),
@@ -257,7 +257,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
             Ok(SessionCapture { pipeline, control: Some(SessionControl::Wgc(control)) })
         }
         Err(wgc_err) => {
-            eprintln!(
+            teprintln!(
                 "WGC capture failed for {device_name}: {wgc_err:#}; \
                  falling back to DXGI Desktop Duplication"
             );
@@ -309,7 +309,7 @@ fn start_live_capture(
         },
     );
 
-    println!(
+    tprintln!(
         "pipeline: starting live monitor capture (WGC -> NVENC; zero-copy if available): \
          display={}, name={}, gpu={}, native={}x{}, encode={}x{}, downscale={}, fps={}, bitrate_bps={}",
         info.index,
@@ -351,7 +351,7 @@ fn start_dxgi_capture(
         h264_profile: cfg.h264_profile,
     };
 
-    println!(
+    tprintln!(
         "pipeline: starting DXGI duplication capture: device={}, native={}x{}, encode={}x{}, \
          downscale={}, fps={}, bitrate_bps={}",
         device_name, info.width, info.height, config.width, config.height, downscale,
@@ -478,7 +478,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         Arc::clone(&stop),
     );
 
-    println!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
+    tprintln!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
     let _ = ready_tx.send(Ok(()));
 
     let mut dirty = false;
@@ -504,7 +504,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             Ok(PollStatus::Dirty) => dirty = true,
             Ok(PollStatus::Timeout) => {}
             Err(e) => {
-                eprintln!("dxgi capture: {e:?}; stopping capture");
+                teprintln!("dxgi capture: {e:?}; stopping capture");
                 break;
             }
         }
@@ -522,7 +522,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             let tex = match dup.frame() {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("dxgi compose failed: {e:?}; stopping capture");
+                    teprintln!("dxgi compose failed: {e:?}; stopping capture");
                     break;
                 }
             };
@@ -536,14 +536,14 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             Ok(au) => au,
             Err(e) if is_transient_encode_error(&e) && busy_streak < MAX_TRANSIENT_ENCODE_DROPS => {
                 busy_streak += 1;
-                eprintln!(
+                teprintln!(
                     "dxgi encode transiently overloaded ({e:#}); dropping frame ({busy_streak} in a row)"
                 );
                 next_due = Instant::now() + frame_duration;
                 continue;
             }
             Err(e) => {
-                eprintln!("dxgi encode failed: {e:?}; stopping capture");
+                teprintln!("dxgi encode failed: {e:?}; stopping capture");
                 break;
             }
         };
@@ -562,7 +562,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         if frames_sent % 60 == 0 {
             let avg_ms = (timing_sum_ns / timing_count.max(1) as u128) as f64 / 1.0e6;
             let max_ms = timing_max_ns as f64 / 1.0e6;
-            println!(
+            tprintln!(
                 "encode-path latency: path=dxgi+{}, avg_ms={:.2}, max_ms={:.2}, frames={}",
                 path_name, avg_ms, max_ms, frames_sent
             );
@@ -573,7 +573,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
     }
 
     stop.store(true, Ordering::Relaxed);
-    println!("dxgi capture stopped");
+    tprintln!("dxgi capture stopped");
 }
 
 pub fn probe_bitrate(cfg: &Config) -> Result<()> {
@@ -586,14 +586,14 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
 
     let targets = [4_000_000u32, 2_000_000, 1_000_000, 3_000_000, 6_000_000];
     for (i, &t) in targets.iter().enumerate() {
-        println!("probe-bitrate: injecting synthetic target (step={i}, target_bps={t})");
+        tprintln!("probe-bitrate: injecting synthetic target (step={i}, target_bps={t})");
         pipeline.set_target_bitrate(t);
         for _ in 0..10 {
             let _ = rx.blocking_recv();
         }
     }
 
-    println!("probe-bitrate complete: cross-thread bitrate update exercised");
+    tprintln!("probe-bitrate complete: cross-thread bitrate update exercised");
     Ok(())
 }
 
@@ -635,7 +635,7 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
         }
     }
 
-    println!("probe-live complete: path={path}, frames={written}, total_bytes={total}");
+    tprintln!("probe-live complete: path={path}, frames={written}, total_bytes={total}");
     Ok(())
 }
 
@@ -922,7 +922,7 @@ fn build_backend(
     if want_intel {
         match IntelEncoder::new_on_device(config, native_w, native_h, device, context) {
             Ok(encoder) => {
-                println!(
+                tprintln!(
                     "pipeline: live capture ready -- INTEL Quick Sync same-adapter path ({}x{}@{})",
                     config.width, config.height, config.fps
                 );
@@ -930,18 +930,18 @@ fn build_backend(
             }
             Err(e) => {
                 if matches!(vendor, EncoderVendor::Intel) {
-                    eprintln!(
+                    teprintln!(
                         "Intel Quick Sync same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
                     );
                     let encoder = IntelEncoder::new(config)
                         .context("Intel Quick Sync requested via --encoder intel but unavailable")?;
-                    println!(
+                    tprintln!(
                         "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
                         config.width, config.height, config.fps
                     );
                     return Ok(Backend::IntelCpu { encoder });
                 }
-                eprintln!(
+                teprintln!(
                     "Intel Quick Sync unavailable on capture adapter ({e:?}); falling over to NVENC"
                 );
             }
@@ -950,32 +950,32 @@ fn build_backend(
 
     match build_zero_copy(config, device, context) {
         Ok((encoder, path)) => {
-            println!(
+            tprintln!(
                 "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
                 config.width, config.height, config.fps
             );
             Ok(Backend::Nvenc { encoder, path })
         }
         Err(e) => {
-            eprintln!(
+            teprintln!(
                 "NVENC zero-copy path unavailable ({e:?}); falling back to CPU bridge (higher latency)"
             );
             match Encoder::new(config) {
                 Ok(encoder) => {
-                    println!(
+                    tprintln!(
                         "pipeline: live capture ready -- NVENC CPU-bridge fallback ({}x{}@{})",
                         config.width, config.height, config.fps
                     );
                     Ok(Backend::Nvenc { encoder, path: EncodePath::CpuBridge })
                 }
                 Err(nv_err) if !matches!(vendor, EncoderVendor::Nvidia) => {
-                    eprintln!(
+                    teprintln!(
                         "NVENC unavailable ({nv_err:?}); trying Intel Quick Sync on its own device"
                     );
                     let encoder = IntelEncoder::new(config).map_err(|ie| {
                         nv_err.context(format!("no working encoder (Intel fallback also failed: {ie:?})"))
                     })?;
-                    println!(
+                    tprintln!(
                         "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
                         config.width, config.height, config.fps
                     );
@@ -1031,7 +1031,7 @@ fn spawn_repeater(
                         Ok(Some(au)) => au,
                         Ok(None) => continue,
                         Err(e) => {
-                            eprintln!("idle repeat encode failed: {e:?}");
+                            teprintln!("idle repeat encode failed: {e:?}");
                             continue;
                         }
                     }
@@ -1039,7 +1039,7 @@ fn spawn_repeater(
                 let _ = tx.send(EncodedFrame { data: Bytes::from(au), capture });
                 last_emit = Instant::now();
             }
-            println!("idle repeater stopped");
+            tprintln!("idle repeater stopped");
         })
         .expect("spawn repeater thread");
 }
@@ -1147,7 +1147,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                     && self.busy_streak < MAX_TRANSIENT_ENCODE_DROPS =>
             {
                 self.busy_streak += 1;
-                eprintln!(
+                teprintln!(
                     "encode transiently overloaded ({e:#}); dropping frame ({} in a row)",
                     self.busy_streak
                 );
@@ -1169,7 +1169,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         if self.frames_sent % 60 == 0 {
             let avg_ms = (self.timing_sum_ns / self.timing_count.max(1) as u128) as f64 / 1.0e6;
             let max_ms = self.timing_max_ns as f64 / 1.0e6;
-            println!(
+            tprintln!(
                 "encode-path latency: path={}, avg_ms={:.2}, max_ms={:.2}, frames={}",
                 self.path_name, avg_ms, max_ms, self.frames_sent
             );
@@ -1181,7 +1181,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
-        eprintln!("pipeline: capture item closed (display disconnected?)");
+        teprintln!("pipeline: capture item closed (display disconnected?)");
         Ok(())
     }
 }
@@ -1197,7 +1197,7 @@ fn synthetic_pattern_loop(
     let mut encoder = match Encoder::new(config) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("encode thread: failed to create NVENC encoder ({e:?}); pipeline stopped");
+            teprintln!("encode thread: failed to create NVENC encoder ({e:?}); pipeline stopped");
             return;
         }
     };
@@ -1209,7 +1209,7 @@ fn synthetic_pattern_loop(
     let mut frame_index: u32 = 0;
     let mut next_deadline = Instant::now();
 
-    println!(
+    tprintln!(
         "pipeline: synthetic pattern encode loop started ({SP_WIDTH}x{SP_HEIGHT}@{SP_FPS})"
     );
 
@@ -1218,10 +1218,10 @@ fn synthetic_pattern_loop(
         if pending != 0 && pending != current_bitrate {
             match encoder.set_bitrate(pending) {
                 Ok(()) => {
-                    println!("adapting bitrate: {current_bitrate} -> {pending} bps");
+                    tprintln!("adapting bitrate: {current_bitrate} -> {pending} bps");
                     current_bitrate = pending;
                 }
-                Err(e) => eprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+                Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
             }
         }
 
@@ -1233,7 +1233,7 @@ fn synthetic_pattern_loop(
                 let _ = tx.send(EncodedFrame { data: Bytes::from(au), capture: Instant::now() });
             }
             Err(e) => {
-                eprintln!("encode failed (frame={frame_index}): {e:?}; pipeline stopped");
+                teprintln!("encode failed (frame={frame_index}): {e:?}; pipeline stopped");
                 return;
             }
         }

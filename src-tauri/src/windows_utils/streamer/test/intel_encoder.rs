@@ -44,7 +44,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
     }) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("skipping Intel Quick Sync smoke test (no HW/runtime): {e:?}");
+            teprintln!("skipping Intel Quick Sync smoke test (no HW/runtime): {e:?}");
             return;
         }
     };
@@ -80,7 +80,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
         fill_synthetic_bgra(&mut frame, W, H, i);
         let _ = encoder.encode_bgra(&frame, false).expect("encode after bitrate reset");
     }
-    println!("Intel Quick Sync smoke test OK: 40 frames, {total} bytes, IDR+RepeatPPS verified");
+    tprintln!("Intel Quick Sync smoke test OK: 40 frames, {total} bytes, IDR+RepeatPPS verified");
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn intel_quicksync_fused_downscale() {
     let (device, context) = match create_intel_d3d11_device() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("skipping fused-downscale test (no Intel device): {e:?}");
+            teprintln!("skipping fused-downscale test (no Intel device): {e:?}");
             return;
         }
     };
@@ -120,7 +120,7 @@ fn intel_quicksync_fused_downscale() {
     ) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("skipping fused-downscale test (encoder init): {e:?}");
+            teprintln!("skipping fused-downscale test (encoder init): {e:?}");
             return;
         }
     };
@@ -154,5 +154,5 @@ fn intel_quicksync_fused_downscale() {
     for _ in 0..9 {
         let _ = encoder.encode_texture(&tex, false).expect("fused-scale encode");
     }
-    println!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
+    tprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
 }

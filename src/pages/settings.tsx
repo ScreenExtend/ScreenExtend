@@ -37,6 +37,7 @@ import {
 
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
+import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
@@ -460,6 +461,16 @@ export default function Settings() {
                   Save Password
                 </Button>
               </div>*/}
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Logs</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <LogTerminal />
             </CardContent>
           </Card>
         </div>

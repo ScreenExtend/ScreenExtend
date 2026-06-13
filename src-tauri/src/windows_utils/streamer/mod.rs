@@ -51,7 +51,7 @@ pub fn device_vendor(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device
     match describe() {
         Some(name) => {
             let vendor = select_vendor(&name);
-            println!("capture device adapter: name={name}, vendor={vendor:?}");
+            tprintln!("capture device adapter: name={name}, vendor={vendor:?}");
             vendor
         }
         None => Vendor::Unknown,

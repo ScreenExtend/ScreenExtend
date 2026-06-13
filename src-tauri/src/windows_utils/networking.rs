@@ -172,20 +172,20 @@ pub fn watch_for_network_changes(app: AppHandle) {
         let _com = match COMLibrary::new() {
             Ok(com) => com,
             Err(error) => {
-                println!("[network-watcher] failed to initialize COM: {error:?}");
+                tprintln!("[network-watcher] failed to initialize COM: {error:?}");
                 return;
             }
         };
 
         let mut previous = get_network_adapters(app.clone(), app.state::<AppState>());
-        println!("[network-watcher] initial network adapters: {previous:?}");
+        tprintln!("[network-watcher] initial network adapters: {previous:?}");
         apply(&app, previous.clone());
 
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let current = get_network_adapters(app.clone(), app.state::<AppState>());
             if current != previous {
-                println!("[network-watcher] network adapters changed: {current:?}");
+                tprintln!("[network-watcher] network adapters changed: {current:?}");
                 previous = current.clone();
                 apply(&app, current);
             }
@@ -199,6 +199,6 @@ fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
     *state.network_adapters.lock().unwrap() = adapters;
     super::sync_streamers(&state);
     if let Err(e) = crate::NetworkChange.emit(app) {
-        eprintln!("[network-watcher] failed to emit NetworkChange: {e:?}");
+        teprintln!("[network-watcher] failed to emit NetworkChange: {e:?}");
     }
 }

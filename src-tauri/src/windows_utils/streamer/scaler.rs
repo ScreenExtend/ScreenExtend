@@ -96,7 +96,7 @@ impl Scaler {
         .context("CreateVideoProcessorOutputView")?;
         let out_view = out_view.context("scaler output view was null")?;
 
-        println!("GPU downscaler ready: src={src_w}x{src_h}, dst={dst_w}x{dst_h}");
+        tprintln!("GPU downscaler ready: src={src_w}x{src_h}, dst={dst_w}x{dst_h}");
 
         Ok(Self {
             video_device,

@@ -333,7 +333,7 @@ impl Config {
 }
 
 pub fn print_help() {
-    println!(
+    tprintln!(
         "ultra-low-latency WebRTC screen streamer\n\
 \n\
 USAGE: untitled17 [OPTIONS]\n\

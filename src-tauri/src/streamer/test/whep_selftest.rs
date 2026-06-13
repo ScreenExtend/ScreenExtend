@@ -30,18 +30,18 @@ pub async fn run(mut config: Config) -> Result<()> {
     }
     let port = config.https_port;
 
-    println!("=== M3 WHEP self-test ===");
-    println!("[selftest] starting in-process server (HTTP :{}, HTTPS :{port})", config.port);
+    tprintln!("=== M3 WHEP self-test ===");
+    tprintln!("[selftest] starting in-process server (HTTP :{}, HTTPS :{port})", config.port);
 
     let server_cfg = config.clone();
     let server_handle = tokio::spawn(async move {
         if let Err(e) = crate::streamer::server::run(server_cfg, None).await {
-            eprintln!("[selftest] server exited with error: {e:?}");
+            teprintln!("[selftest] server exited with error: {e:?}");
         }
     });
 
     wait_for_health(port).await?;
-    println!("[selftest] server healthy");
+    tprintln!("[selftest] server healthy");
 
     let api = {
         use webrtc::api::media_engine::MIME_TYPE_H264;
@@ -121,7 +121,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         let track_seen = Arc::clone(&track_seen);
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _recv, _trans| {
             let codec = track.codec();
-            println!(
+            tprintln!(
                 "[selftest] on_track fired: mime={} payload_type={}",
                 codec.capability.mime_type, track.payload_type()
             );
@@ -135,7 +135,7 @@ pub async fn run(mut config: Config) -> Result<()> {
                             Ok((pkt, _)) => {
                                 let n = rtp_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 if n == 1 || n % 30 == 0 {
-                                    println!(
+                                    tprintln!(
                                         "[selftest] RTP #{n} seq={} ts={} payload={}B",
                                         pkt.header.sequence_number,
                                         pkt.header.timestamp,
@@ -152,7 +152,7 @@ pub async fn run(mut config: Config) -> Result<()> {
     }
 
     pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-        println!("[selftest] client PC state: {s:?}");
+        tprintln!("[selftest] client PC state: {s:?}");
         Box::pin(async {})
     }));
 
@@ -166,9 +166,9 @@ pub async fn run(mut config: Config) -> Result<()> {
         .ok_or_else(|| anyhow!("no local description"))?
         .sdp;
 
-    println!("[selftest] POST /whep ({} bytes)", offer_sdp.len());
+    tprintln!("[selftest] POST /whep ({} bytes)", offer_sdp.len());
     let answer_sdp = http_post_sdp(port, &offer_sdp).await?;
-    println!("[selftest] got answer SDP ({} bytes)", answer_sdp.len());
+    tprintln!("[selftest] got answer SDP ({} bytes)", answer_sdp.len());
 
     let checks = [
         ("H264", answer_sdp.contains("H264")),
@@ -180,23 +180,23 @@ pub async fn run(mut config: Config) -> Result<()> {
         ("transport-cc", answer_sdp.contains("transport-cc")),
         ("rtx", answer_sdp.contains("rtx")),
     ];
-    println!("[selftest] --- SDP attribute checks ---");
+    tprintln!("[selftest] --- SDP attribute checks ---");
     let mut all_ok = true;
     for (name, ok) in checks {
-        println!("[selftest]   {} {}", if ok { "PASS" } else { "FAIL" }, name);
+        tprintln!("[selftest]   {} {}", if ok { "PASS" } else { "FAIL" }, name);
         all_ok &= ok;
     }
     if let Some(fmtp) = answer_sdp.lines().find(|l| l.contains("profile-level-id")) {
-        println!("[selftest] negotiated fmtp: {}", fmtp.trim());
+        tprintln!("[selftest] negotiated fmtp: {}", fmtp.trim());
     }
     if !all_ok {
-        eprintln!("---- answer SDP ----\n{answer_sdp}\n--------------------");
+        teprintln!("---- answer SDP ----\n{answer_sdp}\n--------------------");
         bail!("SDP attribute checks failed");
     }
 
     pc.set_remote_description(RTCSessionDescription::answer(answer_sdp)?)
         .await?;
-    println!("[selftest] answer applied; waiting up to {TIMEOUT_SECS}s for >= {MIN_RTP_PACKETS} RTP packets");
+    tprintln!("[selftest] answer applied; waiting up to {TIMEOUT_SECS}s for >= {MIN_RTP_PACKETS} RTP packets");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
     while tokio::time::Instant::now() < deadline {
@@ -208,7 +208,7 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let final_count = rtp_count.load(Ordering::Relaxed);
     let tracks = track_seen.load(Ordering::Relaxed);
-    println!("[selftest] on_track fired: {tracks}; RTP packets received: {final_count}");
+    tprintln!("[selftest] on_track fired: {tracks}; RTP packets received: {final_count}");
 
     pc.close().await.ok();
     server_handle.abort();
@@ -220,7 +220,7 @@ pub async fn run(mut config: Config) -> Result<()> {
         bail!("only {final_count} RTP packets in {TIMEOUT_SECS}s (need >= {MIN_RTP_PACKETS})");
     }
 
-    println!("=== M3 WHEP self-test PASSED ({final_count} RTP packets) ===");
+    tprintln!("=== M3 WHEP self-test PASSED ({final_count} RTP packets) ===");
     Ok(())
 }
 
