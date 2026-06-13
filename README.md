@@ -106,7 +106,7 @@ ScreenExtend encodes captured displays with the host GPU. The matrix below lists
 
 - **[Rust](https://rustup.rs/)** (stable toolchain)
 - **[Node.js](https://nodejs.org/)** (LTS) and **[pnpm](https://pnpm.io/)**
-- **Tauri 2 system dependencies** — see the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/). On Windows this means the MSVC C++ build tools and WebView2.
+- **Tauri 2 system dependencies** (see the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/))
 
 ### Setup & run (development)
 
