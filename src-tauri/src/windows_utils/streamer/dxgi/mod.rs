@@ -88,7 +88,7 @@ fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_O
             let name = wide_to_string(&desc.DeviceName);
             if name == device_name {
                 let adapter_desc = unsafe { adapter.GetDesc1() }.ok();
-                println!(
+                tprintln!(
                     "dxgi: output {} found on adapter '{}'",
                     name,
                     adapter_desc
@@ -134,7 +134,7 @@ fn create_device_on(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11Devi
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     )
     .or_else(|e| {
-        eprintln!("dxgi: device with VIDEO_SUPPORT failed ({e:?}); retrying without");
+        teprintln!("dxgi: device with VIDEO_SUPPORT failed ({e:?}); retrying without");
         try_flags(D3D11_CREATE_DEVICE_BGRA_SUPPORT)
     })?;
 
@@ -230,7 +230,7 @@ impl Duplicator {
             }
             if (w, h) == (logical_w, logical_h) {
                 let effective = if rotated {
-                    println!(
+                    tprintln!(
                         "dxgi: output flags rotation {:?} but the duplication surface is already \
                          desktop-oriented ({w}x{h}); compositing without an un-rotate pass",
                         dd.Rotation
@@ -256,7 +256,7 @@ impl Duplicator {
         let (composite, _, composite_rtv) = make_target(&device, logical_w, logical_h)?;
         let renderer = QuadRenderer::new(&device, &context)?;
 
-        println!(
+        tprintln!(
             "dxgi: duplication ready on {device_name}: {phys_w}x{phys_h}, rotation={rotation:?}, \
              logical={logical_w}x{logical_h}"
         );
@@ -312,7 +312,7 @@ impl Duplicator {
                 }
                 self.dup = Some(dup);
                 self.redup_failures = 0;
-                println!("dxgi: duplication re-established");
+                tprintln!("dxgi: duplication re-established");
                 Ok(())
             }
             Err(e) => {
@@ -376,9 +376,9 @@ impl Duplicator {
                             dirty = true;
                         }
                     }
-                    Err(e) => eprintln!("dxgi: cursor shape conversion failed: {e:?}"),
+                    Err(e) => teprintln!("dxgi: cursor shape conversion failed: {e:?}"),
                 },
-                Err(e) => eprintln!("dxgi: GetFramePointerShape failed: {e:?}"),
+                Err(e) => teprintln!("dxgi: GetFramePointerShape failed: {e:?}"),
             }
         }
 
@@ -487,7 +487,7 @@ pub fn probe_to_bmp(requested_monitor: u32, path: &str) -> Result<()> {
     let device_name = monitor
         .device_name()
         .map_err(|e| anyhow!("monitor device name: {e}"))?;
-    println!(
+    tprintln!(
         "dxgi probe: monitor[{}] '{}' ({device_name}) {}x{}",
         info.index, info.name, info.width, info.height
     );
@@ -529,7 +529,7 @@ pub fn probe_to_bmp(requested_monitor: u32, path: &str) -> Result<()> {
     let tex = dup.frame()?;
     let (data, pitch) = reader.read_back(tex)?;
     write_bmp(path, info.width, info.height, data, pitch)?;
-    println!(
+    tprintln!(
         "dxgi probe: wrote {}x{} (updates={frames}, cursor_drawn={cursor_drawn}, \
          cursor_pos={cx},{cy}, cursor_size={cw}x{ch}) -> {path}",
         info.width, info.height

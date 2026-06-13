@@ -11,7 +11,7 @@ const SIDEBAR_WIDTH = 275;
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const { windowOtp: [otp] } = useContext(GlobalProviderContext);
+  const { windowOtp: [otp], windowSessionId: [sessionId] } = useContext(GlobalProviderContext);
 
   return (
     <div className="flex h-screen w-full">
@@ -44,7 +44,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           {children}
         </div>
         <div className="flex items-center justify-end p-4 border-t">
-          <div className="flex items-center space-x-2 mx-2 text-lg">
+          <div className="flex flex-col mx-2 text-sm">
+            <p>Session ID: {sessionId}</p>
             <p>Session OTP: {otp}</p>
           </div>
           <div className="flex-1"></div>

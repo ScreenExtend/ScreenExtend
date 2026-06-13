@@ -45,9 +45,9 @@ pub fn set_display_topology_extend() {
     use windows::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND};
     let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
     if result == 0 {
-        println!("[display] projection mode set to Extend (SetDisplayConfig returned SUCCESS)");
+        tprintln!("[display] projection mode set to Extend (SetDisplayConfig returned SUCCESS)");
     } else {
-        eprintln!(
+        teprintln!(
             "[display] failed to set projection mode to Extend \
              (SetDisplayConfig win32 error {result}; 31=ERROR_GEN_FAILURE/no saved extend topology)"
         );
@@ -136,7 +136,7 @@ pub fn set_disconnect_grace(state: State<'_, AppState>, seconds: u32) {
     state
         .disconnect_grace
         .store(secs, std::sync::atomic::Ordering::Relaxed);
-    println!("disconnect grace set to {secs}s");
+    tprintln!("disconnect grace set to {secs}s");
 }
 
 #[tauri::command]
@@ -233,7 +233,7 @@ pub fn sync_streamers(state: &AppState) {
         if desired.iter().any(|(desired_ip, _)| desired_ip == ip) {
             true
         } else {
-            println!("[streamer] stopping streamer bound to {ip}");
+            tprintln!("[streamer] stopping streamer bound to {ip}");
             streamer.handle.graceful_shutdown(Some(Duration::from_secs(1)));
             false
         }
@@ -261,11 +261,11 @@ pub fn sync_streamers(state: &AppState) {
         let ip_for_log = ip.clone();
         std::thread::spawn(move || {
             if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
-                eprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
+                teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
             }
         });
 
-        println!("[streamer] started streamer bound to {ip}");
+        tprintln!("[streamer] started streamer bound to {ip}");
         streamers.insert(ip, StreamerHandle { handle });
     }
 }

@@ -16,7 +16,7 @@ use windows_capture::settings::{
 
 pub fn set_dpi_awareness() {
     if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-        eprintln!("SetProcessDpiAwarenessContext failed (likely already set): {e}");
+        teprintln!("SetProcessDpiAwarenessContext failed (likely already set): {e}");
     }
 }
 
@@ -38,7 +38,7 @@ pub fn check_dwm_composition() -> Result<()> {
             "DWM composition disabled, install Desktop Experience on Server"
         ),
         Err(_) => {
-            eprintln!("DwmIsCompositionEnabled failed (non-fatal)");
+            teprintln!("DwmIsCompositionEnabled failed (non-fatal)");
             Ok(())
         }
     }
@@ -50,20 +50,20 @@ pub fn select_monitor(requested: u32) -> Result<(Monitor, MonitorInfo)> {
         bail!("no displays found");
     }
 
-    println!("{} display(s) detected:", monitors.len());
+    tprintln!("{} display(s) detected:", monitors.len());
     for (i, m) in monitors.iter().enumerate() {
         let name = m.name().unwrap_or_else(|_| "<unknown>".into());
         let gpu = m.device_string().unwrap_or_else(|_| "<unknown gpu>".into());
         let w = m.width().unwrap_or(0);
         let h = m.height().unwrap_or(0);
         let hz = m.refresh_rate().unwrap_or(0);
-        println!("  display[{i}]: {name} -- {gpu} -- {w}x{h}@{hz}Hz");
+        tprintln!("  display[{i}]: {name} -- {gpu} -- {w}x{h}@{hz}Hz");
     }
 
     let index = if (requested as usize) < monitors.len() {
         requested
     } else {
-        eprintln!("requested display {requested} absent, falling back to 0");
+        teprintln!("requested display {requested} absent, falling back to 0");
         0
     };
 
@@ -362,7 +362,7 @@ impl GraphicsCaptureApiHandler for ProbeHandler {
 
 pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
     let (monitor, info) = select_monitor(requested_monitor)?;
-    println!(
+    tprintln!(
         "capturing display[{}] '{}' ({}) {}x{} -> {}",
         info.index, info.name, info.gpu, info.width, info.height, path
     );
@@ -384,7 +384,7 @@ pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
     let captured = result.lock().unwrap().take();
     match captured {
         Some(r) => {
-            println!("captured {}x{} frame -> {}", r.width, r.height, path);
+            tprintln!("captured {}x{} frame -> {}", r.width, r.height, path);
             Ok(())
         }
         None => bail!("capture ended without producing a frame"),

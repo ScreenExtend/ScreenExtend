@@ -44,9 +44,9 @@ fn raise_timer_resolution() {
     use windows::Win32::Media::timeBeginPeriod;
     let rc = unsafe { timeBeginPeriod(1) };
     if rc == 0 {
-        println!("timer resolution raised to 1ms");
+        tprintln!("timer resolution raised to 1ms");
     } else {
-        eprintln!("timeBeginPeriod(1) rejected (rc={rc})");
+        teprintln!("timeBeginPeriod(1) rejected (rc={rc})");
     }
 }
 
@@ -72,8 +72,8 @@ fn exempt_from_power_throttling() {
         )
     };
     match rc {
-        Ok(()) => println!("process exempted from power throttling"),
-        Err(e) => eprintln!("power-throttling exemption failed: {e}"),
+        Ok(()) => tprintln!("process exempted from power throttling"),
+        Err(e) => teprintln!("power-throttling exemption failed: {e}"),
     }
 }
 
@@ -92,14 +92,14 @@ fn register_mmcss() -> isize {
         let mut task_index: u32 = 0;
         match unsafe { AvSetMmThreadCharacteristicsW(wide_name, &mut task_index) } {
             Ok(h) if !h.is_invalid() => {
-                println!("MMCSS registered ({name})");
+                tprintln!("MMCSS registered ({name})");
                 return h.0 as isize;
             }
             _ => continue,
         }
     }
 
-    eprintln!("all MMCSS task names failed");
+    teprintln!("all MMCSS task names failed");
     0
 }
 
@@ -111,7 +111,7 @@ fn raise_current_thread_priority() {
     unsafe {
         let t = GetCurrentThread();
         if let Err(e) = SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL) {
-            eprintln!("SetThreadPriority failed: {e}");
+            teprintln!("SetThreadPriority failed: {e}");
         }
         let _ = SetThreadPriorityBoost(t, true);
     }
@@ -127,7 +127,7 @@ pub fn raise_d3d11_gpu_priority(device: &windows::Win32::Graphics::Direct3D11::I
         Err(_) => return,
     };
     match unsafe { dxgi.SetGPUThreadPriority(5) } {
-        Ok(()) => println!("GPU thread priority raised (+5)"),
-        Err(e) => eprintln!("SetGPUThreadPriority failed: {e}"),
+        Ok(()) => tprintln!("GPU thread priority raised (+5)"),
+        Err(e) => teprintln!("SetGPUThreadPriority failed: {e}"),
     }
 }

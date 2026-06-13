@@ -122,7 +122,7 @@ impl Encoder {
             this.setup_shared()?;
         }
 
-        println!(
+        tprintln!(
             "NVENC H.264 encoder initialized (D3D11 / ULL): {}x{}@{}, bitrate_bps={}, zero_copy={}, profile={:?}, rc={}, qp={:?}, intra_refresh={}",
             config.width,
             config.height,
@@ -291,7 +291,7 @@ impl Encoder {
         self.encode_config = new_config;
         self.init_params = reconfig.reInitEncodeParams;
         self.init_params.encodeConfig = &mut self.encode_config;
-        println!("NVENC bitrate reconfigured (bitrate_bps={bps})");
+        tprintln!("NVENC bitrate reconfigured (bitrate_bps={bps})");
         Ok(())
     }
 
@@ -635,10 +635,10 @@ fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
                     .position(|&c| c == 0)
                     .unwrap_or(desc.Description.len())],
             );
-            println!("DXGI adapter (index={i}, name={name}, is_software={is_software})");
+            tprintln!("DXGI adapter (index={i}, name={name}, is_software={is_software})");
             if !is_software && name.to_uppercase().contains("NVIDIA") {
                 chosen = Some(adapter);
-                println!("selected NVIDIA adapter for NVENC (index={i}, name={name})");
+                tprintln!("selected NVIDIA adapter for NVENC (index={i}, name={name})");
                 break;
             }
             i += 1;
@@ -742,7 +742,7 @@ fn check(status: NVENCSTATUS, what: &str, _encoder: *mut c_void) -> Result<()> {
 
 fn log_drop_status(status: NVENCSTATUS, what: &str) {
     if status != NVENCSTATUS::NV_ENC_SUCCESS {
-        eprintln!("{what} returned {status:?} during encoder drop");
+        teprintln!("{what} returned {status:?} during encoder drop");
     }
 }
 
@@ -753,7 +753,7 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     const FRAMES: u32 = 300;
     const BITRATE: u32 = 10_000_000;
 
-    println!("encoding synthetic pattern to Annex-B: path={path}, {WIDTH}x{HEIGHT}@{FPS}, {FRAMES} frames");
+    tprintln!("encoding synthetic pattern to Annex-B: path={path}, {WIDTH}x{HEIGHT}@{FPS}, {FRAMES} frames");
 
     let mut encoder = Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -781,12 +781,12 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
             .with_context(|| format!("writing frame {i} ({} bytes)", au.len()))?;
 
         if i % 60 == 0 || i == FRAMES - 1 {
-            println!("encoded frame={i} (au_bytes={}, total_bytes={total_bytes})", au.len());
+            tprintln!("encoded frame={i} (au_bytes={}, total_bytes={total_bytes})", au.len());
         }
     }
     file.flush().context("flushing output file")?;
 
-    println!("wrote Annex-B H.264: path={path}, frames={FRAMES}, total_bytes={total_bytes}");
+    tprintln!("wrote Annex-B H.264: path={path}, frames={FRAMES}, total_bytes={total_bytes}");
     Ok(())
 }
 
