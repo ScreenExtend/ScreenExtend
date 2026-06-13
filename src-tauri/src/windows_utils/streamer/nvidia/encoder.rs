@@ -392,16 +392,19 @@ impl Encoder {
         let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
         h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
         if self.config.intra_refresh {
-            let refresh_period = (fps / 2).max(1);
             h264.set_enableIntraRefresh(1);
-            h264.intraRefreshPeriod = refresh_period;
-            h264.intraRefreshCnt = (fps / 4).max(1);
+            h264.intraRefreshPeriod = (fps * 4).max(2);
+            h264.intraRefreshCnt = (fps / 2).max(1);
         }
         let slice_count = (self.config.height / 256).clamp(4, 8);
         h264.sliceMode = 3;
         h264.sliceModeData = slice_count;
         h264.maxNumRefFrames = 1;
         h264.set_repeatSPSPPS(1);
+        h264.set_enableFillerDataInsertion(0);
+        h264.set_outputBufferingPeriodSEI(0);
+        h264.set_outputPictureTimingSEI(0);
+        h264.set_outputAUD(0);
 
         match self.config.profile {
             H264Profile::Baseline => {

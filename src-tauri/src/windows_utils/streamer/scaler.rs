@@ -193,3 +193,63 @@ impl Scaler {
         }
     }
 }
+
+pub struct TextureReader {
+    ctx: ID3D11DeviceContext,
+    staging: ID3D11Texture2D,
+    readback: Vec<u8>,
+    height: u32,
+}
+
+unsafe impl Send for TextureReader {}
+
+impl TextureReader {
+    pub fn new(
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }
+            .context("CreateTexture2D (reader staging)")?;
+        Ok(Self {
+            ctx: ctx.clone(),
+            staging: staging.context("reader staging texture was null")?,
+            readback: Vec::new(),
+            height,
+        })
+    }
+
+    pub fn read_back(&mut self, src: &ID3D11Texture2D) -> Result<(&[u8], u32)> {
+        unsafe {
+            self.ctx.CopyResource(&self.staging, src);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Map(reader staging)")?;
+            let row_pitch = mapped.RowPitch;
+            let total = row_pitch as usize * self.height as usize;
+            self.readback.resize(total, 0);
+            std::ptr::copy_nonoverlapping(
+                mapped.pData as *const u8,
+                self.readback.as_mut_ptr(),
+                total,
+            );
+            self.ctx.Unmap(&self.staging, 0);
+            Ok((&self.readback, row_pitch))
+        }
+    }
+}

@@ -280,6 +280,13 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
         .map(|s| session::next_session_seq(s, client_ip))
         .unwrap_or(0);
 
+    if let Some(s) = state.config.sessions.as_ref() {
+        if let Some(stop) = session::take_active_capture(s, client_ip) {
+            println!("stopping previous capture for {client_ip} before starting a new session");
+            let _ = tokio::task::spawn_blocking(stop).await;
+        }
+    }
+
     let detected_refresh = if req.refresh_rate == 0 {
         60
     } else {
@@ -337,11 +344,15 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             if display_changed {
                 let name = prev.device_name.clone();
                 let name2 = name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_resolution(&name2, width, height, refresh)
+                let res = tokio::task::spawn_blocking(move || {
+                    pipeline::set_display_mode(&name2, width, height, refresh, portrait)
                 })
                 .await;
-                apply_display_settings(&name, override_for_ip).await;
+                if let Ok(Err(e)) = res {
+                    eprintln!("could not apply display mode to {name}: {e}");
+                }
+                apply_display_scale(&name, override_for_ip).await;
+                wait_for_display_settle(&name).await;
                 println!(
                     "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh})",
                     prev.display_id
@@ -383,20 +394,24 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
                 }
             };
 
+            let _ = tokio::task::spawn_blocking(pipeline::set_display_topology_extend).await;
+
             {
                 let name = device_name.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_resolution(&name, width, height, refresh)
+                    pipeline::set_display_mode(&name, width, height, refresh, portrait)
                 })
                 .await;
                 match res {
-                    Ok(Ok(())) => println!("virtual display {device_name} set to {width}x{height}@{refresh}"),
+                    Ok(Ok(())) => println!(
+                        "virtual display {device_name} set to {width}x{height}@{refresh} (portrait={portrait})"
+                    ),
                     Ok(Err(e)) => eprintln!("could not force {device_name} to {width}x{height}: {e}"),
-                    Err(e) => eprintln!("set-resolution task for {device_name} panicked: {e}"),
+                    Err(e) => eprintln!("set-mode task for {device_name} panicked: {e}"),
                 }
             }
 
-            apply_display_settings(&device_name, override_for_ip).await;
+            apply_display_scale(&device_name, override_for_ip).await;
             (display_id, device_name)
         }
     };
@@ -415,9 +430,7 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
 
     let session = match pipeline::start_on_monitor(&cfg, &device_name) {
         Ok(s) => s,
-        Err(e) => {
-            return Err(e.context("starting capture for virtual display"));
-        }
+        Err(e) => return Err(e.context("starting capture for virtual display")),
     };
 
     let (closed_tx, closed_rx) = oneshot::channel();
@@ -458,9 +471,18 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
         .as_ref()
         .map(|s| session::arm_leave(s, client_ip));
 
+    let session_holder = match state.config.sessions.as_ref() {
+        Some(s) => {
+            session::set_active_capture(s, client_ip, session_seq, Box::new(move || session.stop()));
+            None
+        }
+        None => Some(session),
+    };
+
     let client = client.clone();
     let reporter = state.config.device_reporter.clone();
     let sessions = state.config.sessions.clone();
+    let disconnect_grace = state.config.disconnect_grace.clone();
     let report_ip = client_ip.to_string();
     tokio::spawn(async move {
         let left = match &leave {
@@ -479,11 +501,27 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             }
         };
 
-        session.stop();
+        let stop = sessions
+            .as_ref()
+            .and_then(|s| session::take_active_capture_if(s, &report_ip, session_seq));
+        if let Some(stop) = stop {
+            let _ = tokio::task::spawn_blocking(stop).await;
+        } else if let Some(session) = session_holder {
+            session.stop();
+        }
 
         if !left {
-            println!("session for display id={display_id} ({device_name}) PC closed; keeping display");
-            return;
+            let grace = std::time::Duration::from_secs(
+                disconnect_grace
+                    .as_ref()
+                    .map(|g| g.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(session::DEFAULT_DISCONNECT_GRACE_SECS),
+            );
+            println!(
+                "session for display id={display_id} ({device_name}) PC closed; \
+                 waiting {grace:?} for a rejoin before removing the display"
+            );
+            tokio::time::sleep(grace).await;
         }
 
         let superseded = sessions
@@ -491,10 +529,13 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             .map(|s| !session::is_current_session(s, &report_ip, session_seq))
             .unwrap_or(false);
         if superseded {
-            println!("session for display id={display_id} ({device_name}) leave superseded; keeping display");
+            println!("session for display id={display_id} ({device_name}) superseded; keeping display");
             return;
         }
-        println!("page closed; removing display id={display_id} ({device_name})");
+        println!(
+            "session for display id={display_id} ({device_name}) ended ({}); removing display",
+            if left { "page closed" } else { "disconnected, no rejoin" }
+        );
         if let Some(s) = sessions.as_ref() {
             let _ = session::take_live_display(s, &report_ip);
         }
@@ -512,22 +553,38 @@ async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }
 
-async fn apply_display_settings(device_name: &str, over: Option<DeviceOverride>) {
+async fn apply_display_scale(device_name: &str, over: Option<DeviceOverride>) {
     let Some(o) = over else { return };
     let name = device_name.to_string();
-    let portrait = o.orientation_portrait;
     let scale = o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE);
     let res = tokio::task::spawn_blocking(move || {
-        if let Err(e) = pipeline::set_display_orientation(&name, portrait) {
-            eprintln!("could not set orientation for {name}: {e}");
-        }
         if let Err(e) = pipeline::set_display_scale(&name, scale) {
             eprintln!("could not set scale for {name}: {e}");
         }
     })
     .await;
     if let Err(e) = res {
-        eprintln!("apply-display-settings task for {device_name} panicked: {e}");
+        eprintln!("apply-display-scale task for {device_name} panicked: {e}");
+    }
+}
+
+async fn wait_for_display_settle(device_name: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut last: Option<(u32, u32)> = None;
+    loop {
+        let name = device_name.to_string();
+        let dims = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
+            .await
+            .ok()
+            .flatten();
+        if dims.is_some() && dims == last {
+            return;
+        }
+        last = dims;
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
     }
 }
 

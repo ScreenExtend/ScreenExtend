@@ -21,9 +21,12 @@ use windows_capture::settings::{
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
 use super::capture::{MonitorInfo, select_monitor, select_monitor_by_device_name};
 use windows_capture::monitor::Monitor;
+use super::dxgi::{Duplicator, PollStatus};
+use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
-use super::scaler::Scaler;
+use super::scaler::{Scaler, TextureReader};
 use super::tuning;
+use super::Vendor;
 
 #[derive(Clone)]
 pub struct EncodedFrame {
@@ -59,7 +62,7 @@ impl Pipeline {
 }
 
 fn apply_pending_bitrate(
-    encoder: &mut Encoder,
+    backend: &mut Backend,
     target_bitrate: &AtomicU32,
     current: &mut u32,
 ) {
@@ -67,7 +70,7 @@ fn apply_pending_bitrate(
     if pending == 0 || pending == *current {
         return;
     }
-    match encoder.set_bitrate(pending) {
+    match backend.set_bitrate(pending) {
         Ok(()) => {
             println!("adapting bitrate: {} -> {pending} bps", *current);
             *current = pending;
@@ -76,12 +79,24 @@ fn apply_pending_bitrate(
     }
 }
 
-fn live_encoder_config(native_w: u32, native_h: u32, refresh_hz: u32, cfg: &Config) -> EncoderConfig {
+const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
+
+fn is_transient_encode_error(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("device busy")
+}
+
+pub(crate) fn live_encoder_config(
+    native_w: u32,
+    native_h: u32,
+    refresh_hz: u32,
+    cfg: &Config,
+) -> EncoderConfig {
     let fps = if let Some(f) = cfg.fps {
         f.clamp(15, 500)
     } else {
         let refresh = if refresh_hz == 0 { 60 } else { refresh_hz };
-        refresh.clamp(60, cfg.max_fps)
+        let max_fps = cfg.max_fps.clamp(15, 500);
+        refresh.clamp(60.min(max_fps), max_fps)
     };
 
     let (width, height) = scaled_dims(native_w, native_h, cfg.scale);
@@ -149,23 +164,74 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
     super::capture::check_dwm_composition()?;
 
     let (monitor, info) = select_monitor(cfg.monitor)?;
-    let (pipeline, control) = start_live_capture(cfg, monitor, &info, tx, idr_request, target_bitrate)?;
-    std::mem::forget(control);
+    match start_live_capture(
+        cfg,
+        monitor,
+        &info,
+        tx.clone(),
+        Arc::clone(&idr_request),
+        Arc::clone(&target_bitrate),
+    ) {
+        Ok((pipeline, control)) => {
+            std::mem::forget(control);
+            Ok(pipeline)
+        }
+        Err(wgc_err) => {
+            let device_name = match monitor.device_name() {
+                Ok(name) => name,
+                Err(e) => {
+                    return Err(wgc_err
+                        .context(format!("monitor device name for DXGI fallback: {e}")));
+                }
+            };
+            eprintln!(
+                "WGC capture failed for display {}: {wgc_err:#}; \
+                 falling back to DXGI Desktop Duplication on {device_name}",
+                info.index
+            );
+            let (pipeline, control) =
+                start_dxgi_capture(cfg, &device_name, &info, tx, idr_request, target_bitrate)
+                    .map_err(|e| e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})")))?;
+            drop(control);
+            Ok(pipeline)
+        }
+    }
+}
 
-    Ok(pipeline)
+pub struct DxgiControl {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DxgiControl {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+enum SessionControl {
+    Wgc(CaptureControl<LiveCapture, anyhow::Error>),
+    Dxgi(DxgiControl),
 }
 
 pub struct SessionCapture {
     pub pipeline: Pipeline,
-    control: Option<CaptureControl<LiveCapture, anyhow::Error>>,
+    control: Option<SessionControl>,
 }
 
 impl SessionCapture {
     pub fn stop(mut self) {
-        if let Some(control) = self.control.take() {
-            if let Err(e) = control.stop() {
-                eprintln!("pipeline: stopping session capture failed: {e:?}");
+        match self.control.take() {
+            Some(SessionControl::Wgc(control)) => {
+                if let Err(e) = control.stop() {
+                    eprintln!("pipeline: stopping session capture failed: {e:?}");
+                }
             }
+            Some(SessionControl::Dxgi(control)) => control.stop(),
+            None => {}
         }
     }
 }
@@ -178,10 +244,29 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     super::capture::check_dwm_composition()?;
 
     let (monitor, info) = select_monitor_by_device_name(device_name)?;
-    let (pipeline, control) =
-        start_live_capture(cfg, monitor, &info, tx, idr_request, target_bitrate)?;
 
-    Ok(SessionCapture { pipeline, control: Some(control) })
+    match start_live_capture(
+        cfg,
+        monitor,
+        &info,
+        tx.clone(),
+        Arc::clone(&idr_request),
+        Arc::clone(&target_bitrate),
+    ) {
+        Ok((pipeline, control)) => {
+            Ok(SessionCapture { pipeline, control: Some(SessionControl::Wgc(control)) })
+        }
+        Err(wgc_err) => {
+            eprintln!(
+                "WGC capture failed for {device_name}: {wgc_err:#}; \
+                 falling back to DXGI Desktop Duplication"
+            );
+            let (pipeline, control) =
+                start_dxgi_capture(cfg, device_name, &info, tx, idr_request, target_bitrate)
+                    .map_err(|e| e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})")))?;
+            Ok(SessionCapture { pipeline, control: Some(SessionControl::Dxgi(control)) })
+        }
+    }
 }
 
 fn start_live_capture(
@@ -215,6 +300,7 @@ fn start_live_capture(
         ColorFormat::Bgra8,
         CaptureFlags {
             config,
+            vendor: cfg.encoder_vendor,
             native_w: info.width,
             native_h: info.height,
             tx,
@@ -242,6 +328,252 @@ fn start_live_capture(
         LiveCapture::start_free_threaded(settings).map_err(|e| anyhow!("starting WGC capture: {e}"))?;
 
     Ok((pipeline, control))
+}
+
+fn start_dxgi_capture(
+    cfg: &Config,
+    device_name: &str,
+    info: &MonitorInfo,
+    tx: broadcast::Sender<EncodedFrame>,
+    idr_request: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
+) -> Result<(Pipeline, DxgiControl)> {
+    let config = live_encoder_config(info.width, info.height, info.refresh_hz, cfg);
+    let downscale = config.width != info.width || config.height != info.height;
+    let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
+
+    let pipeline = Pipeline {
+        tx: tx.clone(),
+        frame_duration,
+        idr_request: Arc::clone(&idr_request),
+        target_bitrate: Arc::clone(&target_bitrate),
+        max_bitrate_bps: config.max_bitrate_bps,
+        h264_profile: cfg.h264_profile,
+    };
+
+    println!(
+        "pipeline: starting DXGI duplication capture: device={}, native={}x{}, encode={}x{}, \
+         downscale={}, fps={}, bitrate_bps={}",
+        device_name, info.width, info.height, config.width, config.height, downscale,
+        config.fps, config.bitrate_bps,
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+
+    let thread_args = DxgiThreadArgs {
+        device_name: device_name.to_string(),
+        config,
+        vendor: cfg.encoder_vendor,
+        native_w: info.width,
+        native_h: info.height,
+        frame_duration,
+        tx,
+        idr_request,
+        target_bitrate,
+        stop: Arc::clone(&stop),
+    };
+    let join = std::thread::Builder::new()
+        .name("dxgi-capture".to_string())
+        .spawn(move || dxgi_capture_thread(thread_args, ready_tx))
+        .context("spawning dxgi capture thread")?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((pipeline, DxgiControl { stop, join: Some(join) })),
+        Ok(Err(e)) => {
+            let _ = join.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = join.join();
+            Err(anyhow!("dxgi capture thread exited during setup"))
+        }
+    }
+}
+
+struct DxgiThreadArgs {
+    device_name: String,
+    config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
+    native_w: u32,
+    native_h: u32,
+    frame_duration: Duration,
+    tx: broadcast::Sender<EncodedFrame>,
+    idr_request: Arc<AtomicBool>,
+    target_bitrate: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+}
+
+fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<Result<()>>) {
+    let DxgiThreadArgs {
+        device_name,
+        config,
+        vendor,
+        native_w,
+        native_h,
+        frame_duration,
+        tx,
+        idr_request,
+        target_bitrate,
+        stop,
+    } = args;
+
+    let _thread_tuning = tuning::tune_current_thread();
+
+    let setup = (|| -> Result<(Duplicator, Arc<Mutex<EncodeCore>>, &'static str)> {
+        let dup = Duplicator::new(&device_name, native_w, native_h)?;
+        let backend =
+            build_backend(config, vendor, native_w, native_h, dup.device(), dup.context())?;
+
+        let needs_scaler =
+            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let scaler = if needs_scaler {
+            Some(
+                Scaler::new(dup.device(), dup.context(), native_w, native_h, config.width, config.height)
+                    .context("building GPU downscaler for --scale")?,
+            )
+        } else {
+            None
+        };
+        let reader = if backend.is_cpu_bridge() && scaler.is_none() {
+            Some(TextureReader::new(dup.device(), dup.context(), native_w, native_h)?)
+        } else {
+            None
+        };
+
+        tuning::raise_d3d11_gpu_priority(backend.device());
+        tuning::raise_d3d11_gpu_priority(dup.device());
+        let path_name = backend.name();
+
+        let core = Arc::new(Mutex::new(EncodeCore {
+            backend,
+            scaler,
+            reader,
+            target_bitrate,
+            idr_request: Arc::clone(&idr_request),
+            current_bitrate: config.bitrate_bps,
+            have_frame: false,
+            frame_index: 0,
+        }));
+        Ok((dup, core, path_name))
+    })();
+
+    let (mut dup, core, path_name) = match setup {
+        Ok(state) => state,
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let epoch = Instant::now();
+    let last_frame_at = Arc::new(AtomicU64::new(0));
+    spawn_repeater(
+        Arc::clone(&core),
+        tx.clone(),
+        idr_request,
+        frame_duration,
+        Arc::clone(&last_frame_at),
+        epoch,
+        Arc::clone(&stop),
+    );
+
+    println!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
+    let _ = ready_tx.send(Ok(()));
+
+    let mut dirty = false;
+    let mut next_due = Instant::now();
+    let mut busy_streak: u32 = 0;
+    let mut frames_sent: u64 = 0;
+    let mut timing_sum_ns: u128 = 0;
+    let mut timing_count: u64 = 0;
+    let mut timing_max_ns: u128 = 0;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let timeout_ms = if dirty {
+            let rem = next_due.saturating_duration_since(Instant::now());
+            ((rem.as_micros() + 999) / 1000) as u32
+        } else {
+            50
+        };
+        match dup.poll(timeout_ms) {
+            Ok(PollStatus::Dirty) => dirty = true,
+            Ok(PollStatus::Timeout) => {}
+            Err(e) => {
+                eprintln!("dxgi capture: {e:?}; stopping capture");
+                break;
+            }
+        }
+
+        if !dirty {
+            continue;
+        }
+        let now = Instant::now();
+        if now < next_due {
+            continue;
+        }
+
+        let capture = now;
+        let encode_res = {
+            let tex = match dup.frame() {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("dxgi compose failed: {e:?}; stopping capture");
+                    break;
+                }
+            };
+            let mut core = match core.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            core.encode_texture(tex)
+        };
+        let au = match encode_res {
+            Ok(au) => au,
+            Err(e) if is_transient_encode_error(&e) && busy_streak < MAX_TRANSIENT_ENCODE_DROPS => {
+                busy_streak += 1;
+                eprintln!(
+                    "dxgi encode transiently overloaded ({e:#}); dropping frame ({busy_streak} in a row)"
+                );
+                next_due = Instant::now() + frame_duration;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("dxgi encode failed: {e:?}; stopping capture");
+                break;
+            }
+        };
+        busy_streak = 0;
+
+        last_frame_at.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let _ = tx.send(EncodedFrame { data: Bytes::from(au), capture });
+        dirty = false;
+        next_due = capture + frame_duration;
+
+        frames_sent += 1;
+        let dt = capture.elapsed().as_nanos();
+        timing_sum_ns += dt;
+        timing_count += 1;
+        timing_max_ns = timing_max_ns.max(dt);
+        if frames_sent % 60 == 0 {
+            let avg_ms = (timing_sum_ns / timing_count.max(1) as u128) as f64 / 1.0e6;
+            let max_ms = timing_max_ns as f64 / 1.0e6;
+            println!(
+                "encode-path latency: path=dxgi+{}, avg_ms={:.2}, max_ms={:.2}, frames={}",
+                path_name, avg_ms, max_ms, frames_sent
+            );
+            timing_sum_ns = 0;
+            timing_count = 0;
+            timing_max_ns = 0;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    println!("dxgi capture stopped");
 }
 
 pub fn probe_bitrate(cfg: &Config) -> Result<()> {
@@ -330,6 +662,7 @@ fn is_keyframe(au: &[u8]) -> bool {
 
 struct CaptureFlags {
     config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
     native_w: u32,
     native_h: u32,
     tx: broadcast::Sender<EncodedFrame>,
@@ -355,10 +688,100 @@ impl EncodePath {
     }
 }
 
+enum Backend {
+    Nvenc { encoder: Encoder, path: EncodePath },
+    Intel { encoder: IntelEncoder },
+    /// Intel Quick Sync on its own device, fed via CPU readback — last-resort bridge for when
+    /// the capture device is neither Intel (no same-adapter path) nor NVENC-reachable.
+    IntelCpu { encoder: IntelEncoder },
+}
+
+impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            Backend::Nvenc { path, .. } => path.name(),
+            Backend::Intel { .. } => "intel-same-adapter",
+            Backend::IntelCpu { .. } => "intel-cpu-bridge",
+        }
+    }
+
+    fn device(&self) -> &ID3D11Device {
+        match self {
+            Backend::Nvenc { encoder, .. } => encoder.device(),
+            Backend::Intel { encoder } => encoder.device(),
+            Backend::IntelCpu { encoder } => encoder.device(),
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        match self {
+            Backend::Nvenc { encoder, .. } => encoder.set_bitrate(bps),
+            Backend::Intel { encoder } => encoder.set_bitrate(bps),
+            Backend::IntelCpu { encoder } => encoder.set_bitrate(bps),
+        }
+    }
+
+    /// Whether captured frames must be downscaled to encode size before being handed over.
+    /// The Intel same-adapter path fuses the downscale into its VPP pass and wants the
+    /// native-size texture; every other path expects encode-size input.
+    fn wants_prescale(&self) -> bool {
+        !matches!(self, Backend::Intel { .. })
+    }
+
+    /// Whether frames reach the encoder as CPU bytes (`encode_cpu`) instead of textures.
+    fn is_cpu_bridge(&self) -> bool {
+        matches!(self, Backend::Nvenc { path: EncodePath::CpuBridge, .. } | Backend::IntelCpu { .. })
+    }
+
+    fn encode_gpu(&mut self, src_texture: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<u8>> {
+        match self {
+            Backend::Intel { encoder } => encoder.encode_texture(src_texture, force_idr),
+            Backend::Nvenc {
+                encoder,
+                path: EncodePath::ZeroCopy { igpu_context, shared_igpu, igpu_mutex },
+            } => {
+                unsafe {
+                    igpu_mutex
+                        .AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS)
+                        .context("iGPU keyed mutex AcquireSync(writer)")?;
+                    igpu_context.CopyResource(&*shared_igpu, src_texture);
+                    igpu_context.Flush();
+                    igpu_mutex
+                        .ReleaseSync(KEY_ENCODER)
+                        .context("iGPU keyed mutex ReleaseSync(encoder)")?;
+                }
+                encoder.encode_input(force_idr)
+            }
+            _ => bail!("encode_gpu called on a CPU-bridge backend"),
+        }
+    }
+
+    fn encode_cpu(&mut self, data: &[u8], row_pitch: u32, force_idr: bool) -> Result<Vec<u8>> {
+        match self {
+            Backend::Nvenc { encoder, path: EncodePath::CpuBridge } => {
+                encoder.encode_bgra_padded(data, row_pitch, force_idr)
+            }
+            Backend::IntelCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
+            _ => bail!("encode_cpu called on a GPU-path backend"),
+        }
+    }
+
+    fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
+        match self {
+            Backend::Nvenc { encoder, .. } => encoder.encode_repeat(force_idr),
+            Backend::Intel { encoder } => encoder.encode_repeat(force_idr),
+            Backend::IntelCpu { encoder } => encoder.encode_repeat(force_idr),
+        }
+    }
+
+}
+
 struct EncodeCore {
-    encoder: Encoder,
-    path: EncodePath,
+    backend: Backend,
     scaler: Option<Scaler>,
+    /// CPU readback for texture-fed (DXGI duplication) captures on a CPU-bridge backend
+    /// without a scaler; `None` on the WGC path (it reads back via `Frame::buffer`).
+    reader: Option<TextureReader>,
     target_bitrate: Arc<AtomicU32>,
     idr_request: Arc<AtomicBool>,
     current_bitrate: u32,
@@ -373,44 +796,55 @@ impl EncodeCore {
 
     fn encode_captured(&mut self, frame: &mut Frame) -> Result<Vec<u8>> {
         let force_idr = self.take_force_idr();
-        apply_pending_bitrate(&mut self.encoder, &self.target_bitrate, &mut self.current_bitrate);
+        apply_pending_bitrate(&mut self.backend, &self.target_bitrate, &mut self.current_bitrate);
+        let Self { backend, scaler, .. } = self;
 
-        let scaled: Option<ID3D11Texture2D> = match &mut self.scaler {
-            Some(s) => Some(s.scale(frame.as_raw_texture())?.clone()),
-            None => None,
-        };
-        let src_texture: ID3D11Texture2D = match &scaled {
-            Some(t) => t.clone(),
-            None => frame.as_raw_texture().clone(),
-        };
-
-        let zero = if let EncodePath::ZeroCopy { igpu_context, shared_igpu, igpu_mutex } = &self.path
-        {
-            Some((igpu_context.clone(), shared_igpu.clone(), igpu_mutex.clone()))
-        } else {
-            None
-        };
-
-        let au = if let Some((igpu_context, shared_igpu, igpu_mutex)) = zero {
-            unsafe {
-                igpu_mutex
-                    .AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS)
-                    .context("iGPU keyed mutex AcquireSync(writer)")?;
-                igpu_context.CopyResource(&shared_igpu, &src_texture);
-                igpu_context.Flush();
-                igpu_mutex
-                    .ReleaseSync(KEY_ENCODER)
-                    .context("iGPU keyed mutex ReleaseSync(encoder)")?;
+        let au = if backend.is_cpu_bridge() {
+            if let Some(scaler) = scaler {
+                scaler.scale(frame.as_raw_texture())?;
+                let (data, row_pitch) = scaler.read_back()?;
+                backend.encode_cpu(data, row_pitch, force_idr)?
+            } else {
+                let mut fb = frame.buffer()?;
+                let row_pitch = fb.row_pitch();
+                backend.encode_cpu(fb.as_raw_buffer(), row_pitch, force_idr)?
             }
-            self.encoder.encode_input(force_idr)?
-        } else if let Some(scaler) = &mut self.scaler {
-            let (data, row_pitch) = scaler.read_back()?;
-            self.encoder.encode_bgra_padded(data, row_pitch, force_idr)?
         } else {
-            let mut fb = frame.buffer()?;
-            let row_pitch = fb.row_pitch();
-            self.encoder
-                .encode_bgra_padded(fb.as_raw_buffer(), row_pitch, force_idr)?
+            let src_texture: ID3D11Texture2D = match scaler {
+                Some(s) => s.scale(frame.as_raw_texture())?.clone(),
+                None => frame.as_raw_texture().clone(),
+            };
+            backend.encode_gpu(&src_texture, force_idr)?
+        };
+
+        self.have_frame = true;
+        self.frame_index += 1;
+        Ok(au)
+    }
+
+    /// Encode a raw capture-device texture (DXGI duplication path; no `windows_capture::Frame`).
+    fn encode_texture(&mut self, tex: &ID3D11Texture2D) -> Result<Vec<u8>> {
+        let force_idr = self.take_force_idr();
+        apply_pending_bitrate(&mut self.backend, &self.target_bitrate, &mut self.current_bitrate);
+        let Self { backend, scaler, reader, .. } = self;
+
+        let au = if backend.is_cpu_bridge() {
+            let (data, row_pitch) = if let Some(scaler) = scaler {
+                scaler.scale(tex)?;
+                scaler.read_back()?
+            } else {
+                let reader = reader
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("cpu-bridge texture encode without a TextureReader"))?;
+                reader.read_back(tex)?
+            };
+            backend.encode_cpu(data, row_pitch, force_idr)?
+        } else {
+            let src_texture: ID3D11Texture2D = match scaler {
+                Some(s) => s.scale(tex)?.clone(),
+                None => tex.clone(),
+            };
+            backend.encode_gpu(&src_texture, force_idr)?
         };
 
         self.have_frame = true;
@@ -423,8 +857,8 @@ impl EncodeCore {
             return Ok(None);
         }
         let force_idr = self.take_force_idr();
-        apply_pending_bitrate(&mut self.encoder, &self.target_bitrate, &mut self.current_bitrate);
-        let au = self.encoder.encode_repeat(force_idr)?;
+        apply_pending_bitrate(&mut self.backend, &self.target_bitrate, &mut self.current_bitrate);
+        let au = self.backend.encode_repeat(force_idr)?;
         self.frame_index += 1;
         Ok(Some(au))
     }
@@ -437,6 +871,7 @@ struct LiveCapture {
     last_frame_at: Arc<AtomicU64>,
     path_name: &'static str,
     frames_sent: u64,
+    busy_streak: u32,
     stop: Arc<AtomicBool>,
     _thread_tuning: tuning::ThreadTuning,
     timing_sum_ns: u128,
@@ -469,6 +904,87 @@ fn build_zero_copy(
         encoder,
         EncodePath::ZeroCopy { igpu_context: igpu_context.clone(), shared_igpu, igpu_mutex },
     ))
+}
+
+fn build_backend(
+    config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
+    native_w: u32,
+    native_h: u32,
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+) -> Result<Backend> {
+    use crate::streamer::config::EncoderVendor;
+
+    let want_intel = matches!(vendor, EncoderVendor::Intel)
+        || (matches!(vendor, EncoderVendor::Auto) && super::device_vendor(device) == Vendor::Intel);
+
+    if want_intel {
+        match IntelEncoder::new_on_device(config, native_w, native_h, device, context) {
+            Ok(encoder) => {
+                println!(
+                    "pipeline: live capture ready -- INTEL Quick Sync same-adapter path ({}x{}@{})",
+                    config.width, config.height, config.fps
+                );
+                return Ok(Backend::Intel { encoder });
+            }
+            Err(e) => {
+                if matches!(vendor, EncoderVendor::Intel) {
+                    eprintln!(
+                        "Intel Quick Sync same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
+                    );
+                    let encoder = IntelEncoder::new(config)
+                        .context("Intel Quick Sync requested via --encoder intel but unavailable")?;
+                    println!(
+                        "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
+                        config.width, config.height, config.fps
+                    );
+                    return Ok(Backend::IntelCpu { encoder });
+                }
+                eprintln!(
+                    "Intel Quick Sync unavailable on capture adapter ({e:?}); falling over to NVENC"
+                );
+            }
+        }
+    }
+
+    match build_zero_copy(config, device, context) {
+        Ok((encoder, path)) => {
+            println!(
+                "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
+                config.width, config.height, config.fps
+            );
+            Ok(Backend::Nvenc { encoder, path })
+        }
+        Err(e) => {
+            eprintln!(
+                "NVENC zero-copy path unavailable ({e:?}); falling back to CPU bridge (higher latency)"
+            );
+            match Encoder::new(config) {
+                Ok(encoder) => {
+                    println!(
+                        "pipeline: live capture ready -- NVENC CPU-bridge fallback ({}x{}@{})",
+                        config.width, config.height, config.fps
+                    );
+                    Ok(Backend::Nvenc { encoder, path: EncodePath::CpuBridge })
+                }
+                Err(nv_err) if !matches!(vendor, EncoderVendor::Nvidia) => {
+                    eprintln!(
+                        "NVENC unavailable ({nv_err:?}); trying Intel Quick Sync on its own device"
+                    );
+                    let encoder = IntelEncoder::new(config).map_err(|ie| {
+                        nv_err.context(format!("no working encoder (Intel fallback also failed: {ie:?})"))
+                    })?;
+                    println!(
+                        "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
+                        config.width, config.height, config.fps
+                    );
+                    Ok(Backend::IntelCpu { encoder })
+                }
+                Err(nv_err) => Err(nv_err),
+            }
+        }
+    }
 }
 
 fn spawn_repeater(
@@ -533,12 +1049,23 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     type Error = anyhow::Error;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let CaptureFlags { config, native_w, native_h, tx, idr_request, target_bitrate } =
+        let CaptureFlags { config, vendor, native_w, native_h, tx, idr_request, target_bitrate } =
             ctx.flags;
 
         let thread_tuning = tuning::tune_current_thread();
 
-        let scaler = if config.width != native_w || config.height != native_h {
+        let backend = build_backend(
+            config,
+            vendor,
+            native_w,
+            native_h,
+            &ctx.device,
+            &ctx.device_context,
+        )?;
+
+        let needs_scaler =
+            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let scaler = if needs_scaler {
             match Scaler::new(
                 &ctx.device,
                 &ctx.device_context,
@@ -556,34 +1083,13 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             None
         };
 
-        let (encoder, path) = match build_zero_copy(config, &ctx.device, &ctx.device_context) {
-            Ok((enc, path)) => {
-                println!(
-                    "pipeline: live capture ready -- ZERO-COPY cross-adapter GPU path ({}x{}@{})",
-                    config.width, config.height, config.fps
-                );
-                (enc, path)
-            }
-            Err(e) => {
-                eprintln!(
-                    "zero-copy path unavailable ({e:?}); falling back to CPU bridge (higher latency)"
-                );
-                let enc = Encoder::new(config)?;
-                println!(
-                    "pipeline: live capture ready -- CPU-bridge fallback ({}x{}@{})",
-                    config.width, config.height, config.fps
-                );
-                (enc, EncodePath::CpuBridge)
-            }
-        };
+        tuning::raise_d3d11_gpu_priority(backend.device());
 
-        tuning::raise_d3d11_gpu_priority(encoder.device());
-
-        let path_name = path.name();
+        let path_name = backend.name();
         let core = Arc::new(Mutex::new(EncodeCore {
-            encoder,
-            path,
+            backend,
             scaler,
+            reader: None,
             target_bitrate: Arc::clone(&target_bitrate),
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -613,6 +1119,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             last_frame_at,
             path_name,
             frames_sent: 0,
+            busy_streak: 0,
             stop,
             _thread_tuning: thread_tuning,
             timing_sum_ns: 0,
@@ -629,10 +1136,26 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         let capture = Instant::now();
         let t0 = capture;
 
-        let au = {
+        let encode_res = {
             let mut core = self.core.lock().expect("encode core mutex poisoned");
-            core.encode_captured(frame)?
+            core.encode_captured(frame)
         };
+        let au = match encode_res {
+            Ok(au) => au,
+            Err(e)
+                if is_transient_encode_error(&e)
+                    && self.busy_streak < MAX_TRANSIENT_ENCODE_DROPS =>
+            {
+                self.busy_streak += 1;
+                eprintln!(
+                    "encode transiently overloaded ({e:#}); dropping frame ({} in a row)",
+                    self.busy_streak
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        self.busy_streak = 0;
 
         self.last_frame_at
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -691,7 +1214,16 @@ fn synthetic_pattern_loop(
     );
 
     loop {
-        apply_pending_bitrate(&mut encoder, &target_bitrate, &mut current_bitrate);
+        let pending = target_bitrate.swap(0, Ordering::Relaxed);
+        if pending != 0 && pending != current_bitrate {
+            match encoder.set_bitrate(pending) {
+                Ok(()) => {
+                    println!("adapting bitrate: {current_bitrate} -> {pending} bps");
+                    current_bitrate = pending;
+                }
+                Err(e) => eprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+            }
+        }
 
         let force_idr = frame_index == 0 || idr_request.swap(false, Ordering::Relaxed);
         fill_synthetic_pattern(&mut frame_buf, SP_WIDTH, SP_HEIGHT, frame_index);
