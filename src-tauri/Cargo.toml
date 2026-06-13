@@ -20,45 +20,49 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Tauri core + typed command/event gen bindings
 tauri = { version = "2", features = ["unstable", "specta"] }
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta = "=2.0.0-rc.22"
+specta-typescript = "0.0.9"
+
+# Tauri plugins
+tauri-plugin-cli = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-http = "2"
+tauri-plugin-os = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-store = "2"
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
-specta-typescript = "0.0.9"
-specta = "=2.0.0-rc.22"
-elevated-command = "1.1"
-tokio = { version = "1", features = [ "full" ] }
-tauri-plugin-shell = "2"
-tauri-plugin-clipboard-manager = "2"
-tauri-plugin-cli = "2"
-tauri-plugin-http = "2"
-tauri-plugin-store = "2"
-tauri-plugin-os = "2"
-wmi = "0.17.2"
-rand = "0.9.1"
-tauri-plugin-dialog = "2"
-fs4 = { version = "0.13", features = ["sync"] }
-# scopeguard = "1.2.0"
-# notify = "8.0.0"
-# futures = "0.3.31"
-# reqwest = { version = "0.12", features = ["json", "blocking"] }
-# anyhow = "1.0.98"
-anyhow = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+
+# HTTP server + TLS
 axum = "0.8"
 axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
-bytes = "1"
-libloading = "0.9"
-local-ip-address = "0.6"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# WebRTC streaming
 webrtc = "0.17"
+
+# Utilities
+anyhow = "1.0"
+bytes = "1"
+elevated-command = "1.1"
+fs4 = { version = "0.13", features = ["sync"] }
+libloading = "0.9"
 log = "0.4.22"
+rand = "0.9.1"
 thiserror = "2.0.3"
-owo-colors = "4.1.0"
-lazy_format = "2.0.3"
-joinery = "3.1.0"
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+wmi = "0.17.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2"
@@ -87,6 +91,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",

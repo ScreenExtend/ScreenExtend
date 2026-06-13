@@ -26,3 +26,7 @@ dist-ssr
 # Testing files
 testwaior - Copy/
 .claude/
+
+# Code-signing private key material
+self-signed-cert.pem
+self-signed-key.pem

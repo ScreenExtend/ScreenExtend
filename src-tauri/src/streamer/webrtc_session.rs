@@ -230,6 +230,7 @@ pub async fn handle_whep_offer(
         let frame_duration = pipeline.frame_duration;
         let track = Arc::clone(&track);
         let pc_keepalive = Arc::clone(&pc);
+        let pipeline = pipeline.clone();
         tokio::spawn(async move {
             let _pc = pc_keepalive;
             let mut last_capture: Option<Instant> = None;
@@ -257,7 +258,8 @@ pub async fn handle_whep_offer(
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
-                        println!("viewer lagged (skipped={skipped}), relying on intra-refresh to heal");
+                        println!("viewer lagged (skipped={skipped}); requesting IDR to resync");
+                        pipeline.request_idr();
                         continue;
                     }
                     Err(RecvError::Closed) => {

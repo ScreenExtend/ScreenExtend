@@ -7,5 +7,10 @@ pub use crate::windows_utils::streamer::pipeline::{
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use crate::windows_utils::streamer::capture::{
-    monitor_device_names, set_display_orientation, set_display_resolution, set_display_scale,
+    monitor_device_names, monitor_dimensions, set_display_mode, set_display_orientation,
+    set_display_resolution, set_display_scale,
 };
+
+#[cfg(target_os = "windows")]
+#[allow(unused_imports)]
+pub use crate::windows_utils::set_display_topology_extend;

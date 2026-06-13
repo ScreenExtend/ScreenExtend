@@ -150,7 +150,9 @@ pub fn run() {
             install_drivers,
             remove_drivers,
             set_device_override,
-            remove_device_override
+            remove_device_override,
+            set_disconnect_grace,
+            get_disconnect_grace
         ])
         .events(collect_events![
             DeviceJoin,

@@ -31,8 +31,11 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         let mut client = self.client.lock().unwrap();
         client.refresh_state();
         let id = client.new_id(None).ok_or_else(|| "no free display id".to_string())?;
-        let mode = Mode { width, height, refresh_rates: vec![refresh_rate] };
-        let monitor = Monitor { id, enabled: true, name: Some(name), modes: vec![mode] };
+        let mut modes = vec![Mode { width, height, refresh_rates: vec![refresh_rate] }];
+        if width != height {
+            modes.push(Mode { width: height, height: width, refresh_rates: vec![refresh_rate] });
+        }
+        let monitor = Monitor { id, enabled: true, name: Some(name), modes };
         client.add(monitor).map_err(|e| format!("add monitor: {e}"))?;
         client.notify().map_err(|e| format!("notify driver: {e}"))?;
         Ok(id)

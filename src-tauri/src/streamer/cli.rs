@@ -16,6 +16,9 @@ pub fn run() -> Result<()> {
     if let Some(path) = streamer.config().probe_capture.clone() {
         return streamer.probe_capture(&path);
     }
+    if let Some(path) = streamer.config().probe_dxgi.clone() {
+        return streamer.probe_dxgi(&path);
+    }
     if let Some(path) = streamer.config().probe_encode.clone() {
         return streamer.probe_encode(&path);
     }
