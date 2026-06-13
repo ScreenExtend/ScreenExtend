@@ -9,7 +9,7 @@ A free desktop‑extension solution that turns any device with a web browser int
 </div>
 
 > [!WARNING]
-> Current builds support **Windows hosts with an NVIDIA or Intel GPU** (NVENC / QSP), and are not yet widely tested. Use at your own risk. macOS and Linux host support is scaffolded but not yet functional, and the AMD encoder is stubbed out (see [Platform support](#platform-support)).
+> Current builds support **Windows hosts with an NVIDIA or Intel GPU** (NVENC / QSV), and are not yet widely tested. Use at your own risk. macOS and Linux host support is scaffolded but not yet functional, and the AMD encoder is stubbed out (see [Platform support](#platform-support)).
 
 ---
 
@@ -43,7 +43,7 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 1. On launch the host generates a session ID and an OTP, and starts a small HTTPS server bound to each network adapter.
 2. The desktop UI shows a QR code / URL per network address. The client opens `http(s)://<host-ip>:<port>/?id=<sessionId>` and submits the OTP plus its own screen metrics. (the host serves both HTTP and HTTPS, with the secure endpoint supporting faster decoding using WebCodecs)
-3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Windows Graphics Capture (older Windows builds that don't support WGC use DXGI Desktop Duplication), encodes it with **NVENC/QSP**, and negotiates a **WebRTC** connection using **WHEP**.
+3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Windows Graphics Capture (older Windows builds that don't support WGC use DXGI Desktop Duplication), encodes it with **NVENC/QSV**, and negotiates a **WebRTC** connection using **WHEP**.
 4. The client decodes the H.264 stream (via WebCodecs, with a fallback transform worker) and renders it fullscreen, acting as an extended monitor.
 5. Editing a device's settings results in automatic changes and re-negotiation, without destroying and recreating the display.
 
@@ -56,8 +56,8 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 | **Rust + TS bridge** | [`tauri-specta`](https://github.com/oscartbeaumont/tauri-specta) - typed commands/events, generated into `src/lib/bindings.ts` |
 | **Web/signaling server** | [`axum`](https://github.com/tokio-rs/axum) + `axum-server` over TLS (`rustls`, self‑signed via `rcgen`) |
 | **Streaming** | [`webrtc`](https://github.com/webrtc-rs/webrtc) with WHEP signaling; H.264 |
-| **Capture** | Windows Graphics Capture (`windows-capture`), with a custom DXGI Desktop Duplication engine (GPU cursor compositing) as fallback on Windows builds where WGC cannot open virtual displays |
-| **Encoding** | NVIDIA NVENC or Intel QSP FFI bindings (AMD scaffolded) |
+| **Capture** | Windows Graphics Capture ([`windows-capture`](https://github.com/NiiightmareXD/windows-capture)), with a custom DXGI Desktop Duplication engine (GPU cursor compositing) as fallback on Windows builds where WGC cannot open virtual displays |
+| **Encoding** | NVIDIA NVENC or Intel QSV FFI bindings (AMD scaffolded) |
 | **Virtual displays** | Bundled signed Windows Virtual Display Driver (IDD), driven over IPC ([`driver_ipc`](https://github.com/MolotovCherry/virtual-display-rs)) and installed with `nefconc` + `certutil` |
 | **Networking** | Windows hosted network (`netsh wlan`) for offline mode, live network‑adapter watching |
 
@@ -88,21 +88,15 @@ The client is just a web page, so anything with a reasonably modern browser (Web
 
 ScreenExtend encodes captured displays with the host GPU. The matrix below lists the common hardware video‑encoding APIs and reflects the **current** state of each path in ScreenExtend:
 
-| Encoding API | GPU Vendor | FreeBSD | Linux | macOS | Windows |
-| --- | --- | :---: | :---: | :---: | :---: |
-| AMF | AMD | ➖ | ➖ | ➖ | 🟡 |
-| Media Foundation | Qualcomm | ➖ | ➖ | ➖ | ➖ |
-| NVENC | NVIDIA | ➖ | 🟡 | ➖ | ✅ |
-| Quick Sync | Intel | ➖ | ➖ | ➖ | ✅ |
-| VAAPI | AMD | ➖ | ➖ | ➖ | ➖ |
-| | Intel | ➖ | ➖ | ➖ | ➖ |
-| | NVIDIA | ➖ | ➖ | ➖ | ➖ |
-| Video Toolbox | Apple | ➖ | ➖ | 🟡 | ➖ |
-| | Intel | ➖ | ➖ | ✅ | ➖ |
-| Vulkan Video | AMD | ➖ | ➖ | ➖ | ➖ |
-| | Intel | ➖ | ➖ | ➖ | ➖ |
-| | NVIDIA | ➖ | ➖ | ➖ | ➖ |
-| Software | Any | ➖ | ➖ | ➖ | ➖ |
+| Encoding API | GPU Vendor | Linux | macOS | Windows |
+| --- | --- | :---: | :---: | :---: |
+| AMF | AMD | ➖ |   | 🟡 |
+| NVENC | NVIDIA | ➖ |   | ✅ |
+| Quick Sync | Intel | ➖ |   | ✅ |
+| Media Foundation | Qualcomm |   |   | ➖ |
+| Video Toolbox | Apple |   | ➖ |   |
+| | Intel |   | ➖ |   |
+| Software | Any | ➖ | ➖ | ➖ |
 
 ✅ Supported &nbsp;·&nbsp; 🟡 In progress &nbsp;·&nbsp; ➖ Not supported
 
