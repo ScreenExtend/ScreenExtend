@@ -140,7 +140,7 @@ async fn detect_session_locality(
     };
     let lt = cand_type.get(&lid).cloned().unwrap_or_default().to_lowercase();
     let rt = cand_type.get(&rid).cloned().unwrap_or_default().to_lowercase();
-    println!("selected ICE candidate pair (local={lt}, remote={rt})");
+    tprintln!("selected ICE candidate pair (local={lt}, remote={rt})");
 
     if lt.contains("relay") || rt.contains("relay") {
         SessionLocality::CrossNetwork
@@ -167,7 +167,7 @@ pub async fn handle_whep_offer(
         .skip(1)
         .map(|s| s.chars().take(6).collect())
         .collect();
-    println!("WHEP offer H.264 profile-level-ids (configured={profile:?}, offered={offered:?})");
+    tprintln!("WHEP offer H.264 profile-level-ids (configured={profile:?}, offered={offered:?})");
 
     let rtc_config = RTCConfiguration {
         ice_servers,
@@ -209,10 +209,10 @@ pub async fn handle_whep_offer(
                         for p in &packets {
                             let any = p.as_any();
                             if any.downcast_ref::<PictureLossIndication>().is_some() {
-                                println!("RTCP PLI received, requesting IDR");
+                                tprintln!("RTCP PLI received, requesting IDR");
                                 pipeline.request_idr();
                             } else if any.downcast_ref::<FullIntraRequest>().is_some() {
-                                println!("RTCP FIR received, requesting IDR");
+                                tprintln!("RTCP FIR received, requesting IDR");
                                 pipeline.request_idr();
                             }
                         }
@@ -230,6 +230,7 @@ pub async fn handle_whep_offer(
         let frame_duration = pipeline.frame_duration;
         let track = Arc::clone(&track);
         let pc_keepalive = Arc::clone(&pc);
+        let pipeline = pipeline.clone();
         tokio::spawn(async move {
             let _pc = pc_keepalive;
             let mut last_capture: Option<Instant> = None;
@@ -252,16 +253,17 @@ pub async fn handle_whep_offer(
                             })
                             .await
                         {
-                            println!("track write_sample failed ({e}); viewer writer stopping");
+                            tprintln!("track write_sample failed ({e}); viewer writer stopping");
                             break;
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {
-                        println!("viewer lagged (skipped={skipped}), relying on intra-refresh to heal");
+                        tprintln!("viewer lagged (skipped={skipped}); requesting IDR to resync");
+                        pipeline.request_idr();
                         continue;
                     }
                     Err(RecvError::Closed) => {
-                        println!("pipeline broadcast closed; viewer writer stopping");
+                        tprintln!("pipeline broadcast closed; viewer writer stopping");
                         break;
                     }
                 }
@@ -273,7 +275,7 @@ pub async fn handle_whep_offer(
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(std::sync::Mutex::new(closed_tx));
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
-        println!("peer connection state changed: {state:?}");
+        tprintln!("peer connection state changed: {state:?}");
         if state == RTCPeerConnectionState::Connected
             && !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -281,7 +283,7 @@ pub async fn handle_whep_offer(
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let locality = detect_session_locality(&pc).await;
-                println!("session locality detected: {locality:?}");
+                tprintln!("session locality detected: {locality:?}");
             });
         }
         if matches!(
@@ -381,13 +383,13 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
 
             let estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
             if let Some(target) = controller.update(estimate, now) {
-                println!(
+                tprintln!(
                     "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, fraction_lost={fraction_lost}, estimate={estimate}, target={target})"
                 );
                 current_target = target;
                 pipeline.set_target_bitrate(target);
             }
         }
-        println!("bitrate driver stopped (peer connection closed)");
+        tprintln!("bitrate driver stopped (peer connection closed)");
     });
 }

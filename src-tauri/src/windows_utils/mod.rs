@@ -38,6 +38,20 @@ pub struct AppState {
     pub device_reporter: SharedDeviceReporter,
     pub device_overrides: SharedDeviceOverrides,
     pub sessions: SharedSessions,
+    pub disconnect_grace: session::SharedDisconnectGrace,
+}
+
+pub fn set_display_topology_extend() {
+    use windows::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND};
+    let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+    if result == 0 {
+        tprintln!("[display] projection mode set to Extend (SetDisplayConfig returned SUCCESS)");
+    } else {
+        teprintln!(
+            "[display] failed to set projection mode to Extend \
+             (SetDisplayConfig win32 error {result}; 31=ERROR_GEN_FAILURE/no saved extend topology)"
+        );
+    }
 }
 
 #[tauri::command]
@@ -46,6 +60,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     if app_handle.try_state::<AppState>().is_some() {
         return true;
     }
+    tauri::async_runtime::spawn_blocking(set_display_topology_extend);
     let virtual_display =
         tauri::async_runtime::spawn_blocking(WindowsVirtualDisplay::new_shared).await;
 
@@ -70,6 +85,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         device_reporter,
         device_overrides,
         sessions,
+        disconnect_grace: session::new_shared_disconnect_grace(),
     };
     app_handle.manage(state);
     true
@@ -109,6 +125,26 @@ pub fn set_device_override(
 pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
     state.device_overrides.lock().unwrap().remove(&ip);
     session::bump_kick_epoch(&state.sessions, &ip);
+    session::signal_leave(&state.sessions, &ip);
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_disconnect_grace(state: State<'_, AppState>, seconds: u32) {
+    let secs = (seconds as u64)
+        .clamp(session::MIN_DISCONNECT_GRACE_SECS, session::MAX_DISCONNECT_GRACE_SECS);
+    state
+        .disconnect_grace
+        .store(secs, std::sync::atomic::Ordering::Relaxed);
+    tprintln!("disconnect grace set to {secs}s");
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
+    state
+        .disconnect_grace
+        .load(std::sync::atomic::Ordering::Relaxed) as u32
 }
 
 #[tauri::command]
@@ -197,7 +233,7 @@ pub fn sync_streamers(state: &AppState) {
         if desired.iter().any(|(desired_ip, _)| desired_ip == ip) {
             true
         } else {
-            println!("[streamer] stopping streamer bound to {ip}");
+            tprintln!("[streamer] stopping streamer bound to {ip}");
             streamer.handle.graceful_shutdown(Some(Duration::from_secs(1)));
             false
         }
@@ -217,6 +253,7 @@ pub fn sync_streamers(state: &AppState) {
             device_reporter: Some(state.device_reporter.clone()),
             device_overrides: Some(state.device_overrides.clone()),
             sessions: Some(state.sessions.clone()),
+            disconnect_grace: Some(state.disconnect_grace.clone()),
             ..Config::default()
         };
 
@@ -224,11 +261,11 @@ pub fn sync_streamers(state: &AppState) {
         let ip_for_log = ip.clone();
         std::thread::spawn(move || {
             if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
-                eprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
+                teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
             }
         });
 
-        println!("[streamer] started streamer bound to {ip}");
+        tprintln!("[streamer] started streamer bound to {ip}");
         streamers.insert(ip, StreamerHandle { handle });
     }
 }

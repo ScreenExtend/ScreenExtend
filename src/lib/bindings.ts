@@ -47,6 +47,15 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
 },
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
+},
+async setDisconnectGrace(seconds: number) : Promise<void> {
+    await TAURI_INVOKE("set_disconnect_grace", { seconds });
+},
+async getDisconnectGrace() : Promise<number> {
+    return await TAURI_INVOKE("get_disconnect_grace");
+},
+async getLogBacklog() : Promise<string[]> {
+    return await TAURI_INVOKE("get_log_backlog");
 }
 }
 
@@ -59,6 +68,7 @@ deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
+logLine: LogLine,
 networkChange: NetworkChange
 }>({
 deviceJoin: "device-join",
@@ -66,6 +76,7 @@ deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
+logLine: "log-line",
 networkChange: "network-change"
 })
 
@@ -81,6 +92,7 @@ export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
+export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
 

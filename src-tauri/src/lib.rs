@@ -12,6 +12,9 @@ use tauri_plugin_cli::CliExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_shell::ShellExt;
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
+
+#[macro_use]
+mod logbus;
 mod streamer;
 
 #[cfg(target_os = "windows")]
@@ -150,7 +153,10 @@ pub fn run() {
             install_drivers,
             remove_drivers,
             set_device_override,
-            remove_device_override
+            remove_device_override,
+            set_disconnect_grace,
+            get_disconnect_grace,
+            logbus::get_log_backlog
         ])
         .events(collect_events![
             DeviceJoin,
@@ -158,7 +164,8 @@ pub fn run() {
             DeviceModifyAction,
             DeviceRemove,
             DeviceRemoveAction,
-            NetworkChange
+            NetworkChange,
+            logbus::LogLine
         ]);
 
     #[cfg(debug_assertions)]
@@ -403,6 +410,7 @@ pub fn run() {
                             std::process::exit(0);
                         }
                         builder.mount_events(app);
+                        logbus::attach(app.handle().clone());
                         tauri::WebviewWindowBuilder::new(
                             app,
                             "main".to_string(),

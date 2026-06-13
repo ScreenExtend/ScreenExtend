@@ -37,6 +37,7 @@ import {
 
 import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
+import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
@@ -61,6 +62,10 @@ export default function Settings() {
   const [_accountPassword, setAccountPassword] = useState("");
   const [_showAccountPassword, setShowAccountPassword] = useState(false);
   const [accountName, setAccountName] = useState("");
+
+  const [disconnectGrace, setDisconnectGrace] = useState("10");
+  const [oldDisconnectGrace, setOldDisconnectGrace] = useState("10");
+  const [disconnectGraceTooltipOpen, setDisconnectGraceTooltipOpen] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -95,7 +100,31 @@ export default function Settings() {
       setAccountName(user.name);
     }
     void updateText();
+    async function loadDisconnectGrace() {
+      const seconds = await commands.getDisconnectGrace();
+      setDisconnectGrace(String(seconds));
+      setOldDisconnectGrace(String(seconds));
+    }
+    void loadDisconnectGrace();
   }, []);
+
+  const saveDisconnectGrace = async () => {
+    const parsed = Number(disconnectGrace);
+    if (!Number.isFinite(parsed)) {
+      setDisconnectGrace(oldDisconnectGrace);
+      return;
+    }
+    const seconds = Math.min(600, Math.max(0, Math.round(parsed)));
+    setDisconnectGrace(String(seconds));
+    if (String(seconds) === oldDisconnectGrace) return;
+    await commands.setDisconnectGrace(seconds);
+    localStorage.setItem("disconnectGraceSecs", String(seconds));
+    setOldDisconnectGrace(String(seconds));
+    toast({
+      title: "Disconnect Timeout Updated",
+      description: seconds === 0 ? "Displays of disconnected devices will now be removed immediately." : `Disconnected devices now have ${seconds} second${seconds === 1 ? "" : "s"} to reconnect before their display is removed.`,
+    });
+  };
 
   useEffect(() => {
     if (spin) {
@@ -302,6 +331,49 @@ export default function Settings() {
             </CardContent>
           </Card>
         </div>
+        <div className="mb-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex flex-row items-center">
+                Device Disconnect Timeout
+                <TooltipProvider>
+                  <Tooltip delayDuration={100} open={disconnectGraceTooltipOpen} onOpenChange={(state) => setDisconnectGraceTooltipOpen(state)}>
+                    <TooltipTrigger asChild className="cursor-pointer ml-2" onClick={() => setDisconnectGraceTooltipOpen(true)}>
+                      <Info size={15} />
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-[260px]">
+                      <p>How long a disconnected device's virtual display is kept before being removed.</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <div className="relative outline-none flex-1">
+                  <Input
+                    type="number"
+                    placeholder="Timeout (seconds)"
+                    className="outline-none"
+                    value={disconnectGrace}
+                    min={0}
+                    max={600}
+                    onChange={event => setDisconnectGrace(event.target.value)}
+                    onBlur={() => {
+                      if (!Number.isFinite(Number(disconnectGrace)) || disconnectGrace.trim() === "") {
+                        setDisconnectGrace(oldDisconnectGrace);
+                      }
+                    }}
+                    hoverLabel={true}
+                  />
+                </div>
+                <Button onClick={() => void saveDisconnectGrace()}>
+                  Save Timeout
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
         <div className="">
           <Card>
             <CardHeader>
@@ -389,6 +461,16 @@ export default function Settings() {
                   Save Password
                 </Button>
               </div>*/}
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Logs</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <LogTerminal />
             </CardContent>
           </Card>
         </div>

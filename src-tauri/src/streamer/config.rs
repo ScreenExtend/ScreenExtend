@@ -1,7 +1,8 @@
 use std::net::Ipv4Addr;
 
 use super::session::{
-    SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedSessions, SharedVirtualDisplay,
+    SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedDisconnectGrace,
+    SharedSessions, SharedVirtualDisplay,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -18,6 +19,25 @@ impl H264Profile {
             "baseline" | "base" | "cb" => Some(Self::Baseline),
             "main" => Some(Self::Main),
             "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncoderVendor {
+    #[default]
+    Auto,
+    Nvidia,
+    Intel,
+}
+
+impl EncoderVendor {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "nvidia" | "nvenc" => Some(Self::Nvidia),
+            "intel" | "quicksync" | "qsv" | "onevpl" | "vpl" => Some(Self::Intel),
             _ => None,
         }
     }
@@ -70,6 +90,7 @@ pub struct Config {
     pub https_port: u16,
     pub monitor: u32,
     pub probe_capture: Option<String>,
+    pub probe_dxgi: Option<String>,
     pub probe_encode: Option<String>,
     pub whep_selftest: bool,
     pub probe_live: Option<String>,
@@ -88,11 +109,13 @@ pub struct Config {
     pub max_bitrate_kbps: Option<u32>,
     pub qp: Option<u8>,
     pub intra_refresh: bool,
+    pub encoder_vendor: EncoderVendor,
     pub virtual_display: Option<SharedVirtualDisplay>,
     pub session_auth: Option<SessionAuth>,
     pub device_reporter: Option<SharedDeviceReporter>,
     pub device_overrides: Option<SharedDeviceOverrides>,
     pub sessions: Option<SharedSessions>,
+    pub disconnect_grace: Option<SharedDisconnectGrace>,
 }
 
 const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
@@ -106,6 +129,7 @@ impl Default for Config {
             https_port: 8443,
             monitor: 1,
             probe_capture: None,
+            probe_dxgi: None,
             probe_encode: None,
             whep_selftest: false,
             probe_live: None,
@@ -123,12 +147,14 @@ impl Default for Config {
             max_fps: 500,
             max_bitrate_kbps: None,
             qp: None,
-            intra_refresh: true,
+            intra_refresh: false,
+            encoder_vendor: EncoderVendor::Auto,
             virtual_display: None,
             session_auth: None,
             device_reporter: None,
             device_overrides: None,
             sessions: None,
+            disconnect_grace: None,
         }
     }
 }
@@ -238,6 +264,12 @@ impl Config {
                     }
                     i += 2;
                 }
+                "--encoder" => {
+                    if let Some(v) = val(&args, i).and_then(|s| EncoderVendor::parse(&s)) {
+                        c.encoder_vendor = v;
+                    }
+                    i += 2;
+                }
                 "--bind-ip" => {
                     if let Some(ip) = val(&args, i).and_then(|s| s.parse().ok()) {
                         c.bind_ip = ip;
@@ -254,6 +286,14 @@ impl Config {
                         None => ("capture_probe.png".to_string(), 1),
                     };
                     c.probe_capture = Some(path);
+                    i += step;
+                }
+                "--probe-dxgi" => {
+                    let (path, step) = match val(&args, i) {
+                        Some(p) => (p, 2),
+                        None => ("dxgi_probe.bmp".to_string(), 1),
+                    };
+                    c.probe_dxgi = Some(path);
                     i += step;
                 }
                 "--probe-encode" => {
@@ -293,7 +333,7 @@ impl Config {
 }
 
 pub fn print_help() {
-    println!(
+    tprintln!(
         "ultra-low-latency WebRTC screen streamer\n\
 \n\
 USAGE: untitled17 [OPTIONS]\n\
@@ -313,8 +353,11 @@ CAPTURE / ENCODE\n\
   --h264-profile <p>      baseline | main | high (default baseline)\n\
   --qp <1..51>            constant-QP rate control instead of CBR — kills flicker on\n\
                           static/dark content (lower = higher quality; try 18-23)\n\
-  --intra-refresh <on|off>  rolling intra refresh for loss recovery (default on;\n\
-                          off = steadier image, needs PLI->IDR to recover from loss)\n\
+  --intra-refresh <on|off>  rolling intra refresh for passive loss recovery (default off;\n\
+                          on = periodic refresh waves can be visible as bands repainting\n\
+                          the image; off = steady image, recovers via PLI/FIR -> IDR)\n\
+  --encoder <v>           hardware encoder: auto | nvidia | intel (default auto =\n\
+                          pick by capture adapter; intel = Quick Sync / oneVPL)\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
 \n\
 ICE / TLS\n\
@@ -327,6 +370,7 @@ ICE / TLS\n\
 \n\
 PROBES / SELF-TEST (no browser)\n\
   --probe-capture [path]  one frame -> PNG (default capture_probe.png)\n\
+  --probe-dxgi [path]     one frame via DXGI duplication + cursor -> BMP (default dxgi_probe.bmp)\n\
   --probe-encode [path]   300 synthetic frames -> Annex-B (default out.h264)\n\
   --probe-live [path]     150 live frames -> Annex-B (default live.h264)\n\
   --probe-bitrate         exercise adaptive-bitrate reconfigure\n\

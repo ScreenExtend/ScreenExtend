@@ -31,7 +31,7 @@ impl DeviceReporter for TauriDeviceReporter {
             device.video_quality = o.video_quality as u32;
         }
         if let Err(e) = DeviceJoin(device).emit(&self.app) {
-            eprintln!("[device-reporter] emit DeviceJoin failed: {e:?}");
+            teprintln!("[device-reporter] emit DeviceJoin failed: {e:?}");
         }
     }
 
@@ -44,7 +44,7 @@ impl DeviceReporter for TauriDeviceReporter {
             refresh_rate: 0,
         });
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
-            eprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");
+            teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");
         }
     }
 }

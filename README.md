@@ -4,12 +4,12 @@
 
 **Extend your screen. Extend your possibilities. Unlock ultimate productivity.**
 
-A free desktop‑extension solution that turns any device with a web browser into a wireless second monitorm no app to install on the client.
+A free desktop‑extension solution that turns any device with a web browser into a wireless second monitorm without any app to install on the client.
 
 </div>
 
 > [!WARNING]
-> Current builds support **Windows hosts with an NVIDIA GPU** only, and are not yet widely tested. Use at your own risk. macOS and Linux host support is scaffolded but not yet functional, and AMD/Intel encoders are stubbed out (see [Platform support](#platform-support)).
+> Current builds support **Windows hosts with an NVIDIA or Intel GPU** (NVENC / QSV), and are not yet widely tested. Use at your own risk. macOS and Linux host support is scaffolded but not yet functional, and the AMD encoder is stubbed out (see [Platform support](#platform-support)).
 
 ---
 
@@ -21,33 +21,31 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 ## Features
 
-- **Hardware‑accelerated streaming.** Desktop capture is encoded with the GPU (NVENC H.264) and delivered over WebRTC for low latency.
-- **Per‑device settings.** Adjust resolution scale, orientation (landscape/portrait), refresh rate, and video scale/quality independently for each connected device, live — changes re‑negotiate the stream without dropping the display.
-- **Password‑protected sessions.** A session ID plus a one‑time password (OTP) gate every join, so unauthorized devices on the network can't connect.
-- **Offline / no‑internet mode.** The host can stand up its own Wi‑Fi hosted network so devices can connect with no router or internet access at all.
-- **Auto network discovery.** The host listens on every active network adapter and rebuilds join URLs/QR codes as your network changes.
+- **Hardware‑accelerated streaming.** Desktop capture is encoded with the GPU and delivered over WebRTC for low latency.
+- **Per‑device settings.** Adjust resolution scale, orientation, refresh rate, and video scale/quality independently for each connected device.
+- **Password‑protected sessions.** A session ID plus a one‑time password (OTP) restrict any new join requests.
+- **Offline / no‑internet mode.** The host can host its own Ad-hoc Wifi hosted network so devices can connect with no central router.
+- **Auto network discovery.** The host listens on every active network adapter and rebuilds join URLs/QR codes as network changes occur.
 - **Encrypted transport.** Streaming and signaling run over HTTPS/WebRTC with a self‑signed certificate generated at runtime.
 
 ## How it works
 
 ```
    Client browser                    Host (ScreenExtend desktop app)
- ┌────────────────┐   WHEP/HTTPS    ┌──────────────────────────────────┐
- │  open URL /     │ ───────────────▶│  axum server (per network IP)     │
+ ┌─────────────────┐    WHEP/HTTPS   ┌───────────────────────────────────┐
+ │  open URL /     │                 │  axum server (per network IP)     │
  │  scan QR + OTP  │                 │   • validates session ID + OTP    │
  │                 │                 │   • creates a virtual display     │
- │  <video> via    │◀─ WebRTC ───────│   • captures + NVENC‑encodes it   │
- │  WebCodecs      │   (H.264)       │   • streams via WebRTC            │
- └────────────────┘                 └──────────────────────────────────┘
+ │  <video> via    │     WebRTC      │   • captures + NVENC‑encodes it   │
+ │  WebCodecs      │     (H.264)     │   • streams via WebRTC            │
+ └─────────────────┘                 └───────────────────────────────────┘
 ```
 
 1. On launch the host generates a session ID and an OTP, and starts a small HTTPS server bound to each network adapter.
-2. The desktop UI shows a QR code / URL per network address. The client opens `http(s)://<host-ip>:<port>/?id=<sessionId>` and submits the OTP plus its own screen metrics. (The host serves both HTTP and HTTPS; the secure endpoint is used for the WebCodecs decode path.)
-3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Desktop Duplication, encodes it with **NVENC**, and negotiates a **WebRTC** connection using **WHEP**.
+2. The desktop UI shows a QR code / URL per network address. The client opens `http(s)://<host-ip>:<port>/?id=<sessionId>` and submits the OTP plus its own screen metrics. (the host serves both HTTP and HTTPS, with the secure endpoint supporting faster decoding using WebCodecs)
+3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Windows Graphics Capture (older Windows builds that don't support WGC use DXGI Desktop Duplication), encodes it with **NVENC/QSV**, and negotiates a **WebRTC** connection using **WHEP**.
 4. The client decodes the H.264 stream (via WebCodecs, with a fallback transform worker) and renders it fullscreen, acting as an extended monitor.
-5. Editing a device's settings bumps a reconfigure epoch; the client transparently re‑negotiates the stream while the underlying virtual display is updated in place (resolution/orientation/DPI changed live, never destroyed and recreated).
-
-For a deeper dive, see the inline module docs under `src-tauri/src/streamer/` and `src-tauri/src/windows_utils/`.
+5. Editing a device's settings results in automatic changes and re-negotiation, without destroying and recreating the display.
 
 ## Technologies & architecture
 
@@ -55,13 +53,13 @@ For a deeper dive, see the inline module docs under `src-tauri/src/streamer/` an
 | --- | --- |
 | **Desktop shell** | [Tauri 2](https://tauri.app) (Rust core + system webview) |
 | **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, shadcn/ui + Radix UI, React Router |
-| **Rust + TS bridge** | [`tauri-specta`](https://github.com/oscartbeaumont/tauri-specta) — typed commands/events, generated into `src/lib/bindings.ts` |
+| **Rust + TS bridge** | [`tauri-specta`](https://github.com/oscartbeaumont/tauri-specta) - typed commands/events, generated into `src/lib/bindings.ts` |
 | **Web/signaling server** | [`axum`](https://github.com/tokio-rs/axum) + `axum-server` over TLS (`rustls`, self‑signed via `rcgen`) |
 | **Streaming** | [`webrtc`](https://github.com/webrtc-rs/webrtc) with WHEP signaling; H.264 |
-| **Capture** | `windows-capture` (Desktop Duplication / DXGI) |
-| **Encoding** | NVIDIA NVENC via custom `nvenc_sys` FFI bindings (AMD/Intel scaffolded) |
-| **Virtual displays** | Bundled signed Windows Virtual Display Driver (IDD), driven over IPC (`driver_ipc`) and installed with `nefconc` + `certutil` |
-| **Networking** | `local-ip-address`, Windows hosted network (`netsh wlan`) for offline mode, live network‑adapter watching |
+| **Capture** | Windows Graphics Capture ([`windows-capture`](https://github.com/NiiightmareXD/windows-capture)), with a custom DXGI Desktop Duplication engine (GPU cursor compositing) as fallback on Windows builds where WGC cannot open virtual displays |
+| **Encoding** | NVIDIA NVENC or Intel QSV FFI bindings (AMD scaffolded) |
+| **Virtual displays** | Bundled signed Windows Virtual Display Driver (IDD), driven over IPC ([`driver_ipc`](https://github.com/MolotovCherry/virtual-display-rs)) and installed with `nefconc` + `certutil` |
+| **Networking** | Windows hosted network (`netsh wlan`) for offline mode, live network‑adapter watching |
 
 ### Repository layout
 
@@ -82,40 +80,25 @@ For a deeper dive, see the inline module docs under `src-tauri/src/streamer/` an
 
 ## Platform support
 
-| | Host (runs the app) | Client (joins via browser) |
-| --- | --- | --- |
-| **Windows** | ✅ Supported (NVIDIA GPU required) | ✅ Any modern browser |
-| **macOS** | 🚧 Scaffolded, not functional | ✅ Any modern browser |
-| **Linux** | 🚧 Scaffolded, not functional | ✅ Any modern browser |
-| **iOS / Android** | — | ✅ Any modern browser |
+The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA/Intel only.
 
-The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA only.
-
-**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. The virtual display driver used to create extended monitors requires Windows 10 2004+. Both 64‑bit (x86‑64) and 32‑bit (x86) editions are supported.
+**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64‑bit (x86‑64) machines are supported.
 
 ### Hardware encoder support
 
 ScreenExtend encodes captured displays with the host GPU. The matrix below lists the common hardware video‑encoding APIs and reflects the **current** state of each path in ScreenExtend:
 
-| Encoding API | GPU Vendor | FreeBSD | Linux | macOS | Windows |
-| --- | --- | :---: | :---: | :---: | :---: |
-| AMF | AMD | ➖ | ➖ | ➖ | 🟡 |
-| Media Foundation | Qualcomm | ➖ | ➖ | ➖ | ➖ |
-| NVENC | NVIDIA | ➖ | 🟡 | ➖ | ✅ |
-| Quick Sync | Intel | ➖ | ➖ | ➖ | 🟡 |
-| VAAPI | AMD | ➖ | ➖ | ➖ | ➖ |
-| | Intel | ➖ | ➖ | ➖ | ➖ |
-| | NVIDIA | ➖ | ➖ | ➖ | ➖ |
-| Video Toolbox | Apple | ➖ | ➖ | 🟡 | ➖ |
-| | Intel | ➖ | ➖ | 🟡 | ➖ |
-| Vulkan Video | AMD | ➖ | ➖ | ➖ | ➖ |
-| | Intel | ➖ | ➖ | ➖ | ➖ |
-| | NVIDIA | ➖ | ➖ | ➖ | ➖ |
-| Software | Any | ➖ | ➖ | ➖ | ➖ |
+| Encoding API | GPU Vendor | Linux | macOS | Windows |
+| --- | --- | :---: | :---: | :---: |
+| AMF | AMD | ➖ |   | 🟡 |
+| NVENC | NVIDIA | ➖ |   | ✅ |
+| Quick Sync | Intel | ➖ |   | ✅ |
+| Media Foundation | Qualcomm |   |   | ➖ |
+| Video Toolbox | Apple |   | ➖ |   |
+| | Intel |   | ➖ |   |
+| Software | Any | ➖ | ➖ | ➖ |
 
-✅ Supported &nbsp;·&nbsp; 🟡 Scaffolded / in progress &nbsp;·&nbsp; ➖ Not supported
-
-Only **NVENC on Windows** is functional today; the other paths are stubbed or planned.
+✅ Supported &nbsp;·&nbsp; 🟡 In progress &nbsp;·&nbsp; ➖ Not supported
 
 ## Building from source
 
@@ -123,8 +106,7 @@ Only **NVENC on Windows** is functional today; the other paths are stubbed or pl
 
 - **[Rust](https://rustup.rs/)** (stable toolchain)
 - **[Node.js](https://nodejs.org/)** (LTS) and **[pnpm](https://pnpm.io/)**
-- **Tauri 2 system dependencies** — see the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/). On Windows this means the MSVC C++ build tools and WebView2.
-- A **Windows host with an NVIDIA GPU** to actually run the result.
+- **Tauri 2 system dependencies** (see the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/))
 
 ### Setup & run (development)
 
@@ -149,13 +131,6 @@ pnpm tauri build
 
 Installers and the executable are emitted under `src-tauri/target/release/bundle/`.
 
-To build for a specific architecture (matching CI):
-
-```sh
-pnpm tauri build --target x86_64-pc-windows-msvc   # 64-bit
-pnpm tauri build --target i686-pc-windows-msvc     # 32-bit
-```
-
 ### Installing the virtual display driver
 
 Creating extended displays requires the bundled signed virtual display driver. The app installs it for you on first use, but it can also be triggered from the CLI (this trusts the bundled certificate and creates the display device node, and requires Administrator):
@@ -167,7 +142,7 @@ ScreenExtend.exe removedrivers    # uninstall driver + certificate
 
 ### Releases
 
-Pushes to the `release` branch trigger `.github/workflows/build-windows.yml`, which builds 32‑ and 64‑bit Windows targets via `tauri-action` and publishes a GitHub Release. Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
+Pushes to the `release` branch trigger `.github/workflows/build-windows.yml`, which builds the 64‑bit Windows target via `tauri-action` and publishes a GitHub Release. Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
 
 ## Contributing
 

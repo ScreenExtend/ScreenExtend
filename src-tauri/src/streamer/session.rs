@@ -37,6 +37,16 @@ pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
 
 pub type SharedDeviceOverrides = Arc<Mutex<HashMap<String, DeviceOverride>>>;
 
+pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
+
+pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 10;
+pub const MIN_DISCONNECT_GRACE_SECS: u64 = 0;
+pub const MAX_DISCONNECT_GRACE_SECS: u64 = 600;
+
+pub fn new_shared_disconnect_grace() -> SharedDisconnectGrace {
+    Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_DISCONNECT_GRACE_SECS))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveDisplay {
     pub display_id: u32,
@@ -54,6 +64,8 @@ impl LiveDisplay {
     }
 }
 
+pub type CaptureStopper = Box<dyn FnOnce() + Send>;
+
 #[derive(Default)]
 pub struct DeviceSessionState {
     pub reconfig_epoch: u64,
@@ -61,6 +73,7 @@ pub struct DeviceSessionState {
     pub session_seq: u64,
     pub live_display: Option<LiveDisplay>,
     pub leave: Option<Arc<LeaveSignal>>,
+    pub active_capture: Option<(u64, CaptureStopper)>,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -71,6 +84,7 @@ impl std::fmt::Debug for DeviceSessionState {
             .field("session_seq", &self.session_seq)
             .field("live_display", &self.live_display)
             .field("leave_armed", &self.leave.is_some())
+            .field("active_capture_seq", &self.active_capture.as_ref().map(|(s, _)| *s))
             .finish()
     }
 }
@@ -119,6 +133,28 @@ pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
 
 pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
     sessions.lock().unwrap().get(ip).map(|s| s.kick_epoch).unwrap_or(0)
+}
+
+pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: CaptureStopper) {
+    sessions.lock().unwrap().entry(ip.to_string()).or_default().active_capture = Some((seq, stop));
+}
+
+pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<CaptureStopper> {
+    sessions
+        .lock()
+        .unwrap()
+        .get_mut(ip)
+        .and_then(|s| s.active_capture.take())
+        .map(|(_, stop)| stop)
+}
+
+pub fn take_active_capture_if(sessions: &SharedSessions, ip: &str, seq: u64) -> Option<CaptureStopper> {
+    let mut map = sessions.lock().unwrap();
+    let state = map.get_mut(ip)?;
+    match &state.active_capture {
+        Some((s, _)) if *s == seq => state.active_capture.take().map(|(_, stop)| stop),
+        _ => None,
+    }
 }
 
 pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {

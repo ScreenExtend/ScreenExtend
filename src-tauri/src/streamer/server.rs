@@ -187,7 +187,7 @@ async fn leave(
 ) -> Response {
     let ip = peer.ip().to_string();
     if let Some(s) = state.config.sessions.as_ref() {
-        println!("leave beacon from {ip}; tearing down session");
+        tprintln!("leave beacon from {ip}; tearing down session");
         session::signal_leave(s, &ip);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -227,7 +227,7 @@ async fn whep(
 
     let client_ip = peer.ip().to_string();
 
-    println!(
+    tprintln!(
         "join request: device={:?}, session={}, screen={}x{}, sdp_bytes={}",
         req.device_name,
         req.session_id,
@@ -239,7 +239,7 @@ async fn whep(
     let auth = match state.config.session_auth.as_ref() {
         Some(auth) if auth.validate(&req.session_id, &req.otp) => auth,
         _ => {
-            println!("join rejected: invalid session id or OTP");
+            tprintln!("join rejected: invalid session id or OTP");
             return (StatusCode::UNAUTHORIZED, "invalid session id or OTP").into_response();
         }
     };
@@ -247,7 +247,7 @@ async fn whep(
 
     match start_session(&state, &req, &client_ip).await {
         Ok(answer) => {
-            println!("join accepted: WHEP answer generated ({} bytes)", answer.len());
+            tprintln!("join accepted: WHEP answer generated ({} bytes)", answer.len());
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sdp")],
@@ -256,7 +256,7 @@ async fn whep(
                 .into_response()
         }
         Err(e) => {
-            eprintln!("join failed: {e:?}");
+            teprintln!("join failed: {e:?}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("join failed: {e}"),
@@ -279,6 +279,13 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
         .as_ref()
         .map(|s| session::next_session_seq(s, client_ip))
         .unwrap_or(0);
+
+    if let Some(s) = state.config.sessions.as_ref() {
+        if let Some(stop) = session::take_active_capture(s, client_ip) {
+            tprintln!("stopping previous capture for {client_ip} before starting a new session");
+            let _ = tokio::task::spawn_blocking(stop).await;
+        }
+    }
 
     let detected_refresh = if req.refresh_rate == 0 {
         60
@@ -337,17 +344,21 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             if display_changed {
                 let name = prev.device_name.clone();
                 let name2 = name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_resolution(&name2, width, height, refresh)
+                let res = tokio::task::spawn_blocking(move || {
+                    pipeline::set_display_mode(&name2, width, height, refresh, portrait)
                 })
                 .await;
-                apply_display_settings(&name, override_for_ip).await;
-                println!(
+                if let Ok(Err(e)) = res {
+                    teprintln!("could not apply display mode to {name}: {e}");
+                }
+                apply_display_scale(&name, override_for_ip).await;
+                wait_for_display_settle(&name).await;
+                tprintln!(
                     "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh})",
                     prev.display_id
                 );
             } else {
-                println!(
+                tprintln!(
                     "virtual display id={} untouched (encoder-only edit)",
                     prev.display_id
                 );
@@ -369,11 +380,11 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
                     .context("create-display task")?
                     .map_err(|e| anyhow::anyhow!("creating virtual display: {e}"))?
                 };
-                println!("virtual display created (id={display_id}, {width}x{height}@{refresh})");
+                tprintln!("virtual display created (id={display_id}, {width}x{height}@{refresh})");
 
                 match wait_for_new_monitor(&before).await {
                     Some(name) => {
-                        println!("virtual display id={display_id} attached as {name}");
+                        tprintln!("virtual display id={display_id} attached as {name}");
                         (display_id, name)
                     }
                     None => {
@@ -383,20 +394,24 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
                 }
             };
 
+            let _ = tokio::task::spawn_blocking(pipeline::set_display_topology_extend).await;
+
             {
                 let name = device_name.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_resolution(&name, width, height, refresh)
+                    pipeline::set_display_mode(&name, width, height, refresh, portrait)
                 })
                 .await;
                 match res {
-                    Ok(Ok(())) => println!("virtual display {device_name} set to {width}x{height}@{refresh}"),
-                    Ok(Err(e)) => eprintln!("could not force {device_name} to {width}x{height}: {e}"),
-                    Err(e) => eprintln!("set-resolution task for {device_name} panicked: {e}"),
+                    Ok(Ok(())) => tprintln!(
+                        "virtual display {device_name} set to {width}x{height}@{refresh} (portrait={portrait})"
+                    ),
+                    Ok(Err(e)) => teprintln!("could not force {device_name} to {width}x{height}: {e}"),
+                    Err(e) => teprintln!("set-mode task for {device_name} panicked: {e}"),
                 }
             }
 
-            apply_display_settings(&device_name, override_for_ip).await;
+            apply_display_scale(&device_name, override_for_ip).await;
             (display_id, device_name)
         }
     };
@@ -415,9 +430,7 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
 
     let session = match pipeline::start_on_monitor(&cfg, &device_name) {
         Ok(s) => s,
-        Err(e) => {
-            return Err(e.context("starting capture for virtual display"));
-        }
+        Err(e) => return Err(e.context("starting capture for virtual display")),
     };
 
     let (closed_tx, closed_rx) = oneshot::channel();
@@ -458,9 +471,18 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
         .as_ref()
         .map(|s| session::arm_leave(s, client_ip));
 
+    let session_holder = match state.config.sessions.as_ref() {
+        Some(s) => {
+            session::set_active_capture(s, client_ip, session_seq, Box::new(move || session.stop()));
+            None
+        }
+        None => Some(session),
+    };
+
     let client = client.clone();
     let reporter = state.config.device_reporter.clone();
     let sessions = state.config.sessions.clone();
+    let disconnect_grace = state.config.disconnect_grace.clone();
     let report_ip = client_ip.to_string();
     tokio::spawn(async move {
         let left = match &leave {
@@ -479,11 +501,27 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             }
         };
 
-        session.stop();
+        let stop = sessions
+            .as_ref()
+            .and_then(|s| session::take_active_capture_if(s, &report_ip, session_seq));
+        if let Some(stop) = stop {
+            let _ = tokio::task::spawn_blocking(stop).await;
+        } else if let Some(session) = session_holder {
+            session.stop();
+        }
 
         if !left {
-            println!("session for display id={display_id} ({device_name}) PC closed; keeping display");
-            return;
+            let grace = std::time::Duration::from_secs(
+                disconnect_grace
+                    .as_ref()
+                    .map(|g| g.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(session::DEFAULT_DISCONNECT_GRACE_SECS),
+            );
+            tprintln!(
+                "session for display id={display_id} ({device_name}) PC closed; \
+                 waiting {grace:?} for a rejoin before removing the display"
+            );
+            tokio::time::sleep(grace).await;
         }
 
         let superseded = sessions
@@ -491,10 +529,13 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
             .map(|s| !session::is_current_session(s, &report_ip, session_seq))
             .unwrap_or(false);
         if superseded {
-            println!("session for display id={display_id} ({device_name}) leave superseded; keeping display");
+            tprintln!("session for display id={display_id} ({device_name}) superseded; keeping display");
             return;
         }
-        println!("page closed; removing display id={display_id} ({device_name})");
+        tprintln!(
+            "session for display id={display_id} ({device_name}) ended ({}); removing display",
+            if left { "page closed" } else { "disconnected, no rejoin" }
+        );
         if let Some(s) = sessions.as_ref() {
             let _ = session::take_live_display(s, &report_ip);
         }
@@ -512,22 +553,38 @@ async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }
 
-async fn apply_display_settings(device_name: &str, over: Option<DeviceOverride>) {
+async fn apply_display_scale(device_name: &str, over: Option<DeviceOverride>) {
     let Some(o) = over else { return };
     let name = device_name.to_string();
-    let portrait = o.orientation_portrait;
     let scale = o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE);
     let res = tokio::task::spawn_blocking(move || {
-        if let Err(e) = pipeline::set_display_orientation(&name, portrait) {
-            eprintln!("could not set orientation for {name}: {e}");
-        }
         if let Err(e) = pipeline::set_display_scale(&name, scale) {
-            eprintln!("could not set scale for {name}: {e}");
+            teprintln!("could not set scale for {name}: {e}");
         }
     })
     .await;
     if let Err(e) = res {
-        eprintln!("apply-display-settings task for {device_name} panicked: {e}");
+        teprintln!("apply-display-scale task for {device_name} panicked: {e}");
+    }
+}
+
+async fn wait_for_display_settle(device_name: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut last: Option<(u32, u32)> = None;
+    loop {
+        let name = device_name.to_string();
+        let dims = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
+            .await
+            .ok()
+            .flatten();
+        if dims.is_some() && dims == last {
+            return;
+        }
+        last = dims;
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
     }
 }
 
@@ -562,21 +619,21 @@ fn build_ice_servers(config: &Config) -> Vec<RTCIceServer> {
                 username: user.clone(),
                 credential: cred.clone(),
             });
-            eprintln!(
+            teprintln!(
                 "TURN relay configured ({url}) — MUST be local/regional to preserve latency"
             );
         }
         (Some(_), _, _) => {
-            eprintln!("TURN_URL set but credentials missing, TURN disabled");
+            teprintln!("TURN_URL set but credentials missing, TURN disabled");
         }
         _ => {}
     }
 
     if servers.is_empty() {
-        println!("ICE servers: none configured -> host candidates only (same-network)");
+        tprintln!("ICE servers: none configured -> host candidates only (same-network)");
     } else {
         for s in &servers {
-            println!(
+            tprintln!(
                 "ICE server configured (urls={:?}, has_creds={})",
                 s.urls,
                 !s.username.is_empty()
@@ -588,19 +645,19 @@ fn build_ice_servers(config: &Config) -> Vec<RTCIceServer> {
 }
 
 fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: bool) {
-    println!("server listening — HTTP :{http_port}, HTTPS :{https_port}");
+    tprintln!("server listening — HTTP :{http_port}, HTTPS :{https_port}");
     match lan_ip {
         Some(ip) => {
-            println!("  LAN (open this first):  http://{ip}:{http_port}/");
-            println!("  LAN (secure / WebCodecs): https://{ip}:{https_port}/");
+            tprintln!("  LAN (open this first):  http://{ip}:{http_port}/");
+            tprintln!("  LAN (secure / WebCodecs): https://{ip}:{https_port}/");
         }
-        None => println!("  LAN IP not set; use this machine's IP manually (or pass --lan-ip)"),
+        None => tprintln!("  LAN IP not set; use this machine's IP manually (or pass --lan-ip)"),
     }
-    println!(
+    tprintln!(
         "  local:  http://localhost:{http_port}/   health: http://localhost:{http_port}/health"
     );
     if self_signed {
-        println!(
+        tprintln!(
             "HTTPS uses a self-signed dev cert: browser shows a one-time warning, accept to proceed; \
              supply --tls-cert/--tls-key for a trusted cert"
         );

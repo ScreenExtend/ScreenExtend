@@ -50,6 +50,15 @@ function App() {
   }, [sessionId, otp]);
 
   useEffect(() => {
+    if (!loaded) return;
+    const stored = localStorage.getItem("disconnectGraceSecs");
+    const seconds = Number(stored);
+    if (stored !== null && Number.isFinite(seconds) && seconds >= 0) {
+      void commands.setDisconnectGrace(seconds);
+    }
+  }, [loaded]);
+
+  useEffect(() => {
     const unlisteners: (() => void)[] = [];
     const start_listener = async () => {
       unlisteners.push(await events.deviceJoin.listen(event => {

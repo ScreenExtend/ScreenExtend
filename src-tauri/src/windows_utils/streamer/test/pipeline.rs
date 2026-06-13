@@ -1,5 +1,5 @@
-use crate::streamer::config::ScalePercent;
-use crate::windows_utils::streamer::pipeline::scaled_dims;
+use crate::streamer::config::{Config, ScalePercent};
+use crate::windows_utils::streamer::pipeline::{live_encoder_config, scaled_dims};
 
 #[test]
 fn scale_100_is_native_passthrough() {
@@ -37,4 +37,21 @@ fn scale_parse_accepts_percent_and_bare() {
 fn scale_never_produces_zero_dims() {
     let (w, h) = scaled_dims(8, 8, ScalePercent::new(ScalePercent::MIN));
     assert!(w >= 2 && h >= 2);
+}
+
+#[test]
+fn encoder_config_tolerates_max_fps_below_60() {
+    let mut cfg = Config::default();
+    cfg.fps = None;
+    cfg.max_fps = 20;
+    let enc = live_encoder_config(1920, 1080, 60, &cfg);
+    assert_eq!(enc.fps, 20);
+
+    cfg.max_fps = 144;
+    let enc = live_encoder_config(1920, 1080, 120, &cfg);
+    assert_eq!(enc.fps, 120);
+
+    cfg.max_fps = 240;
+    let enc = live_encoder_config(1920, 1080, 30, &cfg);
+    assert_eq!(enc.fps, 60);
 }

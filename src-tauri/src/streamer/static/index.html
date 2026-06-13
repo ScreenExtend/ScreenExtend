@@ -358,7 +358,6 @@
                 try { if (pc) pc.close(); } catch (_) {}
             }
             window.addEventListener('pagehide', sendLeave);
-            window.addEventListener('beforeunload', sendLeave);
 
             async function getIceServers() {
                 try {

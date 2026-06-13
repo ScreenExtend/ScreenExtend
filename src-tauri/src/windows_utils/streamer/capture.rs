@@ -16,7 +16,7 @@ use windows_capture::settings::{
 
 pub fn set_dpi_awareness() {
     if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-        eprintln!("SetProcessDpiAwarenessContext failed (likely already set): {e}");
+        teprintln!("SetProcessDpiAwarenessContext failed (likely already set): {e}");
     }
 }
 
@@ -38,7 +38,7 @@ pub fn check_dwm_composition() -> Result<()> {
             "DWM composition disabled, install Desktop Experience on Server"
         ),
         Err(_) => {
-            eprintln!("DwmIsCompositionEnabled failed (non-fatal)");
+            teprintln!("DwmIsCompositionEnabled failed (non-fatal)");
             Ok(())
         }
     }
@@ -50,20 +50,20 @@ pub fn select_monitor(requested: u32) -> Result<(Monitor, MonitorInfo)> {
         bail!("no displays found");
     }
 
-    println!("{} display(s) detected:", monitors.len());
+    tprintln!("{} display(s) detected:", monitors.len());
     for (i, m) in monitors.iter().enumerate() {
         let name = m.name().unwrap_or_else(|_| "<unknown>".into());
         let gpu = m.device_string().unwrap_or_else(|_| "<unknown gpu>".into());
         let w = m.width().unwrap_or(0);
         let h = m.height().unwrap_or(0);
         let hz = m.refresh_rate().unwrap_or(0);
-        println!("  display[{i}]: {name} -- {gpu} -- {w}x{h}@{hz}Hz");
+        tprintln!("  display[{i}]: {name} -- {gpu} -- {w}x{h}@{hz}Hz");
     }
 
     let index = if (requested as usize) < monitors.len() {
         requested
     } else {
-        eprintln!("requested display {requested} absent, falling back to 0");
+        teprintln!("requested display {requested} absent, falling back to 0");
         0
     };
 
@@ -89,11 +89,29 @@ pub fn monitor_device_names() -> Vec<String> {
     }
 }
 
+pub fn monitor_dimensions(device_name: &str) -> Option<(u32, u32)> {
+    let monitors = Monitor::enumerate().ok()?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m.device_name().ok().as_deref() == Some(device_name))?;
+    Some((monitor.width().ok()?, monitor.height().ok()?))
+}
+
 pub fn set_display_resolution(device_name: &str, width: u32, height: u32, refresh: u32) -> Result<()> {
+    set_display_mode(device_name, width, height, refresh, false)
+}
+
+pub fn set_display_mode(
+    device_name: &str,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    portrait: bool,
+) -> Result<()> {
     use windows::Win32::Graphics::Gdi::{
         CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
-        DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
-        EnumDisplaySettingsW,
+        DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH, DMDO_DEFAULT,
+        ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
     };
     use windows::core::PCWSTR;
 
@@ -107,18 +125,21 @@ pub fn set_display_resolution(device_name: &str, width: u32, height: u32, refres
     unsafe {
         let _ = EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &mut devmode);
     }
+    let (pels_w, pels_h) = if portrait { (height, width) } else { (width, height) };
     devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-    devmode.dmPelsWidth = width;
-    devmode.dmPelsHeight = height;
+    devmode.dmPelsWidth = pels_w;
+    devmode.dmPelsHeight = pels_h;
     devmode.dmDisplayFrequency = refresh;
-    devmode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    devmode.Anonymous1.Anonymous2.dmDisplayOrientation = DMDO_DEFAULT;
+    devmode.dmFields |=
+        DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
 
     let result =
         unsafe { ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None) };
     if result == DISP_CHANGE_SUCCESSFUL {
         Ok(())
     } else {
-        bail!("ChangeDisplaySettingsExW({device_name}) -> {result:?}");
+        bail!("ChangeDisplaySettingsExW({device_name}, {pels_w}x{pels_h}@{refresh}, portrait={portrait}) -> {result:?}");
     }
 }
 
@@ -341,7 +362,7 @@ impl GraphicsCaptureApiHandler for ProbeHandler {
 
 pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
     let (monitor, info) = select_monitor(requested_monitor)?;
-    println!(
+    tprintln!(
         "capturing display[{}] '{}' ({}) {}x{} -> {}",
         info.index, info.name, info.gpu, info.width, info.height, path
     );
@@ -363,7 +384,7 @@ pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
     let captured = result.lock().unwrap().take();
     match captured {
         Some(r) => {
-            println!("captured {}x{} frame -> {}", r.width, r.height, path);
+            tprintln!("captured {}x{} frame -> {}", r.width, r.height, path);
             Ok(())
         }
         None => bail!("capture ended without producing a frame"),

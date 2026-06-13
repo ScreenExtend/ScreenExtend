@@ -65,6 +65,11 @@ impl Streamer {
         platform::probe_capture(self.config.monitor, path)
     }
 
+    pub fn probe_dxgi(&self, path: &str) -> Result<()> {
+        Self::prepare();
+        platform::probe_dxgi(self.config.monitor, path)
+    }
+
     pub fn probe_encode(&self, path: &str) -> Result<()> {
         Self::prepare();
         platform::probe_encode(&self.config, path)

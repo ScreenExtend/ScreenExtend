@@ -26,15 +26,35 @@ pub fn probe_capture(monitor: u32, path: &str) -> Result<()> {
     }
 }
 
+pub fn probe_dxgi(monitor: u32, path: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_utils::streamer::dxgi::probe_to_bmp(monitor, path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (monitor, path);
+        anyhow::bail!("DXGI duplication probe is only implemented on Windows")
+    }
+}
+
 pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        crate::windows_utils::streamer::nvidia::encoder::probe_encode(config, path)
+        use crate::streamer::config::EncoderVendor;
+        match config.encoder_vendor {
+            EncoderVendor::Intel => {
+                crate::windows_utils::streamer::intel::encoder::probe_encode(config, path)
+            }
+            EncoderVendor::Auto | EncoderVendor::Nvidia => {
+                crate::windows_utils::streamer::nvidia::encoder::probe_encode(config, path)
+            }
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (config, path);
-        anyhow::bail!("encode probe is only implemented on Windows (NVENC)")
+        anyhow::bail!("encode probe is only implemented on Windows")
     }
 }
 
