@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 
 use super::config::{Config, ScalePercent};
 use super::pipeline;
-use super::session::{self, DeviceInfo, DeviceOverride};
+use super::session::{self, DeviceInfo, DeviceOverride, OtpLimiter, OtpOutcome, SharedOtpLimiter};
 use super::webrtc_session::{self, RTCIceServer};
 
 #[derive(Deserialize)]
@@ -45,22 +45,40 @@ pub const MIN_DISPLAY_SCALE: u32 = 25;
 pub const MAX_DISPLAY_SCALE: u32 = 200;
 
 #[derive(Clone)]
-struct AppState {
+pub struct AppState {
     config: Arc<Config>,
     ice_servers: Arc<Vec<RTCIceServer>>,
     ice_json: Arc<String>,
     net_json: Arc<String>,
+    otp_limiter: SharedOtpLimiter,
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Self {
+        Self {
+            ice_servers: Arc::new(build_ice_servers(&config)),
+            ice_json: Arc::new(build_ice_json(&config)),
+            net_json: Arc::new(build_net_json(&config)),
+            otp_limiter: Arc::new(OtpLimiter::new()),
+            config: Arc::new(config),
+        }
+    }
+
+    pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
+        self.ice_servers.as_ref().clone()
+    }
+}
+
+pub struct ProcessedResponse {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: String,
 }
 
 pub async fn run(config: Config, handle: Option<axum_server::Handle>) -> Result<()> {
     let handle = handle.unwrap_or_else(axum_server::Handle::new);
 
-    let state = AppState {
-        ice_servers: Arc::new(build_ice_servers(&config)),
-        ice_json: Arc::new(build_ice_json(&config)),
-        net_json: Arc::new(build_net_json(&config)),
-        config: Arc::new(config.clone()),
-    };
+    let state = AppState::new(config.clone());
 
     let app = router(state);
 
@@ -167,16 +185,10 @@ async fn reconfig(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    let ip = peer.ip().to_string();
-    let (epoch, kick) = state
-        .config
-        .sessions
-        .as_ref()
-        .map(|s| (session::reconfig_epoch(s, &ip), session::kick_epoch(s, &ip)))
-        .unwrap_or((0, 0));
+    let body = process_reconfig(&state, &peer.ip().to_string());
     (
         [(header::CONTENT_TYPE, "application/json")],
-        serde_json::json!({ "epoch": epoch, "kick": kick }).to_string(),
+        body,
     )
         .into_response()
 }
@@ -185,12 +197,30 @@ async fn leave(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
-    let ip = peer.ip().to_string();
-    if let Some(s) = state.config.sessions.as_ref() {
-        tprintln!("leave beacon from {ip}; tearing down session");
-        session::signal_leave(s, &ip);
-    }
+    process_leave(&state, &peer.ip().to_string());
     StatusCode::NO_CONTENT.into_response()
+}
+
+pub fn process_reconfig(state: &AppState, device_key: &str) -> String {
+    let (epoch, kick) = state
+        .config
+        .sessions
+        .as_ref()
+        .map(|s| {
+            (
+                session::reconfig_epoch(s, device_key),
+                session::kick_epoch(s, device_key),
+            )
+        })
+        .unwrap_or((0, 0));
+    serde_json::json!({ "epoch": epoch, "kick": kick }).to_string()
+}
+
+pub fn process_leave(state: &AppState, device_key: &str) {
+    if let Some(s) = state.config.sessions.as_ref() {
+        tprintln!("leave beacon from {device_key}; tearing down session");
+        session::signal_leave(s, device_key);
+    }
 }
 
 fn build_net_json(config: &Config) -> String {
@@ -218,14 +248,32 @@ async fn whep(
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let req: JoinRequest = match serde_json::from_slice(&body) {
+    let ice = state.fallback_ice_servers();
+    let out = process_whep(&state, &peer.ip().to_string(), &body, ice).await;
+    (
+        StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        [(header::CONTENT_TYPE, out.content_type)],
+        out.body,
+    )
+        .into_response()
+}
+
+pub async fn process_whep(
+    state: &AppState,
+    device_key: &str,
+    body: &[u8],
+    ice_servers: Vec<RTCIceServer>,
+) -> ProcessedResponse {
+    let req: JoinRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("invalid join request: {e}")).into_response();
+            return ProcessedResponse {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                content_type: "text/plain",
+                body: format!("invalid join request: {e}"),
+            };
         }
     };
-
-    let client_ip = peer.ip().to_string();
 
     tprintln!(
         "join request: device={:?}, session={}, screen={}x{}, sdp_bytes={}",
@@ -236,37 +284,76 @@ async fn whep(
         req.sdp.len()
     );
 
-    let auth = match state.config.session_auth.as_ref() {
-        Some(auth) if auth.validate(&req.session_id, &req.otp) => auth,
-        _ => {
-            tprintln!("join rejected: invalid session id or OTP");
-            return (StatusCode::UNAUTHORIZED, "invalid session id or OTP").into_response();
-        }
-    };
-    let _ = auth;
+    // Refuse outright if this device is still serving an OTP lockout.
+    if let Some(retry_after) = state.otp_limiter.locked_for(device_key) {
+        let secs = retry_after.as_secs() + 1;
+        tprintln!("join rejected: {device_key} locked out, {secs}s remaining on OTP timeout");
+        return ProcessedResponse {
+            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            content_type: "text/plain",
+            body: format!("too many invalid OTP attempts; try again in {secs}s"),
+        };
+    }
 
-    match start_session(&state, &req, &client_ip).await {
+    match state.config.session_auth.as_ref() {
+        Some(auth) if auth.validate(&req.session_id, &req.otp) => {
+            state.otp_limiter.record_success(device_key);
+        }
+        _ => match state.otp_limiter.record_failure(device_key) {
+            OtpOutcome::LockedOut { retry_after } => {
+                let secs = retry_after.as_secs() + 1;
+                tprintln!(
+                    "join rejected: invalid OTP from {device_key}; \
+                     max attempts reached, locked out for {secs}s"
+                );
+                return ProcessedResponse {
+                    status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    content_type: "text/plain",
+                    body: format!("too many invalid OTP attempts; try again in {secs}s"),
+                };
+            }
+            OtpOutcome::Rejected { remaining } => {
+                tprintln!(
+                    "join rejected: invalid session id or OTP from {device_key} \
+                     ({remaining} attempt(s) left)"
+                );
+                return ProcessedResponse {
+                    status: StatusCode::UNAUTHORIZED.as_u16(),
+                    content_type: "text/plain",
+                    body: format!(
+                        "invalid session id or OTP ({remaining} attempt(s) left)"
+                    ),
+                };
+            }
+        },
+    }
+
+    match start_session(state, &req, device_key, ice_servers).await {
         Ok(answer) => {
             tprintln!("join accepted: WHEP answer generated ({} bytes)", answer.len());
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/sdp")],
-                answer,
-            )
-                .into_response()
+            ProcessedResponse {
+                status: StatusCode::OK.as_u16(),
+                content_type: "application/sdp",
+                body: answer,
+            }
         }
         Err(e) => {
             teprintln!("join failed: {e:?}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("join failed: {e}"),
-            )
-                .into_response()
+            ProcessedResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                content_type: "text/plain",
+                body: format!("join failed: {e}"),
+            }
         }
     }
 }
 
-async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> Result<String> {
+async fn start_session(
+    state: &AppState,
+    req: &JoinRequest,
+    client_ip: &str,
+    ice_servers: Vec<RTCIceServer>,
+) -> Result<String> {
     let client = state
         .config
         .virtual_display
@@ -437,7 +524,7 @@ async fn start_session(state: &AppState, req: &JoinRequest, client_ip: &str) -> 
     let answer = match webrtc_session::handle_whep_offer(
         req.sdp.clone(),
         &session.pipeline,
-        state.ice_servers.as_ref().clone(),
+        ice_servers,
         Some(closed_tx),
     )
     .await

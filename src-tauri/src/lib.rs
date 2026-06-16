@@ -51,6 +51,12 @@ pub struct DeviceRemoveAction(Device);
 pub struct NetworkChange;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct CloudStatusChange {
+    pub state: String,
+    pub detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
     pub ip: String,
     pub name: String,
@@ -143,6 +149,8 @@ pub fn run() {
             //            get_devices,
             set_current_user,
             set_session_credentials,
+            register_cloud_session,
+            get_cloud_status,
             exit_app,
             get_username,
             networking::get_network_adapters,
@@ -150,6 +158,8 @@ pub fn run() {
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
             hosted_network::is_hosted_network,
+            hosted_network::is_wifi_on,
+            hosted_network::turn_on_wifi,
             install_drivers,
             remove_drivers,
             set_device_override,
@@ -165,6 +175,7 @@ pub fn run() {
             DeviceRemove,
             DeviceRemoveAction,
             NetworkChange,
+            CloudStatusChange,
             logbus::LogLine
         ]);
 

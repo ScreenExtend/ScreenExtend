@@ -55,6 +55,8 @@ export default function Settings() {
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState(hostedNetworkPassword);
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
   const [hostedNetworkModalOpen, setHostedNetworkModalOpen] = useState(false);
+  const [wifiModalOpen, setWifiModalOpen] = useState(false);
+  const [wifiTurningOn, setWifiTurningOn] = useState(false);
   const [disabled, setDisabled] = useState(false);
   const [inputDisabled, setInputDisabled] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
@@ -140,6 +142,30 @@ export default function Settings() {
     void updateUser(currentUser, {hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword]);
 
+  const startNetworkWithFeedback = async (opts?: { fromWifiModal?: boolean }): Promise<boolean> => {
+    await commands.stopHostedNetwork();
+    const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+    if (success) {
+      setHostedNetworkOn(true);
+      toast({
+        title: "Network Creation Success",
+        description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
+      });
+      return true;
+    }
+    await commands.stopHostedNetwork();
+    setHostedNetworkOn(false);
+    if (!opts?.fromWifiModal && !(await commands.isWifiOn())) {
+      setWifiModalOpen(true);
+    } else {
+      toast({
+        title: "Network Creation Failure",
+        description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card, such as hotspot.",
+      });
+    }
+    return false;
+  };
+
   return (
     <Layout>
       <div className="p-8">
@@ -201,22 +227,7 @@ export default function Settings() {
                   checked={hostedNetworkOn}
                   onCheckedChange={async () => {
                     if ((!hostedNetworkOn || inputDisabled)) {
-                      await commands.stopHostedNetwork();
-                      const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
-                      if (success) {
-                        setHostedNetworkOn(true);
-                        toast({
-                          title: "Network Creation Success",
-                          description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
-                        });
-                      } else {
-                        await commands.stopHostedNetwork();
-                        setHostedNetworkOn(false);
-                        toast({
-                          title: "Network Creation Failure",
-                          description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card, such as hotspot.",
-                        });
-                      }
+                      await startNetworkWithFeedback();
                     } else {
                       await commands.stopHostedNetwork();
                       setHostedNetworkName(oldHostedNetworkName);
@@ -539,6 +550,46 @@ export default function Settings() {
               }}
             >
               Continue
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={wifiModalOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Turn on Wi-Fi?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Hosting a network requires Wi-Fi to be turned on.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              onClick={() => setWifiModalOpen(false)}
+              disabled={wifiTurningOn}
+              className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={wifiTurningOn}
+              className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
+              onClick={async () => {
+                setWifiTurningOn(true);
+                const turned = await commands.turnOnWifi();
+                if (turned) {
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                  await startNetworkWithFeedback({ fromWifiModal: true });
+                } else {
+                  toast({
+                    title: "Couldn't Turn On Wi-Fi",
+                    description: "Please enable Wi-Fi manually from Windows settings, then try again.",
+                  });
+                }
+                setWifiTurningOn(false);
+                setWifiModalOpen(false);
+              }}
+            >
+              {wifiTurningOn ? "Turning On…" : "Turn On"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
