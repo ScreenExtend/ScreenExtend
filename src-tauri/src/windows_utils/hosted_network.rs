@@ -8,6 +8,7 @@ use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_shell::ShellExt;
 use windows::core::{Result, HSTRING};
+use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioKind, RadioState};
 use windows::Devices::WiFiDirect::{
     WiFiDirectAdvertisementPublisher, WiFiDirectAdvertisementPublisherStatus,
     WiFiDirectAdvertisementPublisherStatusChangedEventArgs,
@@ -22,16 +23,12 @@ fn start_wifi_direct_(
     password: &str,
     success_tx: Sender<bool>,
 ) -> Result<WiFiDirectAdvertisementPublisher> {
-    let connection_profile = NetworkInformation::GetInternetConnectionProfile()
-        .expect("error while getting connection profile");
+    let connection_profile = NetworkInformation::GetInternetConnectionProfile()?;
     let tethering_manager =
-        NetworkOperatorTetheringManager::CreateFromConnectionProfile(&connection_profile)
-            .expect("error while cretaing connection profile");
-    let initial_state = tethering_manager
-        .TetheringOperationalState()
-        .expect("error while finding operational state");
+        NetworkOperatorTetheringManager::CreateFromConnectionProfile(&connection_profile)?;
+    let initial_state = tethering_manager.TetheringOperationalState()?;
     if initial_state != windows::Networking::NetworkOperators::TetheringOperationalState(2) {
-        success_tx.send(false).expect("error while sending status");
+        let _ = success_tx.send(false);
         return Err(windows::core::Error::new(
             windows::core::HRESULT(1),
             "error while starting hotspot",
@@ -48,23 +45,22 @@ fn start_wifi_direct_(
         WiFiDirectAdvertisementPublisher,
         WiFiDirectAdvertisementPublisherStatusChangedEventArgs,
     >::new(move |_sender, args| {
-        let status = args.as_ref().expect("no args").Status()?;
-        match status {
-            WiFiDirectAdvertisementPublisherStatus::Started => {
-                success_tx.send(true).expect("error while sending status")
+        if let Some(args) = args.as_ref() {
+            match args.Status()? {
+                WiFiDirectAdvertisementPublisherStatus::Started => {
+                    let _ = success_tx.send(true);
+                }
+                WiFiDirectAdvertisementPublisherStatus::Aborted => {
+                    let _ = success_tx.send(false);
+                }
+                _ => (),
             }
-            WiFiDirectAdvertisementPublisherStatus::Aborted => {
-                success_tx.send(false).expect("error while sending status")
-            }
-            _ => (),
         }
         Ok(())
     });
     publisher.StatusChanged(&publisher_status_changed_callback)?;
 
-    let advertisement = publisher
-        .Advertisement()
-        .expect("error while getting advertisement");
+    let advertisement = publisher.Advertisement()?;
     advertisement.SetIsAutonomousGroupOwnerEnabled(true)?;
 
     let legacy_settings = advertisement.LegacySettings()?;
@@ -75,6 +71,53 @@ fn start_wifi_direct_(
     publisher.Start()?;
 
     Ok(publisher)
+}
+
+fn wifi_radios() -> Vec<Radio> {
+    let access = match Radio::RequestAccessAsync().and_then(|op| op.join()) {
+        Ok(status) => status,
+        Err(_) => return Vec::new(),
+    };
+    if access != RadioAccessStatus::Allowed {
+        return Vec::new();
+    }
+    let radios = match Radio::GetRadiosAsync().and_then(|op| op.join()) {
+        Ok(radios) => radios,
+        Err(_) => return Vec::new(),
+    };
+    radios
+        .into_iter()
+        .filter(|r| r.Kind().map(|k| k == RadioKind::WiFi).unwrap_or(false))
+        .collect()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn is_wifi_on() -> bool {
+    wifi_radios()
+        .iter()
+        .any(|r| r.State().map(|s| s == RadioState::On).unwrap_or(false))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn turn_on_wifi() -> bool {
+    let radios = wifi_radios();
+    if radios.is_empty() {
+        return false;
+    }
+    let mut any_on = false;
+    for radio in radios {
+        if radio.State().map(|s| s == RadioState::On).unwrap_or(false) {
+            any_on = true;
+            continue;
+        }
+        match radio.SetStateAsync(RadioState::On).and_then(|op| op.join()) {
+            Ok(RadioAccessStatus::Allowed) => any_on = true,
+            _ => {}
+        }
+    }
+    any_on
 }
 
 fn supports_legacy_hosted_network_(app: AppHandle) -> bool {
@@ -135,7 +178,7 @@ pub fn start_hosted_network(
                 return *state.hosted_network_running.lock().unwrap();
             }
         };
-        if !success_rx.recv().unwrap() {
+        if !success_rx.recv().unwrap_or(false) {
             *state.hosted_network_running.lock().unwrap() = false;
             return *state.hosted_network_running.lock().unwrap();
         }

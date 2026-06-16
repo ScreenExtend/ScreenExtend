@@ -1,5 +1,6 @@
 pub mod bitrate;
 pub mod cli;
+pub mod cloud;
 pub mod config;
 pub mod pipeline;
 pub mod session;

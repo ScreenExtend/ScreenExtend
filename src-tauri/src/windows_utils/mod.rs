@@ -14,6 +14,7 @@ use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 use tauri::State;
+use crate::streamer::cloud::{CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink};
 use crate::streamer::session::{
     self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedSessions,
     SharedVirtualDisplay,
@@ -39,6 +40,36 @@ pub struct AppState {
     pub device_overrides: SharedDeviceOverrides,
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
+    pub cloud: Mutex<Option<CloudClient>>,
+    pub cloud_status: Arc<Mutex<(String, String)>>,
+}
+
+pub type SharedCloudStatus = Arc<Mutex<(String, String)>>;
+
+#[derive(Debug)]
+pub struct TauriCloudStatusSink {
+    app: tauri::AppHandle,
+    status: SharedCloudStatus,
+}
+
+impl TauriCloudStatusSink {
+    pub fn new_shared(app: tauri::AppHandle, status: SharedCloudStatus) -> SharedCloudStatusSink {
+        Arc::new(Self { app, status })
+    }
+}
+
+impl CloudStatusSink for TauriCloudStatusSink {
+    fn report(&self, state: CloudState, detail: String) {
+        use tauri_specta::Event;
+        *self.status.lock().unwrap() = (state.as_str().to_string(), detail.clone());
+        let payload = crate::CloudStatusChange {
+            state: state.as_str().to_string(),
+            detail,
+        };
+        if let Err(e) = payload.emit(&self.app) {
+            teprintln!("[cloud] failed to emit status event: {e:?}");
+        }
+    }
 }
 
 pub fn set_display_topology_extend() {
@@ -86,6 +117,8 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         device_overrides,
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
+        cloud: Mutex::new(None),
+        cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
     };
     app_handle.manage(state);
     true
@@ -209,6 +242,42 @@ pub fn remove_all_displays(client: &SharedVirtualDisplay) {
 pub fn set_session_credentials(state: State<'_, AppState>, session_id: String, otp: String) {
     *state.session_auth.session_id.lock().unwrap() = session_id;
     *state.session_auth.otp.lock().unwrap() = otp;
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn register_cloud_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) {
+    let server_config = Config {
+        virtual_display: Some(state.virtual_display.clone()),
+        session_auth: Some(state.session_auth.clone()),
+        device_reporter: Some(state.device_reporter.clone()),
+        device_overrides: Some(state.device_overrides.clone()),
+        sessions: Some(state.sessions.clone()),
+        disconnect_grace: Some(state.disconnect_grace.clone()),
+        ..Config::default()
+    };
+    *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
+    let sink = TauriCloudStatusSink::new_shared(app, state.cloud_status.clone());
+    let client = CloudClient::spawn(CloudConfig::new(session_id), server_config, sink);
+    let mut guard = state.cloud.lock().unwrap();
+    if let Some(mut prev) = guard.take() {
+        prev.stop();
+    }
+    *guard = Some(client);
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange {
+    let (status, detail) = state.cloud_status.lock().unwrap().clone();
+    crate::CloudStatusChange {
+        state: status,
+        detail,
+    }
 }
 
 #[tauri::command]

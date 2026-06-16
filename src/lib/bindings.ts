@@ -15,6 +15,12 @@ async setCurrentUser(currentUser: string) : Promise<void> {
 async setSessionCredentials(sessionId: string, otp: string) : Promise<void> {
     await TAURI_INVOKE("set_session_credentials", { sessionId, otp });
 },
+async registerCloudSession(sessionId: string) : Promise<void> {
+    await TAURI_INVOKE("register_cloud_session", { sessionId });
+},
+async getCloudStatus() : Promise<CloudStatusChange> {
+    return await TAURI_INVOKE("get_cloud_status");
+},
 async exitApp() : Promise<void> {
     await TAURI_INVOKE("exit_app");
 },
@@ -35,6 +41,12 @@ async stopHostedNetwork() : Promise<boolean> {
 },
 async isHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("is_hosted_network");
+},
+async isWifiOn() : Promise<boolean> {
+    return await TAURI_INVOKE("is_wifi_on");
+},
+async turnOnWifi() : Promise<boolean> {
+    return await TAURI_INVOKE("turn_on_wifi");
 },
 async installDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("install_drivers");
@@ -63,6 +75,7 @@ async getLogBacklog() : Promise<string[]> {
 
 
 export const events = __makeEvents__<{
+cloudStatusChange: CloudStatusChange,
 deviceJoin: DeviceJoin,
 deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
@@ -71,6 +84,7 @@ deviceRemoveAction: DeviceRemoveAction,
 logLine: LogLine,
 networkChange: NetworkChange
 }>({
+cloudStatusChange: "cloud-status-change",
 deviceJoin: "device-join",
 deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
@@ -86,6 +100,7 @@ networkChange: "network-change"
 
 /** user-defined types **/
 
+export type CloudStatusChange = { state: string; detail: string }
 export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device

@@ -5,6 +5,13 @@ import { commands, type NetworkInfo } from "./bindings";
 
 const STREAMER_HTTP_PORT = 8080;
 
+export const CLOUD_SESSION_DOMAIN = "session.screenextend.app";
+
+export function buildCloudQrValue(sessionId: string): string {
+  if (!sessionId) return "";
+  return `https://${CLOUD_SESSION_DOMAIN}/?id=${sessionId}`;
+}
+
 window.commands = commands;
 
 declare global {

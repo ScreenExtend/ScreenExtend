@@ -53,6 +53,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 # WebRTC streaming
 webrtc = "0.17"
 
+# Cloud relay control channel
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
 # Utilities
 anyhow = "1.0"
 bytes = "1"
@@ -73,6 +77,7 @@ version = "0.62"
 features = [
     "Data_Xml_Dom",
     "Devices_Enumeration",
+    "Devices_Radios",
     "Devices_WiFiDirect",
     "Foundation",
     "Foundation_Collections",

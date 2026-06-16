@@ -42,9 +42,11 @@ export default function Bootstrap() {
       setSessionId(newSessionId);
       setOtp(newOtp);
       await commands.setSessionCredentials(newSessionId, newOtp);
+      void commands.registerCloudSession(newSessionId);
       setQrValues(await buildQrValues(newSessionId));
       await events.networkChange.listen(async () => {
         setQrValues(await buildQrValues(newSessionId));
+        void commands.registerCloudSession(newSessionId);
       });
       setHostedNetworkOn(false);
       const username = await commands.getUsername();

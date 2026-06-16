@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -182,6 +183,89 @@ impl SessionAuth {
             && !want_otp.is_empty()
             && want_session.as_str() == session_id
             && want_otp.as_str() == otp
+    }
+}
+
+/// Max failed OTP attempts allowed (per device) before a lockout kicks in.
+pub const MAX_OTP_ATTEMPTS: u32 = 5;
+/// How long a device is locked out after exhausting its attempts.
+pub const OTP_LOCKOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OtpAttempt {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Result of recording a failed OTP attempt.
+pub enum OtpOutcome {
+    /// The attempt was rejected; `remaining` tries are left before lockout.
+    Rejected { remaining: u32 },
+    /// The device has just been locked out for `retry_after`.
+    LockedOut { retry_after: Duration },
+}
+
+/// Tracks failed OTP attempts per device and enforces a temporary lockout once
+/// [`MAX_OTP_ATTEMPTS`] is reached, mirroring the retry/timeout limiting used by
+/// the session relay.
+#[derive(Debug, Default)]
+pub struct OtpLimiter {
+    attempts: Mutex<HashMap<String, OtpAttempt>>,
+}
+
+pub type SharedOtpLimiter = Arc<OtpLimiter>;
+
+impl OtpLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `Some(retry_after)` if `key` is currently locked out, otherwise
+    /// `None`. Expired lockouts are cleared as a side effect.
+    pub fn locked_for(&self, key: &str) -> Option<Duration> {
+        let mut map = self.attempts.lock().unwrap();
+        let entry = map.get_mut(key)?;
+        match entry.locked_until {
+            Some(until) => {
+                let now = Instant::now();
+                if now < until {
+                    Some(until - now)
+                } else {
+                    // Lockout served; start the device fresh.
+                    *entry = OtpAttempt::default();
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Record a failed OTP attempt for `key` and return the resulting state.
+    pub fn record_failure(&self, key: &str) -> OtpOutcome {
+        let mut map = self.attempts.lock().unwrap();
+        let entry = map.entry(key.to_string()).or_default();
+
+        // If a previous lockout has elapsed, reset before counting again.
+        if let Some(until) = entry.locked_until {
+            if Instant::now() >= until {
+                *entry = OtpAttempt::default();
+            }
+        }
+
+        entry.failures += 1;
+        if entry.failures >= MAX_OTP_ATTEMPTS {
+            entry.locked_until = Some(Instant::now() + OTP_LOCKOUT);
+            OtpOutcome::LockedOut { retry_after: OTP_LOCKOUT }
+        } else {
+            OtpOutcome::Rejected {
+                remaining: MAX_OTP_ATTEMPTS - entry.failures,
+            }
+        }
+    }
+
+    /// Clear all tracked failures for `key` after a successful authentication.
+    pub fn record_success(&self, key: &str) {
+        self.attempts.lock().unwrap().remove(key);
     }
 }
 
