@@ -95,6 +95,19 @@
     outline-offset: 2px;
   }
 
+  /*
+   * Tailwind's preflight sets `-webkit-appearance: button`, which makes macOS
+   * WKWebView paint native gray button chrome on any <button> that lacks an
+   * explicit background (e.g. ghost/icon buttons). Chromium ignores it, so this
+   * only shows on macOS. Force it off so backgrounds come solely from our
+   * utility classes on both platforms.
+   */
+  button {
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
   #mainQRCodeOuter {
     -ms-overflow-style: none;
     scrollbar-width: none;

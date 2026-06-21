@@ -68,6 +68,43 @@ rand = "0.9.1"
 thiserror = "2.0.3"
 wmi = "0.17.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS capture/encode backend
+arc-swap = "1"
+crossbeam-channel = "0.5"
+
+# Apple framework bindings
+objc2 = "0.6"
+libc = "0.2"
+block2 = "0.6"
+dispatch2 = "0.3"
+mach2 = "0.4"
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase", "CFCGTypes", "CFDictionary", "CFString", "CFNumber", "CFArray",
+] }
+objc2-io-surface = { version = "0.3", features = [
+    "IOSurface", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGDisplayStream", "CGDirectDisplay", "CGDisplayConfiguration", "CGError",
+    "block2", "dispatch2", "objc2-io-surface",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBase", "CVReturn", "CVBuffer", "CVImageBuffer", "CVPixelBuffer",
+    "CVPixelBufferIOSurface", "objc2-io-surface",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase", "CMTime", "CMSampleBuffer", "CMFormatDescription", "CMBlockBuffer",
+] }
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties",
+    "objc2-core-media", "objc2-core-video",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSProcessInfo", "NSString", "NSObjCRuntime", "NSArray",
+] }
+objc2-core-wlan = "0.3"
+
 [target.'cfg(windows)'.dependencies]
 windows-capture = "2"
 winreg = "0.52.0"
@@ -107,3 +144,6 @@ features = [
     "Win32_System_Threading",
     "Win32_Media",
 ]
+
+[profile.dev.package.objc2]
+debug-assertions = false

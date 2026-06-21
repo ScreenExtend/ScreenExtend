@@ -1,0 +1,7 @@
+dyld: lazy symbol binding failed: Symbol not found: _CGPreflightScreenCaptureAccess
+  Referenced from: /Users/sarvesh/Desktop/ScreenExtend/src-tauri/target/debug/screenextend
+  Expected in: /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+
+dyld: Symbol not found: _CGPreflightScreenCaptureAccess
+  Referenced from: /Users/sarvesh/Desktop/ScreenExtend/src-tauri/target/debug/screenextend
+  Expected in: /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics

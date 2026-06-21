@@ -12,7 +12,7 @@ export function Sidebar() {
   const location = useLocation();
 
   return (
-    <div className="absolute bg-white dark:bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0" id="innerSidebar">
+    <div className="absolute bg-background z-10 border-r lg:border-r-0 lg:relative h-screen lg:block transition-all duration-500 max-w-full left-0" id="innerSidebar">
       <div className="space-y-4 h-full flex flex-col w-full border-r">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
@@ -31,7 +31,7 @@ export function Sidebar() {
                 variant={
                   !["/settings", "/devices", "/"].includes(location.pathname) ? "secondary" : "ghost"
                 }
-                className="w-full justify-start text-base py-6"
+                className="w-full justify-start text-base pt-3 pb-9"
               >
                 <UserRoundPlus size={15} className="mr-2 h-6 w-6" />
                 Add Device
@@ -42,7 +42,7 @@ export function Sidebar() {
                 variant={
                   location.pathname === "/devices" ? "secondary" : "ghost"
                 }
-                className="w-full justify-start text-base py-6"
+                className="w-full justify-start text-base pt-3 pb-9"
               >
                 <MonitorSmartphone size={15} className="mr-2 h-6 w-6" />
                 Edit Device
@@ -53,7 +53,7 @@ export function Sidebar() {
                 variant={
                   location.pathname === "/settings" ? "secondary" : "ghost"
                 }
-                className="w-full justify-start text-base py-6"
+                className="w-full justify-start text-base pt-3 pb-9"
               >
                 <Settings size={15} className="mr-2 h-6 w-6" />
                 Settings

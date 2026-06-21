@@ -40,7 +40,12 @@ import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
-import { cn } from "@/lib/utils";
+import { cn, generatePassword } from "@/lib/utils";
+import { type as getOsType } from "@tauri-apps/plugin-os";
+
+// macOS Host-AP (WEP) requires a password of at least 10 characters; other
+// platforms accept 8.
+const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 
 export default function Settings() {
   const { currentUser } = useContext(AuthProviderContext);
@@ -50,7 +55,7 @@ export default function Settings() {
   const [spin, setSpin] = useState(false);
   const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState("ScreenExtend");
-  const [hostedNetworkPassword, setHostedNetworkPassword] = useState("12345678");
+  const [hostedNetworkPassword, setHostedNetworkPassword] = useState(() => generatePassword(12));
   const [oldHostedNetworkName, setOldHostedNetworkName] = useState(hostedNetworkName);
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState(hostedNetworkPassword);
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
@@ -276,12 +281,12 @@ export default function Settings() {
                     placeholder="Network Password"
                     className={cn(
                       "outline-none",
-                      hostedNetworkPassword.length < 8 && "border-red-500 focus:ring-red-500"
+                      hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH && "border-red-500 focus:ring-red-500"
                     )}
                     value={hostedNetworkPassword}
                     disabled={(!hostedNetworkOn || inputDisabled)}
                     onChange={event => setHostedNetworkPassword(event.target.value)}
-                    minLength={8}
+                    minLength={MIN_HOSTED_NETWORK_PASSWORD_LENGTH}
                     maxLength={63}
                     hoverLabel={true}
                   />
@@ -305,9 +310,9 @@ export default function Settings() {
                       />
                     )}
                   </div>
-                  <p className="text-red-500 text-xs mt-1" style={{ position: "absolute", display: (hostedNetworkPassword.length < 8 ? "initial": "none") }}>A password must have at least 8 characters</p>
+                  <p className="text-red-500 text-xs mt-1" style={{ position: "absolute", display: (hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH ? "initial": "none") }}>A password must have at least {MIN_HOSTED_NETWORK_PASSWORD_LENGTH} characters</p>
                 </div>
-                <Button disabled={(!hostedNetworkOn || inputDisabled) || hostedNetworkPassword.length < 8} onClick={async () => {
+                <Button disabled={(!hostedNetworkOn || inputDisabled) || hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH} onClick={async () => {
                     if (hostedNetworkName !== oldHostedNetworkName || hostedNetworkPassword !== oldHostedNetworkPassword) {
                       if (!(await getUser(currentUser))!.dontShowAgain.editNetwork) {
                         setDisabled(false);

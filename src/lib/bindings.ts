@@ -81,6 +81,7 @@ deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
+hostedNetworkNoPassword: HostedNetworkNoPassword,
 logLine: LogLine,
 networkChange: NetworkChange
 }>({
@@ -90,6 +91,7 @@ deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
+hostedNetworkNoPassword: "hosted-network-no-password",
 logLine: "log-line",
 networkChange: "network-change"
 })
@@ -107,6 +109,12 @@ export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
+/**
+ * Emitted when a hosted network had to be created without the requested
+ * password (e.g. the secured macOS Host-AP path failed and we fell back to an
+ * open network). The frontend surfaces this as a warning notification.
+ */
+export type HostedNetworkNoPassword = null
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }

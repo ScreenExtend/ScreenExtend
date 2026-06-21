@@ -1,11 +1,11 @@
 import { useEffect, useState, useContext, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Copy, Check } from "lucide-react";
-import { Modal } from "flowbite-react";
 import QRCode from "react-qr-code";
 import {
   Carousel,
@@ -15,12 +15,10 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { commands, events } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
-const appWindow = getCurrentWebviewWindow();
 
 type CloudStatus = { state: string; detail: string };
 
@@ -35,9 +33,10 @@ function CloudBadge({ status }: { status: CloudStatus }) {
   return (
     <span
       title={status.detail || undefined}
-      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${className}`}
+      className={`inline-flex items-center gap-1 rounded-full border ml-2 px-2 py-0.5 text-xs font-medium ${className}`}
     >
       <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
+      <span className="pr-1" />
       {label}
     </span>
   );
@@ -145,7 +144,12 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
   };
 
   return (
-    <div className="p-1 mx-auto">
+    // Definite width (w-96, capped by max-w-full on narrow viewports) so the
+    // QR's `width: 100%` resolves against a fixed length. Without this the width
+    // is content-derived and the SVG's own intrinsic size (500px) leaks into the
+    // calculation, which WebKit resolves differently on an in-place re-render
+    // than on a fresh mount — making the QR grow until an HMR remount.
+    <div className="p-1 mx-auto w-96 min-w-72 max-w-full">
       <h2 className="text-2xl font-bold text-center mb-2 flex items-center justify-center gap-2">
         {name}
         {badge}
@@ -154,9 +158,17 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
         <QRCode
           size={500}
           style={{
-            height: "auto",
-            maxWidth: "100%",
+            display: "block",
+            // Pin the height to the width via aspect-ratio instead of
+            // height: "auto". The SVG carries explicit width/height attrs, and
+            // WebKit (macOS WKWebView) does not re-resolve its intrinsic aspect
+            // ratio on an in-place re-render (e.g. when the cloud status badge
+            // flips), so it would grow toward the attribute size until an HMR
+            // remount. A fixed aspect-ratio keeps it stable on every render.
             width: "100%",
+            maxWidth: "100%",
+            height: "auto",
+            aspectRatio: "1 / 1",
             borderRadius: "0.275rem",
             transition: "filter 0.2s",
             filter: blurred ? "blur(10px)" : undefined
@@ -207,31 +219,13 @@ function QrModalComponent({ value }: { value: string }) {
   const [openModal, setOpenModal] = useState(false);
 
   useEffect(() => {
-    if (openModal) {
-      setTimeout(() => {
-        const modalInnerBody = document.getElementsByClassName("max-w-2xl")[0];
-        modalInnerBody.removeAttribute("class");
-      }, 0);
-    }
-  }, [openModal]);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    const listenToWindowResize = async () => {
-      unlisten = await appWindow.onResized(({ payload: size }) => {
-        const qrCode = document.getElementById("mainQRCode");
-        if (qrCode) {
-          qrCode.style.height = (size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
-        }
-      });
-    }
-    void listenToWindowResize();
-    return () => {
-      if (unlisten) {
-        unlisten();
-      }
+    if (!openModal) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenModal(false);
     };
-  }, []);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openModal]);
 
   return (
     <>
@@ -241,27 +235,54 @@ function QrModalComponent({ value }: { value: string }) {
       >
         Expand QR{" "}
       </Button>
-      <Modal
-        dismissible
-        show={openModal}
-        onClose={() => setOpenModal(false)}
-        className="bg-black bg-opacity-75"
-      >
-        <Modal.Body id="mainQRCodeOuter">
-          <QRCode
-            size={256}
+      {openModal && createPortal(
+        // Inline styles (not Tailwind classes) for the critical layout props so
+        // positioning can't be defeated by class generation or specificity, and
+        // the portal escapes any transformed/filtered ancestor that would make
+        // `position: fixed` resolve to an element box instead of the viewport.
+        <div
+          id="mainQRCodeOuter"
+          onClick={() => setOpenModal(false)}
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: "rgba(0, 0, 0, 0.75)",
+          }}
+        >
+          {/*
+            Square sized to the smaller viewport side (90vmin) so it stays as
+            large as possible with a slight margin, on any window shape. `vmin`
+            tracks resizes with no JS. The white background + padding form the
+            QR's quiet-zone border against the dark backdrop.
+          */}
+          <div
+            onClick={(event) => event.stopPropagation()}
             style={{
-              height: window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2,
-              maxWidth: "100%",
-              width: "100%",
-              borderRadius: "0.275rem"
+              width: "90vmin",
+              height: "90vmin",
+              padding: "min(2.5vmin, 1rem)",
+              boxSizing: "border-box",
+              backgroundColor: "#ffffff",
+              borderRadius: "1rem",
             }}
-            value={value}
-            viewBox="0 0 256 256"
-            id="mainQRCode"
-          />
-        </Modal.Body>
-      </Modal>
+          >
+            <QRCode
+              id="mainQRCode"
+              value={value}
+              viewBox="0 0 256 256"
+              style={{ width: "100%", height: "100%", display: "block" }}
+            />
+          </div>
+        </div>,
+        document.body
+      )}
     </>
     );
 }

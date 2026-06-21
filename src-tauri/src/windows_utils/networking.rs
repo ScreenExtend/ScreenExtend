@@ -45,6 +45,27 @@ pub struct NetworkInfo {
     pub ip_addresses: Vec<String>,
 }
 
+fn hosted_network_name(app: &AppHandle, state: &State<'_, AppState>) -> String {
+    let current_user = state.current_user.lock().unwrap().clone();
+
+    let stored_name = app.store("config.json").ok().and_then(|config| {
+        let user_data = config.get(&current_user)?;
+        let name = user_data
+            .get("hostedNetworkCredentials")?
+            .get("name")?
+            .as_str()?;
+        Some(name.to_string())
+    });
+
+    stored_name.unwrap_or_else(|| {
+        if current_user.is_empty() {
+            "ScreenExtend".to_string()
+        } else {
+            format!("ScreenExtend-{current_user}")
+        }
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<NetworkInfo> {
@@ -60,25 +81,21 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         Err(_) => return Vec::new(),
     };
 
-    let ip_query = "SELECT * FROM MSFT_NetIPAddress";
-    let ip_addresses: Vec<NetIPAddress> = match wmi_con.raw_query(ip_query) {
+    let ip_addresses: Vec<NetIPAddress> = match wmi_con.raw_query("SELECT * FROM MSFT_NetIPAddress") {
         Ok(query) => query,
         Err(_) => return Vec::new(),
     };
 
-    let profile_query = "SELECT * FROM MSFT_NetConnectionProfile";
-    let connection_profiles: Vec<NetConnectionProfile> = match wmi_con.raw_query(profile_query) {
-        Ok(query) => query,
-        Err(_) => return Vec::new(),
-    };
+    let connection_profiles: Vec<NetConnectionProfile> =
+        match wmi_con.raw_query("SELECT * FROM MSFT_NetConnectionProfile") {
+            Ok(query) => query,
+            Err(_) => return Vec::new(),
+        };
 
     let mut ip_map: HashMap<u32, Vec<&NetIPAddress>> = HashMap::new();
     for ip in &ip_addresses {
         if let Some(interface_index) = ip.interface_index {
-            ip_map
-                .entry(interface_index)
-                .or_insert_with(Vec::new)
-                .push(ip);
+            ip_map.entry(interface_index).or_default().push(ip);
         }
     }
 
@@ -89,80 +106,41 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         }
     }
 
-    let network_infos: Vec<NetworkInfo> = adapters
+    adapters
         .iter()
         .filter_map(|adapter| {
-            if let Some(interface_index) = adapter.interface_index {
-                let network_name = if adapter.driver_description.as_deref() == Some("Microsoft Wi-Fi Direct Virtual Adapter") {
-                    if is_hosted_network(app.clone(), state.clone()) {
-                        let temporary_name = match app.store("config.json") {
-                            Ok(config) => {
-                                if let Some(user_data) =
-                                    config.get(state.current_user.lock().unwrap().clone())
-                                {
-                                    if let Some(credentials) =
-                                        user_data.get("hostedNetworkCredentials")
-                                    {
-                                        if let Some(name) = credentials.get("name") {
-                                            name.as_str().unwrap_or("Unknown").to_string()
-                                        } else {
-                                            "Unknown".to_string()
-                                        }
-                                    } else {
-                                        "Unknown".to_string()
-                                    }
-                                } else {
-                                    "Unknown".to_string()
-                                }
-                            }
-                            Err(_) => "Unknown".to_string(),
-                        };
-                        if temporary_name == "Unknown" {
-                            if state.current_user.lock().unwrap().len() > 0 {
-                                "ScreenExtend".to_string() + &state.current_user.lock().unwrap()
-                            } else {
-                                "ScreenExtend".to_string()
-                            }
-                        } else {
-                            temporary_name
-                        }
-                    } else {
-                        "Personal Hotspot".to_string()
-                    }
-                } else {
-                    if let Some(profile) = profile_map.get(&interface_index) {
-                        profile.name.as_deref().unwrap_or("Unknown").to_string()
-                    } else {
-                        adapter.name.as_deref().unwrap_or("Unknown").to_string()
-                    }
-                };
-                let ip_addresses = if let Some(ips) = ip_map.get(&interface_index) {
-                    let ipv4_addresses: Vec<String> = ips
-                        .iter()
-                        .filter(|ip| ip.address_family == Some(2))
-                        .filter_map(|ip| ip.ip_address.clone())
-                        .collect();
-                    let ipv6_addresses: Vec<String> = ips
-                        .iter()
-                        .filter(|ip| ip.address_family == Some(23))
-                        .filter_map(|ip| ip.ip_address.clone())
-                        .collect();
-                    [ipv4_addresses, ipv6_addresses].concat()
-                } else {
-                    Vec::new()
-                };
-                Some(NetworkInfo {
-                    network_name,
-                    interface_index,
-                    ip_addresses,
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+            let interface_index = adapter.interface_index?;
 
-    network_infos
+            let is_wifi_direct = adapter.driver_description.as_deref()
+                == Some("Microsoft Wi-Fi Direct Virtual Adapter");
+            let network_name = if is_wifi_direct {
+                if is_hosted_network(app.clone(), state.clone()) {
+                    hosted_network_name(&app, &state)
+                } else {
+                    "Personal Hotspot".to_string()
+                }
+            } else if let Some(profile) = profile_map.get(&interface_index) {
+                profile.name.as_deref().unwrap_or("Unknown").to_string()
+            } else {
+                adapter.name.as_deref().unwrap_or("Unknown").to_string()
+            };
+
+            let ip_addresses = ip_map.get(&interface_index).map_or_else(Vec::new, |ips| {
+                let by_family = |family: u16| {
+                    ips.iter()
+                        .filter(move |ip| ip.address_family == Some(family))
+                        .filter_map(|ip| ip.ip_address.clone())
+                };
+                by_family(2).chain(by_family(23)).collect()
+            });
+
+            Some(NetworkInfo {
+                network_name,
+                interface_index,
+                ip_addresses,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]

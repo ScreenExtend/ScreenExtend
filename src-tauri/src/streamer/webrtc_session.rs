@@ -25,7 +25,12 @@ use super::bitrate::{BitrateController, DEFAULT_MIN_BITRATE_BPS, estimate_from_l
 use super::config::H264Profile;
 use super::pipeline::Pipeline;
 
-const BWE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+// Sense the link twice a second so a congestion-driven bitrate cut lands before a
+// full second of frames has queued (queue buildup is directly perceived latency,
+// and a deep enough queue makes the WebCodecs receiver drop to a keyframe). The
+// `BitrateController` still damps emissions (10% change threshold, 500ms min
+// interval), so faster polling reacts sooner without thrashing the encoder.
+const BWE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn h264_fmtp(profile_level_id: &str) -> String {
     format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}")

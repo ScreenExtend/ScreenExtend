@@ -34,27 +34,28 @@ export function ThemeProvider({
   void updateUser(currentUser, { theme });
 
   useEffect(() => {
-    const fetchTheme = async () => {
-      const root = window.document.documentElement;
-
+    const root = window.document.documentElement;
+    // Resolve "system" via matchMedia so it matches the pre-paint inline script
+    // in index.html exactly. Applying the class idempotently avoids a
+    // remove/re-add churn that macOS WKWebView fails to re-style for `dark:`
+    // descendant selectors.
+    const resolved =
+      theme === "system"
+        ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+        : theme;
+    if (!root.classList.contains(resolved)) {
       root.classList.remove("light", "dark");
-
-      if (theme === "system") {
-        const systemTheme = await appWindow.theme() || "light";
-        root.classList.add(systemTheme);
-        return;
-      }
-
-      root.classList.add(theme);
+      root.classList.add(resolved);
     }
-    void fetchTheme();
   }, [theme]);
 
   void appWindow.onThemeChanged(async ({ payload: newTheme }) => {
     if ((await getUser(currentUser))!.theme === "system") {
       const root = window.document.documentElement;
-      root.classList.remove("light", "dark");
-      root.classList.add(newTheme);
+      if (!root.classList.contains(newTheme)) {
+        root.classList.remove("light", "dark");
+        root.classList.add(newTheme);
+      }
       setTheme(newTheme);
       setTheme("system");
     }

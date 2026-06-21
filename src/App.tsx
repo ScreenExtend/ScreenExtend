@@ -17,6 +17,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
+import { useToast } from "@/components/ui/use-toast";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
 
@@ -42,6 +43,8 @@ function App() {
   const [devices, setDevices] = useState<Device[]>([]);
 
   const [closing, setClosing] = useState(false);
+
+  const { toast } = useToast();
 
   useEffect(() => {
     if (sessionId && otp) {
@@ -76,6 +79,13 @@ function App() {
       unlisteners.push(await events.deviceRemove.listen(event => {
         const device = event.payload as Device;
         setDevices(prev => prev.filter(d => d.ip !== device.ip));
+      }));
+      unlisteners.push(await events.hostedNetworkNoPassword.listen(() => {
+        toast({
+          variant: "destructive",
+          title: "Network Created Without Password",
+          description: "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it.",
+        });
       }));
     }
     void start_listener();

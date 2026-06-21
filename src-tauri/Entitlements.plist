@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Required so the app can reach the private CGVirtualDisplay mach service
+      on hardened-runtime / signed builds. Without this, CGVirtualDisplay
+      initWithDescriptor returns nil.
+    -->
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.CG.virtual-display</string>
+    </array>
+
+    <!--
+      The App Sandbox forbids private APIs, so it must stay disabled. This app
+      is distributed outside the Mac App Store.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>

@@ -1,5 +1,6 @@
 import React, { createContext } from "react";
 import { Store } from "@tauri-apps/plugin-store";
+import { generatePassword } from "@/lib/utils";
 
 export type AuthContextType = {
   currentUser: string,
@@ -57,7 +58,7 @@ export const AuthProviderContext = createContext<AuthContextType>({ currentUser:
 const UserDB = Store.load("config.json");
 
 export const createUser = async (information: Partial<User>) => {
-  return await (await UserDB).set(information.username!, { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend-" + (information.username !== "GUESTGUESTGUESTGUESTGUEST" ? information.username : "Guest"), password: "ScreenExtend" + Array.from({length: 5}, () => Math.floor(Math.random() * 10)).join("") + "!"}, ...information });
+  return await (await UserDB).set(information.username!, { ...defaultUser, hostedNetworkCredentials: {name: "ScreenExtend-" + (information.username !== "GUESTGUESTGUESTGUESTGUEST" ? information.username : "Guest"), password: generatePassword(12)}, ...information });
 };
 
 export const getUser = async (username: string) => {

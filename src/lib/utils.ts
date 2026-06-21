@@ -57,6 +57,24 @@ export async function buildQrValues(sessionId: string): Promise<{ title: string;
     .filter((entry): entry is { title: string; value: string } => entry !== null);
 }
 
+/**
+ * Generates a cryptographically-random alphanumeric password with confusable
+ * characters (0/O, 1/I/l, etc.) excluded so it can be read aloud or typed from
+ * a screen without ambiguity. Defaults to 12 characters, which satisfies the
+ * macOS Host-AP minimum length of 10.
+ */
+export function generatePassword(length = 12): string {
+    // Alphanumeric minus easily-confused glyphs: 0 O, 1 I L l, i o.
+    const charset = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    const values = new Uint32Array(length);
+    crypto.getRandomValues(values);
+    let result = "";
+    for (let i = 0; i < length; i++) {
+        result += charset[values[i] % charset.length];
+    }
+    return result;
+}
+
 export function generateSlug() {
     let result = "";
     const characters = "abcdefghijklmnopqrstuvwxyz";

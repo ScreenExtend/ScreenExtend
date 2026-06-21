@@ -50,6 +50,12 @@ pub struct DeviceRemoveAction(Device);
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct NetworkChange;
 
+/// Emitted when a hosted network had to be created without the requested
+/// password (e.g. the secured macOS Host-AP path failed and we fell back to an
+/// open network). The frontend surfaces this as a warning notification.
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct HostedNetworkNoPassword;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct CloudStatusChange {
     pub state: String,
@@ -126,7 +132,7 @@ impl Device {
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        windows_utils::remove_all_displays(&state.virtual_display);
+        remove_all_displays(&state.virtual_display);
     }
     app.exit(0);
 }
@@ -175,6 +181,7 @@ pub fn run() {
             DeviceRemove,
             DeviceRemoveAction,
             NetworkChange,
+            HostedNetworkNoPassword,
             CloudStatusChange,
             logbus::LogLine
         ]);

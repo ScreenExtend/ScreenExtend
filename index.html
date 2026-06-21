@@ -6,6 +6,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ScreenExtend</title>
     <script>
+      // Apply the theme class before first paint. macOS WKWebView does not
+      // re-evaluate Tailwind `dark:` (`.dark .dark\:*`) descendant selectors
+      // when the class is added later (the ThemeProvider sets it in an effect),
+      // so the class must already be present when styles are first computed.
+      // The provider reconciles this on mount without churning the class.
+      (function () {
+        try {
+          var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.classList.add(dark ? "dark" : "light");
+        } catch (e) {
+          document.documentElement.classList.add("light");
+        }
+      })();
+    </script>
+    <script>
       document.addEventListener("contextmenu", event => event.preventDefault());
       document.addEventListener("click", (event) => {
         if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {

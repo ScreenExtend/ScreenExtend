@@ -1,0 +1,9 @@
+join request: device="dsdssd", session=3ZLPMF5CUGQE, screen=1280x800, sdp_bytes=5891
+virtual display created (id=4128836, 1280x800@60)
+virtual display id=4128836 attached as 4128836
+could not force 4128836 to 1280x800: macOS set_display_mode not yet implemented
+join failed: starting capture for virtual display
+
+Caused by:
+    0: starting capture backend
+    1: capture stream creation failed

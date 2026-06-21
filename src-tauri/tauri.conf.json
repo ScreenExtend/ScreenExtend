@@ -37,7 +37,10 @@
     ],
     "externalBin": [
       "binaries/nefconc"
-    ]
+    ],
+    "macOS": {
+      "entitlements": "./Entitlements.plist"
+    }
   },
   "plugins": {
     "cli": {
