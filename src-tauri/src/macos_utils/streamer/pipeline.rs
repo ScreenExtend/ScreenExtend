@@ -39,7 +39,15 @@ pub struct EncodedFrame {
     pub capture: Instant,
 }
 
-const BROADCAST_CAPACITY: usize = 3;
+// 2 (was 3): tokio rounds up to a power of two, so 3 was really a 4-slot channel
+// — up to 3 encoded frames could sit buffered behind a stalled writer (= tail
+// latency). 2 caps the in-transport backlog at one frame while still tolerating
+// the normal one-frame producer/consumer overlap. NOT 1: at capacity 1 an
+// ordinary single-frame overlap overwrites the unread slot → RecvError::Lagged →
+// the writer's lag handler requests an IDR every time → an IDR storm that
+// saturates the weak Intel encoder. The Lagged→IDR resync then fires only on a
+// genuine ≥2-frame stall, which is the intended drop-don't-buffer trip point.
+const BROADCAST_CAPACITY: usize = 2;
 
 /// Handle on a running encode pipeline. Field-for-field compatible with the
 /// Windows `Pipeline` (the fields `webrtc_session` reads: `tx`,
@@ -258,16 +266,23 @@ fn run_encode_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        // Park until a frame is published or the idle tick elapses.
+        source.wait(idle);
+        let force_idr = idr_request.swap(false, Ordering::Relaxed);
+        // Apply a pending BWE bitrate AFTER the park, not before it. A bitrate
+        // update fires the same wake channel `source.wait` blocks on, so reading
+        // it here lets the cut take effect on the frame we're about to submit
+        // this iteration — one capture-frame sooner than reading it at the top of
+        // the next loop. The atomic holds the latest value until swapped, so this
+        // loses no update. set_bitrate pushes nothing into the capture FIFO, so
+        // the 1:1 submit/pop pairing is untouched.
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 {
             if let Err(e) = encoder.set_bitrate(pending) {
                 teprintln!("set_bitrate failed (target_bps={pending}): {e:?}");
             }
         }
-
-        // Park until a frame is published or the idle tick elapses.
-        source.wait(idle);
-        let force_idr = idr_request.swap(false, Ordering::Relaxed);
 
         if let Some(frame) = source.try_take_latest() {
             if let Some(pixbuf) = frame.pixel_buffer() {

@@ -100,6 +100,48 @@ fn estimate_holds_in_neutral_band() {
 }
 
 #[test]
+fn cut_emits_when_symmetric_threshold_would_stall() {
+    // Regression: the production controller (new()) must emit a cut where a
+    // symmetric 10% gate stalls. With alpha=0.4, feeding a steady 0.85× target
+    // (15% raw cut), the EWMA-damped first step is ~6% — below 10%, so the old
+    // symmetric gate suppressed it AND, under sustained loss, the candidate
+    // asymptotes to exactly 10% below, which a strict `<` never admits. The 4%
+    // cut threshold must let it through.
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    let start = c.update(10_000_000, now).expect("first sample emits");
+    assert_eq!(start, 10_000_000);
+    // 15% raw cut, EWMA-damped to ~6% on the first step — would be blocked by a
+    // 10% threshold but must pass the 4% cut threshold.
+    let cut = c.update(8_500_000, now + Duration::from_millis(50));
+    assert!(cut.is_some(), "cut must emit under the asymmetric threshold");
+    assert!(cut.unwrap() < start, "emitted value must be a reduction: {cut:?}");
+}
+
+#[test]
+fn upward_probe_still_hysteretic_under_asymmetric_cut() {
+    // The asymmetric cut threshold must NOT loosen the UP direction: a small
+    // upward move is still suppressed by the 10% hysteresis even though the cut
+    // threshold is only 4%. Fresh controller so EWMA state is clean.
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    assert_eq!(c.update(10_000_000, now), Some(10_000_000));
+    // +3% raw up: EWMA candidate well under the 10% up-threshold → suppressed.
+    assert_eq!(c.update(10_300_000, now + Duration::from_secs(1)), None);
+}
+
+#[test]
+fn upward_probe_still_rate_limited_under_asymmetric_cut() {
+    // A large upward move within the min_interval is still rate-limited (only
+    // cuts bypass the wait). Fresh controller so last_change_at == the first emit.
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    assert_eq!(c.update(10_000_000, now), Some(10_000_000));
+    // Big jump up only 100ms later: above threshold but inside the 500ms window.
+    assert_eq!(c.update(40_000_000, now + Duration::from_millis(100)), None);
+}
+
+#[test]
 fn end_to_end_degrade_then_recover() {
     let mut c = BitrateController::with_params(MIN, MAX, 0.5, 0.05, Duration::ZERO);
     let now = t0();

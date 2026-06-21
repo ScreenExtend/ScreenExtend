@@ -21,7 +21,11 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 8;
+// 4 (was 8): drop to the freshest frame sooner, halving worst-case standing
+// decoder latency. NOT 2-3 — natural decodeQueueSize on a weak iGPU at 1080p
+// sits ~1-3 under load, so a lower threshold would fire nearly every frame and
+// the drop→forced-IDR→refill cycle would livelock the already-saturated encoder.
+const BACKLOG_DROP_THRESHOLD = 4;
 
 self.onmessage = (e) => {
   if (e.data && e.data.type === 'canvas') {
@@ -156,7 +160,10 @@ self.onrtctransform = (event) => {
           decoder.decodeQueueSize > BACKLOG_DROP_THRESHOLD && type !== 'key') {
         self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
         waitingForKey = true;
-        requestKey(true);
+        // Throttled (not forced): at the lower BACKLOG_DROP_THRESHOLD this can
+        // trip more often, so honor the 250ms min interval to avoid hammering
+        // the weak encoder with back-to-back IDRs (each a serialization spike).
+        requestKey(false);
         continue;
       }
 

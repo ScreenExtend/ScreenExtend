@@ -410,6 +410,15 @@
                     const iceServers = await getIceServers();
                     pc = new RTCPeerConnection({ iceServers });
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+                    // Ultra-low latency: tell the receiver to target zero extra playout
+                    // delay (Chromium-only; guarded no-op on Safari/WKWebView). On the
+                    // WebCodecs path this trims the jitter-buffer release hold; on the
+                    // <video> fallback it removes the compositor's smoothing hold. The
+                    // <video> fallback additionally sets jitterBufferTarget below, which
+                    // is the floor this hint cannot go under.
+                    try {
+                        if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
+                    } catch (_) {}
 
                     if (webcodecs) {
                         worker = new Worker('/transform-worker.js');
@@ -470,7 +479,12 @@
                         } else {
                             video.srcObject = e.streams[0];
                             try {
-                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 40;
+                                // 10ms (was 40ms): a thin jitter cushion for the wireless
+                                // link — low enough to shave ~30ms of standing latency,
+                                // not 0 (which trades the cushion for visible drops/stutter
+                                // under bursty loss). Watch framesDropped in the stats log;
+                                // bump up if drops climb on a congested network.
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 10;
                             } catch (_) {}
                             showVideo();
                             tryPlay();

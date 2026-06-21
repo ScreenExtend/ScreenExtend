@@ -118,6 +118,12 @@ pub struct Encoder {
     /// turns this into IDR-free loss recovery is driven from the transport (see
     /// the LTR note in the encode loop).
     ltr_enabled: bool,
+    /// True when the session runs in constant-QP / quality mode (`cfg.qp` set):
+    /// rate control is pinned to Quality + frame-QP, NOT AverageBitRate. Live
+    /// `set_bitrate` calls (driven by BWE) must be no-ops in this mode — otherwise
+    /// the first one silently flips the session into ABR, defeating the requested
+    /// constant-QP. Recorded here because the encoder keeps no other copy of cfg.
+    qp_mode: bool,
 }
 
 // The session + channel are safe to move across threads; the encode loop owns
@@ -208,6 +214,7 @@ impl Encoder {
             frame_index: 0,
             low_latency,
             ltr_enabled: false,
+            qp_mode: cfg.qp.is_some(),
         };
         enc.configure(&cfg)?;
         // Warm the encoder so the first real frame isn't slow.
@@ -429,8 +436,27 @@ impl Encoder {
     }
 
     /// Push a new target bitrate live (BWE → `AverageBitRate`, §15.3).
+    ///
+    /// Constant-QP sessions ignore this: their rate control is pinned to
+    /// Quality + frame-QP, and setting `AverageBitRate` would silently flip them
+    /// into ABR — so in `qp_mode` this is a no-op (and BWE leaves QP alone).
+    ///
+    /// In bitrate mode we re-tighten `DataRateLimits` alongside the average, to
+    /// the same 1.5×/1s cap `configure_rate_control` set initially. Without this
+    /// the spike cap stays frozen at the *initial* (high) bitrate: after a BWE
+    /// cut to a narrow link, a single IDR could still legally emit ~1.5× the
+    /// *original* rate, refilling the send queue and injecting exactly the
+    /// transmit-latency jitter the cap exists to prevent. Tracking the cap down
+    /// with the target keeps the burst ceiling proportional to the live link.
     pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
-        set_i32(self.vt_session(), unsafe { kVTCompressionPropertyKey_AverageBitRate }, bps as i32);
+        if self.qp_mode {
+            return Ok(());
+        }
+        let s = self.vt_session();
+        set_i32(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, bps as i32);
+        let cap_bytes = (((bps as f64) * 1.5) / 8.0) as i64;
+        let limits = data_rate_limits(cap_bytes, 1.0);
+        set_cftype(s, unsafe { kVTCompressionPropertyKey_DataRateLimits }, &limits);
         Ok(())
     }
 
