@@ -62,6 +62,11 @@ pub enum CaptureError {
     /// M1/M2 seam: the FFI path exists structurally but is not yet wired.
     #[error("{0} not yet implemented (M1/M2): see PRD {1}")]
     NotImplemented(&'static str, &'static str),
+    /// Both capture backends failed to start: ScreenCaptureKit (preferred) and the
+    /// CGDisplayStream fallback. Carries both messages so each cause stays visible
+    /// (mirrors the Windows WGC -> DXGI fallback's combined error).
+    #[error("ScreenCaptureKit failed ({sck}); CGDisplayStream fallback also failed: {cgds}")]
+    FallbackFailed { sck: String, cgds: String },
 }
 
 /// Both backends produce the same thing — frames published into a shared
@@ -168,21 +173,75 @@ pub fn ensure_screen_recording_access() -> bool {
     }
 }
 
-/// Pick the right backend for this OS and start it (PRD §3.3). SCK on 12.3+,
-/// CGDisplayStream on 10.15–12.2.
+/// Start desktop capture, preferring ScreenCaptureKit and falling back to
+/// CGDisplayStream (PRD §3.3).
+///
+/// This mirrors the Windows `WGC -> DXGI Desktop Duplication` fallback
+/// (`windows_utils::streamer::pipeline::start_on_monitor`): the preferred backend
+/// is attempted first, and **any startup failure** drops to the backup rather
+/// than failing the capture outright. ScreenCaptureKit is the modern
+/// direct-to-WindowServer path (macOS 12.3+); CGDisplayStream is the backup.
+///
+/// Below 12.3 SCK does not exist, so we skip straight to the fallback — no wasted
+/// attempt and no misleading failure log. When SCK is available but fails to
+/// start, its error is logged and preserved: if the CGDisplayStream fallback then
+/// also fails, both causes are reported via [`CaptureError::FallbackFailed`].
 pub fn start_capture(
     display: DisplayId,
     gpu: Arc<Gpu>,
     sink: Arc<FrameSink>,
     cfg: CaptureConfig,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
-    if screencapturekit_available() {
-        let mut b = sck::SckBackend::new(display, gpu, sink, cfg)?;
-        b.start()?;
-        Ok(Box::new(b))
+    // Try the preferred backend (SCK) first when the OS supports it.
+    let sck_err = if screencapturekit_available() {
+        match start_sck(display, gpu.clone(), sink.clone(), cfg) {
+            Ok(backend) => return Ok(backend),
+            Err(e) => {
+                teprintln!(
+                    "[capture] ScreenCaptureKit failed to start for display {display}: {e}; \
+                     falling back to CGDisplayStream"
+                );
+                Some(e)
+            }
+        }
     } else {
-        let mut b = cgds::CgDisplayStreamBackend::new(display, gpu, sink, cfg)?;
-        b.start()?;
-        Ok(Box::new(b))
+        None
+    };
+
+    // Backup path: CGDisplayStream. On its own failure, surface the SCK error too
+    // (when we actually tried SCK) so both causes are visible.
+    match start_cgds(display, gpu, sink, cfg) {
+        Ok(backend) => Ok(backend),
+        Err(cgds_err) => match sck_err {
+            Some(sck_err) => Err(CaptureError::FallbackFailed {
+                sck: sck_err.to_string(),
+                cgds: cgds_err.to_string(),
+            }),
+            None => Err(cgds_err),
+        },
     }
+}
+
+/// Build and start the ScreenCaptureKit backend (preferred path).
+fn start_sck(
+    display: DisplayId,
+    gpu: Arc<Gpu>,
+    sink: Arc<FrameSink>,
+    cfg: CaptureConfig,
+) -> Result<Box<dyn CaptureBackend>, CaptureError> {
+    let mut b = sck::SckBackend::new(display, gpu, sink, cfg)?;
+    b.start()?;
+    Ok(Box::new(b))
+}
+
+/// Build and start the CGDisplayStream backend (fallback path).
+fn start_cgds(
+    display: DisplayId,
+    gpu: Arc<Gpu>,
+    sink: Arc<FrameSink>,
+    cfg: CaptureConfig,
+) -> Result<Box<dyn CaptureBackend>, CaptureError> {
+    let mut b = cgds::CgDisplayStreamBackend::new(display, gpu, sink, cfg)?;
+    b.start()?;
+    Ok(Box::new(b))
 }
