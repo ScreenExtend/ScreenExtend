@@ -44,6 +44,23 @@ pub const MAX_REFRESH_RATE: u32 = 500;
 pub const MIN_DISPLAY_SCALE: u32 = 25;
 pub const MAX_DISPLAY_SCALE: u32 = 200;
 
+/// TEMP(no-virtual-display): when `true`, the streamer does NOT create a
+/// per-client virtual display. It streams the host's base (main) display
+/// instead and skips every virtual-display step (create / correlate / in-place
+/// reconfigure / remove). Everything else — auth, capture, encode, WHEP,
+/// disconnect handling — runs exactly as before.
+///
+/// This exists because the immediate target host is a Mac that supports
+/// ScreenCaptureKit but cannot create `CGVirtualDisplay`s. The macOS
+/// virtual-display backend is left intact and simply goes unused while this is
+/// on; flip the const back to `false` to restore the virtual-display path.
+///
+/// Gated to macOS only so other platforms keep their unchanged behavior.
+#[cfg(target_os = "macos")]
+const STREAM_BASE_DISPLAY_ONLY: bool = true;
+#[cfg(not(target_os = "macos"))]
+const STREAM_BASE_DISPLAY_ONLY: bool = false;
+
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
@@ -425,7 +442,25 @@ async fn start_session(
         .and_then(|s| session::get_live_display(s, client_ip));
     let existed_before = existing.is_some();
 
-    let (display_id, device_name) = match existing {
+    let (display_id, device_name) = if STREAM_BASE_DISPLAY_ONLY {
+        // TEMP(no-virtual-display): the target host cannot create CGVirtualDisplays
+        // (ScreenCaptureKit is available but the entitlement is not), so skip the
+        // create+correlate dance and stream the base (main) display directly. The
+        // capture/encode/WHEP/teardown path below is unchanged; only the
+        // virtual-display steps are bypassed. See STREAM_BASE_DISPLAY_ONLY.
+        let device_name = existing
+            .as_ref()
+            .map(|prev| prev.device_name.clone())
+            .or_else(|| pipeline::monitor_device_names().into_iter().next())
+            .context("no active display to stream as the base display")?;
+        let display_id = device_name.trim().parse().unwrap_or(0);
+        tprintln!(
+            "[base-display-only] streaming base display {device_name} \
+             (virtual display creation disabled)"
+        );
+        (display_id, device_name)
+    } else {
+    match existing {
         Some(prev) => {
             let display_changed = prev.display_params() != desired.display_params();
             if display_changed {
@@ -501,6 +536,7 @@ async fn start_session(
             apply_display_scale(&device_name, override_for_ip).await;
             (display_id, device_name)
         }
+    }
     };
 
     if let Some(s) = state.config.sessions.as_ref() {
