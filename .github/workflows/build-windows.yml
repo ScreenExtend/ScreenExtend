@@ -1,4 +1,4 @@
-name: 'build-windows'
+name: 'build'
 
 on:
   push:
@@ -7,16 +7,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build-tauri:
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: 'x86_64-pc-windows-msvc'
+          - platform: 'windows-latest'
+            target: 'x86_64-pc-windows-msvc'
+            args: '--target x86_64-pc-windows-msvc'
+          - platform: 'macos-latest' # Apple Silicon (M1 and above)
+            target: 'aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin --config src-tauri/tauri.macos.conf.json'
+          - platform: 'macos-latest' # Intel
+            target: 'x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json'
 
-    runs-on: windows-latest
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,10 +57,10 @@ jobs:
           releaseBody: 'See the assets to download this version and install.'
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
+          args: ${{ matrix.args }}
 
   finalize-release:
-    needs: build-windows
+    needs: build-tauri
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,7 +1,36 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ScreenExtend",
+  "mainBinaryName": "ScreenExtend",
+  "version": "0.2.0",
+  "identifier": "app.screenextend.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
   "bundle": {
-    "resources": [],
-    "externalBin": []
+    "active": true,
+    "targets": "all",
+    "publisher": "Sarvesh Madullapalli",
+    "copyright": "Copyright © 2026 Sarvesh Madullapalli All Rights Reserved",
+    "category": "Education",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "entitlements": "./Entitlements.plist"
+    }
   }
 }
