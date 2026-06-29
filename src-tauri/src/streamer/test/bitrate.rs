@@ -100,6 +100,33 @@ fn estimate_holds_in_neutral_band() {
 }
 
 #[test]
+fn cut_emits_when_symmetric_threshold_would_stall() {
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    let start = c.update(10_000_000, now).expect("first sample emits");
+    assert_eq!(start, 10_000_000);
+    let cut = c.update(8_500_000, now + Duration::from_millis(50));
+    assert!(cut.is_some(), "cut must emit under the asymmetric threshold");
+    assert!(cut.unwrap() < start, "emitted value must be a reduction: {cut:?}");
+}
+
+#[test]
+fn upward_probe_still_hysteretic_under_asymmetric_cut() {
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    assert_eq!(c.update(10_000_000, now), Some(10_000_000));
+    assert_eq!(c.update(10_300_000, now + Duration::from_secs(1)), None);
+}
+
+#[test]
+fn upward_probe_still_rate_limited_under_asymmetric_cut() {
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    assert_eq!(c.update(10_000_000, now), Some(10_000_000));
+    assert_eq!(c.update(40_000_000, now + Duration::from_millis(100)), None);
+}
+
+#[test]
 fn end_to_end_degrade_then_recover() {
     let mut c = BitrateController::with_params(MIN, MAX, 0.5, 0.05, Duration::ZERO);
     let now = t0();

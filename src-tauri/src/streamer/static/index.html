@@ -79,7 +79,11 @@
             const errEl = document.getElementById('errorMessage');
             const loadingEl = document.getElementById('loading');
 
-            const canWebCodecs = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && ('VideoDecoder' in window) && (typeof RTCRtpScriptTransform !== 'undefined') && (typeof canvas.transferControlToOffscreen === 'function');
+            const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
+            const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
+            const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
+
+            const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
 
             let pc = null;
             let worker = null;
@@ -166,12 +170,7 @@
             function kickDevice() {
                 if (kicked) return;
                 kicked = true;
-                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
-                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
-                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
-                if (worker) { worker.terminate(); worker = null; }
-                try { if (pc) pc.close(); } catch (_) {}
-                pc = null;
+                teardownSession();
                 isLive = false;
                 stopLock();
                 showError('You have been removed from this session.');
@@ -180,12 +179,7 @@
             function reconfigure() {
                 if (reconfiguring) return;
                 reconfiguring = true;
-                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
-                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
-                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
-                if (worker) { worker.terminate(); worker = null; }
-                try { if (pc) pc.close(); } catch (_) {}
-                pc = null;
+                teardownSession();
                 usingFallback = false;
                 start(true);
             }
@@ -391,25 +385,39 @@
                 }
             }
 
+            function teardownSession() {
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
+                if (worker) { worker.terminate(); worker = null; }
+                try { if (pc) pc.close(); } catch (_) {}
+                pc = null;
+            }
+
             function fallbackToVideo(reason) {
                 if (usingFallback) return;
                 usingFallback = true;
                 console.warn('falling back to <video>:', reason);
-                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
-                if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
-                if (worker) { worker.terminate(); worker = null; }
-                try { if (pc) pc.close(); } catch (_) {}
-                pc = null;
+                teardownSession();
                 start(false);
             }
 
             async function start(preferWebCodecs) {
+                teardownSession();
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const iceServers = await getIceServers();
-                    pc = new RTCPeerConnection({ iceServers });
+                    const pcConfig = { iceServers };
+                    if (webcodecs && !hasScriptTransform) {
+                        pcConfig.encodedInsertableStreams = true;
+                        pcConfig.forceEncodedVideoInsertableStreams = true;
+                    }
+                    pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+                    try {
+                        if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
+                    } catch (_) {}
 
                     if (webcodecs) {
                         worker = new Worker('/transform-worker.js');
@@ -433,7 +441,15 @@
                         };
                         const off = freshCanvas().transferControlToOffscreen();
                         worker.postMessage({ type: 'canvas', canvas: off }, [off]);
-                        videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                        if (hasScriptTransform) {
+                            videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                        } else {
+                            const { readable } = videoTransceiver.receiver.createEncodedStreams();
+                            worker.postMessage({ type: 'encodedstream', readable }, [readable]);
+                        }
+                        try {
+                            if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
+                        } catch (_) {}
                         showCanvas();
                     }
 
@@ -442,7 +458,7 @@
 
                         if (webcodecs) {
                             showCanvas();
-                            statsPoll = setInterval(() => {
+                            if (DEBUG) statsPoll = setInterval(() => {
                                 if (worker) worker.postMessage({ type: 'stats' });
                                 if (pc) pc.getStats().then((rep) => {
                                     let foundInbound = false, pair = null;
@@ -470,7 +486,7 @@
                         } else {
                             video.srcObject = e.streams[0];
                             try {
-                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 40;
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 10;
                             } catch (_) {}
                             showVideo();
                             tryPlay();
@@ -484,13 +500,17 @@
                         if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
                             onStreamLive();
                         } else if (s === 'failed') {
+                            teardownSession();
+                            usingFallback = false;
                             showError('Connection failed.');
                         }
                     };
                     pc.onconnectionstatechange = () => {
                         if (pc !== localPc || reconfiguring) return;
                         if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                            showError('Disconnected, reload the page to reconnect.');
+                            teardownSession();
+                            usingFallback = false;
+                            showError('Disconnected, reconnect to continue.');
                         }
                     };
 
@@ -691,6 +711,7 @@
                 showError('');
                 kicked = false;
                 leaveSent = false;
+                usingFallback = false;
                 reconfigEpoch = null;
                 kickEpoch = null;
                 connectBtn.disabled = true;

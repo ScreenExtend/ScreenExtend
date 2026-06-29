@@ -12,14 +12,13 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 
-import { AuthProviderContext, createUser, getUser } from "@/components/auth-provider";
+import { createConfig, getConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useTheme, type Theme } from "@/components/theme-provider";
 
 export default function Bootstrap() {
-  const { setCurrentUser } = useContext(AuthProviderContext);
   const { theme, setTheme } = useTheme();
   const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
 
@@ -49,15 +48,16 @@ export default function Bootstrap() {
         void commands.registerCloudSession(newSessionId);
       });
       setHostedNetworkOn(false);
-      const username = await commands.getUsername();
-      const existing = await getUser(username);
+      const existing = await getConfig();
       if (!existing) {
-        await createUser({ username, name: username, password: "", theme });
+        await createConfig({ name: await commands.getUsername(), theme });
       } else {
         setTheme(existing.theme as Theme);
       }
-      setCurrentUser(username);
-      await commands.setCurrentUser(username);
+      const turn = (await getConfig())?.turnConfig;
+      if (turn?.urls) {
+        await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");
+      }
       document.getElementById("dashlink")!.click();
     } else {
       if (tryInstall) {

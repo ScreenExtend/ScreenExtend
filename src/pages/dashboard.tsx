@@ -1,11 +1,11 @@
 import { useEffect, useState, useContext, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Copy, Check } from "lucide-react";
-import { Modal } from "flowbite-react";
 import QRCode from "react-qr-code";
 import {
   Carousel,
@@ -15,12 +15,10 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { commands, events } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
-const appWindow = getCurrentWebviewWindow();
 
 type CloudStatus = { state: string; detail: string };
 
@@ -35,9 +33,10 @@ function CloudBadge({ status }: { status: CloudStatus }) {
   return (
     <span
       title={status.detail || undefined}
-      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${className}`}
+      className={`inline-flex items-center rounded-full border ml-2 px-2 py-0.5 text-xs font-medium ${className}`}
     >
       <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
+      <span className="pr-1" />
       {label}
     </span>
   );
@@ -46,6 +45,7 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 export default function Dashboard() {
   const { windowQrValues: [qrValues], windowSessionId: [sessionId] } = useContext(GlobalProviderContext);
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
+  const [statusLoaded, setStatusLoaded] = useState(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -55,11 +55,13 @@ export default function Dashboard() {
       unlisten = await events.cloudStatusChange.listen((event) => {
         gotLiveEvent = true;
         setCloudStatus(event.payload as CloudStatus);
+        setStatusLoaded(true);
       });
       try {
         const current = await commands.getCloudStatus();
         if (!cancelled && !gotLiveEvent) setCloudStatus(current as CloudStatus);
       } catch {}
+      if (!cancelled) setStatusLoaded(true);
     })();
     return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
@@ -72,18 +74,20 @@ export default function Dashboard() {
     : cloudStatus.state === "error" ? "Unavailable"
     : "Offline";
 
+  if (!statusLoaded) return <Layout><></></Layout>;
+
   return (
     <Layout>
       <div className="p-8">
         <h2 className="flex justify-center text-4xl font-semibold">What network is your device connected to?</h2>
       </div>
       <div className="w-full overflow-hidden box-border mb-10">
-        <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center gap-8">
+        <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center">
           {cloudUrl && (
             <QrDisplay name="Anywhere (Internet)" url={cloudUrl} badge={<CloudBadge status={cloudStatus} />} blurred={!cloudReady} blurredLabel={cloudBlurredLabel} />
           )}
           {lanValues.length ? (
-            lanValues.map((qrValue) => (
+            lanValues.map(qrValue => (
               <QrDisplay
                 name={qrValue.title}
                 url={qrValue.value}
@@ -145,8 +149,8 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
   };
 
   return (
-    <div className="p-1 mx-auto">
-      <h2 className="text-2xl font-bold text-center mb-2 flex items-center justify-center gap-2">
+    <div className="p-1 mx-auto w-96 min-w-72 max-w-full">
+      <h2 className="text-2xl font-bold text-center mb-2 flex items-center justify-center">
         {name}
         {badge}
       </h2>
@@ -154,9 +158,11 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
         <QRCode
           size={500}
           style={{
-            height: "auto",
-            maxWidth: "100%",
+            display: "block",
             width: "100%",
+            maxWidth: "100%",
+            height: "auto",
+            aspectRatio: "1 / 1",
             borderRadius: "0.275rem",
             transition: "filter 0.2s",
             filter: blurred ? "blur(10px)" : undefined
@@ -165,7 +171,7 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
           viewBox="0 0 256 256"
         />
         {blurred && (
-          <div className="absolute inset-0 flex items-center justify-center z-10">
+          <div className="absolute top-0 right-0 bottom-0 left-0 flex items-center justify-center z-10">
             <span className="rounded-md bg-black/60 px-3 py-1.5 text-sm font-medium text-white">
               {blurredLabel ?? "Unavailable"}
             </span>
@@ -207,31 +213,13 @@ function QrModalComponent({ value }: { value: string }) {
   const [openModal, setOpenModal] = useState(false);
 
   useEffect(() => {
-    if (openModal) {
-      setTimeout(() => {
-        const modalInnerBody = document.getElementsByClassName("max-w-2xl")[0];
-        modalInnerBody.removeAttribute("class");
-      }, 0);
-    }
-  }, [openModal]);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    const listenToWindowResize = async () => {
-      unlisten = await appWindow.onResized(({ payload: size }) => {
-        const qrCode = document.getElementById("mainQRCode");
-        if (qrCode) {
-          qrCode.style.height = (size.height*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2) + "px";
-        }
-      });
-    }
-    void listenToWindowResize();
-    return () => {
-      if (unlisten) {
-        unlisten();
-      }
+    if (!openModal) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenModal(false);
     };
-  }, []);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openModal]);
 
   return (
     <>
@@ -241,27 +229,44 @@ function QrModalComponent({ value }: { value: string }) {
       >
         Expand QR{" "}
       </Button>
-      <Modal
-        dismissible
-        show={openModal}
-        onClose={() => setOpenModal(false)}
-        className="bg-black bg-opacity-75"
-      >
-        <Modal.Body id="mainQRCodeOuter">
-          <QRCode
-            size={256}
+      {openModal && createPortal(
+        <div
+          id="mainQRCodeOuter"
+          onClick={() => setOpenModal(false)}
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            backgroundColor: "rgba(0, 0, 0, 0.75)",
+          }}
+        >
+          <div
+            onClick={(event) => event.stopPropagation()}
             style={{
-              height: window.innerHeight*0.9 - parseFloat(getComputedStyle(document.documentElement).fontSize)*1.5*2,
-              maxWidth: "100%",
-              width: "100%",
-              borderRadius: "0.275rem"
+              width: "90vmin",
+              height: "90vmin",
+              padding: "min(2.5vmin, 1rem)",
+              boxSizing: "border-box",
+              backgroundColor: "#ffffff",
+              borderRadius: "1rem",
             }}
-            value={value}
-            viewBox="0 0 256 256"
-            id="mainQRCode"
-          />
-        </Modal.Body>
-      </Modal>
+          >
+            <QRCode
+              id="mainQRCode"
+              value={value}
+              viewBox="0 0 256 256"
+              style={{ width: "100%", height: "100%", display: "block" }}
+            />
+          </div>
+        </div>,
+        document.body
+      )}
     </>
     );
 }

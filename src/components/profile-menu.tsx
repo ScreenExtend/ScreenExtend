@@ -24,33 +24,40 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { AuthProviderContext, updateUser, getUser } from "@/components/auth-provider";
+import { updateConfig, getConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands } from "@/lib/bindings";
 import defaultLogo from "@/assets/default.svg";
 
 export function ProfileMenu() {
-  const { currentUser } = useContext(AuthProviderContext);
-  const { windowClosing: [, setClosing] } = useContext(GlobalProviderContext);
+  const { windowClosing: [closing, setClosing] } = useContext(GlobalProviderContext);
   const [disabled, setDisabled] = useState(false);
+  const [background, setBackground] = useState(false);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
 
   useEffect(() => {
     void (async () => {
-      const user = await getUser(currentUser);
-      if (user) setName(user.name);
+      const config = await getConfig();
+      if (config) setName(config.name);
     })();
-  }, [currentUser]);
+  }, []);
 
   return (
-    <DropdownMenu>
+    <DropdownMenu onOpenChange={setBackground}>
+      <div
+        aria-hidden="true"
+        className={`fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center transition-opacity duration-200 ease-out ${
+          background && !closing ? "opacity-100" : "pointer-events-none opacity-0"
+        }`}
+        style={{ zIndex: 9999 }}
+      />
       <DropdownMenuTrigger asChild>
         <AvatarWrapper className="cursor-pointer">
           <ReactSVG src={defaultLogo} />
         </AvatarWrapper>
       </DropdownMenuTrigger>
-      <DropdownMenuContent className="w-56">
+      <DropdownMenuContent className="w-56 z-[99999] mr-4">
         <DropdownMenuLabel>{name || "My Account"}</DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
@@ -68,9 +75,7 @@ export function ProfileMenu() {
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={async () => {
-              if (currentUser.length !== 0) {
-                await updateUser(currentUser, {dontShowAgain: {editDevice: false, editNetwork: false}});
-              }
+              await updateConfig({dontShowAgain: {editDevice: false, editNetwork: false}});
             }}
           >
             <RotateCcw className="mr-2 h-4 w-4" />

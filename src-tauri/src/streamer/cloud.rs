@@ -217,6 +217,7 @@ impl CloudClient {
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
+                    .on_thread_start(super::platform::tune_transport_thread)
                     .build()
                 {
                     Ok(rt) => rt,
@@ -435,11 +436,12 @@ async fn dispatch(
 
     let (status, content_type, out_body): (u16, &'static str, String) = match (method, path) {
         ("POST", "/whep") => {
-            let ice: Vec<RTCIceServer> = if ice_servers.is_empty() {
+            let base: Vec<RTCIceServer> = if ice_servers.is_empty() {
                 state.fallback_ice_servers()
             } else {
                 ice_servers.into_iter().map(IceServerWire::into_rtc).collect()
             };
+            let ice = state.ice_with_turn(base);
             let r = server::process_whep(state, client_id, body.as_bytes(), ice).await;
             (r.status, r.content_type, r.body)
         }

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 
-import { AuthProviderContext, getUser, updateUser } from "@/components/auth-provider";
+import { getConfig, updateConfig } from "@/components/config-provider";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 const appWindow = getCurrentWebviewWindow();
 
@@ -28,33 +28,27 @@ export function ThemeProvider({
   defaultTheme = "system",
   ...props
 }: ThemeProviderProps) {
-  const { currentUser } = useContext(AuthProviderContext);
-
   const [theme, setTheme] = useState<Theme>(defaultTheme);
-  void updateUser(currentUser, { theme });
 
   useEffect(() => {
-    const fetchTheme = async () => {
-      const root = window.document.documentElement;
-
+    const root = window.document.documentElement;
+    const resolved =
+      theme === "system"
+        ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+        : theme;
+    if (!root.classList.contains(resolved)) {
       root.classList.remove("light", "dark");
-
-      if (theme === "system") {
-        const systemTheme = await appWindow.theme() || "light";
-        root.classList.add(systemTheme);
-        return;
-      }
-
-      root.classList.add(theme);
+      root.classList.add(resolved);
     }
-    void fetchTheme();
   }, [theme]);
 
   void appWindow.onThemeChanged(async ({ payload: newTheme }) => {
-    if ((await getUser(currentUser))!.theme === "system") {
+    if ((await getConfig())!.theme === "system") {
       const root = window.document.documentElement;
-      root.classList.remove("light", "dark");
-      root.classList.add(newTheme);
+      if (!root.classList.contains(newTheme)) {
+        root.classList.remove("light", "dark");
+        root.classList.add(newTheme);
+      }
       setTheme(newTheme);
       setTheme("system");
     }
@@ -63,7 +57,7 @@ export function ThemeProvider({
   const value = {
     theme,
     setTheme: async (theme: Theme) => {
-      await updateUser(currentUser, { theme });
+      await updateConfig({ theme });
       setTheme(theme);
     },
   };

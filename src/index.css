@@ -95,11 +95,17 @@
     outline-offset: 2px;
   }
 
+  button {
+    -webkit-appearance: none;
+    appearance: none;
+    background-color: rgba(0, 0, 0, 0);
+  }
+
   #mainQRCodeOuter {
     -ms-overflow-style: none;
     scrollbar-width: none;
   }
-  
+
   #mainQRCodeOuter::-webkit-scrollbar {
     display: none;
   }

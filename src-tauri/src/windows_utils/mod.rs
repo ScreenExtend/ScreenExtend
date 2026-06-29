@@ -17,7 +17,7 @@ use tauri::State;
 use crate::streamer::cloud::{CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink};
 use crate::streamer::session::{
     self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedSessions,
-    SharedVirtualDisplay,
+    SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
 use device_reporter::TauriDeviceReporter;
@@ -31,7 +31,6 @@ pub struct StreamerHandle {
 pub struct AppState {
     pub virtual_display: SharedVirtualDisplay,
     pub stop_hosted_network: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    pub current_user: Mutex<String>,
     pub hosted_network_running: Mutex<bool>,
     pub network_adapters: Mutex<Vec<NetworkInfo>>,
     pub streamers: Mutex<HashMap<String, StreamerHandle>>,
@@ -40,6 +39,7 @@ pub struct AppState {
     pub device_overrides: SharedDeviceOverrides,
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
+    pub user_turn: SharedTurnConfig,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
 }
@@ -73,15 +73,93 @@ impl CloudStatusSink for TauriCloudStatusSink {
 }
 
 pub fn set_display_topology_extend() {
-    use windows::Win32::Devices::Display::{SetDisplayConfig, SDC_APPLY, SDC_TOPOLOGY_EXTEND};
-    let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
-    if result == 0 {
-        tprintln!("[display] projection mode set to Extend (SetDisplayConfig returned SUCCESS)");
-    } else {
-        teprintln!(
-            "[display] failed to set projection mode to Extend \
-             (SetDisplayConfig win32 error {result}; 31=ERROR_GEN_FAILURE/no saved extend topology)"
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, GetDisplayConfigBufferSizes,
+        QueryDisplayConfig, SetDisplayConfig, QDC_ALL_PATHS, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
+    };
+
+    const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
+
+    fn source_key(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, i32, u32) {
+        (p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id)
+    }
+    fn target_key(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, i32, u32) {
+        (p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id)
+    }
+
+    let mut path_count = 0u32;
+    let mut mode_count = 0u32;
+    if let Err(e) = unsafe {
+        GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count)
+    }
+    .ok()
+    {
+        teprintln!("[display] extend: GetDisplayConfigBufferSizes failed ({e})");
+        return;
+    }
+
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+    if let Err(e) = unsafe {
+        QueryDisplayConfig(
+            QDC_ALL_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        )
+    }
+    .ok()
+    {
+        teprintln!("[display] extend: QueryDisplayConfig failed ({e})");
+        return;
+    }
+    paths.truncate(path_count as usize);
+
+    let active: Vec<&DISPLAYCONFIG_PATH_INFO> = paths
+        .iter()
+        .filter(|p| p.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+        .collect();
+
+    let active_targets: std::collections::HashSet<_> =
+        active.iter().map(|p| target_key(p)).collect();
+    let active_sources: std::collections::HashSet<_> =
+        active.iter().map(|p| source_key(p)).collect();
+    let is_cloned = active_targets.len() >= 2 && active_sources.len() < active_targets.len();
+
+    let has_inactive_display = paths.iter().any(|p| {
+        let inactive = p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0;
+        let available = unsafe { p.targetInfo.targetAvailable.as_bool() };
+        inactive && available && !active_targets.contains(&target_key(p))
+    });
+
+    if !is_cloned && !has_inactive_display {
+        tprintln!(
+            "[display] already extended ({} monitor(s), {} source(s)); nothing to do",
+            active_targets.len(),
+            active_sources.len()
         );
+        return;
+    }
+
+    let reason = if is_cloned { "duplicate/clone topology" } else { "an inactive display" };
+    tprintln!(
+        "[display] {reason} detected ({} active monitor(s)); applying extend topology",
+        active_targets.len()
+    );
+
+    let result = unsafe {
+        SetDisplayConfig(
+            None::<&[DISPLAYCONFIG_PATH_INFO]>,
+            None::<&[DISPLAYCONFIG_MODE_INFO]>,
+            SDC_TOPOLOGY_EXTEND | SDC_APPLY,
+        )
+    };
+    if result == 0 {
+        tprintln!("[display] extend topology applied");
+    } else {
+        teprintln!("[display] failed to apply extend topology (SetDisplayConfig win32 error {result})");
     }
 }
 
@@ -108,7 +186,6 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     let state = AppState {
         virtual_display,
         stop_hosted_network: Mutex::new(None),
-        current_user: Mutex::new("".to_string()),
         hosted_network_running: Mutex::new(false),
         network_adapters: Mutex::new(Vec::new()),
         streamers: Mutex::new(HashMap::new()),
@@ -117,6 +194,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         device_overrides,
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
+        user_turn: session::new_shared_turn_config(),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
     };
@@ -178,6 +256,45 @@ pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
     state
         .disconnect_grace
         .load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
+pub struct TurnConfig {
+    pub urls: String,
+    pub username: String,
+    pub credential: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_turn_config(state: State<'_, AppState>, urls: String, username: String, credential: String) {
+    let urls: Vec<String> = urls
+        .split(',')
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    let enabled = !urls.is_empty();
+    *state.user_turn.lock().unwrap() = UserTurnConfig {
+        urls,
+        username: username.trim().to_string(),
+        credential: credential.trim().to_string(),
+    };
+    if enabled {
+        tprintln!("TURN relay configured from settings");
+    } else {
+        tprintln!("TURN relay cleared (none configured)");
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_turn_config(state: State<'_, AppState>) -> TurnConfig {
+    let cfg = state.user_turn.lock().unwrap();
+    TurnConfig {
+        urls: cfg.urls.join(","),
+        username: cfg.username.clone(),
+        credential: cfg.credential.clone(),
+    }
 }
 
 #[tauri::command]
@@ -258,6 +375,7 @@ pub fn register_cloud_session(
         device_overrides: Some(state.device_overrides.clone()),
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
+        user_turn: Some(state.user_turn.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -278,12 +396,6 @@ pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange 
         state: status,
         detail,
     }
-}
-
-#[tauri::command]
-#[specta::specta]
-pub fn set_current_user(state: State<'_, AppState>, current_user: String) {
-    *state.current_user.lock().unwrap() = current_user;
 }
 
 pub fn sync_streamers(state: &AppState) {
@@ -323,6 +435,7 @@ pub fn sync_streamers(state: &AppState) {
             device_overrides: Some(state.device_overrides.clone()),
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
+            user_turn: Some(state.user_turn.clone()),
             ..Config::default()
         };
 
