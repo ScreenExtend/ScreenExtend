@@ -57,6 +57,17 @@ export async function buildQrValues(sessionId: string): Promise<{ title: string;
     .filter((entry): entry is { title: string; value: string } => entry !== null);
 }
 
+export function generatePassword(length = 12): string {
+    const charset = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    const values = new Uint32Array(length);
+    crypto.getRandomValues(values);
+    let result = "";
+    for (let i = 0; i < length; i++) {
+        result += charset[values[i] % charset.length];
+    }
+    return result;
+}
+
 export function generateSlug() {
     let result = "";
     const characters = "abcdefghijklmnopqrstuvwxyz";

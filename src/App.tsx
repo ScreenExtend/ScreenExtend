@@ -12,11 +12,12 @@ import Settings from "@/pages/settings";
 import Devices from "@/pages/devices";
 import { Loader2 } from "lucide-react";
 
-import { AuthProviderContext, type Device } from "@/components/auth-provider";
+import { type Device } from "@/components/config-provider";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
+import { useToast } from "@/components/ui/use-toast";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
 
@@ -32,16 +33,16 @@ const router = createMemoryRouter(
 );
 
 function App() {
-  const [currentUser, setCurrentUser] = useState("");
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [otp, setOtp] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [qrValues, setQrValues] = useState([] as { title: string; value: string; }[]);
   const [loaded, setLoaded] = useState(false);
-  const [authValues, setAuthValues] = useState({ username: "", password: "" });
   const [devices, setDevices] = useState<Device[]>([]);
 
   const [closing, setClosing] = useState(false);
+
+  const { toast } = useToast();
 
   useEffect(() => {
     if (sessionId && otp) {
@@ -77,6 +78,13 @@ function App() {
         const device = event.payload as Device;
         setDevices(prev => prev.filter(d => d.ip !== device.ip));
       }));
+      unlisteners.push(await events.hostedNetworkNoPassword.listen(() => {
+        toast({
+          variant: "destructive",
+          title: "Network Created Without Password",
+          description: "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it.",
+        });
+      }));
     }
     void start_listener();
     return () => unlisteners.forEach(unlisten => unlisten());
@@ -97,21 +105,18 @@ function App() {
       windowSessionId: [sessionId, setSessionId],
       windowQrValues: [qrValues, setQrValues],
       windowLoaded: [loaded, setLoaded],
-      windowAuthValues: [authValues, setAuthValues],
       windowClosing: [closing, setClosing],
       windowDevices: [devices, setDevices]
     }}>
-      <AuthProviderContext.Provider value={{ currentUser, setCurrentUser }}>
-        <ThemeProvider defaultTheme="system">
+      <ThemeProvider defaultTheme="system">
           <RouterProvider router={router} />
-          <div className="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 9999 }}>
+          <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 9999 }}>
             <div className="rounded-lg p-6 flex flex-col items-center">
               <Loader2 className="animate-spin text-white mb-4" size={48} />
               <p className="text-xl font-semibold text-white">Closing</p>
             </div>
           </div>
         </ThemeProvider>
-      </AuthProviderContext.Provider>
     </GlobalProviderContext.Provider>
   );
 }

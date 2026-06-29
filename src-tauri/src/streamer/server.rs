@@ -48,7 +48,6 @@ pub const MAX_DISPLAY_SCALE: u32 = 200;
 pub struct AppState {
     config: Arc<Config>,
     ice_servers: Arc<Vec<RTCIceServer>>,
-    ice_json: Arc<String>,
     net_json: Arc<String>,
     otp_limiter: SharedOtpLimiter,
 }
@@ -57,7 +56,6 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         Self {
             ice_servers: Arc::new(build_ice_servers(&config)),
-            ice_json: Arc::new(build_ice_json(&config)),
             net_json: Arc::new(build_net_json(&config)),
             otp_limiter: Arc::new(OtpLimiter::new()),
             config: Arc::new(config),
@@ -66,6 +64,78 @@ impl AppState {
 
     pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
         self.ice_servers.as_ref().clone()
+    }
+
+    pub fn ice_with_turn(&self, mut base: Vec<RTCIceServer>) -> Vec<RTCIceServer> {
+        if let Some(turn) = user_turn_ice_server(&self.config) {
+            base.push(turn);
+        }
+        if let Some(turn) = ephemeral_turn_ice_server(&self.config) {
+            base.push(turn);
+        }
+        base
+    }
+
+    pub fn ice_json_live(&self) -> String {
+        let mut servers: Vec<serde_json::Value> = Vec::new();
+        if !self.config.stun_urls.is_empty() {
+            servers.push(serde_json::json!({ "urls": self.config.stun_urls }));
+        }
+        if let (Some(url), Some(user), Some(cred)) = (
+            &self.config.turn_url,
+            &self.config.turn_username,
+            &self.config.turn_credential,
+        ) {
+            servers.push(serde_json::json!({
+                "urls": [url], "username": user, "credential": cred
+            }));
+        }
+        for turn in [
+            user_turn_ice_server(&self.config),
+            ephemeral_turn_ice_server(&self.config),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            servers.push(serde_json::json!({
+                "urls": turn.urls, "username": turn.username, "credential": turn.credential
+            }));
+        }
+        serde_json::json!({ "iceServers": servers }).to_string()
+    }
+}
+
+pub fn user_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
+    let shared = config.user_turn.as_ref()?;
+    let cfg = shared.lock().unwrap();
+    if cfg.urls.is_empty() {
+        return None;
+    }
+    Some(RTCIceServer {
+        urls: cfg.urls.clone(),
+        username: cfg.username.clone(),
+        credential: cfg.credential.clone(),
+        ..Default::default()
+    })
+}
+
+pub fn ephemeral_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
+    let secret = config.turn_secret.as_deref()?;
+    if config.turn_urls.is_empty() {
+        return None;
+    }
+    let ttl = std::time::Duration::from_secs(config.turn_ttl_secs.max(60));
+    match turn::auth::generate_long_term_credentials(secret, ttl) {
+        Ok((username, credential)) => Some(RTCIceServer {
+            urls: config.turn_urls.clone(),
+            username,
+            credential,
+            ..Default::default()
+        }),
+        Err(e) => {
+            teprintln!("[turn] failed to mint ephemeral credentials: {e}");
+            None
+        }
     }
 }
 
@@ -96,10 +166,13 @@ pub async fn run(config: Config, handle: Option<axum_server::Handle>) -> Result<
 
     log_urls(config.lan_ip.as_deref(), config.port, config.https_port, self_signed);
 
+    use axum_server::accept::NoDelayAcceptor;
     let http = axum_server::bind(http_addr)
+        .acceptor(NoDelayAcceptor)
         .handle(handle.clone())
         .serve(app.clone().into_make_service_with_connect_info::<SocketAddr>());
     let https = axum_server::bind_rustls(https_addr, tls_config)
+        .map(|rustls| rustls.acceptor(NoDelayAcceptor))
         .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>());
 
@@ -168,7 +241,7 @@ async fn styles() -> Response {
 async fn ice_config(State(state): State<AppState>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
-        state.ice_json.as_ref().clone(),
+        state.ice_json_live(),
     )
         .into_response()
 }
@@ -227,28 +300,13 @@ fn build_net_json(config: &Config) -> String {
     serde_json::json!({ "httpsPort": config.https_port }).to_string()
 }
 
-fn build_ice_json(config: &Config) -> String {
-    let mut servers: Vec<serde_json::Value> = Vec::new();
-    if !config.stun_urls.is_empty() {
-        servers.push(serde_json::json!({ "urls": config.stun_urls }));
-    }
-    if let (Some(url), Some(user), Some(cred)) =
-        (&config.turn_url, &config.turn_username, &config.turn_credential)
-    {
-        servers.push(serde_json::json!({
-            "urls": [url], "username": user, "credential": cred
-        }));
-    }
-    serde_json::json!({ "iceServers": servers }).to_string()
-}
-
 async fn whep(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let ice = state.fallback_ice_servers();
+    let ice = state.ice_with_turn(state.fallback_ice_servers());
     let out = process_whep(&state, &peer.ip().to_string(), &body, ice).await;
     (
         StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -481,8 +539,6 @@ async fn start_session(
                 }
             };
 
-            let _ = tokio::task::spawn_blocking(pipeline::set_display_topology_extend).await;
-
             {
                 let name = device_name.clone();
                 let res = tokio::task::spawn_blocking(move || {
@@ -678,6 +734,8 @@ async fn wait_for_display_settle(device_name: &str) {
 async fn wait_for_new_monitor(before: &[String]) -> Option<String> {
     let deadline = tokio::time::Instant::now() + DISPLAY_ATTACH_TIMEOUT;
     loop {
+        let _ = tokio::task::spawn_blocking(pipeline::set_display_topology_extend).await;
+
         let now = pipeline::monitor_device_names();
         if let Some(name) = now.iter().find(|n| !before.contains(n)) {
             return Some(name.clone());

@@ -26,7 +26,6 @@ use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
 use super::scaler::{Scaler, TextureReader};
 use super::tuning;
-use super::Vendor;
 
 #[derive(Clone)]
 pub struct EncodedFrame {
@@ -38,8 +37,7 @@ const SP_WIDTH: u32 = 1280;
 const SP_HEIGHT: u32 = 720;
 const SP_FPS: u32 = 30;
 const SP_BITRATE_BPS: u32 = 6_000_000;
-
-const BROADCAST_CAPACITY: usize = 3;
+const BROADCAST_CAPACITY: usize = 2;
 
 #[derive(Clone)]
 pub struct Pipeline {
@@ -47,6 +45,7 @@ pub struct Pipeline {
     pub frame_duration: Duration,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    wake: crossbeam_channel::Sender<()>,
     pub max_bitrate_bps: u32,
     pub h264_profile: H264Profile,
 }
@@ -54,10 +53,12 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn request_idr(&self) {
         self.idr_request.store(true, Ordering::Relaxed);
+        let _ = self.wake.try_send(());
     }
 
     pub fn set_target_bitrate(&self, bps: u32) {
         self.target_bitrate.store(bps, Ordering::Relaxed);
+        let _ = self.wake.try_send(());
     }
 }
 
@@ -136,11 +137,13 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
 
     if cfg.synthetic_pattern {
         let frame_duration = Duration::from_nanos(1_000_000_000 / SP_FPS as u64);
+        let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
         let pipeline = Pipeline {
             tx: tx.clone(),
             frame_duration,
             idr_request: Arc::clone(&idr_request),
             target_bitrate: Arc::clone(&target_bitrate),
+            wake,
             max_bitrate_bps: SP_BITRATE_BPS,
             h264_profile: cfg.h264_profile,
         };
@@ -156,7 +159,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         };
         std::thread::Builder::new()
             .name("nvenc-encode".to_string())
-            .spawn(move || synthetic_pattern_loop(tx, idr_request, target_bitrate, enc))
+            .spawn(move || synthetic_pattern_loop(tx, idr_request, target_bitrate, enc, wake_rx))
             .expect("spawn encode thread");
         return Ok(pipeline);
     }
@@ -281,11 +284,13 @@ fn start_live_capture(
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps as u64);
 
+    let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
         idr_request: Arc::clone(&idr_request),
         target_bitrate: Arc::clone(&target_bitrate),
+        wake,
         max_bitrate_bps: config.max_bitrate_bps,
         h264_profile: cfg.h264_profile,
     };
@@ -306,6 +311,7 @@ fn start_live_capture(
             tx,
             idr_request,
             target_bitrate,
+            wake_rx,
         },
     );
 
@@ -342,11 +348,13 @@ fn start_dxgi_capture(
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
 
+    let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
         idr_request: Arc::clone(&idr_request),
         target_bitrate: Arc::clone(&target_bitrate),
+        wake,
         max_bitrate_bps: config.max_bitrate_bps,
         h264_profile: cfg.h264_profile,
     };
@@ -371,6 +379,7 @@ fn start_dxgi_capture(
         tx,
         idr_request,
         target_bitrate,
+        wake_rx,
         stop: Arc::clone(&stop),
     };
     let join = std::thread::Builder::new()
@@ -401,6 +410,7 @@ struct DxgiThreadArgs {
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    wake_rx: crossbeam_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
 }
 
@@ -415,10 +425,12 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         tx,
         idr_request,
         target_bitrate,
+        wake_rx,
         stop,
     } = args;
 
     let _thread_tuning = tuning::tune_current_thread();
+    let _keep_awake = tuning::KeepAwake::begin();
 
     let setup = (|| -> Result<(Duplicator, Arc<Mutex<EncodeCore>>, &'static str)> {
         let dup = Duplicator::new(&device_name, native_w, native_h)?;
@@ -476,6 +488,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         Arc::clone(&last_frame_at),
         epoch,
         Arc::clone(&stop),
+        wake_rx,
     );
 
     tprintln!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
@@ -496,7 +509,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
         let timeout_ms = if dirty {
             let rem = next_due.saturating_duration_since(Instant::now());
-            ((rem.as_micros() + 999) / 1000) as u32
+            (rem.as_micros() / 1000) as u32
         } else {
             50
         };
@@ -668,6 +681,7 @@ struct CaptureFlags {
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    wake_rx: crossbeam_channel::Receiver<()>,
 }
 
 enum EncodePath {
@@ -874,6 +888,7 @@ struct LiveCapture {
     busy_streak: u32,
     stop: Arc<AtomicBool>,
     _thread_tuning: tuning::ThreadTuning,
+    _keep_awake: tuning::KeepAwake,
     timing_sum_ns: u128,
     timing_count: u64,
     timing_max_ns: u128,
@@ -916,74 +931,69 @@ fn build_backend(
 ) -> Result<Backend> {
     use crate::streamer::config::EncoderVendor;
 
-    let want_intel = matches!(vendor, EncoderVendor::Intel)
-        || (matches!(vendor, EncoderVendor::Auto) && super::device_vendor(device) == Vendor::Intel);
+    let try_nvenc = || -> Result<Backend> {
+        match build_zero_copy(config, device, context) {
+            Ok((encoder, path)) => {
+                tprintln!(
+                    "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
+                    config.width, config.height, config.fps
+                );
+                Ok(Backend::Nvenc { encoder, path })
+            }
+            Err(e) => {
+                teprintln!(
+                    "NVENC zero-copy path unavailable ({e:?}); falling back to CPU bridge (higher latency)"
+                );
+                match Encoder::new(config) {
+                    Ok(encoder) => {
+                        tprintln!(
+                            "pipeline: live capture ready -- NVENC CPU-bridge fallback ({}x{}@{})",
+                            config.width, config.height, config.fps
+                        );
+                        Ok(Backend::Nvenc { encoder, path: EncodePath::CpuBridge })
+                    }
+                    Err(nv_err) => Err(nv_err),
+                }
+            }
+        }
+    };
 
-    if want_intel {
+    let try_intel = || -> Result<Backend> {
         match IntelEncoder::new_on_device(config, native_w, native_h, device, context) {
             Ok(encoder) => {
                 tprintln!(
                     "pipeline: live capture ready -- INTEL Quick Sync same-adapter path ({}x{}@{})",
                     config.width, config.height, config.fps
                 );
-                return Ok(Backend::Intel { encoder });
+                Ok(Backend::Intel { encoder })
             }
             Err(e) => {
-                if matches!(vendor, EncoderVendor::Intel) {
-                    teprintln!(
-                        "Intel Quick Sync same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
-                    );
-                    let encoder = IntelEncoder::new(config)
-                        .context("Intel Quick Sync requested via --encoder intel but unavailable")?;
-                    tprintln!(
-                        "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
-                        config.width, config.height, config.fps
-                    );
-                    return Ok(Backend::IntelCpu { encoder });
-                }
                 teprintln!(
-                    "Intel Quick Sync unavailable on capture adapter ({e:?}); falling over to NVENC"
+                    "Intel Quick Sync same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
                 );
+                let encoder = IntelEncoder::new(config)
+                    .context("Intel Quick Sync unavailable (same-adapter and CPU-bridge both failed)")?;
+                tprintln!(
+                    "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
+                    config.width, config.height, config.fps
+                );
+                Ok(Backend::IntelCpu { encoder })
             }
         }
-    }
+    };
 
-    match build_zero_copy(config, device, context) {
-        Ok((encoder, path)) => {
-            tprintln!(
-                "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
-                config.width, config.height, config.fps
-            );
-            Ok(Backend::Nvenc { encoder, path })
-        }
-        Err(e) => {
-            teprintln!(
-                "NVENC zero-copy path unavailable ({e:?}); falling back to CPU bridge (higher latency)"
-            );
-            match Encoder::new(config) {
-                Ok(encoder) => {
-                    tprintln!(
-                        "pipeline: live capture ready -- NVENC CPU-bridge fallback ({}x{}@{})",
-                        config.width, config.height, config.fps
-                    );
-                    Ok(Backend::Nvenc { encoder, path: EncodePath::CpuBridge })
-                }
-                Err(nv_err) if !matches!(vendor, EncoderVendor::Nvidia) => {
-                    teprintln!(
-                        "NVENC unavailable ({nv_err:?}); trying Intel Quick Sync on its own device"
-                    );
-                    let encoder = IntelEncoder::new(config).map_err(|ie| {
-                        nv_err.context(format!("no working encoder (Intel fallback also failed: {ie:?})"))
-                    })?;
-                    tprintln!(
-                        "pipeline: live capture ready -- INTEL Quick Sync CPU-bridge path ({}x{}@{})",
-                        config.width, config.height, config.fps
-                    );
-                    Ok(Backend::IntelCpu { encoder })
-                }
-                Err(nv_err) => Err(nv_err),
+    match vendor {
+        EncoderVendor::Nvidia => try_nvenc(),
+        EncoderVendor::Intel => try_intel(),
+        EncoderVendor::Auto => match try_nvenc() {
+            Ok(backend) => Ok(backend),
+            Err(nv_err) => {
+                teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
+                try_intel().map_err(|ie| {
+                    nv_err.context(format!("no working encoder (Intel fallback also failed: {ie:?})"))
+                })
             }
-        }
+        },
     }
 }
 
@@ -995,6 +1005,7 @@ fn spawn_repeater(
     last_frame_at: Arc<AtomicU64>,
     epoch: Instant,
     stop: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
 ) {
     let tick = frame_duration.max(Duration::from_millis(8));
     let idle_after_ms = (frame_duration.as_millis() as u64 * 2).max(34);
@@ -1002,12 +1013,19 @@ fn spawn_repeater(
     std::thread::Builder::new()
         .name("nvenc-repeat".to_string())
         .spawn(move || {
+            let _thread_tuning = tuning::tune_current_thread();
             let mut last_emit = Instant::now();
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                std::thread::sleep(tick);
+                match wake_rx.recv_timeout(tick) {
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        std::thread::sleep(tick);
+                    }
+                }
+                while wake_rx.try_recv().is_ok() {}
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1049,10 +1067,19 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     type Error = anyhow::Error;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let CaptureFlags { config, vendor, native_w, native_h, tx, idr_request, target_bitrate } =
-            ctx.flags;
+        let CaptureFlags {
+            config,
+            vendor,
+            native_w,
+            native_h,
+            tx,
+            idr_request,
+            target_bitrate,
+            wake_rx,
+        } = ctx.flags;
 
         let thread_tuning = tuning::tune_current_thread();
+        let keep_awake = tuning::KeepAwake::begin();
 
         let backend = build_backend(
             config,
@@ -1110,6 +1137,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             Arc::clone(&last_frame_at),
             epoch,
             Arc::clone(&stop),
+            wake_rx,
         );
 
         Ok(Self {
@@ -1122,6 +1150,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             busy_streak: 0,
             stop,
             _thread_tuning: thread_tuning,
+            _keep_awake: keep_awake,
             timing_sum_ns: 0,
             timing_count: 0,
             timing_max_ns: 0,
@@ -1191,6 +1220,7 @@ fn synthetic_pattern_loop(
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
+    wake_rx: crossbeam_channel::Receiver<()>,
 ) {
     let _thread_tuning = tuning::tune_current_thread();
 
@@ -1243,7 +1273,13 @@ fn synthetic_pattern_loop(
         next_deadline += frame_interval;
         let now = Instant::now();
         if next_deadline > now {
-            std::thread::sleep(next_deadline - now);
+            match wake_rx.recv_timeout(next_deadline - now) {
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(next_deadline - now);
+                }
+            }
+            while wake_rx.try_recv().is_ok() {}
         } else {
             next_deadline = now;
         }

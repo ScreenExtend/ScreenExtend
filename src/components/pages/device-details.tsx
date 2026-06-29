@@ -1,4 +1,4 @@
-import React, { useState, useContext } from "react";
+import React, { useState } from "react";
 
 import { Slider } from "@/components/ui/slider";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -33,7 +33,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { AuthProviderContext, updateUser, getUser, type Device } from "@/components/auth-provider";
+import { updateConfig, getConfig, type Device } from "@/components/config-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { commands, events } from "@/lib/bindings";
 import { useFormik } from "formik";
@@ -45,7 +45,6 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [inProgress, setInProgress] = useState(false);
   const [tempRate, setTempRate] = useState(device.refreshRate);
   const [tempQuality, setTempQuality] = useState(device.videoQuality);
-  const { currentUser } = useContext(AuthProviderContext);
   const { toast } = useToast();
 
   const deviceDetails = useFormik({
@@ -84,7 +83,7 @@ export function DeviceDetails({ device }: { device: Device }) {
     if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
       setOpen(false);
     } else {
-      if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
+      if ((await getConfig())!.dontShowAgain.editDevice) {
         setOpen(false);
         deviceDetails.resetForm({ values: device });
       } else {
@@ -100,7 +99,7 @@ export function DeviceDetails({ device }: { device: Device }) {
       if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
         setOpen(false);
       } else {
-        if ((await getUser(currentUser))!.dontShowAgain.editDevice) {
+        if ((await getConfig())!.dontShowAgain.editDevice) {
           setOpen(false);
           deviceDetails.resetForm({ values: device });
         } else {
@@ -125,8 +124,8 @@ export function DeviceDetails({ device }: { device: Device }) {
         <SheetHeader>
           <SheetTitle>Edit Device</SheetTitle>
         </SheetHeader>
-        <div className="grid gap-4 py-4">
-          <div className="flex gap-4">
+        <div className="py-4">
+          <div className="flex">
             <div className="flex-1">
               <Label>Device Name</Label>
               <Input
@@ -139,7 +138,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 disabled={inProgress}
               />
             </div>
-            <div className="flex-1">
+            <div className="flex-1 ml-4">
               <Label>Orientation</Label>
               <Select
                 name="orientation"
@@ -160,7 +159,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               </Select>
             </div>
           </div>
-          <div>
+          <div className="mt-4">
             <Label>Device IP</Label>
             <Input
               disabled={true}
@@ -172,7 +171,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               hoverLabel={false}
             />
           </div>
-          <div>
+          <div className="mt-4">
             <Label>Device OS</Label>
             <Input
               disabled={true}
@@ -184,7 +183,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               hoverLabel={false}
             />
           </div>
-          <div>
+          <div className="mt-4">
             <Label>Screen Size</Label>
             <Input
               disabled={true}
@@ -196,7 +195,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               hoverLabel={false}
             />
           </div>
-          <div>
+          <div className="mt-4">
             <Label className="block my-2">
               Scale - ({deviceDetails.values.scale}%)
             </Label>
@@ -212,10 +211,10 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
           </div>
-          <div>
-            <Label className="my-2 flex items-center gap-1">
+          <div className="mt-4">
+            <Label className="my-2 flex items-center">
               Refresh Rate -{" "}
-              <div className="flex items-center gap-1">
+              <div className="flex items-center ml-1">
                 <Input
                   name="refreshRate"
                   type="number"
@@ -246,8 +245,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                   className="w-12 px-1 text-center"
                   hoverLabel={false}
                   disabled={inProgress}
-                />{" "}
-                Hz
+                />
+                <span className="ml-1">Hz</span>
               </div>
             </Label>
             <Slider
@@ -263,7 +262,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
           </div>
-          <div>
+          <div className="mt-4">
             <Label className="block my-2">
               Video Scale - ({deviceDetails.values.videoScale}%)
             </Label>
@@ -279,10 +278,10 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
           </div>
-          <div>
-            <Label className="my-2 flex items-center gap-1">
+          <div className="mt-4">
+            <Label className="my-2 flex items-center">
               Video Quality -{" "}
-              <div className="flex items-center gap-1">
+              <div className="flex items-center ml-1">
                 <Input
                   name="videoQuality"
                   type="number"
@@ -331,7 +330,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
         </div>
         <SheetFooter>
-          <div className="flex gap-4 w-full mt-3">
+          <div className="flex w-full mt-3">
             <DeleteDevice
               onClick={async () => {
                 setInProgress(true);
@@ -347,7 +346,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
             <Button
-              className="flex-1 text-white"
+              className="flex-1 text-white ml-4"
               type="submit"
               onClick={() => {
                 deviceDetails.handleSubmit();
@@ -382,7 +381,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={async () => {
-                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editDevice: dontShowAgain}});
+                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editDevice: dontShowAgain}});
                 setWarningDialogOpen(false);
               }}
             >
@@ -391,7 +390,7 @@ export function DeviceDetails({ device }: { device: Device }) {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                await updateUser(currentUser, {dontShowAgain: {...(await getUser(currentUser))!.dontShowAgain, editDevice: dontShowAgain}});
+                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editDevice: dontShowAgain}});
                 setWarningDialogOpen(false);
                 setOpen(false);
                 deviceDetails.resetForm({ values: device });

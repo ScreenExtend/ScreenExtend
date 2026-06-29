@@ -48,6 +48,19 @@ pub fn new_shared_disconnect_grace() -> SharedDisconnectGrace {
     Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_DISCONNECT_GRACE_SECS))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserTurnConfig {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
+pub type SharedTurnConfig = Arc<Mutex<UserTurnConfig>>;
+
+pub fn new_shared_turn_config() -> SharedTurnConfig {
+    Arc::new(Mutex::new(UserTurnConfig::default()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveDisplay {
     pub display_id: u32,

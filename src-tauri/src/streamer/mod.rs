@@ -36,6 +36,7 @@ impl Streamer {
         Self::prepare();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .on_thread_start(platform::tune_transport_thread)
             .build()?;
         runtime.block_on(server::run(self.config, None))
     }
@@ -44,6 +45,7 @@ impl Streamer {
         Self::prepare();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .on_thread_start(platform::tune_transport_thread)
             .build()?;
         runtime.block_on(server::run(self.config, Some(handle)))
     }
@@ -57,6 +59,7 @@ impl Streamer {
         Self::prepare();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .on_thread_start(platform::tune_transport_thread)
             .build()?;
         runtime.block_on(test::whep_selftest::run(self.config))
     }

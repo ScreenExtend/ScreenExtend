@@ -82,6 +82,14 @@ impl Encoder {
             );
         }
 
+        let creation_flags = unsafe { device.GetCreationFlags() };
+        if creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32 == 0 {
+            bail!(
+                "capture D3D11 device was created without VIDEO_SUPPORT; the oneVPL same-adapter \
+                 Quick Sync path would fault in MFXVideoVPP_Init — use a dedicated Intel device"
+            );
+        }
+
         let vpl = Vpl::load()?;
 
         if let Ok(mt) = context.cast::<ID3D11Multithread>() {
@@ -307,6 +315,10 @@ impl Encoder {
             co3.LowDelayBRC = MFX_CODINGOPTION_ON;
             co3.WinBRCSize = 1;
             co3.WinBRCMaxAvgKbps = max_kbps;
+            let fps = self.config.fps.max(1);
+            let avg_frame_bytes = (self.config.bitrate_bps / 8 / fps).max(1);
+            co3.MaxFrameSizeP = avg_frame_bytes.saturating_mul(2);
+            co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
         }
 
         let mut ext: [*mut mfxExtBuffer; 3] = [

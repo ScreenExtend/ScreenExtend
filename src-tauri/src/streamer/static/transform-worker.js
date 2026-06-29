@@ -6,6 +6,7 @@ let configured = false;
 let waitingForKey = true;
 let sizedCanvas = false;
 let renderedOnce = false;
+let renderFromTs = 0;
 
 let framesIn = 0;
 let keyframesIn = 0;
@@ -21,7 +22,7 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 8;
+const BACKLOG_DROP_THRESHOLD = 4;
 
 self.onmessage = (e) => {
   if (e.data && e.data.type === 'canvas') {
@@ -29,6 +30,9 @@ self.onmessage = (e) => {
     ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   } else if (e.data && e.data.type === 'stats') {
     postStats();
+  } else if (e.data && e.data.type === 'encodedstream') {
+    self.postMessage({ type: 'transformstart', hasReadable: !!e.data.readable, hasSendKey: false });
+    startPump(e.data.readable);
   }
 };
 
@@ -52,7 +56,7 @@ function makeDecoder() {
           canvas.height = frame.displayHeight;
           sizedCanvas = true;
         }
-        if (ctx) {
+        if (ctx && frame.timestamp >= renderFromTs) {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           framesRendered++;
           if (!renderedOnce) {
@@ -123,7 +127,11 @@ self.onrtctransform = (event) => {
     hasReadable: !!(transformer && transformer.readable),
     hasSendKey: !!(transformer && typeof transformer.sendKeyFrameRequest === 'function'),
   });
-  const reader = transformer.readable.getReader();
+  startPump(transformer.readable);
+};
+
+function startPump(readable) {
+  const reader = readable.getReader();
 
   ensureConfigured().then(() => requestKey(true)).catch(() => {});
 
@@ -156,13 +164,16 @@ self.onrtctransform = (event) => {
           decoder.decodeQueueSize > BACKLOG_DROP_THRESHOLD && type !== 'key') {
         self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
         waitingForKey = true;
-        requestKey(true);
+        requestKey(false);
         continue;
       }
 
       try {
-        await ensureConfigured();
-        if (waitingForKey && type === 'key') waitingForKey = false;
+        if (!configured || !decoder || decoder.state === 'closed') await ensureConfigured();
+        if (waitingForKey && type === 'key') {
+          waitingForKey = false;
+          renderFromTs = encodedFrame.timestamp;
+        }
         decoder.decode(
           new EncodedVideoChunk({
             type,
@@ -176,4 +187,4 @@ self.onrtctransform = (event) => {
       }
     }
   })();
-};
+}

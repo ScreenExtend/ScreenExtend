@@ -13,7 +13,7 @@ const InputOTP = React.forwardRef<
   <OTPInput
     ref={ref}
     containerClassName={cn(
-      "flex items-center gap-2",
+      "flex items-center",
       containerClassName
     )}
     className={cn("disabled:cursor-not-allowed", className)}
@@ -49,7 +49,7 @@ const InputOTPSlot = React.forwardRef<
     >
       {char}
       {hasFakeCaret && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <div className="pointer-events-none absolute top-0 right-0 bottom-0 left-0 flex items-center justify-center">
           <div className="h-4 w-px animate-caret-blink bg-foreground duration-1000" />
         </div>
       )}
@@ -61,8 +61,8 @@ InputOTPSlot.displayName = "InputOTPSlot"
 const InputOTPSeparator = React.forwardRef<
   React.ElementRef<"div">,
   React.ComponentPropsWithoutRef<"div">
->(({ ...props }, ref) => (
-  <div ref={ref} role="separator" {...props}>
+>(({ className, ...props }, ref) => (
+  <div ref={ref} role="separator" className={cn("mx-2", className)} {...props}>
     <Dot />
   </div>
 ))

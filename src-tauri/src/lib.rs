@@ -51,6 +51,9 @@ pub struct DeviceRemoveAction(Device);
 pub struct NetworkChange;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct HostedNetworkNoPassword;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct CloudStatusChange {
     pub state: String,
     pub detail: String,
@@ -126,7 +129,7 @@ impl Device {
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        windows_utils::remove_all_displays(&state.virtual_display);
+        remove_all_displays(&state.virtual_display);
     }
     app.exit(0);
 }
@@ -134,11 +137,33 @@ fn exit_app(app: tauri::AppHandle) {
 #[tauri::command]
 #[specta::specta]
 fn get_username() -> String {
-    std::env::var("USERNAME")
-        .or_else(|_| std::env::var("USER"))
-        .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "User".to_string())
+    whoami::username().unwrap_or_else(|_| "".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{AboutMetadata, MenuBuilder, PredefinedMenuItem, SubmenuBuilder};
+
+    let about = PredefinedMenuItem::about(
+        handle,
+        Some("About ScreenExtend"),
+        Some(AboutMetadata {
+            name: Some("ScreenExtend".into()),
+            ..Default::default()
+        }),
+    )?;
+    let quit = PredefinedMenuItem::quit(handle, Some("Quit ScreenExtend"))?;
+    let app_menu = SubmenuBuilder::new(handle, "ScreenExtend")
+        .item(&about)
+        .separator()
+        .item(&quit)
+        .build()?;
+    MenuBuilder::new(handle).item(&app_menu).build()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    tauri::menu::MenuBuilder::new(handle).build()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -147,7 +172,6 @@ pub fn run() {
         .commands(collect_commands![
             setup,
             //            get_devices,
-            set_current_user,
             set_session_credentials,
             register_cloud_session,
             get_cloud_status,
@@ -166,6 +190,8 @@ pub fn run() {
             remove_device_override,
             set_disconnect_grace,
             get_disconnect_grace,
+            set_turn_config,
+            get_turn_config,
             logbus::get_log_backlog
         ])
         .events(collect_events![
@@ -175,6 +201,7 @@ pub fn run() {
             DeviceRemove,
             DeviceRemoveAction,
             NetworkChange,
+            HostedNetworkNoPassword,
             CloudStatusChange,
             logbus::LogLine
         ]);
@@ -199,6 +226,7 @@ pub fn run() {
         .plugin(tauri_plugin_cli::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .menu(build_menu)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             if let Ok(matches) = app.cli().matches() {

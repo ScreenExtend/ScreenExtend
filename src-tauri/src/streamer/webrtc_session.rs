@@ -25,7 +25,7 @@ use super::bitrate::{BitrateController, DEFAULT_MIN_BITRATE_BPS, estimate_from_l
 use super::config::H264Profile;
 use super::pipeline::Pipeline;
 
-const BWE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+const BWE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn h264_fmtp(profile_level_id: &str) -> String {
     format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}")
@@ -102,6 +102,9 @@ fn udp_only_setting_engine() -> webrtc::api::setting_engine::SettingEngine {
 
     let mut se = webrtc::api::setting_engine::SettingEngine::default();
     se.set_network_types(vec![NetworkType::Udp4, NetworkType::Udp6]);
+    se.set_srflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
+    se.set_prflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
+    se.set_relay_acceptance_min_wait(Some(std::time::Duration::from_millis(0)));
     se
 }
 
@@ -151,6 +154,80 @@ async fn detect_session_locality(
     } else {
         SessionLocality::CrossNetwork
     }
+}
+
+fn summarize_sdp_candidates(sdp: &str) -> String {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut routable: Vec<String> = Vec::new();
+    for line in sdp.lines() {
+        let line = line.trim_start();
+        let Some(body) = line
+            .strip_prefix("a=candidate:")
+            .or_else(|| line.strip_prefix("candidate:"))
+        else {
+            continue;
+        };
+        let toks: Vec<&str> = body.split_whitespace().collect();
+        let typ = toks
+            .iter()
+            .position(|t| *t == "typ")
+            .and_then(|i| toks.get(i + 1))
+            .copied()
+            .unwrap_or("?");
+        *counts.entry(typ).or_insert(0) += 1;
+        if matches!(typ, "srflx" | "relay" | "prflx") {
+            let transport = toks.get(2).copied().unwrap_or("?");
+            let ip = toks.get(4).copied().unwrap_or("?");
+            let port = toks.get(5).copied().unwrap_or("?");
+            routable.push(format!("{typ}/{transport} {ip}:{port}"));
+        }
+    }
+    if counts.is_empty() {
+        return "no ICE candidates in SDP".to_string();
+    }
+    let counts_str = counts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if routable.is_empty() {
+        format!("{counts_str} (no public/relay candidates)")
+    } else {
+        format!("{counts_str} | {}", routable.join(", "))
+    }
+}
+
+async fn log_ice_diagnostics(pc: &webrtc::peer_connection::RTCPeerConnection) {
+    use std::collections::HashMap;
+
+    use webrtc::stats::StatsReportType;
+
+    let report = pc.get_stats().await;
+
+    let mut cand: HashMap<String, String> = HashMap::new();
+    for stat in report.reports.values() {
+        if let StatsReportType::LocalCandidate(c) | StatsReportType::RemoteCandidate(c) = stat {
+            cand.insert(
+                c.id.clone(),
+                format!("{:?} {}:{}", c.candidate_type, c.ip, c.port),
+            );
+        }
+    }
+
+    let mut pair_count = 0;
+    for stat in report.reports.values() {
+        if let StatsReportType::CandidatePair(p) = stat {
+            pair_count += 1;
+            let local = cand.get(&p.local_candidate_id).cloned().unwrap_or_default();
+            let remote = cand.get(&p.remote_candidate_id).cloned().unwrap_or_default();
+            teprintln!(
+                "  ICE pair [{:?}] nominated={} reqSent={} respRecv={} local=({local}) remote=({remote})",
+                p.state, p.nominated, p.requests_sent, p.responses_received
+            );
+        }
+    }
+    teprintln!("ICE diagnostics: {pair_count} candidate pair(s) above");
 }
 
 pub async fn handle_whep_offer(
@@ -288,6 +365,16 @@ pub async fn handle_whep_offer(
         }
         if matches!(
             state,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected
+        ) {
+            let pc = Arc::clone(&pc_state);
+            tokio::spawn(async move {
+                teprintln!("peer connection {state:?} — dumping ICE candidate pairs:");
+                log_ice_diagnostics(&pc).await;
+            });
+        }
+        if matches!(
+            state,
             RTCPeerConnectionState::Failed
                 | RTCPeerConnectionState::Disconnected
                 | RTCPeerConnectionState::Closed
@@ -299,6 +386,10 @@ pub async fn handle_whep_offer(
         Box::pin(async {})
     }));
 
+    tprintln!(
+        "ICE candidates in remote offer (browser): {}",
+        summarize_sdp_candidates(&offer_sdp)
+    );
     let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer SDP")?;
     pc.set_remote_description(offer)
         .await
@@ -312,12 +403,23 @@ pub async fn handle_whep_offer(
     pc.set_local_description(answer)
         .await
         .context("set_local_description(answer)")?;
-    let _ = gather_complete.recv().await;
+    const GATHER_MAX_WAIT: Duration = Duration::from_millis(1500);
+    match tokio::time::timeout(GATHER_MAX_WAIT, gather_complete.recv()).await {
+        Ok(_) => {}
+        Err(_) => tprintln!(
+            "ICE gathering still in progress after {GATHER_MAX_WAIT:?}; returning answer with candidates gathered so far"
+        ),
+    }
 
     let local = pc
         .local_description()
         .await
         .ok_or_else(|| anyhow!("no local description after gathering"))?;
+
+    tprintln!(
+        "ICE candidates in local answer (host): {}",
+        summarize_sdp_candidates(&local.sdp)
+    );
 
     Ok(local.sdp)
 }

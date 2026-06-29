@@ -12,6 +12,15 @@ pub fn set_dpi_awareness() {
 pub fn apply_process_tuning() {
     #[cfg(target_os = "windows")]
     crate::windows_utils::streamer::tuning::apply_process_tuning();
+    #[cfg(target_os = "macos")]
+    crate::macos_utils::streamer::tuning::apply_process_tuning();
+}
+
+pub fn tune_transport_thread() {
+    #[cfg(target_os = "windows")]
+    crate::windows_utils::streamer::tuning::tune_transport_thread();
+    #[cfg(target_os = "macos")]
+    crate::macos_utils::streamer::qos::pin_current_thread_user_initiated();
 }
 
 pub fn probe_capture(monitor: u32, path: &str) -> Result<()> {

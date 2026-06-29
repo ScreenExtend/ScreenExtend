@@ -9,9 +9,6 @@ export const commands = {
 async setup() : Promise<boolean> {
     return await TAURI_INVOKE("setup");
 },
-async setCurrentUser(currentUser: string) : Promise<void> {
-    await TAURI_INVOKE("set_current_user", { currentUser });
-},
 async setSessionCredentials(sessionId: string, otp: string) : Promise<void> {
     await TAURI_INVOKE("set_session_credentials", { sessionId, otp });
 },
@@ -66,6 +63,12 @@ async setDisconnectGrace(seconds: number) : Promise<void> {
 async getDisconnectGrace() : Promise<number> {
     return await TAURI_INVOKE("get_disconnect_grace");
 },
+async setTurnConfig(urls: string, username: string, credential: string) : Promise<void> {
+    await TAURI_INVOKE("set_turn_config", { urls, username, credential });
+},
+async getTurnConfig() : Promise<TurnConfig> {
+    return await TAURI_INVOKE("get_turn_config");
+},
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
 }
@@ -81,6 +84,7 @@ deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
+hostedNetworkNoPassword: HostedNetworkNoPassword,
 logLine: LogLine,
 networkChange: NetworkChange
 }>({
@@ -90,6 +94,7 @@ deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
+hostedNetworkNoPassword: "hosted-network-no-password",
 logLine: "log-line",
 networkChange: "network-change"
 })
@@ -107,9 +112,11 @@ export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
+export type HostedNetworkNoPassword = null
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
+export type TurnConfig = { urls: string; username: string; credential: string }
 
 /** tauri-specta globals **/
 

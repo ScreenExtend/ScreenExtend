@@ -28,6 +28,7 @@ pub struct Scaler {
     readback: Vec<u8>,
     dst_w: u32,
     dst_h: u32,
+    cached_in_view: Option<(*mut core::ffi::c_void, ID3D11VideoProcessorInputView)>,
 }
 
 unsafe impl Send for Scaler {}
@@ -110,26 +111,35 @@ impl Scaler {
             readback: Vec::new(),
             dst_w,
             dst_h,
+            cached_in_view: None,
         })
     }
 
     pub fn scale(&mut self, src: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
-        let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-            FourCC: 0,
-            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            ..Default::default()
+        let key = src.as_raw();
+        let in_view = match &self.cached_in_view {
+            Some((cached_key, view)) if *cached_key == key => view.clone(),
+            _ => {
+                let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                    FourCC: 0,
+                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                };
+                let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
+                unsafe {
+                    self.video_device.CreateVideoProcessorInputView(
+                        src,
+                        &self.enumerator,
+                        &in_desc,
+                        Some(&mut in_view),
+                    )
+                }
+                .context("CreateVideoProcessorInputView")?;
+                let in_view = in_view.context("scaler input view was null")?;
+                self.cached_in_view = Some((key, in_view.clone()));
+                in_view
+            }
         };
-        let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
-        unsafe {
-            self.video_device.CreateVideoProcessorInputView(
-                src,
-                &self.enumerator,
-                &in_desc,
-                Some(&mut in_view),
-            )
-        }
-        .context("CreateVideoProcessorInputView")?;
-        let in_view = in_view.context("scaler input view was null")?;
 
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
         stream.Enable = true.into();

@@ -8,6 +8,7 @@ pub struct BitrateController {
     max_bps: u32,
     alpha: f64,
     change_threshold: f64,
+    cut_threshold: f64,
     min_interval: Duration,
     ewma: Option<f64>,
     last_emitted: Option<u32>,
@@ -17,6 +18,7 @@ pub struct BitrateController {
 impl BitrateController {
     pub fn new(min_bps: u32, max_bps: u32) -> Self {
         Self::with_params(min_bps, max_bps, 0.4, 0.10, Duration::from_millis(500))
+            .with_cut_threshold(0.04)
     }
 
     pub fn with_params(
@@ -33,11 +35,18 @@ impl BitrateController {
             max_bps,
             alpha,
             change_threshold,
+            cut_threshold: change_threshold,
             min_interval,
             ewma: None,
             last_emitted: None,
             last_change_at: None,
         }
+    }
+
+    pub fn with_cut_threshold(mut self, cut_threshold: f64) -> Self {
+        assert!(cut_threshold > 0.0 && cut_threshold <= 1.0, "cut_threshold must be in (0, 1]");
+        self.cut_threshold = cut_threshold;
+        self
     }
 
     pub fn current_target(&self) -> Option<u32> {
@@ -60,14 +69,19 @@ impl BitrateController {
             return Some(candidate);
         };
 
+        let is_cut = candidate < last;
+        let threshold = if is_cut { self.cut_threshold } else { self.change_threshold };
+
         let rel_delta = (candidate as f64 - last as f64).abs() / (last.max(1) as f64);
-        if rel_delta < self.change_threshold {
+        if rel_delta < threshold {
             return None;
         }
 
-        if let Some(t) = self.last_change_at {
-            if now.duration_since(t) < self.min_interval {
-                return None;
+        if !is_cut {
+            if let Some(t) = self.last_change_at {
+                if now.duration_since(t) < self.min_interval {
+                    return None;
+                }
             }
         }
 

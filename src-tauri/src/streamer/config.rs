@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use super::session::{
     SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedDisconnectGrace,
-    SharedSessions, SharedVirtualDisplay,
+    SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +101,9 @@ pub struct Config {
     pub turn_url: Option<String>,
     pub turn_username: Option<String>,
     pub turn_credential: Option<String>,
+    pub turn_urls: Vec<String>,
+    pub turn_secret: Option<String>,
+    pub turn_ttl_secs: u64,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub fps: Option<u32>,
@@ -116,6 +119,7 @@ pub struct Config {
     pub device_overrides: Option<SharedDeviceOverrides>,
     pub sessions: Option<SharedSessions>,
     pub disconnect_grace: Option<SharedDisconnectGrace>,
+    pub user_turn: Option<SharedTurnConfig>,
 }
 
 const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
@@ -140,6 +144,9 @@ impl Default for Config {
             turn_url: None,
             turn_username: None,
             turn_credential: None,
+            turn_urls: vec![],
+            turn_secret: None,
+            turn_ttl_secs: 600,
             tls_cert: None,
             tls_key: None,
             fps: None,
@@ -155,6 +162,7 @@ impl Default for Config {
             device_overrides: None,
             sessions: None,
             disconnect_grace: None,
+            user_turn: None,
         }
     }
 }
@@ -219,6 +227,26 @@ impl Config {
                 }
                 "--turn-credential" => {
                     c.turn_credential = val(&args, i);
+                    i += 2;
+                }
+                "--turn-secret" => {
+                    c.turn_secret = val(&args, i).filter(|s| !s.trim().is_empty());
+                    i += 2;
+                }
+                "--turn-urls" => {
+                    if let Some(s) = val(&args, i) {
+                        c.turn_urls = s
+                            .split(',')
+                            .map(|u| u.trim().to_string())
+                            .filter(|u| !u.is_empty())
+                            .collect();
+                    }
+                    i += 2;
+                }
+                "--turn-ttl" => {
+                    if let Some(v) = val(&args, i).and_then(|s| s.parse::<u64>().ok()) {
+                        c.turn_ttl_secs = v.max(60);
+                    }
                     i += 2;
                 }
                 "--tls-cert" => {
@@ -362,9 +390,14 @@ CAPTURE / ENCODE\n\
 \n\
 ICE / TLS\n\
   --stun <a,b,..>         comma-separated STUN urls (default Google STUN)\n\
-  --turn-url <url>        TURN relay url\n\
-  --turn-username <u>     TURN username\n\
-  --turn-credential <c>   TURN credential\n\
+  --turn-url <url>        static TURN relay url\n\
+  --turn-username <u>     static TURN username\n\
+  --turn-credential <c>   static TURN credential\n\
+  --turn-secret <s>       shared secret for our self-hosted TURN (TURN-SERVER/);\n\
+                          enables per-session ephemeral creds (env: SCREENEXTEND_TURN_SECRET)\n\
+  --turn-urls <a,b,..>    TURN urls for the self-hosted relay\n\
+                          (env: SCREENEXTEND_TURN_URLS; default turn.screenextend.app)\n\
+  --turn-ttl <secs>       lifetime of minted TURN credentials (default 600, min 60)\n\
   --tls-cert <path>       PEM certificate (default: cached self-signed)\n\
   --tls-key <path>        PEM private key\n\
 \n\

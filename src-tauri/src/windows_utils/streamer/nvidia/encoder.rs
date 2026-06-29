@@ -388,6 +388,7 @@ impl Encoder {
         config.rcParams.set_enableAQ(0);
         config.rcParams.set_enableTemporalAQ(0);
         config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
+        config.rcParams.set_zeroReorderDelay(1);
 
         let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
         h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
@@ -400,6 +401,8 @@ impl Encoder {
         h264.sliceMode = 3;
         h264.sliceModeData = slice_count;
         h264.maxNumRefFrames = 1;
+        h264.numRefL0 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+        h264.numRefL1 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
         h264.set_repeatSPSPPS(1);
         h264.set_enableFillerDataInsertion(0);
         h264.set_outputBufferingPeriodSEI(0);
