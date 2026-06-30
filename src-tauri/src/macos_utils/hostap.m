@@ -1,3 +1,5 @@
+// FROM https://gist.github.com/wolever/4418079
+
 #import <CoreWLAN/CoreWLAN.h>
 #import <objc/message.h>
 
@@ -65,12 +67,12 @@ int main(int argc, char* argv[]) {
         [NSInvocation invocationWithMethodSignature:signature];
         invocation.target = iface;
         invocation.selector = selector;
-        
+
         [invocation invoke];
         printf("Done?");
-        
+
       //objc_msgSend(iface, @selector(stopHostAPMode));
-        
+
     } else if([command isEqualToString:@"start"]) {
       if(!ssid) {
         printf("error: an ssid must be specified\n");
@@ -100,13 +102,13 @@ int main(int argc, char* argv[]) {
         if ([channel channelNumber] == 11)
           break;
       }
-        
+
         printf("Found Channel: %d\n", channel.channelNumber);
 
         // Start Host AP mode
         NSError *error = nil;
         NSError **errorptr = &error;
-        
+
         SEL selector = @selector(startHostAPModeWithSSID:securityType:channel:password:error:);
         NSMethodSignature *signature = [iface methodSignatureForSelector: selector];
         NSInvocation *invocation =
@@ -121,11 +123,11 @@ int main(int argc, char* argv[]) {
         [invocation setArgument: &channel atIndex:4];
         [invocation setArgument: &pass atIndex:5];
         [invocation setArgument: &errorptr atIndex:6];
-        
+
         [invocation invoke];
         BOOL success;
         [invocation getReturnValue:&success];
-        
+
         if (!success) {
             printf("startHostAPModeWithSSID error: %s\n", [(*errorptr).localizedDescription UTF8String]);
             return 1;

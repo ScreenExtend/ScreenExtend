@@ -4,12 +4,12 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
-use windows_capture::encoder::ImageFormat;
-use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
-use windows_capture::monitor::Monitor;
-use windows_capture::settings::{
+use crate::windows_capture::capture::{Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::encoder::ImageFormat;
+use crate::windows_capture::frame::Frame;
+use crate::windows_capture::graphics_capture_api::InternalCaptureControl;
+use crate::windows_capture::monitor::Monitor;
+use crate::windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
