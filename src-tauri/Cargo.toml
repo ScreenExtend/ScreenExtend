@@ -113,44 +113,62 @@ objc2-foundation = { version = "0.3", features = [
 objc2-core-wlan = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-capture = "2"
 winreg = "0.52.0"
+windows-future = "0.3.2"
+parking_lot = "0.12.5"
+rayon = "1.12.0"
+clap = { version = "4.6.1", features = ["derive"] }
+ctrlc = "3.5.2"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
-    "Data_Xml_Dom",
-    "Devices_Enumeration",
-    "Devices_Radios",
-    "Devices_WiFiDirect",
-    "Foundation",
     "Foundation_Collections",
-    "Networking",
-    "Networking_Connectivity",
-    "Networking_NetworkOperators",
-    "Security_Credentials",
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_Networking_WinSock",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_UI_Shell",
-    "Win32_UI_HiDpi",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_System_ProcessStatus",
     "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Gdi",
+    "Security_Cryptography",
     "Win32_Devices_Display",
-    "Win32_Security",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Networking",
+    "Win32_System_LibraryLoader",
+    "System",
+    "Media_MediaProperties",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Ole",
+    "Security_Credentials",
+    "Devices_WiFiDirect",
+    "Networking_Connectivity",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_System_Threading",
-    "Win32_System_Power",
+    "Storage",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Graphics_Capture",
+    "Win32_Graphics_Direct3D",
+    "Graphics_DirectX_Direct3D11",
+    "Media_Transcoding",
+    "Win32_UI_Shell",
+    "Graphics_Imaging",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_UI_HiDpi",
+    "Networking_NetworkOperators",
+    "Storage_Streams",
+    "Data_Xml_Dom",
+    "Devices_Radios",
+    "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_Media",
+    "Devices_Enumeration",
+    "Win32_Graphics_Dwm",
+    "Foundation_Metadata",
+    "System_Threading",
+    "Foundation",
+    "Win32_Security",
+    "Win32_Networking_WinSock",
+    "Media_Core",
+    "Win32_System_Power",
 ]
 
 [profile.dev.package.objc2]

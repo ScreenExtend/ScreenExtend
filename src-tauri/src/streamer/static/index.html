@@ -56,9 +56,11 @@
             </div>
         </div>
 
-        <canvas id="canvas"></canvas>
-        <video id="video" autoplay playsinline muted></video>
-        <button id="unmute">Tap to start playback</button>
+        <div id="stage">
+            <canvas id="canvas"></canvas>
+            <video id="video" autoplay playsinline muted tabindex="-1" disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback"></video>
+            <button id="unmute">Tap to start playback</button>
+        </div>
 
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
             <div class="card">
@@ -74,6 +76,7 @@
         <script>
             const video = document.getElementById('video');
             let canvas = document.getElementById('canvas');
+            const stage = document.getElementById('stage');
             const unmuteBtn = document.getElementById('unmute');
             const modal = document.getElementById('modal');
             const errEl = document.getElementById('errorMessage');
@@ -207,6 +210,13 @@
             function currentFullscreenEl() {
                 return document.fullscreenElement || document.mozFullScreenElement || document.webkitFullscreenElement || null;
             }
+            function fullscreenTarget() {
+                if (stage.requestFullscreen || stage.webkitRequestFullscreen ||
+                    stage.mozRequestFullScreen || stage.msRequestFullscreen) {
+                    return stage;
+                }
+                return liveEl();
+            }
             function sizeToViewport() {
                 const w = window.innerWidth + 'px';
                 const h = window.innerHeight + 'px';
@@ -248,8 +258,12 @@
                 }
                 if (!gestureHandler) {
                     gestureHandler = () => {
-                        if (!locked || currentFullscreenEl()) return;
-                        enterFullscreen(liveEl()).catch(() => {});
+                        if (!locked) return;
+                        if (currentFullscreenEl()) {
+                            if (!document.pointerLockElement) acquirePointerLock(stage);
+                            return;
+                        }
+                        enterFullscreen(fullscreenTarget()).catch(() => {});
                     };
                     GESTURE_EVENTS.forEach((ev) => window.addEventListener(ev, gestureHandler, { passive: true, capture: true }));
                 }
@@ -277,7 +291,7 @@
                     if (!locked || document.visibilityState !== 'visible') return;
                     await acquireWakeLock();
                     await acquireKeyboardLock();
-                    if (!currentFullscreenEl()) { try { await enterFullscreen(liveEl()); } catch (_) {} }
+                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
 
@@ -288,12 +302,12 @@
                     if (currentFullscreenEl()) {
                         exitViewportMode();
                         clearViewportSize();
-                        acquirePointerLock(liveEl());
+                        acquirePointerLock(stage);
                         await acquireKeyboardLock();
                         await acquireWakeLock();
                     } else {
                         enterViewportMode();
-                        try { await enterFullscreen(liveEl()); } catch (_) {}
+                        try { await enterFullscreen(fullscreenTarget()); } catch (_) {}
                     }
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
@@ -303,13 +317,13 @@
                 window.addEventListener('beforeunload', beforeUnloadHandler);
 
                 await acquireWakeLock();
-                await enterFullscreen(el).catch(() => {});
+                await enterFullscreen(fullscreenTarget()).catch(() => {});
 
                 if (currentFullscreenEl()) {
                     exitViewportMode();
                     clearViewportSize();
                     await new Promise((r) => setTimeout(r, 120));
-                    acquirePointerLock(liveEl());
+                    acquirePointerLock(stage);
                     await acquireKeyboardLock();
                 } else {
                     enterViewportMode();
@@ -332,7 +346,7 @@
                 if (document.exitPointerLock) document.exitPointerLock();
                 else if (document.mozExitPointerLock) document.mozExitPointerLock();
                 else if (document.webkitExitPointerLock) document.webkitExitPointerLock();
-                [canvas, video].forEach((el) => { el.style.cursor = ''; el.style.userSelect = ''; el.style.webkitUserSelect = ''; el.style.mozUserSelect = ''; el.style.msUserSelect = ''; });
+                [canvas, video, stage].forEach((el) => { el.style.cursor = ''; el.style.userSelect = ''; el.style.webkitUserSelect = ''; el.style.mozUserSelect = ''; el.style.msUserSelect = ''; });
 
                 if (currentFullscreenEl()) {
                     try {

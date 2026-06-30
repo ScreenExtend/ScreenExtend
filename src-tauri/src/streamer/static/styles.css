@@ -11,14 +11,23 @@ html, body {
     font: 14px / 1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
 }
 
-#video, #canvas {
+#stage {
     position: fixed;
     inset: 0;
-    width: 100vw;
-    height: 100vh;
+    background: #000;
+}
+
+#video, #canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     background: #000;
     display: none;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
 }
 
 #unmute {

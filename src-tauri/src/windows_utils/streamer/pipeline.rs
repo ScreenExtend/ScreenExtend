@@ -10,17 +10,17 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::core::Interface;
-use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
-use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
-use windows_capture::settings::{
+use crate::windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::frame::Frame;
+use crate::windows_capture::graphics_capture_api::InternalCaptureControl;
+use crate::windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
 use super::capture::{MonitorInfo, select_monitor, select_monitor_by_device_name};
-use windows_capture::monitor::Monitor;
+use crate::windows_capture::monitor::Monitor;
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
