@@ -3,26 +3,33 @@ use std::io::Write as _;
 use std::ptr;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
+    D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
+    ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+    CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
+    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
 };
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 
 use crate::streamer::config::H264Profile;
 use super::super::nvidia::encoder::EncoderConfig;
 use super::intel_sys::*;
 
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
+const KEY_WRITER: u64 = 0;
+const KEY_ENCODER: u64 = 1;
+const KEY_TIMEOUT_MS: u32 = 1000;
+const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1; // `DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE`
 
 #[derive(Clone, Copy)]
 enum SurfaceKind {
@@ -36,12 +43,107 @@ fn align_up_u16(v: u32, a: u32) -> u16 {
     (((v + a - 1) / a) * a) as u16
 }
 
+struct InputBridge {
+    enc_tex: ID3D11Texture2D,
+    enc_mutex: IDXGIKeyedMutex,
+    cap_context: ID3D11DeviceContext,
+    cap_tex: ID3D11Texture2D,
+    cap_mutex: IDXGIKeyedMutex,
+    shared_handle: HANDLE,
+}
+
+impl InputBridge {
+    fn new(
+        enc_device: &ID3D11Device,
+        cap_device: &ID3D11Device,
+        cap_context: &ID3D11DeviceContext,
+        w: u32,
+        h: u32,
+    ) -> Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0
+                | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0) as u32,
+        };
+        let mut enc_tex: Option<ID3D11Texture2D> = None;
+        unsafe { enc_device.CreateTexture2D(&desc, None, Some(&mut enc_tex)) }
+            .context("CreateTexture2D (Quick Sync input bridge, encode side)")?;
+        let enc_tex = enc_tex.context("bridge texture was null")?;
+
+        let resource: IDXGIResource1 = enc_tex
+            .cast()
+            .context("bridge texture as IDXGIResource1 (is it SHARED_NTHANDLE?)")?;
+        let shared_handle =
+            unsafe { resource.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_RW, PCWSTR::null()) }
+                .context("IDXGIResource1::CreateSharedHandle (Quick Sync input bridge)")?;
+        let enc_mutex: IDXGIKeyedMutex = enc_tex
+            .cast()
+            .context("bridge texture as IDXGIKeyedMutex (encode side)")?;
+
+        let cap_device1: ID3D11Device1 =
+            cap_device.cast().context("capture device as ID3D11Device1")?;
+        let cap_tex: ID3D11Texture2D = unsafe { cap_device1.OpenSharedResource1(shared_handle) }
+            .inspect_err(|_| unsafe {
+                let _ = CloseHandle(shared_handle);
+            })
+            .context("OpenSharedResource1 (Quick Sync input bridge, capture side)")?;
+        let cap_mutex: IDXGIKeyedMutex = cap_tex
+            .cast()
+            .context("bridge texture as IDXGIKeyedMutex (capture side)")?;
+
+        Ok(Self {
+            enc_tex,
+            enc_mutex,
+            cap_context: cap_context.clone(),
+            cap_tex,
+            cap_mutex,
+            shared_handle,
+        })
+    }
+
+    unsafe fn upload(&self, src: &ID3D11Texture2D, w: u32, h: u32) -> Result<()> {
+        unsafe { self.cap_mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+            .context("Quick Sync bridge AcquireSync(writer)")?;
+        let copy = (|| -> Result<()> {
+            let dst_res: ID3D11Resource =
+                self.cap_tex.cast().context("bridge texture as ID3D11Resource")?;
+            let src_res: ID3D11Resource =
+                src.cast().context("source texture as ID3D11Resource")?;
+            let box_ = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+            unsafe {
+                self.cap_context
+                    .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                self.cap_context.Flush();
+            }
+            Ok(())
+        })();
+        let _ = unsafe { self.cap_mutex.ReleaseSync(KEY_ENCODER) };
+        copy
+    }
+}
+
+impl Drop for InputBridge {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.shared_handle);
+        }
+    }
+}
+
 pub struct Encoder {
     vpl: Vpl,
     session: mfxSession,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-
+    bridge: Option<InputBridge>,
     enc_param: mfxVideoParam,
     enc_frame_info: mfxFrameInfo,
 
@@ -82,17 +184,27 @@ impl Encoder {
             );
         }
 
+        let (src_w, src_h) = (native_w.max(config.width), native_h.max(config.height));
+
         let creation_flags = unsafe { device.GetCreationFlags() };
-        if creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32 == 0 {
-            bail!(
-                "capture D3D11 device was created without VIDEO_SUPPORT; the oneVPL same-adapter \
-                 Quick Sync path would fault in MFXVideoVPP_Init — use a dedicated Intel device"
+        let capture_has_video = creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32 != 0;
+        let (enc_device, enc_context, bridge) = if capture_has_video {
+            (device.clone(), context.clone(), None)
+        } else {
+            let (enc_device, enc_context) = create_intel_d3d11_device_for(device)
+                .context("creating a dedicated Intel device (capture device lacks VIDEO_SUPPORT)")?;
+            let bridge = InputBridge::new(&enc_device, device, context, src_w, src_h)
+                .context("building the same-adapter Quick Sync input bridge")?;
+            tprintln!(
+                "Intel Quick Sync: capture device lacks VIDEO_SUPPORT; routing through a dedicated \
+                 Intel device via a same-adapter shared-texture bridge ({src_w}x{src_h})"
             );
-        }
+            (enc_device, enc_context, Some(bridge))
+        };
 
         let vpl = Vpl::load()?;
 
-        if let Ok(mt) = context.cast::<ID3D11Multithread>() {
+        if let Ok(mt) = enc_context.cast::<ID3D11Multithread>() {
             let _ = unsafe { mt.SetMultithreadProtected(true) };
         }
 
@@ -103,7 +215,7 @@ impl Encoder {
                 (vpl.MFXVideoCORE_SetHandle)(
                     session,
                     MFX_HANDLE_D3D11_DEVICE,
-                    device.as_raw() as mfxHDL,
+                    enc_device.as_raw() as mfxHDL,
                 )
             },
             "MFXVideoCORE_SetHandle(D3D11_DEVICE)",
@@ -115,13 +227,13 @@ impl Encoder {
         let fps = config.fps.max(1);
         let coded_w = align_up_u16(config.width, 16);
         let coded_h = align_up_u16(config.height, 16);
-        let (src_w, src_h) = (native_w.max(config.width), native_h.max(config.height));
 
         let mut this = Self {
             vpl,
             session,
-            device: device.clone(),
-            context: context.clone(),
+            device: enc_device,
+            context: enc_context,
+            bridge,
             enc_param: unsafe { std::mem::zeroed() },
             enc_frame_info: unsafe { std::mem::zeroed() },
             bitstream_buf: Vec::new(),
@@ -527,7 +639,6 @@ impl Encoder {
         let dst = unsafe { ID3D11Texture2D::from_raw_borrowed(&dst_ptr) }
             .ok_or_else(|| anyhow!("GetNativeHandle returned null texture"))?;
         let dst_res: ID3D11Resource = dst.cast().context("VPP input texture as ID3D11Resource")?;
-        let src_res: ID3D11Resource = src.cast().context("source texture as ID3D11Resource")?;
         let box_ = D3D11_BOX {
             left: 0,
             top: 0,
@@ -536,10 +647,34 @@ impl Encoder {
             bottom: self.src_h,
             back: 1,
         };
-        unsafe {
-            self.context
-                .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
-            self.context.Flush();
+
+        match &self.bridge {
+            None => {
+                let src_res: ID3D11Resource =
+                    src.cast().context("source texture as ID3D11Resource")?;
+                unsafe {
+                    self.context
+                        .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                    self.context.Flush();
+                }
+            }
+            Some(bridge) => {
+                unsafe { bridge.upload(src, self.src_w, self.src_h)? };
+                unsafe { bridge.enc_mutex.AcquireSync(KEY_ENCODER, KEY_TIMEOUT_MS) }
+                    .context("Quick Sync bridge AcquireSync(encoder)")?;
+                let copy = (|| -> Result<()> {
+                    let src_res: ID3D11Resource =
+                        bridge.enc_tex.cast().context("bridge texture as ID3D11Resource")?;
+                    unsafe {
+                        self.context
+                            .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                        self.context.Flush();
+                    }
+                    Ok(())
+                })();
+                let _ = unsafe { bridge.enc_mutex.ReleaseSync(KEY_WRITER) };
+                copy?;
+            }
         }
         Ok(())
     }
@@ -719,30 +854,61 @@ fn create_session(vpl: &Vpl) -> Result<mfxSession> {
 }
 
 pub(crate) fn create_intel_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    create_intel_d3d11_device_inner(None)
+}
+
+fn create_intel_d3d11_device_for(
+    capture: &ID3D11Device,
+) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    create_intel_d3d11_device_inner(adapter_luid(capture))
+}
+
+fn create_intel_d3d11_device_inner(
+    prefer_luid: Option<LUID>,
+) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
         let mut chosen: Option<IDXGIAdapter1> = None;
+        let mut by_name: Option<(u32, String, IDXGIAdapter1)> = None;
         let mut i = 0u32;
         while let Ok(adapter) = factory.EnumAdapters1(i) {
+            let idx = i;
+            i += 1;
             let desc = adapter.GetDesc1().context("IDXGIAdapter1::GetDesc1")?;
             let is_software =
                 (DXGI_ADAPTER_FLAG(desc.Flags as i32).0 & DXGI_ADAPTER_FLAG_SOFTWARE.0) != 0;
-            let name = String::from_utf16_lossy(
-                &desc.Description[..desc
-                    .Description
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(desc.Description.len())],
-            );
-            if !is_software && name.to_uppercase().contains("INTEL") {
-                tprintln!("selected Intel adapter for Quick Sync (index={i}, name={name})");
-                chosen = Some(adapter);
-                break;
+            if is_software {
+                continue;
             }
-            i += 1;
+            let name = adapter_name(&desc);
+            if let Some(want) = prefer_luid {
+                if luid_eq(desc.AdapterLuid, want) {
+                    tprintln!(
+                        "selected Intel adapter for Quick Sync by LUID match (index={idx}, name={name})"
+                    );
+                    chosen = Some(adapter);
+                    break;
+                }
+            }
+            if by_name.is_none() && name.to_uppercase().contains("INTEL") {
+                if prefer_luid.is_none() {
+                    tprintln!("selected Intel adapter for Quick Sync (index={idx}, name={name})");
+                    chosen = Some(adapter);
+                    break;
+                }
+                by_name = Some((idx, name, adapter));
+            }
         }
-        let adapter = chosen
-            .ok_or_else(|| anyhow!("no Intel adapter found; Quick Sync requires an Intel GPU"))?;
+        let adapter = match chosen {
+            Some(a) => a,
+            None => {
+                let (idx, name, a) = by_name.ok_or_else(|| {
+                    anyhow!("no Intel adapter found; Quick Sync requires an Intel GPU")
+                })?;
+                tprintln!("selected Intel adapter for Quick Sync (index={idx}, name={name})");
+                a
+            }
+        };
 
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
         let mut device: Option<ID3D11Device> = None;
@@ -764,6 +930,27 @@ pub(crate) fn create_intel_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceC
             context.context("D3D11CreateDevice returned no context")?,
         ))
     }
+}
+
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..end])
+}
+
+fn adapter_luid(device: &ID3D11Device) -> Option<LUID> {
+    let dxgi: IDXGIDevice = device.cast().ok()?;
+    let adapter = unsafe { dxgi.GetAdapter() }.ok()?;
+    let desc = unsafe { adapter.GetDesc() }.ok()?;
+    Some(desc.AdapterLuid)
+}
+
+#[inline]
+fn luid_eq(a: LUID, b: LUID) -> bool {
+    a.LowPart == b.LowPart && a.HighPart == b.HighPart
 }
 
 pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Result<()> {

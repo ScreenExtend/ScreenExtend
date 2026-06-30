@@ -4,6 +4,7 @@ pub mod networking;
 pub mod streamer;
 pub mod virtual_display;
 pub mod driver_ipc;
+pub mod windows_capture;
 
 use elevated_command::Command;
 use std::collections::HashMap;

@@ -29,6 +29,7 @@ pub struct Scaler {
     dst_w: u32,
     dst_h: u32,
     cached_in_view: Option<(*mut core::ffi::c_void, ID3D11VideoProcessorInputView)>,
+    cached_out_view: Option<(*mut core::ffi::c_void, ID3D11VideoProcessorOutputView)>,
 }
 
 unsafe impl Send for Scaler {}
@@ -112,53 +113,95 @@ impl Scaler {
             dst_w,
             dst_h,
             cached_in_view: None,
+            cached_out_view: None,
         })
     }
 
     pub fn scale(&mut self, src: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
-        let key = src.as_raw();
-        let in_view = match &self.cached_in_view {
-            Some((cached_key, view)) if *cached_key == key => view.clone(),
-            _ => {
-                let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                    FourCC: 0,
-                    ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                    ..Default::default()
-                };
-                let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
-                unsafe {
-                    self.video_device.CreateVideoProcessorInputView(
-                        src,
-                        &self.enumerator,
-                        &in_desc,
-                        Some(&mut in_view),
-                    )
-                }
-                .context("CreateVideoProcessorInputView")?;
-                let in_view = in_view.context("scaler input view was null")?;
-                self.cached_in_view = Some((key, in_view.clone()));
-                in_view
-            }
-        };
+        let in_view = self.input_view(src)?;
+        self.run_blt(in_view, &self.out_view)?;
+        Ok(&self.dst)
+    }
 
+    pub fn scale_into(&mut self, src: &ID3D11Texture2D, dst: &ID3D11Texture2D) -> Result<()> {
+        let in_view = self.input_view(src)?;
+        let out_view = self.output_view_for(dst)?;
+        self.run_blt(in_view, &out_view)
+    }
+
+    fn input_view(&mut self, src: &ID3D11Texture2D) -> Result<ID3D11VideoProcessorInputView> {
+        let key = src.as_raw();
+        if let Some((cached_key, view)) = &self.cached_in_view {
+            if *cached_key == key {
+                return Ok(view.clone());
+            }
+        }
+        let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorInputView(
+                src,
+                &self.enumerator,
+                &in_desc,
+                Some(&mut in_view),
+            )
+        }
+        .context("CreateVideoProcessorInputView")?;
+        let in_view = in_view.context("scaler input view was null")?;
+        self.cached_in_view = Some((key, in_view.clone()));
+        Ok(in_view)
+    }
+
+    fn output_view_for(
+        &mut self,
+        dst: &ID3D11Texture2D,
+    ) -> Result<ID3D11VideoProcessorOutputView> {
+        let key = dst.as_raw();
+        if let Some((cached_key, view)) = &self.cached_out_view {
+            if *cached_key == key {
+                return Ok(view.clone());
+            }
+        }
+        let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let mut out_view: Option<ID3D11VideoProcessorOutputView> = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorOutputView(
+                dst,
+                &self.enumerator,
+                &out_desc,
+                Some(&mut out_view),
+            )
+        }
+        .context("CreateVideoProcessorOutputView (external target)")?;
+        let out_view = out_view.context("external scaler output view was null")?;
+        self.cached_out_view = Some((key, out_view.clone()));
+        Ok(out_view)
+    }
+
+    fn run_blt(
+        &self,
+        in_view: ID3D11VideoProcessorInputView,
+        out_view: &ID3D11VideoProcessorOutputView,
+    ) -> Result<()> {
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
         stream.Enable = true.into();
         stream.pInputSurface = core::mem::ManuallyDrop::new(Some(in_view));
 
         let result = unsafe {
-            self.video_ctx.VideoProcessorBlt(
-                &self.processor,
-                &self.out_view,
-                0,
-                std::slice::from_ref(&stream),
-            )
+            self.video_ctx
+                .VideoProcessorBlt(&self.processor, out_view, 0, std::slice::from_ref(&stream))
         };
         unsafe {
             core::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
         }
-        result.context("VideoProcessorBlt")?;
-
-        Ok(&self.dst)
+        result.context("VideoProcessorBlt")
     }
 
     pub fn read_back(&mut self) -> Result<(&[u8], u32)> {
