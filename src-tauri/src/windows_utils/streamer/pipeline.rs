@@ -747,9 +747,17 @@ impl Backend {
         matches!(self, Backend::Nvenc { path: EncodePath::CpuBridge, .. } | Backend::IntelCpu { .. })
     }
 
-    fn encode_gpu(&mut self, src_texture: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<u8>> {
+    fn encode_gpu(
+        &mut self,
+        raw: &ID3D11Texture2D,
+        scaler: Option<&mut Scaler>,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
         match self {
-            Backend::Intel { encoder } => encoder.encode_texture(src_texture, force_idr),
+            Backend::Intel { encoder } => {
+                debug_assert!(scaler.is_none(), "Intel fuses scaling in VPP; no prescaler expected");
+                encoder.encode_texture(raw, force_idr)
+            }
             Backend::Nvenc {
                 encoder,
                 path: EncodePath::ZeroCopy { igpu_context, shared_igpu, igpu_mutex },
@@ -758,11 +766,17 @@ impl Backend {
                     igpu_mutex
                         .AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS)
                         .context("iGPU keyed mutex AcquireSync(writer)")?;
-                    igpu_context.CopyResource(&*shared_igpu, src_texture);
+                    let staged = match scaler {
+                        Some(s) => s.scale_into(raw, &*shared_igpu),
+                        None => {
+                            igpu_context.CopyResource(&*shared_igpu, raw);
+                            Ok(())
+                        }
+                    };
                     igpu_context.Flush();
-                    igpu_mutex
-                        .ReleaseSync(KEY_ENCODER)
-                        .context("iGPU keyed mutex ReleaseSync(encoder)")?;
+                    let released = igpu_mutex.ReleaseSync(KEY_ENCODER);
+                    staged.context("staging frame into shared NVENC input")?;
+                    released.context("iGPU keyed mutex ReleaseSync(encoder)")?;
                 }
                 encoder.encode_input(force_idr)
             }
@@ -824,11 +838,7 @@ impl EncodeCore {
                 backend.encode_cpu(fb.as_raw_buffer(), row_pitch, force_idr)?
             }
         } else {
-            let src_texture: ID3D11Texture2D = match scaler {
-                Some(s) => s.scale(frame.as_raw_texture())?.clone(),
-                None => frame.as_raw_texture().clone(),
-            };
-            backend.encode_gpu(&src_texture, force_idr)?
+            backend.encode_gpu(frame.as_raw_texture(), scaler.as_mut(), force_idr)?
         };
 
         self.have_frame = true;
@@ -854,11 +864,7 @@ impl EncodeCore {
             };
             backend.encode_cpu(data, row_pitch, force_idr)?
         } else {
-            let src_texture: ID3D11Texture2D = match scaler {
-                Some(s) => s.scale(tex)?.clone(),
-                None => tex.clone(),
-            };
-            backend.encode_gpu(&src_texture, force_idr)?
+            backend.encode_gpu(tex, scaler.as_mut(), force_idr)?
         };
 
         self.have_frame = true;
