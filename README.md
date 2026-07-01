@@ -13,6 +13,16 @@ A free desktop‑extension solution that turns any device with a web browser int
 
 ---
 
+## How to use
+
+Run ScreenExtend on the **host** (the PC you want to extend). It launches straight into the app, installing its virtual display driver on first run if needed. From there, everything happens across three screens:
+
+- **Add Device** (the home screen). Shows a QR code and URL for each network the host is on, plus an "Anywhere (Internet)" tile for joining across different networks. On your client device (phone, tablet, laptop, etc), scan the QR or open the URL in a browser, enter the 6‑digit session OTP, and submit. The host spins up a virtual display for it and the client becomes a fullscreen extended monitor.
+- **Edit Device.** Lists every connected device with its live settings. Open a device to adjust its resolution scale, orientation, refresh rate, and video scale/quality, or to remove it. The **Display Settings** button opens your OS display settings so you can rearrange where each extended screen sits.
+- **Settings.** View and regenerate the **session OTP**, start an offline **hosted network** so devices can join with no router, set the **disconnect timeout** (how long a display is kept when a device drops), configure a **TURN server** for cross‑network connections, change your display name, and read the live logs.
+
+In short: pick a network on **Add Device**, join from the client's browser with the OTP, then manage everything from **Edit Device** and **Settings**.
+
 ## Overview
 
 ScreenExtend runs as a desktop app on the **host** machine (the computer whose screen you want to extend). The host advertises a session over your local network. Any **client** (phone, tablet, laptop, spare PC, etc) joins simply by opening a URL or scanning a QR code in its browser. The host then spins up a real virtual display for that client and streams it over WebRTC, so the client behaves like a genuine extended monitor: drag windows onto it, move your cursor across it, and work on the extra space.
