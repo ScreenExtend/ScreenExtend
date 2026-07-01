@@ -94,8 +94,8 @@ ScreenExtend encodes captured displays with the host GPU. The matrix below lists
 | NVENC | NVIDIA | ➖ |   | ✅ |
 | Quick Sync | Intel | ➖ |   | ✅ |
 | Media Foundation | Qualcomm |   |   | ➖ |
-| Video Toolbox | Apple |   | ➖ |   |
-| | Intel |   | ➖ |   |
+| Video Toolbox | Apple |   | ✅ |   |
+| | Intel |   | ✅ |   |
 | Software | Any | ➖ | ➖ | ➖ |
 
 ✅ Supported &nbsp;·&nbsp; 🟡 In progress &nbsp;·&nbsp; ➖ Not supported
