@@ -9,7 +9,7 @@ A free desktop‑extension solution that turns any device with a web browser int
 </div>
 
 > [!WARNING]
-> Current builds support **Windows hosts with an NVIDIA or Intel GPU** (NVENC / QSV), and are not yet widely tested. Use at your own risk. macOS and Linux host support is scaffolded but not yet functional, and the AMD encoder is stubbed out (see [Platform support](#platform-support)).
+> Current builds support **Windows hosts with an NVIDIA or Intel GPU and Mac hosts** (NVENC / QSV), and are not yet widely tested. Use at your own risk. Linux host support is scaffolded but not yet functional, and the AMD encoder is stubbed out (see [Platform support](#platform-support)).
 
 ---
 
@@ -92,7 +92,7 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA/Intel only.
 
-**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64‑bit (x86‑64) machines are supported.
+**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64‑bit (x86‑64) machines are supported. MacOS Catalina 10.15+.
 
 ### Hardware encoder support
 
