@@ -1,6 +1,6 @@
 [package]
 name = "screenextend"
-version = "0.2.4"
+version = "0.2.5"
 description = "ScreenExtend"
 authors = ["Sarvesh Madullapalli"]
 edition = "2021"
