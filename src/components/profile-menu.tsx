@@ -12,17 +12,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from "@/components/ui/alert-dialog";
 
 import { updateConfig, getConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
@@ -31,9 +20,7 @@ import defaultLogo from "@/assets/default.svg";
 
 export function ProfileMenu() {
   const { windowClosing: [closing, setClosing] } = useContext(GlobalProviderContext);
-  const [disabled, setDisabled] = useState(false);
   const [background, setBackground] = useState(false);
-  const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
 
   useEffect(() => {
@@ -83,46 +70,15 @@ export function ProfileMenu() {
           </DropdownMenuItem>
           <DropdownMenuItem
             className="cursor-pointer"
-            onClick={(event: React.MouseEvent<HTMLDivElement>) => {
-              event.preventDefault();
+            onClick={async () => {
+              setClosing(true);
+              await commands.removeDrivers();
+              await commands.stopHostedNetwork();
+              await commands.exitApp();
             }}
           >
             <Trash2 className="mr-2 h-4 w-4" />
-            <AlertDialog open={open}>
-              <AlertDialogTrigger asChild onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
-                event.preventDefault();
-                setDisabled(false);
-                setOpen(true);
-              }}>
-                <span style={{ color: "red" }}><b>Uninstall Drivers</b></span>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Uninstall Drivers</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    This will remove ScreenExtend drivers and associated local data from this computer. This action cannot be undone.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel disabled={disabled} className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50" onClick={() => setOpen(false)}>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    className="bg-red-600 hover:bg-red-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
-                    onClick={async (event: React.MouseEvent<HTMLButtonElement>) => {
-                      event.preventDefault();
-                      setDisabled(true);
-                      await commands.removeDrivers();
-                      setOpen(false);
-                      setClosing(true);
-                      await commands.stopHostedNetwork();
-                      await commands.exitApp();
-                    }}
-                    disabled={disabled}
-                  >
-                    Continue
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
+            <span style={{ color: "red" }}><b>Uninstall Drivers</b></span>
           </DropdownMenuItem>
         </DropdownMenuGroup>
       </DropdownMenuContent>
