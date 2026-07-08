@@ -7,7 +7,8 @@ export const GlobalContextDefault = {
   sessionId: "",
   qrValues: [] as { title: string, value: string }[],
   loaded: false,
-  devices: [] as Device[]
+  devices: [] as Device[],
+  publicSessionsEnabled: true
 };
 
 export type GlobalContextType = {
@@ -17,7 +18,8 @@ export type GlobalContextType = {
   windowQrValues: [{ title: string, value: string }[], React.Dispatch<React.SetStateAction<{ title: string, value: string }[]>>],
   windowLoaded: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
   windowClosing: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
-  windowDevices: [Device[], React.Dispatch<React.SetStateAction<Device[]>>]
+  windowDevices: [Device[], React.Dispatch<React.SetStateAction<Device[]>>],
+  windowPublicSessionsEnabled: [boolean, React.Dispatch<React.SetStateAction<boolean>>]
 }
 
 export const GlobalProviderContext = createContext<GlobalContextType>({
@@ -27,5 +29,6 @@ export const GlobalProviderContext = createContext<GlobalContextType>({
   windowQrValues: [[] as { title: string, value: string }[], () => {}],
   windowLoaded: [false, () => {}],
   windowClosing: [false, () => {}],
-  windowDevices: [[] as Device[], () => {}]
+  windowDevices: [[] as Device[], () => {}],
+  windowPublicSessionsEnabled: [true, () => {}]
 });

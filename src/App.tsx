@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Route,
   RouterProvider,
@@ -12,11 +12,12 @@ import Settings from "@/pages/settings";
 import Devices from "@/pages/devices";
 import { Loader2 } from "lucide-react";
 
-import { type Device } from "@/components/config-provider";
+import { getSavedDevices, getConfig, type Device } from "@/components/config-provider";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
+import { buildQrValues } from "@/lib/utils";
 import { useToast } from "@/components/ui/use-toast";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
@@ -39,8 +40,12 @@ function App() {
   const [qrValues, setQrValues] = useState([] as { title: string; value: string; }[]);
   const [loaded, setLoaded] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
 
   const [closing, setClosing] = useState(false);
+
+  const sessionIdRef = useRef(sessionId);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
   const { toast } = useToast();
 
@@ -62,11 +67,13 @@ function App() {
   useEffect(() => {
     const unlisteners: (() => void)[] = [];
     const start_listener = async () => {
-      unlisteners.push(await events.deviceJoin.listen(event => {
+      unlisteners.push(await events.deviceJoin.listen(async event => {
         const device = event.payload as Device;
+        const saved = (await getSavedDevices()).find(d => d.ip === device.ip);
+        const merged = saved && saved.name ? { ...device, name: saved.name } : device;
         setDevices(prev => {
-          const next = prev.filter(d => d.ip !== device.ip);
-          next.push(device);
+          const next = prev.filter(d => d.ip !== merged.ip);
+          next.push(merged);
           return next;
         });
       }));
@@ -84,6 +91,19 @@ function App() {
           title: "Network Created Without Password",
           description: "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it.",
         });
+      }));
+      unlisteners.push(await events.sessionIdChange.listen(async event => {
+        const newId = (event.payload as { sessionId: string }).sessionId;
+        if (!newId) return;
+        setSessionId(newId);
+        const cfg = await getConfig();
+        setQrValues(await buildQrValues(newId, cfg?.serverPorts?.http));
+      }));
+      unlisteners.push(await events.networkChange.listen(async () => {
+        const id = sessionIdRef.current;
+        if (!id) return;
+        const cfg = await getConfig();
+        setQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
       }));
     }
     void start_listener();
@@ -106,7 +126,8 @@ function App() {
       windowQrValues: [qrValues, setQrValues],
       windowLoaded: [loaded, setLoaded],
       windowClosing: [closing, setClosing],
-      windowDevices: [devices, setDevices]
+      windowDevices: [devices, setDevices],
+      windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled]
     }}>
       <ThemeProvider defaultTheme="system">
           <RouterProvider router={router} />

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,38 @@ pub const MAX_DISCONNECT_GRACE_SECS: u64 = 600;
 
 pub fn new_shared_disconnect_grace() -> SharedDisconnectGrace {
     Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_DISCONNECT_GRACE_SECS))
+}
+
+pub const DEFAULT_HTTP_PORT: u16 = 8080;
+pub const DEFAULT_HTTPS_PORT: u16 = 8443;
+
+#[derive(Debug)]
+pub struct ServerPortState {
+    pub http: AtomicU16,
+    pub https: AtomicU16,
+}
+
+pub type SharedServerPorts = Arc<ServerPortState>;
+
+pub fn new_shared_server_ports() -> SharedServerPorts {
+    Arc::new(ServerPortState {
+        http: AtomicU16::new(DEFAULT_HTTP_PORT),
+        https: AtomicU16::new(DEFAULT_HTTPS_PORT),
+    })
+}
+
+impl ServerPortState {
+    pub fn get(&self) -> (u16, u16) {
+        (
+            self.http.load(Ordering::Relaxed),
+            self.https.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn set(&self, http: u16, https: u16) {
+        self.http.store(http, Ordering::Relaxed);
+        self.https.store(https, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

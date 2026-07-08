@@ -5,7 +5,7 @@ import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Eye, EyeOff, Info, RefreshCw } from "lucide-react";
+import { Eye, EyeOff, RefreshCw } from "lucide-react";
 import {
   InputOTP,
   InputOTPGroup,
@@ -18,12 +18,6 @@ import {
   CardTitle
 } from "@/components/ui/card";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -35,22 +29,21 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig } from "@/components/config-provider";
+import { updateConfig, getConfig, flushConfig, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
-import { cn } from "@/lib/utils";
+import { cn, buildQrValues } from "@/lib/utils";
 import { type as getOsType } from "@tauri-apps/plugin-os";
 
 const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 
 export default function Settings() {
-  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn] } = useContext(GlobalProviderContext);
+  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
 
   const [spin, setSpin] = useState(false);
-  const [hostedNetworkTooltipOpen, setHostedNetworkTooltipOpen] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState("");
   const [hostedNetworkPassword, setHostedNetworkPassword] = useState("");
   const [oldHostedNetworkName, setOldHostedNetworkName] = useState("");
@@ -65,12 +58,14 @@ export default function Settings() {
   const [accountName, setAccountName] = useState("");
   const [disconnectGrace, setDisconnectGrace] = useState("");
   const [oldDisconnectGrace, setOldDisconnectGrace] = useState("");
-  const [disconnectGraceTooltipOpen, setDisconnectGraceTooltipOpen] = useState(false);
   const [turnUrls, setTurnUrls] = useState("");
   const [turnUsername, setTurnUsername] = useState("");
   const [turnCredential, setTurnCredential] = useState("");
   const [showTurnCredential, setShowTurnCredential] = useState(false);
-  const [turnTooltipOpen, setTurnTooltipOpen] = useState(false);
+  const [httpPort, setHttpPort] = useState(String(DEFAULT_HTTP_PORT));
+  const [httpsPort, setHttpsPort] = useState(String(DEFAULT_HTTPS_PORT));
+  const [oldHttpPort, setOldHttpPort] = useState(String(DEFAULT_HTTP_PORT));
+  const [oldHttpsPort, setOldHttpsPort] = useState(String(DEFAULT_HTTPS_PORT));
   const [configLoaded, setConfigLoaded] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -102,6 +97,11 @@ export default function Settings() {
       setTurnUrls(turn.urls);
       setTurnUsername(turn.username);
       setTurnCredential(turn.credential);
+      const ports = config.serverPorts ?? { http: DEFAULT_HTTP_PORT, https: DEFAULT_HTTPS_PORT };
+      setHttpPort(String(ports.http));
+      setHttpsPort(String(ports.https));
+      setOldHttpPort(String(ports.http));
+      setOldHttpsPort(String(ports.https));
       const seconds = await commands.getDisconnectGrace();
       setDisconnectGrace(String(seconds));
       setOldDisconnectGrace(String(seconds));
@@ -142,6 +142,53 @@ export default function Settings() {
       description: urls
         ? "Devices on other networks will now relay through this TURN server. It applies on the next connection."
         : "No TURN server is configured. Connections across different networks may fail.",
+    });
+  };
+
+  const togglePublicSessions = async (enabled: boolean) => {
+    setPublicSessionsEnabled(enabled);
+    await updateConfig({ publicSessionsEnabled: enabled });
+    await flushConfig();
+    if (enabled) {
+      if (sessionId) void commands.registerCloudSession(sessionId);
+      toast({
+        title: "Public Sessions Enabled",
+        description: "Devices on other networks can now join over the internet using your session link on the Add Device screen.",
+      });
+    } else {
+      void commands.unregisterCloudSession();
+      toast({
+        title: "Public Sessions Disabled",
+        description: "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app.",
+      });
+    }
+  };
+
+  const saveServerPorts = async () => {
+    const http = Math.round(Number(httpPort));
+    const https = Math.round(Number(httpsPort));
+    const isValid = (p: number) => Number.isInteger(p) && p >= 1 && p <= 65535;
+    if (!isValid(http) || !isValid(https) || http === https) {
+      setHttpPort(oldHttpPort);
+      setHttpsPort(oldHttpsPort);
+      toast({
+        title: "Invalid Ports",
+        description: "Enter two different port numbers between 1 and 65535 for HTTP and HTTPS.",
+      });
+      return;
+    }
+    if (String(http) === oldHttpPort && String(https) === oldHttpsPort) return;
+    const applied = await commands.setServerPorts(http, https);
+    setHttpPort(String(applied.http));
+    setHttpsPort(String(applied.https));
+    setOldHttpPort(String(applied.http));
+    setOldHttpsPort(String(applied.https));
+    await updateConfig({ serverPorts: { http: applied.http, https: applied.https } });
+    await flushConfig();
+    if (sessionId) setQrValues(await buildQrValues(sessionId, applied.http));
+    toast({
+      title: "Server Ports Updated",
+      description: `Local network streaming now uses HTTP port ${applied.http} and HTTPS port ${applied.https}. Connected devices were disconnected and must rejoin using the updated links.`,
     });
   };
 
@@ -233,10 +280,40 @@ export default function Settings() {
         <div className="mb-4">
           <Card>
             <CardHeader>
-              <CardTitle>Create Hosted Network</CardTitle>
+              <CardTitle className="flex flex-row items-center">
+                Public Internet Sessions
+              </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="flex items-center space-x-4 border-b p-3 px-0">
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <div className="flex-1 space-y-1">
+                  <p className="text-sm font-medium leading-none">
+                    {publicSessionsEnabled ? "Public sessions enabled" : "Public sessions disabled"}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    Allow devices to join over the internet via the "Anywhere (Internet)" option using session.screenextend.app.
+                  </p>
+                </div>
+                <Switch
+                  checked={publicSessionsEnabled}
+                  onCheckedChange={(checked) => void togglePublicSessions(checked)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mb-4">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Create Hosted Network</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Host a local network for devices to join, useful for speed or when no other network is available.
+                </p>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center space-x-4 border-b p-3 px-0 pt-0">
                 <div className="flex-1 space-y-1">
                   <p className="text-sm font-medium leading-none">
                     {hostedNetworkOn ? "Stop Network" : "Start Network"}
@@ -260,16 +337,6 @@ export default function Settings() {
                     }
                   }}
                 />
-                <TooltipProvider>
-                  <Tooltip delayDuration={100} open={hostedNetworkTooltipOpen} onOpenChange={(state) => setHostedNetworkTooltipOpen(state)}>
-                    <TooltipTrigger asChild className="cursor-pointer" onClick={() => setHostedNetworkTooltipOpen(true)}>
-                      <Info size={15} />
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[220px]">
-                      <p>Host a local network for devices to join, useful for speed or when no other network is available.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
               </div>
               <div
                 className={cn(
@@ -364,19 +431,12 @@ export default function Settings() {
         <div className="mb-4">
           <Card>
             <CardHeader>
-              <CardTitle className="flex flex-row items-center">
-                Device Disconnect Timeout
-                <TooltipProvider>
-                  <Tooltip delayDuration={100} open={disconnectGraceTooltipOpen} onOpenChange={(state) => setDisconnectGraceTooltipOpen(state)}>
-                    <TooltipTrigger asChild className="cursor-pointer ml-2" onClick={() => setDisconnectGraceTooltipOpen(true)}>
-                      <Info size={15} />
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[260px]">
-                      <p>How long a disconnected device's virtual display is kept before being removed.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              </CardTitle>
+              <div>
+                <CardTitle>Device Disconnect Timeout</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  How long a disconnected device's virtual display is kept before being removed.
+                </p>
+              </div>
             </CardHeader>
             <CardContent>
               <div className="flex items-center space-x-4 p-3 px-0">
@@ -407,19 +467,12 @@ export default function Settings() {
         <div className="mb-4">
           <Card>
             <CardHeader>
-              <CardTitle className="flex flex-row items-center">
-                TURN Server
-                <TooltipProvider>
-                  <Tooltip delayDuration={100} open={turnTooltipOpen} onOpenChange={(state) => setTurnTooltipOpen(state)}>
-                    <TooltipTrigger asChild className="cursor-pointer ml-2" onClick={() => setTurnTooltipOpen(true)}>
-                      <Info size={15} />
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[280px]">
-                      <p>A TURN server relays video when two devices are on different networks and can't connect directly. Free TURN providers include Metered, Twilio, or Cloudflare.</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              </CardTitle>
+              <div>
+                <CardTitle>TURN Server</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  A TURN server relays video when two devices are on different networks and can't connect directly. Free TURN providers include Metered, Twilio, or Cloudflare.
+                </p>
+              </div>
             </CardHeader>
             <CardContent>
               <div className="flex items-center space-x-4 p-3 px-0">
@@ -464,6 +517,51 @@ export default function Settings() {
                 </div>
                 <Button onClick={() => void saveTurnConfig()}>
                   Save TURN
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mb-4">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Server Ports</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  The TCP ports the local-network server listens on for device connections. Change these if another app already uses 8080/8443. Connected devices must rejoin with the updated link after a change.
+                </p>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <div className="relative outline-none flex-1">
+                  <Input
+                    type="number"
+                    placeholder="HTTP Port"
+                    className="outline-none"
+                    value={httpPort}
+                    min={1}
+                    max={65535}
+                    onChange={event => setHttpPort(event.target.value)}
+                    onBlur={() => { if (!/^\d+$/.test(httpPort.trim())) setHttpPort(oldHttpPort); }}
+                    hoverLabel={true}
+                  />
+                </div>
+                <div className="relative outline-none flex-1">
+                  <Input
+                    type="number"
+                    placeholder="HTTPS Port"
+                    className="outline-none"
+                    value={httpsPort}
+                    min={1}
+                    max={65535}
+                    onChange={event => setHttpsPort(event.target.value)}
+                    onBlur={() => { if (!/^\d+$/.test(httpsPort.trim())) setHttpsPort(oldHttpsPort); }}
+                    hoverLabel={true}
+                  />
+                </div>
+                <Button onClick={() => void saveServerPorts()}>
+                  Save Ports
                 </Button>
               </div>
             </CardContent>

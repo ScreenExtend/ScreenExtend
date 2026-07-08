@@ -14,13 +14,13 @@ import {
 
 import { createConfig, getConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
-import { commands, events } from "@/lib/bindings";
+import { commands } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useTheme, type Theme } from "@/components/theme-provider";
 
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
-  const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues] } = useContext(GlobalProviderContext);
+  const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -35,20 +35,37 @@ export default function Bootstrap() {
       success = loaded;
     }
     if (success) {
+      const existing = await getConfig();
+      const savedPorts = existing?.serverPorts;
+      if (savedPorts) {
+        await commands.setServerPorts(savedPorts.http, savedPorts.https);
+      }
+      for (const device of existing?.devices ?? []) {
+        await commands.setDeviceOverride(
+          device.ip,
+          device.scale,
+          device.orientation,
+          device.refreshRate,
+          device.videoScale,
+          device.videoQuality
+        );
+      }
+      const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
+      setPublicSessionsEnabled(publicSessionsEnabled);
+
       await commands.watchForNetworkChanges();
       const newSessionId = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'[b % 32]).join('');
       const newOtp = [...Array(6)].reduce(a => a + "0123456789"[~~(Math.random() * "0123456789".length)], "");
       setSessionId(newSessionId);
       setOtp(newOtp);
       await commands.setSessionCredentials(newSessionId, newOtp);
-      void commands.registerCloudSession(newSessionId);
-      setQrValues(await buildQrValues(newSessionId));
-      await events.networkChange.listen(async () => {
-        setQrValues(await buildQrValues(newSessionId));
+      if (publicSessionsEnabled) {
         void commands.registerCloudSession(newSessionId);
-      });
+      } else {
+        void commands.unregisterCloudSession();
+      }
+      setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
       setHostedNetworkOn(false);
-      const existing = await getConfig();
       if (!existing) {
         await createConfig({ name: await commands.getUsername(), theme });
       } else {

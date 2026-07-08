@@ -33,7 +33,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, type Device } from "@/components/config-provider";
+import { updateConfig, getConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { commands, events } from "@/lib/bindings";
 import { useFormik } from "formik";
@@ -68,6 +68,7 @@ export function DeviceDetails({ device }: { device: Device }) {
         normalized.videoScale,
         normalized.videoQuality
       );
+      await saveDeviceSettings(normalized);
       await events.deviceModify.emit(normalized);
       setInProgress(false);
       toast({
@@ -335,6 +336,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               onClick={async () => {
                 setInProgress(true);
                 await commands.removeDeviceOverride(device.ip);
+                await removeSavedDevice(device.ip);
                 await events.deviceRemove.emit(device);
                 setInProgress(false);
                 toast({

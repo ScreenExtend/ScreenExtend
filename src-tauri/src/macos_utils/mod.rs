@@ -12,8 +12,8 @@ use tauri::Manager;
 use tauri::State;
 use crate::streamer::cloud::{CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink};
 use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedSessions,
-    SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
+    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedServerPorts,
+    SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
 use device_reporter::TauriDeviceReporter;
@@ -36,6 +36,7 @@ pub struct AppState {
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
+    pub server_ports: SharedServerPorts,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
 }
@@ -64,6 +65,14 @@ impl CloudStatusSink for TauriCloudStatusSink {
         };
         if let Err(e) = payload.emit(&self.app) {
             teprintln!("[cloud] failed to emit status event: {e:?}");
+        }
+    }
+
+    fn session_rotated(&self, session_id: String) {
+        use tauri_specta::Event;
+        let payload = crate::SessionIdChange { session_id };
+        if let Err(e) = payload.emit(&self.app) {
+            teprintln!("[cloud] failed to emit session id change event: {e:?}");
         }
     }
 }
@@ -99,6 +108,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
+        server_ports: session::new_shared_server_ports(),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
     };
@@ -201,6 +211,50 @@ pub fn get_turn_config(state: State<'_, AppState>) -> TurnConfig {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, specta::Type)]
+pub struct ServerPorts {
+    pub http: u16,
+    pub https: u16,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_server_ports(state: State<'_, AppState>) -> ServerPorts {
+    let (http, https) = state.server_ports.get();
+    ServerPorts { http, https }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_server_ports(state: State<'_, AppState>, http_port: u16, https_port: u16) -> ServerPorts {
+    let http = if http_port == 0 { session::DEFAULT_HTTP_PORT } else { http_port };
+    let https = if https_port == 0 { session::DEFAULT_HTTPS_PORT } else { https_port };
+
+    let (cur_http, cur_https) = state.server_ports.get();
+    if http == https {
+        teprintln!("[streamer] rejecting server port change: HTTP and HTTPS must differ ({http})");
+        return ServerPorts { http: cur_http, https: cur_https };
+    }
+    if http == cur_http && https == cur_https {
+        return ServerPorts { http, https };
+    }
+
+    state.server_ports.set(http, https);
+    tprintln!("[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers");
+
+    {
+        let mut streamers = state.streamers.lock().unwrap();
+        for (ip, streamer) in streamers.drain() {
+            tprintln!("[streamer] stopping streamer bound to {ip} for port change");
+            streamer.handle.shutdown();
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    sync_streamers(&state);
+
+    ServerPorts { http, https }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn install_drivers(_app: tauri::AppHandle) -> bool {
@@ -254,6 +308,17 @@ pub fn register_cloud_session(
 
 #[tauri::command]
 #[specta::specta]
+pub fn unregister_cloud_session(state: State<'_, AppState>) {
+    let mut guard = state.cloud.lock().unwrap();
+    if let Some(mut prev) = guard.take() {
+        prev.stop();
+        tprintln!("[cloud] public sessions disabled; relay client stopped");
+    }
+    *state.cloud_status.lock().unwrap() = (CloudState::Disabled.as_str().to_string(), String::new());
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange {
     let (status, detail) = state.cloud_status.lock().unwrap().clone();
     crate::CloudStatusChange {
@@ -271,6 +336,8 @@ pub fn sync_streamers(state: &AppState) {
             .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(|addr| (ip.clone(), addr)))
             .collect()
     };
+
+    let (http_port, https_port) = state.server_ports.get();
 
     let mut streamers = state.streamers.lock().unwrap();
 
@@ -293,6 +360,8 @@ pub fn sync_streamers(state: &AppState) {
         let config = Config {
             bind_ip: addr,
             lan_ip: Some(ip.clone()),
+            port: http_port,
+            https_port,
             virtual_display: Some(state.virtual_display.clone()),
             session_auth: Some(state.session_auth.clone()),
             device_reporter: Some(state.device_reporter.clone()),
