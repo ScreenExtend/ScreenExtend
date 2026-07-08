@@ -43,7 +43,7 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 }
 
 export default function Dashboard() {
-  const { windowQrValues: [qrValues], windowSessionId: [sessionId] } = useContext(GlobalProviderContext);
+  const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled] } = useContext(GlobalProviderContext);
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
 
@@ -66,7 +66,7 @@ export default function Dashboard() {
     return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
 
-  const cloudUrl = buildCloudQrValue(sessionId);
+  const cloudUrl = publicSessionsEnabled ? buildCloudQrValue(sessionId) : "";
   const lanValues = qrValues.filter((qr) => qr.value.length > 0);
   const cloudReady = cloudStatus.state === "registered";
   const cloudBlurredLabel =

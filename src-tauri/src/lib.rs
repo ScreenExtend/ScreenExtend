@@ -60,6 +60,12 @@ pub struct CloudStatusChange {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct SessionIdChange {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
     pub ip: String,
     pub name: String,
@@ -174,6 +180,7 @@ pub fn run() {
             //            get_devices,
             set_session_credentials,
             register_cloud_session,
+            unregister_cloud_session,
             get_cloud_status,
             exit_app,
             get_username,
@@ -192,6 +199,8 @@ pub fn run() {
             get_disconnect_grace,
             set_turn_config,
             get_turn_config,
+            set_server_ports,
+            get_server_ports,
             logbus::get_log_backlog
         ])
         .events(collect_events![
@@ -203,6 +212,7 @@ pub fn run() {
             NetworkChange,
             HostedNetworkNoPassword,
             CloudStatusChange,
+            SessionIdChange,
             logbus::LogLine
         ]);
 

@@ -176,9 +176,17 @@ impl CloudState {
 
 pub trait CloudStatusSink: Send + Sync + std::fmt::Debug {
     fn report(&self, state: CloudState, detail: String);
+    fn session_rotated(&self, session_id: String);
 }
 
 pub type SharedCloudStatusSink = Arc<dyn CloudStatusSink>;
+
+fn generate_session_id() -> String {
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    (0..12)
+        .map(|_| ALPHABET[(rand::random::<u8>() as usize) % ALPHABET.len()] as char)
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct CloudConfig {
@@ -257,7 +265,8 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-async fn run_loop(config: CloudConfig, server_config: Config, sink: SharedCloudStatusSink) {
+async fn run_loop(mut config: CloudConfig, server_config: Config, sink: SharedCloudStatusSink) {
+    let session_auth = server_config.session_auth.clone();
     let state = Arc::new(AppState::new(server_config));
     let mut backoff_secs = 1u64;
 
@@ -272,8 +281,23 @@ async fn run_loop(config: CloudConfig, server_config: Config, sink: SharedCloudS
                 backoff_secs = 1;
             }
             Err(e) => {
-                teprintln!("[cloud] relay connection error: {e:#}");
-                sink.report(CloudState::Offline, format!("Relay unreachable: {e}"));
+                if e.to_string().contains(register_error_code::SESSION_TAKEN) {
+                    let new_id = generate_session_id();
+                    tprintln!(
+                        "[cloud] session id '{}' still held by relay; rotating to '{}'",
+                        config.session_id,
+                        new_id
+                    );
+                    config.session_id = new_id.clone();
+                    if let Some(auth) = session_auth.as_ref() {
+                        *auth.session_id.lock().unwrap() = new_id.clone();
+                    }
+                    sink.session_rotated(new_id);
+                    backoff_secs = 1;
+                } else {
+                    teprintln!("[cloud] relay connection error: {e:#}");
+                    sink.report(CloudState::Offline, format!("Relay unreachable: {e}"));
+                }
             }
         }
 

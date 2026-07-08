@@ -3,7 +3,7 @@ import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { commands, type NetworkInfo } from "./bindings";
 
-const STREAMER_HTTP_PORT = 8080;
+export const DEFAULT_STREAMER_HTTP_PORT = 8080;
 
 export const CLOUD_SESSION_DOMAIN = "session.screenextend.app";
 
@@ -36,8 +36,9 @@ export function useFocus<T extends HTMLElement>() {
     return { inputRef, setInputFocus };
 }
 
-export async function buildQrValues(sessionId: string): Promise<{ title: string; value: string }[]> {
+export async function buildQrValues(sessionId: string, httpPort: number = DEFAULT_STREAMER_HTTP_PORT): Promise<{ title: string; value: string }[]> {
   if (!sessionId) return [];
+  const port = Number.isInteger(httpPort) && httpPort > 0 ? httpPort : DEFAULT_STREAMER_HTTP_PORT;
   let adapters: NetworkInfo[] = [];
   try {
     adapters = await commands.getNetworkAdapters();
@@ -51,7 +52,7 @@ export async function buildQrValues(sessionId: string): Promise<{ title: string;
       if (!ipv4) return null;
       return {
         title: adapter.network_name,
-        value: `http://${ipv4}:${STREAMER_HTTP_PORT}/?id=${sessionId}`,
+        value: `http://${ipv4}:${port}/?id=${sessionId}`,
       };
     })
     .filter((entry): entry is { title: string; value: string } => entry !== null);

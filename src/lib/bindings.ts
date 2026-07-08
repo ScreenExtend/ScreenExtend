@@ -15,6 +15,9 @@ async setSessionCredentials(sessionId: string, otp: string) : Promise<void> {
 async registerCloudSession(sessionId: string) : Promise<void> {
     await TAURI_INVOKE("register_cloud_session", { sessionId });
 },
+async unregisterCloudSession() : Promise<void> {
+    await TAURI_INVOKE("unregister_cloud_session");
+},
 async getCloudStatus() : Promise<CloudStatusChange> {
     return await TAURI_INVOKE("get_cloud_status");
 },
@@ -69,6 +72,12 @@ async setTurnConfig(urls: string, username: string, credential: string) : Promis
 async getTurnConfig() : Promise<TurnConfig> {
     return await TAURI_INVOKE("get_turn_config");
 },
+async setServerPorts(httpPort: number, httpsPort: number) : Promise<ServerPorts> {
+    return await TAURI_INVOKE("set_server_ports", { httpPort, httpsPort });
+},
+async getServerPorts() : Promise<ServerPorts> {
+    return await TAURI_INVOKE("get_server_ports");
+},
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
 }
@@ -86,7 +95,8 @@ deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
 hostedNetworkNoPassword: HostedNetworkNoPassword,
 logLine: LogLine,
-networkChange: NetworkChange
+networkChange: NetworkChange,
+sessionIdChange: SessionIdChange
 }>({
 cloudStatusChange: "cloud-status-change",
 deviceJoin: "device-join",
@@ -96,7 +106,8 @@ deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
 hostedNetworkNoPassword: "hosted-network-no-password",
 logLine: "log-line",
-networkChange: "network-change"
+networkChange: "network-change",
+sessionIdChange: "session-id-change"
 })
 
 /** user-defined constants **/
@@ -116,6 +127,8 @@ export type HostedNetworkNoPassword = null
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
+export type ServerPorts = { http: number; https: number }
+export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
 
 /** tauri-specta globals **/
