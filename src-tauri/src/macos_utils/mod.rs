@@ -1,3 +1,4 @@
+pub mod compatibility;
 pub mod device_reporter;
 pub mod hosted_network;
 pub mod networking;

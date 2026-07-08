@@ -65,6 +65,23 @@ pub struct SessionIdChange {
     pub session_id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Type)]
+pub struct UnsupportedApi {
+    pub name: String,
+    pub description: String,
+    pub required_version: String,
+    pub severity: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type)]
+pub struct CompatibilityReport {
+    pub os_name: String,
+    pub os_version: String,
+    pub min_os_version: String,
+    pub os_supported: bool,
+    pub unsupported_apis: Vec<UnsupportedApi>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
     pub ip: String,
@@ -176,6 +193,7 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
 pub fn run() {
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
+            compatibility::check_system_requirements,
             setup,
             //            get_devices,
             set_session_credentials,
