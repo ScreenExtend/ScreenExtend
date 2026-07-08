@@ -1,3 +1,4 @@
+pub mod compatibility;
 pub mod hosted_network;
 pub mod networking;
 pub mod virtual_display;

@@ -6,6 +6,9 @@
 
 
 export const commands = {
+async checkSystemRequirements() : Promise<CompatibilityReport> {
+    return await TAURI_INVOKE("check_system_requirements");
+},
 async setup() : Promise<boolean> {
     return await TAURI_INVOKE("setup");
 },
@@ -117,6 +120,7 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type CloudStatusChange = { state: string; detail: string }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[] }
 export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
@@ -130,6 +134,7 @@ export type NetworkInfo = { network_name: string; interface_index: number; ip_ad
 export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
+export type UnsupportedApi = { name: string; description: string; required_version: string; severity: string }
 
 /** tauri-specta globals **/
 

@@ -14,7 +14,7 @@ import {
 
 import { createConfig, getConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
-import { commands } from "@/lib/bindings";
+import { commands, type CompatibilityReport } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useTheme, type Theme } from "@/components/theme-provider";
 
@@ -24,9 +24,11 @@ export default function Bootstrap() {
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
+  const [compatBlocking, setCompatBlocking] = useState(false);
   const running = useRef(false);
 
-  const start = async (tryInstall: boolean) => {
+  const runSetup = async (tryInstall: boolean) => {
     let success;
     if (!loaded) {
       success = await commands.setup();
@@ -80,17 +82,41 @@ export default function Bootstrap() {
       if (tryInstall) {
         await commands.installDrivers();
         await new Promise(resolve => setTimeout(resolve, 5000));
-        start(false);
+        runSetup(false);
       } else {
         setError(true);
       }
     }
   };
 
+  const start = async () => {
+    let report: CompatibilityReport;
+    try {
+      report = await commands.checkSystemRequirements();
+    } catch {
+      await runSetup(true);
+      return;
+    }
+    const hasBlocking =
+      !report.os_supported ||
+      report.unsupported_apis.some(api => api.severity === "blocking");
+    if (hasBlocking) {
+      setCompatReport(report);
+      setCompatBlocking(true);
+      return;
+    }
+    if (report.unsupported_apis.length > 0) {
+      setCompatReport(report);
+      setCompatBlocking(false);
+      return;
+    }
+    await runSetup(true);
+  };
+
   useEffect(() => {
     if (running.current) return;
     running.current = true;
-    void start(true);
+    void start();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -116,11 +142,68 @@ export default function Bootstrap() {
                 await new Promise(resolve => setTimeout(resolve, 5000));
                 setLoading(false);
                 setError(false);
-                await start(false);
+                await runSetup(false);
               }}
               disabled={loading}
             >
               Install Drivers
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={compatReport !== null}>
+        <AlertDialogContent className="max-w-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {compatBlocking ? "Unsupported Operating System" : "Limited System Support"}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3 text-left">
+                <div>
+                  Detected system: <b>{compatReport?.os_version}</b>
+                  <br />
+                  Minimum required: <b>{compatReport?.min_os_version}</b>
+                </div>
+                {compatReport && compatReport.unsupported_apis.length > 0 && (
+                  <div>
+                    {compatBlocking
+                      ? "ScreenExtend cannot run because the following required platform APIs are unavailable on this system:"
+                      : "The following platform APIs are unavailable. ScreenExtend can continue, but these features will be limited or non-functional:"}
+                    <ul className="list-disc pl-5 mt-2 space-y-1">
+                      {compatReport.unsupported_apis.map(api => (
+                        <li key={api.name}>
+                          <b>{api.name}</b> — {api.description} (requires {api.required_version})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div>
+                  Please upgrade your operating system or contact support at{" "}
+                  <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>
+                    support@screenextend.app
+                  </a>.
+                </div>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            {!compatBlocking && (
+              <AlertDialogAction
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+                onClick={() => {
+                  setCompatReport(null);
+                  void runSetup(true);
+                }}
+              >
+                Continue
+              </AlertDialogAction>
+            )}
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white"
+              onClick={() => commands.exitApp()}
+            >
+              Exit
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
