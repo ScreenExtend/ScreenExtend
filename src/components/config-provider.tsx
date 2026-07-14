@@ -34,7 +34,8 @@ export type Config = {
   },
   dontShowAgain: {
     editDevice: boolean,
-    editNetwork: boolean
+    editNetwork: boolean,
+    compatibility: boolean
   }
 };
 
@@ -62,7 +63,8 @@ export const defaultConfig: Config = {
   },
   dontShowAgain: {
     editDevice: false,
-    editNetwork: false
+    editNetwork: false,
+    compatibility: false
   }
 };
 

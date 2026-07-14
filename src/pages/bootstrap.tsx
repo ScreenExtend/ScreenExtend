@@ -11,8 +11,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
+import { Checkbox } from "@/components/ui/checkbox";
 
-import { createConfig, getConfig } from "@/components/config-provider";
+import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, type CompatibilityReport } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
@@ -26,6 +27,7 @@ export default function Bootstrap() {
   const [loading, setLoading] = useState(false);
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
+  const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const running = useRef(false);
 
   const runSetup = async (tryInstall: boolean) => {
@@ -105,7 +107,7 @@ export default function Bootstrap() {
       setCompatBlocking(true);
       return;
     }
-    if (report.unsupported_apis.length > 0) {
+    if (report.unsupported_apis.length > 0 && !(await getConfig())?.dontShowAgain.compatibility) {
       setCompatReport(report);
       setCompatBlocking(false);
       return;
@@ -187,11 +189,27 @@ export default function Bootstrap() {
               </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {!compatBlocking && (
+            <div className="flex items-center space-x-2 mb-4">
+              <Checkbox
+                id="compatDontShowAgain"
+                checked={compatDontShowAgain}
+                onCheckedChange={checked => setCompatDontShowAgain(checked === true)}
+              />
+              <label
+                htmlFor="compatDontShowAgain"
+                className="text-sm text-muted-foreground cursor-pointer"
+              >
+                Don't show this message again
+              </label>
+            </div>
+          )}
           <AlertDialogFooter>
             {!compatBlocking && (
               <AlertDialogAction
                 className="bg-blue-600 hover:bg-blue-700 text-white"
-                onClick={() => {
+                onClick={async () => {
+                  await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, compatibility: compatDontShowAgain}});
                   setCompatReport(null);
                   void runSetup(true);
                 }}
