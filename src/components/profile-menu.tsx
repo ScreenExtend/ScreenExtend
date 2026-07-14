@@ -62,7 +62,7 @@ export function ProfileMenu() {
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={async () => {
-              await updateConfig({dontShowAgain: {editDevice: false, editNetwork: false}});
+              await updateConfig({dontShowAgain: {editDevice: false, editNetwork: false, compatibility: false}});
             }}
           >
             <RotateCcw className="mr-2 h-4 w-4" />

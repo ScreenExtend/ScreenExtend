@@ -73,12 +73,29 @@
             </div>
         </div>
 
+        <div id="compatModal" role="dialog" aria-modal="true" style="z-index: 9998">
+            <div class="card">
+                <h2 id="compatTitle">Limited Browser Support</h2>
+                <p id="compatIntro"></p>
+                <ul id="compatList"></ul>
+                <p id="compatOutro"></p>
+                <div class="check" id="compatCheckRow">
+                    <input type="checkbox" id="compatDontShow" />
+                    <label for="compatDontShow">Don't show this message again</label>
+                </div>
+                <div class="row" id="compatActions">
+                    <button id="compatContinue" type="button">Continue</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             const video = document.getElementById('video');
             let canvas = document.getElementById('canvas');
             const stage = document.getElementById('stage');
             const unmuteBtn = document.getElementById('unmute');
             const modal = document.getElementById('modal');
+            const compatModal = document.getElementById('compatModal');
             const errEl = document.getElementById('errorMessage');
             const loadingEl = document.getElementById('loading');
 
@@ -99,6 +116,7 @@
             let kickEpoch = null;
             let reconfiguring = false;
             let kicked = false;
+            let compatBlocked = false;
 
             function showError(msg) {
                 errEl.textContent = msg || '';
@@ -649,7 +667,7 @@
 
             function validate() {
                 const ok = otpValue().length === 6 && nameInput.value.trim().length > 0 && VALID_RE.test(sessionInput.value.trim());
-                connectBtn.disabled = !ok;
+                connectBtn.disabled = !ok || compatBlocked;
             }
 
             (function prefillFromUrl() {
@@ -713,6 +731,102 @@
             nameInput.addEventListener('input', validate);
 
             const refreshRatePromise = getRefreshRate().catch(() => 0);
+
+            const COMPAT_HIDE_KEY = 'se.compat.hideLimited';
+
+            function compatPrefHidden() {
+                try { return localStorage.getItem(COMPAT_HIDE_KEY) === '1'; } catch (_) { return false; }
+            }
+            function setCompatPrefHidden(hidden) {
+                try {
+                    if (hidden) localStorage.setItem(COMPAT_HIDE_KEY, '1');
+                    else localStorage.removeItem(COMPAT_HIDE_KEY);
+                } catch (_) {}
+            }
+
+            function checkBrowserRequirements() {
+                const unsupported = [];
+                if (typeof RTCPeerConnection === 'undefined' || typeof RTCPeerConnection.prototype.addTransceiver !== 'function') {
+                    unsupported.push({
+                        name: 'WebRTC (RTCPeerConnection)',
+                        description: 'Required to receive the live screen stream.',
+                        severity: 'blocking',
+                    });
+                }
+                if (typeof fetch !== 'function') {
+                    unsupported.push({
+                        name: 'Fetch API',
+                        description: 'Required to negotiate the connection with the host.',
+                        severity: 'blocking',
+                    });
+                }
+                if (!canWebCodecs) {
+                    unsupported.push({
+                        name: 'WebCodecs low-latency playback',
+                        description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode.',
+                        severity: 'optional',
+                    });
+                }
+                return unsupported;
+            }
+
+            function renderCompatModal(apis, blocking) {
+                document.getElementById('compatTitle').textContent = blocking ? 'Unsupported Browser' : 'Limited Browser Support';
+                document.getElementById('compatIntro').textContent = blocking
+                    ? 'This browser is missing features ScreenExtend needs to stream:'
+                    : 'This browser is missing some features. ScreenExtend can continue, but the following will be limited:';
+
+                const listEl = document.getElementById('compatList');
+                listEl.textContent = '';
+                apis.forEach((api) => {
+                    const li = document.createElement('li');
+                    const b = document.createElement('b');
+                    b.textContent = api.name;
+                    li.appendChild(b);
+                    li.appendChild(document.createTextNode(' — ' + api.description));
+                    listEl.appendChild(li);
+                });
+
+                const outroEl = document.getElementById('compatOutro');
+                outroEl.innerHTML = blocking
+                    ? 'Please open this session in an up-to-date browser (recent Chrome, Edge, Safari, or Firefox), or <a href="mailto:support@screenextend.app">contact us</a>.'
+                    : '';
+                outroEl.style.display = blocking ? '' : 'none';
+
+                document.getElementById('compatCheckRow').style.display = blocking ? 'none' : 'flex';
+                document.getElementById('compatActions').style.display = blocking ? 'none' : 'flex';
+
+                compatModal.classList.add('show');
+            }
+
+            (function compatGate() {
+                const params = new URL(window.location.href).searchParams;
+                if (params.has('resetprefs')) {
+                    setCompatPrefHidden(false);
+                    const clean = new URL(window.location.href);
+                    clean.searchParams.delete('resetprefs');
+                    history.replaceState(null, '', clean.toString());
+                }
+
+                const report = checkBrowserRequirements();
+                const blocking = report.filter((a) => a.severity === 'blocking');
+                if (blocking.length > 0) {
+                    compatBlocked = true;
+                    connectBtn.disabled = true;
+                    renderCompatModal(blocking, true);
+                    return;
+                }
+
+                const optional = report.filter((a) => a.severity === 'optional');
+                const deferToHttps = location.protocol === 'http:' && !canWebCodecs;
+                if (optional.length > 0 && !deferToHttps && !compatPrefHidden()) {
+                    renderCompatModal(optional, false);
+                    document.getElementById('compatContinue').onclick = () => {
+                        setCompatPrefHidden(document.getElementById('compatDontShow').checked);
+                        compatModal.classList.remove('show');
+                    };
+                }
+            })();
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
                 e.preventDefault();

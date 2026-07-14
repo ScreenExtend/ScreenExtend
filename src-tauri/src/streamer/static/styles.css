@@ -46,7 +46,7 @@ html, body {
     transform: translateX(-50%);
 }
 
-#modal {
+#modal, #compatModal {
     position: fixed;
     inset: 0;
     z-index: 20;
@@ -57,11 +57,11 @@ html, body {
     background: rgba(0, 0, 0, 0.66);
 }
 
-#modal.show {
+#modal.show, #compatModal.show {
     display: flex;
 }
 
-#modal .card {
+#modal .card, #compatModal .card {
     max-width: 430px;
     background: #14171d;
     border: 1px solid #2a2f3a;
@@ -70,24 +70,24 @@ html, body {
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 
-#modal h2 {
+#modal h2, #compatModal h2 {
     margin: 0 0 .55rem;
     font-size: 16px;
     color: #e6e9ef;
 }
 
-#modal p {
+#modal p, #compatModal p {
     margin: 0 0 1rem;
     color: #aab2c2;
 }
 
-#modal .row {
+#modal .row, #compatModal .row {
     display: flex;
     gap: .6rem;
     flex-wrap: wrap;
 }
 
-#modal button {
+#modal button, #compatModal button {
     padding: .55rem 1rem;
     border: 0;
     border-radius: 9px;
@@ -95,7 +95,7 @@ html, body {
     cursor: pointer;
 }
 
-#goHttps {
+#goHttps, #compatContinue {
     background: #2a6df0;
     color: #fff;
 }
@@ -103,6 +103,39 @@ html, body {
 #dismiss {
     background: #2a2f3a;
     color: #cdd3df;
+}
+
+#compatModal ul {
+    margin: 0 0 1rem;
+    padding-left: 1.15rem;
+    color: #aab2c2;
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+}
+
+#compatModal ul b {
+    color: #cdd3df;
+}
+
+#compatModal .check {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    margin: 0 0 1rem;
+}
+
+#compatModal .check input {
+    width: 15px;
+    height: 15px;
+    accent-color: #2a6df0;
+    cursor: pointer;
+}
+
+#compatModal .check label {
+    font-size: 13px;
+    color: #aab2c2;
+    cursor: pointer;
 }
 
 #join {
