@@ -28,6 +28,41 @@ fn is_keyframe(au: &[u8]) -> bool {
 }
 
 #[test]
+fn intel_quicksync_clamps_extreme_frame_rate() {
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+
+    let mut encoder = match Encoder::new(EncoderConfig {
+        width: W,
+        height: H,
+        fps: 357,
+        bitrate_bps: 30_000_000,
+        max_bitrate_bps: 30_000_000,
+        profile: H264Profile::Baseline,
+        qp: None,
+        intra_refresh: false,
+    }) {
+        Ok(e) => e,
+        Err(e) => {
+            teprintln!("skipping extreme-fps clamp test (no HW/runtime): {e:?}");
+            return;
+        }
+    };
+
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    let mut total = 0usize;
+    for i in 0..10 {
+        fill_synthetic_bgra(&mut frame, W, H, i);
+        let au = encoder
+            .encode_bgra(&frame, i == 0)
+            .expect("encode should succeed after frame-rate clamp");
+        total += au.len();
+    }
+    assert!(total > 0, "clamped-fps encoder should produce bitstream bytes");
+    tprintln!("Intel Quick Sync extreme-fps clamp OK: 1920x1080@357 -> encoded {total} bytes");
+}
+
+#[test]
 fn intel_quicksync_encodes_synthetic_frames() {
     const W: u32 = 1280;
     const H: u32 = 720;
