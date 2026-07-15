@@ -465,6 +465,10 @@ pub fn monitor_dimensions(device_name: &str) -> Option<(u32, u32)> {
     display::dimensions_by_name(device_name)
 }
 
+pub fn monitor_rect(_device_name: &str) -> Option<(i32, i32, u32, u32)> {
+    None
+}
+
 fn pixel_dims(device_name: &str) -> Result<(u32, u32, u32)> {
     let id = display::display_by_name(device_name)
         .with_context(|| format!("display {device_name} is not active"))?;

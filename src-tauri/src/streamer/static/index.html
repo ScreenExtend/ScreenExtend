@@ -60,6 +60,7 @@
             <canvas id="canvas"></canvas>
             <video id="video" autoplay playsinline muted tabindex="-1" disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback"></video>
             <button id="unmute">Tap to start playback</button>
+            <input id="imeSink" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" style="position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0;" />
         </div>
 
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
@@ -89,6 +90,7 @@
             </div>
         </div>
 
+        <script src="/input.js"></script>
         <script>
             const video = document.getElementById('video');
             let canvas = document.getElementById('canvas');
@@ -205,6 +207,34 @@
                 start(true);
             }
 
+            let lastGeomKey = null;
+            let geomTimer = 0;
+            function screenGeom() {
+                let w = Math.round(window.screen.width);
+                let h = Math.round(window.screen.height);
+                const portrait = (window.innerHeight || h) >= (window.innerWidth || w);
+                if (portrait && w > h) { const t = w; w = h; h = t; }
+                if (!portrait && h > w) { const t = w; w = h; h = t; }
+                return { width: w, height: h, portrait };
+            }
+            function relayGeomChange() {
+                if (!isLive || reconfiguring || kicked || !joinData) return;
+                const g = screenGeom();
+                const key = g.width + 'x' + g.height;
+                if (key === lastGeomKey) return;
+                lastGeomKey = key;
+                joinData.width = g.width;
+                joinData.height = g.height;
+                console.log('[geom] client changed to ' + key + ' (portrait=' + g.portrait + '); resizing host display');
+                reconfigure();
+            }
+            function onGeomChange() {
+                if (geomTimer) clearTimeout(geomTimer);
+                geomTimer = setTimeout(relayGeomChange, 400);
+            }
+            window.addEventListener('resize', onGeomChange, { passive: true });
+            window.addEventListener('orientationchange', onGeomChange, { passive: true });
+
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
 
             const LOCK_KEYS = ['Escape', 'MetaLeft', 'MetaRight', 'AltLeft', 'AltRight', 'F11'];
@@ -255,7 +285,7 @@
             }
             async function acquireKeyboardLock() {
                 if (navigator.keyboard && navigator.keyboard.lock) {
-                    try { await navigator.keyboard.lock(LOCK_KEYS); } catch (_) {}
+                    try { await navigator.keyboard.lock(); } catch (_) {}
                 }
             }
             function acquirePointerLock(el) {
@@ -453,6 +483,7 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
                     } catch (_) {}
@@ -832,15 +863,17 @@
                 e.preventDefault();
                 if (connectBtn.disabled) return;
 
+                const g0 = screenGeom();
                 joinData = {
                     sessionId: sessionInput.value.trim(),
                     deviceName: nameInput.value.trim(),
                     otp: otpValue(),
                     os: detectOs(),
                     refreshRate: 0,
-                    width: window.screen.width,
-                    height: window.screen.height,
+                    width: g0.width,
+                    height: g0.height,
                 };
+                lastGeomKey = g0.width + 'x' + g0.height;
 
                 showError('');
                 kicked = false;

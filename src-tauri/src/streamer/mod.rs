@@ -2,6 +2,7 @@ pub mod bitrate;
 pub mod cli;
 pub mod cloud;
 pub mod config;
+pub mod input;
 pub mod pipeline;
 pub mod session;
 pub mod platform;
