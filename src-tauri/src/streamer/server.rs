@@ -198,6 +198,7 @@ fn router(state: AppState) -> Router {
         .route("/whep", post(whep))
         .route("/leave", post(leave))
         .route("/transform-worker.js", get(transform_worker))
+        .route("/input.js", get(input_js))
         .route("/logo.svg", get(logo))
         .route("/styles.css", get(styles))
         .route("/ice-config", get(ice_config))
@@ -218,6 +219,14 @@ async fn transform_worker() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript")],
         include_str!("static/transform-worker.js"),
+    )
+        .into_response()
+}
+
+async fn input_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("static/input.js"),
     )
         .into_response()
 }
@@ -461,7 +470,7 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
-    let portrait = override_for_ip.map(|o| o.orientation_portrait).unwrap_or(false);
+    let portrait = false;
     let scale = override_for_ip
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
@@ -576,12 +585,19 @@ async fn start_session(
         Err(e) => return Err(e.context("starting capture for virtual display")),
     };
 
+    if let Some((left, top, width, height)) = pipeline::monitor_rect(&device_name) {
+        tprintln!(
+            "remote-input display {device_name}: {width}x{height} at ({left},{top})"
+        );
+    }
+
     let (closed_tx, closed_rx) = oneshot::channel();
     let answer = match webrtc_session::handle_whep_offer(
         req.sdp.clone(),
         &session.pipeline,
         ice_servers,
         Some(closed_tx),
+        Some(device_name.clone()),
     )
     .await
     {

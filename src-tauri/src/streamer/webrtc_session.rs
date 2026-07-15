@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -23,6 +26,7 @@ pub use webrtc::ice_transport::ice_server::RTCIceServer;
 
 use super::bitrate::{BitrateController, DEFAULT_MIN_BITRATE_BPS, estimate_from_loss};
 use super::config::H264Profile;
+use super::input;
 use super::pipeline::Pipeline;
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -235,6 +239,7 @@ pub async fn handle_whep_offer(
     pipeline: &Pipeline,
     ice_servers: Vec<RTCIceServer>,
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    input_device: Option<String>,
 ) -> Result<String> {
     let profile = pipeline.h264_profile;
     let api = build_api(profile)?;
@@ -256,6 +261,41 @@ pub async fn handle_whep_offer(
             .await
             .context("new_peer_connection")?,
     );
+
+    let (input_tx, _input_join) = input::spawn(input_device);
+    {
+        let input_tx = input_tx.clone();
+        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let label = dc.label().to_string();
+            if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
+                return Box::pin(async {});
+            }
+            let is_reliable = label == "reliable";
+            let tx = input_tx.clone();
+            let dc = Arc::clone(&dc);
+            Box::pin(async move {
+                tprintln!("remote-input data channel open: {label}");
+                let dc_for_pong = Arc::clone(&dc);
+                dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let tx = tx.clone();
+                    let dc_pong = Arc::clone(&dc_for_pong);
+                    Box::pin(async move {
+                        let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
+                            return;
+                        };
+                        if is_reliable {
+                            if let input::protocol::InputEvent::Ping { t_ns } = ev {
+                                let pong = input::protocol::build_pong(t_ns);
+                                let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
+                                return;
+                            }
+                        }
+                        tx.route(ev, hot);
+                    })
+                }));
+            })
+        }));
+    }
 
     let track = Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
@@ -351,8 +391,17 @@ pub async fn handle_whep_offer(
     let pc_state = Arc::clone(&pc);
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(std::sync::Mutex::new(closed_tx));
+    let input_tx_state = input_tx.clone();
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         tprintln!("peer connection state changed: {state:?}");
+        if matches!(
+            state,
+            RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Disconnected
+                | RTCPeerConnectionState::Closed
+        ) {
+            input_tx_state.release_all();
+        }
         if state == RTCPeerConnectionState::Connected
             && !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
         {

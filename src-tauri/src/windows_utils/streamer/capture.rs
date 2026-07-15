@@ -97,6 +97,54 @@ pub fn monitor_dimensions(device_name: &str) -> Option<(u32, u32)> {
     Some((monitor.width().ok()?, monitor.height().ok()?))
 }
 
+pub fn monitor_rect(device_name: &str) -> Option<(i32, i32, u32, u32)> {
+    use std::mem;
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::core::BOOL;
+
+    struct Ctx {
+        want: Vec<u16>,
+        found: Option<(i32, i32, u32, u32)>,
+    }
+
+    unsafe extern "system" fn cb(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        let mut mi = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: mem::size_of::<MONITORINFOEXW>() as u32,
+                rcMonitor: RECT::default(),
+                rcWork: RECT::default(),
+                dwFlags: 0,
+            },
+            szDevice: [0; 32],
+        };
+        if GetMonitorInfoW(hmon, (&raw mut mi).cast()).as_bool() {
+            let len = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(32);
+            if mi.szDevice[..len] == ctx.want[..] {
+                let r = mi.monitorInfo.rcMonitor;
+                ctx.found = Some((
+                    r.left,
+                    r.top,
+                    (r.right - r.left).max(1) as u32,
+                    (r.bottom - r.top).max(1) as u32,
+                ));
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+
+    let want: Vec<u16> = device_name.encode_utf16().collect();
+    let mut ctx = Ctx { want, found: None };
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&raw mut ctx as isize));
+    }
+    ctx.found
+}
+
 pub fn set_display_resolution(device_name: &str, width: u32, height: u32, refresh: u32) -> Result<()> {
     set_display_mode(device_name, width, height, refresh, false)
 }

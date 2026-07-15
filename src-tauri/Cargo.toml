@@ -1,6 +1,6 @@
 [package]
 name = "screenextend"
-version = "0.2.5"
+version = "0.3.0"
 description = "ScreenExtend"
 authors = ["Sarvesh Madullapalli"]
 edition = "2021"
@@ -66,6 +66,7 @@ futures-util = "0.3"
 anyhow = "1.0"
 bytes = "1"
 crossbeam-channel = "0.5"
+smol_str = "=0.3.2"
 elevated-command = "1.1"
 fs4 = { version = "0.13", features = ["sync"] }
 libloading = "0.9"
@@ -143,6 +144,11 @@ features = [
     "Win32_System_Threading",
     "Storage",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Controls",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_NetworkManagement_IpHelper",
     "Graphics_Capture",
     "Win32_Graphics_Direct3D",
