@@ -26,6 +26,7 @@ use super::super::nvidia::encoder::EncoderConfig;
 use super::intel_sys::*;
 
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
+const INTEL_FPS_QUERY_FALLBACK: u32 = 60;
 const KEY_WRITER: u64 = 0;
 const KEY_ENCODER: u64 = 1;
 const KEY_TIMEOUT_MS: u32 = 1000;
@@ -223,6 +224,20 @@ impl Encoder {
         .inspect_err(|_| unsafe {
             (vpl.MFXClose)(session);
         })?;
+
+        let requested_fps = config.fps.max(1);
+        let max_fps = query_max_supported_fps(&vpl, session, &config, requested_fps);
+        let config = {
+            let mut c = config;
+            if requested_fps > max_fps {
+                tprintln!(
+                    "Intel Quick Sync: capping encode frame rate {requested_fps} -> {max_fps} fps \
+                     (highest rate this device's oneVPL H.264 encoder reports as supported)"
+                );
+                c.fps = max_fps;
+            }
+            c
+        };
 
         let fps = config.fps.max(1);
         let coded_w = align_up_u16(config.width, 16);
@@ -951,6 +966,92 @@ fn adapter_luid(device: &ID3D11Device) -> Option<LUID> {
 #[inline]
 fn luid_eq(a: LUID, b: LUID) -> bool {
     a.LowPart == b.LowPart && a.HighPart == b.HighPart
+}
+
+fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, fps: u32) -> bool {
+    let fps = fps.max(1);
+    let coded_w = align_up_u16(config.width, 16);
+    let coded_h = align_up_u16(config.height, 16);
+    let buffer_size_kb = ((coded_w as u32 * coded_h as u32 * 4) / 1024).clamp(512, 65000) as u16;
+    let target_kbps = (config.bitrate_bps / 1000).clamp(1, 65000) as u16;
+    let max_kbps = (config.max_bitrate_bps / 1000).clamp(target_kbps as u32, 65000) as u16;
+
+    let mut mfx: mfxInfoMFX = unsafe { std::mem::zeroed() };
+    mfx.FrameInfo = mfxFrameInfo {
+        FourCC: MFX_FOURCC_NV12,
+        ChromaFormat: MFX_CHROMAFORMAT_YUV420,
+        BitDepthLuma: 8,
+        BitDepthChroma: 8,
+        PicStruct: MFX_PICSTRUCT_PROGRESSIVE,
+        FrameRateExtN: fps,
+        FrameRateExtD: 1,
+        Width: coded_w,
+        Height: coded_h,
+        CropW: config.width as u16,
+        CropH: config.height as u16,
+        ..Default::default()
+    };
+    mfx.CodecId = MFX_CODEC_AVC;
+    mfx.CodecProfile = match config.profile {
+        H264Profile::Baseline => MFX_PROFILE_AVC_CONSTRAINED_BASELINE,
+        H264Profile::Main => MFX_PROFILE_AVC_MAIN,
+        H264Profile::High => MFX_PROFILE_AVC_HIGH,
+    };
+    mfx.LowPower = MFX_CODINGOPTION_ON;
+    mfx.TargetUsage = MFX_TARGETUSAGE_BEST_SPEED;
+    mfx.GopPicSize = 0xFFFF;
+    mfx.GopRefDist = 1;
+    mfx.NumSlice = (config.height / 256).clamp(4, 8) as u16;
+    mfx.NumRefFrame = 1;
+    mfx.BufferSizeInKB = buffer_size_kb;
+    if let Some(qp) = config.qp {
+        let q = qp as u16;
+        mfx.RateControlMethod = MFX_RATECONTROL_CQP;
+        mfx.InitialDelayInKB = q;
+        mfx.TargetKbps = q;
+        mfx.MaxKbps = q;
+    } else {
+        mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+        mfx.TargetKbps = target_kbps;
+        mfx.MaxKbps = max_kbps;
+    }
+
+    let mut par: mfxVideoParam = unsafe { std::mem::zeroed() };
+    par.AsyncDepth = 1;
+    par.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
+    par.info = mfxInfoUnion { mfx };
+
+    let p: *mut mfxVideoParam = &mut par;
+    let status = unsafe { (vpl.MFXVideoENCODE_Query)(session, p, p) };
+    let out_fps = unsafe { par.info.mfx.FrameInfo.FrameRateExtN };
+    status >= MFX_ERR_NONE && out_fps == fps
+}
+
+fn query_max_supported_fps(
+    vpl: &Vpl,
+    session: mfxSession,
+    config: &EncoderConfig,
+    requested: u32,
+) -> u32 {
+    let requested = requested.max(1);
+    if query_fps_supported(vpl, session, config, requested) {
+        return requested;
+    }
+    const PROBE_LOW: u32 = 30;
+    if !query_fps_supported(vpl, session, config, PROBE_LOW) {
+        return requested.min(INTEL_FPS_QUERY_FALLBACK);
+    }
+    let (mut lo, mut hi, mut best) = (PROBE_LOW, requested, PROBE_LOW);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        if query_fps_supported(vpl, session, config, mid) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
 }
 
 pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Result<()> {
