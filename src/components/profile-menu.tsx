@@ -1,6 +1,5 @@
 import { useContext, useEffect, useState } from "react";
 
-import { ReactSVG } from "react-svg";
 import { Power, Trash2, RotateCcw } from "lucide-react";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import {
@@ -19,7 +18,7 @@ import { commands } from "@/lib/bindings";
 import defaultLogo from "@/assets/default.svg";
 
 export function ProfileMenu() {
-  const { windowClosing: [closing, setClosing] } = useContext(GlobalProviderContext);
+  const { windowClosing: [closing, setClosing], windowAvatar: [avatar] } = useContext(GlobalProviderContext);
   const [background, setBackground] = useState(false);
   const [name, setName] = useState("");
 
@@ -41,7 +40,7 @@ export function ProfileMenu() {
       />
       <DropdownMenuTrigger asChild>
         <AvatarWrapper className="cursor-pointer">
-          <ReactSVG src={defaultLogo} />
+          <img src={avatar ?? defaultLogo} alt="Profile" className="h-full w-full object-cover" />
         </AvatarWrapper>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-56 z-[99999] mr-4">

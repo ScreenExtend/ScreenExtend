@@ -12,7 +12,9 @@ import Settings from "@/pages/settings";
 import Devices from "@/pages/devices";
 import { Loader2 } from "lucide-react";
 
-import { getSavedDevices, getConfig, type Device } from "@/components/config-provider";
+import { getSavedDevices, getConfig, updateConfig, type Device } from "@/components/config-provider";
+import { loadAvatar } from "@/lib/avatar";
+import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -41,8 +43,55 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
+  const [avatar, setAvatar] = useState<string | null>(null);
+  const [zoom, setZoom] = useState(DEFAULT_ZOOM);
+  const zoomReady = useRef(false);
 
   const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setAvatar(await loadAvatar());
+      } catch {
+        setAvatar(null);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      const cfg = await getConfig();
+      const saved = clampZoom(cfg?.zoomFactor ?? DEFAULT_ZOOM);
+      zoomReady.current = true;
+      await applyZoom(saved);
+      setZoom(saved);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!zoomReady.current) return;
+    void applyZoom(zoom);
+    void updateConfig({ zoomFactor: zoom });
+  }, [zoom]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        setZoom(z => zoomIn(z));
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        setZoom(z => zoomOut(z));
+      } else if (e.key === "0") {
+        e.preventDefault();
+        setZoom(DEFAULT_ZOOM);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const sessionIdRef = useRef(sessionId);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
@@ -127,7 +176,9 @@ function App() {
       windowLoaded: [loaded, setLoaded],
       windowClosing: [closing, setClosing],
       windowDevices: [devices, setDevices],
-      windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled]
+      windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled],
+      windowAvatar: [avatar, setAvatar],
+      windowZoom: [zoom, setZoom]
     }}>
       <ThemeProvider defaultTheme="system">
           <RouterProvider router={router} />

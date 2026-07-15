@@ -163,6 +163,58 @@ fn get_username() -> String {
     whoami::username().unwrap_or_else(|_| "".to_string())
 }
 
+fn avatar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("avatar.png"))
+}
+
+#[tauri::command]
+#[specta::specta]
+fn set_avatar(app: tauri::AppHandle, bytes: Vec<u8>) -> bool {
+    match avatar_path(&app).and_then(|path| std::fs::write(&path, &bytes).map_err(|e| e.to_string())) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("failed to save avatar: {e}");
+            false
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+fn get_avatar(app: tauri::AppHandle) -> Option<Vec<u8>> {
+    let path = avatar_path(&app).ok()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::error!("failed to read avatar: {e}");
+            None
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+fn remove_avatar(app: tauri::AppHandle) -> bool {
+    let path = match avatar_path(&app) {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("failed to resolve avatar path: {e}");
+            return false;
+        }
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            log::error!("failed to remove avatar: {e}");
+            false
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{AboutMetadata, MenuBuilder, PredefinedMenuItem, SubmenuBuilder};
@@ -202,6 +254,9 @@ pub fn run() {
             get_cloud_status,
             exit_app,
             get_username,
+            set_avatar,
+            get_avatar,
+            remove_avatar,
             networking::get_network_adapters,
             networking::watch_for_network_changes,
             hosted_network::start_hosted_network,

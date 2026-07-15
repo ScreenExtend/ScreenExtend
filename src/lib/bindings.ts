@@ -30,6 +30,15 @@ async exitApp() : Promise<void> {
 async getUsername() : Promise<string> {
     return await TAURI_INVOKE("get_username");
 },
+async setAvatar(bytes: number[]) : Promise<boolean> {
+    return await TAURI_INVOKE("set_avatar", { bytes });
+},
+async getAvatar() : Promise<number[] | null> {
+    return await TAURI_INVOKE("get_avatar");
+},
+async removeAvatar() : Promise<boolean> {
+    return await TAURI_INVOKE("remove_avatar");
+},
 async getNetworkAdapters() : Promise<NetworkInfo[]> {
     return await TAURI_INVOKE("get_network_adapters");
 },
