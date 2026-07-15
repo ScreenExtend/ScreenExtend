@@ -1,11 +1,14 @@
-import React, { useState, useContext, useEffect } from "react";
+import React, { useState, useContext, useEffect, useRef } from "react";
 
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Eye, EyeOff, RefreshCw } from "lucide-react";
+import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
+import { AvatarCropModal } from "@/components/avatar-crop-modal";
+import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw } from "lucide-react";
+import defaultLogo from "@/assets/default.svg";
 import {
   InputOTP,
   InputOTPGroup,
@@ -35,13 +38,19 @@ import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
 import { cn, buildQrValues } from "@/lib/utils";
+import { saveAvatar, clearAvatar } from "@/lib/avatar";
+import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
 import { type as getOsType } from "@tauri-apps/plugin-os";
 
 const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 
 export default function Settings() {
-  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
+  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [cropSrc, setCropSrc] = useState<string | null>(null);
+  const [cropOpen, setCropOpen] = useState(false);
 
   const [spin, setSpin] = useState(false);
   const [hostedNetworkName, setHostedNetworkName] = useState("");
@@ -228,6 +237,53 @@ export default function Settings() {
       });
     }
     return false;
+  };
+
+  const onFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setCropSrc(URL.createObjectURL(file));
+    setCropOpen(true);
+  };
+
+  const closeCrop = () => {
+    setCropOpen(false);
+    if (cropSrc) URL.revokeObjectURL(cropSrc);
+    setCropSrc(null);
+  };
+
+  const handleCropSave = async (bytes: Uint8Array, dataUrl: string) => {
+    const ok = await saveAvatar(bytes);
+    if (!ok) {
+      toast({
+        title: "Couldn't Save Photo",
+        description: "There was a problem writing your profile picture to disk. Please try again.",
+      });
+      return;
+    }
+    setAvatar(dataUrl);
+    closeCrop();
+    toast({
+      title: "Profile Picture Updated",
+      description: "Your new profile picture has been saved.",
+    });
+  };
+
+  const handleRemoveAvatar = async () => {
+    const ok = await clearAvatar();
+    if (!ok) {
+      toast({
+        title: "Couldn't Remove Photo",
+        description: "There was a problem removing your profile picture. Please try again.",
+      });
+      return;
+    }
+    setAvatar(null);
+    toast({
+      title: "Profile Picture Removed",
+      description: "Your profile picture has been reset to the default.",
+    });
   };
 
   if (!configLoaded) return <Layout><></></Layout>;
@@ -573,7 +629,44 @@ export default function Settings() {
               <CardTitle>Account Settings</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="flex items-center space-x-4 p-3 px-0">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={onFileSelected}
+              />
+              <div className="flex items-center gap-5 px-0">
+                <div className="flex flex-col items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="group relative rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                    aria-label="Change profile picture"
+                    title="Change profile picture"
+                  >
+                    <AvatarWrapper className="h-16 w-16 border">
+                      <img
+                        src={avatar ?? defaultLogo}
+                        alt="Profile"
+                        className="h-full w-full object-cover"
+                      />
+                    </AvatarWrapper>
+                    <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/50 opacity-0 transition-opacity group-hover:opacity-100">
+                      <Camera className="h-5 w-5 text-white" />
+                    </span>
+                    <span className="absolute bottom-0 right-0 flex h-6 w-6 items-center justify-center rounded-full border-2 border-background bg-primary text-primary-foreground shadow-sm">
+                      <Camera className="h-3 w-3" />
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => (avatar ? void handleRemoveAvatar() : fileInputRef.current?.click())}
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    {avatar ? "Remove" : "Change photo"}
+                  </button>
+                </div>
                 <div className="relative outline-none flex-1">
                   <Input
                     type="text"
@@ -602,6 +695,53 @@ export default function Settings() {
                 }}>
                   Save Name
                 </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mt-4">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Zoom</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Scale the entire interface. You can also use Ctrl and + or − to adjust it, and Ctrl 0 to reset.
+                </p>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center gap-3 px-0">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="Zoom out"
+                  disabled={zoom <= MIN_ZOOM}
+                  onClick={() => setZoom(z => zoomOut(z))}
+                >
+                  <Minus className="h-4 w-4" />
+                </Button>
+                <span className="w-16 text-center text-sm font-medium tabular-nums">
+                  {formatZoom(zoom)}
+                </span>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="Zoom in"
+                  disabled={zoom >= MAX_ZOOM}
+                  onClick={() => setZoom(z => zoomIn(z))}
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+                <div className={"ml-1" + (zoom === DEFAULT_ZOOM) ? "cursor-not-allowed select-none" : ""}>
+                  <Button
+                    variant="ghost"
+                    disabled={zoom === DEFAULT_ZOOM}
+                    onClick={() => setZoom(DEFAULT_ZOOM)}
+                  >
+                    <RotateCcw className="mr-2 h-4 w-4" />
+                    Reset
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -725,6 +865,12 @@ export default function Settings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <AvatarCropModal
+        open={cropOpen}
+        imageSrc={cropSrc}
+        onCancel={closeCrop}
+        onSave={handleCropSave}
+      />
     </Layout>
   );
 }

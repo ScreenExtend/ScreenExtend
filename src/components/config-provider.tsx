@@ -19,6 +19,7 @@ export type Config = {
   devices: Device[],
   sessionPassword: string,
   publicSessionsEnabled: boolean,
+  zoomFactor: number,
   serverPorts: {
     http: number,
     https: number
@@ -48,6 +49,7 @@ export const defaultConfig: Config = {
   devices: [],
   sessionPassword: "",
   publicSessionsEnabled: true,
+  zoomFactor: 1,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,
     https: DEFAULT_HTTPS_PORT

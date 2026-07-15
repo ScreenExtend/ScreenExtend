@@ -51,6 +51,7 @@
     "shell:allow-open",
     "clipboard-manager:allow-write-text",
     "core:window:allow-destroy",
+    "core:webview:allow-set-webview-zoom",
     "store:default",
     "os:default",
     "dialog:default"
