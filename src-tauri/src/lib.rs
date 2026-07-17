@@ -116,7 +116,7 @@ impl Device {
             orientation: "Landscape".to_string(),
             refresh_rate,
             video_scale: 100,
-            video_quality: 23,
+            video_quality: 15,
             os: info.os,
             screen_size: info.screen_size,
         }
