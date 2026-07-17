@@ -17,45 +17,43 @@ A free desktop‑extension solution that turns any device with a web browser int
 
 Run ScreenExtend on the **host** (the PC you want to extend). It launches straight into the app, installing its virtual display driver on first run if needed. From there, everything happens across three screens:
 
-- **Add Device** (the home screen). Shows a QR code and URL for each network the host is on, plus an "Anywhere (Internet)" tile for joining across different networks. On your client device (phone, tablet, laptop, etc), scan the QR or open the URL in a browser, enter the 6‑digit session OTP, and submit. The host spins up a virtual display for it and the client becomes a fullscreen extended monitor.
+- **Add Device** (the home screen). Shows a QR code and URL for each network the host is on, plus an "Anywhere (Internet)" tile for joining across different networks. On your client device (phone, tablet, laptop, etc), scan the QR or open the URL in a browser, enter the 6-digit session OTP, and submit. The host spins up a virtual display for it and the client becomes a fullscreen extended monitor.
 - **Edit Device.** Lists every connected device with its live settings. Open a device to adjust its resolution scale, orientation, refresh rate, and video scale/quality, or to remove it. The **Display Settings** button opens your OS display settings so you can rearrange where each extended screen sits.
-- **Settings.** View and regenerate the **session OTP**, start an offline **hosted network** so devices can join with no router, set the **disconnect timeout** (how long a display is kept when a device drops), configure a **TURN server** for cross‑network connections, change your display name, and read the live logs.
-
-In short: pick a network on **Add Device**, join from the client's browser with the OTP, then manage everything from **Edit Device** and **Settings**.
+- **Settings.** View and regenerate the **session OTP**, start an offline **hosted network** so devices can join with no router, set the **disconnect timeout** (how long a display is kept when a device drops), configure a **TURN server** for cross-network connections, change your display name, and read the live logs.
 
 ## Overview
 
-ScreenExtend runs as a desktop app on the **host** machine (the computer whose screen you want to extend). The host advertises a session over your local network. Any **client** (phone, tablet, laptop, spare PC, etc) joins simply by opening a URL or scanning a QR code in its browser. The host then spins up a real virtual display for that client and streams it over WebRTC, so the client behaves like a genuine extended monitor: drag windows onto it, move your cursor across it, and work on the extra space.
+ScreenExtend runs as a desktop app on the **host** machine (the computer whose screen you want to extend). The host advertises a session over your local network. Any **client** (phone, tablet, laptop, spare PC, etc) joins by opening a URL or scanning a QR code in its browser. The host spins up a real virtual display for that client and streams it over WebRTC, so it acts like an actual extended monitor: drag windows onto it, move your cursor across it, work on the extra space.
 
 Each client gets its own dedicated virtual display and video pipeline, so multiple devices can join the same host and each acts as an independent monitor.
 
 ## Features
 
-- **Hardware‑accelerated streaming.** Desktop capture is encoded with the GPU and delivered over WebRTC for low latency.
-- **Per‑device settings.** Adjust resolution scale, orientation, refresh rate, and video scale/quality independently for each connected device.
-- **Password‑protected sessions.** A session ID plus a one‑time password (OTP) restrict any new join requests.
-- **Offline / no‑internet mode.** The host can host its own Ad-hoc Wifi hosted network so devices can connect with no central router.
+- **Hardware-accelerated streaming.** Desktop capture is encoded with the GPU and delivered over WebRTC for low latency.
+- **Per-device settings.** Adjust resolution scale, orientation, refresh rate, and video scale/quality independently for each connected device.
+- **Password-protected sessions.** A session ID plus a one-time password (OTP) restrict any new join requests.
+- **Offline / no-internet mode.** The host can run its own ad-hoc Wi-Fi hosted network so devices can connect with no central router.
 - **Auto network discovery.** The host listens on every active network adapter and rebuilds join URLs/QR codes as network changes occur.
-- **Encrypted transport.** Streaming and signaling run over HTTPS/WebRTC with a self‑signed certificate generated at runtime.
+- **Encrypted transport.** Streaming and signaling run over HTTPS/WebRTC with a self-signed certificate generated at runtime.
 
 ## How it works
 
 ```
-   Client browser                    Host (ScreenExtend desktop app)
+   Client browser                       Host (ScreenExtend desktop app)
  ┌─────────────────┐    WHEP/HTTPS   ┌───────────────────────────────────┐
  │  open URL /     │                 │  axum server (per network IP)     │
  │  scan QR + OTP  │                 │   • validates session ID + OTP    │
  │                 │                 │   • creates a virtual display     │
- │  <video> via    │     WebRTC      │   • captures + NVENC‑encodes it   │
+ │  <video> via    │     WebRTC      │   • captures + GPU-encodes it     │
  │  WebCodecs      │     (H.264)     │   • streams via WebRTC            │
  └─────────────────┘                 └───────────────────────────────────┘
 ```
 
 1. On launch the host generates a session ID and an OTP, and starts a small HTTPS server bound to each network adapter.
-2. The desktop UI shows a QR code / URL per network address. The client opens `http(s)://<host-ip>:<port>/?id=<sessionId>` and submits the OTP plus its own screen metrics. (the host serves both HTTP and HTTPS, with the secure endpoint supporting faster decoding using WebCodecs)
-3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Windows Graphics Capture (older Windows builds that don't support WGC use DXGI Desktop Duplication), encodes it with **NVENC/QSV**, and negotiates a **WebRTC** connection using **WHEP**.
+2. The desktop UI shows a QR code / URL per network address. The client opens `http(s)://<host-ip>:<port>/?id=<sessionId>` and submits the OTP plus its own screen metrics. (The host serves both HTTP and HTTPS, with the secure endpoint supporting faster decoding via WebCodecs.)
+3. The host validates the credentials, creates a **virtual display** sized to the client via a signed Windows display driver, captures that display with Windows Graphics Capture (older Windows builds that don't support WGC fall back to DXGI Desktop Duplication), encodes it with **NVENC/QSV**, and negotiates a **WebRTC** connection using **WHEP**.
 4. The client decodes the H.264 stream (via WebCodecs, with a fallback transform worker) and renders it fullscreen, acting as an extended monitor.
-5. Editing a device's settings results in automatic changes and re-negotiation, without destroying and recreating the display.
+5. Editing a device's settings triggers automatic changes and renegotiation, without destroying and recreating the display.
 
 ## Technologies & architecture
 
@@ -64,39 +62,22 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 | **Desktop shell** | [Tauri 2](https://tauri.app) (Rust core + system webview) |
 | **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, shadcn/ui + Radix UI, React Router |
 | **Rust + TS bridge** | [`tauri-specta`](https://github.com/oscartbeaumont/tauri-specta) - typed commands/events, generated into `src/lib/bindings.ts` |
-| **Web/signaling server** | [`axum`](https://github.com/tokio-rs/axum) + `axum-server` over TLS (`rustls`, self‑signed via `rcgen`) |
+| **Web/signaling server** | [`axum`](https://github.com/tokio-rs/axum) + `axum-server` over TLS (`rustls`, self-signed via `rcgen`) |
 | **Streaming** | [`webrtc`](https://github.com/webrtc-rs/webrtc) with WHEP signaling; H.264 |
-| **Capture** | Windows Graphics Capture ([`windows-capture`](https://github.com/NiiightmareXD/windows-capture)), with a custom DXGI Desktop Duplication engine (GPU cursor compositing) as fallback on Windows builds where WGC cannot open virtual displays |
+| **Capture** | Windows Graphics Capture ([`windows-capture`](https://github.com/NiiightmareXD/windows-capture)), with a custom DXGI Desktop Duplication engine (GPU cursor compositing) as fallback on Windows builds where WGC can't open virtual displays |
 | **Encoding** | NVIDIA NVENC or Intel QSV FFI bindings (AMD scaffolded) |
 | **Virtual displays** | Bundled signed Windows Virtual Display Driver (IDD), driven over IPC ([`driver_ipc`](https://github.com/MolotovCherry/virtual-display-rs)) and installed with `nefconc` + `certutil` |
-| **Networking** | Windows hosted network (`netsh wlan`) for offline mode, live network‑adapter watching |
-
-### Repository layout
-
-```
-.
-├── src/                      # React + TypeScript frontend (the host's control UI)
-│   ├── pages/                #   dashboard, devices, settings, bootstrap
-│   ├── components/           #   shadcn/ui components, providers, device details
-│   └── lib/bindings.ts       #   auto-generated Tauri command/event bindings
-├── src-tauri/                # Rust core
-│   ├── src/streamer/         #   axum server, WHEP/WebRTC sessions, pipeline, TLS, config
-│   ├── src/{windows,macos,linux}_utils/  # platform-specific implementations (WIP)
-│   ├── src/streamer/static/  #   browser client served to joining devices (HTML/CSS/JS)
-│   ├── resources/            #   signed virtual display driver + certificate
-│   └── binaries/             #   nefconc sidecar (device-node/driver installer)
-└── .github/workflows/        # Windows release build (CI)
-```
+| **Networking** | Windows hosted network (`netsh wlan`) for offline mode, live network-adapter watching |
 
 ## Platform support
 
 The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA/Intel only.
 
-**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64‑bit (x86‑64) machines are supported. MacOS Catalina 10.15+.
+**Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64-bit (x86-64) machines are supported. macOS Catalina 10.15+.
 
 ### Hardware encoder support
 
-ScreenExtend encodes captured displays with the host GPU. The matrix below lists the common hardware video‑encoding APIs and reflects the **current** state of each path in ScreenExtend:
+ScreenExtend encodes captured displays with the host GPU. The matrix below lists the common hardware video-encoding APIs and reflects the **current** state of each path in ScreenExtend:
 
 | Encoding API | GPU Vendor | Linux | macOS | Windows |
 | --- | --- | :---: | :---: | :---: |
@@ -152,22 +133,22 @@ ScreenExtend.exe removedrivers    # uninstall driver + certificate
 
 ### Releases
 
-Pushes to the `release` branch trigger `.github/workflows/build-windows.yml`, which builds the 64‑bit Windows target via `tauri-action` and publishes a GitHub Release. Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
+Pushes to the `release` branch trigger `.github/workflows/build-windows.yml`, which builds the 64-bit Windows target via `tauri-action` and publishes a GitHub Release. Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
 
 ## Contributing
 
-Contributions are welcome!
+Contributions are welcome.
 
 - **Bugs & feature requests:** open an [issue](https://github.com/ScreenExtend/ScreenExtend/issues) with as much detail as you can (host OS/GPU, client device/browser, and steps to reproduce).
 - **Code:** open a pull request against `main`. Please keep changes focused and match the style of the surrounding code.
-- **Unsupported platforms:** ScreenExtend currently runs on a limited set of hosts. If yours is unsupported and you'd like to help test, email [support@screenextend.app](mailto:support@screenextend.app) with your device information.
+- **Unsupported platforms:** ScreenExtend currently runs on a limited set of hosts. If yours isn't supported and you'd like to help test, email [support@screenextend.app](mailto:support@screenextend.app) with your device info.
 
-Pull requests and issues are reviewed on a roughly biweekly basis.
+Pull requests and issues are reviewed roughly every two weeks.
 
 ## License
 
-ScreenExtend is licensed under the **GNU Affero General Public License v3 (AGPL‑3.0)**. Any code from ScreenExtend incorporated into other projects must include the original copyright notice and license text, all source must remain public and accessible to users, and any changes must be clearly indicated. See [LICENSE](LICENSE) for the full text.
+ScreenExtend is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**. Any code from ScreenExtend incorporated into other projects must include the original copyright notice and license text, all source must remain public and accessible to users, and any changes must be clearly indicated. See [LICENSE](LICENSE) for the full text.
 
 ## Contact
-General inquiries: [hi@screenextend.app](mailto:hi@screenextend.app)  
+General inquiries: [hi@screenextend.app](mailto:hi@screenextend.app)
 Website: [screenextend.app](https://screenextend.app/)
