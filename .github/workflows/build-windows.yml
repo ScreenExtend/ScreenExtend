@@ -7,7 +7,33 @@ on:
   workflow_dispatch:
 
 jobs:
+  check-rebuild:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: check commit footer ends in 'rebuild'
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          stripped=$(printf '%s' "$COMMIT_MSG" | sed -z 's/[[:space:]]*$//')
+          if [[ "$stripped" == *rebuild ]]; then
+            echo "Commit footer ends in 'rebuild' -> building."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Commit footer does not end in 'rebuild' -> skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-tauri:
+    needs: check-rebuild
+    if: needs.check-rebuild.outputs.should_run == 'true'
     permissions:
       contents: write
     strategy:
