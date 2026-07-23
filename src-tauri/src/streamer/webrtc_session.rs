@@ -291,9 +291,6 @@ pub async fn handle_whep_offer(
                                 return;
                             }
                         }
-                        // Remote control disabled for this device: the display stays
-                        // view-only, so drop input instead of injecting it. Pings above
-                        // still get answered to keep the latency HUD alive.
                         if !control_enabled {
                             return;
                         }
