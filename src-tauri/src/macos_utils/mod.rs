@@ -127,6 +127,7 @@ pub fn set_device_override(
     refresh_rate: u32,
     video_scale: u32,
     video_quality: u32,
+    control_enabled: bool,
 ) {
     use crate::streamer::server::{
         MAX_DISPLAY_SCALE, MAX_REFRESH_RATE, MIN_DISPLAY_SCALE, MIN_REFRESH_RATE,
@@ -141,6 +142,7 @@ pub fn set_device_override(
             refresh_rate: refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE),
             video_scale: ScalePercent::new(video_scale).percent(),
             video_quality: video_quality.clamp(1, 51) as u8,
+            control_enabled,
         },
     );
     session::bump_reconfig_epoch(&state.sessions, &ip);

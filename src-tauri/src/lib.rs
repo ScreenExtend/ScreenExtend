@@ -94,6 +94,8 @@ pub struct Device {
     pub video_scale: u32,
     #[serde(rename = "videoQuality")]
     pub video_quality: u32,
+    #[serde(rename = "remoteControl")]
+    pub control_enabled: bool,
     pub os: String,
     #[serde(rename = "screenSize")]
     pub screen_size: String,
@@ -117,6 +119,7 @@ impl Device {
             refresh_rate,
             video_scale: 100,
             video_quality: 15,
+            control_enabled: true,
             os: info.os,
             screen_size: info.screen_size,
         }

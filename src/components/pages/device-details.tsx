@@ -1,10 +1,19 @@
 import React, { useState } from "react";
 
+import { Info } from "lucide-react";
+
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Select,
   SelectContent,
@@ -36,7 +45,37 @@ import {
 import { updateConfig, getConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { commands, events } from "@/lib/bindings";
+import { cn } from "@/lib/utils";
 import { useFormik } from "formik";
+
+function TipLabel({
+  text,
+  children,
+  className,
+}: {
+  text: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            className={cn(
+              "inline-flex w-fit cursor-help items-center gap-1",
+              className
+            )}
+          />
+        }
+      >
+        {children}
+        <Info className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[15rem]">{text}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 export function DeviceDetails({ device }: { device: Device }) {
   const [open, setOpen] = useState(false);
@@ -66,7 +105,8 @@ export function DeviceDetails({ device }: { device: Device }) {
         normalized.orientation,
         normalized.refreshRate,
         normalized.videoScale,
-        normalized.videoQuality
+        normalized.videoQuality,
+        normalized.remoteControl
       );
       await saveDeviceSettings(normalized);
       await events.deviceModify.emit(normalized);
@@ -125,10 +165,13 @@ export function DeviceDetails({ device }: { device: Device }) {
         <SheetHeader>
           <SheetTitle>Edit Device</SheetTitle>
         </SheetHeader>
+        <TooltipProvider delay={150}>
         <div className="py-4">
           <div className="flex">
             <div className="flex-1">
-              <Label>Device Name</Label>
+              <TipLabel text="The name for this device in ScreenExtend.">
+                <Label>Device Name</Label>
+              </TipLabel>
               <Input
                 placeholder="Device Name"
                 name="name"
@@ -140,7 +183,9 @@ export function DeviceDetails({ device }: { device: Device }) {
               />
             </div>
             <div className="flex-1 ml-4">
-              <Label>Orientation</Label>
+              <TipLabel text="Rotates the extended display for this device.">
+                <Label>Orientation</Label>
+              </TipLabel>
               <Select
                 name="orientation"
                 value={deviceDetails.values.orientation}
@@ -161,7 +206,9 @@ export function DeviceDetails({ device }: { device: Device }) {
             </div>
           </div>
           <div className="mt-4">
-            <Label>Device IP</Label>
+            <TipLabel text="The device's network address (read-only).">
+              <Label>Device IP</Label>
+            </TipLabel>
             <Input
               disabled={true}
               placeholder="182.167.99.1"
@@ -173,7 +220,9 @@ export function DeviceDetails({ device }: { device: Device }) {
             />
           </div>
           <div className="mt-4">
-            <Label>Device OS</Label>
+            <TipLabel text="The operating system of this device (read-only).">
+              <Label>Device OS</Label>
+            </TipLabel>
             <Input
               disabled={true}
               placeholder="00-B0-D0-63-C2-26"
@@ -185,7 +234,9 @@ export function DeviceDetails({ device }: { device: Device }) {
             />
           </div>
           <div className="mt-4">
-            <Label>Screen Size</Label>
+            <TipLabel text="The device's screen resolution in pixels (read-only).">
+              <Label>Screen Size</Label>
+            </TipLabel>
             <Input
               disabled={true}
               placeholder="1080x1920"
@@ -196,10 +247,22 @@ export function DeviceDetails({ device }: { device: Device }) {
               hoverLabel={false}
             />
           </div>
+          <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+            <TipLabel text="Let this device control your PC with touch and keyboard. Turn off to keep the display view-only.">
+              <Label>Remote Control</Label>
+            </TipLabel>
+            <Switch
+              checked={deviceDetails.values.remoteControl}
+              onCheckedChange={(checked) =>
+                deviceDetails.setFieldValue("remoteControl", checked)
+              }
+              disabled={inProgress}
+            />
+          </div>
           <div className="mt-4">
-            <Label className="block my-2">
-              Scale - ({deviceDetails.values.scale}%)
-            </Label>
+            <TipLabel text="Zooms the extended desktop's content up or down." className="my-2">
+              <Label>Scale - ({deviceDetails.values.scale}%)</Label>
+            </TipLabel>
             <Slider
               value={[deviceDetails.values.scale]}
               defaultValue={[deviceDetails.values.scale]}
@@ -214,7 +277,9 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
-              Refresh Rate -{" "}
+              <TipLabel text="How many frames per second the display targets (Hz).">
+                Refresh Rate -
+              </TipLabel>
               <div className="flex items-center ml-1">
                 <Input
                   name="refreshRate"
@@ -264,9 +329,9 @@ export function DeviceDetails({ device }: { device: Device }) {
             />
           </div>
           <div className="mt-4">
-            <Label className="block my-2">
-              Video Scale - ({deviceDetails.values.videoScale}%)
-            </Label>
+            <TipLabel text="Resolution of the streamed video. Lower uses less bandwidth." className="my-2">
+              <Label>Video Scale - ({deviceDetails.values.videoScale}%)</Label>
+            </TipLabel>
             <Slider
               value={[deviceDetails.values.videoScale]}
               defaultValue={[deviceDetails.values.videoScale]}
@@ -281,7 +346,9 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
-              Video Quality -{" "}
+              <TipLabel text="Higher encodes faster but looks worse. Pick the highest value that still looks good.">
+                Video Quality -
+              </TipLabel>
               <div className="flex items-center ml-1">
                 <Input
                   name="videoQuality"
@@ -325,11 +392,9 @@ export function DeviceDetails({ device }: { device: Device }) {
               step={1}
               disabled={inProgress}
             />
-            <p className="text-sm text-muted-foreground mt-2">
-              Higher values encode faster but lower the quality. Pick the highest value that still looks good to you.
-            </p>
           </div>
         </div>
+        </TooltipProvider>
         <SheetFooter>
           <div className="flex w-full mt-3">
             <DeleteDevice

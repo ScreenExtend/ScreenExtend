@@ -37,9 +37,13 @@ export default function Devices() {
         <div className="mb-6">
           <div className="flex items-center">
             <h2 className="text-2xl font-semibold">Connected Devices</h2>
-            <TooltipProvider>
-              <Tooltip delayDuration={100} open={devicesTooltipOpen} onOpenChange={state => setDevicesTooltipOpen(state)}>
-                <TooltipTrigger asChild className="cursor-pointer top-1/2 ml-1.5" onClick={() => setDevicesTooltipOpen(true)}>
+            <TooltipProvider delay={100}>
+              <Tooltip open={devicesTooltipOpen} onOpenChange={state => setDevicesTooltipOpen(state)}>
+                <TooltipTrigger
+                  className="cursor-pointer ml-1.5"
+                  onClick={() => setDevicesTooltipOpen(true)}
+                  render={<span />}
+                >
                   <Info size={15} />
                 </TooltipTrigger>
                 <TooltipContent className="max-w-[220px]">

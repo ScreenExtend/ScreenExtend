@@ -51,7 +51,8 @@ export default function Bootstrap() {
           device.orientation,
           device.refreshRate,
           device.videoScale,
-          device.videoQuality
+          device.videoQuality,
+          device.remoteControl ?? true
         );
       }
       const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;

@@ -66,8 +66,8 @@ async installDrivers() : Promise<boolean> {
 async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
-async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number) : Promise<void> {
-    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality });
+async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled });
 },
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
@@ -130,7 +130,7 @@ sessionIdChange: "session-id-change"
 
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[] }
-export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; os: string; screenSize: string }
+export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device

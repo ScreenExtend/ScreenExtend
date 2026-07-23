@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import { AvatarCropModal } from "@/components/avatar-crop-modal";
-import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown } from "lucide-react";
 import defaultLogo from "@/assets/default.svg";
 import {
   InputOTP,
@@ -76,6 +76,7 @@ export default function Settings() {
   const [oldHttpPort, setOldHttpPort] = useState(String(DEFAULT_HTTP_PORT));
   const [oldHttpsPort, setOldHttpsPort] = useState(String(DEFAULT_HTTPS_PORT));
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -520,109 +521,6 @@ export default function Settings() {
             </CardContent>
           </Card>
         </div>
-        <div className="mb-4">
-          <Card>
-            <CardHeader>
-              <div>
-                <CardTitle>TURN Server</CardTitle>
-                <p className="text-sm text-muted-foreground mt-1">
-                  A TURN server relays video when two devices are on different networks and can't connect directly. Free TURN providers include Metered, Twilio, or Cloudflare.
-                </p>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center space-x-4 p-3 px-0">
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type="text"
-                    placeholder="turn:turn.example.com:3478"
-                    className="outline-none"
-                    value={turnUrls}
-                    onChange={event => setTurnUrls(event.target.value)}
-                    hoverLabel={true}
-                  />
-                </div>
-              </div>
-              <div className="flex items-center space-x-4 p-3 px-0">
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type="text"
-                    placeholder="Username"
-                    className="outline-none"
-                    value={turnUsername}
-                    onChange={event => setTurnUsername(event.target.value)}
-                    hoverLabel={true}
-                  />
-                </div>
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type={showTurnCredential ? "text" : "password"}
-                    placeholder="Credential"
-                    className="outline-none"
-                    value={turnCredential}
-                    onChange={event => setTurnCredential(event.target.value)}
-                    hoverLabel={true}
-                  />
-                  <div className="absolute top-0 bottom-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer">
-                    {showTurnCredential ? (
-                      <EyeOff className="h-5 w-5" onClick={() => setShowTurnCredential(false)} />
-                    ) : (
-                      <Eye className="h-5 w-5" onClick={() => setShowTurnCredential(true)} />
-                    )}
-                  </div>
-                </div>
-                <Button onClick={() => void saveTurnConfig()}>
-                  Save TURN
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-        <div className="mb-4">
-          <Card>
-            <CardHeader>
-              <div>
-                <CardTitle>Server Ports</CardTitle>
-                <p className="text-sm text-muted-foreground mt-1">
-                  The TCP ports the local-network server listens on for device connections. Change these if another app already uses 8080/8443. Connected devices must rejoin with the updated link after a change.
-                </p>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center space-x-4 p-3 px-0">
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type="number"
-                    placeholder="HTTP Port"
-                    className="outline-none"
-                    value={httpPort}
-                    min={1}
-                    max={65535}
-                    onChange={event => setHttpPort(event.target.value)}
-                    onBlur={() => { if (!/^\d+$/.test(httpPort.trim())) setHttpPort(oldHttpPort); }}
-                    hoverLabel={true}
-                  />
-                </div>
-                <div className="relative outline-none flex-1">
-                  <Input
-                    type="number"
-                    placeholder="HTTPS Port"
-                    className="outline-none"
-                    value={httpsPort}
-                    min={1}
-                    max={65535}
-                    onChange={event => setHttpsPort(event.target.value)}
-                    onBlur={() => { if (!/^\d+$/.test(httpsPort.trim())) setHttpsPort(oldHttpsPort); }}
-                    hoverLabel={true}
-                  />
-                </div>
-                <Button onClick={() => void saveServerPorts()}>
-                  Save Ports
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
         <div className="">
           <Card>
             <CardHeader>
@@ -746,15 +644,143 @@ export default function Settings() {
             </CardContent>
           </Card>
         </div>
-        <div className="mt-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Logs</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <LogTerminal />
-            </CardContent>
-          </Card>
+        <div className="mt-6">
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen((o) => !o)}
+            aria-expanded={advancedOpen}
+            className="flex w-full items-center justify-between rounded-md px-4 py-4 text-left transition-colors hover:bg-accent"
+          >
+            <div>
+              <h3 className="text-lg font-semibold">Advanced</h3>
+              <p className="text-sm text-muted-foreground mt-1">
+                TURN relay, server ports, and application logs.
+              </p>
+            </div>
+            <ChevronDown
+              className={cn(
+                "h-5 w-5 shrink-0 text-muted-foreground transition-transform",
+                advancedOpen && "rotate-180"
+              )}
+            />
+          </button>
+          {advancedOpen && (
+            <div className="mt-4">
+              <div className="mb-4">
+                <Card>
+                  <CardHeader>
+                    <div>
+                      <CardTitle>TURN Server</CardTitle>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        A TURN server relays video when two devices are on different networks and can't connect directly. Free TURN providers include Metered, Twilio, or Cloudflare.
+                      </p>
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center space-x-4 p-3 px-0">
+                      <div className="relative outline-none flex-1">
+                        <Input
+                          type="text"
+                          placeholder="turn:turn.example.com:3478"
+                          className="outline-none"
+                          value={turnUrls}
+                          onChange={event => setTurnUrls(event.target.value)}
+                          hoverLabel={true}
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-4 p-3 px-0">
+                      <div className="relative outline-none flex-1">
+                        <Input
+                          type="text"
+                          placeholder="Username"
+                          className="outline-none"
+                          value={turnUsername}
+                          onChange={event => setTurnUsername(event.target.value)}
+                          hoverLabel={true}
+                        />
+                      </div>
+                      <div className="relative outline-none flex-1">
+                        <Input
+                          type={showTurnCredential ? "text" : "password"}
+                          placeholder="Credential"
+                          className="outline-none"
+                          value={turnCredential}
+                          onChange={event => setTurnCredential(event.target.value)}
+                          hoverLabel={true}
+                        />
+                        <div className="absolute top-0 bottom-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer">
+                          {showTurnCredential ? (
+                            <EyeOff className="h-5 w-5" onClick={() => setShowTurnCredential(false)} />
+                          ) : (
+                            <Eye className="h-5 w-5" onClick={() => setShowTurnCredential(true)} />
+                          )}
+                        </div>
+                      </div>
+                      <Button onClick={() => void saveTurnConfig()}>
+                        Save TURN
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              <div className="mb-4">
+                <Card>
+                  <CardHeader>
+                    <div>
+                      <CardTitle>Server Ports</CardTitle>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        The TCP ports the local-network server listens on for device connections. Change these if another app already uses 8080/8443. Connected devices must rejoin with the updated link after a change.
+                      </p>
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center space-x-4 p-3 px-0">
+                      <div className="relative outline-none flex-1">
+                        <Input
+                          type="number"
+                          placeholder="HTTP Port"
+                          className="outline-none"
+                          value={httpPort}
+                          min={1}
+                          max={65535}
+                          onChange={event => setHttpPort(event.target.value)}
+                          onBlur={() => { if (!/^\d+$/.test(httpPort.trim())) setHttpPort(oldHttpPort); }}
+                          hoverLabel={true}
+                        />
+                      </div>
+                      <div className="relative outline-none flex-1">
+                        <Input
+                          type="number"
+                          placeholder="HTTPS Port"
+                          className="outline-none"
+                          value={httpsPort}
+                          min={1}
+                          max={65535}
+                          onChange={event => setHttpsPort(event.target.value)}
+                          onBlur={() => { if (!/^\d+$/.test(httpsPort.trim())) setHttpsPort(oldHttpsPort); }}
+                          hoverLabel={true}
+                        />
+                      </div>
+                      <Button onClick={() => void saveServerPorts()}>
+                        Save Ports
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+              <div>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Logs</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <LogTerminal />
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
+          )}
         </div>
       </div>
       <AlertDialog open={hostedNetworkModalOpen}>

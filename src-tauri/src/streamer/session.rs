@@ -27,6 +27,7 @@ pub struct DeviceOverride {
     pub refresh_rate: u32,
     pub video_scale: u32,
     pub video_quality: u8,
+    pub control_enabled: bool,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {

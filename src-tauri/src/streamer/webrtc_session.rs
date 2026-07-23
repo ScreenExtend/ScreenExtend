@@ -240,6 +240,7 @@ pub async fn handle_whep_offer(
     ice_servers: Vec<RTCIceServer>,
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
     input_device: Option<String>,
+    control_enabled: bool,
 ) -> Result<String> {
     let profile = pipeline.h264_profile;
     let api = build_api(profile)?;
@@ -289,6 +290,12 @@ pub async fn handle_whep_offer(
                                 let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
                                 return;
                             }
+                        }
+                        // Remote control disabled for this device: the display stays
+                        // view-only, so drop input instead of injecting it. Pings above
+                        // still get answered to keep the latency HUD alive.
+                        if !control_enabled {
+                            return;
                         }
                         tx.route(ev, hot);
                     })

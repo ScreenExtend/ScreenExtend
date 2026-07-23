@@ -9,6 +9,7 @@ export type Device = {
   refreshRate: number;
   videoScale: number;
   videoQuality: number;
+  remoteControl: boolean;
   os: string;
   screenSize: string;
 };
