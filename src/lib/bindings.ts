@@ -90,6 +90,12 @@ async setServerPorts(httpPort: number, httpsPort: number) : Promise<ServerPorts>
 async getServerPorts() : Promise<ServerPorts> {
     return await TAURI_INVOKE("get_server_ports");
 },
+async setDisableGpuEncode(disabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_disable_gpu_encode", { disabled });
+},
+async getDisableGpuEncode() : Promise<boolean> {
+    return await TAURI_INVOKE("get_disable_gpu_encode");
+},
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
 }

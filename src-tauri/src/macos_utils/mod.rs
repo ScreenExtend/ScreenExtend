@@ -38,6 +38,9 @@ pub struct AppState {
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
     pub server_ports: SharedServerPorts,
+    /// macOS always encodes via VideoToolbox; this flag is stored for UI/command parity with
+    /// Windows (where it forces the software x264 path) and has no effect on the macOS pipeline.
+    pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
 }
@@ -110,6 +113,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
         server_ports: session::new_shared_server_ports(),
+        disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
     };
@@ -256,6 +260,24 @@ pub fn set_server_ports(state: State<'_, AppState>, http_port: u16, https_port: 
     sync_streamers(&state);
 
     ServerPorts { http, https }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_disable_gpu_encode(state: State<'_, AppState>) -> bool {
+    state
+        .disable_gpu_encode
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
+    // macOS has no software-encode fallback (VideoToolbox is always used); just record the
+    // preference for command/UI parity with Windows without disturbing running streamers.
+    state
+        .disable_gpu_encode
+        .store(disabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[tauri::command]

@@ -43,6 +43,8 @@ pub struct AppState {
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
     pub server_ports: SharedServerPorts,
+    /// When set, every streamer is built with the CPU-only software encoder (no GPU encode).
+    pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
 }
@@ -207,6 +209,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
         server_ports: session::new_shared_server_ports(),
+        disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
     };
@@ -357,6 +360,38 @@ pub fn set_server_ports(state: State<'_, AppState>, http_port: u16, https_port: 
 
 #[tauri::command]
 #[specta::specta]
+pub fn get_disable_gpu_encode(state: State<'_, AppState>) -> bool {
+    state
+        .disable_gpu_encode
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
+    let prev = state
+        .disable_gpu_encode
+        .swap(disabled, std::sync::atomic::Ordering::Relaxed);
+    if prev == disabled {
+        return;
+    }
+    tprintln!(
+        "[streamer] GPU video encoding {}; restarting streamers",
+        if disabled { "disabled (software x264 only)" } else { "re-enabled" }
+    );
+    {
+        let mut streamers = state.streamers.lock().unwrap();
+        for (ip, streamer) in streamers.drain() {
+            tprintln!("[streamer] stopping streamer bound to {ip} for encoder change");
+            streamer.handle.shutdown();
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    sync_streamers(&state);
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn install_drivers(app: tauri::AppHandle) -> bool {
     let resource_path = |file: &str| {
         app.path()
@@ -434,6 +469,9 @@ pub fn register_cloud_session(
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
+        disable_gpu_encode: state
+            .disable_gpu_encode
+            .load(std::sync::atomic::Ordering::Relaxed),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -509,6 +547,9 @@ pub fn sync_streamers(state: &AppState) {
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
+            disable_gpu_encode: state
+                .disable_gpu_encode
+                .load(std::sync::atomic::Ordering::Relaxed),
             ..Config::default()
         };
 

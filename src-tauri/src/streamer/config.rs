@@ -30,6 +30,9 @@ pub enum EncoderVendor {
     Auto,
     Nvidia,
     Intel,
+    /// CPU-only libx264 fallback. Never auto-selected over a working hardware encoder; picked
+    /// explicitly (`--encoder software`) or when GPU encoding is disabled.
+    Software,
 }
 
 impl EncoderVendor {
@@ -38,6 +41,7 @@ impl EncoderVendor {
             "auto" => Some(Self::Auto),
             "nvidia" | "nvenc" => Some(Self::Nvidia),
             "intel" | "quicksync" | "qsv" | "onevpl" | "vpl" => Some(Self::Intel),
+            "software" | "sw" | "cpu" | "x264" => Some(Self::Software),
             _ => None,
         }
     }
@@ -113,6 +117,9 @@ pub struct Config {
     pub qp: Option<u8>,
     pub intra_refresh: bool,
     pub encoder_vendor: EncoderVendor,
+    /// Force the CPU-only software encoder, skipping all hardware paths. Discouraged (much higher
+    /// CPU cost); exists for machines where hardware encode is broken or absent (e.g. VMs).
+    pub disable_gpu_encode: bool,
     pub virtual_display: Option<SharedVirtualDisplay>,
     pub session_auth: Option<SessionAuth>,
     pub device_reporter: Option<SharedDeviceReporter>,
@@ -156,6 +163,7 @@ impl Default for Config {
             qp: None,
             intra_refresh: false,
             encoder_vendor: EncoderVendor::Auto,
+            disable_gpu_encode: false,
             virtual_display: None,
             session_auth: None,
             device_reporter: None,
@@ -298,6 +306,22 @@ impl Config {
                     }
                     i += 2;
                 }
+                "--disable-gpu-encode" => {
+                    // Bare flag, or explicit on/off value.
+                    match val(&args, i) {
+                        Some(v) => {
+                            c.disable_gpu_encode = matches!(
+                                v.trim().to_ascii_lowercase().as_str(),
+                                "on" | "1" | "true" | "yes"
+                            );
+                            i += 2;
+                        }
+                        None => {
+                            c.disable_gpu_encode = true;
+                            i += 1;
+                        }
+                    }
+                }
                 "--bind-ip" => {
                     if let Some(ip) = val(&args, i).and_then(|s| s.parse().ok()) {
                         c.bind_ip = ip;
@@ -384,8 +408,11 @@ CAPTURE / ENCODE\n\
   --intra-refresh <on|off>  rolling intra refresh for passive loss recovery (default off;\n\
                           on = periodic refresh waves can be visible as bands repainting\n\
                           the image; off = steady image, recovers via PLI/FIR -> IDR)\n\
-  --encoder <v>           hardware encoder: auto | nvidia | intel (default auto =\n\
-                          pick by capture adapter; intel = Quick Sync / oneVPL)\n\
+  --encoder <v>           encoder: auto | nvidia | intel | software (default auto =\n\
+                          pick by capture adapter; intel = Quick Sync / oneVPL;\n\
+                          software = CPU-only libx264 fallback, needs libx264.dll)\n\
+  --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
+                          paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
 \n\
 ICE / TLS\n\

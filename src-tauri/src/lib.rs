@@ -277,6 +277,8 @@ pub fn run() {
             get_turn_config,
             set_server_ports,
             get_server_ports,
+            set_disable_gpu_encode,
+            get_disable_gpu_encode,
             logbus::get_log_backlog
         ])
         .events(collect_events![

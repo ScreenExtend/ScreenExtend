@@ -43,6 +43,7 @@ import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@
 import { type as getOsType } from "@tauri-apps/plugin-os";
 
 const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
+const IS_WINDOWS = getOsType() === "windows";
 
 export default function Settings() {
   const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom] } = useContext(GlobalProviderContext);
@@ -77,6 +78,7 @@ export default function Settings() {
   const [oldHttpsPort, setOldHttpsPort] = useState(String(DEFAULT_HTTPS_PORT));
   const [configLoaded, setConfigLoaded] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [disableGpuEncode, setDisableGpuEncode] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -115,6 +117,7 @@ export default function Settings() {
       const seconds = await commands.getDisconnectGrace();
       setDisconnectGrace(String(seconds));
       setOldDisconnectGrace(String(seconds));
+      setDisableGpuEncode(config.disableGpuEncode ?? false);
       setConfigLoaded(true);
     }
     void updateText();
@@ -172,6 +175,19 @@ export default function Settings() {
         description: "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app.",
       });
     }
+  };
+
+  const toggleGpuEncode = async (disabled: boolean) => {
+    setDisableGpuEncode(disabled);
+    await commands.setDisableGpuEncode(disabled);
+    await updateConfig({ disableGpuEncode: disabled });
+    await flushConfig();
+    toast({
+      title: disabled ? "GPU Video Encoding Disabled" : "GPU Video Encoding Enabled",
+      description: disabled
+        ? "Video is now encoded on the CPU (software). This uses far more CPU and can lower quality or frame rate. Connected devices reconnect using the software encoder."
+        : "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder.",
+    });
   };
 
   const saveServerPorts = async () => {
@@ -769,6 +785,36 @@ export default function Settings() {
                   </CardContent>
                 </Card>
               </div>
+              {IS_WINDOWS && (
+                <div className="mb-4">
+                  <Card>
+                    <CardHeader>
+                      <div>
+                        <CardTitle>Video Encoding</CardTitle>
+                        <p className="text-sm text-muted-foreground mt-1">
+                          Screen video is normally encoded by your GPU (NVIDIA, Intel, or AMD), which is fast and light on the CPU. Only turn this off if hardware encoding won't start — for example inside a virtual machine.
+                        </p>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="flex items-center space-x-4 p-3 px-0">
+                        <div className="flex-1 space-y-1">
+                          <p className="text-sm font-medium leading-none">
+                            Disable GPU video encoding
+                          </p>
+                          <p className="text-sm text-muted-foreground">
+                            Not recommended. Forces slower CPU-only (software) encoding, which raises CPU usage and can reduce quality or frame rate. Leave this off unless hardware encoding is broken or unavailable. Changing it reconnects active devices.
+                          </p>
+                        </div>
+                        <Switch
+                          checked={disableGpuEncode}
+                          onCheckedChange={(checked) => void toggleGpuEncode(checked)}
+                        />
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
               <div>
                 <Card>
                   <CardHeader>

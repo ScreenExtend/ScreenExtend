@@ -2,6 +2,7 @@ mod intel_encoder;
 mod intel_layout;
 mod nvenc_layout;
 mod pipeline;
+mod x264_encoder;
 
 #[test]
 #[ignore = "requires an interactive desktop; run with --ignored"]

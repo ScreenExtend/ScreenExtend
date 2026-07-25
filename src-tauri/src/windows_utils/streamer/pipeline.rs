@@ -26,6 +26,7 @@ use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
 use super::scaler::{Scaler, TextureReader};
 use super::tuning;
+use super::x264::encoder::X264Encoder;
 
 #[derive(Clone)]
 pub struct EncodedFrame {
@@ -128,6 +129,16 @@ pub(crate) fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> 
     let w = scale.apply(native_w).max(2) & !1;
     let h = scale.apply(native_h).max(2) & !1;
     (w, h)
+}
+
+/// The vendor to actually build, honouring the "disable GPU encoding" override: when set, force
+/// the software encoder regardless of the configured hardware vendor.
+fn effective_vendor(cfg: &Config) -> crate::streamer::config::EncoderVendor {
+    if cfg.disable_gpu_encode {
+        crate::streamer::config::EncoderVendor::Software
+    } else {
+        cfg.encoder_vendor
+    }
 }
 
 pub fn start(cfg: &Config) -> Result<Pipeline> {
@@ -305,7 +316,7 @@ fn start_live_capture(
         ColorFormat::Bgra8,
         CaptureFlags {
             config,
-            vendor: cfg.encoder_vendor,
+            vendor: effective_vendor(cfg),
             native_w: info.width,
             native_h: info.height,
             tx,
@@ -372,7 +383,7 @@ fn start_dxgi_capture(
     let thread_args = DxgiThreadArgs {
         device_name: device_name.to_string(),
         config,
-        vendor: cfg.encoder_vendor,
+        vendor: effective_vendor(cfg),
         native_w: info.width,
         native_h: info.height,
         frame_duration,
@@ -453,7 +464,9 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             None
         };
 
-        tuning::raise_d3d11_gpu_priority(backend.device());
+        if let Some(dev) = backend.device() {
+            tuning::raise_d3d11_gpu_priority(dev);
+        }
         tuning::raise_d3d11_gpu_priority(dup.device());
         let path_name = backend.name();
 
@@ -708,6 +721,10 @@ enum Backend {
     /// Intel Quick Sync on its own device, fed via CPU readback — last-resort bridge for when
     /// the capture device is neither Intel (no same-adapter path) nor NVENC-reachable.
     IntelCpu { encoder: IntelEncoder },
+    /// CPU-only libx264. The final fallback when no hardware encoder works at all (e.g. a VM
+    /// whose capture path is on a software D3D adapter). Fed BGRA CPU bytes like the other
+    /// cpu-bridge backends; converts to I420 and encodes entirely on the CPU.
+    X264 { encoder: X264Encoder },
 }
 
 impl Backend {
@@ -716,14 +733,18 @@ impl Backend {
             Backend::Nvenc { path, .. } => path.name(),
             Backend::Intel { .. } => "intel-same-adapter",
             Backend::IntelCpu { .. } => "intel-cpu-bridge",
+            Backend::X264 { .. } => "software-x264",
         }
     }
 
-    fn device(&self) -> &ID3D11Device {
+    /// The encoder's D3D11 device, or `None` for the software backend (which has none). Used only
+    /// for GPU-priority tuning, so `None` simply means "nothing to tune".
+    fn device(&self) -> Option<&ID3D11Device> {
         match self {
-            Backend::Nvenc { encoder, .. } => encoder.device(),
-            Backend::Intel { encoder } => encoder.device(),
-            Backend::IntelCpu { encoder } => encoder.device(),
+            Backend::Nvenc { encoder, .. } => Some(encoder.device()),
+            Backend::Intel { encoder } => Some(encoder.device()),
+            Backend::IntelCpu { encoder } => Some(encoder.device()),
+            Backend::X264 { .. } => None,
         }
     }
 
@@ -732,6 +753,7 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.set_bitrate(bps),
             Backend::Intel { encoder } => encoder.set_bitrate(bps),
             Backend::IntelCpu { encoder } => encoder.set_bitrate(bps),
+            Backend::X264 { encoder } => encoder.set_bitrate(bps),
         }
     }
 
@@ -744,7 +766,12 @@ impl Backend {
 
     /// Whether frames reach the encoder as CPU bytes (`encode_cpu`) instead of textures.
     fn is_cpu_bridge(&self) -> bool {
-        matches!(self, Backend::Nvenc { path: EncodePath::CpuBridge, .. } | Backend::IntelCpu { .. })
+        matches!(
+            self,
+            Backend::Nvenc { path: EncodePath::CpuBridge, .. }
+                | Backend::IntelCpu { .. }
+                | Backend::X264 { .. }
+        )
     }
 
     fn encode_gpu(
@@ -790,6 +817,7 @@ impl Backend {
                 encoder.encode_bgra_padded(data, row_pitch, force_idr)
             }
             Backend::IntelCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
+            Backend::X264 { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             _ => bail!("encode_cpu called on a GPU-path backend"),
         }
     }
@@ -799,6 +827,7 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.encode_repeat(force_idr),
             Backend::Intel { encoder } => encoder.encode_repeat(force_idr),
             Backend::IntelCpu { encoder } => encoder.encode_repeat(force_idr),
+            Backend::X264 { encoder } => encoder.encode_repeat(force_idr),
         }
     }
 
@@ -988,18 +1017,45 @@ fn build_backend(
         }
     };
 
-    match vendor {
-        EncoderVendor::Nvidia => try_nvenc(),
-        EncoderVendor::Intel => try_intel(),
-        EncoderVendor::Auto => match try_nvenc() {
-            Ok(backend) => Ok(backend),
-            Err(nv_err) => {
-                teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
-                try_intel().map_err(|ie| {
-                    nv_err.context(format!("no working encoder (Intel fallback also failed: {ie:?})"))
-                })
+    let try_x264 = || -> Result<Backend> {
+        match X264Encoder::new(config) {
+            Ok(encoder) => {
+                tprintln!(
+                    "pipeline: live capture ready -- SOFTWARE x264 CPU path ({}x{}@{})",
+                    config.width, config.height, config.fps
+                );
+                Ok(Backend::X264 { encoder })
             }
-        },
+            Err(e) => Err(e.context("software x264 fallback unavailable")),
+        }
+    };
+
+    match vendor {
+        // Explicit software selection (or `--disable-gpu-encode`): never touch the GPU encoders.
+        EncoderVendor::Software => try_x264(),
+        EncoderVendor::Nvidia => try_nvenc().or_else(|nv_err| {
+            teprintln!("NVENC unavailable ({nv_err:?}); falling back to software x264");
+            try_x264().map_err(|xe| {
+                nv_err.context(format!("software fallback also failed: {xe:?}"))
+            })
+        }),
+        EncoderVendor::Intel => try_intel().or_else(|ie| {
+            teprintln!("Intel Quick Sync unavailable ({ie:?}); falling back to software x264");
+            try_x264().map_err(|xe| ie.context(format!("software fallback also failed: {xe:?}")))
+        }),
+        EncoderVendor::Auto => try_nvenc()
+            .or_else(|nv_err| {
+                teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
+                try_intel()
+                    .map_err(|ie| nv_err.context(format!("Intel fallback also failed: {ie:?}")))
+            })
+            .or_else(|hw_err| {
+                teprintln!(
+                    "no hardware encoder available ({hw_err:?}); falling back to software x264"
+                );
+                try_x264()
+                    .map_err(|xe| hw_err.context(format!("software fallback also failed: {xe:?}")))
+            }),
     }
 }
 
@@ -1116,7 +1172,9 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             None
         };
 
-        tuning::raise_d3d11_gpu_priority(backend.device());
+        if let Some(dev) = backend.device() {
+            tuning::raise_d3d11_gpu_priority(dev);
+        }
 
         let path_name = backend.name();
         let core = Arc::new(Mutex::new(EncodeCore {

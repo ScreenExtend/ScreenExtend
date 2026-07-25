@@ -21,6 +21,7 @@ export type Config = {
   sessionPassword: string,
   publicSessionsEnabled: boolean,
   zoomFactor: number,
+  disableGpuEncode: boolean,
   serverPorts: {
     http: number,
     https: number
@@ -51,6 +52,7 @@ export const defaultConfig: Config = {
   sessionPassword: "",
   publicSessionsEnabled: true,
   zoomFactor: 1,
+  disableGpuEncode: false,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,
     https: DEFAULT_HTTPS_PORT

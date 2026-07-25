@@ -7,6 +7,7 @@ pub mod tuning;
 pub mod amd;
 pub mod intel;
 pub mod nvidia;
+pub mod x264;
 
 #[cfg(test)]
 mod test;

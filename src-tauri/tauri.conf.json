@@ -23,7 +23,8 @@
       "resources/VirtualDisplayDriver.dll",
       "resources/VirtualDisplayDriver.cat",
       "resources/VirtualDisplayDriver.inf",
-      "resources/ScreenExtend.cer"
+      "resources/ScreenExtend.cer",
+      "resources/libx264-164.dll"
     ],
     "publisher": "Sarvesh Madullapalli",
     "copyright": "Copyright © 2026 Sarvesh Madullapalli All Rights Reserved",

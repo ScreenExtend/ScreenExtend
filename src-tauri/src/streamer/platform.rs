@@ -51,9 +51,17 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use crate::streamer::config::EncoderVendor;
-        match config.encoder_vendor {
+        let vendor = if config.disable_gpu_encode {
+            EncoderVendor::Software
+        } else {
+            config.encoder_vendor
+        };
+        match vendor {
             EncoderVendor::Intel => {
                 crate::windows_utils::streamer::intel::encoder::probe_encode(config, path)
+            }
+            EncoderVendor::Software => {
+                crate::windows_utils::streamer::x264::encoder::probe_encode(config, path)
             }
             EncoderVendor::Auto | EncoderVendor::Nvidia => {
                 crate::windows_utils::streamer::nvidia::encoder::probe_encode(config, path)
