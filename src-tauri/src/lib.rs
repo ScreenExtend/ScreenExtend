@@ -172,6 +172,47 @@ fn avatar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("avatar.png"))
 }
 
+fn current_version() -> String {
+    "0.3.1".to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type)]
+pub struct UpdateInfo {
+    pub update_available: bool,
+    pub current_version: String,
+    pub latest_version: String,
+    pub download_url: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn check_for_update() -> Result<UpdateInfo, String> {
+    const DOWNLOAD_URL: &str = "https://screenextend.app/#download";
+    let current = current_version();
+
+    let resp = tauri_plugin_http::reqwest::Client::new()
+        .get("https://api.github.com/repos/ScreenExtend/ScreenExtend/releases/latest")
+        .header("User-Agent", "ScreenExtend")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let tag = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| "release response missing tag_name".to_string())?;
+    let latest = tag.strip_prefix("app-v").unwrap_or(tag).to_string();
+
+    Ok(UpdateInfo {
+        update_available: latest != current,
+        current_version: current,
+        latest_version: latest,
+        download_url: DOWNLOAD_URL.to_string(),
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 fn set_avatar(app: tauri::AppHandle, bytes: Vec<u8>) -> bool {
@@ -257,6 +298,7 @@ pub fn run() {
             get_cloud_status,
             exit_app,
             get_username,
+            check_for_update,
             set_avatar,
             get_avatar,
             remove_avatar,
