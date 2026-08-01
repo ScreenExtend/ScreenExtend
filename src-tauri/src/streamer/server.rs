@@ -1,14 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use axum::{
-    Router,
     body::Bytes,
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 
 use serde::Deserialize;
@@ -164,13 +164,21 @@ pub async fn run(config: Config, handle: Option<axum_server::Handle>) -> Result<
     let self_signed = material.self_signed;
     let tls_config = super::tls::rustls_config(&material).await?;
 
-    log_urls(config.lan_ip.as_deref(), config.port, config.https_port, self_signed);
+    log_urls(
+        config.lan_ip.as_deref(),
+        config.port,
+        config.https_port,
+        self_signed,
+    );
 
     use axum_server::accept::NoDelayAcceptor;
     let http = axum_server::bind(http_addr)
         .acceptor(NoDelayAcceptor)
         .handle(handle.clone())
-        .serve(app.clone().into_make_service_with_connect_info::<SocketAddr>());
+        .serve(
+            app.clone()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        );
     let https = axum_server::bind_rustls(https_addr, tls_config)
         .map(|rustls| rustls.acceptor(NoDelayAcceptor))
         .handle(handle)
@@ -268,11 +276,7 @@ async fn reconfig(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
     let body = process_reconfig(&state, &peer.ip().to_string());
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 async fn leave(
@@ -387,9 +391,7 @@ pub async fn process_whep(
                 return ProcessedResponse {
                     status: StatusCode::UNAUTHORIZED.as_u16(),
                     content_type: "text/plain",
-                    body: format!(
-                        "invalid session id or OTP ({remaining} attempt(s) left)"
-                    ),
+                    body: format!("invalid session id or OTP ({remaining} attempt(s) left)"),
                 };
             }
         },
@@ -397,7 +399,10 @@ pub async fn process_whep(
 
     match start_session(state, &req, device_key, ice_servers).await {
         Ok(answer) => {
-            tprintln!("join accepted: WHEP answer generated ({} bytes)", answer.len());
+            tprintln!(
+                "join accepted: WHEP answer generated ({} bytes)",
+                answer.len()
+            );
             ProcessedResponse {
                 status: StatusCode::OK.as_u16(),
                 content_type: "application/sdp",
@@ -463,7 +468,11 @@ async fn start_session(
 
     let width = req.width.clamp(2, 16384) & !1;
     let height = req.height.clamp(2, 16384) & !1;
-    let refresh = if cfg.max_fps == 0 { 60 } else { cfg.max_fps.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE) };
+    let refresh = if cfg.max_fps == 0 {
+        60
+    } else {
+        cfg.max_fps.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
+    };
 
     let display_name = if req.device_name.trim().is_empty() {
         "ScreenExtend".to_string()
@@ -587,9 +596,7 @@ async fn start_session(
     };
 
     if let Some((left, top, width, height)) = pipeline::monitor_rect(&device_name) {
-        tprintln!(
-            "remote-input display {device_name}: {width}x{height} at ({left},{top})"
-        );
+        tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
     }
 
     let (closed_tx, closed_rx) = oneshot::channel();
@@ -634,7 +641,12 @@ async fn start_session(
 
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
-            session::set_active_capture(s, client_ip, session_seq, Box::new(move || session.stop()));
+            session::set_active_capture(
+                s,
+                client_ip,
+                session_seq,
+                Box::new(move || session.stop()),
+            );
             None
         }
         None => Some(session),
@@ -690,12 +702,18 @@ async fn start_session(
             .map(|s| !session::is_current_session(s, &report_ip, session_seq))
             .unwrap_or(false);
         if superseded {
-            tprintln!("session for display id={display_id} ({device_name}) superseded; keeping display");
+            tprintln!(
+                "session for display id={display_id} ({device_name}) superseded; keeping display"
+            );
             return;
         }
         tprintln!(
             "session for display id={display_id} ({device_name}) ended ({}); removing display",
-            if left { "page closed" } else { "disconnected, no rejoin" }
+            if left {
+                "page closed"
+            } else {
+                "disconnected, no rejoin"
+            }
         );
         if let Some(s) = sessions.as_ref() {
             let _ = session::take_live_display(s, &report_ip);
@@ -775,7 +793,11 @@ fn build_ice_servers(config: &Config) -> Vec<RTCIceServer> {
         });
     }
 
-    match (&config.turn_url, &config.turn_username, &config.turn_credential) {
+    match (
+        &config.turn_url,
+        &config.turn_username,
+        &config.turn_credential,
+    ) {
         (Some(url), Some(user), Some(cred)) => {
             servers.push(RTCIceServer {
                 urls: vec![url.clone()],

@@ -1,4 +1,9 @@
-#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code
+)]
 
 use std::ffi::c_void;
 
@@ -262,8 +267,8 @@ pub struct mfxFrameData {
     pub TimeStamp: mfxU64,
     pub FrameOrder: mfxU32,
     pub Locked: mfxU16,
-    pub Pitch: mfxU16, // union { Pitch; PitchLow; }
-    pub Y: *mut mfxU8, // union { Y; Y16; R; }
+    pub Pitch: mfxU16,  // union { Pitch; PitchLow; }
+    pub Y: *mut mfxU8,  // union { Y; Y16; R; }
     pub UV: *mut mfxU8, // union { UV; ...; U; Cb; G; }
     pub Cr: *mut mfxU8, // union { Cr; V; B; ... } -- for RGB4, B == base of BGRA
     pub A: *mut mfxU8,
@@ -293,9 +298,11 @@ pub struct mfxFrameSurfaceInterface {
     pub reserved1: [mfxU16; 3],
     pub AddRef: Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1) -> mfxStatus>,
     pub Release: Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1) -> mfxStatus>,
-    pub GetRefCounter:
-        Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1, counter: *mut mfxU32) -> mfxStatus>,
-    pub Map: Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1, flags: mfxU32) -> mfxStatus>,
+    pub GetRefCounter: Option<
+        unsafe extern "C" fn(surface: *mut mfxFrameSurface1, counter: *mut mfxU32) -> mfxStatus,
+    >,
+    pub Map:
+        Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1, flags: mfxU32) -> mfxStatus>,
     pub Unmap: Option<unsafe extern "C" fn(surface: *mut mfxFrameSurface1) -> mfxStatus>,
     pub GetNativeHandle: Option<
         unsafe extern "C" fn(
@@ -552,7 +559,8 @@ type FnMFXSetConfigFilterProperty =
 type FnMFXCreateSession =
     unsafe extern "C" fn(loader: mfxLoader, i: mfxU32, session: *mut mfxSession) -> mfxStatus;
 type FnMFXClose = unsafe extern "C" fn(session: mfxSession) -> mfxStatus;
-type FnMFXQueryVersion = unsafe extern "C" fn(session: mfxSession, version: *mut mfxU32) -> mfxStatus;
+type FnMFXQueryVersion =
+    unsafe extern "C" fn(session: mfxSession, version: *mut mfxU32) -> mfxStatus;
 type FnMFXQueryIMPL = unsafe extern "C" fn(session: mfxSession, impl_: *mut mfxI32) -> mfxStatus;
 
 type FnSetHandle =
@@ -638,8 +646,9 @@ macro_rules! resolve {
 impl Vpl {
     /// Dynamically load the oneVPL dispatcher and resolve all entry points used by the encoder.
     pub fn load() -> Result<Self> {
-        let lib = unsafe { libloading::Library::new("libvpl.dll") }
-            .context("loading libvpl.dll (Intel oneVPL dispatcher; ships with the Intel GPU driver)")?;
+        let lib = unsafe { libloading::Library::new("libvpl.dll") }.context(
+            "loading libvpl.dll (Intel oneVPL dispatcher; ships with the Intel GPU driver)",
+        )?;
 
         // Resolve the symbols while the library is borrowed, then move the library into the struct.
         // `Symbol::into_raw` keeps the pointer valid as long as the library is alive.

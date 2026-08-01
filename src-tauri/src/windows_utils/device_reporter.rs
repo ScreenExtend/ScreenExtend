@@ -24,8 +24,12 @@ impl DeviceReporter for TauriDeviceReporter {
         let mut device = Device::defaults(info);
         if let Some(o) = self.overrides.lock().unwrap().get(&ip) {
             device.scale = o.scale;
-            device.orientation =
-                if o.orientation_portrait { "Portrait" } else { "Landscape" }.to_string();
+            device.orientation = if o.orientation_portrait {
+                "Portrait"
+            } else {
+                "Landscape"
+            }
+            .to_string();
             device.refresh_rate = o.refresh_rate;
             device.video_scale = o.video_scale;
             device.video_quality = o.video_quality as u32;

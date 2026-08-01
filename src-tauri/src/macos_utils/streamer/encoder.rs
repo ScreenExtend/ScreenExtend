@@ -2,32 +2,31 @@ use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::ptr::NonNull;
 
-use anyhow::{Result, bail};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use anyhow::{bail, Result};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, kCFAllocatorDefault,
-    kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    kCFAllocatorDefault, kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks,
+    kCFTypeDictionaryValueCallBacks, CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained,
+    CFString, CFType,
 };
 use objc2_core_media::{
-    CMSampleBuffer, CMTime, CMTimeFlags, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
-    kCMVideoCodecType_H264,
+    kCMVideoCodecType_H264, CMSampleBuffer, CMTime, CMTimeFlags,
+    CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
 };
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
-    VTCompressionSession, VTEncodeInfoFlags, VTSession, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_DataRateLimits,
-    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxFrameDelayCount,
-    kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_MaxFrameDelayCount, kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_MaximizePowerEfficiency,
     kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTEncodeFrameOptionKey_ForceKeyFrame,
-    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
-    kVTProfileLevel_H264_Main_AutoLevel,
+    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
+    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel,
     kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
-    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
+    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
+    VTEncodeInfoFlags, VTSession, VTSessionSetProperty,
 };
 
 use crate::streamer::config::H264Profile;
@@ -154,14 +153,18 @@ impl Encoder {
         {
             let s = self.vt_session();
             set_bool(s, unsafe { kVTCompressionPropertyKey_RealTime }, true);
-            set_bool(s, unsafe { kVTCompressionPropertyKey_AllowFrameReordering }, false);
+            set_bool(
+                s,
+                unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
+                false,
+            );
 
             let profile: &CFString = if self.low_latency {
                 match cfg.profile {
-                    H264Profile::High => vt_optional_cfstring(
-                        "kVTProfileLevel_H264_ConstrainedHigh_AutoLevel",
-                    )
-                    .unwrap_or(unsafe { kVTProfileLevel_H264_High_AutoLevel }),
+                    H264Profile::High => {
+                        vt_optional_cfstring("kVTProfileLevel_H264_ConstrainedHigh_AutoLevel")
+                            .unwrap_or(unsafe { kVTProfileLevel_H264_High_AutoLevel })
+                    }
                     H264Profile::Main => unsafe { kVTProfileLevel_H264_Main_AutoLevel },
                     H264Profile::Baseline => {
                         vt_optional_cfstring("kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel")
@@ -178,20 +181,48 @@ impl Encoder {
                     H264Profile::High => unsafe { kVTProfileLevel_H264_High_AutoLevel },
                 }
             };
-            set_cftype(s, unsafe { kVTCompressionPropertyKey_ProfileLevel }, profile);
+            set_cftype(
+                s,
+                unsafe { kVTCompressionPropertyKey_ProfileLevel },
+                profile,
+            );
             set_optional_str(s, "kVTCompressionPropertyKey_ColorPrimaries", "ITU_R_709_2");
-            set_optional_str(s, "kVTCompressionPropertyKey_TransferFunction", "ITU_R_709_2");
+            set_optional_str(
+                s,
+                "kVTCompressionPropertyKey_TransferFunction",
+                "ITU_R_709_2",
+            );
             set_optional_str(s, "kVTCompressionPropertyKey_YCbCrMatrix", "ITU_R_709_2");
-            set_i32(s, unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, cfg.fps as i32);
+            set_i32(
+                s,
+                unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
+                cfg.fps as i32,
+            );
             set_i32(
                 s,
                 unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
                 (cfg.fps as i32).saturating_mul(60).max(1),
             );
-            set_f64(s, unsafe { kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration }, 10.0);
-            set_i32(s, unsafe { kVTCompressionPropertyKey_MaxFrameDelayCount }, 0);
-            set_bool(s, unsafe { kVTCompressionPropertyKey_MaximizePowerEfficiency }, false);
-            set_bool(s, unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality }, true);
+            set_f64(
+                s,
+                unsafe { kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration },
+                10.0,
+            );
+            set_i32(
+                s,
+                unsafe { kVTCompressionPropertyKey_MaxFrameDelayCount },
+                0,
+            );
+            set_bool(
+                s,
+                unsafe { kVTCompressionPropertyKey_MaximizePowerEfficiency },
+                false,
+            );
+            set_bool(
+                s,
+                unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+                true,
+            );
             ltr = set_optional(s, "kVTCompressionPropertyKey_EnableLTR", cfbool(true));
             if cfg.intra_refresh {
                 teprintln!(
@@ -216,10 +247,18 @@ impl Encoder {
             set_optional_i32(s, "kVTCompressionPropertyKey_MinAllowedFrameQP", qp as i32);
             return;
         }
-        set_i32(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, cfg.bitrate_bps as i32);
+        set_i32(
+            s,
+            unsafe { kVTCompressionPropertyKey_AverageBitRate },
+            cfg.bitrate_bps as i32,
+        );
         let cap_bytes = (((cfg.bitrate_bps as f64) * 1.5) / 8.0) as i64;
         let limits = data_rate_limits(cap_bytes, 1.0);
-        set_cftype(s, unsafe { kVTCompressionPropertyKey_DataRateLimits }, &limits);
+        set_cftype(
+            s,
+            unsafe { kVTCompressionPropertyKey_DataRateLimits },
+            &limits,
+        );
         set_optional_i32(s, "kVTCompressionPropertyKey_MaxAllowedFrameQP", 45);
     }
 
@@ -230,7 +269,12 @@ impl Encoder {
             flags: CMTimeFlags::Valid,
             epoch: 0,
         };
-        let dur = CMTime { value: 1, timescale: self.fps, flags: CMTimeFlags::Valid, epoch: 0 };
+        let dur = CMTime {
+            value: 1,
+            timescale: self.fps,
+            flags: CMTimeFlags::Valid,
+            epoch: 0,
+        };
         self.frame_index += 1;
 
         let frame_props = if force_idr {
@@ -264,7 +308,12 @@ impl Encoder {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        let invalid = CMTime { value: 0, timescale: 0, flags: CMTimeFlags(0), epoch: 0 };
+        let invalid = CMTime {
+            value: 0,
+            timescale: 0,
+            flags: CMTimeFlags(0),
+            epoch: 0,
+        };
         let st = unsafe { self.session.complete_frames(invalid) };
         if st != 0 {
             bail!("VTCompressionSessionCompleteFrames failed: OSStatus {st}");
@@ -277,10 +326,18 @@ impl Encoder {
             return Ok(());
         }
         let s = self.vt_session();
-        set_i32(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, bps as i32);
+        set_i32(
+            s,
+            unsafe { kVTCompressionPropertyKey_AverageBitRate },
+            bps as i32,
+        );
         let cap_bytes = (((bps as f64) * 1.5) / 8.0) as i64;
         let limits = data_rate_limits(cap_bytes, 1.0);
-        set_cftype(s, unsafe { kVTCompressionPropertyKey_DataRateLimits }, &limits);
+        set_cftype(
+            s,
+            unsafe { kVTCompressionPropertyKey_DataRateLimits },
+            &limits,
+        );
         Ok(())
     }
 
@@ -306,7 +363,12 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        let invalid = CMTime { value: 0, timescale: 0, flags: CMTimeFlags(0), epoch: 0 };
+        let invalid = CMTime {
+            value: 0,
+            timescale: 0,
+            flags: CMTimeFlags(0),
+            epoch: 0,
+        };
         unsafe {
             let _ = self.session.complete_frames(invalid);
             self.session.invalidate();
@@ -337,7 +399,9 @@ unsafe extern "C-unwind" fn output_callback(
         return;
     }
     let retained = unsafe { CFRetained::retain(sample_ptr) };
-    let _ = ctx.tx.send(CompressedSample { sample: Some(retained) });
+    let _ = ctx.tx.send(CompressedSample {
+        sample: Some(retained),
+    });
 }
 
 fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
@@ -355,8 +419,8 @@ fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
     let mut is_keyframe = false;
     let mut off = 0usize;
     while off + NAL_LENGTH_PREFIX <= data.len() {
-        let nal_len = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-            as usize;
+        let nal_len =
+            u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
         off += NAL_LENGTH_PREFIX;
         if nal_len == 0 || off + nal_len > data.len() {
             break;
@@ -407,8 +471,8 @@ fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
 
     let mut off = 0usize;
     while off + NAL_LENGTH_PREFIX <= data.len() {
-        let nal_len = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-            as usize;
+        let nal_len =
+            u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
         off += NAL_LENGTH_PREFIX;
         if nal_len == 0 || off + nal_len > data.len() {
             break;
@@ -518,10 +582,14 @@ fn set_optional_f64(session: &VTSession, key_symbol: &str, value: f64) -> bool {
 }
 
 fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
-    let keys: Vec<*const c_void> =
-        pairs.iter().map(|(k, _)| (*k as *const CFString).cast()).collect();
-    let values: Vec<*const c_void> =
-        pairs.iter().map(|(_, v)| (*v as *const CFType).cast()).collect();
+    let keys: Vec<*const c_void> = pairs
+        .iter()
+        .map(|(k, _)| (*k as *const CFString).cast())
+        .collect();
+    let values: Vec<*const c_void> = pairs
+        .iter()
+        .map(|(_, v)| (*v as *const CFType).cast())
+        .collect();
     unsafe {
         CFDictionary::new(
             None,
@@ -538,11 +606,18 @@ fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
 fn data_rate_limits(max_bytes: i64, window_secs: f64) -> CFRetained<CFArray> {
     let bytes = CFNumber::new_isize(max_bytes as isize);
     let secs = CFNumber::new_f64(window_secs);
-    let values: [*const c_void; 2] =
-        [(&*bytes as *const CFNumber).cast(), (&*secs as *const CFNumber).cast()];
+    let values: [*const c_void; 2] = [
+        (&*bytes as *const CFNumber).cast(),
+        (&*secs as *const CFNumber).cast(),
+    ];
     unsafe {
-        CFArray::new(None, values.as_ptr() as *mut *const c_void, 2, &kCFTypeArrayCallBacks)
-            .expect("CFArrayCreate for DataRateLimits")
+        CFArray::new(
+            None,
+            values.as_ptr() as *mut *const c_void,
+            2,
+            &kCFTypeArrayCallBacks,
+        )
+        .expect("CFArrayCreate for DataRateLimits")
     }
 }
 
@@ -582,7 +657,14 @@ mod tests {
     fn make_bgra_frame(w: usize, h: usize, tick: usize) -> CFRetained<CVPixelBuffer> {
         let mut out: *mut CVPixelBuffer = ptr::null_mut();
         let r = unsafe {
-            CVPixelBufferCreate(kCFAllocatorDefault, w, h, BGRA, None, NonNull::from(&mut out))
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                w,
+                h,
+                BGRA,
+                None,
+                NonNull::from(&mut out),
+            )
         };
         assert_eq!(r, 0, "CVPixelBufferCreate");
         let pb = unsafe { CFRetained::from_raw(NonNull::new(out).unwrap()) };
@@ -662,24 +744,41 @@ mod tests {
             bitstream.len(),
             per_frame.len()
         );
-        let keyframes: Vec<usize> =
-            per_frame.iter().enumerate().filter(|(_, n)| n.contains(&5)).map(|(i, _)| i).collect();
+        let keyframes: Vec<usize> = per_frame
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.contains(&5))
+            .map(|(i, _)| i)
+            .collect();
         println!("frame 0 NALs: {:?}", per_frame[0]);
         println!("frame 1 NALs: {:?}", per_frame[1]);
         println!("keyframe indices: {keyframes:?}");
 
-        assert!(per_frame.len() >= 55, "expected ~60 frames, got {}", per_frame.len());
+        assert!(
+            per_frame.len() >= 55,
+            "expected ~60 frames, got {}",
+            per_frame.len()
+        );
         assert!(per_frame[0].contains(&7), "frame 0 missing SPS");
         assert!(per_frame[0].contains(&8), "frame 0 missing PPS");
         assert!(per_frame[0].contains(&5), "frame 0 missing IDR slice");
         assert!(per_frame[1].contains(&1), "frame 1 not a P-frame");
         assert!(!per_frame[1].contains(&5), "frame 1 unexpectedly an IDR");
-        assert!(keyframes.len() <= 3, "too many keyframes: {keyframes:?} (P-frames not used)");
-        assert!(keyframes.iter().any(|&i| (28..=31).contains(&i)), "forced keyframe ~30 missing");
+        assert!(
+            keyframes.len() <= 3,
+            "too many keyframes: {keyframes:?} (P-frames not used)"
+        );
+        assert!(
+            keyframes.iter().any(|&i| (28..=31).contains(&i)),
+            "forced keyframe ~30 missing"
+        );
 
         for (i, nals) in per_frame.iter().enumerate() {
             for &t in nals {
-                assert!(matches!(t, 1 | 5 | 6 | 7 | 8 | 9), "frame {i} unexpected NAL type {t}");
+                assert!(
+                    matches!(t, 1 | 5 | 6 | 7 | 8 | 9),
+                    "frame {i} unexpected NAL type {t}"
+                );
             }
         }
     }
@@ -702,7 +801,11 @@ mod tests {
     fn recreate_churn_releases_hw() {
         for i in 0..8 {
             let enc = Encoder::new(cfg_at(1280, 720));
-            assert!(enc.is_ok(), "create #{i} at 1280x720 failed: {:?}", enc.err());
+            assert!(
+                enc.is_ok(),
+                "create #{i} at 1280x720 failed: {:?}",
+                enc.err()
+            );
             drop(enc);
             println!("ok: churn iteration {i} created+released at 1280x720");
         }
@@ -729,7 +832,11 @@ mod tests {
         for (w, h) in [(480u32, 270u32), (448u32, 252u32), (160u32, 90u32)] {
             let hw = hw_create_status(w, h);
             let enc = Encoder::new(cfg_at(w, h));
-            assert!(enc.is_ok(), "Encoder::new must succeed at {w}x{h}: {:?}", enc.err());
+            assert!(
+                enc.is_ok(),
+                "Encoder::new must succeed at {w}x{h}: {:?}",
+                enc.err()
+            );
             println!("ok: {w}x{h} created (require-HW was {hw:?}; Encoder::new used SW fallback)");
         }
     }
@@ -764,7 +871,10 @@ mod tests {
                     println!("concurrency: {n} simultaneous HW session(s) OK");
                 }
                 Err(e) => {
-                    println!("concurrency: capped at {} simultaneous HW session(s) ({e})", n - 1);
+                    println!(
+                        "concurrency: capped at {} simultaneous HW session(s) ({e})",
+                        n - 1
+                    );
                     break;
                 }
             }

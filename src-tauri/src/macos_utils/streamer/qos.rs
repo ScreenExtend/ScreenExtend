@@ -2,9 +2,9 @@ use std::ffi::{c_char, c_int, c_void};
 
 use mach2::mach_init::mach_thread_self;
 use mach2::thread_policy::{
+    thread_policy_set, thread_precedence_policy_data_t, thread_time_constraint_policy_data_t,
     THREAD_PRECEDENCE_POLICY, THREAD_PRECEDENCE_POLICY_COUNT, THREAD_TIME_CONSTRAINT_POLICY,
-    THREAD_TIME_CONSTRAINT_POLICY_COUNT, thread_policy_set, thread_precedence_policy_data_t,
-    thread_time_constraint_policy_data_t,
+    THREAD_TIME_CONSTRAINT_POLICY_COUNT,
 };
 
 use super::mach::ns_to_mach_ticks;
@@ -68,7 +68,7 @@ pub fn raise_current_thread_precedence() {
 #[cfg(target_arch = "x86_64")]
 pub fn pin_current_thread_encode_affinity() {
     use mach2::thread_policy::{
-        THREAD_AFFINITY_POLICY, THREAD_AFFINITY_POLICY_COUNT, thread_affinity_policy_data_t,
+        thread_affinity_policy_data_t, THREAD_AFFINITY_POLICY, THREAD_AFFINITY_POLICY_COUNT,
     };
     const ENCODE_AFFINITY_TAG: c_int = 1;
     let mut data = thread_affinity_policy_data_t {
@@ -98,15 +98,18 @@ const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
 #[derive(Clone, Copy)]
 struct JoinToken([u8; 64]);
 
-type CreateFn =
-    unsafe extern "C" fn(*const c_char, u32, os_workgroup_attr_t) -> os_workgroup_t;
+type CreateFn = unsafe extern "C" fn(*const c_char, u32, os_workgroup_attr_t) -> os_workgroup_t;
 type JoinFn = unsafe extern "C" fn(os_workgroup_t, *mut JoinToken) -> c_int;
 type LeaveFn = unsafe extern "C" fn(os_workgroup_t, *mut JoinToken);
 type ReleaseFn = unsafe extern "C" fn(*mut c_void);
 
 unsafe fn dlsym(name: &[u8]) -> Option<*mut c_void> {
     let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const c_char) };
-    if p.is_null() { None } else { Some(p) }
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 pub struct FrameWorkgroup {
@@ -128,7 +131,11 @@ impl FrameWorkgroup {
                 dlsym(b"os_release\0").map(|p| std::mem::transmute::<_, ReleaseFn>(p));
 
             let name = b"screenextend-encode\0";
-            let wg = create(name.as_ptr() as *const c_char, OS_CLOCK_MACH_ABSOLUTE_TIME, std::ptr::null_mut());
+            let wg = create(
+                name.as_ptr() as *const c_char,
+                OS_CLOCK_MACH_ABSOLUTE_TIME,
+                std::ptr::null_mut(),
+            );
             if wg.is_null() {
                 return None;
             }
@@ -138,11 +145,18 @@ impl FrameWorkgroup {
                 if let Some(rel) = release {
                     rel(wg);
                 }
-                teprintln!("[qos] os_workgroup_join failed (rc={rc}); using QoS + time-constraint only");
+                teprintln!(
+                    "[qos] os_workgroup_join failed (rc={rc}); using QoS + time-constraint only"
+                );
                 return None;
             }
             tprintln!("[qos] joined real-time encode workgroup");
-            Some(FrameWorkgroup { wg, token, leave, release })
+            Some(FrameWorkgroup {
+                wg,
+                token,
+                leave,
+                release,
+            })
         }
     }
 }

@@ -3,21 +3,21 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use block2::RcBlock;
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchRetained, GlobalQueueIdentifier};
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, kCFTypeDictionaryKeyCallBacks,
-    kCFTypeDictionaryValueCallBacks,
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFDictionary,
+    CFNumber, CFRetained, CFString,
 };
 use objc2_core_graphics::{
-    CGDisplayStream, CGDisplayStreamFrameStatus, CGDisplayStreamUpdate, CGError,
     kCGDisplayStreamMinimumFrameTime, kCGDisplayStreamPreserveAspectRatio,
-    kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor,
-    kCGDisplayStreamYCbCrMatrix, kCGDisplayStreamYCbCrMatrix_ITU_R_709_2,
+    kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor, kCGDisplayStreamYCbCrMatrix,
+    kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream, CGDisplayStreamFrameStatus,
+    CGDisplayStreamUpdate, CGError,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferCreateWithIOSurface};
 use objc2_io_surface::IOSurfaceRef;
@@ -27,8 +27,9 @@ use super::gpu::Gpu;
 use super::mach::mach_now;
 use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId};
 
-type FrameHandler =
-    RcBlock<dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate)>;
+type FrameHandler = RcBlock<
+    dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate),
+>;
 
 pub struct CgDisplayStreamBackend {
     display_id: DisplayId,
@@ -130,7 +131,10 @@ fn handle_frame(
             height,
             arrived_mach: mach_now(),
             captured_at: Instant::now(),
-            backing: Backing::PixelBuffer { pixbuf, _surface: surface_ret },
+            backing: Backing::PixelBuffer {
+                pixbuf,
+                _surface: surface_ret,
+            },
         });
     }
 }
@@ -210,8 +214,8 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_virtual_display() {
-        use crate::macos_utils::virtual_display::MacosVirtualDisplay;
         use crate::macos_utils::streamer::pipeline;
+        use crate::macos_utils::virtual_display::MacosVirtualDisplay;
 
         fn try_capture(id: u32, w: u32, h: u32) -> (bool, u64) {
             let gpu = Gpu::new().unwrap();
@@ -242,7 +246,11 @@ mod tests {
         let name = id.to_string();
         let g = display::display_geometry(id);
         println!("created id={id}, geometry={}x{}@{}", g.0, g.1, g.2);
-        assert_eq!((g.0, g.1), (1280, 800), "virtual display must boot at its real mode");
+        assert_eq!(
+            (g.0, g.1),
+            (1280, 800),
+            "virtual display must boot at its real mode"
+        );
         let (ok, frames) = try_capture(id, g.0, g.1);
         println!("  capture@create: ok={ok} frames={frames}");
         assert!(ok && frames > 0, "capture must work right after create");
@@ -250,10 +258,17 @@ mod tests {
         pipeline::set_display_mode(&name, 1920, 1080, 60, false).expect("set 1920x1080");
         let g = display::display_geometry(id);
         println!("after set 1920x1080: geometry={}x{}@{}", g.0, g.1, g.2);
-        assert_eq!((g.0, g.1), (1920, 1080), "resolution change must take effect");
+        assert_eq!(
+            (g.0, g.1),
+            (1920, 1080),
+            "resolution change must take effect"
+        );
         let (ok, frames) = try_capture(id, g.0, g.1);
         println!("  capture@1920x1080: ok={ok} frames={frames}");
-        assert!(ok && frames > 0, "capture must work after resolution change");
+        assert!(
+            ok && frames > 0,
+            "capture must work after resolution change"
+        );
 
         pipeline::set_display_mode(&name, 1280, 800, 60, true).expect("set portrait");
         let g = display::display_geometry(id);
@@ -265,7 +280,10 @@ mod tests {
 
         pipeline::set_display_scale(&name, 200).expect("set scale 200%");
         let g = display::display_geometry(id);
-        println!("after scale 200%: geometry(logical)={}x{}@{}", g.0, g.1, g.2);
+        println!(
+            "after scale 200%: geometry(logical)={}x{}@{}",
+            g.0, g.1, g.2
+        );
         let (ok, frames) = try_capture(id, g.0, g.1);
         println!("  capture@hidpi: ok={ok} frames={frames}");
         assert!(ok && frames > 0, "capture must work after scale change");
@@ -290,8 +308,7 @@ mod tests {
             fps: fps as i32,
             pixel_format: PIXEL_FORMAT_420F,
         };
-        let mut backend =
-            CgDisplayStreamBackend::new(display_id, gpu, sink, cfg).expect("backend");
+        let mut backend = CgDisplayStreamBackend::new(display_id, gpu, sink, cfg).expect("backend");
         if let Err(e) = backend.start() {
             eprintln!(
                 "capture did NOT start: {e:?}. On macOS 10.15 a null stream almost \
@@ -326,10 +343,16 @@ mod tests {
             let mean = samples.iter().sum::<f64>() / samples.len() as f64;
             let p99_idx = ((samples.len() as f64 * 0.99) as usize).min(samples.len() - 1);
             let p99 = samples[p99_idx];
-            println!("latency ms: mean={mean:.3} p99={p99:.3} max={:.3}", samples.last().unwrap());
+            println!(
+                "latency ms: mean={mean:.3} p99={p99:.3} max={:.3}",
+                samples.last().unwrap()
+            );
         }
 
-        assert!(delivered > 0, "no frames delivered (check Screen Recording permission / TCC)");
+        assert!(
+            delivered > 0,
+            "no frames delivered (check Screen Recording permission / TCC)"
+        );
         assert!(wrapped_ok > 0, "IOSurface -> CVPixelBuffer wrap failed");
     }
 }

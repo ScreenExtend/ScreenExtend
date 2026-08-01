@@ -5,20 +5,22 @@ pub mod networking;
 pub mod streamer;
 pub mod virtual_display;
 
+use crate::streamer::cloud::{
+    CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
+};
+use crate::streamer::session::{
+    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter,
+    SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
+};
+use crate::streamer::{Config, Streamer};
+use device_reporter::TauriDeviceReporter;
+use networking::NetworkInfo;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::Manager;
 use tauri::State;
-use crate::streamer::cloud::{CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink};
-use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedServerPorts,
-    SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
-};
-use crate::streamer::{Config, Streamer};
-use device_reporter::TauriDeviceReporter;
-use networking::NetworkInfo;
 use virtual_display::MacosVirtualDisplay;
 
 pub struct StreamerHandle {
@@ -131,10 +133,10 @@ pub fn set_device_override(
     video_quality: u32,
     control_enabled: bool,
 ) {
+    use crate::streamer::config::ScalePercent;
     use crate::streamer::server::{
         MAX_DISPLAY_SCALE, MAX_REFRESH_RATE, MIN_DISPLAY_SCALE, MIN_REFRESH_RATE,
     };
-    use crate::streamer::config::ScalePercent;
 
     state.device_overrides.lock().unwrap().insert(
         ip.clone(),
@@ -161,8 +163,10 @@ pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
 #[tauri::command]
 #[specta::specta]
 pub fn set_disconnect_grace(state: State<'_, AppState>, seconds: u32) {
-    let secs = (seconds as u64)
-        .clamp(session::MIN_DISCONNECT_GRACE_SECS, session::MAX_DISCONNECT_GRACE_SECS);
+    let secs = (seconds as u64).clamp(
+        session::MIN_DISCONNECT_GRACE_SECS,
+        session::MAX_DISCONNECT_GRACE_SECS,
+    );
     state
         .disconnect_grace
         .store(secs, std::sync::atomic::Ordering::Relaxed);
@@ -186,7 +190,12 @@ pub struct TurnConfig {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_turn_config(state: State<'_, AppState>, urls: String, username: String, credential: String) {
+pub fn set_turn_config(
+    state: State<'_, AppState>,
+    urls: String,
+    username: String,
+    credential: String,
+) {
     let urls: Vec<String> = urls
         .split(',')
         .map(|u| u.trim().to_string())
@@ -231,21 +240,38 @@ pub fn get_server_ports(state: State<'_, AppState>) -> ServerPorts {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_server_ports(state: State<'_, AppState>, http_port: u16, https_port: u16) -> ServerPorts {
-    let http = if http_port == 0 { session::DEFAULT_HTTP_PORT } else { http_port };
-    let https = if https_port == 0 { session::DEFAULT_HTTPS_PORT } else { https_port };
+pub fn set_server_ports(
+    state: State<'_, AppState>,
+    http_port: u16,
+    https_port: u16,
+) -> ServerPorts {
+    let http = if http_port == 0 {
+        session::DEFAULT_HTTP_PORT
+    } else {
+        http_port
+    };
+    let https = if https_port == 0 {
+        session::DEFAULT_HTTPS_PORT
+    } else {
+        https_port
+    };
 
     let (cur_http, cur_https) = state.server_ports.get();
     if http == https {
         teprintln!("[streamer] rejecting server port change: HTTP and HTTPS must differ ({http})");
-        return ServerPorts { http: cur_http, https: cur_https };
+        return ServerPorts {
+            http: cur_http,
+            https: cur_https,
+        };
     }
     if http == cur_http && https == cur_https {
         return ServerPorts { http, https };
     }
 
     state.server_ports.set(http, https);
-    tprintln!("[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers");
+    tprintln!(
+        "[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers"
+    );
 
     {
         let mut streamers = state.streamers.lock().unwrap();
@@ -335,7 +361,8 @@ pub fn unregister_cloud_session(state: State<'_, AppState>) {
         prev.stop();
         tprintln!("[cloud] public sessions disabled; relay client stopped");
     }
-    *state.cloud_status.lock().unwrap() = (CloudState::Disabled.as_str().to_string(), String::new());
+    *state.cloud_status.lock().unwrap() =
+        (CloudState::Disabled.as_str().to_string(), String::new());
 }
 
 #[tauri::command]
@@ -367,7 +394,9 @@ pub fn sync_streamers(state: &AppState) {
             true
         } else {
             tprintln!("[streamer] stopping streamer bound to {ip}");
-            streamer.handle.graceful_shutdown(Some(Duration::from_secs(1)));
+            streamer
+                .handle
+                .graceful_shutdown(Some(Duration::from_secs(1)));
             false
         }
     });

@@ -3,8 +3,14 @@ use crate::windows_utils::streamer::pipeline::{live_encoder_config, scaled_dims}
 
 #[test]
 fn scale_100_is_native_passthrough() {
-    assert_eq!(scaled_dims(1920, 1080, ScalePercent::new(100)), (1920, 1080));
-    assert_eq!(scaled_dims(1921, 1081, ScalePercent::new(100)), (1920, 1080));
+    assert_eq!(
+        scaled_dims(1920, 1080, ScalePercent::new(100)),
+        (1920, 1080)
+    );
+    assert_eq!(
+        scaled_dims(1921, 1081, ScalePercent::new(100)),
+        (1920, 1080)
+    );
 }
 
 #[test]

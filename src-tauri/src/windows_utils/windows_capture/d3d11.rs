@@ -1,20 +1,22 @@
 use std::slice;
 
+use windows::core::Interface;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_9_1, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_3,
-    D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_9_1, D3D_FEATURE_LEVEL_9_2,
+    D3D_FEATURE_LEVEL_9_3,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ_WRITE,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ_WRITE,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
-use windows::core::Interface;
 
 #[derive(thiserror::Error, Eq, PartialEq, Clone, Debug)]
 /// Errors that can occur when creating or working with Direct3D devices and textures.
@@ -77,7 +79,10 @@ pub(crate) struct MappedStagingTexture<'a> {
 
 impl<'a> MappedStagingTexture<'a> {
     /// Maps an owned staging texture.
-    pub fn map_owned(context: &'a ID3D11DeviceContext, texture: StagingTexture) -> Result<Self, windows::core::Error> {
+    pub fn map_owned(
+        context: &'a ID3D11DeviceContext,
+        texture: StagingTexture,
+    ) -> Result<Self, windows::core::Error> {
         Self::map(context, StagingTextureHandle::Owned(texture))
     }
 
@@ -96,11 +101,21 @@ impl<'a> MappedStagingTexture<'a> {
     ) -> Result<Self, windows::core::Error> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
-            context.Map(texture.texture(), 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
+            context.Map(
+                texture.texture(),
+                0,
+                D3D11_MAP_READ_WRITE,
+                0,
+                Some(&mut mapped),
+            )?;
         }
         texture.set_mapped(true);
 
-        Ok(Self { context, texture, mapped })
+        Ok(Self {
+            context,
+            texture,
+            mapped,
+        })
     }
 
     /// Returns the mapped bytes as an immutable slice for the requested number of rows.
@@ -173,7 +188,14 @@ pub fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext), Error>
         D3D_FEATURE_LEVEL_9_1,
     ];
 
-    let try_create = |flags: D3D11_CREATE_DEVICE_FLAG| -> Result<(Option<ID3D11Device>, Option<ID3D11DeviceContext>, D3D_FEATURE_LEVEL), windows::core::Error> {
+    let try_create = |flags: D3D11_CREATE_DEVICE_FLAG| -> Result<
+        (
+            Option<ID3D11Device>,
+            Option<ID3D11DeviceContext>,
+            D3D_FEATURE_LEVEL,
+        ),
+        windows::core::Error,
+    > {
         let mut d3d_device = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
         let mut d3d_device_context = None;
@@ -204,7 +226,8 @@ pub fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext), Error>
     }
 
     let d3d_device = d3d_device.ok_or(Error::UnexpectedNullResult("an `ID3D11Device`"))?;
-    let d3d_device_context = d3d_device_context.ok_or(Error::UnexpectedNullResult("an `ID3D11DeviceContext`"))?;
+    let d3d_device_context =
+        d3d_device_context.ok_or(Error::UnexpectedNullResult("an `ID3D11DeviceContext`"))?;
 
     Ok((d3d_device, d3d_device_context))
 }
@@ -233,14 +256,22 @@ pub struct StagingTexture {
 
 impl StagingTexture {
     /// Create a staging texture suitable for CPU read/write with the given geometry/format.
-    pub fn new(device: &ID3D11Device, width: u32, height: u32, format: DXGI_FORMAT) -> Result<Self, Error> {
+    pub fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<Self, Error> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
             Format: format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32,
@@ -253,7 +284,11 @@ impl StagingTexture {
         }
         let inner = tex.ok_or(Error::UnexpectedNullResult("an `ID3D11Texture2D`"))?;
 
-        Ok(Self { inner, desc, is_mapped: false })
+        Ok(Self {
+            inner,
+            desc,
+            is_mapped: false,
+        })
     }
 
     /// Gets the underlying [`windows::Win32::Graphics::Direct3D11::ID3D11Texture2D`].
@@ -297,6 +332,10 @@ impl StagingTexture {
             return None;
         }
 
-        Some(Self { inner: tex, desc, is_mapped: false })
+        Some(Self {
+            inner: tex,
+            desc,
+            is_mapped: false,
+        })
     }
 }

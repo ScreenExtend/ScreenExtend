@@ -1,7 +1,7 @@
 use anyhow::Result;
 
+use super::config::{print_help, Config};
 use super::Streamer;
-use super::config::{Config, print_help};
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -44,7 +44,10 @@ impl BitrateController {
     }
 
     pub fn with_cut_threshold(mut self, cut_threshold: f64) -> Self {
-        assert!(cut_threshold > 0.0 && cut_threshold <= 1.0, "cut_threshold must be in (0, 1]");
+        assert!(
+            cut_threshold > 0.0 && cut_threshold <= 1.0,
+            "cut_threshold must be in (0, 1]"
+        );
         self.cut_threshold = cut_threshold;
         self
     }
@@ -61,8 +64,8 @@ impl BitrateController {
         };
         self.ewma = Some(smoothed);
 
-        let candidate = (smoothed.round() as i64).clamp(self.min_bps as i64, self.max_bps as i64)
-            as u32;
+        let candidate =
+            (smoothed.round() as i64).clamp(self.min_bps as i64, self.max_bps as i64) as u32;
 
         let Some(last) = self.last_emitted else {
             self.emit(candidate, now);
@@ -70,7 +73,11 @@ impl BitrateController {
         };
 
         let is_cut = candidate < last;
-        let threshold = if is_cut { self.cut_threshold } else { self.change_threshold };
+        let threshold = if is_cut {
+            self.cut_threshold
+        } else {
+            self.change_threshold
+        };
 
         let rel_delta = (candidate as f64 - last as f64).abs() / (last.max(1) as f64);
         if rel_delta < threshold {

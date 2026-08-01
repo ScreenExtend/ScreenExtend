@@ -14,22 +14,23 @@ use std::mem;
 use std::num::ParseIntError;
 use std::string::FromUtf16Error;
 
+use windows::core::{BOOL, HSTRING, PCWSTR};
 use windows::Graphics::Capture::GraphicsCaptureItem;
 use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS,
-    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
-    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
+    QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, DISPLAY_DEVICE_STATE_FLAGS, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW,
-    EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MONITORINFO,
-    MONITORINFOEXW, MonitorFromPoint,
+    EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW,
+    MonitorFromPoint, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_STATE_FLAGS, ENUM_CURRENT_SETTINGS,
+    HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::core::{BOOL, HSTRING, PCWSTR};
 
 use super::settings::GraphicsCaptureItemType;
 
@@ -178,7 +179,12 @@ impl Monitor {
         let mut number_of_paths = 0;
         let mut number_of_modes = 0;
         unsafe {
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut number_of_paths, &mut number_of_modes).ok()?;
+            GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut number_of_paths,
+                &mut number_of_modes,
+            )
+            .ok()?;
         };
 
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); number_of_paths as usize];
@@ -272,12 +278,24 @@ impl Monitor {
             },
             szDevice: [0; 32],
         };
-        if unsafe { !GetMonitorInfoW(HMONITOR(self.as_raw_hmonitor()), (&raw mut monitor_info).cast()).as_bool() } {
+        if unsafe {
+            !GetMonitorInfoW(
+                HMONITOR(self.as_raw_hmonitor()),
+                (&raw mut monitor_info).cast(),
+            )
+            .as_bool()
+        } {
             return Err(Error::FailedToGetMonitorInfo);
         }
 
         let device_name = String::from_utf16(
-            &monitor_info.szDevice.as_slice().iter().take_while(|ch| **ch != 0x0000).copied().collect::<Vec<u16>>(),
+            &monitor_info
+                .szDevice
+                .as_slice()
+                .iter()
+                .take_while(|ch| **ch != 0x0000)
+                .copied()
+                .collect::<Vec<u16>>(),
         )?;
 
         Ok(device_name)
@@ -302,7 +320,13 @@ impl Monitor {
             },
             szDevice: [0; 32],
         };
-        if unsafe { !GetMonitorInfoW(HMONITOR(self.as_raw_hmonitor()), (&raw mut monitor_info).cast()).as_bool() } {
+        if unsafe {
+            !GetMonitorInfoW(
+                HMONITOR(self.as_raw_hmonitor()),
+                (&raw mut monitor_info).cast(),
+            )
+            .as_bool()
+        } {
             return Err(Error::FailedToGetMonitorInfo);
         }
 
@@ -316,8 +340,13 @@ impl Monitor {
         };
 
         if unsafe {
-            !EnumDisplayDevicesW(PCWSTR::from_raw(monitor_info.szDevice.as_mut_ptr()), 0, &mut display_device, 0)
-                .as_bool()
+            !EnumDisplayDevicesW(
+                PCWSTR::from_raw(monitor_info.szDevice.as_mut_ptr()),
+                0,
+                &mut display_device,
+                0,
+            )
+            .as_bool()
         } {
             return Err(Error::FailedToGetMonitorName);
         }
@@ -345,10 +374,19 @@ impl Monitor {
     /// - [`Error::FailedToConvertWindowsString`] when converting the device name from UTF-16 fails
     #[inline]
     pub fn refresh_rate(&self) -> Result<u32, Error> {
-        let mut device_mode =
-            DEVMODEW { dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(), ..DEVMODEW::default() };
+        let mut device_mode = DEVMODEW {
+            dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(),
+            ..DEVMODEW::default()
+        };
         let name = HSTRING::from(self.device_name()?);
-        if unsafe { !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut device_mode).as_bool() } {
+        if unsafe {
+            !EnumDisplaySettingsW(
+                PCWSTR(name.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut device_mode,
+            )
+            .as_bool()
+        } {
             return Err(Error::FailedToGetMonitorSettings);
         }
 
@@ -365,10 +403,19 @@ impl Monitor {
     /// - [`Error::FailedToConvertWindowsString`] when converting the device name from UTF-16 fails
     #[inline]
     pub fn width(&self) -> Result<u32, Error> {
-        let mut device_mode =
-            DEVMODEW { dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(), ..DEVMODEW::default() };
+        let mut device_mode = DEVMODEW {
+            dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(),
+            ..DEVMODEW::default()
+        };
         let name = HSTRING::from(self.device_name()?);
-        if unsafe { !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut device_mode).as_bool() } {
+        if unsafe {
+            !EnumDisplaySettingsW(
+                PCWSTR(name.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut device_mode,
+            )
+            .as_bool()
+        } {
             return Err(Error::FailedToGetMonitorSettings);
         }
 
@@ -385,10 +432,19 @@ impl Monitor {
     /// - [`Error::FailedToConvertWindowsString`] when converting the device name from UTF-16 fails
     #[inline]
     pub fn height(&self) -> Result<u32, Error> {
-        let mut device_mode =
-            DEVMODEW { dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(), ..DEVMODEW::default() };
+        let mut device_mode = DEVMODEW {
+            dmSize: u16::try_from(mem::size_of::<DEVMODEW>()).unwrap(),
+            ..DEVMODEW::default()
+        };
         let name = HSTRING::from(self.device_name()?);
-        if unsafe { !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut device_mode).as_bool() } {
+        if unsafe {
+            !EnumDisplaySettingsW(
+                PCWSTR(name.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut device_mode,
+            )
+            .as_bool()
+        } {
             return Err(Error::FailedToGetMonitorSettings);
         }
 
@@ -405,8 +461,13 @@ impl Monitor {
         let mut monitors: Vec<Self> = Vec::new();
 
         unsafe {
-            EnumDisplayMonitors(None, None, Some(Self::enum_monitors_callback), LPARAM(&raw mut monitors as isize))
-                .ok()?;
+            EnumDisplayMonitors(
+                None,
+                None,
+                Some(Self::enum_monitors_callback),
+                LPARAM(&raw mut monitors as isize),
+            )
+            .ok()?;
         };
 
         Ok(monitors)
@@ -416,7 +477,9 @@ impl Monitor {
     #[inline]
     #[must_use]
     pub const fn from_raw_hmonitor(monitor: *mut std::ffi::c_void) -> Self {
-        Self { monitor: HMONITOR(monitor) }
+        Self {
+            monitor: HMONITOR(monitor),
+        }
     }
 
     /// Returns the raw `HMONITOR` handle of the monitor.
@@ -428,7 +491,12 @@ impl Monitor {
 
     // Callback used for enumerating all monitors.
     #[inline]
-    unsafe extern "system" fn enum_monitors_callback(monitor: HMONITOR, _: HDC, _: *mut RECT, vec: LPARAM) -> BOOL {
+    unsafe extern "system" fn enum_monitors_callback(
+        monitor: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        vec: LPARAM,
+    ) -> BOOL {
         let monitors = unsafe { &mut *(vec.0 as *mut Vec<Self>) };
 
         monitors.push(Self { monitor });

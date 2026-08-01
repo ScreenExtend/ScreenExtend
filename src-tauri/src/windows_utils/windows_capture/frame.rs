@@ -7,7 +7,7 @@ use windows::Foundation::TimeSpan;
 use windows::Graphics::Capture::Direct3D11CaptureFrame;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX, D3D11_TEXTURE2D_DESC,
 };
 
 use super::d3d11::{MappedStagingTexture, StagingTexture};
@@ -93,7 +93,16 @@ impl<'a> Frame<'a> {
         color_format: ColorFormat,
         title_bar_height: Option<u32>,
     ) -> Self {
-        Self { capture_frame, d3d_device, frame_surface, frame_texture, context, desc, color_format, title_bar_height }
+        Self {
+            capture_frame,
+            d3d_device,
+            frame_surface,
+            frame_texture,
+            context,
+            desc,
+            color_format,
+            title_bar_height,
+        }
     }
 
     /// Gets the width of the frame.
@@ -109,7 +118,12 @@ impl<'a> Frame<'a> {
             .capture_frame
             .DirtyRegions()?
             .into_iter()
-            .map(|r| DirtyRegion { x: r.X, y: r.Y, width: r.Width, height: r.Height })
+            .map(|r| DirtyRegion {
+                x: r.X,
+                y: r.Y,
+                width: r.Width,
+                height: r.Height,
+            })
             .collect())
     }
 
@@ -171,16 +185,27 @@ impl<'a> Frame<'a> {
     /// Gets the frame buffer.
     #[inline]
     pub fn buffer(&'_ mut self) -> Result<FrameBuffer<'_>, Error> {
-        let staging = StagingTexture::new(self.d3d_device, self.width(), self.height(), self.desc.Format)?;
+        let staging = StagingTexture::new(
+            self.d3d_device,
+            self.width(),
+            self.height(),
+            self.desc.Format,
+        )?;
 
         // Copy the GPU texture into a CPU-readable staging texture before mapping it.
         unsafe {
-            self.context.CopyResource(staging.texture(), &self.frame_texture);
+            self.context
+                .CopyResource(staging.texture(), &self.frame_texture);
         }
 
         let mapped_texture = MappedStagingTexture::map_owned(self.context, staging)?;
 
-        Ok(FrameBuffer::from_mapped(mapped_texture, self.width(), self.height(), self.color_format))
+        Ok(FrameBuffer::from_mapped(
+            mapped_texture,
+            self.width(),
+            self.height(),
+            self.color_format,
+        ))
     }
 
     /// Gets a cropped frame buffer.
@@ -199,10 +224,22 @@ impl<'a> Frame<'a> {
         let texture_width = end_x - start_x;
         let texture_height = end_y - start_y;
 
-        let staging = StagingTexture::new(self.d3d_device, texture_width, texture_height, self.desc.Format)?;
+        let staging = StagingTexture::new(
+            self.d3d_device,
+            texture_width,
+            texture_height,
+            self.desc.Format,
+        )?;
 
         // Box settings
-        let resource_box = D3D11_BOX { left: start_x, top: start_y, front: 0, right: end_x, bottom: end_y, back: 1 };
+        let resource_box = D3D11_BOX {
+            left: start_x,
+            top: start_y,
+            front: 0,
+            right: end_x,
+            bottom: end_y,
+            back: 1,
+        };
 
         // Copy the requested sub-rectangle into a CPU-readable staging texture.
         unsafe {
@@ -220,7 +257,12 @@ impl<'a> Frame<'a> {
 
         let mapped_texture = MappedStagingTexture::map_owned(self.context, staging)?;
 
-        Ok(FrameBuffer::from_mapped(mapped_texture, texture_width, texture_height, self.color_format))
+        Ok(FrameBuffer::from_mapped(
+            mapped_texture,
+            texture_width,
+            texture_height,
+            self.color_format,
+        ))
     }
 
     /// Gets the frame buffer without the title bar.
@@ -239,7 +281,11 @@ impl<'a> Frame<'a> {
 
     /// Saves the frame buffer as an image to the specified path.
     #[inline]
-    pub fn save_as_image<T: AsRef<Path>>(&mut self, path: T, format: ImageFormat) -> Result<(), Error> {
+    pub fn save_as_image<T: AsRef<Path>>(
+        &mut self,
+        path: T,
+        format: ImageFormat,
+    ) -> Result<(), Error> {
         let mut frame_buffer = self.buffer()?;
 
         frame_buffer.save_as_image(path, format)?;
@@ -298,7 +344,14 @@ impl<'a> FrameBuffer<'a> {
         depth_pitch: u32,
         color_format: ColorFormat,
     ) -> Self {
-        Self { backing: FrameBufferBacking::Borrowed(raw_buffer), width, height, row_pitch, depth_pitch, color_format }
+        Self {
+            backing: FrameBufferBacking::Borrowed(raw_buffer),
+            width,
+            height,
+            row_pitch,
+            depth_pitch,
+            color_format,
+        }
     }
 
     const fn from_mapped(
@@ -397,7 +450,11 @@ impl<'a> FrameBuffer<'a> {
             let dst = buffer_address as *mut u8;
 
             unsafe {
-                ptr::copy_nonoverlapping(src.add(index), dst.add(y as usize * width_size), width_size);
+                ptr::copy_nonoverlapping(
+                    src.add(index),
+                    dst.add(y as usize * width_size),
+                    width_size,
+                );
             }
         });
 
@@ -406,7 +463,11 @@ impl<'a> FrameBuffer<'a> {
 
     /// Saves the frame buffer as an image to the specified path.
     #[inline]
-    pub fn save_as_image<T: AsRef<Path>>(&mut self, path: T, format: ImageFormat) -> Result<(), Error> {
+    pub fn save_as_image<T: AsRef<Path>>(
+        &mut self,
+        path: T,
+        format: ImageFormat,
+    ) -> Result<(), Error> {
         let width = self.width;
         let height = self.height;
 
@@ -417,8 +478,11 @@ impl<'a> FrameBuffer<'a> {
         };
 
         let mut buffer = Vec::new();
-        let bytes =
-            ImageEncoder::new(format, pixel_format)?.encode(self.as_nopadding_buffer(&mut buffer), width, height)?;
+        let bytes = ImageEncoder::new(format, pixel_format)?.encode(
+            self.as_nopadding_buffer(&mut buffer),
+            width,
+            height,
+        )?;
 
         fs::write(path, bytes)?;
 

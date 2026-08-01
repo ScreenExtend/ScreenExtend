@@ -130,7 +130,9 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
 
         let mut ifa = ifap;
         while !ifa.is_null() {
-            let name = CStr::from_ptr((*ifa).ifa_name).to_string_lossy().into_owned();
+            let name = CStr::from_ptr((*ifa).ifa_name)
+                .to_string_lossy()
+                .into_owned();
             flags.insert(name.clone(), (*ifa).ifa_flags as i32);
 
             let addr = (*ifa).ifa_addr;
@@ -173,7 +175,8 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
             };
             let interface_index = interface_index(&name)?;
 
-            let network_name = if media == "Wi-Fi" && is_hosted_network(app.clone(), state.clone()) {
+            let network_name = if media == "Wi-Fi" && is_hosted_network(app.clone(), state.clone())
+            {
                 hosted_network_name(&app)
             } else if media == "Wi-Fi" {
                 wifi_ssid(&name).unwrap_or_else(|| "Wi-Fi".to_string())

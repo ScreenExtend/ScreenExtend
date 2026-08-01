@@ -23,12 +23,15 @@ pub fn load_or_generate(
 ) -> Result<TlsMaterial> {
     match (cert_path, key_path) {
         (Some(c), Some(k)) => {
-            let cert_pem = std::fs::read(c)
-                .with_context(|| format!("reading TLS cert from {c}"))?;
-            let key_pem = std::fs::read(k)
-                .with_context(|| format!("reading TLS key from {k}"))?;
+            let cert_pem =
+                std::fs::read(c).with_context(|| format!("reading TLS cert from {c}"))?;
+            let key_pem = std::fs::read(k).with_context(|| format!("reading TLS key from {k}"))?;
             tprintln!("TLS: using operator-provided certificate (cert={c}, key={k})");
-            Ok(TlsMaterial { cert_pem, key_pem, self_signed: false })
+            Ok(TlsMaterial {
+                cert_pem,
+                key_pem,
+                self_signed: false,
+            })
         }
         (Some(_), None) | (None, Some(_)) => {
             anyhow::bail!(
@@ -51,22 +54,24 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
     let key_file = PathBuf::from(DEV_KEY_FILE);
 
     if cert_file.exists() && key_file.exists() {
-        if let (Ok(cert_pem), Ok(key_pem)) =
-            (std::fs::read(&cert_file), std::fs::read(&key_file))
-        {
+        if let (Ok(cert_pem), Ok(key_pem)) = (std::fs::read(&cert_file), std::fs::read(&key_file)) {
             tprintln!(
                 "TLS: reusing cached dev self-signed certificate ({})",
                 cert_file.display()
             );
-            return Ok(TlsMaterial { cert_pem, key_pem, self_signed: true });
+            return Ok(TlsMaterial {
+                cert_pem,
+                key_pem,
+                self_signed: true,
+            });
         }
     }
 
     let sans = subject_alt_names(extra_sans);
     tprintln!("TLS: generating dev self-signed certificate (SANs: {sans:?})");
 
-    let mut params = rcgen::CertificateParams::new(sans)
-        .context("building self-signed certificate params")?;
+    let mut params =
+        rcgen::CertificateParams::new(sans).context("building self-signed certificate params")?;
     let mut dn = rcgen::DistinguishedName::new();
     dn.push(rcgen::DnType::CommonName, "ScreenExtend");
     params.distinguished_name = dn;
@@ -82,11 +87,21 @@ fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
         teprintln!("TLS: could not cache dev cert ({e}); it will be regenerated next launch");
     }
 
-    Ok(TlsMaterial { cert_pem, key_pem, self_signed: true })
+    Ok(TlsMaterial {
+        cert_pem,
+        key_pem,
+        self_signed: true,
+    })
 }
 
-fn cache_dev_cert(cert_file: &Path, cert_pem: &[u8], key_file: &Path, key_pem: &[u8]) -> Result<()> {
-    std::fs::write(cert_file, cert_pem).with_context(|| format!("writing {}", cert_file.display()))?;
+fn cache_dev_cert(
+    cert_file: &Path,
+    cert_pem: &[u8],
+    key_file: &Path,
+    key_pem: &[u8],
+) -> Result<()> {
+    std::fs::write(cert_file, cert_pem)
+        .with_context(|| format!("writing {}", cert_file.display()))?;
     std::fs::write(key_file, key_pem).with_context(|| format!("writing {}", key_file.display()))?;
     Ok(())
 }

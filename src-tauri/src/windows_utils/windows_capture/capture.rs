@@ -1,20 +1,21 @@
 use std::mem;
 use std::os::windows::prelude::AsRawHandle;
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
 use parking_lot::Mutex;
+use windows::core::Result as WindowsResult;
 use windows::Win32::Foundation::{ERROR_INVALID_THREAD_ID, HANDLE, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 use windows::Win32::System::Threading::{GetCurrentThreadId, GetThreadId};
 use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
+    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PostQuitMessage, PostThreadMessageW, TranslateMessage, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, TranslateMessage, MSG,
+    WM_QUIT,
 };
-use windows::core::Result as WindowsResult;
 use windows_future::AsyncActionCompletedHandler;
 
 use super::d3d11::{self, create_d3d_device};
@@ -107,14 +108,20 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
         halt_handle: Arc<AtomicBool>,
         callback: Arc<Mutex<T>>,
     ) -> Self {
-        Self { thread_handle: Some(thread_handle), halt_handle, callback }
+        Self {
+            thread_handle: Some(thread_handle),
+            halt_handle,
+            callback,
+        }
     }
 
     /// Checks whether the capture thread has finished.
     #[inline]
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.thread_handle.as_ref().is_none_or(std::thread::JoinHandle::is_finished)
+        self.thread_handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
     /// Gets the join handle for the capture thread.
@@ -186,14 +193,18 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
             }
 
             loop {
-                match unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default()) } {
+                match unsafe {
+                    PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default())
+                } {
                     Ok(()) => break,
                     Err(error) => {
                         if thread_handle.is_finished() {
                             break;
                         }
 
-                        if error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_THREAD_ID.0) {
+                        if error.code()
+                            != windows::core::HRESULT::from_win32(ERROR_INVALID_THREAD_ID.0)
+                        {
                             return Err(CaptureControlError::FailedToPostThreadMessage);
                         }
 
@@ -311,15 +322,23 @@ pub trait GraphicsCaptureApiHandler: Sized {
         // Start capture
         let result = Arc::new(Mutex::new(None));
 
-        let ctx =
-            Context { flags: settings.flags, device: d3d_device.clone(), device_context: d3d_device_context.clone() };
+        let ctx = Context {
+            flags: settings.flags,
+            device: d3d_device.clone(),
+            device_context: d3d_device_context.clone(),
+        };
 
-        let callback = Arc::new(Mutex::new(Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?));
+        let callback = Arc::new(Mutex::new(
+            Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
+        ));
 
         let mut capture = GraphicsCaptureApi::new(
             d3d_device,
             d3d_device_context,
-            settings.item.try_into().map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
+            settings
+                .item
+                .try_into()
+                .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
             callback,
             settings.cursor_capture_settings,
             settings.draw_border_settings,
@@ -331,20 +350,25 @@ pub trait GraphicsCaptureApiHandler: Sized {
             result.clone(),
         )
         .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
-        capture.start_capture().map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
+        capture
+            .start_capture()
+            .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
         // Message loop
         run_message_loop()?;
 
         // Shut down dispatcher queue
-        let async_action =
-            controller.ShutdownQueueAsync().map_err(|_| GraphicsCaptureApiError::FailedToShutdownDispatcherQueue)?;
+        let async_action = controller
+            .ShutdownQueueAsync()
+            .map_err(|_| GraphicsCaptureApiError::FailedToShutdownDispatcherQueue)?;
 
         async_action
-            .SetCompleted(&AsyncActionCompletedHandler::new(move |_, _| -> WindowsResult<()> {
-                unsafe { PostQuitMessage(0) };
-                Ok(())
-            }))
+            .SetCompleted(&AsyncActionCompletedHandler::new(
+                move |_, _| -> WindowsResult<()> {
+                    unsafe { PostQuitMessage(0) };
+                    Ok(())
+                },
+            ))
             .map_err(|_| GraphicsCaptureApiError::FailedToSetDispatcherQueueCompletedHandler)?;
 
         // Final message loop
@@ -374,87 +398,106 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let (halt_sender, halt_receiver) = mpsc::channel::<Arc<AtomicBool>>();
         let (callback_sender, callback_receiver) = mpsc::channel::<Arc<Mutex<Self>>>();
 
-        let thread_handle = thread::spawn(move || -> Result<(), GraphicsCaptureApiError<Self::Error>> {
-            // Initialize WinRT
-            let _winrt = WinRT::new().map_err(|_| GraphicsCaptureApiError::FailedToInitWinRT)?;
+        let thread_handle = thread::spawn(
+            move || -> Result<(), GraphicsCaptureApiError<Self::Error>> {
+                // Initialize WinRT
+                let _winrt =
+                    WinRT::new().map_err(|_| GraphicsCaptureApiError::FailedToInitWinRT)?;
 
-            // Create a dispatcher queue for the current thread
-            let controller = unsafe {
-                CreateDispatcherQueueController(dispatcher_queue_options())
-                    .map_err(|_| GraphicsCaptureApiError::FailedToCreateDispatcherQueueController)?
-            };
+                // Create a dispatcher queue for the current thread
+                let controller = unsafe {
+                    CreateDispatcherQueueController(dispatcher_queue_options()).map_err(|_| {
+                        GraphicsCaptureApiError::FailedToCreateDispatcherQueueController
+                    })?
+                };
 
-            // Get current thread ID
-            let thread_id = unsafe { GetCurrentThreadId() };
+                // Get current thread ID
+                let thread_id = unsafe { GetCurrentThreadId() };
 
-            // Create direct3d device and context
-            let (d3d_device, d3d_device_context) = create_d3d_device()?;
+                // Create direct3d device and context
+                let (d3d_device, d3d_device_context) = create_d3d_device()?;
 
-            // Start capture
-            let result = Arc::new(Mutex::new(None));
+                // Start capture
+                let result = Arc::new(Mutex::new(None));
 
-            let ctx = Context {
-                flags: settings.flags,
-                device: d3d_device.clone(),
-                device_context: d3d_device_context.clone(),
-            };
+                let ctx = Context {
+                    flags: settings.flags,
+                    device: d3d_device.clone(),
+                    device_context: d3d_device_context.clone(),
+                };
 
-            let callback = Arc::new(Mutex::new(Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?));
+                let callback = Arc::new(Mutex::new(
+                    Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
+                ));
 
-            let mut capture = GraphicsCaptureApi::new(
-                d3d_device,
-                d3d_device_context,
-                settings.item.try_into().map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
-                callback.clone(),
-                settings.cursor_capture_settings,
-                settings.draw_border_settings,
-                settings.secondary_window_settings,
-                settings.minimum_update_interval_settings,
-                settings.dirty_region_settings,
-                settings.color_format,
-                thread_id,
-                result.clone(),
-            )
-            .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
+                let mut capture = GraphicsCaptureApi::new(
+                    d3d_device,
+                    d3d_device_context,
+                    settings
+                        .item
+                        .try_into()
+                        .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
+                    callback.clone(),
+                    settings.cursor_capture_settings,
+                    settings.draw_border_settings,
+                    settings.secondary_window_settings,
+                    settings.minimum_update_interval_settings,
+                    settings.dirty_region_settings,
+                    settings.color_format,
+                    thread_id,
+                    result.clone(),
+                )
+                .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
-            capture.start_capture().map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
+                capture
+                    .start_capture()
+                    .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
-            // Send halt handle
-            let halt_handle = capture.halt_handle();
-            halt_sender.send(halt_handle).map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
+                // Send halt handle
+                let halt_handle = capture.halt_handle();
+                halt_sender
+                    .send(halt_handle)
+                    .map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
 
-            // Send callback
-            callback_sender.send(callback).map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
+                // Send callback
+                callback_sender
+                    .send(callback)
+                    .map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
 
-            // Message loop
-            run_message_loop()?;
+                // Message loop
+                run_message_loop()?;
 
-            // Shutdown dispatcher queue
-            let async_action = controller
-                .ShutdownQueueAsync()
-                .map_err(|_| GraphicsCaptureApiError::FailedToShutdownDispatcherQueue)?;
+                // Shutdown dispatcher queue
+                let async_action = controller
+                    .ShutdownQueueAsync()
+                    .map_err(|_| GraphicsCaptureApiError::FailedToShutdownDispatcherQueue)?;
 
-            async_action
-                .SetCompleted(&AsyncActionCompletedHandler::new(move |_, _| -> Result<(), windows::core::Error> {
-                    unsafe { PostQuitMessage(0) };
-                    Ok(())
-                }))
-                .map_err(|_| GraphicsCaptureApiError::FailedToSetDispatcherQueueCompletedHandler)?;
+                async_action
+                    .SetCompleted(&AsyncActionCompletedHandler::new(
+                        move |_, _| -> Result<(), windows::core::Error> {
+                            unsafe { PostQuitMessage(0) };
+                            Ok(())
+                        },
+                    ))
+                    .map_err(|_| {
+                        GraphicsCaptureApiError::FailedToSetDispatcherQueueCompletedHandler
+                    })?;
 
-            // Final message loop
-            run_message_loop()?;
+                // Final message loop
+                run_message_loop()?;
 
-            // Stop capture
-            capture.stop_capture();
+                // Stop capture
+                capture.stop_capture();
 
-            // Check handler result
-            let result = result.lock().take();
-            if let Some(e) = result {
-                return Err(GraphicsCaptureApiError::FrameHandlerError(e));
-            }
+                // Check handler result
+                let result = result.lock().take();
+                if let Some(e) = result {
+                    return Err(GraphicsCaptureApiError::FrameHandlerError(e));
+                }
 
-            Ok(())
-        });
+                Ok(())
+            },
+        );
 
         let Ok(halt_handle) = halt_receiver.recv() else {
             match thread_handle.join() {

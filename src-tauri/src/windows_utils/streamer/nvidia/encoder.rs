@@ -3,28 +3,26 @@ use std::io::Write as _;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context as _, Result};
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1,
-    IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
+    DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
-use windows::core::{Interface, PCWSTR};
 
-use crate::streamer::config::{Config, H264Profile};
 use super::nvenc_sys::*;
+use crate::streamer::config::{Config, H264Profile};
 
 pub const KEY_WRITER: u64 = 0;
 pub const KEY_ENCODER: u64 = 1;
@@ -86,7 +84,11 @@ impl Encoder {
             let create: libloading::Symbol<CreateInstanceFn> = lib
                 .get(b"NvEncodeAPICreateInstance\0")
                 .context("resolving NvEncodeAPICreateInstance")?;
-            check(create(&mut fns), "NvEncodeAPICreateInstance", ptr::null_mut())?;
+            check(
+                create(&mut fns),
+                "NvEncodeAPICreateInstance",
+                ptr::null_mut(),
+            )?;
         }
         if fns.nvEncOpenEncodeSessionEx.is_none() {
             bail!("NVENC function list did not populate (driver too old?)");
@@ -142,10 +144,9 @@ impl Encoder {
             .input_texture
             .cast()
             .context("input texture as IDXGIResource1 (is it SHARED?)")?;
-        let handle = unsafe {
-            resource.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_RW, PCWSTR::null())
-        }
-        .context("IDXGIResource1::CreateSharedHandle")?;
+        let handle =
+            unsafe { resource.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_RW, PCWSTR::null()) }
+                .context("IDXGIResource1::CreateSharedHandle")?;
         let mutex: IDXGIKeyedMutex = self
             .input_texture
             .cast()
@@ -375,7 +376,11 @@ impl Encoder {
         if let Some(q) = self.config.qp {
             let q = q as u32;
             config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
-            config.rcParams.constQP = NV_ENC_QP { qpInterP: q, qpInterB: q, qpIntra: q };
+            config.rcParams.constQP = NV_ENC_QP {
+                qpInterP: q,
+                qpInterB: q,
+                qpIntra: q,
+            };
         } else {
             config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
             config.rcParams.averageBitRate = self.config.bitrate_bps;
@@ -534,7 +539,11 @@ impl Encoder {
         result
     }
 
-    unsafe fn encode_locked(&mut self, mapped: NV_ENC_INPUT_PTR, force_idr: bool) -> Result<Vec<u8>> {
+    unsafe fn encode_locked(
+        &mut self,
+        mapped: NV_ENC_INPUT_PTR,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
         let mut pic: NV_ENC_PIC_PARAMS = unsafe { zeroed() };
         pic.version = NV_ENC_PIC_PARAMS_VER;
         pic.inputWidth = self.config.width;
@@ -622,8 +631,7 @@ impl Drop for Encoder {
 
 fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
-        let factory: IDXGIFactory1 =
-            CreateDXGIFactory1().context("CreateDXGIFactory1")?;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
 
         let mut chosen: Option<IDXGIAdapter1> = None;
         let mut i = 0u32;
@@ -647,9 +655,8 @@ fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
             i += 1;
         }
 
-        let adapter = chosen.ok_or_else(|| {
-            anyhow!("no NVIDIA adapter found; NVENC requires NVIDIA GPU")
-        })?;
+        let adapter =
+            chosen.ok_or_else(|| anyhow!("no NVIDIA adapter found; NVENC requires NVIDIA GPU"))?;
 
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
         let mut device: Option<ID3D11Device> = None;
@@ -690,7 +697,10 @@ fn create_input_texture(
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
         CPUAccessFlags: 0,
@@ -769,8 +779,8 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         intra_refresh: config.intra_refresh,
     })?;
 
-    let mut file = std::fs::File::create(path)
-        .with_context(|| format!("creating output file {path}"))?;
+    let mut file =
+        std::fs::File::create(path).with_context(|| format!("creating output file {path}"))?;
 
     let mut frame = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
     let mut total_bytes = 0usize;
@@ -784,7 +794,10 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
             .with_context(|| format!("writing frame {i} ({} bytes)", au.len()))?;
 
         if i % 60 == 0 || i == FRAMES - 1 {
-            tprintln!("encoded frame={i} (au_bytes={}, total_bytes={total_bytes})", au.len());
+            tprintln!(
+                "encoded frame={i} (au_bytes={}, total_bytes={total_bytes})",
+                au.len()
+            );
         }
     }
     file.flush().context("flushing output file")?;

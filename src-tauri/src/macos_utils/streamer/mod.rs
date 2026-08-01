@@ -99,7 +99,9 @@ pub fn ensure_screen_recording_access() -> bool {
         if preflight() {
             return true;
         }
-        let granted = sym("CGRequestScreenCaptureAccess").map(|req| req()).unwrap_or(false);
+        let granted = sym("CGRequestScreenCaptureAccess")
+            .map(|req| req())
+            .unwrap_or(false);
         if !granted {
             teprintln!(
                 "[tcc] Screen Recording permission not granted. Enable ScreenExtend under \

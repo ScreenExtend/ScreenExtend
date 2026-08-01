@@ -1,8 +1,8 @@
 pub mod compatibility;
 pub mod hosted_network;
 pub mod networking;
-pub mod virtual_display;
 pub mod streamer;
+pub mod virtual_display;
 
 use std::process::Command;
 

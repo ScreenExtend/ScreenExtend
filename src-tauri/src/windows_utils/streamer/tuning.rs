@@ -61,7 +61,8 @@ impl Drop for ThreadTuning {
         if self.mmcss != 0 {
             use windows::Win32::System::Threading::AvRevertMmThreadCharacteristics;
             unsafe {
-                let _ = AvRevertMmThreadCharacteristics(HANDLE(self.mmcss as *mut core::ffi::c_void));
+                let _ =
+                    AvRevertMmThreadCharacteristics(HANDLE(self.mmcss as *mut core::ffi::c_void));
             }
             self.mmcss = 0;
         }
@@ -91,9 +92,9 @@ fn raise_timer_resolution() {
 #[cfg(windows)]
 fn exempt_from_power_throttling() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE,
     };
 
     let state = PROCESS_POWER_THROTTLING_STATE {
@@ -118,9 +119,9 @@ fn exempt_from_power_throttling() {
 #[cfg(windows)]
 fn honor_timer_resolution_in_background() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE,
     };
 
     let state = PROCESS_POWER_THROTTLING_STATE {
@@ -145,7 +146,7 @@ fn honor_timer_resolution_in_background() {
 #[cfg(windows)]
 fn raise_process_priority() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, HIGH_PRIORITY_CLASS, SetPriorityClass,
+        GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS,
     };
     match unsafe { SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) } {
         Ok(()) => tprintln!("process priority class raised to HIGH"),
@@ -165,7 +166,7 @@ unsafe impl Send for KeepAwake {}
 impl KeepAwake {
     pub fn begin() -> Self {
         use windows::Win32::System::Power::{
-            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+            SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
         };
         let prev = unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
@@ -184,7 +185,7 @@ impl KeepAwake {
 impl Drop for KeepAwake {
     fn drop(&mut self) {
         if self.active {
-            use windows::Win32::System::Power::{ES_CONTINUOUS, SetThreadExecutionState};
+            use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
             unsafe {
                 let _ = SetThreadExecutionState(ES_CONTINUOUS);
             }
@@ -195,11 +196,11 @@ impl Drop for KeepAwake {
 
 #[cfg(windows)]
 pub fn tune_transport_thread() {
+    use windows::core::w;
     use windows::Win32::System::Threading::{
         AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
         THREAD_PRIORITY_ABOVE_NORMAL,
     };
-    use windows::core::w;
 
     let mut task_index: u32 = 0;
     let _ = unsafe { AvSetMmThreadCharacteristicsW(w!("Playback"), &mut task_index) };
@@ -210,10 +211,10 @@ pub fn tune_transport_thread() {
 
 #[cfg(windows)]
 fn register_mmcss() -> isize {
-    use windows::Win32::System::Threading::{
-        AVRT_PRIORITY_CRITICAL, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
-    };
     use windows::core::w;
+    use windows::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, AVRT_PRIORITY_CRITICAL,
+    };
 
     let tasks: &[(&str, windows::core::PCWSTR)] = &[
         ("Pro Audio", w!("Pro Audio")),
@@ -256,8 +257,8 @@ fn raise_current_thread_priority() {
 
 #[cfg(windows)]
 pub fn raise_d3d11_gpu_priority(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) {
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
     let dxgi: IDXGIDevice = match device.cast() {
         Ok(d) => d,

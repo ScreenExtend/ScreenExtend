@@ -11,12 +11,12 @@ use tokio::sync::broadcast;
 
 use crate::streamer::config::{Config, H264Profile};
 
-use super::config::{EncoderConfig, live_encoder_config};
+use super::config::{live_encoder_config, EncoderConfig};
 use super::display;
 use super::encoder::Encoder;
-use super::frame::{FrameSource, frame_channel};
+use super::frame::{frame_channel, FrameSource};
 use super::gpu::Gpu;
-use super::{CaptureBackend, CaptureConfig, DisplayId, PIXEL_FORMAT_420F, start_capture};
+use super::{start_capture, CaptureBackend, CaptureConfig, DisplayId, PIXEL_FORMAT_420F};
 
 #[derive(Clone)]
 pub struct EncodedFrame {
@@ -148,13 +148,20 @@ fn run_encode_loop(
             super::qos::raise_current_thread_precedence();
             super::qos::pin_current_thread_encode_affinity();
             while let Ok(sample) = output.recv() {
-                let capture = drain_ts.lock().unwrap().pop_front().unwrap_or_else(Instant::now);
+                let capture = drain_ts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(Instant::now);
                 let mut au: Vec<u8> = Vec::new();
                 sample.to_annexb(&mut au);
                 if au.is_empty() {
                     continue;
                 }
-                let _ = tx.send(EncodedFrame { data: Bytes::from(au), capture });
+                let _ = tx.send(EncodedFrame {
+                    data: Bytes::from(au),
+                    capture,
+                });
             }
         })
         .expect("spawn encode-drain thread");
@@ -180,7 +187,13 @@ fn run_encode_loop(
 
         if let Some(frame) = source.try_take_latest() {
             if let Some(pixbuf) = frame.pixel_buffer() {
-                if !submit_one(&mut encoder, &pending_ts, frame.captured_at, pixbuf, force_idr) {
+                if !submit_one(
+                    &mut encoder,
+                    &pending_ts,
+                    frame.captured_at,
+                    pixbuf,
+                    force_idr,
+                ) {
                     teprintln!("encode submit failed; stopping encode loop");
                     break;
                 }
@@ -252,8 +265,8 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
 
 pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCapture> {
     super::ensure_screen_recording_access();
-    let display = display_by_name(device_name)
-        .with_context(|| format!("resolving display {device_name}"))?;
+    let display =
+        display_by_name(device_name).with_context(|| format!("resolving display {device_name}"))?;
     let (native_w, native_h, refresh) = display_geometry(display);
     let enc = live_encoder_config(native_w, native_h, refresh, cfg);
 
@@ -267,8 +280,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
-    let backend =
-        start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
+    let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
 
     let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source)?;
     Ok(SessionCapture {
@@ -296,7 +308,10 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
     let mut encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
     let out = encoder.output();
 
-    let phase = |encoder: &mut Encoder, out: &crossbeam_channel::Receiver<super::encoder::CompressedSample>, tick0: usize| -> usize {
+    let phase = |encoder: &mut Encoder,
+                 out: &crossbeam_channel::Receiver<super::encoder::CompressedSample>,
+                 tick0: usize|
+     -> usize {
         let mut buf: Vec<u8> = Vec::new();
         let mut bytes = 0usize;
         for i in 0..120usize {
@@ -495,7 +510,11 @@ pub fn set_display_mode(
     refresh: u32,
     portrait: bool,
 ) -> Result<()> {
-    let (w, h) = if portrait { (height, width) } else { (width, height) };
+    let (w, h) = if portrait {
+        (height, width)
+    } else {
+        (width, height)
+    };
     reconfigure_display(device_name, w, h, refresh, 0).map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -510,7 +529,11 @@ pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> 
 
 pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
     let (w, h, refresh) = pixel_dims(device_name)?;
-    let hidpi = if percent >= HIDPI_THRESHOLD_PERCENT { 1 } else { 0 };
+    let hidpi = if percent >= HIDPI_THRESHOLD_PERCENT {
+        1
+    } else {
+        0
+    };
     reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -627,7 +650,10 @@ mod tests {
         println!(
             "submitted={submitted} new_frames={new_frames} keyframes={keyframes} bytes={bytes}"
         );
-        assert!(submitted > 0, "no frames captured (idle screen? add activity)");
+        assert!(
+            submitted > 0,
+            "no frames captured (idle screen? add activity)"
+        );
         assert!(!lat.is_empty(), "no encoded frames");
         lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mean = lat.iter().sum::<f64>() / lat.len() as f64;

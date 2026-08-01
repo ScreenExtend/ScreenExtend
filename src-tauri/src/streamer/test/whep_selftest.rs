@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
-use webrtc::api::APIBuilder;
+use anyhow::{anyhow, bail, Result};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::APIBuilder;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -31,7 +31,10 @@ pub async fn run(mut config: Config) -> Result<()> {
     let port = config.https_port;
 
     tprintln!("=== M3 WHEP self-test ===");
-    tprintln!("[selftest] starting in-process server (HTTP :{}, HTTPS :{port})", config.port);
+    tprintln!(
+        "[selftest] starting in-process server (HTTP :{}, HTTPS :{port})",
+        config.port
+    );
 
     let server_cfg = config.clone();
     let server_handle = tokio::spawn(async move {
@@ -45,18 +48,31 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let api = {
         use webrtc::api::media_engine::MIME_TYPE_H264;
+        use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters};
         use webrtc::rtp_transceiver::RTCPFeedback;
-        use webrtc::rtp_transceiver::rtp_codec::{
-            RTCRtpCodecCapability, RTCRtpCodecParameters,
-        };
 
         let mut m = MediaEngine::default();
         let fb = vec![
-            RTCPFeedback { typ: "goog-remb".to_owned(), parameter: "".to_owned() },
-            RTCPFeedback { typ: "ccm".to_owned(), parameter: "fir".to_owned() },
-            RTCPFeedback { typ: "nack".to_owned(), parameter: "".to_owned() },
-            RTCPFeedback { typ: "nack".to_owned(), parameter: "pli".to_owned() },
-            RTCPFeedback { typ: "transport-cc".to_owned(), parameter: "".to_owned() },
+            RTCPFeedback {
+                typ: "goog-remb".to_owned(),
+                parameter: "".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "ccm".to_owned(),
+                parameter: "fir".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "transport-cc".to_owned(),
+                parameter: "".to_owned(),
+            },
         ];
         m.register_codec(
             RTCRtpCodecParameters {
@@ -123,7 +139,8 @@ pub async fn run(mut config: Config) -> Result<()> {
             let codec = track.codec();
             tprintln!(
                 "[selftest] on_track fired: mime={} payload_type={}",
-                codec.capability.mime_type, track.payload_type()
+                codec.capability.mime_type,
+                track.payload_type()
             );
             track_seen.fetch_add(1, Ordering::Relaxed);
             let rtp_count = Arc::clone(&rtp_count);
@@ -172,9 +189,18 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let checks = [
         ("H264", answer_sdp.contains("H264")),
-        ("packetization-mode=1", answer_sdp.contains("packetization-mode=1")),
-        ("profile-level-id=42e01f", answer_sdp.contains("profile-level-id=42e01f")),
-        ("rtcp-fb nack", answer_sdp.contains("a=rtcp-fb") && answer_sdp.contains("nack")),
+        (
+            "packetization-mode=1",
+            answer_sdp.contains("packetization-mode=1"),
+        ),
+        (
+            "profile-level-id=42e01f",
+            answer_sdp.contains("profile-level-id=42e01f"),
+        ),
+        (
+            "rtcp-fb nack",
+            answer_sdp.contains("a=rtcp-fb") && answer_sdp.contains("nack"),
+        ),
         ("rtcp-fb nack pli", answer_sdp.contains("nack pli")),
         ("rtcp-fb ccm fir", answer_sdp.contains("ccm fir")),
         ("transport-cc", answer_sdp.contains("transport-cc")),
@@ -225,9 +251,8 @@ pub async fn run(mut config: Config) -> Result<()> {
 }
 
 async fn wait_for_health(port: u16) -> Result<()> {
-    let req = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let req =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     for _ in 0..100 {
         if let Ok(resp) = tls_send_recv(port, req.as_bytes()).await {
             if String::from_utf8_lossy(&resp).contains("200") {
@@ -262,8 +287,8 @@ async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> {
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_rustls::TlsConnector;
     use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
 
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 

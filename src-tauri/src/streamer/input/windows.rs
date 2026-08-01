@@ -5,15 +5,16 @@ use std::collections::HashSet;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, HIGH_PRIORITY_CLASS, SetPriorityClass, SetThreadPriority,
+    GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, HIGH_PRIORITY_CLASS,
     THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Controls::{
@@ -21,30 +22,30 @@ use windows::Win32::UI::Controls::{
     POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
-    InjectSyntheticPointerInput, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT,
-    POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_FLAGS, POINTER_INFO,
-    POINTER_PEN_INFO, POINTER_TOUCH_INFO,
+    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_CANCELED, POINTER_FLAG_DOWN,
+    POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_UP, POINTER_FLAG_UPDATE,
+    POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PT_PEN, PT_TOUCH, PostMessageW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_DROPFILES, WindowFromPoint,
+    GetSystemMetrics, PostMessageW, WindowFromPoint, PT_PEN, PT_TOUCH, SM_CXSCREEN,
+    SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    WM_DROPFILES,
 };
-use windows::core::PCWSTR;
 
-use super::DisplayRect;
 use super::protocol::{
-    DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH, btn,
+    btn, DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
+use super::DisplayRect;
 
 pub const NAME: &str = "windows-sendinput+syntheticpointer";
 
@@ -99,7 +100,12 @@ impl VirtualScreen {
             if height <= 0 {
                 height = GetSystemMetrics(SM_CYSCREEN);
             }
-            VirtualScreen { left, top, width: width.max(1), height: height.max(1) }
+            VirtualScreen {
+                left,
+                top,
+                width: width.max(1),
+                height: height.max(1),
+            }
         }
     }
 }
@@ -158,14 +164,21 @@ impl Injector {
 
     fn refresh_geometry(&mut self) {
         use std::time::{Duration, Instant};
-        let fresh = matches!(self.geom_checked, Some(t) if t.elapsed() < Duration::from_millis(500));
+        let fresh =
+            matches!(self.geom_checked, Some(t) if t.elapsed() < Duration::from_millis(500));
         if fresh {
             return;
         }
         self.virt = VirtualScreen::query();
         if let Some(name) = &self.device_name {
-            let resolved = crate::windows_utils::streamer::capture::monitor_rect(name)
-                .map(|(left, top, width, height)| DisplayRect { left, top, width, height });
+            let resolved = crate::windows_utils::streamer::capture::monitor_rect(name).map(
+                |(left, top, width, height)| DisplayRect {
+                    left,
+                    top,
+                    width,
+                    height,
+                },
+            );
             if resolved != self.target {
                 if let Some(r) = resolved {
                     log::info!(
@@ -183,22 +196,38 @@ impl Injector {
         self.refresh_geometry();
         match ev {
             InputEvent::Pointer {
-                source, id, x, y, pressure, tilt_x, tilt_y, twist, w, h, buttons, phase,
+                source,
+                id,
+                x,
+                y,
+                pressure,
+                tilt_x,
+                tilt_y,
+                twist,
+                w,
+                h,
+                buttons,
+                phase,
             } => match *source {
                 SRC_MOUSE => self.mouse_pointer(*x, *y, *buttons, *phase),
-                SRC_PEN => {
-                    self.pen(*x, *y, *pressure, *tilt_x, *tilt_y, *twist, *buttons, *phase)
-                }
+                SRC_PEN => self.pen(
+                    *x, *y, *pressure, *tilt_x, *tilt_y, *twist, *buttons, *phase,
+                ),
                 SRC_TOUCH => self.touch(*id, *x, *y, *pressure, *w, *h, *phase),
                 _ => {}
             },
-            InputEvent::PointerBatch { source, id, buttons, samples } => {
-                self.pointer_batch(*source, *id, *buttons, samples)
-            }
+            InputEvent::PointerBatch {
+                source,
+                id,
+                buttons,
+                samples,
+            } => self.pointer_batch(*source, *id, *buttons, samples),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
             InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
-            InputEvent::Key { down, code, key, .. } => self.key(*down, code, key),
+            InputEvent::Key {
+                down, code, key, ..
+            } => self.key(*down, code, key),
             InputEvent::Text { s, .. } => self.text(s),
             InputEvent::Resize { .. } => {
                 self.virt = VirtualScreen::query();
@@ -215,8 +244,10 @@ impl Injector {
         self.scratch.clear();
         button_transitions(self.buttons, 0, &mut self.scratch);
         for (scan, ext) in self.down_keys.drain() {
-            self.scratch
-                .push(key_input(scan, KEYEVENTF_SCANCODE | ext_flag(ext) | KEYEVENTF_KEYUP));
+            self.scratch.push(key_input(
+                scan,
+                KEYEVENTF_SCANCODE | ext_flag(ext) | KEYEVENTF_KEYUP,
+            ));
         }
         send_inputs(&self.scratch);
         self.scratch.clear();
@@ -280,7 +311,8 @@ impl Injector {
         self.mouse_relative = true;
         self.scratch.clear();
         if dx != 0 || dy != 0 {
-            self.scratch.push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
+            self.scratch
+                .push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
         }
         button_transitions(self.buttons, buttons, &mut self.scratch);
         send_inputs(&self.scratch);
@@ -297,11 +329,13 @@ impl Injector {
         self.scratch.clear();
         if dy != 0.0 {
             let data = (-dy * scale).round() as i32 as u32;
-            self.scratch.push(mouse_input(0, 0, data, MOUSEEVENTF_WHEEL));
+            self.scratch
+                .push(mouse_input(0, 0, data, MOUSEEVENTF_WHEEL));
         }
         if dx != 0.0 {
             let data = (dx * scale).round() as i32 as u32;
-            self.scratch.push(mouse_input(0, 0, data, MOUSEEVENTF_HWHEEL));
+            self.scratch
+                .push(mouse_input(0, 0, data, MOUSEEVENTF_HWHEEL));
         }
         send_inputs(&self.scratch);
         self.scratch.clear();
@@ -310,7 +344,16 @@ impl Injector {
     fn pointer_batch(&mut self, source: u8, id: u32, buttons: u16, samples: &[MoveSample]) {
         for s in samples {
             match source {
-                SRC_PEN => self.pen(s.x, s.y, s.pressure, s.tilt_x, s.tilt_y, s.twist, buttons, Phase::Move),
+                SRC_PEN => self.pen(
+                    s.x,
+                    s.y,
+                    s.pressure,
+                    s.tilt_x,
+                    s.tilt_y,
+                    s.twist,
+                    buttons,
+                    Phase::Move,
+                ),
                 SRC_TOUCH => self.touch(id, s.x, s.y, s.pressure, 0.0, 0.0, Phase::Move),
                 _ => self.mouse_pointer(s.x, s.y, buttons, Phase::Move),
             }
@@ -330,9 +373,11 @@ impl Injector {
         if !ctrl_held {
             self.scratch.push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE));
         }
-        self.scratch.push(mouse_input(0, 0, notches as u32, MOUSEEVENTF_WHEEL));
+        self.scratch
+            .push(mouse_input(0, 0, notches as u32, MOUSEEVENTF_WHEEL));
         if !ctrl_held {
-            self.scratch.push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
+            self.scratch
+                .push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
         }
         send_inputs(&self.scratch);
         self.scratch.clear();
@@ -370,7 +415,8 @@ impl Injector {
         for ch in s.chars() {
             for unit in ch.encode_utf16(&mut buf) {
                 self.scratch.push(key_input(*unit, KEYEVENTF_UNICODE));
-                self.scratch.push(key_input(*unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                self.scratch
+                    .push(key_input(*unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
             }
         }
         send_inputs(&self.scratch);
@@ -379,11 +425,22 @@ impl Injector {
 
     #[allow(clippy::too_many_arguments)]
     fn pen(
-        &mut self, x: f32, y: f32, pressure: f32, tilt_x: f32, tilt_y: f32, twist: f32,
-        buttons: u16, phase: Phase,
+        &mut self,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+        twist: f32,
+        buttons: u16,
+        phase: Phase,
     ) {
         let Some(dev) = self.pen_dev else {
-            let b = if pressure > 0.0 || buttons & btn::PRIMARY != 0 { btn::PRIMARY } else { 0 };
+            let b = if pressure > 0.0 || buttons & btn::PRIMARY != 0 {
+                btn::PRIMARY
+            } else {
+                0
+            };
             self.mouse_pointer(x, y, b, phase);
             return;
         };
@@ -418,7 +475,14 @@ impl Injector {
 
     #[allow(clippy::too_many_arguments)]
     fn pen_info(
-        &self, x: f32, y: f32, pressure: f32, tilt_x: f32, tilt_y: f32, twist: f32, buttons: u16,
+        &self,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        tilt_x: f32,
+        tilt_y: f32,
+        twist: f32,
+        buttons: u16,
         flags: POINTER_FLAGS,
     ) -> POINTER_TYPE_INFO {
         let pt = self.inject_point(x, y);
@@ -444,17 +508,32 @@ impl Injector {
             tiltX: tilt_x.clamp(-90.0, 90.0) as i32,
             tiltY: tilt_y.clamp(-90.0, 90.0) as i32,
         };
-        POINTER_TYPE_INFO { r#type: PT_PEN, Anonymous: POINTER_TYPE_INFO_0 { penInfo: pen } }
+        POINTER_TYPE_INFO {
+            r#type: PT_PEN,
+            Anonymous: POINTER_TYPE_INFO_0 { penInfo: pen },
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn touch(&mut self, id: u32, x: f32, y: f32, pressure: f32, w: f32, h: f32, phase: Phase) {
         let Some(dev) = self.touch_dev else {
-            let b = matches!(phase, Phase::Down | Phase::Move | Phase::Enter | Phase::Over);
+            let b = matches!(
+                phase,
+                Phase::Down | Phase::Move | Phase::Enter | Phase::Over
+            );
             self.mouse_pointer(x, y, if b { btn::PRIMARY } else { 0 }, phase);
             return;
         };
-        self.contacts.insert(id, Contact { x, y, pressure, w, h });
+        self.contacts.insert(
+            id,
+            Contact {
+                x,
+                y,
+                pressure,
+                w,
+                h,
+            },
+        );
 
         let ending = matches!(phase, Phase::Up | Phase::Cancel | Phase::Leave | Phase::Out);
         let mut frame = std::mem::take(&mut self.touch_scratch);
@@ -515,7 +594,10 @@ impl Injector {
             orientation: 0,
             pressure,
         };
-        POINTER_TYPE_INFO { r#type: PT_TOUCH, Anonymous: POINTER_TYPE_INFO_0 { touchInfo: touch } }
+        POINTER_TYPE_INFO {
+            r#type: PT_TOUCH,
+            Anonymous: POINTER_TYPE_INFO_0 { touchInfo: touch },
+        }
     }
 
     fn clipboard(&mut self, op: u8, mime: &str, data: &[u8]) {
@@ -531,8 +613,10 @@ impl Injector {
         self.scratch.clear();
         self.scratch.push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE));
         self.scratch.push(key_input(SC_KEY_V, KEYEVENTF_SCANCODE));
-        self.scratch.push(key_input(SC_KEY_V, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
-        self.scratch.push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
+        self.scratch
+            .push(key_input(SC_KEY_V, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
+        self.scratch
+            .push(key_input(SC_LCTRL, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP));
         send_inputs(&self.scratch);
         self.scratch.clear();
     }
@@ -637,7 +721,10 @@ impl Injector {
 
     fn inject_point(&self, nx: f32, ny: f32) -> POINT {
         let p = self.pixel(nx, ny);
-        POINT { x: p.x - self.virt.left, y: p.y - self.virt.top }
+        POINT {
+            x: p.x - self.virt.left,
+            y: p.y - self.virt.top,
+        }
     }
 
     fn space_dims(&self) -> (i32, i32) {
@@ -652,25 +739,74 @@ fn button_transitions(old: u16, new: u16, out: &mut Vec<INPUT>) {
     let changed = old ^ new;
     let is_down = |bit: u16| new & bit != 0;
     if changed & btn::PRIMARY != 0 {
-        out.push(mouse_input(0, 0, 0, if is_down(btn::PRIMARY) { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }));
+        out.push(mouse_input(
+            0,
+            0,
+            0,
+            if is_down(btn::PRIMARY) {
+                MOUSEEVENTF_LEFTDOWN
+            } else {
+                MOUSEEVENTF_LEFTUP
+            },
+        ));
     }
     if changed & btn::SECONDARY != 0 {
-        out.push(mouse_input(0, 0, 0, if is_down(btn::SECONDARY) { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }));
+        out.push(mouse_input(
+            0,
+            0,
+            0,
+            if is_down(btn::SECONDARY) {
+                MOUSEEVENTF_RIGHTDOWN
+            } else {
+                MOUSEEVENTF_RIGHTUP
+            },
+        ));
     }
     if changed & btn::AUXILIARY != 0 {
-        out.push(mouse_input(0, 0, 0, if is_down(btn::AUXILIARY) { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }));
+        out.push(mouse_input(
+            0,
+            0,
+            0,
+            if is_down(btn::AUXILIARY) {
+                MOUSEEVENTF_MIDDLEDOWN
+            } else {
+                MOUSEEVENTF_MIDDLEUP
+            },
+        ));
     }
     if changed & btn::BACK != 0 {
-        out.push(mouse_input(0, 0, XBUTTON1, if is_down(btn::BACK) { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }));
+        out.push(mouse_input(
+            0,
+            0,
+            XBUTTON1,
+            if is_down(btn::BACK) {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
+        ));
     }
     if changed & btn::FORWARD != 0 {
-        out.push(mouse_input(0, 0, XBUTTON2, if is_down(btn::FORWARD) { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }));
+        out.push(mouse_input(
+            0,
+            0,
+            XBUTTON2,
+            if is_down(btn::FORWARD) {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
+        ));
     }
 }
 
 #[inline]
 fn ext_flag(ext: bool) -> KEYBD_EVENT_FLAGS {
-    if ext { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) }
+    if ext {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        KEYBD_EVENT_FLAGS(0)
+    }
 }
 
 #[inline]
@@ -678,7 +814,14 @@ fn mouse_input(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: data,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
         },
     }
 }
@@ -688,7 +831,13 @@ fn key_input(scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
-            ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
         },
     }
 }
@@ -731,7 +880,9 @@ fn set_clipboard(mime: &str, data: &[u8]) -> bool {
 }
 
 unsafe fn set_clip_text(text_utf8: &[u8]) -> bool {
-    let Ok(s) = std::str::from_utf8(text_utf8) else { return false };
+    let Ok(s) = std::str::from_utf8(text_utf8) else {
+        return false;
+    };
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     wide.push(0);
     unsafe { put_clipboard(CF_UNICODETEXT, bytemuck_u16(&wide)) }
@@ -749,7 +900,9 @@ unsafe fn set_clip_raw(mime: &str, data: &[u8]) -> bool {
 
 unsafe fn put_clipboard(format: u32, bytes: &[u8]) -> bool {
     unsafe {
-        let Ok(h) = GlobalAlloc(GHND, bytes.len().max(1)) else { return false };
+        let Ok(h) = GlobalAlloc(GHND, bytes.len().max(1)) else {
+            return false;
+        };
         let p = GlobalLock(h) as *mut u8;
         if p.is_null() {
             let _ = GlobalFree(Some(h));

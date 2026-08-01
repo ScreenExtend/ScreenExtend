@@ -1,12 +1,15 @@
+use windows::core::{w, Interface};
 use windows::Graphics::Capture::GraphicsCaptureItem;
-use windows::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
-    PeekMessageW, RegisterClassExW, TranslateMessage, WM_DESTROY, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
+    RegisterClassExW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE, WM_DESTROY,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::{Interface, w};
 use windows_future::AsyncStatus;
 
 use super::settings::GraphicsCaptureItemType;
@@ -26,7 +29,12 @@ pub enum Error {
 ///
 /// Safety: Called by the system with a valid `HWND` and message parameters.
 /// Forwards unhandled messages to `DefWindowProcW`.
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_DESTROY => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -141,9 +149,15 @@ impl GraphicsCapturePicker {
             }
         }
 
-        op.GetResults()
-            .ok()
-            .map_or_else(|| Ok(None), |item| Ok(Some(PickedGraphicsCaptureItem { item, _guard: HwndGuard(hwnd) })))
+        op.GetResults().ok().map_or_else(
+            || Ok(None),
+            |item| {
+                Ok(Some(PickedGraphicsCaptureItem {
+                    item,
+                    _guard: HwndGuard(hwnd),
+                }))
+            },
+        )
     }
 }
 

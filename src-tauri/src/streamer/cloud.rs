@@ -60,7 +60,9 @@ pub enum HostToRelay {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
-    Pong { ts: u64 },
+    Pong {
+        ts: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -134,7 +136,9 @@ pub enum RelayToHost {
         #[serde(rename = "clientId")]
         client_id: String,
     },
-    Ping { ts: u64 },
+    Ping {
+        ts: u64,
+    },
     Shutdown {
         #[serde(default)]
         reason: String,
@@ -213,11 +217,7 @@ pub struct CloudClient {
 }
 
 impl CloudClient {
-    pub fn spawn(
-        config: CloudConfig,
-        server_config: Config,
-        sink: SharedCloudStatusSink,
-    ) -> Self {
+    pub fn spawn(config: CloudConfig, server_config: Config, sink: SharedCloudStatusSink) -> Self {
         let stop = Arc::new(Notify::new());
         let stop_for_thread = stop.clone();
         let handle = std::thread::Builder::new()
@@ -420,9 +420,16 @@ fn handle_relay_message(
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                let resp =
-                    dispatch(&state, request_id, &client_id, &method, &path, &body, ice_servers)
-                        .await;
+                let resp = dispatch(
+                    &state,
+                    request_id,
+                    &client_id,
+                    &method,
+                    &path,
+                    &body,
+                    ice_servers,
+                )
+                .await;
                 match serde_json::to_string(&resp) {
                     Ok(text) => {
                         let _ = tx.send(Message::Text(text.into()));
@@ -463,13 +470,20 @@ async fn dispatch(
             let base: Vec<RTCIceServer> = if ice_servers.is_empty() {
                 state.fallback_ice_servers()
             } else {
-                ice_servers.into_iter().map(IceServerWire::into_rtc).collect()
+                ice_servers
+                    .into_iter()
+                    .map(IceServerWire::into_rtc)
+                    .collect()
             };
             let ice = state.ice_with_turn(base);
             let r = server::process_whep(state, client_id, body.as_bytes(), ice).await;
             (r.status, r.content_type, r.body)
         }
-        ("GET", "/reconfig") => (200, "application/json", server::process_reconfig(state, client_id)),
+        ("GET", "/reconfig") => (
+            200,
+            "application/json",
+            server::process_reconfig(state, client_id),
+        ),
         ("POST", "/leave") => {
             server::process_leave(state, client_id);
             (204, "text/plain", String::new())

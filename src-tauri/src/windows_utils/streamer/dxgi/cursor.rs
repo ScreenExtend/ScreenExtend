@@ -1,24 +1,24 @@
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
+use windows::core::{s, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob};
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC,
+    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BLEND_DESC,
     D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_INV_SRC_COLOR,
     D3D11_BLEND_ONE, D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_SRC_COLOR,
     D3D11_BLEND_ZERO, D3D11_BUFFER_DESC, D3D11_COLOR_WRITE_ENABLE_ALL, D3D11_CPU_ACCESS_WRITE,
-    D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
     D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC,
-    D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT, ID3D11BlendState, ID3D11Buffer, ID3D11Device,
-    ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC, D3D11_USAGE_IMMUTABLE,
+    D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
 };
-use windows::core::{PCSTR, s};
 
 const SHADER_SRC: &str = "\
 cbuffer Quad : register(b0) { float4 v[4]; };\n\
@@ -172,7 +172,11 @@ impl QuadRenderer {
             sampler: sampler.context("sampler was null")?,
             blend_alpha: make_blend(device, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA)?,
             blend_multiply: make_blend(device, D3D11_BLEND_ZERO, D3D11_BLEND_SRC_COLOR)?,
-            blend_xor: make_blend(device, D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_INV_SRC_COLOR)?,
+            blend_xor: make_blend(
+                device,
+                D3D11_BLEND_INV_DEST_COLOR,
+                D3D11_BLEND_INV_SRC_COLOR,
+            )?,
         })
     }
 
@@ -237,14 +241,22 @@ pub struct CursorSprite {
     pub hotspot_y: i32,
 }
 
-fn make_srv(device: &ID3D11Device, w: u32, h: u32, pixels: &[u32]) -> Result<ID3D11ShaderResourceView> {
+fn make_srv(
+    device: &ID3D11Device,
+    w: u32,
+    h: u32,
+    pixels: &[u32],
+) -> Result<ID3D11ShaderResourceView> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: w,
         Height: h,
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_IMMUTABLE,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: 0,
@@ -287,8 +299,16 @@ pub fn build_sprite(
                     ((byte >> (7 - (x & 7))) & 1) as u32
                 };
                 let i = y * w as usize + x;
-                and_px[i] = if bit(y) == 1 { OPAQUE_WHITE } else { OPAQUE_BLACK };
-                xor_px[i] = if bit(y + h as usize) == 1 { OPAQUE_WHITE } else { OPAQUE_BLACK };
+                and_px[i] = if bit(y) == 1 {
+                    OPAQUE_WHITE
+                } else {
+                    OPAQUE_BLACK
+                };
+                xor_px[i] = if bit(y + h as usize) == 1 {
+                    OPAQUE_WHITE
+                } else {
+                    OPAQUE_BLACK
+                };
             }
         }
         return Ok(CursorSprite {

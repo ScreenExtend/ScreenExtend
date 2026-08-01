@@ -2,28 +2,28 @@ use std::ffi::c_void;
 use std::io::Write as _;
 use std::ptr;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context as _, Result};
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11Device1, ID3D11DeviceContext,
-    ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
-    IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
+    DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
-use windows::core::{Interface, PCWSTR};
 
-use crate::streamer::config::H264Profile;
 use super::super::nvidia::encoder::EncoderConfig;
 use super::intel_sys::*;
+use crate::streamer::config::H264Profile;
 
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 const INTEL_FPS_QUERY_FALLBACK: u32 = 60;
@@ -67,7 +67,10 @@ impl InputBridge {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -89,8 +92,9 @@ impl InputBridge {
             .cast()
             .context("bridge texture as IDXGIKeyedMutex (encode side)")?;
 
-        let cap_device1: ID3D11Device1 =
-            cap_device.cast().context("capture device as ID3D11Device1")?;
+        let cap_device1: ID3D11Device1 = cap_device
+            .cast()
+            .context("capture device as ID3D11Device1")?;
         let cap_tex: ID3D11Texture2D = unsafe { cap_device1.OpenSharedResource1(shared_handle) }
             .inspect_err(|_| unsafe {
                 let _ = CloseHandle(shared_handle);
@@ -114,14 +118,30 @@ impl InputBridge {
         unsafe { self.cap_mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
             .context("Quick Sync bridge AcquireSync(writer)")?;
         let copy = (|| -> Result<()> {
-            let dst_res: ID3D11Resource =
-                self.cap_tex.cast().context("bridge texture as ID3D11Resource")?;
-            let src_res: ID3D11Resource =
-                src.cast().context("source texture as ID3D11Resource")?;
-            let box_ = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+            let dst_res: ID3D11Resource = self
+                .cap_tex
+                .cast()
+                .context("bridge texture as ID3D11Resource")?;
+            let src_res: ID3D11Resource = src.cast().context("source texture as ID3D11Resource")?;
+            let box_ = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: w,
+                bottom: h,
+                back: 1,
+            };
             unsafe {
-                self.cap_context
-                    .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                self.cap_context.CopySubresourceRegion(
+                    &dst_res,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &src_res,
+                    0,
+                    Some(&box_),
+                );
                 self.cap_context.Flush();
             }
             Ok(())
@@ -192,8 +212,9 @@ impl Encoder {
         let (enc_device, enc_context, bridge) = if capture_has_video {
             (device.clone(), context.clone(), None)
         } else {
-            let (enc_device, enc_context) = create_intel_d3d11_device_for(device)
-                .context("creating a dedicated Intel device (capture device lacks VIDEO_SUPPORT)")?;
+            let (enc_device, enc_context) = create_intel_d3d11_device_for(device).context(
+                "creating a dedicated Intel device (capture device lacks VIDEO_SUPPORT)",
+            )?;
             let bridge = InputBridge::new(&enc_device, device, context, src_w, src_h)
                 .context("building the same-adapter Quick Sync input bridge")?;
             tprintln!(
@@ -571,7 +592,10 @@ impl Encoder {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             CPUAccessFlags: 0,
@@ -668,8 +692,16 @@ impl Encoder {
                 let src_res: ID3D11Resource =
                     src.cast().context("source texture as ID3D11Resource")?;
                 unsafe {
-                    self.context
-                        .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                    self.context.CopySubresourceRegion(
+                        &dst_res,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &src_res,
+                        0,
+                        Some(&box_),
+                    );
                     self.context.Flush();
                 }
             }
@@ -678,11 +710,21 @@ impl Encoder {
                 unsafe { bridge.enc_mutex.AcquireSync(KEY_ENCODER, KEY_TIMEOUT_MS) }
                     .context("Quick Sync bridge AcquireSync(encoder)")?;
                 let copy = (|| -> Result<()> {
-                    let src_res: ID3D11Resource =
-                        bridge.enc_tex.cast().context("bridge texture as ID3D11Resource")?;
+                    let src_res: ID3D11Resource = bridge
+                        .enc_tex
+                        .cast()
+                        .context("bridge texture as ID3D11Resource")?;
                     unsafe {
-                        self.context
-                            .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, Some(&box_));
+                        self.context.CopySubresourceRegion(
+                            &dst_res,
+                            0,
+                            0,
+                            0,
+                            0,
+                            &src_res,
+                            0,
+                            Some(&box_),
+                        );
                         self.context.Flush();
                     }
                     Ok(())
@@ -745,8 +787,7 @@ impl Encoder {
         }
         let mut waited_ms = 0u32;
         loop {
-            let st =
-                unsafe { (self.vpl.MFXVideoCORE_SyncOperation)(self.session, syncp, 100) };
+            let st = unsafe { (self.vpl.MFXVideoCORE_SyncOperation)(self.session, syncp, 100) };
             if st == MFX_WRN_IN_EXECUTION {
                 waited_ms += 100;
                 if waited_ms >= 2_000 {
@@ -767,13 +808,18 @@ impl Encoder {
     fn get_surface(&self, kind: SurfaceKind) -> Result<*mut mfxFrameSurface1> {
         let mut surf: *mut mfxFrameSurface1 = ptr::null_mut();
         let (f, what) = match kind {
-            SurfaceKind::VppIn => (self.vpl.MFXMemory_GetSurfaceForVPP, "MFXMemory_GetSurfaceForVPP"),
-            SurfaceKind::VppOut => {
-                (self.vpl.MFXMemory_GetSurfaceForVPPOut, "MFXMemory_GetSurfaceForVPPOut")
-            }
-            SurfaceKind::Encode => {
-                (self.vpl.MFXMemory_GetSurfaceForEncode, "MFXMemory_GetSurfaceForEncode")
-            }
+            SurfaceKind::VppIn => (
+                self.vpl.MFXMemory_GetSurfaceForVPP,
+                "MFXMemory_GetSurfaceForVPP",
+            ),
+            SurfaceKind::VppOut => (
+                self.vpl.MFXMemory_GetSurfaceForVPPOut,
+                "MFXMemory_GetSurfaceForVPPOut",
+            ),
+            SurfaceKind::Encode => (
+                self.vpl.MFXMemory_GetSurfaceForEncode,
+                "MFXMemory_GetSurfaceForEncode",
+            ),
         };
         check_strict(unsafe { f(self.session, &mut surf) }, what)?;
         if surf.is_null() {
@@ -863,7 +909,9 @@ fn create_session(vpl: &Vpl) -> Result<mfxSession> {
         }
         Err(e) => {
             unsafe { (vpl.MFXUnload)(loader) };
-            Err(e.context("no Intel hardware oneVPL implementation (would fail over to next vendor)"))
+            Err(e.context(
+                "no Intel hardware oneVPL implementation (would fail over to next vendor)",
+            ))
         }
     }
 }
@@ -1089,7 +1137,10 @@ pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Res
         file.write_all(&au)
             .with_context(|| format!("writing frame {i}"))?;
         if i % 60 == 0 || i == FRAMES - 1 {
-            tprintln!("Intel encoded frame={i} (au_bytes={}, total_bytes={total})", au.len());
+            tprintln!(
+                "Intel encoded frame={i} (au_bytes={}, total_bytes={total})",
+                au.len()
+            );
         }
     }
     file.flush().context("flushing output file")?;

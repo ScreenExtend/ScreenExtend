@@ -1,6 +1,6 @@
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
-use crate::windows_utils::streamer::x264::encoder::{X264Encoder, fill_synthetic_bgra};
+use crate::windows_utils::streamer::x264::encoder::{fill_synthetic_bgra, X264Encoder};
 
 fn nal_units(au: &[u8]) -> Vec<(u8, usize)> {
     let mut starts = Vec::new();
@@ -85,10 +85,16 @@ fn x264_software_encodes_synthetic_frames() {
             .unwrap_or_else(|e| panic!("encode frame {i} failed: {e:?}"));
         per_frame_us.push(start.elapsed().as_micros());
 
-        assert!(!au.is_empty(), "frame {i}: zerolatency must emit output every frame");
+        assert!(
+            !au.is_empty(),
+            "frame {i}: zerolatency must emit output every frame"
+        );
         outputs += 1;
         total_bytes += au.len();
-        assert!(starts_with_annexb(&au), "frame {i}: output must start with an Annex-B start code");
+        assert!(
+            starts_with_annexb(&au),
+            "frame {i}: output must start with an Annex-B start code"
+        );
 
         for (_, len) in nal_units(&au) {
             max_nal = max_nal.max(len);
@@ -107,9 +113,15 @@ fn x264_software_encodes_synthetic_frames() {
         }
     }
 
-    assert_eq!(outputs, FRAMES, "frame-in/packet-out: {FRAMES} frames must yield {FRAMES} outputs");
+    assert_eq!(
+        outputs, FRAMES,
+        "frame-in/packet-out: {FRAMES} frames must yield {FRAMES} outputs"
+    );
     assert!(first_ok, "frame 0 must contain SPS + PPS + IDR");
-    assert!(forced_ok, "mid-stream forced keyframe must contain SPS + PPS + IDR");
+    assert!(
+        forced_ok,
+        "mid-stream forced keyframe must contain SPS + PPS + IDR"
+    );
 
     let achieved_bps = (total_bytes as f64 * 8.0 * FPS as f64) / FRAMES as f64;
     let ratio = achieved_bps / BITRATE as f64;
@@ -160,13 +172,17 @@ fn x264_software_runtime_bitrate_change() {
     let mut high_bytes = 0usize;
     for i in 0..60 {
         fill_synthetic_bgra(&mut frame, W, H, i);
-        let au = encoder.encode_bgra(&frame, i == 0).expect("high-rate encode");
+        let au = encoder
+            .encode_bgra(&frame, i == 0)
+            .expect("high-rate encode");
         if i >= 5 {
             high_bytes += au.len();
         }
     }
 
-    encoder.set_bitrate(LOW).expect("runtime bitrate reconfigure");
+    encoder
+        .set_bitrate(LOW)
+        .expect("runtime bitrate reconfigure");
 
     let mut low_bytes = 0usize;
     for i in 60..120 {

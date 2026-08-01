@@ -216,7 +216,9 @@ async fn check_for_update() -> Result<UpdateInfo, String> {
 #[tauri::command]
 #[specta::specta]
 fn set_avatar(app: tauri::AppHandle, bytes: Vec<u8>) -> bool {
-    match avatar_path(&app).and_then(|path| std::fs::write(&path, &bytes).map_err(|e| e.to_string())) {
+    match avatar_path(&app)
+        .and_then(|path| std::fs::write(&path, &bytes).map_err(|e| e.to_string()))
+    {
         Ok(()) => true,
         Err(e) => {
             log::error!("failed to save avatar: {e}");
@@ -349,6 +351,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().default_version_comparator(|current, update| { update.version != current }).build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())

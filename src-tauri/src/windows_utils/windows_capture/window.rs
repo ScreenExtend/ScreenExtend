@@ -16,20 +16,22 @@
 //! [`super::settings::TryIntoCaptureItemWithDetails`] for [`Window`].
 use std::ptr;
 
+use windows::core::{Owned, BOOL, HSTRING};
 use windows::Graphics::Capture::GraphicsCaptureItem;
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, TRUE};
-use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
 use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
-use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_CHILD,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, FindWindowW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE,
+    GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
 };
-use windows::core::{BOOL, HSTRING, Owned};
 
 use super::monitor::Monitor;
 use super::settings::GraphicsCaptureItemType;
@@ -153,7 +155,8 @@ impl Window {
             return Ok(String::new());
         }
 
-        let name = String::from_utf16(&buf[..copied as usize]).map_err(|_| Error::FailedToConvertWindowsString)?;
+        let name = String::from_utf16(&buf[..copied as usize])
+            .map_err(|_| Error::FailedToConvertWindowsString)?;
 
         Ok(name)
     }
@@ -187,7 +190,8 @@ impl Window {
     pub fn process_name(&self) -> Result<String, Error> {
         let id = self.process_id()?;
 
-        let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, id) }?;
+        let process =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, id) }?;
         let process = unsafe { Owned::new(process) };
 
         let mut name = vec![0u16; 260];
@@ -197,9 +201,15 @@ impl Window {
             return Err(Error::WindowsError(unsafe { GetLastError().into() }));
         }
 
-        let name =
-            String::from_utf16(&name.as_slice().iter().take_while(|ch| **ch != 0x0000).copied().collect::<Vec<u16>>())
-                .map_err(|_| Error::FailedToConvertWindowsString)?;
+        let name = String::from_utf16(
+            &name
+                .as_slice()
+                .iter()
+                .take_while(|ch| **ch != 0x0000)
+                .copied()
+                .collect::<Vec<u16>>(),
+        )
+        .map_err(|_| Error::FailedToConvertWindowsString)?;
 
         Ok(name)
     }
@@ -214,7 +224,11 @@ impl Window {
 
         let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONULL) };
 
-        if monitor.is_invalid() { None } else { Some(Monitor::from_raw_hmonitor(monitor.0)) }
+        if monitor.is_invalid() {
+            None
+        } else {
+            Some(Monitor::from_raw_hmonitor(monitor.0))
+        }
     }
 
     /// Returns the bounding rectangle of the window in screen coordinates.
@@ -226,7 +240,11 @@ impl Window {
     pub fn rect(&self) -> Result<RECT, Error> {
         let mut rect = RECT::default();
         let result = unsafe { GetWindowRect(self.window, &mut rect) };
-        if result.is_ok() { Ok(rect) } else { Err(Error::WindowsError(unsafe { GetLastError().into() })) }
+        if result.is_ok() {
+            Ok(rect)
+        } else {
+            Err(Error::WindowsError(unsafe { GetLastError().into() }))
+        }
     }
 
     /// Calculates the height of the window's title bar in pixels.
@@ -313,7 +331,10 @@ impl Window {
         let mut windows: Vec<Self> = Vec::new();
 
         unsafe {
-            EnumWindows(Some(Self::enum_windows_callback), LPARAM(ptr::addr_of_mut!(windows) as isize))?;
+            EnumWindows(
+                Some(Self::enum_windows_callback),
+                LPARAM(ptr::addr_of_mut!(windows) as isize),
+            )?;
         }
 
         Ok(windows)

@@ -22,10 +22,7 @@ const ASSERTION_LEVEL_ON: u32 = 255;
 /// `kIOReturnSuccess`.
 const IO_RETURN_SUCCESS: i32 = 0;
 
-const ASSERTION_TYPES: [&str; 2] = [
-    "PreventUserIdleSystemSleep",
-    "PreventUserIdleDisplaySleep",
-];
+const ASSERTION_TYPES: [&str; 2] = ["PreventUserIdleSystemSleep", "PreventUserIdleDisplaySleep"];
 
 pub struct KeepAwake {
     ids: Vec<IOPMAssertionID>,
@@ -53,11 +50,12 @@ impl KeepAwake {
             }
         }
         if ids.is_empty() {
-            teprintln!(
-                "[power] keep-awake assertions failed; system/display may sleep mid-stream"
-            );
+            teprintln!("[power] keep-awake assertions failed; system/display may sleep mid-stream");
         } else {
-            tprintln!("[power] keep-awake asserted for session ({} assertion(s))", ids.len());
+            tprintln!(
+                "[power] keep-awake asserted for session ({} assertion(s))",
+                ids.len()
+            );
         }
         KeepAwake { ids }
     }

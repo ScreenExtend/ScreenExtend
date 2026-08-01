@@ -2,7 +2,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{anyhow, Context as _, Result};
 use libloading::{Library, Symbol};
 
 pub const X264_BUILD: i32 = 164;
@@ -400,13 +400,13 @@ const LIB_NAMES: &[&str] = &["libx264-164.dll", "libx264.dll", "x264.dll"];
 
 fn open_library() -> Result<Library> {
     let mut last_err: Option<String> = None;
-    let mut attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| {
-        match unsafe { Library::new(&candidate) } {
-            Ok(lib) => Some(lib),
-            Err(e) => {
-                *last_err = Some(format!("{}: {e}", candidate.display()));
-                None
-            }
+    let mut attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
+        Library::new(&candidate)
+    } {
+        Ok(lib) => Some(lib),
+        Err(e) => {
+            *last_err = Some(format!("{}: {e}", candidate.display()));
+            None
         }
     };
 
@@ -479,9 +479,9 @@ impl X264Api {
             let encoder_encode: Symbol<FnEncoderEncode> = lib
                 .get(b"x264_encoder_encode\0")
                 .context("resolving x264_encoder_encode")?;
-            let encoder_reconfig: Symbol<FnEncoderReconfig> = lib
-                .get(b"x264_encoder_reconfig\0")
-                .context("resolving x264_encoder_reconfig")?;
+            let encoder_reconfig: Symbol<FnEncoderReconfig> =
+                lib.get(b"x264_encoder_reconfig\0")
+                    .context("resolving x264_encoder_reconfig")?;
             let encoder_intra_refresh: Symbol<FnEncoderIntraRefresh> = lib
                 .get(b"x264_encoder_intra_refresh\0")
                 .context("resolving x264_encoder_intra_refresh")?;

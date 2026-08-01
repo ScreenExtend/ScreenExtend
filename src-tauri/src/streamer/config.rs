@@ -291,8 +291,10 @@ impl Config {
                 }
                 "--intra-refresh" => {
                     if let Some(v) = val(&args, i) {
-                        c.intra_refresh =
-                            matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                        c.intra_refresh = matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "on" | "1" | "true" | "yes"
+                        );
                     }
                     i += 2;
                 }
@@ -302,21 +304,19 @@ impl Config {
                     }
                     i += 2;
                 }
-                "--disable-gpu-encode" => {
-                    match val(&args, i) {
-                        Some(v) => {
-                            c.disable_gpu_encode = matches!(
-                                v.trim().to_ascii_lowercase().as_str(),
-                                "on" | "1" | "true" | "yes"
-                            );
-                            i += 2;
-                        }
-                        None => {
-                            c.disable_gpu_encode = true;
-                            i += 1;
-                        }
+                "--disable-gpu-encode" => match val(&args, i) {
+                    Some(v) => {
+                        c.disable_gpu_encode = matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "on" | "1" | "true" | "yes"
+                        );
+                        i += 2;
                     }
-                }
+                    None => {
+                        c.disable_gpu_encode = true;
+                        i += 1;
+                    }
+                },
                 "--bind-ip" => {
                     if let Some(ip) = val(&args, i).and_then(|s| s.parse().ok()) {
                         c.bind_ip = ip;

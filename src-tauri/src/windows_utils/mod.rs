@@ -1,13 +1,23 @@
 pub mod compatibility;
 pub mod device_reporter;
+pub mod driver_ipc;
 pub mod hosted_network;
 pub mod networking;
 pub mod streamer;
 pub mod virtual_display;
-pub mod driver_ipc;
 pub mod windows_capture;
 
+use crate::streamer::cloud::{
+    CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
+};
+use crate::streamer::session::{
+    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter,
+    SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
+};
+use crate::streamer::{Config, Streamer};
+use device_reporter::TauriDeviceReporter;
 use elevated_command::Command;
+use networking::NetworkInfo;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::process::Command as StdCommand;
@@ -16,14 +26,6 @@ use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 use tauri::State;
-use crate::streamer::cloud::{CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink};
-use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedServerPorts,
-    SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
-};
-use crate::streamer::{Config, Streamer};
-use device_reporter::TauriDeviceReporter;
-use networking::NetworkInfo;
 use virtual_display::WindowsVirtualDisplay;
 
 pub struct StreamerHandle {
@@ -86,25 +88,31 @@ impl CloudStatusSink for TauriCloudStatusSink {
 
 pub fn set_display_topology_extend() {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, GetDisplayConfigBufferSizes,
-        QueryDisplayConfig, SetDisplayConfig, QDC_ALL_PATHS, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
+        GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_PATH_INFO, QDC_ALL_PATHS, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
     };
 
     const DISPLAYCONFIG_PATH_ACTIVE: u32 = 0x0000_0001;
 
     fn source_key(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, i32, u32) {
-        (p.sourceInfo.adapterId.LowPart, p.sourceInfo.adapterId.HighPart, p.sourceInfo.id)
+        (
+            p.sourceInfo.adapterId.LowPart,
+            p.sourceInfo.adapterId.HighPart,
+            p.sourceInfo.id,
+        )
     }
     fn target_key(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, i32, u32) {
-        (p.targetInfo.adapterId.LowPart, p.targetInfo.adapterId.HighPart, p.targetInfo.id)
+        (
+            p.targetInfo.adapterId.LowPart,
+            p.targetInfo.adapterId.HighPart,
+            p.targetInfo.id,
+        )
     }
 
     let mut path_count = 0u32;
     let mut mode_count = 0u32;
-    if let Err(e) = unsafe {
-        GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count)
-    }
-    .ok()
+    if let Err(e) =
+        unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count) }.ok()
     {
         teprintln!("[display] extend: GetDisplayConfigBufferSizes failed ({e})");
         return;
@@ -155,7 +163,11 @@ pub fn set_display_topology_extend() {
         return;
     }
 
-    let reason = if is_cloned { "duplicate/clone topology" } else { "an inactive display" };
+    let reason = if is_cloned {
+        "duplicate/clone topology"
+    } else {
+        "an inactive display"
+    };
     tprintln!(
         "[display] {reason} detected ({} active monitor(s)); applying extend topology",
         active_targets.len()
@@ -171,7 +183,9 @@ pub fn set_display_topology_extend() {
     if result == 0 {
         tprintln!("[display] extend topology applied");
     } else {
-        teprintln!("[display] failed to apply extend topology (SetDisplayConfig win32 error {result})");
+        teprintln!(
+            "[display] failed to apply extend topology (SetDisplayConfig win32 error {result})"
+        );
     }
 }
 
@@ -228,10 +242,10 @@ pub fn set_device_override(
     video_quality: u32,
     control_enabled: bool,
 ) {
+    use crate::streamer::config::ScalePercent;
     use crate::streamer::server::{
         MAX_DISPLAY_SCALE, MAX_REFRESH_RATE, MIN_DISPLAY_SCALE, MIN_REFRESH_RATE,
     };
-    use crate::streamer::config::ScalePercent;
 
     state.device_overrides.lock().unwrap().insert(
         ip.clone(),
@@ -258,8 +272,10 @@ pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
 #[tauri::command]
 #[specta::specta]
 pub fn set_disconnect_grace(state: State<'_, AppState>, seconds: u32) {
-    let secs = (seconds as u64)
-        .clamp(session::MIN_DISCONNECT_GRACE_SECS, session::MAX_DISCONNECT_GRACE_SECS);
+    let secs = (seconds as u64).clamp(
+        session::MIN_DISCONNECT_GRACE_SECS,
+        session::MAX_DISCONNECT_GRACE_SECS,
+    );
     state
         .disconnect_grace
         .store(secs, std::sync::atomic::Ordering::Relaxed);
@@ -283,7 +299,12 @@ pub struct TurnConfig {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_turn_config(state: State<'_, AppState>, urls: String, username: String, credential: String) {
+pub fn set_turn_config(
+    state: State<'_, AppState>,
+    urls: String,
+    username: String,
+    credential: String,
+) {
     let urls: Vec<String> = urls
         .split(',')
         .map(|u| u.trim().to_string())
@@ -328,21 +349,38 @@ pub fn get_server_ports(state: State<'_, AppState>) -> ServerPorts {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_server_ports(state: State<'_, AppState>, http_port: u16, https_port: u16) -> ServerPorts {
-    let http = if http_port == 0 { session::DEFAULT_HTTP_PORT } else { http_port };
-    let https = if https_port == 0 { session::DEFAULT_HTTPS_PORT } else { https_port };
+pub fn set_server_ports(
+    state: State<'_, AppState>,
+    http_port: u16,
+    https_port: u16,
+) -> ServerPorts {
+    let http = if http_port == 0 {
+        session::DEFAULT_HTTP_PORT
+    } else {
+        http_port
+    };
+    let https = if https_port == 0 {
+        session::DEFAULT_HTTPS_PORT
+    } else {
+        https_port
+    };
 
     let (cur_http, cur_https) = state.server_ports.get();
     if http == https {
         teprintln!("[streamer] rejecting server port change: HTTP and HTTPS must differ ({http})");
-        return ServerPorts { http: cur_http, https: cur_https };
+        return ServerPorts {
+            http: cur_http,
+            https: cur_https,
+        };
     }
     if http == cur_http && https == cur_https {
         return ServerPorts { http, https };
     }
 
     state.server_ports.set(http, https);
-    tprintln!("[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers");
+    tprintln!(
+        "[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers"
+    );
 
     {
         let mut streamers = state.streamers.lock().unwrap();
@@ -376,7 +414,11 @@ pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
     }
     tprintln!(
         "[streamer] GPU video encoding {}; restarting streamers",
-        if disabled { "disabled (software x264 only)" } else { "re-enabled" }
+        if disabled {
+            "disabled (software x264 only)"
+        } else {
+            "re-enabled"
+        }
     );
     {
         let mut streamers = state.streamers.lock().unwrap();
@@ -491,7 +533,8 @@ pub fn unregister_cloud_session(state: State<'_, AppState>) {
         prev.stop();
         tprintln!("[cloud] public sessions disabled; relay client stopped");
     }
-    *state.cloud_status.lock().unwrap() = (CloudState::Disabled.as_str().to_string(), String::new());
+    *state.cloud_status.lock().unwrap() =
+        (CloudState::Disabled.as_str().to_string(), String::new());
 }
 
 #[tauri::command]
@@ -523,7 +566,9 @@ pub fn sync_streamers(state: &AppState) {
             true
         } else {
             tprintln!("[streamer] stopping streamer bound to {ip}");
-            streamer.handle.graceful_shutdown(Some(Duration::from_secs(1)));
+            streamer
+                .handle
+                .graceful_shutdown(Some(Duration::from_secs(1)));
             false
         }
     });

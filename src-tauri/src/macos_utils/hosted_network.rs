@@ -77,7 +77,10 @@ fn try_start_host_ap(
         let detail = unsafe { error.as_ref() }
             .map(|e| e.localizedDescription().to_string())
             .unwrap_or_else(|| "unknown error".to_string());
-        teprintln!("[hosted-network] startHostAPMode (secured={}) failed: {detail}", password.is_some());
+        teprintln!(
+            "[hosted-network] startHostAPMode (secured={}) failed: {detail}",
+            password.is_some()
+        );
     }
     success
 }
@@ -109,9 +112,7 @@ pub fn start_hosted_network(
 
     let had_password = !password.is_empty();
     let mut fell_back = false;
-    let started = if had_password
-        && try_start_host_ap(&interface, &channel, name, Some(password))
-    {
+    let started = if had_password && try_start_host_ap(&interface, &channel, name, Some(password)) {
         true
     } else {
         let started_open = try_start_host_ap(&interface, &channel, name, None);

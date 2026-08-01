@@ -1,6 +1,6 @@
 use windows::Win32::Foundation::S_FALSE;
-use windows::Win32::System::Com::{CO_MTA_USAGE_COOKIE, CoDecrementMTAUsage, CoIncrementMTAUsage};
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::Win32::System::Com::{CoDecrementMTAUsage, CoIncrementMTAUsage, CO_MTA_USAGE_COOKIE};
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
 /// Panic safe wrapper around `CoIncrementMTAUsage`.
 struct WinMTACookie {
@@ -10,7 +10,9 @@ struct WinMTACookie {
 impl WinMTACookie {
     /// Increments the current threads MTA usage.
     pub fn new() -> windows::core::Result<Self> {
-        Ok(Self { cookie: unsafe { CoIncrementMTAUsage()? } })
+        Ok(Self {
+            cookie: unsafe { CoIncrementMTAUsage()? },
+        })
     }
 }
 

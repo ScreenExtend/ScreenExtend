@@ -1,30 +1,30 @@
 pub mod cursor;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context as _, Result};
+use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY,
-    DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270, DXGI_MODE_ROTATION_ROTATE90,
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1,
-    IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
-use windows::core::Interface;
 
-use cursor::{BlendKind, CursorSprite, QuadRenderer, build_sprite, quad_verts};
+use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
 
 const REDUP_MAX_RETRIES: u32 = 40;
 
@@ -68,8 +68,7 @@ fn wide_to_string(wide: &[u16]) -> String {
 }
 
 fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> {
-    let factory: IDXGIFactory1 =
-        unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
     let mut seen = Vec::new();
     for a in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(a) } {
@@ -95,8 +94,9 @@ fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_O
                         .map(|d| wide_to_string(&d.Description))
                         .unwrap_or_else(|| "<unknown>".into()),
                 );
-                let output1: IDXGIOutput1 =
-                    output.cast().context("IDXGIOutput as IDXGIOutput1 (needs DXGI 1.2+)")?;
+                let output1: IDXGIOutput1 = output
+                    .cast()
+                    .context("IDXGIOutput as IDXGIOutput1 (needs DXGI 1.2+)")?;
                 return Ok((adapter, output1, desc));
             }
             seen.push(name);
@@ -107,28 +107,29 @@ fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_O
 
 fn create_device_on(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-    let try_flags = |flags: D3D11_CREATE_DEVICE_FLAG| -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        unsafe {
-            D3D11CreateDevice(
-                adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                flags,
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        }
-        .context("D3D11CreateDevice on duplication adapter")?;
-        Ok((
-            device.context("duplication device was null")?,
-            context.context("duplication context was null")?,
-        ))
-    };
+    let try_flags =
+        |flags: D3D11_CREATE_DEVICE_FLAG| -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            unsafe {
+                D3D11CreateDevice(
+                    adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    flags,
+                    Some(&levels),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .context("D3D11CreateDevice on duplication adapter")?;
+            Ok((
+                device.context("duplication device was null")?,
+                context.context("duplication context was null")?,
+            ))
+        };
 
     let (device, context) = try_flags(
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -161,21 +162,30 @@ fn duplicate_with_retry(
             }
         }
     }
-    Err(anyhow!("DuplicateOutput failed after {attempts} attempts: {last:?}"))
+    Err(anyhow!(
+        "DuplicateOutput failed after {attempts} attempts: {last:?}"
+    ))
 }
 
 fn make_target(
     device: &ID3D11Device,
     w: u32,
     h: u32,
-) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView, ID3D11RenderTargetView)> {
+) -> Result<(
+    ID3D11Texture2D,
+    ID3D11ShaderResourceView,
+    ID3D11RenderTargetView,
+)> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: w,
         Height: h,
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
         CPUAccessFlags: 0,
@@ -223,8 +233,10 @@ impl Duplicator {
             let dup = duplicate_with_retry(&output, &device, 5)?;
             let dd: DXGI_OUTDUPL_DESC = unsafe { dup.GetDesc() };
             let (w, h) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
-            let rotated =
-                matches!(dd.Rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270);
+            let rotated = matches!(
+                dd.Rotation,
+                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
+            );
             if rotated && (h, w) == (logical_w, logical_h) {
                 break (dup, w, h, dd.Rotation, dd.Rotation);
             }
@@ -318,7 +330,10 @@ impl Duplicator {
             Err(e) => {
                 self.redup_failures += 1;
                 if self.redup_failures > REDUP_MAX_RETRIES {
-                    bail!("re-duplication failed {} times, giving up: {e:?}", self.redup_failures);
+                    bail!(
+                        "re-duplication failed {} times, giving up: {e:?}",
+                        self.redup_failures
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 Ok(())
@@ -348,8 +363,9 @@ impl Duplicator {
 
         if info.LastPresentTime != 0 {
             if let Some(res) = &resource {
-                let tex: ID3D11Texture2D =
-                    res.cast().context("duplication resource as ID3D11Texture2D")?;
+                let tex: ID3D11Texture2D = res
+                    .cast()
+                    .context("duplication resource as ID3D11Texture2D")?;
                 unsafe { self.context.CopyResource(&self.desktop, &tex) };
                 self.have_desktop = true;
                 dirty = true;
@@ -357,7 +373,8 @@ impl Duplicator {
         }
 
         if info.PointerShapeBufferSize > 0 {
-            self.shape_buf.resize(info.PointerShapeBufferSize as usize, 0);
+            self.shape_buf
+                .resize(info.PointerShapeBufferSize as usize, 0);
             let mut required = 0u32;
             let mut shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
             let got = unsafe {
@@ -399,13 +416,19 @@ impl Duplicator {
 
         let _ = unsafe { dup.ReleaseFrame() };
 
-        Ok(if dirty && self.have_desktop { PollStatus::Dirty } else { PollStatus::Timeout })
+        Ok(if dirty && self.have_desktop {
+            PollStatus::Dirty
+        } else {
+            PollStatus::Timeout
+        })
     }
 
     fn refresh_cursor_state(&mut self) {
-        use windows::Win32::UI::WindowsAndMessaging::{CURSORINFO, CURSOR_SHOWING, GetCursorInfo};
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
-        let Some(sprite) = self.sprite.as_ref() else { return };
+        let Some(sprite) = self.sprite.as_ref() else {
+            return;
+        };
         let mut ci = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
@@ -437,7 +460,9 @@ impl Duplicator {
         self.refresh_cursor_state();
         let identity = !matches!(
             self.rotation,
-            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE180 | DXGI_MODE_ROTATION_ROTATE270
+            DXGI_MODE_ROTATION_ROTATE90
+                | DXGI_MODE_ROTATION_ROTATE180
+                | DXGI_MODE_ROTATION_ROTATE270
         );
         let cursor_on = self.cursor_visible && self.sprite.is_some();
 
@@ -469,8 +494,14 @@ impl Duplicator {
                 self.height,
             );
             for (srv, blend) in &sprite.passes {
-                self.renderer
-                    .draw(&self.composite_rtv, srv, *blend, &verts, self.width, self.height)?;
+                self.renderer.draw(
+                    &self.composite_rtv,
+                    srv,
+                    *blend,
+                    &verts,
+                    self.width,
+                    self.height,
+                )?;
             }
         }
 
@@ -489,7 +520,10 @@ pub fn probe_to_bmp(requested_monitor: u32, path: &str) -> Result<()> {
         .map_err(|e| anyhow!("monitor device name: {e}"))?;
     tprintln!(
         "dxgi probe: monitor[{}] '{}' ({device_name}) {}x{}",
-        info.index, info.name, info.width, info.height
+        info.index,
+        info.name,
+        info.width,
+        info.height
     );
 
     let mut dup = Duplicator::new(&device_name, info.width, info.height)?;
@@ -532,7 +566,8 @@ pub fn probe_to_bmp(requested_monitor: u32, path: &str) -> Result<()> {
     tprintln!(
         "dxgi probe: wrote {}x{} (updates={frames}, cursor_drawn={cursor_drawn}, \
          cursor_pos={cx},{cy}, cursor_size={cw}x{ch}) -> {path}",
-        info.width, info.height
+        info.width,
+        info.height
     );
     Ok(())
 }

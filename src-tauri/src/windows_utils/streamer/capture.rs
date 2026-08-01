@@ -1,9 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context as _, Result, anyhow, bail};
-use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
 use crate::windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use crate::windows_capture::encoder::ImageFormat;
 use crate::windows_capture::frame::Frame;
@@ -13,9 +9,15 @@ use crate::windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use anyhow::{anyhow, bail, Context as _, Result};
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 
 pub fn set_dpi_awareness() {
-    if let Err(e) = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
         teprintln!("SetProcessDpiAwarenessContext failed (likely already set): {e}");
     }
 }
@@ -34,9 +36,7 @@ pub fn check_dwm_composition() -> Result<()> {
     use windows::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
     match unsafe { DwmIsCompositionEnabled() } {
         Ok(enabled) if enabled.as_bool() => Ok(()),
-        Ok(_) => bail!(
-            "DWM composition disabled, install Desktop Experience on Server"
-        ),
+        Ok(_) => bail!("DWM composition disabled, install Desktop Experience on Server"),
         Err(_) => {
             teprintln!("DwmIsCompositionEnabled failed (non-fatal)");
             Ok(())
@@ -71,7 +71,9 @@ pub fn select_monitor(requested: u32) -> Result<(Monitor, MonitorInfo)> {
     let info = MonitorInfo {
         index,
         name: monitor.name().unwrap_or_else(|_| "<unknown>".into()),
-        gpu: monitor.device_string().unwrap_or_else(|_| "<unknown gpu>".into()),
+        gpu: monitor
+            .device_string()
+            .unwrap_or_else(|_| "<unknown gpu>".into()),
         width: monitor.width().context("monitor width")?,
         height: monitor.height().context("monitor height")?,
         refresh_hz: monitor.refresh_rate().unwrap_or(0),
@@ -99,18 +101,23 @@ pub fn monitor_dimensions(device_name: &str) -> Option<(u32, u32)> {
 
 pub fn monitor_rect(device_name: &str) -> Option<(i32, i32, u32, u32)> {
     use std::mem;
+    use windows::core::BOOL;
     use windows::Win32::Foundation::{LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
-    use windows::core::BOOL;
 
     struct Ctx {
         want: Vec<u16>,
         found: Option<(i32, i32, u32, u32)>,
     }
 
-    unsafe extern "system" fn cb(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, lparam: LPARAM) -> BOOL {
+    unsafe extern "system" fn cb(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
         let ctx = &mut *(lparam.0 as *mut Ctx);
         let mut mi = MONITORINFOEXW {
             monitorInfo: MONITORINFO {
@@ -145,7 +152,12 @@ pub fn monitor_rect(device_name: &str) -> Option<(i32, i32, u32, u32)> {
     ctx.found
 }
 
-pub fn set_display_resolution(device_name: &str, width: u32, height: u32, refresh: u32) -> Result<()> {
+pub fn set_display_resolution(
+    device_name: &str,
+    width: u32,
+    height: u32,
+    refresh: u32,
+) -> Result<()> {
     set_display_mode(device_name, width, height, refresh, false)
 }
 
@@ -156,14 +168,17 @@ pub fn set_display_mode(
     refresh: u32,
     portrait: bool,
 ) -> Result<()> {
-    use windows::Win32::Graphics::Gdi::{
-        CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
-        DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH, DMDO_DEFAULT,
-        ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
-    };
     use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY, DEVMODEW,
+        DISP_CHANGE_SUCCESSFUL, DMDO_DEFAULT, DM_DISPLAYFREQUENCY, DM_DISPLAYORIENTATION,
+        DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    };
 
-    let wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let name = PCWSTR(wide.as_ptr());
 
     let mut devmode = DEVMODEW {
@@ -173,14 +188,17 @@ pub fn set_display_mode(
     unsafe {
         let _ = EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &mut devmode);
     }
-    let (pels_w, pels_h) = if portrait { (height, width) } else { (width, height) };
+    let (pels_w, pels_h) = if portrait {
+        (height, width)
+    } else {
+        (width, height)
+    };
     devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
     devmode.dmPelsWidth = pels_w;
     devmode.dmPelsHeight = pels_h;
     devmode.dmDisplayFrequency = refresh;
     devmode.Anonymous1.Anonymous2.dmDisplayOrientation = DMDO_DEFAULT;
-    devmode.dmFields |=
-        DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
+    devmode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
 
     let result =
         unsafe { ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None) };
@@ -192,14 +210,17 @@ pub fn set_display_mode(
 }
 
 pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> {
-    use windows::Win32::Graphics::Gdi::{
-        CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
-        DM_DISPLAYORIENTATION, DM_PELSHEIGHT, DM_PELSWIDTH, DMDO_90, DMDO_DEFAULT,
-        ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
-    };
     use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY, DEVMODEW,
+        DISP_CHANGE_SUCCESSFUL, DMDO_90, DMDO_DEFAULT, DM_DISPLAYORIENTATION, DM_PELSHEIGHT,
+        DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+    };
 
-    let wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let name = PCWSTR(wide.as_ptr());
 
     let mut devmode = DEVMODEW {
@@ -219,7 +240,8 @@ pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> 
     }
 
     devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-    devmode.Anonymous1.Anonymous2.dmDisplayOrientation = if portrait { DMDO_90 } else { DMDO_DEFAULT };
+    devmode.Anonymous1.Anonymous2.dmDisplayOrientation =
+        if portrait { DMDO_90 } else { DMDO_DEFAULT };
     let w = devmode.dmPelsWidth;
     let h = devmode.dmPelsHeight;
     devmode.dmPelsWidth = h;
@@ -252,16 +274,13 @@ struct DisplayConfigSetDpi {
 const DISPLAYCONFIG_DEVICE_INFO_GET_DPI: i32 = -3;
 const DISPLAYCONFIG_DEVICE_INFO_SET_DPI: i32 = -4;
 
-const DPI_PERCENT_VALUES: [u32; 12] =
-    [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+const DPI_PERCENT_VALUES: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
-fn source_path_for_device(
-    device_name: &str,
-) -> Result<(windows::Win32::Foundation::LUID, u32)> {
+fn source_path_for_device(device_name: &str) -> Result<(windows::Win32::Foundation::LUID, u32)> {
     use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
-        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
-        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
     };
 
     let mut path_count = 0u32;
@@ -311,8 +330,8 @@ fn source_path_for_device(
 
 pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_TYPE,
-        DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
+        DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        DISPLAYCONFIG_DEVICE_INFO_TYPE,
     };
 
     let (adapter_id, source_id) = source_path_for_device(device_name)?;
@@ -351,8 +370,8 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
         },
         scale_rel: desired_rel,
     };
-    let header_ptr = (&set as *const DisplayConfigSetDpi)
-        .cast::<DISPLAYCONFIG_DEVICE_INFO_HEADER>();
+    let header_ptr =
+        (&set as *const DisplayConfigSetDpi).cast::<DISPLAYCONFIG_DEVICE_INFO_HEADER>();
     if unsafe { DisplayConfigSetDeviceInfo(header_ptr) } != 0 {
         bail!("DisplayConfigSetDeviceInfo(SET_DPI) failed for {device_name}");
     }
@@ -366,7 +385,9 @@ pub fn select_monitor_by_device_name(device_name: &str) -> Result<(Monitor, Moni
             let info = MonitorInfo {
                 index: i as u32,
                 name: monitor.name().unwrap_or_else(|_| "<unknown>".into()),
-                gpu: monitor.device_string().unwrap_or_else(|_| "<unknown gpu>".into()),
+                gpu: monitor
+                    .device_string()
+                    .unwrap_or_else(|_| "<unknown gpu>".into()),
                 width: monitor.width().context("monitor width")?,
                 height: monitor.height().context("monitor height")?,
                 refresh_hz: monitor.refresh_rate().unwrap_or(0),
@@ -402,7 +423,10 @@ impl GraphicsCaptureApiHandler for ProbeHandler {
     ) -> Result<(), Self::Error> {
         let (w, h) = (frame.width(), frame.height());
         frame.save_as_image(&self.path, ImageFormat::Png)?;
-        *self.result.lock().unwrap() = Some(ProbeResult { width: w, height: h });
+        *self.result.lock().unwrap() = Some(ProbeResult {
+            width: w,
+            height: h,
+        });
         capture_control.stop();
         Ok(())
     }
@@ -412,7 +436,12 @@ pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
     let (monitor, info) = select_monitor(requested_monitor)?;
     tprintln!(
         "capturing display[{}] '{}' ({}) {}x{} -> {}",
-        info.index, info.name, info.gpu, info.width, info.height, path
+        info.index,
+        info.name,
+        info.gpu,
+        info.width,
+        info.height,
+        path
     );
 
     let result = Arc::new(Mutex::new(None));

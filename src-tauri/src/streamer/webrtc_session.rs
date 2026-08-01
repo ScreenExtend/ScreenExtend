@@ -1,30 +1,30 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
-use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::PayloadType;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
+use webrtc::rtp_transceiver::PayloadType;
 use webrtc::rtp_transceiver::RTCPFeedback;
-use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
 
 pub use webrtc::ice_transport::ice_server::RTCIceServer;
 
-use super::bitrate::{BitrateController, DEFAULT_MIN_BITRATE_BPS, estimate_from_loss};
+use super::bitrate::{estimate_from_loss, BitrateController, DEFAULT_MIN_BITRATE_BPS};
 use super::config::H264Profile;
 use super::input;
 use super::pipeline::Pipeline;
@@ -47,11 +47,26 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 
     let video_feedback = vec![
-        RTCPFeedback { typ: "goog-remb".to_owned(), parameter: "".to_owned() },
-        RTCPFeedback { typ: "ccm".to_owned(), parameter: "fir".to_owned() },
-        RTCPFeedback { typ: "nack".to_owned(), parameter: "".to_owned() },
-        RTCPFeedback { typ: "nack".to_owned(), parameter: "pli".to_owned() },
-        RTCPFeedback { typ: "transport-cc".to_owned(), parameter: "".to_owned() },
+        RTCPFeedback {
+            typ: "goog-remb".to_owned(),
+            parameter: "".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "ccm".to_owned(),
+            parameter: "fir".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "pli".to_owned(),
+        },
+        RTCPFeedback {
+            typ: "transport-cc".to_owned(),
+            parameter: "".to_owned(),
+        },
     ];
 
     for (pt, rtx_pt, plid) in h264_codecs(profile) {
@@ -145,8 +160,16 @@ async fn detect_session_locality(
     let Some((lid, rid)) = nominated else {
         return SessionLocality::Unknown;
     };
-    let lt = cand_type.get(&lid).cloned().unwrap_or_default().to_lowercase();
-    let rt = cand_type.get(&rid).cloned().unwrap_or_default().to_lowercase();
+    let lt = cand_type
+        .get(&lid)
+        .cloned()
+        .unwrap_or_default()
+        .to_lowercase();
+    let rt = cand_type
+        .get(&rid)
+        .cloned()
+        .unwrap_or_default()
+        .to_lowercase();
     tprintln!("selected ICE candidate pair (local={lt}, remote={rt})");
 
     if lt.contains("relay") || rt.contains("relay") {
@@ -224,7 +247,10 @@ async fn log_ice_diagnostics(pc: &webrtc::peer_connection::RTCPeerConnection) {
         if let StatsReportType::CandidatePair(p) = stat {
             pair_count += 1;
             let local = cand.get(&p.local_candidate_id).cloned().unwrap_or_default();
-            let remote = cand.get(&p.remote_candidate_id).cloned().unwrap_or_default();
+            let remote = cand
+                .get(&p.remote_candidate_id)
+                .cloned()
+                .unwrap_or_default();
             teprintln!(
                 "  ICE pair [{:?}] nominated={} reqSent={} respRecv={} local=({local}) remote=({remote})",
                 p.state, p.nominated, p.requests_sent, p.responses_received

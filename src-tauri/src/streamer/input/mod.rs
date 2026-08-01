@@ -1,6 +1,6 @@
-use crossbeam_channel::{Sender, bounded, select, unbounded};
-use std::sync::Arc;
+use crossbeam_channel::{bounded, select, unbounded, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 pub mod protocol;
@@ -58,8 +58,12 @@ impl InjectorTx {
     pub fn route(&self, ev: InputEvent, hot: bool) {
         if hot {
             match self.fast.try_send(ev) {
-                Ok(()) => { self.stats.fast_received.fetch_add(1, Ordering::Relaxed); }
-                Err(_) => { self.stats.fast_dropped.fetch_add(1, Ordering::Relaxed); }
+                Ok(()) => {
+                    self.stats.fast_received.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.stats.fast_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         } else {
             let _ = self.reliable.send(ev);
@@ -73,7 +77,9 @@ impl InjectorTx {
 
     pub fn release_all(&self) {
         use self::protocol::Lifecycle;
-        let _ = self.reliable.send(InputEvent::Lifecycle(Lifecycle::Focus(false)));
+        let _ = self
+            .reliable
+            .send(InputEvent::Lifecycle(Lifecycle::Focus(false)));
     }
 }
 
@@ -105,5 +111,12 @@ pub fn spawn(device_name: Option<String>) -> (InjectorTx, JoinHandle<()>) {
         })
         .expect("spawn injector thread");
 
-    (InjectorTx { fast: fast_tx, reliable: rel_tx, stats }, join)
+    (
+        InjectorTx {
+            fast: fast_tx,
+            reliable: rel_tx,
+            stats,
+        },
+        join,
+    )
 }

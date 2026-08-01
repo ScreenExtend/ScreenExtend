@@ -58,17 +58,17 @@
 //! All retained objc2 objects (stream, delegate, content, queue) are held in
 //! [`SckBackend`] for the session, mirroring how `cgds` keeps its stream/queue.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{c_void, CStr};
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQoS, DispatchQueue, DispatchRetained, GlobalQueueIdentifier};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Bool, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{msg_send, sel};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString};
 use objc2_core_media::CMSampleBuffer;
@@ -642,9 +642,8 @@ fn frame_is_complete_and_dirty(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool
     let Some(status_key) = ctx.status_key else {
         return false;
     };
-    let status_val = unsafe {
-        CFDictionaryGetValue(dict, status_key as *const CFString as *const c_void)
-    };
+    let status_val =
+        unsafe { CFDictionaryGetValue(dict, status_key as *const CFString as *const c_void) };
     if status_val.is_null() {
         return false;
     }
@@ -683,8 +682,7 @@ fn frame_is_complete_and_dirty(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool
 fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
     // SAFETY: returns the sample's backing CVImageBuffer (+1 retained by the
     // binding). NULL if the sample carries no image buffer.
-    let Some(image_buffer): Option<CFRetained<CVImageBuffer>> =
-        (unsafe { sample.image_buffer() })
+    let Some(image_buffer): Option<CFRetained<CVImageBuffer>> = (unsafe { sample.image_buffer() })
     else {
         return;
     };
@@ -719,7 +717,10 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
             height: ctx.height,
             arrived_mach: mach_now(),
             captured_at: Instant::now(),
-            backing: Backing::PixelBuffer { pixbuf, _surface: surface },
+            backing: Backing::PixelBuffer {
+                pixbuf,
+                _surface: surface,
+            },
         });
     }
 }
@@ -745,10 +746,7 @@ fn nserror_description(error: *mut AnyObject) -> String {
 // in the exact shape we need here, so we declare them.
 // ---------------------------------------------------------------------------
 unsafe extern "C-unwind" {
-    fn CFDictionaryGetValue(
-        the_dict: *const CFDictionary,
-        key: *const c_void,
-    ) -> *const c_void;
+    fn CFDictionaryGetValue(the_dict: *const CFDictionary, key: *const c_void) -> *const c_void;
     /// Returns a CF `Boolean` (`unsigned char`): non-zero iff the value was read.
     fn CFNumberGetValue(number: *const CFNumber, the_type: isize, value_ptr: *mut c_void) -> u8;
 }
@@ -763,7 +761,10 @@ mod tests {
     #[test]
     fn delegate_class_registers() {
         let cls = delegate_class();
-        assert!(cls.instance_variable(CTX_IVAR_NAME).is_some(), "ctx ivar present");
+        assert!(
+            cls.instance_variable(CTX_IVAR_NAME).is_some(),
+            "ctx ivar present"
+        );
         assert!(
             cls.responds_to(sel!(stream:didOutputSampleBuffer:ofType:)),
             "hot-path selector present"

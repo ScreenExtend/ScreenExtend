@@ -1,20 +1,19 @@
 use anyhow::{Context as _, Result};
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
+    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
-use windows::core::Interface;
 
 pub struct Scaler {
     video_device: ID3D11VideoDevice,
@@ -43,12 +42,17 @@ impl Scaler {
         dst_w: u32,
         dst_h: u32,
     ) -> Result<Self> {
-        let video_device: ID3D11VideoDevice =
-            device.cast().context("capture device as ID3D11VideoDevice")?;
-        let video_ctx: ID3D11VideoContext =
-            context.cast().context("capture context as ID3D11VideoContext")?;
+        let video_device: ID3D11VideoDevice = device
+            .cast()
+            .context("capture device as ID3D11VideoDevice")?;
+        let video_ctx: ID3D11VideoContext = context
+            .cast()
+            .context("capture context as ID3D11VideoContext")?;
 
-        let rate = DXGI_RATIONAL { Numerator: 60, Denominator: 1 };
+        let rate = DXGI_RATIONAL {
+            Numerator: 60,
+            Denominator: 1,
+        };
         let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: rate,
@@ -71,7 +75,10 @@ impl Scaler {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -156,10 +163,7 @@ impl Scaler {
         Ok(in_view)
     }
 
-    fn output_view_for(
-        &mut self,
-        dst: &ID3D11Texture2D,
-    ) -> Result<ID3D11VideoProcessorOutputView> {
+    fn output_view_for(&mut self, dst: &ID3D11Texture2D) -> Result<ID3D11VideoProcessorOutputView> {
         let key = dst.as_raw();
         if let Some((cached_key, view)) = &self.cached_out_view {
             if *cached_key == key {
@@ -195,8 +199,12 @@ impl Scaler {
         stream.pInputSurface = core::mem::ManuallyDrop::new(Some(in_view));
 
         let result = unsafe {
-            self.video_ctx
-                .VideoProcessorBlt(&self.processor, out_view, 0, std::slice::from_ref(&stream))
+            self.video_ctx.VideoProcessorBlt(
+                &self.processor,
+                out_view,
+                0,
+                std::slice::from_ref(&stream),
+            )
         };
         unsafe {
             core::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
@@ -212,7 +220,10 @@ impl Scaler {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -269,7 +280,10 @@ impl TextureReader {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
             CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,

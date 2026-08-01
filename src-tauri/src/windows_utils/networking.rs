@@ -73,7 +73,8 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         Err(_) => return Vec::new(),
     };
 
-    let ip_addresses: Vec<NetIPAddress> = match wmi_con.raw_query("SELECT * FROM MSFT_NetIPAddress") {
+    let ip_addresses: Vec<NetIPAddress> = match wmi_con.raw_query("SELECT * FROM MSFT_NetIPAddress")
+    {
         Ok(query) => query,
         Err(_) => return Vec::new(),
     };

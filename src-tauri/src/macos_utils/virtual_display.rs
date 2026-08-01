@@ -172,10 +172,22 @@ unsafe fn create_cg_virtual_display(
     desc.setQueue(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
     desc.setName(&NSString::from_str(name));
 
-    desc.setWhitePoint(CGPoint { x: 0.3125, y: 0.3291 });
-    desc.setBluePrimary(CGPoint { x: 0.1494, y: 0.0557 });
-    desc.setGreenPrimary(CGPoint { x: 0.2559, y: 0.6983 });
-    desc.setRedPrimary(CGPoint { x: 0.6797, y: 0.3203 });
+    desc.setWhitePoint(CGPoint {
+        x: 0.3125,
+        y: 0.3291,
+    });
+    desc.setBluePrimary(CGPoint {
+        x: 0.1494,
+        y: 0.0557,
+    });
+    desc.setGreenPrimary(CGPoint {
+        x: 0.2559,
+        y: 0.6983,
+    });
+    desc.setRedPrimary(CGPoint {
+        x: 0.6797,
+        y: 0.3203,
+    });
 
     desc.setMaxPixelsWide(width);
     desc.setMaxPixelsHigh(height);

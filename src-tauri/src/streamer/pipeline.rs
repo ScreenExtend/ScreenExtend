@@ -1,7 +1,7 @@
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use crate::windows_utils::streamer::pipeline::{
-    EncodedFrame, Pipeline, SessionCapture, probe_bitrate, probe_live, start, start_on_monitor,
+    probe_bitrate, probe_live, start, start_on_monitor, EncodedFrame, Pipeline, SessionCapture,
 };
 
 #[cfg(target_os = "windows")]
@@ -18,12 +18,13 @@ pub use crate::windows_utils::set_display_topology_extend;
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
 pub use crate::macos_utils::streamer::pipeline::{
-    EncodedFrame, Pipeline, SessionCapture, probe_bitrate, probe_live, start, start_on_monitor,
+    probe_bitrate, probe_live, start, start_on_monitor, EncodedFrame, Pipeline, SessionCapture,
 };
 
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
 pub use crate::macos_utils::streamer::pipeline::{
     monitor_device_names, monitor_dimensions, monitor_rect, set_display_mode,
-    set_display_orientation, set_display_resolution, set_display_scale, set_display_topology_extend,
+    set_display_orientation, set_display_resolution, set_display_scale,
+    set_display_topology_extend,
 };

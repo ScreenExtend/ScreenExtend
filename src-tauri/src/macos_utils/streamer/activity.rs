@@ -11,8 +11,7 @@ unsafe impl Send for LatencyActivity {}
 pub fn begin_latency_critical_activity() -> LatencyActivity {
     let pi = NSProcessInfo::processInfo();
     let reason = NSString::from_str("ScreenExtend desktop capture/encode");
-    let token = unsafe {
-        pi.beginActivityWithOptions_reason(NSActivityOptions::UserInteractive, &reason)
-    };
+    let token =
+        unsafe { pi.beginActivityWithOptions_reason(NSActivityOptions::UserInteractive, &reason) };
     LatencyActivity { _token: token }
 }

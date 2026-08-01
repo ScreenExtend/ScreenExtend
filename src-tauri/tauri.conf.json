@@ -41,7 +41,8 @@
     ],
     "macOS": {
       "entitlements": "./Entitlements.plist"
-    }
+    },
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "cli": {
@@ -66,6 +67,15 @@
         "removedrivers": {
           "args": []
         }
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkwRERFOTc1RTNCREU5NDYKUldSRzZiM2pkZW5ka1Bpc2dMSjNVV2FNUU5VRUE0aWZGNzloYTJlWXoyYWsvSC80UVNyYTU5WmYK",
+      "endpoints": [
+        "https://github.com/ScreenExtend/ScreenExtend/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

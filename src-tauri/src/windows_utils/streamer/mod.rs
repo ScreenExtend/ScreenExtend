@@ -35,8 +35,8 @@ pub fn select_vendor(adapter_description: &str) -> Vendor {
 
 #[cfg(target_os = "windows")]
 pub fn device_vendor(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) -> Vendor {
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
     let describe = || -> Option<String> {
         let dxgi: IDXGIDevice = device.cast().ok()?;

@@ -46,7 +46,9 @@ pub const MIN_DISCONNECT_GRACE_SECS: u64 = 0;
 pub const MAX_DISCONNECT_GRACE_SECS: u64 = 600;
 
 pub fn new_shared_disconnect_grace() -> SharedDisconnectGrace {
-    Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_DISCONNECT_GRACE_SECS))
+    Arc::new(std::sync::atomic::AtomicU64::new(
+        DEFAULT_DISCONNECT_GRACE_SECS,
+    ))
 }
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
@@ -107,7 +109,13 @@ pub struct LiveDisplay {
 
 impl LiveDisplay {
     pub fn display_params(&self) -> (u32, u32, u32, u32, bool) {
-        (self.width, self.height, self.refresh, self.scale, self.portrait)
+        (
+            self.width,
+            self.height,
+            self.refresh,
+            self.scale,
+            self.portrait,
+        )
     }
 }
 
@@ -131,7 +139,10 @@ impl std::fmt::Debug for DeviceSessionState {
             .field("session_seq", &self.session_seq)
             .field("live_display", &self.live_display)
             .field("leave_armed", &self.leave.is_some())
-            .field("active_capture_seq", &self.active_capture.as_ref().map(|(s, _)| *s))
+            .field(
+                "active_capture_seq",
+                &self.active_capture.as_ref().map(|(s, _)| *s),
+            )
             .finish()
     }
 }
@@ -140,12 +151,21 @@ pub type SharedSessions = Arc<Mutex<HashMap<String, DeviceSessionState>>>;
 
 pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
     let signal = Arc::new(LeaveSignal::default());
-    sessions.lock().unwrap().entry(ip.to_string()).or_default().leave = Some(signal.clone());
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .leave = Some(signal.clone());
     signal
 }
 
 pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
-    let signal = sessions.lock().unwrap().get(ip).and_then(|s| s.leave.clone());
+    let signal = sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .and_then(|s| s.leave.clone());
     if let Some(s) = signal {
         s.left.store(true, Ordering::SeqCst);
         s.notify.notify_waiters();
@@ -153,15 +173,28 @@ pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
 }
 
 pub fn get_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
-    sessions.lock().unwrap().get(ip).and_then(|s| s.live_display.clone())
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .and_then(|s| s.live_display.clone())
 }
 
 pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDisplay) {
-    sessions.lock().unwrap().entry(ip.to_string()).or_default().live_display = Some(display);
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .live_display = Some(display);
 }
 
 pub fn take_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
-    sessions.lock().unwrap().get_mut(ip).and_then(|s| s.live_display.take())
+    sessions
+        .lock()
+        .unwrap()
+        .get_mut(ip)
+        .and_then(|s| s.live_display.take())
 }
 
 pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
@@ -170,7 +203,12 @@ pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
 }
 
 pub fn reconfig_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
-    sessions.lock().unwrap().get(ip).map(|s| s.reconfig_epoch).unwrap_or(0)
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .map(|s| s.reconfig_epoch)
+        .unwrap_or(0)
 }
 
 pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
@@ -179,11 +217,21 @@ pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
 }
 
 pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
-    sessions.lock().unwrap().get(ip).map(|s| s.kick_epoch).unwrap_or(0)
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .map(|s| s.kick_epoch)
+        .unwrap_or(0)
 }
 
 pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: CaptureStopper) {
-    sessions.lock().unwrap().entry(ip.to_string()).or_default().active_capture = Some((seq, stop));
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .active_capture = Some((seq, stop));
 }
 
 pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<CaptureStopper> {
@@ -195,7 +243,11 @@ pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<Captur
         .map(|(_, stop)| stop)
 }
 
-pub fn take_active_capture_if(sessions: &SharedSessions, ip: &str, seq: u64) -> Option<CaptureStopper> {
+pub fn take_active_capture_if(
+    sessions: &SharedSessions,
+    ip: &str,
+    seq: u64,
+) -> Option<CaptureStopper> {
     let mut map = sessions.lock().unwrap();
     let state = map.get_mut(ip)?;
     match &state.active_capture {
@@ -212,7 +264,12 @@ pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
 }
 
 pub fn is_current_session(sessions: &SharedSessions, ip: &str, seq: u64) -> bool {
-    sessions.lock().unwrap().get(ip).map(|s| s.session_seq == seq).unwrap_or(false)
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .map(|s| s.session_seq == seq)
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -301,7 +358,9 @@ impl OtpLimiter {
         entry.failures += 1;
         if entry.failures >= MAX_OTP_ATTEMPTS {
             entry.locked_until = Some(Instant::now() + OTP_LOCKOUT);
-            OtpOutcome::LockedOut { retry_after: OTP_LOCKOUT }
+            OtpOutcome::LockedOut {
+                retry_after: OTP_LOCKOUT,
+            }
         } else {
             OtpOutcome::Rejected {
                 remaining: MAX_OTP_ATTEMPTS - entry.failures,

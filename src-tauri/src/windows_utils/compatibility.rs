@@ -68,18 +68,21 @@ fn run_probes() -> Probes {
             Err(_) => return Probes::optimistic(),
         };
 
-        let wmi = WMIConnection::with_namespace_path(
-            "root\\StandardCimv2",
-            unsafe { COMLibrary::assume_initialized() },
-        )
+        let wmi = WMIConnection::with_namespace_path("root\\StandardCimv2", unsafe {
+            COMLibrary::assume_initialized()
+        })
         .is_ok();
 
         Probes {
             wgc: wgc_supported(),
             dxgi: dxgi_supported(),
             wifi_radios: type_present("Windows.Devices.Radios.Radio"),
-            wifi_direct: type_present("Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher"),
-            tethering: type_present("Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager"),
+            wifi_direct: type_present(
+                "Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher",
+            ),
+            tethering: type_present(
+                "Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager",
+            ),
             wmi,
         }
     })
@@ -124,7 +127,9 @@ pub fn check_system_requirements() -> CompatibilityReport {
     } else if !probes.wgc {
         unsupported.push(UnsupportedApi {
             name: "Windows Graphics Capture".to_string(),
-            description: "Preferred screen capture backend; falling back to DXGI Desktop Duplication.".to_string(),
+            description:
+                "Preferred screen capture backend; falling back to DXGI Desktop Duplication."
+                    .to_string(),
             required_version: "Windows 10 20H1 (build 19041)".to_string(),
             severity: "optional".to_string(),
         });

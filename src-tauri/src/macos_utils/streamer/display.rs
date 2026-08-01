@@ -1,6 +1,6 @@
 use objc2_core_graphics::{
-    CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGError, CGGetActiveDisplayList, CGMainDisplayID,
+    CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError,
+    CGGetActiveDisplayList, CGMainDisplayID,
 };
 
 use super::DisplayId;
@@ -10,13 +10,7 @@ const MAX_DISPLAYS: usize = 16;
 pub fn active_displays() -> Vec<DisplayId> {
     let mut ids = [0u32; MAX_DISPLAYS];
     let mut count: u32 = 0;
-    let err = unsafe {
-        CGGetActiveDisplayList(
-            MAX_DISPLAYS as u32,
-            ids.as_mut_ptr(),
-            &mut count,
-        )
-    };
+    let err = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS as u32, ids.as_mut_ptr(), &mut count) };
     if err != CGError::Success {
         teprintln!("[display] CGGetActiveDisplayList failed: CGError {}", err.0);
         return Vec::new();

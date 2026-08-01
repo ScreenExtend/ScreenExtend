@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVPixelBuffer;
 use objc2_io_surface::IOSurfaceRef;
@@ -47,8 +47,14 @@ pub struct FrameSource {
 
 pub fn frame_channel() -> (Arc<FrameSink>, FrameSource) {
     let (wake_tx, wake_rx) = bounded(1);
-    let sink = Arc::new(FrameSink { latest: ArcSwapOption::empty(), wake_tx });
-    let source = FrameSource { sink: sink.clone(), wake_rx };
+    let sink = Arc::new(FrameSink {
+        latest: ArcSwapOption::empty(),
+        wake_tx,
+    });
+    let source = FrameSource {
+        sink: sink.clone(),
+        wake_rx,
+    };
     (sink, source)
 }
 

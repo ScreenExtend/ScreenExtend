@@ -250,8 +250,12 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
         op::FOCUS_STATE => InputEvent::Lifecycle(Lifecycle::Focus(*b.get(1)? != 0)),
         op::VISIBILITY => InputEvent::Lifecycle(Lifecycle::Visibility(*b.get(1)? != 0)),
         op::POINTERLOCK_STATE => InputEvent::Lifecycle(Lifecycle::PointerLock(*b.get(1)? != 0)),
-        op::PING => InputEvent::Ping { t_ns: rd_u64(b, 1)? },
-        op::PONG => InputEvent::Pong { t_ns: rd_u64(b, 1)? },
+        op::PING => InputEvent::Ping {
+            t_ns: rd_u64(b, 1)?,
+        },
+        op::PONG => InputEvent::Pong {
+            t_ns: rd_u64(b, 1)?,
+        },
         _ => return None,
     };
     Some((ev, is_fast(opcode)))
@@ -301,11 +305,18 @@ fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
         });
         o += SAMPLE_SIZE;
     }
-    Some(InputEvent::PointerBatch { source, id, buttons, samples })
+    Some(InputEvent::PointerBatch {
+        source,
+        id,
+        buttons,
+        samples,
+    })
 }
 
 fn parse_zoom(b: &[u8]) -> Option<InputEvent> {
-    Some(InputEvent::Zoom { delta: rd_f32(b, 1)? })
+    Some(InputEvent::Zoom {
+        delta: rd_f32(b, 1)?,
+    })
 }
 
 fn parse_wheel(b: &[u8]) -> Option<InputEvent> {
@@ -366,7 +377,9 @@ fn parse_clipboard(b: &[u8]) -> Option<InputEvent> {
     let mime_len = rd_u32(b, 2)? as usize;
     let mime_start = 6;
     let mime_end = mime_start + mime_len;
-    let mime = std::str::from_utf8(b.get(mime_start..mime_end)?).ok()?.to_string();
+    let mime = std::str::from_utf8(b.get(mime_start..mime_end)?)
+        .ok()?
+        .to_string();
     let data_len = rd_u32(b, mime_end)? as usize;
     let data_start = mime_end + 4;
     let data = b.get(data_start..data_start + data_len)?.to_vec();
@@ -393,11 +406,15 @@ fn parse_drop(b: &[u8]) -> Option<InputEvent> {
     for _ in 0..count {
         let name_len = rd_u16(b, pos)? as usize;
         pos += 2;
-        let name = std::str::from_utf8(b.get(pos..pos + name_len)?).ok()?.to_string();
+        let name = std::str::from_utf8(b.get(pos..pos + name_len)?)
+            .ok()?
+            .to_string();
         pos += name_len;
         let mime_len = rd_u32(b, pos)? as usize;
         pos += 4;
-        let mime = std::str::from_utf8(b.get(pos..pos + mime_len)?).ok()?.to_string();
+        let mime = std::str::from_utf8(b.get(pos..pos + mime_len)?)
+            .ok()?
+            .to_string();
         pos += mime_len;
         let size = rd_u64(b, pos)?;
         pos += 8;
@@ -405,7 +422,12 @@ fn parse_drop(b: &[u8]) -> Option<InputEvent> {
         pos += 8;
         let data = b.get(pos..pos + data_len)?.to_vec();
         pos += data_len;
-        items.push(DropItem { name, mime, size, data });
+        items.push(DropItem {
+            name,
+            mime,
+            size,
+            data,
+        });
     }
     Some(InputEvent::Drop { x, y, items })
 }
@@ -455,7 +477,16 @@ mod tests {
         let (ev, hot) = parse(&b).unwrap();
         assert!(hot);
         match ev {
-            InputEvent::Pointer { source, id, x, y, pressure, buttons, phase, .. } => {
+            InputEvent::Pointer {
+                source,
+                id,
+                x,
+                y,
+                pressure,
+                buttons,
+                phase,
+                ..
+            } => {
                 assert_eq!(source, SRC_PEN);
                 assert_eq!(id, 7);
                 assert!((x - 0.5).abs() < 1e-6);
@@ -485,7 +516,12 @@ mod tests {
         let (ev, hot) = parse(&b).unwrap();
         assert!(hot);
         match ev {
-            InputEvent::PointerBatch { source, id, buttons, samples } => {
+            InputEvent::PointerBatch {
+                source,
+                id,
+                buttons,
+                samples,
+            } => {
                 assert_eq!(source, SRC_PEN);
                 assert_eq!(id, 3);
                 assert_eq!(buttons, btn::PRIMARY);
@@ -516,7 +552,9 @@ mod tests {
         let (ev, hot) = parse(&b).unwrap();
         assert!(!hot);
         match ev {
-            InputEvent::Key { down, code, key, .. } => {
+            InputEvent::Key {
+                down, code, key, ..
+            } => {
                 assert!(down);
                 assert_eq!(code, "KeyA");
                 assert_eq!(key, "a");
@@ -558,6 +596,9 @@ mod tests {
         }
         let pong = build_pong(123456789);
         assert_eq!(pong[0], op::PONG);
-        assert_eq!(u64::from_le_bytes(pong[1..9].try_into().unwrap()), 123456789);
+        assert_eq!(
+            u64::from_le_bytes(pong[1..9].try_into().unwrap()),
+            123456789
+        );
     }
 }

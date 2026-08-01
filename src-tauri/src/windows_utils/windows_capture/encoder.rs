@@ -1,21 +1,23 @@
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use windows::core::{Interface, HSTRING};
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
 use windows::Media::Core::{
-    AudioStreamDescriptor, MediaStreamSample, MediaStreamSource, MediaStreamSourceSampleRequestedEventArgs,
-    MediaStreamSourceStartingEventArgs, VideoStreamDescriptor,
+    AudioStreamDescriptor, MediaStreamSample, MediaStreamSource,
+    MediaStreamSourceSampleRequestedEventArgs, MediaStreamSourceStartingEventArgs,
+    VideoStreamDescriptor,
 };
 use windows::Media::MediaProperties::{
-    AudioEncodingProperties, ContainerEncodingProperties, MediaEncodingProfile, MediaEncodingSubtypes,
-    VideoEncodingProperties,
+    AudioEncodingProperties, ContainerEncodingProperties, MediaEncodingProfile,
+    MediaEncodingSubtypes, VideoEncodingProperties,
 };
 use windows::Media::Transcoding::MediaTranscoder;
 use windows::Security::Cryptography::CryptographicBuffer;
@@ -23,13 +25,12 @@ use windows::Storage::Streams::{DataReader, IRandomAccessStream, InMemoryRandomA
 use windows::Storage::{FileAccessMode, StorageFile};
 use windows::System::Threading::{ThreadPool, WorkItemHandler, WorkItemOptions, WorkItemPriority};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11Device, ID3D11RenderTargetView, ID3D11Texture2D,
+    ID3D11Device, ID3D11RenderTargetView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11SurfaceFromDXGISurface;
-use windows::core::{HSTRING, Interface};
 
 use super::d3d11::SendDirectX;
 use super::frame::Frame;
@@ -120,7 +121,10 @@ pub struct ImageEncoder {
 impl ImageEncoder {
     /// Constructs a new [`ImageEncoder`].
     #[inline]
-    pub fn new(format: ImageFormat, pixel_format: ImageEncoderPixelFormat) -> Result<Self, ImageEncoderError> {
+    pub fn new(
+        format: ImageFormat,
+        pixel_format: ImageEncoderPixelFormat,
+    ) -> Result<Self, ImageEncoderError> {
         let encoder = match format {
             ImageFormat::Jpeg => BitmapEncoder::JpegEncoderId()?,
             ImageFormat::Png => BitmapEncoder::PngEncoderId()?,
@@ -136,7 +140,10 @@ impl ImageEncoder {
             ImageEncoderPixelFormat::Rgb16F => BitmapPixelFormat::Rgba16,
         };
 
-        Ok(Self { pixel_format, encoder })
+        Ok(Self {
+            pixel_format,
+            encoder,
+        })
     }
 
     /// Encodes the provided pixel buffer into the configured output [`ImageFormat`].
@@ -152,7 +159,12 @@ impl ImageEncoder {
     /// - [`ImageEncoderError::WindowsError`] when Windows Imaging API calls fail
     /// - [`ImageEncoderError::IntConversionError`] on integer conversion failures
     #[inline]
-    pub fn encode(&self, image_buffer: &[u8], width: u32, height: u32) -> Result<Vec<u8>, ImageEncoderError> {
+    pub fn encode(
+        &self,
+        image_buffer: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, ImageEncoderError> {
         let stream = InMemoryRandomAccessStream::new()?;
 
         let encoder = BitmapEncoder::CreateAsync(self.encoder, &stream)?.join()?;
@@ -325,8 +337,12 @@ impl VideoSettingsBuilder {
         properties.SetHeight(self.height)?;
         properties.FrameRate()?.SetNumerator(self.frame_rate)?;
         properties.FrameRate()?.SetDenominator(1)?;
-        properties.PixelAspectRatio()?.SetNumerator(self.pixel_aspect_ratio.0)?;
-        properties.PixelAspectRatio()?.SetDenominator(self.pixel_aspect_ratio.1)?;
+        properties
+            .PixelAspectRatio()?
+            .SetNumerator(self.pixel_aspect_ratio.0)?;
+        properties
+            .PixelAspectRatio()?
+            .SetDenominator(self.pixel_aspect_ratio.1)?;
         Ok((properties, self.disabled))
     }
 }
@@ -418,7 +434,9 @@ impl ContainerSettingsBuilder {
     ///
     /// Default subtype: [`ContainerSettingsSubType::MPEG4`].
     pub const fn new() -> Self {
-        Self { sub_type: ContainerSettingsSubType::MPEG4 }
+        Self {
+            sub_type: ContainerSettingsSubType::MPEG4,
+        }
     }
     /// Sets the container subtype (e.g., [`ContainerSettingsSubType::MPEG4`]).
     pub const fn sub_type(mut self, sub_type: ContainerSettingsSubType) -> Self {
@@ -718,7 +736,10 @@ impl VideoEncoder {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT(format as i32),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -763,41 +784,89 @@ impl VideoEncoder {
         let token = media_stream_source.SampleRequested(&TypedEventHandler::<
             MediaStreamSource,
             MediaStreamSourceSampleRequestedEventArgs,
-        >::new(move |_, sample_requested| {
-            let sample_requested = sample_requested
-                .as_ref()
-                .expect("MediaStreamSource SampleRequested parameter was None. This should not happen.");
+        >::new(
+            move |_, sample_requested| {
+                let sample_requested = sample_requested.as_ref().expect(
+                    "MediaStreamSource SampleRequested parameter was None. This should not happen.",
+                );
 
-            let request = sample_requested.Request()?;
-            let is_audio = request.StreamDescriptor()?.cast::<AudioStreamDescriptor>().is_ok();
+                let request = sample_requested.Request()?;
+                let is_audio = request
+                    .StreamDescriptor()?
+                    .cast::<AudioStreamDescriptor>()
+                    .is_ok();
 
-            // Always offload blocking work to the thread pool; never block the MSS event
-            // thread.
-            let deferral = request.GetDeferral()?;
+                // Always offload blocking work to the thread pool; never block the MSS event
+                // thread.
+                let deferral = request.GetDeferral()?;
 
-            if is_audio {
-                if is_audio_disabled {
+                if is_audio {
+                    if is_audio_disabled {
+                        request.SetSample(None)?;
+                        deferral.Complete()?;
+                    } else {
+                        let request_clone = request;
+                        let audio_receiver = audio_receiver.clone();
+                        ThreadPool::RunWithPriorityAndOptionsAsync(
+                            &WorkItemHandler::new(move |_| {
+                                let value = audio_receiver.lock().recv();
+                                match value {
+                                    Ok(Some((source, timestamp))) => {
+                                        let sample = match source {
+                                            AudioEncoderSource::Buffer(bytes) => {
+                                                let buf = CryptographicBuffer::CreateFromByteArray(
+                                                    &bytes,
+                                                )?;
+                                                let sample = MediaStreamSample::CreateFromBuffer(
+                                                    &buf, timestamp,
+                                                )?;
+                                                // Duration = (frames / sample_rate) in 100ns ticks
+                                                // frames = bytes / block_align
+                                                let frames =
+                                                    (bytes.len() as u32) / audio_block_align;
+                                                let duration_ticks = (frames as i64)
+                                                    * 10_000_000i64
+                                                    / (audio_sample_rate as i64);
+                                                sample.SetDuration(TimeSpan {
+                                                    Duration: duration_ticks,
+                                                })?;
+                                                sample
+                                            }
+                                        };
+                                        request_clone.SetSample(&sample)?;
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        request_clone.SetSample(None)?;
+                                    }
+                                }
+                                deferral.Complete()?;
+                                Ok(())
+                            }),
+                            WorkItemPriority::Normal,
+                            WorkItemOptions::None,
+                        )?;
+                    }
+                } else if is_video_disabled {
                     request.SetSample(None)?;
                     deferral.Complete()?;
                 } else {
                     let request_clone = request;
-                    let audio_receiver = audio_receiver.clone();
+                    let frame_receiver = frame_receiver.clone();
                     ThreadPool::RunWithPriorityAndOptionsAsync(
                         &WorkItemHandler::new(move |_| {
-                            let value = audio_receiver.lock().recv();
+                            let value = frame_receiver.lock().recv();
                             match value {
                                 Ok(Some((source, timestamp))) => {
                                     let sample = match source {
-                                        AudioEncoderSource::Buffer(bytes) => {
-                                            let buf = CryptographicBuffer::CreateFromByteArray(&bytes)?;
-                                            let sample = MediaStreamSample::CreateFromBuffer(&buf, timestamp)?;
-                                            // Duration = (frames / sample_rate) in 100ns ticks
-                                            // frames = bytes / block_align
-                                            let frames = (bytes.len() as u32) / audio_block_align;
-                                            let duration_ticks =
-                                                (frames as i64) * 10_000_000i64 / (audio_sample_rate as i64);
-                                            sample.SetDuration(TimeSpan { Duration: duration_ticks })?;
-                                            sample
+                                        VideoEncoderSource::DirectX(surface) => {
+                                            MediaStreamSample::CreateFromDirect3D11Surface(
+                                                &surface.0, timestamp,
+                                            )?
+                                        }
+                                        VideoEncoderSource::Buffer(bytes) => {
+                                            let buf =
+                                                CryptographicBuffer::CreateFromByteArray(&bytes)?;
+                                            MediaStreamSample::CreateFromBuffer(&buf, timestamp)?
                                         }
                                     };
                                     request_clone.SetSample(&sample)?;
@@ -813,42 +882,10 @@ impl VideoEncoder {
                         WorkItemOptions::None,
                     )?;
                 }
-            } else if is_video_disabled {
-                request.SetSample(None)?;
-                deferral.Complete()?;
-            } else {
-                let request_clone = request;
-                let frame_receiver = frame_receiver.clone();
-                ThreadPool::RunWithPriorityAndOptionsAsync(
-                    &WorkItemHandler::new(move |_| {
-                        let value = frame_receiver.lock().recv();
-                        match value {
-                            Ok(Some((source, timestamp))) => {
-                                let sample = match source {
-                                    VideoEncoderSource::DirectX(surface) => {
-                                        MediaStreamSample::CreateFromDirect3D11Surface(&surface.0, timestamp)?
-                                    }
-                                    VideoEncoderSource::Buffer(bytes) => {
-                                        let buf = CryptographicBuffer::CreateFromByteArray(&bytes)?;
-                                        MediaStreamSample::CreateFromBuffer(&buf, timestamp)?
-                                    }
-                                };
-                                request_clone.SetSample(&sample)?;
-                            }
-                            Ok(None) | Err(_) => {
-                                request_clone.SetSample(None)?;
-                            }
-                        }
-                        deferral.Complete()?;
-                        Ok(())
-                    }),
-                    WorkItemPriority::Normal,
-                    WorkItemOptions::None,
-                )?;
-            }
 
-            Ok(())
-        }))?;
+                Ok(())
+            },
+        ))?;
         Ok(token)
     }
 
@@ -895,8 +932,10 @@ impl VideoEncoder {
         let audio_bps = audio_desc_props.BitsPerSample()?;
         let audio_block_align = (audio_bps / 8) * audio_ch;
 
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
+        let media_stream_source = MediaStreamSource::CreateFromDescriptors(
+            &video_stream_descriptor,
+            &audio_stream_descriptor,
+        )?;
         // Keep a modest buffer (30ms)
         media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
 
@@ -904,14 +943,19 @@ impl VideoEncoder {
             MediaStreamSource,
             MediaStreamSourceStartingEventArgs,
         >::new(move |_, stream_start| {
-            let stream_start =
-                stream_start.as_ref().expect("MediaStreamSource Starting parameter was None. This should not happen.");
-            stream_start.Request()?.SetActualStartPosition(TimeSpan { Duration: 0 })?;
+            let stream_start = stream_start
+                .as_ref()
+                .expect("MediaStreamSource Starting parameter was None. This should not happen.");
+            stream_start
+                .Request()?
+                .SetActualStartPosition(TimeSpan { Duration: 0 })?;
             Ok(())
         }))?;
 
-        let (frame_sender, frame_receiver_raw) = mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
-        let (audio_sender, audio_receiver_raw) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
+        let (frame_sender, frame_receiver_raw) =
+            mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
+        let (audio_sender, audio_receiver_raw) =
+            mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
 
         let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
         let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
@@ -1044,8 +1088,10 @@ impl VideoEncoder {
         let audio_bps = audio_desc_props.BitsPerSample()?;
         let audio_block_align = (audio_bps / 8) * audio_ch;
 
-        let media_stream_source =
-            MediaStreamSource::CreateFromDescriptors(&video_stream_descriptor, &audio_stream_descriptor)?;
+        let media_stream_source = MediaStreamSource::CreateFromDescriptors(
+            &video_stream_descriptor,
+            &audio_stream_descriptor,
+        )?;
         // CHANGED: use 30ms buffer (was 0)
         media_stream_source.SetBufferTime(Duration::from_millis(30).into())?;
 
@@ -1053,14 +1099,19 @@ impl VideoEncoder {
             MediaStreamSource,
             MediaStreamSourceStartingEventArgs,
         >::new(move |_, stream_start| {
-            let stream_start =
-                stream_start.as_ref().expect("MediaStreamSource Starting parameter was None. This should not happen.");
-            stream_start.Request()?.SetActualStartPosition(TimeSpan { Duration: 0 })?;
+            let stream_start = stream_start
+                .as_ref()
+                .expect("MediaStreamSource Starting parameter was None. This should not happen.");
+            stream_start
+                .Request()?
+                .SetActualStartPosition(TimeSpan { Duration: 0 })?;
             Ok(())
         }))?;
 
-        let (frame_sender, frame_receiver_raw) = mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
-        let (audio_sender, audio_receiver_raw) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
+        let (frame_sender, frame_receiver_raw) =
+            mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
+        let (audio_sender, audio_receiver_raw) =
+            mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
 
         let frame_receiver = Arc::new(Mutex::new(frame_receiver_raw));
         let audio_receiver = Arc::new(Mutex::new(audio_receiver_raw));
@@ -1079,7 +1130,11 @@ impl VideoEncoder {
         media_transcoder.SetHardwareAccelerationEnabled(true)?;
 
         let transcode = media_transcoder
-            .PrepareMediaStreamSourceTranscodeAsync(&media_stream_source, &stream, &media_encoding_profile)?
+            .PrepareMediaStreamSourceTranscodeAsync(
+                &media_stream_source,
+                &stream,
+                &media_encoding_profile,
+            )?
             .join()?;
 
         let error_notify = Arc::new(AtomicBool::new(false));
@@ -1117,20 +1172,32 @@ impl VideoEncoder {
         })
     }
 
-    fn build_padded_surface(&mut self, frame: &Frame) -> Result<SendDirectX<IDirect3DSurface>, VideoEncoderError> {
+    fn build_padded_surface(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<SendDirectX<IDirect3DSurface>, VideoEncoderError> {
         let frame_format = frame.color_format();
         let needs_recreate = self.cached_surface.as_ref().is_none_or(|cache| {
-            cache.format != frame_format || cache.width != self.target_width || cache.height != self.target_height
+            cache.format != frame_format
+                || cache.width != self.target_width
+                || cache.height != self.target_height
         });
 
         if needs_recreate {
-            let surface =
-                Self::create_cached_surface(frame.device(), self.target_width, self.target_height, frame_format)?;
+            let surface = Self::create_cached_surface(
+                frame.device(),
+                self.target_width,
+                self.target_height,
+                frame_format,
+            )?;
             self.cached_surface = Some(surface);
             self.target_color_format = frame_format;
         }
 
-        let cache = self.cached_surface.as_mut().expect("cached_surface must be populated before use");
+        let cache = self
+            .cached_surface
+            .as_mut()
+            .expect("cached_surface must be populated before use");
         let context = frame.device_context();
 
         if let Some(rtv) = &cache.render_target_view {
@@ -1144,7 +1211,14 @@ impl VideoEncoder {
         let copy_height = self.target_height.min(frame.height());
 
         if copy_width > 0 && copy_height > 0 {
-            let source_box = D3D11_BOX { left: 0, top: 0, front: 0, right: copy_width, bottom: copy_height, back: 1 };
+            let source_box = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: copy_width,
+                bottom: copy_height,
+                back: 1,
+            };
             unsafe {
                 context.CopySubresourceRegion(
                     &cache.texture.0,
@@ -1174,7 +1248,9 @@ impl VideoEncoder {
         }
 
         let timestamp = match self.first_timestamp {
-            Some(t0) => TimeSpan { Duration: frame.timestamp()?.Duration - t0.Duration },
+            Some(t0) => TimeSpan {
+                Duration: frame.timestamp()?.Duration - t0.Duration,
+            },
             None => {
                 let ts = frame.timestamp()?;
                 self.first_timestamp = Some(ts);
@@ -1182,13 +1258,15 @@ impl VideoEncoder {
             }
         };
 
-        let surface = if frame.width() == self.target_width && frame.height() == self.target_height {
+        let surface = if frame.width() == self.target_width && frame.height() == self.target_height
+        {
             SendDirectX::new(frame.as_raw_surface().clone())
         } else {
             self.build_padded_surface(frame)?
         };
 
-        self.frame_sender.send(Some((VideoEncoderSource::DirectX(surface), timestamp)))?;
+        self.frame_sender
+            .send(Some((VideoEncoderSource::DirectX(surface), timestamp)))?;
 
         if self.error_notify.load(atomic::Ordering::Relaxed) {
             if let Some(t) = self.transcode_thread.take() {
@@ -1202,7 +1280,11 @@ impl VideoEncoder {
     /// Sends a video frame and an audio buffer (owned). Returns immediately.
     /// Audio timestamp is derived from total samples sent so far (monotonic).
     #[inline]
-    pub fn send_frame_with_audio(&mut self, frame: &mut Frame, audio_buffer: &[u8]) -> Result<(), VideoEncoderError> {
+    pub fn send_frame_with_audio(
+        &mut self,
+        frame: &mut Frame,
+        audio_buffer: &[u8],
+    ) -> Result<(), VideoEncoderError> {
         if self.is_video_disabled {
             return Err(VideoEncoderError::VideoDisabled);
         }
@@ -1212,7 +1294,9 @@ impl VideoEncoder {
 
         // Video timestamp based on capture timestamps (as before)
         let video_ts = match self.first_timestamp {
-            Some(t0) => TimeSpan { Duration: frame.timestamp()?.Duration - t0.Duration },
+            Some(t0) => TimeSpan {
+                Duration: frame.timestamp()?.Duration - t0.Duration,
+            },
             None => {
                 let ts = frame.timestamp()?;
                 self.first_timestamp = Some(ts);
@@ -1220,20 +1304,28 @@ impl VideoEncoder {
             }
         };
 
-        let surface = if frame.width() == self.target_width && frame.height() == self.target_height {
+        let surface = if frame.width() == self.target_width && frame.height() == self.target_height
+        {
             SendDirectX::new(frame.as_raw_surface().clone())
         } else {
             self.build_padded_surface(frame)?
         };
 
-        self.frame_sender.send(Some((VideoEncoderSource::DirectX(surface), video_ts)))?;
+        self.frame_sender
+            .send(Some((VideoEncoderSource::DirectX(surface), video_ts)))?;
 
         // Audio timestamp from running sample count
         let frames_in_buf = (audio_buffer.len() as u32) / self.audio_block_align;
-        let audio_ts_ticks = ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
-        let audio_ts = TimeSpan { Duration: audio_ts_ticks as i64 };
+        let audio_ts_ticks =
+            ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
+        let audio_ts = TimeSpan {
+            Duration: audio_ts_ticks as i64,
+        };
 
-        self.audio_sender.send(Some((AudioEncoderSource::Buffer(audio_buffer.to_vec()), audio_ts)))?;
+        self.audio_sender.send(Some((
+            AudioEncoderSource::Buffer(audio_buffer.to_vec()),
+            audio_ts,
+        )))?;
 
         // Advance counter after stamping
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
@@ -1250,21 +1342,32 @@ impl VideoEncoder {
     /// Sends a raw frame buffer (owned inside). Returns immediately.
     /// Windows expects BGRA and bottom-to-top layout for this path.
     #[inline]
-    pub fn send_frame_buffer(&mut self, buffer: &[u8], timestamp: i64) -> Result<(), VideoEncoderError> {
+    pub fn send_frame_buffer(
+        &mut self,
+        buffer: &[u8],
+        timestamp: i64,
+    ) -> Result<(), VideoEncoderError> {
         if self.is_video_disabled {
             return Err(VideoEncoderError::VideoDisabled);
         }
 
         let frame_timestamp = timestamp;
         let timestamp = match self.first_timestamp {
-            Some(t0) => TimeSpan { Duration: frame_timestamp - t0.Duration },
+            Some(t0) => TimeSpan {
+                Duration: frame_timestamp - t0.Duration,
+            },
             None => {
-                self.first_timestamp = Some(TimeSpan { Duration: frame_timestamp });
+                self.first_timestamp = Some(TimeSpan {
+                    Duration: frame_timestamp,
+                });
                 TimeSpan { Duration: 0 }
             }
         };
 
-        self.frame_sender.send(Some((VideoEncoderSource::Buffer(buffer.to_vec()), timestamp)))?;
+        self.frame_sender.send(Some((
+            VideoEncoderSource::Buffer(buffer.to_vec()),
+            timestamp,
+        )))?;
 
         if self.error_notify.load(atomic::Ordering::Relaxed) {
             if let Some(t) = self.transcode_thread.take() {
@@ -1288,10 +1391,16 @@ impl VideoEncoder {
         }
 
         let frames_in_buf = (buffer.len() as u32) / self.audio_block_align;
-        let audio_ts_ticks = ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
-        let timestamp = TimeSpan { Duration: audio_ts_ticks as i64 };
+        let audio_ts_ticks =
+            ((self.audio_samples_sent as i128) * 10_000_000i128) / (self.audio_sample_rate as i128);
+        let timestamp = TimeSpan {
+            Duration: audio_ts_ticks as i64,
+        };
 
-        self.audio_sender.send(Some((AudioEncoderSource::Buffer(buffer.to_vec()), timestamp)))?;
+        self.audio_sender.send(Some((
+            AudioEncoderSource::Buffer(buffer.to_vec()),
+            timestamp,
+        )))?;
 
         self.audio_samples_sent = self.audio_samples_sent.saturating_add(frames_in_buf as u64);
 
@@ -1314,8 +1423,10 @@ impl VideoEncoder {
         // 2) **Close the channels** so any further recv() returns Err immediately. We replace the fields
         //    with dummy senders and drop the originals now.
         {
-            let (dummy_tx_v, _dummy_rx_v) = mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
-            let (dummy_tx_a, _dummy_rx_a) = mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
+            let (dummy_tx_v, _dummy_rx_v) =
+                mpsc::channel::<Option<(VideoEncoderSource, TimeSpan)>>();
+            let (dummy_tx_a, _dummy_rx_a) =
+                mpsc::channel::<Option<(AudioEncoderSource, TimeSpan)>>();
 
             let old_v = std::mem::replace(&mut self.frame_sender, dummy_tx_v);
             let old_a = std::mem::replace(&mut self.audio_sender, dummy_tx_a);
@@ -1325,12 +1436,15 @@ impl VideoEncoder {
 
         // 3) Wait for the transcoder to flush and finalize.
         if let Some(transcode_thread) = self.transcode_thread.take() {
-            transcode_thread.join().expect("Failed to join transcode thread")?;
+            transcode_thread
+                .join()
+                .expect("Failed to join transcode thread")?;
         }
 
         // 4) Unhook events after pipeline has completed.
         self.media_stream_source.RemoveStarting(self.starting)?;
-        self.media_stream_source.RemoveSampleRequested(self.sample_requested)?;
+        self.media_stream_source
+            .RemoveSampleRequested(self.sample_requested)?;
 
         Ok(())
     }
@@ -1357,7 +1471,9 @@ impl Drop for VideoEncoder {
         }
 
         let _ = self.media_stream_source.RemoveStarting(self.starting);
-        let _ = self.media_stream_source.RemoveSampleRequested(self.sample_requested);
+        let _ = self
+            .media_stream_source
+            .RemoveSampleRequested(self.sample_requested);
     }
 }
 

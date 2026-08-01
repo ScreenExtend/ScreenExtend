@@ -1,8 +1,8 @@
-use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_SHADER_RESOURCE, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE};
 
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::intel::encoder::{
-    Encoder, create_intel_d3d11_device, fill_synthetic_bgra,
+    create_intel_d3d11_device, fill_synthetic_bgra, Encoder,
 };
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
 
@@ -58,7 +58,10 @@ fn intel_quicksync_clamps_extreme_frame_rate() {
             .expect("encode should succeed after frame-rate clamp");
         total += au.len();
     }
-    assert!(total > 0, "clamped-fps encoder should produce bitstream bytes");
+    assert!(
+        total > 0,
+        "clamped-fps encoder should produce bitstream bytes"
+    );
     tprintln!("Intel Quick Sync extreme-fps clamp OK: 1920x1080@357 -> encoded {total} bytes");
 }
 
@@ -105,7 +108,10 @@ fn intel_quicksync_encodes_synthetic_frames() {
             first_keyframe = is_keyframe(&au);
         }
     }
-    assert!(first_keyframe, "first frame should be an IDR with in-band SPS/PPS");
+    assert!(
+        first_keyframe,
+        "first frame should be an IDR with in-band SPS/PPS"
+    );
     assert!(total > 0, "encoder should have produced bitstream bytes");
 
     encoder
@@ -113,7 +119,9 @@ fn intel_quicksync_encodes_synthetic_frames() {
         .expect("in-place bitrate Reset should succeed");
     for i in 30..40 {
         fill_synthetic_bgra(&mut frame, W, H, i);
-        let _ = encoder.encode_bgra(&frame, false).expect("encode after bitrate reset");
+        let _ = encoder
+            .encode_bgra(&frame, false)
+            .expect("encode after bitrate reset");
     }
     tprintln!("Intel Quick Sync smoke test OK: 40 frames, {total} bytes, IDR+RepeatPPS verified");
 }
@@ -121,7 +129,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
 #[test]
 fn intel_quicksync_fused_downscale() {
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT, D3D11_TEXTURE2D_DESC,
+        D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -173,7 +181,10 @@ fn intel_quicksync_fused_downscale() {
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: 0,
@@ -184,10 +195,17 @@ fn intel_quicksync_fused_downscale() {
         .expect("create native source texture");
     let tex = tex.expect("native texture");
 
-    let au0 = encoder.encode_texture(&tex, true).expect("fused-scale encode frame 0");
-    assert!(is_keyframe(&au0), "first fused-scale frame should be an IDR");
+    let au0 = encoder
+        .encode_texture(&tex, true)
+        .expect("fused-scale encode frame 0");
+    assert!(
+        is_keyframe(&au0),
+        "first fused-scale frame should be an IDR"
+    );
     for _ in 0..9 {
-        let _ = encoder.encode_texture(&tex, false).expect("fused-scale encode");
+        let _ = encoder
+            .encode_texture(&tex, false)
+            .expect("fused-scale encode");
     }
     tprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
 }

@@ -177,5 +177,8 @@ features = [
     "Win32_System_Power",
 ]
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+
 [profile.dev.package.objc2]
 debug-assertions = false

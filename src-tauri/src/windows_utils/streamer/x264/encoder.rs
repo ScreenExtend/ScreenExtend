@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_int};
 use std::ptr;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use rayon::prelude::*;
 
 use super::x264_sys::*;
@@ -102,7 +102,10 @@ impl X264Encoder {
         };
         let rv = unsafe { (api.param_apply_profile)(&mut p, profile.as_ptr() as *const c_char) };
         if rv != 0 {
-            bail!("x264_param_apply_profile({:?}) failed ({rv})", config.profile);
+            bail!(
+                "x264_param_apply_profile({:?}) failed ({rv})",
+                config.profile
+            );
         }
 
         let handle = unsafe { (api.encoder_open)(&mut p) };
@@ -192,7 +195,11 @@ impl X264Encoder {
         pic_in.img.i_stride[1] = (self.width / 2) as c_int;
         pic_in.img.i_stride[2] = (self.width / 2) as c_int;
         pic_in.i_pts = self.pts;
-        pic_in.i_type = if force_idr { X264_TYPE_IDR } else { X264_TYPE_AUTO };
+        pic_in.i_type = if force_idr {
+            X264_TYPE_IDR
+        } else {
+            X264_TYPE_AUTO
+        };
 
         let mut nals: *mut x264_nal_t = ptr::null_mut();
         let mut n_nal: c_int = 0;
@@ -315,9 +322,14 @@ fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &m
     }
     for cx in 0..w / 2 {
         let i = (cx * 2) * 4;
-        let b = (row0[i] as i32 + row0[i + 4] as i32 + row1[i] as i32 + row1[i + 4] as i32 + 2) >> 2;
-        let g = (row0[i + 1] as i32 + row0[i + 5] as i32 + row1[i + 1] as i32 + row1[i + 5] as i32 + 2) >> 2;
-        let r = (row0[i + 2] as i32 + row0[i + 6] as i32 + row1[i + 2] as i32 + row1[i + 6] as i32 + 2) >> 2;
+        let b =
+            (row0[i] as i32 + row0[i + 4] as i32 + row1[i] as i32 + row1[i + 4] as i32 + 2) >> 2;
+        let g =
+            (row0[i + 1] as i32 + row0[i + 5] as i32 + row1[i + 1] as i32 + row1[i + 5] as i32 + 2)
+                >> 2;
+        let r =
+            (row0[i + 2] as i32 + row0[i + 6] as i32 + row1[i + 2] as i32 + row1[i + 6] as i32 + 2)
+                >> 2;
         u[cx] = bt601_u(r, g, b);
         v[cx] = bt601_v(r, g, b);
     }
@@ -381,7 +393,10 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         file.write_all(&au)
             .with_context(|| format!("writing frame {i} ({} bytes)", au.len()))?;
         if i % 60 == 0 || i == FRAMES - 1 {
-            tprintln!("x264: encoded frame={i} (au_bytes={}, total_bytes={total_bytes})", au.len());
+            tprintln!(
+                "x264: encoded frame={i} (au_bytes={}, total_bytes={total_bytes})",
+                au.len()
+            );
         }
     }
     file.flush().context("flushing output file")?;

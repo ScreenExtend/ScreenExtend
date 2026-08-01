@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::streamer::bitrate::{BitrateController, estimate_from_loss};
+use crate::streamer::bitrate::{estimate_from_loss, BitrateController};
 
 const MIN: u32 = 1_000_000;
 const MAX: u32 = 40_000_000;
@@ -76,14 +76,20 @@ fn converges_on_steady_input() {
 #[test]
 fn estimate_backs_off_on_heavy_loss() {
     let est = estimate_from_loss(10_000_000, 9_500_000, 0.20);
-    assert!(est < 10_000_000, "heavy loss must reduce estimate, got {est}");
+    assert!(
+        est < 10_000_000,
+        "heavy loss must reduce estimate, got {est}"
+    );
     assert_eq!(est, 9_000_000);
 }
 
 #[test]
 fn estimate_probes_up_when_healthy() {
     let est = estimate_from_loss(10_000_000, 10_000_000, 0.0);
-    assert!(est > 10_000_000, "healthy link should probe upward, got {est}");
+    assert!(
+        est > 10_000_000,
+        "healthy link should probe upward, got {est}"
+    );
     assert_eq!(est, 10_800_000);
 }
 
@@ -106,8 +112,14 @@ fn cut_emits_when_symmetric_threshold_would_stall() {
     let start = c.update(10_000_000, now).expect("first sample emits");
     assert_eq!(start, 10_000_000);
     let cut = c.update(8_500_000, now + Duration::from_millis(50));
-    assert!(cut.is_some(), "cut must emit under the asymmetric threshold");
-    assert!(cut.unwrap() < start, "emitted value must be a reduction: {cut:?}");
+    assert!(
+        cut.is_some(),
+        "cut must emit under the asymmetric threshold"
+    );
+    assert!(
+        cut.unwrap() < start,
+        "emitted value must be a reduction: {cut:?}"
+    );
 }
 
 #[test]
@@ -139,7 +151,10 @@ fn end_to_end_degrade_then_recover() {
             target = v;
         }
     }
-    assert!(target < 10_000_000, "target fell under sustained loss: {target}");
+    assert!(
+        target < 10_000_000,
+        "target fell under sustained loss: {target}"
+    );
     let low = target;
 
     for i in 8..40 {
@@ -148,5 +163,8 @@ fn end_to_end_degrade_then_recover() {
             target = v;
         }
     }
-    assert!(target > low, "target recovered after loss cleared: {low} -> {target}");
+    assert!(
+        target > low,
+        "target recovered after loss cleared: {low} -> {target}"
+    );
 }

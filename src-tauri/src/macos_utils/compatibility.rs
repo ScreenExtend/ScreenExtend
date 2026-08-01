@@ -16,7 +16,11 @@ fn sw_vers(field: &str) -> String {
 fn os_version_string() -> String {
     let name = {
         let n = sw_vers("-productName");
-        if n.is_empty() { "macOS".to_string() } else { n }
+        if n.is_empty() {
+            "macOS".to_string()
+        } else {
+            n
+        }
     };
     let ver = sw_vers("-productVersion");
     if ver.is_empty() {
@@ -57,7 +61,8 @@ pub fn check_system_requirements() -> CompatibilityReport {
     } else if !sck_available {
         unsupported.push(UnsupportedApi {
             name: "ScreenCaptureKit".to_string(),
-            description: "Preferred screen capture backend; falling back to CGDisplayStream.".to_string(),
+            description: "Preferred screen capture backend; falling back to CGDisplayStream."
+                .to_string(),
             required_version: "macOS 12.3".to_string(),
             severity: "optional".to_string(),
         });
