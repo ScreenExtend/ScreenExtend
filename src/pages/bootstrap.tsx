@@ -44,8 +44,6 @@ export default function Bootstrap() {
       if (savedPorts) {
         await commands.setServerPorts(savedPorts.http, savedPorts.https);
       }
-      // Restore the software-encoder override before any streamer starts. Only sync when set;
-      // the backend already defaults to hardware (GPU) encoding.
       if (existing?.disableGpuEncode) {
         await commands.setDisableGpuEncode(true);
       }

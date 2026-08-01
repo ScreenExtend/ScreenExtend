@@ -30,8 +30,6 @@ pub enum EncoderVendor {
     Auto,
     Nvidia,
     Intel,
-    /// CPU-only libx264 fallback. Never auto-selected over a working hardware encoder; picked
-    /// explicitly (`--encoder software`) or when GPU encoding is disabled.
     Software,
 }
 
@@ -117,8 +115,6 @@ pub struct Config {
     pub qp: Option<u8>,
     pub intra_refresh: bool,
     pub encoder_vendor: EncoderVendor,
-    /// Force the CPU-only software encoder, skipping all hardware paths. Discouraged (much higher
-    /// CPU cost); exists for machines where hardware encode is broken or absent (e.g. VMs).
     pub disable_gpu_encode: bool,
     pub virtual_display: Option<SharedVirtualDisplay>,
     pub session_auth: Option<SessionAuth>,
@@ -307,7 +303,6 @@ impl Config {
                     i += 2;
                 }
                 "--disable-gpu-encode" => {
-                    // Bare flag, or explicit on/off value.
                     match val(&args, i) {
                         Some(v) => {
                             c.disable_gpu_encode = matches!(

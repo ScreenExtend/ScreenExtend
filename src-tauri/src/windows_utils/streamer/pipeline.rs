@@ -131,8 +131,6 @@ pub(crate) fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> 
     (w, h)
 }
 
-/// The vendor to actually build, honouring the "disable GPU encoding" override: when set, force
-/// the software encoder regardless of the configured hardware vendor.
 fn effective_vendor(cfg: &Config) -> crate::streamer::config::EncoderVendor {
     if cfg.disable_gpu_encode {
         crate::streamer::config::EncoderVendor::Software
@@ -718,12 +716,7 @@ impl EncodePath {
 enum Backend {
     Nvenc { encoder: Encoder, path: EncodePath },
     Intel { encoder: IntelEncoder },
-    /// Intel Quick Sync on its own device, fed via CPU readback — last-resort bridge for when
-    /// the capture device is neither Intel (no same-adapter path) nor NVENC-reachable.
     IntelCpu { encoder: IntelEncoder },
-    /// CPU-only libx264. The final fallback when no hardware encoder works at all (e.g. a VM
-    /// whose capture path is on a software D3D adapter). Fed BGRA CPU bytes like the other
-    /// cpu-bridge backends; converts to I420 and encodes entirely on the CPU.
     X264 { encoder: X264Encoder },
 }
 
@@ -737,8 +730,6 @@ impl Backend {
         }
     }
 
-    /// The encoder's D3D11 device, or `None` for the software backend (which has none). Used only
-    /// for GPU-priority tuning, so `None` simply means "nothing to tune".
     fn device(&self) -> Option<&ID3D11Device> {
         match self {
             Backend::Nvenc { encoder, .. } => Some(encoder.device()),
@@ -764,7 +755,6 @@ impl Backend {
         !matches!(self, Backend::Intel { .. })
     }
 
-    /// Whether frames reach the encoder as CPU bytes (`encode_cpu`) instead of textures.
     fn is_cpu_bridge(&self) -> bool {
         matches!(
             self,
@@ -1031,7 +1021,6 @@ fn build_backend(
     };
 
     match vendor {
-        // Explicit software selection (or `--disable-gpu-encode`): never touch the GPU encoders.
         EncoderVendor::Software => try_x264(),
         EncoderVendor::Nvidia => try_nvenc().or_else(|nv_err| {
             teprintln!("NVENC unavailable ({nv_err:?}); falling back to software x264");

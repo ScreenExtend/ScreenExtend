@@ -43,7 +43,6 @@ pub struct AppState {
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
     pub server_ports: SharedServerPorts,
-    /// When set, every streamer is built with the CPU-only software encoder (no GPU encode).
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,

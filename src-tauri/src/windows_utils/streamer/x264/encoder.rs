@@ -1,15 +1,3 @@
-//! Software H.264 encoder backend (libx264) — the CPU-only last-resort path.
-//!
-//! Unlike the NVENC / Quick Sync backends, nothing here touches the GPU: the encoder takes the
-//! same BGRA CPU bytes the CPU-bridge path already produces, converts them to I420 on the CPU
-//! (multi-threaded, buffers reused), and encodes with libx264 configured for minimum latency
-//! (`ultrafast` + `zerolatency`, no B-frames, sliced threads, ABR with a ~2-frame VBV). It
-//! exists so machines with no working hardware encoder — typically VMs where WGC/DXGI fall back
-//! to a software adapter and NVENC/QSV/AMF are all absent — still stream.
-//!
-//! The public surface mirrors `nvidia::encoder::Encoder` so it slots into the pipeline's
-//! `Backend` enum with no special-casing beyond one match arm.
-
 use std::ffi::{c_char, c_int};
 use std::ptr;
 
@@ -25,21 +13,15 @@ const TUNE_ZEROLATENCY: &[u8] = b"zerolatency\0";
 const PROFILE_BASELINE: &[u8] = b"baseline\0";
 const PROFILE_MAIN: &[u8] = b"main\0";
 const PROFILE_HIGH: &[u8] = b"high\0";
-
-/// Upper bound on encode threads. Sliced-threads gives one slice per thread; past a handful the
-/// extra slices cost compression efficiency for little latency gain, and we want to leave the box
-/// responsive. `available_parallelism` (physical+logical) clamped into this range.
 const MAX_ENCODE_THREADS: usize = 8;
 
 pub struct X264Encoder {
     api: X264Api,
     handle: *mut x264_t,
-    /// Kept for `x264_encoder_reconfig` (live bitrate changes).
     params: x264_param_t,
     config: EncoderConfig,
     width: usize,
     height: usize,
-    /// Reused I420 scratch: `[Y (w*h) | U (w/2*h/2) | V (w/2*h/2)]`. Never reallocated per frame.
     i420: Vec<u8>,
     y_size: usize,
     c_size: usize,
@@ -47,9 +29,6 @@ pub struct X264Encoder {
     pts: i64,
 }
 
-// SAFETY: the `x264_t` handle is only ever touched from one thread at a time (the pipeline holds
-// the encoder behind a `Mutex`, exactly like the NVENC handle). libx264 spawns its own worker
-// threads internally but the API is called single-threaded.
 unsafe impl Send for X264Encoder {}
 
 impl X264Encoder {
@@ -82,37 +61,35 @@ impl X264Encoder {
         p.b_vfr_input = 0;
         p.i_fps_num = fps;
         p.i_fps_den = 1;
-        // frame-count timebase: with 0 B-frames this keeps dts == pts.
+        // frame-count timebase
         p.i_timebase_num = 1;
         p.i_timebase_den = fps;
 
-        // latency-critical (zerolatency sets most of these; pin them anyway)
+        // latency-critical
         p.i_bframe = 0;
         p.b_sliced_threads = 1;
         p.i_threads = encode_thread_count() as c_int;
         p.rc.i_lookahead = 0;
         p.i_sync_lookahead = 0;
 
-        // rate control: ABR + tight VBV (never bare CRF/CQP — bounds worst-case frame size)
+        // rate control
         let kbps = bitrate_kbps(config.bitrate_bps);
         p.rc.i_rc_method = X264_RC_ABR;
         p.rc.i_bitrate = kbps;
         p.rc.i_vbv_max_bitrate = kbps;
         p.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, fps);
 
-        // GOP / recovery: infinite GOP + on-demand IDR — matches the HW backends, which hold a
-        // long GOP and emit IDRs only on PLI/FIR/join (see pipeline `request_idr`).
+        // GOP / recovery
         p.i_keyint_max = X264_KEYINT_MAX_INFINITE;
         p.i_scenecut_threshold = 0;
         p.b_intra_refresh = if config.intra_refresh { 1 } else { 0 };
 
         // bitstream shape for WebRTC
-        p.b_repeat_headers = 1; // SPS/PPS in-band before every IDR
-        p.b_annexb = 1; // webrtc-rs H.264 payloader consumes Annex-B
+        p.b_repeat_headers = 1;
+        p.b_annexb = 1;
         p.i_log_level = X264_LOG_ERROR;
 
-        // Colour signalling. Our converter uses BT.601 limited range; advertise it in the VUI so
-        // the decoder reconstructs the same colours regardless of resolution heuristics.
+        // colour signalling
         p.vui.b_fullrange = 0;
         p.vui.i_colorprim = 6; // SMPTE 170M (BT.601)
         p.vui.i_transfer = 6; // SMPTE 170M
@@ -173,8 +150,6 @@ impl X264Encoder {
         self.encode_converted(force_idr)
     }
 
-    /// Re-encode the last converted frame (idle/keepalive pacing). No re-conversion — the I420
-    /// scratch already holds the previous frame, so a repeat costs zero colour-convert work.
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         if !self.have_frame {
             return Ok(Vec::new());
@@ -184,7 +159,6 @@ impl X264Encoder {
 
     pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
         if self.config.qp.is_some() {
-            // Parallel to NVENC: an explicit constant-QP request opts out of bitrate adaptation.
             return Ok(());
         }
         let kbps = bitrate_kbps(bps);
@@ -200,8 +174,6 @@ impl X264Encoder {
         Ok(())
     }
 
-    /// Encode whatever is currently in the I420 scratch. Returns the Annex-B access unit
-    /// (SPS/PPS + slice NALs), copied out of x264's internal buffer.
     fn encode_converted(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         let (y_ptr, u_ptr, v_ptr) = {
             let (y, rest) = self.i420.split_at_mut(self.y_size);
@@ -241,8 +213,6 @@ impl X264Encoder {
         self.have_frame = true;
 
         if size == 0 || n_nal == 0 || nals.is_null() {
-            // With zerolatency every input yields output; a zero-byte return means nothing to
-            // send this tick (do not treat as an error).
             return Ok(Vec::new());
         }
         debug_assert_eq!(
@@ -250,15 +220,10 @@ impl X264Encoder {
             "0 B-frames must keep dts == pts (no reordering)"
         );
 
-        // x264 lays the n_nal payloads out contiguously starting at the first NAL's p_payload,
-        // for exactly `size` bytes. One copy out; the buffer is x264-owned and only valid until
-        // the next encoder call.
         let out = unsafe { std::slice::from_raw_parts((*nals).p_payload, size as usize).to_vec() };
         Ok(out)
     }
 
-    /// BGRA (`row_pitch`-strided) → I420 into the reused scratch. Parallelised across row pairs;
-    /// each rayon task owns two output Y rows plus one U and one V row (disjoint), so no locking.
     fn convert_bgra_to_i420(&mut self, bgra: &[u8], row_pitch: usize) -> Result<()> {
         let w = self.width;
         let h = self.height;
@@ -295,7 +260,6 @@ impl Drop for X264Encoder {
             return;
         }
         unsafe {
-            // Drain delayed frames (none under zerolatency, but honour the x264 contract).
             let mut nals: *mut x264_nal_t = ptr::null_mut();
             let mut n_nal: c_int = 0;
             let mut pic_out: x264_picture_t = std::mem::zeroed();
@@ -330,15 +294,11 @@ fn bitrate_kbps(bps: u32) -> c_int {
     (bps / 1000).max(64) as c_int
 }
 
-/// VBV buffer sized to ~2 frames of bits (default `vbv_buffer_frames`), the tight bound that
-/// keeps a complex frame from ballooning and blowing the pacing budget.
 fn vbv_buffer_kbit(kbps: c_int, fps: u32) -> c_int {
     let frame_kbit = kbps as f32 / fps.max(1) as f32;
     (frame_kbit * 2.0).max(1.0) as c_int
 }
 
-/// Convert one pair of BGRA rows to two Y rows + one U row + one V row (4:2:0), BT.601 limited
-/// range with 2×2-averaged chroma. Byte order in memory is B, G, R, A (DXGI `B8G8R8A8`).
 #[inline]
 fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &mut [u8], w: usize) {
     let (y0, y1) = y2.split_at_mut(w);
@@ -355,7 +315,6 @@ fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &m
     }
     for cx in 0..w / 2 {
         let i = (cx * 2) * 4;
-        // 2×2 average of the four source pixels feeding this chroma sample.
         let b = (row0[i] as i32 + row0[i + 4] as i32 + row1[i] as i32 + row1[i + 4] as i32 + 2) >> 2;
         let g = (row0[i + 1] as i32 + row0[i + 5] as i32 + row1[i + 1] as i32 + row1[i + 5] as i32 + 2) >> 2;
         let r = (row0[i + 2] as i32 + row0[i + 6] as i32 + row1[i + 2] as i32 + row1[i + 6] as i32 + 2) >> 2;
@@ -384,8 +343,6 @@ fn clamp8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-/// `--probe-encode` on the software backend: encode synthetic BGRA frames to an Annex-B file with
-/// no capture or GPU. Also the manual smoke test for the whole x264 path.
 pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     use std::io::Write as _;
 
@@ -433,7 +390,6 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Moving-gradient + box test pattern in BGRA (memory order B, G, R, A).
 pub(crate) fn fill_synthetic_bgra(buf: &mut [u8], width: u32, height: u32, frame: u32) {
     let w = width as usize;
     let h = height as usize;

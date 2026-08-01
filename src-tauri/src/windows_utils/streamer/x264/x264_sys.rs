@@ -1,18 +1,3 @@
-//! Minimal, hand-vendored FFI for libx264, loaded at runtime with `libloading`.
-//!
-//! We deliberately do **not** use the `x264-sys` crate (build-time pkg-config/vcpkg link).
-//! This mirrors the project's `nvenc_sys` convention: vendor exactly the structs/enums we
-//! touch and dynamically load the shared library, so a normal `cargo build` never needs
-//! libx264 present and the DLL is only required at runtime when the software backend is
-//! actually selected (the VM / no-GPU fallback case).
-//!
-//! # ABI safety
-//! `x264_param_default_preset` and `x264_encoder_open` read/write the *entire* `x264_param_t`,
-//! so its layout must be byte-exact against the loaded library. The structs below are
-//! transcribed verbatim from x264.h at **`X264_BUILD 164`** (the current/vcpkg build). The
-//! bundled `libx264.dll` MUST be a build-164-compatible library. `#[repr(C)]` reproduces the
-//! platform C ABI (field order + alignment/padding) identically to the MSVC/Clang compiler.
-
 #![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
@@ -20,9 +5,6 @@ use std::ffi::{c_char, c_int, c_uint, c_void};
 use anyhow::{Context as _, Result, anyhow};
 use libloading::{Library, Symbol};
 
-/// The x264 build the bindings below match. The public `x264_encoder_open` is a macro that
-/// expands to `x264_encoder_open_<X264_BUILD>`, so this is also the primary exported symbol
-/// suffix we resolve.
 pub const X264_BUILD: i32 = 164;
 
 // --- colour space (i_csp) ---
@@ -203,8 +185,7 @@ pub struct x264_param_content_light_level {
     pub i_max_fall: c_int,
 }
 
-/// `x264_param_t` at `X264_BUILD 164`. Every field, in exact order — the whole struct is
-/// written by `x264_param_default_preset`, so nothing here may be reordered or omitted.
+/// `x264_param_t` at `X264_BUILD 164`
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct x264_param_t {
@@ -264,8 +245,6 @@ pub struct x264_param_t {
     pub cqm_8ic: [u8; 64],
     pub cqm_8pc: [u8; 64],
 
-    /// `void (*)(void*, int, const char*, va_list)` — set by x264 to its default logger.
-    /// We never call it ourselves; kept as an opaque pointer slot for correct struct size.
     pub pf_log: *mut c_void,
     pub p_log_private: *mut c_void,
     pub i_log_level: c_int,
@@ -400,8 +379,6 @@ type FnEncoderDelayedFrames = unsafe extern "C" fn(*mut x264_t) -> c_int;
 type FnEncoderClose = unsafe extern "C" fn(*mut x264_t);
 type FnPictureInit = unsafe extern "C" fn(*mut x264_picture_t);
 
-/// Resolved libx264 entry points. Raw fn pointers are extracted from the loaded library and
-/// remain valid for as long as `_lib` is kept alive (it is, for the life of this struct).
 pub struct X264Api {
     pub param_default_preset: FnParamDefaultPreset,
     pub param_apply_profile: FnParamApplyProfile,
@@ -416,15 +393,9 @@ pub struct X264Api {
     _lib: Library,
 }
 
-// SAFETY: the resolved pointers are into a library that stays loaded for the struct's life,
-// and libx264's stateless helpers are safe to reference from any thread. The encoder *handle*
-// (`x264_t`) — not this table — carries the single-writer-thread requirement.
 unsafe impl Send for X264Api {}
 unsafe impl Sync for X264Api {}
 
-/// Candidate file names for the libx264 shared object, in preference order. We ship
-/// `libx264-164.dll` (bundled as a Tauri resource), so it's first; the others cover a
-/// dev machine that has libx264 from vcpkg (`libx264.dll`) or another source on PATH.
 const LIB_NAMES: &[&str] = &["libx264-164.dll", "libx264.dll", "x264.dll"];
 
 fn open_library() -> Result<Library> {
@@ -439,9 +410,6 @@ fn open_library() -> Result<Library> {
         }
     };
 
-    // 1. Explicit exe-relative locations. In a packaged Tauri app the bundled DLL lands in
-    //    `<exe_dir>/resources/`; Windows' default DLL search does NOT look there, so we must
-    //    name the full path. Also try directly beside the exe.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in LIB_NAMES {
@@ -455,15 +423,12 @@ fn open_library() -> Result<Library> {
         }
     }
 
-    // 2. Bare names: lets the OS loader find a DLL on PATH or in the working dir (dev builds,
-    //    `cargo test` with the DLL on PATH).
     for name in LIB_NAMES {
         if let Some(lib) = attempt(std::path::PathBuf::from(name), &mut last_err) {
             return Ok(lib);
         }
     }
 
-    // 3. Last resort: other build-suffixed names some distributions ship (e.g. libx264-155.dll).
     for build in (150..=175).rev() {
         if let Some(lib) = attempt(
             std::path::PathBuf::from(format!("libx264-{build}.dll")),
@@ -481,9 +446,6 @@ fn open_library() -> Result<Library> {
     ))
 }
 
-/// Resolve `x264_encoder_open`. The public name is a version-suffixed symbol
-/// (`x264_encoder_open_<build>`); the exact suffix depends on the loaded library's build, so
-/// probe our target build first, then a neighbourhood, then the unsuffixed name as a last resort.
 unsafe fn resolve_encoder_open(lib: &Library) -> Result<FnEncoderOpen> {
     let primary = format!("x264_encoder_open_{X264_BUILD}");
     let names = std::iter::once(primary.clone())

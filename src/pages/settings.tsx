@@ -792,7 +792,7 @@ export default function Settings() {
                       <div>
                         <CardTitle>Video Encoding</CardTitle>
                         <p className="text-sm text-muted-foreground mt-1">
-                          Screen video is normally encoded by your GPU (NVIDIA, Intel, or AMD), which is fast and light on the CPU. Only turn this off if hardware encoding won't start — for example inside a virtual machine.
+                          Screen video is normally encoded by your GPU (NVIDIA, Intel, or AMD), which is fast and light on the CPU.
                         </p>
                       </div>
                     </CardHeader>

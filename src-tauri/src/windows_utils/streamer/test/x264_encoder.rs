@@ -1,13 +1,7 @@
-//! Hardware-free smoke test for the software x264 backend (PRD §9). Requires libx264.dll at
-//! runtime; if the library can't be loaded the test logs and returns (so CI without libx264 is
-//! green). When the DLL is present it exercises the full encode path on synthetic frames.
-
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
 use crate::windows_utils::streamer::x264::encoder::{X264Encoder, fill_synthetic_bgra};
 
-/// Split an Annex-B access unit into `(nal_type, payload_len)` pairs (payload excludes the start
-/// code). Handles both 3- and 4-byte start codes.
 fn nal_units(au: &[u8]) -> Vec<(u8, usize)> {
     let mut starts = Vec::new();
     let mut i = 0;
@@ -21,7 +15,6 @@ fn nal_units(au: &[u8]) -> Vec<(u8, usize)> {
     }
     let mut out = Vec::new();
     for (idx, &(payload_start, nal_type)) in starts.iter().enumerate() {
-        // The next NAL begins at the next start code; back off the (up to) 4 preceding zero bytes.
         let mut end = starts.get(idx + 1).map(|&(s, _)| s - 3).unwrap_or(au.len());
         while end > payload_start && au[end - 1] == 0 {
             end -= 1;
@@ -39,7 +32,6 @@ fn contains(nals: &[(u8, usize)], nal_type: u8) -> bool {
     nals.iter().any(|&(t, _)| t == nal_type)
 }
 
-/// SPS(7) + PPS(8) + IDR(5) all present — a self-contained keyframe access unit.
 fn is_idr_with_headers(au: &[u8]) -> bool {
     let nals = nal_units(au);
     contains(&nals, 7) && contains(&nals, 8) && contains(&nals, 5)
@@ -70,9 +62,8 @@ fn x264_software_encodes_synthetic_frames() {
         }
     };
 
-    // ~2 frames of bits, in bytes; VBV should keep any single NAL well under a small multiple.
     let vbv_bytes = (2.0 * (BITRATE as f64 / FPS as f64) / 8.0) as usize;
-    let per_nal_ceiling = vbv_bytes * 4; // generous "~2x vbv/8" bound with headroom for the IDR
+    let per_nal_ceiling = vbv_bytes * 4;
 
     let mut frame = vec![0u8; (W * H * 4) as usize];
     let mut total_bytes = 0usize;
@@ -120,7 +111,6 @@ fn x264_software_encodes_synthetic_frames() {
     assert!(first_ok, "frame 0 must contain SPS + PPS + IDR");
     assert!(forced_ok, "mid-stream forced keyframe must contain SPS + PPS + IDR");
 
-    // Achieved bitrate within +/-25% of target over the run.
     let achieved_bps = (total_bytes as f64 * 8.0 * FPS as f64) / FRAMES as f64;
     let ratio = achieved_bps / BITRATE as f64;
     assert!(
@@ -167,7 +157,6 @@ fn x264_software_runtime_bitrate_change() {
 
     let mut frame = vec![0u8; (W * H * 4) as usize];
 
-    // Warm up + measure the high-bitrate segment (skip the IDR-heavy first frame).
     let mut high_bytes = 0usize;
     for i in 0..60 {
         fill_synthetic_bgra(&mut frame, W, H, i);

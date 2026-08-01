@@ -38,8 +38,6 @@ pub struct AppState {
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
     pub server_ports: SharedServerPorts,
-    /// macOS always encodes via VideoToolbox; this flag is stored for UI/command parity with
-    /// Windows (where it forces the software x264 path) and has no effect on the macOS pipeline.
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
@@ -273,8 +271,6 @@ pub fn get_disable_gpu_encode(state: State<'_, AppState>) -> bool {
 #[tauri::command]
 #[specta::specta]
 pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
-    // macOS has no software-encode fallback (VideoToolbox is always used); just record the
-    // preference for command/UI parity with Windows without disturbing running streamers.
     state
         .disable_gpu_encode
         .store(disabled, std::sync::atomic::Ordering::Relaxed);
