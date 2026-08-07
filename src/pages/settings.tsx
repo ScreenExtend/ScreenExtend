@@ -1,4 +1,6 @@
 import React, { useState, useContext, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import QRCode from "react-qr-code";
 
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
@@ -7,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import { AvatarCropModal } from "@/components/avatar-crop-modal";
-import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown, QrCode } from "lucide-react";
 import defaultLogo from "@/assets/default.svg";
 import {
   InputOTP,
@@ -37,13 +39,15 @@ import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/bindings";
-import { cn, buildQrValues } from "@/lib/utils";
+import { cn, buildQrValues, buildWifiQrValue } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
 import { type as getOsType } from "@tauri-apps/plugin-os";
 
 const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 const IS_WINDOWS = getOsType() === "windows";
+const IS_MACOS = getOsType() === "macos";
+const SUPPORTS_WIFI_QR = IS_WINDOWS || IS_MACOS;
 
 export default function Settings() {
   const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom] } = useContext(GlobalProviderContext);
@@ -60,6 +64,7 @@ export default function Settings() {
   const [oldHostedNetworkPassword, setOldHostedNetworkPassword] = useState("");
   const [showHostedNetworkPassword, setShowHostedNetworkPassword] = useState(false);
   const [hostedNetworkModalOpen, setHostedNetworkModalOpen] = useState(false);
+  const [wifiQrModalOpen, setWifiQrModalOpen] = useState(false);
   const [wifiModalOpen, setWifiModalOpen] = useState(false);
   const [wifiTurningOn, setWifiTurningOn] = useState(false);
   const [disabled, setDisabled] = useState(false);
@@ -231,6 +236,21 @@ export default function Settings() {
   useEffect(() => {
     if (configLoaded) void updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
+
+  useEffect(() => {
+    if (!wifiQrModalOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setWifiQrModalOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [wifiQrModalOpen]);
+
+  // The network keeps broadcasting the last applied credentials, so the QR reflects
+  // those rather than any unsaved edits in the name/password fields.
+  useEffect(() => {
+    if (!hostedNetworkOn) setWifiQrModalOpen(false);
+  }, [hostedNetworkOn]);
 
   const startNetworkWithFeedback = async (opts?: { fromWifiModal?: boolean }): Promise<boolean> => {
     await commands.stopHostedNetwork();
@@ -413,8 +433,9 @@ export default function Settings() {
               </div>
               <div
                 className={cn(
-                  "flex items-center space-x-4 p-3 px-0 mt-4",
-                  (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none"
+                  "flex items-center space-x-4 p-3 px-0 mt-2",
+                  (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none",
+                  "mb-2"
                 )}
               >
                 <div className="relative outline-none flex-1">
@@ -498,6 +519,17 @@ export default function Settings() {
                   Save Settings
                 </Button>
               </div>
+              {SUPPORTS_WIFI_QR && hostedNetworkOn && (
+                <div className="flex items-center space-x-4 border-t p-4 px-0 pb-0">
+                  <div className="flex-1 space-y-1">
+                    <p className="text-sm font-medium leading-none">Connect with QR Code</p>
+                  </div>
+                  <Button variant="outline" onClick={() => setWifiQrModalOpen(true)}>
+                    <QrCode className="mr-2 h-4 w-4" />
+                    Show QR Code
+                  </Button>
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -937,6 +969,43 @@ export default function Settings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {wifiQrModalOpen && createPortal(
+        <div
+          onClick={() => setWifiQrModalOpen(false)}
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 p-4"
+        >
+          <div
+            onClick={(event) => event.stopPropagation()}
+            className="w-full max-w-sm rounded-2xl bg-background p-6 shadow-xl"
+          >
+            <h3 className="text-center text-lg font-semibold">Join "{oldHostedNetworkName}"</h3>
+            <p className="mt-1 text-center text-sm text-muted-foreground">
+              Scan this code to connect to the Wi-Fi network.
+            </p>
+            <div className="mt-4 rounded-xl bg-white p-4">
+              <QRCode
+                value={buildWifiQrValue(oldHostedNetworkName, oldHostedNetworkPassword)}
+                viewBox="0 0 256 256"
+                style={{ width: "100%", height: "auto", display: "block" }}
+              />
+            </div>
+            <div className="mt-4 space-y-1 text-sm">
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Network</span>
+                <span className="break-all text-right font-medium">{oldHostedNetworkName}</span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Password</span>
+                <span className="break-all text-right font-medium">{oldHostedNetworkPassword || "None"}</span>
+              </div>
+            </div>
+            <Button className="mt-5 w-full" onClick={() => setWifiQrModalOpen(false)}>
+              Done
+            </Button>
+          </div>
+        </div>,
+        document.body
+      )}
       <AvatarCropModal
         open={cropOpen}
         imageSrc={cropSrc}

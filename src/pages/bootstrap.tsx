@@ -18,6 +18,20 @@ import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, type CompatibilityReport } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useTheme, type Theme } from "@/components/theme-provider";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
 
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
@@ -28,6 +42,10 @@ export default function Bootstrap() {
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
+  const [updating, setUpdating] = useState(false);
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [downloaded, setDownloaded] = useState(0);
+  const [total, setTotal] = useState(0);
   const running = useRef(false);
 
   const runSetup = async (tryInstall: boolean) => {
@@ -95,7 +113,41 @@ export default function Bootstrap() {
     }
   };
 
+  const runUpdate = async (): Promise<boolean> => {
+    let update;
+    try {
+      update = await check();
+    } catch {
+      return false;
+    }
+    if (!update) return false;
+    setUpdateVersion(update.version);
+    setUpdating(true);
+    try {
+      let received = 0;
+      await update.downloadAndInstall(event => {
+        switch (event.event) {
+          case "Started":
+            setTotal(event.data.contentLength ?? 0);
+            break;
+          case "Progress":
+            received += event.data.chunkLength;
+            setDownloaded(received);
+            break;
+          case "Finished":
+            break;
+        }
+      });
+      await relaunch();
+      return true;
+    } catch {
+      setUpdating(false);
+      return false;
+    }
+  };
+
   const start = async () => {
+    if (await runUpdate()) return;
     let report: CompatibilityReport;
     try {
       report = await commands.checkSystemRequirements();
@@ -126,9 +178,39 @@ export default function Bootstrap() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const updatePct = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null;
+
   return (
     <div className="h-screen w-full flex flex-col items-center justify-center">
       <Link to="/dashboard" id="dashlink"></Link>
+      <AlertDialog open={updating}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Downloading Update</AlertDialogTitle>
+            <AlertDialogDescription>
+              {updateVersion && (
+                <>A new version (<b>v{updateVersion}</b>) of ScreenExtend is being downloaded and installed. </>
+              )}
+              The app will restart automatically once the update is ready. Please don't close it.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-2">
+            <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
+              <div
+                className={updatePct === null
+                  ? "h-full w-1/3 rounded-full bg-blue-600 animate-pulse"
+                  : "h-full rounded-full bg-blue-600 transition-all duration-200"}
+                style={updatePct === null ? undefined : { width: `${updatePct}%` }}
+              />
+            </div>
+            <p className="text-center text-sm text-muted-foreground">
+              {updatePct === null
+                ? (downloaded > 0 ? `Downloaded ${formatBytes(downloaded)}` : "Preparing download…")
+                : `${updatePct}% • ${formatBytes(downloaded)} of ${formatBytes(total)}`}
+            </p>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
       <Loader2 className="animate-spin mb-4" size={48} />
       <p className="text-xl font-semibold">Starting ScreenExtend</p>
       <AlertDialog open={error}>

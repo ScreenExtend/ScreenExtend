@@ -82,7 +82,7 @@ export default function Dashboard() {
         <h2 className="flex justify-center text-4xl font-semibold">What network is your device connected to?</h2>
       </div>
       <div className="w-full overflow-hidden box-border mb-10">
-        <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center">
+        <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center justify-evenly">
           {cloudUrl && (
             <QrDisplay name="Anywhere (Internet)" url={cloudUrl} badge={<CloudBadge status={cloudStatus} />} blurred={!cloudReady} blurredLabel={cloudBlurredLabel} />
           )}
@@ -149,8 +149,8 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
   };
 
   return (
-    <div className="p-1 mx-auto w-96 min-w-72 max-w-full">
-      <h2 className="text-2xl font-bold text-center mb-2 flex items-center justify-center">
+    <div className="p-1 mx-3 w-96 min-w-72 max-w-full">
+      <h2 className="text-2xl font-bold text-center mb-2 flex flex-wrap items-center justify-center">
         {name}
         {badge}
       </h2>

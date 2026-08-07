@@ -12,6 +12,16 @@ export function buildCloudQrValue(sessionId: string): string {
   return `https://${CLOUD_SESSION_DOMAIN}/?id=${sessionId}`;
 }
 
+// Standard Wi-Fi network QR payload (the format phone cameras understand to join a
+// network). Backslash-escapes the reserved characters \ ; , : and ".
+export function buildWifiQrValue(ssid: string, password: string): string {
+  const escape = (value: string) => value.replace(/([\\;,:"])/g, "\\$1");
+  if (!password) {
+    return `WIFI:T:nopass;S:${escape(ssid)};;`;
+  }
+  return `WIFI:T:WPA;S:${escape(ssid)};P:${escape(password)};;`;
+}
+
 window.commands = commands;
 
 declare global {

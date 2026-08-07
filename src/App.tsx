@@ -18,20 +18,9 @@ import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom"
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
-import { commands, events, type UpdateInfo } from "@/lib/bindings";
+import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useToast } from "@/components/ui/use-toast";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import { open as openUrl } from "@tauri-apps/plugin-shell";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
 
@@ -59,7 +48,6 @@ function App() {
   const zoomReady = useRef(false);
 
   const [closing, setClosing] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
 
   useEffect(() => {
     void (async () => {
@@ -67,19 +55,6 @@ function App() {
         setAvatar(await loadAvatar());
       } catch {
         setAvatar(null);
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    void (async () => {
-      try {
-        const result = await commands.checkForUpdate();
-        if (result.status === "ok" && result.data.update_available) {
-          setUpdateInfo(result.data);
-        }
-      } catch {
-        // ignore
       }
     })();
   }, []);
@@ -207,38 +182,6 @@ function App() {
     }}>
       <ThemeProvider defaultTheme="system">
           <RouterProvider router={router} />
-          <AlertDialog open={updateInfo !== null}>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Update Available</AlertDialogTitle>
-                <AlertDialogDescription>
-                  A newer version of ScreenExtend is available.{" "}
-                  {updateInfo && (
-                    <>You're on <b>v{updateInfo.current_version}</b>; the latest is <b>v{updateInfo.latest_version}</b>. </>
-                  )}
-                  Download the update from{" "}
-                  <a href="https://screenextend.app/#download" target="_blank" style={{ textDecoration: "underline" }}>
-                    screenextend.app
-                  </a>{" "}
-                  to get the latest features and fixes.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel onClick={() => setUpdateInfo(null)}>
-                  Later
-                </AlertDialogCancel>
-                <AlertDialogAction
-                  className="bg-blue-600 hover:bg-blue-700 text-white"
-                  onClick={() => {
-                    if (updateInfo) void openUrl(updateInfo.download_url);
-                    setUpdateInfo(null);
-                  }}
-                >
-                  Update Now
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
           <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 9999 }}>
             <div className="rounded-lg p-6 flex flex-col items-center">
               <Loader2 className="animate-spin text-white mb-4" size={48} />
