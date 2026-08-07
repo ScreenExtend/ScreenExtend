@@ -1,5 +1,4 @@
 import React, { useState, useContext, useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
 import QRCode from "react-qr-code";
 
 import Layout from "@/layout/layout";
@@ -236,15 +235,6 @@ export default function Settings() {
   useEffect(() => {
     if (configLoaded) void updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
-
-  useEffect(() => {
-    if (!wifiQrModalOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setWifiQrModalOpen(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [wifiQrModalOpen]);
 
   // The network keeps broadcasting the last applied credentials, so the QR reflects
   // those rather than any unsaved edits in the name/password fields.
@@ -969,43 +959,38 @@ export default function Settings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      {wifiQrModalOpen && createPortal(
-        <div
-          onClick={() => setWifiQrModalOpen(false)}
-          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 p-4"
-        >
-          <div
-            onClick={(event) => event.stopPropagation()}
-            className="w-full max-w-sm rounded-2xl bg-background p-6 shadow-xl"
-          >
-            <h3 className="text-center text-lg font-semibold">Join "{oldHostedNetworkName}"</h3>
-            <p className="mt-1 text-center text-sm text-muted-foreground">
+      <AlertDialog open={wifiQrModalOpen} onOpenChange={setWifiQrModalOpen}>
+        <AlertDialogContent className="max-w-sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-center">Join "{oldHostedNetworkName}"</AlertDialogTitle>
+            <AlertDialogDescription className="text-center">
               Scan this code to connect to the Wi-Fi network.
-            </p>
-            <div className="mt-4 rounded-xl bg-white p-4">
-              <QRCode
-                value={buildWifiQrValue(oldHostedNetworkName, oldHostedNetworkPassword)}
-                viewBox="0 0 256 256"
-                style={{ width: "100%", height: "auto", display: "block" }}
-              />
-            </div>
-            <div className="mt-4 space-y-1 text-sm">
-              <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Network</span>
-                <span className="break-all text-right font-medium">{oldHostedNetworkName}</span>
-              </div>
-              <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Password</span>
-                <span className="break-all text-right font-medium">{oldHostedNetworkPassword || "None"}</span>
-              </div>
-            </div>
-            <Button className="mt-5 w-full" onClick={() => setWifiQrModalOpen(false)}>
-              Done
-            </Button>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="rounded-xl bg-white p-4">
+            <QRCode
+              value={buildWifiQrValue(oldHostedNetworkName, oldHostedNetworkPassword)}
+              viewBox="0 0 256 256"
+              style={{ width: "100%", height: "auto", display: "block" }}
+            />
           </div>
-        </div>,
-        document.body
-      )}
+          <div className="space-y-1 text-sm">
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Network</span>
+              <span className="break-all text-right font-medium">{oldHostedNetworkName}</span>
+            </div>
+            <div className="flex justify-between gap-4">
+              <span className="text-muted-foreground">Password</span>
+              <span className="break-all text-right font-medium">{oldHostedNetworkPassword || "None"}</span>
+            </div>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogAction className="w-full hover:opacity-75" onClick={() => setWifiQrModalOpen(false)}>
+              Done
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <AvatarCropModal
         open={cropOpen}
         imageSrc={cropSrc}
