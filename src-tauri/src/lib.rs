@@ -5,8 +5,6 @@ use specta::Type;
 use specta_typescript::Typescript;
 use tauri::path::BaseDirectory;
 //use tauri::Emitter;
-use fs4::fs_std::FileExt;
-use std::fs::OpenOptions;
 use tauri::Manager;
 use tauri_plugin_cli::CliExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -15,6 +13,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 #[macro_use]
 mod logbus;
+mod single_instance;
 mod streamer;
 
 #[cfg(target_os = "windows")]
@@ -548,43 +547,50 @@ pub fn run() {
                     _ => {
                         let lock_dir = app.path().app_local_data_dir().unwrap();
                         let _ = std::fs::create_dir_all(&lock_dir);
-                        let lock_file_path = lock_dir.join("screenextend.lock");
-                        let file = OpenOptions::new().write(true).create(true).open(lock_file_path);
-                        let mut result = true;
-                        if let Err(_) = file {
-                            result = app.dialog()
-                                .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
+                        let lock_path = lock_dir.join(single_instance::LOCK_FILE);
+                        let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
+
+                        let mut lock = single_instance::acquire_lock(&lock_path);
+
+                        if lock.is_none() {
+                            let quit_other = app
+                                .dialog()
+                                .message("ScreenExtend is already running.")
                                 .title("ScreenExtend")
-                                .buttons(MessageDialogButtons::OkCancel)
+                                .buttons(MessageDialogButtons::OkCancelCustom(
+                                    "Quit running instance".into(),
+                                    "Show running instance".into(),
+                                ))
                                 .blocking_show();
-                        } else if let Ok(file) = file {
-                            let try_lock = file.try_lock_exclusive();
-                            if let Err(_) = try_lock {
-                                result = app.dialog()
-                                    .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
-                                    .title("ScreenExtend")
-                                    .buttons(MessageDialogButtons::OkCancel)
-                                    .blocking_show();
-                            } else if let Ok(can_lock) = try_lock {
-                                if can_lock {
-                                    tauri::async_runtime::spawn(async move {
-                                        let _ = file.lock_exclusive();
-                                    });
-                                } else {
-                                    result = app.dialog()
-                                        .message("Another instance of ScreenExtend has been detected. It is highly recommended to only run one instance at a time. Click OK to continue or Cancel to exit.")
-                                        .title("ScreenExtend")
-                                        .buttons(MessageDialogButtons::OkCancel)
-                                        .blocking_show();
+
+                            if quit_other {
+                                single_instance::signal_running_instance(
+                                    &ctrl_path,
+                                    single_instance::Command::Quit,
+                                );
+                                lock = single_instance::wait_for_lock(
+                                    &lock_path,
+                                    std::time::Duration::from_secs(10),
+                                );
+                                if lock.is_none() {
+                                    std::process::exit(0);
                                 }
+                            } else {
+                                single_instance::signal_running_instance(
+                                    &ctrl_path,
+                                    single_instance::Command::Focus,
+                                );
+                                std::process::exit(0);
                             }
                         }
-                        if !result {
-                            std::process::exit(0);
+
+                        if let Some(file) = lock {
+                            std::mem::forget(file);
                         }
+
                         builder.mount_events(app);
                         logbus::attach(app.handle().clone());
-                        tauri::WebviewWindowBuilder::new(
+                        let window = tauri::WebviewWindowBuilder::new(
                             app,
                             "main".to_string(),
                             tauri::WebviewUrl::App("index.html".into()),
@@ -595,6 +601,16 @@ pub fn run() {
                         .resizable(true)
                         .maximized(true)
                         .build()?;
+
+                        focus_main_window(&window);
+
+                        if let Err(e) = single_instance::start_control_server(
+                            app.handle().clone(),
+                            ctrl_path,
+                            focus_main_window,
+                        ) {
+                            teprintln!("[single-instance] failed to start control server: {e}");
+                        }
                     }
                 }
             }
