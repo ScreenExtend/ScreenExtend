@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use super::session::{
     SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedDisconnectGrace,
-    SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
+    SharedLocalIps, SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +88,7 @@ impl Default for ScalePercent {
 pub struct Config {
     pub bind_ip: Ipv4Addr,
     pub lan_ip: Option<String>,
+    pub local_ips: Option<SharedLocalIps>,
     pub port: u16,
     pub https_port: u16,
     pub monitor: u32,
@@ -132,6 +133,7 @@ impl Default for Config {
         Self {
             bind_ip: Ipv4Addr::UNSPECIFIED,
             lan_ip: None,
+            local_ips: None,
             port: 8080,
             https_port: 8443,
             monitor: 1,

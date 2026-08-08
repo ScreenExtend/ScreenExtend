@@ -8,6 +8,7 @@
         <link rel="icon" type="image/svg+xml" href="/logo.svg" />
         <title>ScreenExtend Session</title>
         <link rel="stylesheet" href="/styles.css" />
+        <script>window.__SAME_DEVICE__ = __SAME_DEVICE_FLAG__;</script>
     </head>
     <body>
         <div id="join">
@@ -86,6 +87,16 @@
                 </div>
                 <div class="row" id="compatActions">
                     <button id="compatContinue" type="button">Continue</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="sameDeviceModal" role="dialog" aria-modal="true" style="z-index: 9997">
+            <div class="card">
+                <h2>You're on the device being controlled</h2>
+                <p>This browser is running on the same computer ScreenExtend is extending. To use it as a second screen, open this page on an additional device, like a phone, tablet, or another laptop.</p>
+                <div class="row">
+                    <button id="sameDeviceDismiss" type="button">Continue anyway</button>
                 </div>
             </div>
         </div>
@@ -853,6 +864,14 @@
                         compatModal.classList.remove('show');
                     };
                 }
+            })();
+
+            (function sameDeviceGate() {
+                if (!window.__SAME_DEVICE__) return;
+                const m = document.getElementById('sameDeviceModal');
+                const dismiss = document.getElementById('sameDeviceDismiss');
+                if (dismiss) dismiss.onclick = () => m.classList.remove('show');
+                m.classList.add('show');
             })();
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
