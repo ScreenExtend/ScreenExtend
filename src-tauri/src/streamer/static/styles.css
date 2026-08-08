@@ -46,7 +46,7 @@ html, body {
     transform: translateX(-50%);
 }
 
-#modal, #compatModal {
+#modal, #compatModal, #sameDeviceModal {
     position: fixed;
     inset: 0;
     z-index: 20;
@@ -57,11 +57,11 @@ html, body {
     background: rgba(0, 0, 0, 0.66);
 }
 
-#modal.show, #compatModal.show {
+#modal.show, #compatModal.show, #sameDeviceModal.show {
     display: flex;
 }
 
-#modal .card, #compatModal .card {
+#modal .card, #compatModal .card, #sameDeviceModal .card {
     max-width: 430px;
     background: #14171d;
     border: 1px solid #2a2f3a;
@@ -70,24 +70,24 @@ html, body {
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
 }
 
-#modal h2, #compatModal h2 {
+#modal h2, #compatModal h2, #sameDeviceModal h2 {
     margin: 0 0 .55rem;
     font-size: 16px;
     color: #e6e9ef;
 }
 
-#modal p, #compatModal p {
+#modal p, #compatModal p, #sameDeviceModal p {
     margin: 0 0 1rem;
     color: #aab2c2;
 }
 
-#modal .row, #compatModal .row {
+#modal .row, #compatModal .row, #sameDeviceModal .row {
     display: flex;
     gap: .6rem;
     flex-wrap: wrap;
 }
 
-#modal button, #compatModal button {
+#modal button, #compatModal button, #sameDeviceModal button {
     padding: .55rem 1rem;
     border: 0;
     border-radius: 9px;
@@ -100,7 +100,7 @@ html, body {
     color: #fff;
 }
 
-#dismiss {
+#dismiss, #sameDeviceDismiss {
     background: #2a2f3a;
     color: #cdd3df;
 }

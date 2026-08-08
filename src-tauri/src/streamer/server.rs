@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -16,7 +16,9 @@ use tokio::sync::oneshot;
 
 use super::config::{Config, ScalePercent};
 use super::pipeline;
-use super::session::{self, DeviceInfo, DeviceOverride, OtpLimiter, OtpOutcome, SharedOtpLimiter};
+use super::session::{
+    self, DeviceInfo, DeviceOverride, OtpLimiter, OtpOutcome, SharedLocalIps, SharedOtpLimiter,
+};
 use super::webrtc_session::{self, RTCIceServer};
 
 #[derive(Deserialize)]
@@ -50,6 +52,7 @@ pub struct AppState {
     ice_servers: Arc<Vec<RTCIceServer>>,
     net_json: Arc<String>,
     otp_limiter: SharedOtpLimiter,
+    local_ips: SharedLocalIps,
 }
 
 impl AppState {
@@ -58,8 +61,17 @@ impl AppState {
             ice_servers: Arc::new(build_ice_servers(&config)),
             net_json: Arc::new(build_net_json(&config)),
             otp_limiter: Arc::new(OtpLimiter::new()),
+            local_ips: config
+                .local_ips
+                .clone()
+                .unwrap_or_else(session::new_shared_local_ips),
             config: Arc::new(config),
         }
+    }
+
+    pub fn is_same_device(&self, peer: IpAddr) -> bool {
+        let ip = normalize_peer_ip(peer);
+        ip.is_loopback() || self.local_ips.lock().unwrap().contains(&ip)
     }
 
     pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
@@ -137,6 +149,32 @@ pub fn ephemeral_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
             None
         }
     }
+}
+
+fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+pub fn collect_local_ips<I, S>(adapter_ips: I) -> Vec<IpAddr>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut ips: Vec<IpAddr> = vec![
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+    for ip in adapter_ips {
+        if let Ok(parsed) = ip.as_ref().parse::<IpAddr>() {
+            ips.push(normalize_peer_ip(parsed));
+        }
+    }
+    ips.sort();
+    ips.dedup();
+    ips
 }
 
 pub struct ProcessedResponse {
@@ -219,8 +257,16 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("static/index.html"))
+async fn index(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Html<String> {
+    let flag = if state.is_same_device(peer.ip()) {
+        "true"
+    } else {
+        "false"
+    };
+    Html(include_str!("static/index.html").replace("__SAME_DEVICE_FLAG__", flag))
 }
 
 async fn transform_worker() -> Response {

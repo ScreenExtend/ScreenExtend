@@ -37,6 +37,7 @@ pub struct AppState {
     pub stop_hosted_network: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     pub hosted_network_running: Mutex<bool>,
     pub network_adapters: Mutex<Vec<NetworkInfo>>,
+    pub local_ips: session::SharedLocalIps,
     pub streamers: Mutex<HashMap<String, StreamerHandle>>,
     pub session_auth: SessionAuth,
     pub device_reporter: SharedDeviceReporter,
@@ -214,6 +215,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         stop_hosted_network: Mutex::new(None),
         hosted_network_running: Mutex::new(false),
         network_adapters: Mutex::new(Vec::new()),
+        local_ips: session::new_shared_local_ips(),
         streamers: Mutex::new(HashMap::new()),
         session_auth: SessionAuth::default(),
         device_reporter,
@@ -548,14 +550,22 @@ pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange 
 }
 
 pub fn sync_streamers(state: &AppState) {
-    let desired: Vec<(String, Ipv4Addr)> = {
+    let (desired, fresh_local_ips) = {
         let adapters = state.network_adapters.lock().unwrap();
-        adapters
+        let desired: Vec<(String, Ipv4Addr)> = adapters
             .iter()
             .flat_map(|adapter| adapter.ip_addresses.iter())
             .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(|addr| (ip.clone(), addr)))
-            .collect()
+            .collect();
+        let fresh_local_ips = crate::streamer::server::collect_local_ips(
+            adapters
+                .iter()
+                .flat_map(|adapter| adapter.ip_addresses.iter().map(String::as_str)),
+        );
+        (desired, fresh_local_ips)
     };
+
+    *state.local_ips.lock().unwrap() = fresh_local_ips;
 
     let (http_port, https_port) = state.server_ports.get();
 
@@ -582,6 +592,7 @@ pub fn sync_streamers(state: &AppState) {
         let config = Config {
             bind_ip: addr,
             lan_ip: Some(ip.clone()),
+            local_ips: Some(state.local_ips.clone()),
             port: http_port,
             https_port,
             virtual_display: Some(state.virtual_display.clone()),

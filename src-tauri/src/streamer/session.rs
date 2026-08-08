@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +39,12 @@ pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
 
 pub type SharedDeviceOverrides = Arc<Mutex<HashMap<String, DeviceOverride>>>;
+
+pub type SharedLocalIps = Arc<Mutex<Vec<IpAddr>>>;
+
+pub fn new_shared_local_ips() -> SharedLocalIps {
+    Arc::new(Mutex::new(Vec::new()))
+}
 
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
 
