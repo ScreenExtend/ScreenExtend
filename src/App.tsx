@@ -21,6 +21,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
 
@@ -97,6 +98,7 @@ function App() {
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
   const { toast } = useToast();
+  const { t } = useTranslation();
 
   useEffect(() => {
     if (sessionId && otp) {
@@ -135,8 +137,8 @@ function App() {
       unlisteners.push(await events.hostedNetworkNoPassword.listen(() => {
         toast({
           variant: "destructive",
-          title: "Network Created Without Password",
-          description: "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it.",
+          title: t("toasts.networkCreatedNoPassword.title"),
+          description: t("toasts.networkCreatedNoPassword.description"),
         });
       }));
       unlisteners.push(await events.sessionIdChange.listen(async event => {
@@ -180,10 +182,10 @@ function App() {
     }}>
       <ThemeProvider defaultTheme="system">
           <RouterProvider router={router} />
-          <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 9999 }}>
+          <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 999999 }}>
             <div className="rounded-lg p-6 flex flex-col items-center">
               <Loader2 className="animate-spin text-white mb-4" size={48} />
-              <p className="text-xl font-semibold text-white">Closing</p>
+              <p className="text-xl font-semibold text-white">{t("app.closing")}</p>
             </div>
           </div>
         </ThemeProvider>

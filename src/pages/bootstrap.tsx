@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { Loader2 } from "lucide-react";
@@ -17,9 +17,21 @@ import { createConfig, getConfig, updateConfig } from "@/components/config-provi
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, type CompatibilityReport } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
+import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+
+function withBold(template: string, value: ReactNode): ReactNode {
+  const [before, after = ""] = template.split(/\{\w+\}/);
+  return (
+    <>
+      {before}
+      <b>{value}</b>
+      {after}
+    </>
+  );
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -35,6 +47,7 @@ function formatBytes(bytes: number): string {
 
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
+  const { t } = useTranslation();
   const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
 
   const [error, setError] = useState(false);
@@ -186,12 +199,12 @@ export default function Bootstrap() {
       <AlertDialog open={updating}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Downloading Update</AlertDialogTitle>
+            <AlertDialogTitle>{t("bootstrap.update.title")}</AlertDialogTitle>
             <AlertDialogDescription>
               {updateVersion && (
-                <>A new version (<b>v{updateVersion}</b>) of ScreenExtend is being downloaded and installed. </>
+                <>{withBold(t("bootstrap.update.versionNote"), `v${updateVersion}`)} </>
               )}
-              The app will restart automatically once the update is ready. Please don't close it.
+              {t("bootstrap.update.restartNote")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="space-y-2">
@@ -205,20 +218,20 @@ export default function Bootstrap() {
             </div>
             <p className="text-center text-sm text-muted-foreground">
               {updatePct === null
-                ? (downloaded > 0 ? `Downloaded ${formatBytes(downloaded)}` : "Preparing download…")
-                : `${updatePct}% • ${formatBytes(downloaded)} of ${formatBytes(total)}`}
+                ? (downloaded > 0 ? t("bootstrap.update.downloaded", { size: formatBytes(downloaded) }) : t("bootstrap.update.preparing"))
+                : t("bootstrap.update.progress", { pct: updatePct, downloaded: formatBytes(downloaded), total: formatBytes(total) })}
             </p>
           </div>
         </AlertDialogContent>
       </AlertDialog>
       <Loader2 className="animate-spin mb-4" size={48} />
-      <p className="text-xl font-semibold">Starting ScreenExtend</p>
+      <p className="text-xl font-semibold">{t("bootstrap.starting")}</p>
       <AlertDialog open={error}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Setup Error</AlertDialogTitle>
+            <AlertDialogTitle>{t("bootstrap.setupError.title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              There was an error while attepting to start ScreenExtend. This often occurs due to core drivers or libraries not being installed. <b>Click the button below to install the missing components.</b> If this error is recurring, contact support at <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>support@screenextend.app</a>.
+              {t("bootstrap.setupError.bodyBeforePrompt")}<b>{t("bootstrap.setupError.installPrompt")}</b>{t("bootstrap.setupError.bodyAfterPrompt")}<a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>{t("common.supportEmail")}</a>{t("bootstrap.setupError.contactSuffix")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -234,7 +247,7 @@ export default function Bootstrap() {
               }}
               disabled={loading}
             >
-              Install Drivers
+              {t("bootstrap.setupError.install")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -243,34 +256,34 @@ export default function Bootstrap() {
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {compatBlocking ? "Unsupported Operating System" : "Limited System Support"}
+              {compatBlocking ? t("bootstrap.compatibility.blockingTitle") : t("bootstrap.compatibility.limitedTitle")}
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3 text-left">
                 <div>
-                  Detected system: <b>{compatReport?.os_version}</b>
+                  {t("bootstrap.compatibility.detectedLabel")} <b>{compatReport?.os_version}</b>
                   <br />
-                  Minimum required: <b>{compatReport?.min_os_version}</b>
+                  {t("bootstrap.compatibility.minimumLabel")} <b>{compatReport?.min_os_version}</b>
                 </div>
                 {compatReport && compatReport.unsupported_apis.length > 0 && (
                   <div>
                     {compatBlocking
-                      ? "ScreenExtend cannot run because the following required platform APIs are unavailable on this system:"
-                      : "The following platform APIs are unavailable. ScreenExtend can continue, but these features will be limited or non-functional:"}
+                      ? t("bootstrap.compatibility.blockingIntro")
+                      : t("bootstrap.compatibility.limitedIntro")}
                     <ul className="list-disc pl-5 mt-2 space-y-1">
                       {compatReport.unsupported_apis.map(api => (
                         <li key={api.name}>
-                          <b>{api.name}</b> — {api.description} (requires {api.required_version})
+                          <b>{api.name}</b> — {api.description} {t("bootstrap.compatibility.apiRequires", { version: api.required_version })}
                         </li>
                       ))}
                     </ul>
                   </div>
                 )}
                 <div>
-                  Please upgrade your operating system or contact support at{" "}
-                  <a href="mailto:support@screenextend.app" target="_blank" style={{ textDecoration: "underline" }}>
-                    support@screenextend.app
-                  </a>.
+                  {t("bootstrap.compatibility.upgradeBefore")}
+                  <a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>
+                    {t("common.supportEmail")}
+                  </a>{t("bootstrap.compatibility.upgradeSuffix")}
                 </div>
               </div>
             </AlertDialogDescription>
@@ -286,7 +299,7 @@ export default function Bootstrap() {
                 htmlFor="compatDontShowAgain"
                 className="text-sm text-muted-foreground cursor-pointer"
               >
-                Don't show this message again
+                {t("common.dontShowAgain")}
               </label>
             </div>
           )}
@@ -300,14 +313,14 @@ export default function Bootstrap() {
                   void runSetup(true);
                 }}
               >
-                Continue
+                {t("common.continue")}
               </AlertDialogAction>
             )}
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={() => commands.exitApp()}
             >
-              Exit
+              {t("common.exit")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

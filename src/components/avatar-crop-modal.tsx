@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { AVATAR_OUTPUT_SIZE } from "@/lib/avatar";
+import { useTranslation } from "@/i18n";
 
 const OUTPUT = AVATAR_OUTPUT_SIZE;
 const MAX_ZOOM = 4;
@@ -15,6 +16,7 @@ type AvatarCropModalProps = {
 };
 
 export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCropModalProps) {
+  const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const coverRef = useRef(1);
@@ -139,9 +141,9 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
       aria-modal="true"
     >
       <div className="w-full max-w-sm rounded-lg border bg-background p-6 shadow-lg">
-        <h3 className="text-lg font-semibold">Adjust your profile picture</h3>
+        <h3 className="text-lg font-semibold">{t("dialogs.avatarCrop.title")}</h3>
         <p className="mt-1 text-sm text-muted-foreground">
-          Drag to reposition and use the slider to zoom.
+          {t("dialogs.avatarCrop.description")}
         </p>
         <div className="mt-4 flex justify-center">
           <div
@@ -166,7 +168,7 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
           </div>
         </div>
         <div className="mt-5 flex items-center gap-3">
-          <span className="text-xs text-muted-foreground">Zoom</span>
+          <span className="text-xs text-muted-foreground">{t("dialogs.avatarCrop.zoom")}</span>
           <Slider
             value={[zoom]}
             min={1}
@@ -178,10 +180,10 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
         </div>
         <div className="mt-6 flex justify-end gap-2">
           <Button variant="outline" onClick={onCancel} disabled={saving}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button onClick={() => void handleSave()} disabled={!ready || saving}>
-            {saving ? "Saving…" : "Save Photo"}
+            {saving ? t("dialogs.avatarCrop.saving") : t("dialogs.avatarCrop.save")}
           </Button>
         </div>
       </div>

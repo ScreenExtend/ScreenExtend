@@ -44,6 +44,7 @@ import {
 
 import { updateConfig, getConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
 import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 import { useFormik } from "formik";
@@ -85,6 +86,7 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [tempRate, setTempRate] = useState(device.refreshRate);
   const [tempQuality, setTempQuality] = useState(device.videoQuality);
   const { toast } = useToast();
+  const { t } = useTranslation();
 
   const deviceDetails = useFormik({
     initialValues: {
@@ -112,8 +114,8 @@ export function DeviceDetails({ device }: { device: Device }) {
       await events.deviceModify.emit(normalized);
       setInProgress(false);
       toast({
-        title: "Device Settings Updated",
-        description: "Your device settings have successfully been updated.",
+        title: t("toasts.device.updatedTitle"),
+        description: t("toasts.device.updatedDescription"),
       });
       setOpen(false);
     },
@@ -405,8 +407,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                 await events.deviceRemove.emit(device);
                 setInProgress(false);
                 toast({
-                  title: "Device Removed",
-                  description: "Your device has been successfully removed.",
+                  title: t("toasts.device.removedTitle"),
+                  description: t("toasts.device.removedDescription"),
                 });
                 setOpen(false);
               }}
@@ -428,9 +430,9 @@ export function DeviceDetails({ device }: { device: Device }) {
       <AlertDialog open={warningDialogOpen} onOpenChange={setWarningDialogOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Edit Device</AlertDialogTitle>
+            <AlertDialogTitle>{t("dialogs.editDeviceUnsaved.title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              You have unsaved changes. Clicking continue will discard your edits.
+              {t("dialogs.editDeviceUnsaved.description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="flex items-center space-x-2 mb-4">
@@ -443,7 +445,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               htmlFor="dontShowAgain"
               className="text-sm text-muted-foreground cursor-pointer"
             >
-              Don't show this message again
+              {t("common.dontShowAgain")}
             </label>
           </div>
           <AlertDialogFooter>
@@ -452,7 +454,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 setWarningDialogOpen(false);
               }}
             >
-              Cancel
+              {t("common.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
@@ -463,7 +465,7 @@ export function DeviceDetails({ device }: { device: Device }) {
                 deviceDetails.resetForm({ values: device });
               }}
             >
-              Continue
+              {t("common.continue")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -491,6 +493,7 @@ export function DeviceDetails({ device }: { device: Device }) {
 //};
 
 export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
+  const { t } = useTranslation();
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
@@ -499,23 +502,23 @@ export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button
           variant="outline"
           disabled={props.disabled}
         >
-          Remove Device
+          {t("dialogs.removeDevice.trigger")}
         </Button>
       </AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Remove Device</AlertDialogTitle>
+          <AlertDialogTitle>{t("dialogs.removeDevice.title")}</AlertDialogTitle>
           <AlertDialogDescription>
-            This action cannot be undone. The device will immediately disconnect but can reconnect for future sessions.
+            {t("dialogs.removeDevice.description")}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
           <AlertDialogAction
             className="bg-red-600 hover:bg-red-700 text-white"
             onClick={props.onClick}
           >
-            Continue
+            {t("common.continue")}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

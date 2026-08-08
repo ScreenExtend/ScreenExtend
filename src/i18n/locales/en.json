@@ -1,0 +1,163 @@
+{
+  "$comment": "All user-facing modal and notification text lives here. To translate the app, copy this file to <language-code>.json (e.g. es.json, fr.json) in the same folder, translate the values, and it will be picked up automatically. Keep the {placeholders} intact. The active language is read from the 'locale' key in localStorage and falls back to 'en'.",
+  "common": {
+    "cancel": "Cancel",
+    "continue": "Continue",
+    "done": "Done",
+    "exit": "Exit",
+    "dontShowAgain": "Don't show this message again",
+    "supportEmail": "support@screenextend.app"
+  },
+  "app": {
+    "closing": "Closing"
+  },
+  "toasts": {
+    "networkCreatedNoPassword": {
+      "title": "Network Created Without Password",
+      "description": "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it."
+    },
+    "displaySettingsUnavailable": {
+      "title": "Unable to Open Display Settings",
+      "description": "Please adjust your display settings manually."
+    },
+    "disconnectTimeout": {
+      "title": "Disconnect Timeout Updated",
+      "immediate": "Displays of disconnected devices will now be removed immediately.",
+      "delayed": "Disconnected devices now have {seconds} {unit} to reconnect before their display is removed.",
+      "second": "second",
+      "seconds": "seconds"
+    },
+    "turn": {
+      "savedTitle": "TURN Server Saved",
+      "clearedTitle": "TURN Server Cleared",
+      "savedDescription": "Devices on other networks will now relay through this TURN server. It applies on the next connection.",
+      "clearedDescription": "No TURN server is configured. Connections across different networks may fail."
+    },
+    "publicSessions": {
+      "enabledTitle": "Public Sessions Enabled",
+      "enabledDescription": "Devices on other networks can now join over the internet using your session link on the Add Device screen.",
+      "disabledTitle": "Public Sessions Disabled",
+      "disabledDescription": "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app."
+    },
+    "gpuEncoding": {
+      "disabledTitle": "GPU Video Encoding Disabled",
+      "enabledTitle": "GPU Video Encoding Enabled",
+      "disabledDescription": "Video is now encoded on the CPU (software). This uses far more CPU and can lower quality or frame rate. Connected devices reconnect using the software encoder.",
+      "enabledDescription": "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder."
+    },
+    "invalidPorts": {
+      "title": "Invalid Ports",
+      "description": "Enter two different port numbers between 1 and 65535 for HTTP and HTTPS."
+    },
+    "serverPorts": {
+      "title": "Server Ports Updated",
+      "description": "Local network streaming now uses HTTP port {http} and HTTPS port {https}. Connected devices were disconnected and must rejoin using the updated links."
+    },
+    "networkCreate": {
+      "successTitle": "Network Creation Success",
+      "successDescription": "The hosted network has successfully been created. Connect other devices to the \"{name}\" Wifi network.",
+      "failureTitle": "Network Creation Failure",
+      "failureDescription": "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card, such as hotspot."
+    },
+    "networkStop": {
+      "title": "Network Stop Success",
+      "description": "The hosted network has successfully been stopped. All devices have been disconnected."
+    },
+    "networkSettings": {
+      "successTitle": "Network Settings Update Success",
+      "successDescription": "The network settings have successfully been updated.",
+      "failureTitle": "Network Settings Update Failure",
+      "failureDescription": "There was an error in updating the network settings."
+    },
+    "avatar": {
+      "saveFailedTitle": "Couldn't Save Photo",
+      "saveFailedDescription": "There was a problem writing your profile picture to disk. Please try again.",
+      "updatedTitle": "Profile Picture Updated",
+      "updatedDescription": "Your new profile picture has been saved.",
+      "removeFailedTitle": "Couldn't Remove Photo",
+      "removeFailedDescription": "There was a problem removing your profile picture. Please try again.",
+      "removedTitle": "Profile Picture Removed",
+      "removedDescription": "Your profile picture has been reset to the default."
+    },
+    "account": {
+      "updatedTitle": "Account Settings Updated",
+      "updatedDescription": "Your name has been updated."
+    },
+    "wifi": {
+      "turnOnFailedTitle": "Couldn't Turn On Wi-Fi",
+      "turnOnFailedDescription": "Please enable Wi-Fi manually from Windows settings, then try again."
+    },
+    "device": {
+      "updatedTitle": "Device Settings Updated",
+      "updatedDescription": "Your device settings have successfully been updated.",
+      "removedTitle": "Device Removed",
+      "removedDescription": "Your device has been successfully removed."
+    }
+  },
+  "dialogs": {
+    "editNetwork": {
+      "trigger": "Save Settings",
+      "title": "Change network settings?",
+      "description": "This action will cause devices on the network to be disconnected. They will need to rejoin the network with the new name and/or password."
+    },
+    "turnOnWifi": {
+      "title": "Turn on Wi-Fi?",
+      "description": "Hosting a network requires Wi-Fi to be turned on.",
+      "turnOn": "Turn On",
+      "turningOn": "Turning On…"
+    },
+    "wifiQr": {
+      "title": "Join \"{name}\"",
+      "description": "Scan this code to connect to the Wi-Fi network.",
+      "networkLabel": "Network",
+      "passwordLabel": "Password",
+      "noPassword": "None"
+    },
+    "editDeviceUnsaved": {
+      "title": "Edit Device",
+      "description": "You have unsaved changes. Clicking continue will discard your edits."
+    },
+    "removeDevice": {
+      "trigger": "Remove Device",
+      "title": "Remove Device",
+      "description": "This action cannot be undone. The device will immediately disconnect but can reconnect for future sessions."
+    },
+    "avatarCrop": {
+      "title": "Adjust your profile picture",
+      "description": "Drag to reposition and use the slider to zoom.",
+      "zoom": "Zoom",
+      "save": "Save Photo",
+      "saving": "Saving…"
+    }
+  },
+  "bootstrap": {
+    "starting": "Starting ScreenExtend",
+    "update": {
+      "title": "Downloading Update",
+      "versionNote": "A new version ({version}) of ScreenExtend is being downloaded and installed.",
+      "restartNote": "The app will restart automatically once the update is ready. Please don't close it.",
+      "preparing": "Preparing download…",
+      "downloaded": "Downloaded {size}",
+      "progress": "{pct}% • {downloaded} of {total}"
+    },
+    "setupError": {
+      "title": "Setup Error",
+      "bodyBeforePrompt": "There was an error while attempting to start ScreenExtend. This often occurs due to core drivers or libraries not being installed. ",
+      "installPrompt": "Click the button below to install the missing components.",
+      "bodyAfterPrompt": " If this error is recurring, contact support at ",
+      "contactSuffix": ".",
+      "install": "Install Drivers"
+    },
+    "compatibility": {
+      "blockingTitle": "Unsupported Operating System",
+      "limitedTitle": "Limited System Support",
+      "detectedLabel": "Detected system:",
+      "minimumLabel": "Minimum required:",
+      "blockingIntro": "ScreenExtend cannot run because the following required platform APIs are unavailable on this system:",
+      "limitedIntro": "The following platform APIs are unavailable. ScreenExtend can continue, but these features will be limited or non-functional:",
+      "apiRequires": "(requires {version})",
+      "upgradeBefore": "Please upgrade your operating system or contact support at ",
+      "upgradeSuffix": "."
+    }
+  }
+}

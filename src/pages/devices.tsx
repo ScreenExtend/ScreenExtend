@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/table";
 
 import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import { Command } from "@tauri-apps/plugin-shell";
 import { type } from "@tauri-apps/plugin-os";
 import { GlobalProviderContext } from "@/components/global-provider";
@@ -30,6 +31,7 @@ export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
   const { windowDevices: [devices] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
+  const { t } = useTranslation();
 
   return (
     <Layout>
@@ -60,8 +62,8 @@ export default function Devices() {
                 await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).execute();
               } else {
                 toast({
-                  title: "Unable to Open Display Settings",
-                  description: "Please adjust your display settings manually.",
+                  title: t("toasts.displaySettingsUnavailable.title"),
+                  description: t("toasts.displaySettingsUnavailable.description"),
                 });
               }
             }}>

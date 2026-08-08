@@ -37,6 +37,7 @@ import { updateConfig, getConfig, flushConfig, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_
 import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import { commands } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
@@ -51,6 +52,7 @@ const SUPPORTS_WIFI_QR = IS_WINDOWS || IS_MACOS;
 export default function Settings() {
   const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
+  const { t } = useTranslation();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [cropSrc, setCropSrc] = useState<string | null>(null);
@@ -140,8 +142,13 @@ export default function Settings() {
     localStorage.setItem("disconnectGraceSecs", String(seconds));
     setOldDisconnectGrace(String(seconds));
     toast({
-      title: "Disconnect Timeout Updated",
-      description: seconds === 0 ? "Displays of disconnected devices will now be removed immediately." : `Disconnected devices now have ${seconds} second${seconds === 1 ? "" : "s"} to reconnect before their display is removed.`,
+      title: t("toasts.disconnectTimeout.title"),
+      description: seconds === 0
+        ? t("toasts.disconnectTimeout.immediate")
+        : t("toasts.disconnectTimeout.delayed", {
+            seconds,
+            unit: t(seconds === 1 ? "toasts.disconnectTimeout.second" : "toasts.disconnectTimeout.seconds"),
+          }),
     });
   };
 
@@ -155,10 +162,8 @@ export default function Settings() {
     await commands.setTurnConfig(urls, username, credential);
     await updateConfig({ turnConfig: { urls, username, credential } });
     toast({
-      title: urls ? "TURN Server Saved" : "TURN Server Cleared",
-      description: urls
-        ? "Devices on other networks will now relay through this TURN server. It applies on the next connection."
-        : "No TURN server is configured. Connections across different networks may fail.",
+      title: urls ? t("toasts.turn.savedTitle") : t("toasts.turn.clearedTitle"),
+      description: urls ? t("toasts.turn.savedDescription") : t("toasts.turn.clearedDescription"),
     });
   };
 
@@ -169,14 +174,14 @@ export default function Settings() {
     if (enabled) {
       if (sessionId) void commands.registerCloudSession(sessionId);
       toast({
-        title: "Public Sessions Enabled",
-        description: "Devices on other networks can now join over the internet using your session link on the Add Device screen.",
+        title: t("toasts.publicSessions.enabledTitle"),
+        description: t("toasts.publicSessions.enabledDescription"),
       });
     } else {
       void commands.unregisterCloudSession();
       toast({
-        title: "Public Sessions Disabled",
-        description: "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app.",
+        title: t("toasts.publicSessions.disabledTitle"),
+        description: t("toasts.publicSessions.disabledDescription"),
       });
     }
   };
@@ -187,10 +192,8 @@ export default function Settings() {
     await updateConfig({ disableGpuEncode: disabled });
     await flushConfig();
     toast({
-      title: disabled ? "GPU Video Encoding Disabled" : "GPU Video Encoding Enabled",
-      description: disabled
-        ? "Video is now encoded on the CPU (software). This uses far more CPU and can lower quality or frame rate. Connected devices reconnect using the software encoder."
-        : "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder.",
+      title: disabled ? t("toasts.gpuEncoding.disabledTitle") : t("toasts.gpuEncoding.enabledTitle"),
+      description: disabled ? t("toasts.gpuEncoding.disabledDescription") : t("toasts.gpuEncoding.enabledDescription"),
     });
   };
 
@@ -202,8 +205,8 @@ export default function Settings() {
       setHttpPort(oldHttpPort);
       setHttpsPort(oldHttpsPort);
       toast({
-        title: "Invalid Ports",
-        description: "Enter two different port numbers between 1 and 65535 for HTTP and HTTPS.",
+        title: t("toasts.invalidPorts.title"),
+        description: t("toasts.invalidPorts.description"),
       });
       return;
     }
@@ -217,8 +220,8 @@ export default function Settings() {
     await flushConfig();
     if (sessionId) setQrValues(await buildQrValues(sessionId, applied.http));
     toast({
-      title: "Server Ports Updated",
-      description: `Local network streaming now uses HTTP port ${applied.http} and HTTPS port ${applied.https}. Connected devices were disconnected and must rejoin using the updated links.`,
+      title: t("toasts.serverPorts.title"),
+      description: t("toasts.serverPorts.description", { http: applied.http, https: applied.https }),
     });
   };
 
@@ -246,8 +249,8 @@ export default function Settings() {
     if (success) {
       setHostedNetworkOn(true);
       toast({
-        title: "Network Creation Success",
-        description: "The hosted network has successfully been created. Connect other devices to the \"" + hostedNetworkName + "\" Wifi network.",
+        title: t("toasts.networkCreate.successTitle"),
+        description: t("toasts.networkCreate.successDescription", { name: hostedNetworkName }),
       });
       return true;
     }
@@ -257,8 +260,8 @@ export default function Settings() {
       setWifiModalOpen(true);
     } else {
       toast({
-        title: "Network Creation Failure",
-        description: "There was an error in creating the hosted network. Try the action again and ensure no other app is using the Wifi-Direct card, such as hotspot.",
+        title: t("toasts.networkCreate.failureTitle"),
+        description: t("toasts.networkCreate.failureDescription"),
       });
     }
     return false;
@@ -282,16 +285,16 @@ export default function Settings() {
     const ok = await saveAvatar(bytes);
     if (!ok) {
       toast({
-        title: "Couldn't Save Photo",
-        description: "There was a problem writing your profile picture to disk. Please try again.",
+        title: t("toasts.avatar.saveFailedTitle"),
+        description: t("toasts.avatar.saveFailedDescription"),
       });
       return;
     }
     setAvatar(dataUrl);
     closeCrop();
     toast({
-      title: "Profile Picture Updated",
-      description: "Your new profile picture has been saved.",
+      title: t("toasts.avatar.updatedTitle"),
+      description: t("toasts.avatar.updatedDescription"),
     });
   };
 
@@ -299,15 +302,15 @@ export default function Settings() {
     const ok = await clearAvatar();
     if (!ok) {
       toast({
-        title: "Couldn't Remove Photo",
-        description: "There was a problem removing your profile picture. Please try again.",
+        title: t("toasts.avatar.removeFailedTitle"),
+        description: t("toasts.avatar.removeFailedDescription"),
       });
       return;
     }
     setAvatar(null);
     toast({
-      title: "Profile Picture Removed",
-      description: "Your profile picture has been reset to the default.",
+      title: t("toasts.avatar.removedTitle"),
+      description: t("toasts.avatar.removedDescription"),
     });
   };
 
@@ -412,8 +415,8 @@ export default function Settings() {
                       setShowHostedNetworkPassword(false);
                       setHostedNetworkOn(false);
                       toast({
-                        title: "Network Stop Success",
-                        description: "The hosted network has successfully been stopped. All devices have been disconnected.",
+                        title: t("toasts.networkStop.title"),
+                        description: t("toasts.networkStop.description"),
                       });
                     }
                   }}
@@ -489,15 +492,15 @@ export default function Settings() {
                           setOldHostedNetworkName(hostedNetworkName);
                           setOldHostedNetworkPassword(hostedNetworkPassword);
                           toast({
-                            title: "Network Settings Update Success",
-                            description: "The network settings have successfully been updated.",
+                            title: t("toasts.networkSettings.successTitle"),
+                            description: t("toasts.networkSettings.successDescription"),
                           });
                         } else {
                           setHostedNetworkName(oldHostedNetworkName);
                           setHostedNetworkPassword(oldHostedNetworkPassword);
                           toast({
-                            title: "Network Settings Update Failure",
-                            description: "The was an error in updating the network settings.",
+                            title: t("toasts.networkSettings.failureTitle"),
+                            description: t("toasts.networkSettings.failureDescription"),
                           });
                         }
                       }
@@ -622,8 +625,8 @@ export default function Settings() {
                     setAccountName(trimmed);
                     await updateConfig({ name: trimmed });
                     toast({
-                      title: "Account Settings Updated",
-                      description: "Your name has been updated.",
+                      title: t("toasts.account.updatedTitle"),
+                      description: t("toasts.account.updatedDescription"),
                     });
                   }
                 }}>
@@ -851,13 +854,13 @@ export default function Settings() {
       </div>
       <AlertDialog open={hostedNetworkModalOpen}>
         <AlertDialogTrigger asChild>
-          Save Settings
+          {t("dialogs.editNetwork.trigger")}
         </AlertDialogTrigger>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Change network settings?</AlertDialogTitle>
+            <AlertDialogTitle>{t("dialogs.editNetwork.title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              This action will cause devices on the network to be disconnected. They will need to rejoin the network with the new name and/or password.
+              {t("dialogs.editNetwork.description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="flex items-center space-x-2 mb-4">
@@ -870,7 +873,7 @@ export default function Settings() {
               htmlFor="dontShowAgain"
               className="text-sm text-muted-foreground cursor-pointer"
             >
-              Don't show this message again
+              {t("common.dontShowAgain")}
             </label>
           </div>
           <AlertDialogFooter>
@@ -884,7 +887,7 @@ export default function Settings() {
               disabled={disabled}
               className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
             >
-              Cancel
+              {t("common.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
@@ -899,20 +902,20 @@ export default function Settings() {
                   setOldHostedNetworkName(hostedNetworkName);
                   setOldHostedNetworkPassword(hostedNetworkPassword);
                   toast({
-                    title: "Network Settings Update Success",
-                    description: "The network settings have successfully been updated.",
+                    title: t("toasts.networkSettings.successTitle"),
+                    description: t("toasts.networkSettings.successDescription"),
                   });
                 } else {
                   setHostedNetworkName(oldHostedNetworkName);
                   setHostedNetworkPassword(oldHostedNetworkPassword);
                   toast({
-                    title: "Network Settings Update Failure",
-                    description: "The was an error in updating the network settings.",
+                    title: t("toasts.networkSettings.failureTitle"),
+                    description: t("toasts.networkSettings.failureDescription"),
                   });
                 }
               }}
             >
-              Continue
+              {t("common.continue")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -920,9 +923,9 @@ export default function Settings() {
       <AlertDialog open={wifiModalOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Turn on Wi-Fi?</AlertDialogTitle>
+            <AlertDialogTitle>{t("dialogs.turnOnWifi.title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              Hosting a network requires Wi-Fi to be turned on.
+              {t("dialogs.turnOnWifi.description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -931,7 +934,7 @@ export default function Settings() {
               disabled={wifiTurningOn}
               className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
             >
-              Cancel
+              {t("common.cancel")}
             </AlertDialogCancel>
             <AlertDialogAction
               disabled={wifiTurningOn}
@@ -944,15 +947,15 @@ export default function Settings() {
                   await startNetworkWithFeedback({ fromWifiModal: true });
                 } else {
                   toast({
-                    title: "Couldn't Turn On Wi-Fi",
-                    description: "Please enable Wi-Fi manually from Windows settings, then try again.",
+                    title: t("toasts.wifi.turnOnFailedTitle"),
+                    description: t("toasts.wifi.turnOnFailedDescription"),
                   });
                 }
                 setWifiTurningOn(false);
                 setWifiModalOpen(false);
               }}
             >
-              {wifiTurningOn ? "Turning On…" : "Turn On"}
+              {wifiTurningOn ? t("dialogs.turnOnWifi.turningOn") : t("dialogs.turnOnWifi.turnOn")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -960,9 +963,9 @@ export default function Settings() {
       <AlertDialog open={wifiQrModalOpen} onOpenChange={setWifiQrModalOpen}>
         <AlertDialogContent className="max-w-sm">
           <AlertDialogHeader>
-            <AlertDialogTitle className="text-center">Join "{oldHostedNetworkName}"</AlertDialogTitle>
+            <AlertDialogTitle className="text-center">{t("dialogs.wifiQr.title", { name: oldHostedNetworkName })}</AlertDialogTitle>
             <AlertDialogDescription className="text-center">
-              Scan this code to connect to the Wi-Fi network.
+              {t("dialogs.wifiQr.description")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="rounded-xl bg-white p-4">
@@ -974,17 +977,17 @@ export default function Settings() {
           </div>
           <div className="space-y-1 text-sm">
             <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">Network</span>
+              <span className="text-muted-foreground">{t("dialogs.wifiQr.networkLabel")}</span>
               <span className="break-all text-right font-medium">{oldHostedNetworkName}</span>
             </div>
             <div className="flex justify-between gap-4">
-              <span className="text-muted-foreground">Password</span>
-              <span className="break-all text-right font-medium">{oldHostedNetworkPassword || "None"}</span>
+              <span className="text-muted-foreground">{t("dialogs.wifiQr.passwordLabel")}</span>
+              <span className="break-all text-right font-medium">{oldHostedNetworkPassword || t("dialogs.wifiQr.noPassword")}</span>
             </div>
           </div>
           <AlertDialogFooter>
             <AlertDialogAction className="w-full hover:opacity-75" onClick={() => setWifiQrModalOpen(false)}>
-              Done
+              {t("common.done")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
