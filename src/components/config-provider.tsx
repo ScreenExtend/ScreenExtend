@@ -109,7 +109,7 @@ export const getSavedDevices = async (): Promise<Device[]> => {
 
 export const saveDeviceSettings = async (device: Device) => {
   const existing = await getSavedDevices();
-  const devices = [...existing.filter(d => d.ip !== device.ip), device];
+  const devices = [...existing.filter(d => d.ip !== device.ip), { ...device, name: "" }];
   await updateConfig({ devices });
 };
 

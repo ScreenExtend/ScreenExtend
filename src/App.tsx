@@ -12,7 +12,7 @@ import Settings from "@/pages/settings";
 import Devices from "@/pages/devices";
 import { Loader2 } from "lucide-react";
 
-import { getSavedDevices, getConfig, updateConfig, type Device } from "@/components/config-provider";
+import { getConfig, updateConfig, type Device } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -116,13 +116,11 @@ function App() {
   useEffect(() => {
     const unlisteners: (() => void)[] = [];
     const start_listener = async () => {
-      unlisteners.push(await events.deviceJoin.listen(async event => {
+      unlisteners.push(await events.deviceJoin.listen(event => {
         const device = event.payload as Device;
-        const saved = (await getSavedDevices()).find(d => d.ip === device.ip);
-        const merged = saved && saved.name ? { ...device, name: saved.name } : device;
         setDevices(prev => {
-          const next = prev.filter(d => d.ip !== merged.ip);
-          next.push(merged);
+          const next = prev.filter(d => d.ip !== device.ip);
+          next.push(device);
           return next;
         });
       }));
