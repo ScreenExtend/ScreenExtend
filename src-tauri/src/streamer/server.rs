@@ -505,7 +505,7 @@ async fn start_session(
         .device_overrides
         .as_ref()
         .and_then(|o| o.lock().unwrap().get(client_ip).copied());
-    let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
+    let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(false);
     if let Some(o) = override_for_ip {
         cfg.scale = ScalePercent::new(o.video_scale);
         cfg.qp = Some(o.video_quality);

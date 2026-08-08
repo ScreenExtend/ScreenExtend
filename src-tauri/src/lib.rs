@@ -118,7 +118,7 @@ impl Device {
             refresh_rate,
             video_scale: 100,
             video_quality: 15,
-            control_enabled: true,
+            control_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
         }
