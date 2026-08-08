@@ -82,6 +82,28 @@ impl CloudStatusSink for TauriCloudStatusSink {
     }
 }
 
+pub fn focus_main_window(window: &tauri::WebviewWindow) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    unsafe {
+        let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if !ns_app.is_null() {
+            let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+        }
+    }
+
+    match window.ns_window() {
+        Ok(ptr) if !ptr.is_null() => unsafe {
+            let ns_window = ptr as *mut AnyObject;
+            let nil: *mut AnyObject = std::ptr::null_mut();
+            let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+        },
+        Ok(_) => {}
+        Err(e) => teprintln!("[window] focus: failed to get ns_window: {e}"),
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn setup(app_handle: tauri::AppHandle) -> bool {

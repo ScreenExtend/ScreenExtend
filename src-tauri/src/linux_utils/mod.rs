@@ -16,6 +16,10 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn focus_main_window(window: &tauri::WebviewWindow) {
+    let _ = window.set_focus();
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn setup(app_handle: tauri::AppHandle) -> bool {

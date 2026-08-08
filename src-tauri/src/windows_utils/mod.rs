@@ -190,6 +190,46 @@ pub fn set_display_topology_extend() {
     }
 }
 
+pub fn focus_main_window(window: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    let hwnd = match window.hwnd() {
+        Ok(h) => HWND(h.0 as _),
+        Err(e) => {
+            teprintln!("[window] focus: failed to get hwnd: {e}");
+            return;
+        }
+    };
+
+    unsafe {
+        let cmd = if IsIconic(hwnd).as_bool() {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        };
+        let _ = ShowWindow(hwnd, cmd);
+
+        let foreground = GetForegroundWindow();
+        let fg_thread = GetWindowThreadProcessId(foreground, None);
+        let this_thread = GetCurrentThreadId();
+        let attach = fg_thread != 0
+            && fg_thread != this_thread
+            && AttachThreadInput(this_thread, fg_thread, true).as_bool();
+
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+
+        if attach {
+            let _ = AttachThreadInput(this_thread, fg_thread, false);
+        }
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn setup(app_handle: tauri::AppHandle) -> bool {
