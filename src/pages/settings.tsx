@@ -236,8 +236,6 @@ export default function Settings() {
     if (configLoaded) void updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
 
-  // The network keeps broadcasting the last applied credentials, so the QR reflects
-  // those rather than any unsaved edits in the name/password fields.
   useEffect(() => {
     if (!hostedNetworkOn) setWifiQrModalOpen(false);
   }, [hostedNetworkOn]);

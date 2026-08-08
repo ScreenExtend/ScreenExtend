@@ -789,9 +789,6 @@ impl Backend {
         }
     }
 
-    /// Whether captured frames must be downscaled to encode size before being handed over.
-    /// The Intel same-adapter path fuses the downscale into its VPP pass and wants the
-    /// native-size texture; every other path expects encode-size input.
     fn wants_prescale(&self) -> bool {
         !matches!(self, Backend::Intel { .. })
     }
@@ -877,8 +874,6 @@ impl Backend {
 struct EncodeCore {
     backend: Backend,
     scaler: Option<Scaler>,
-    /// CPU readback for texture-fed (DXGI duplication) captures on a CPU-bridge backend
-    /// without a scaler; `None` on the WGC path (it reads back via `Frame::buffer`).
     reader: Option<TextureReader>,
     target_bitrate: Arc<AtomicU32>,
     idr_request: Arc<AtomicBool>,
@@ -922,7 +917,6 @@ impl EncodeCore {
         Ok(au)
     }
 
-    /// Encode a raw capture-device texture (DXGI duplication path; no `windows_capture::Frame`).
     fn encode_texture(&mut self, tex: &ID3D11Texture2D) -> Result<Vec<u8>> {
         let force_idr = self.take_force_idr();
         apply_pending_bitrate(
