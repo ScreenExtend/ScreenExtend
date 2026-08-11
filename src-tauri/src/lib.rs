@@ -172,7 +172,7 @@ fn avatar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 }
 
 fn current_version() -> String {
-    "0.3.2".to_string()
+    "0.3.3".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
