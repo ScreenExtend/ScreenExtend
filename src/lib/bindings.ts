@@ -30,14 +30,6 @@ async exitApp() : Promise<void> {
 async getUsername() : Promise<string> {
     return await TAURI_INVOKE("get_username");
 },
-async checkForUpdate() : Promise<Result<UpdateInfo, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("check_for_update") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
 async setAvatar(bytes: number[]) : Promise<boolean> {
     return await TAURI_INVOKE("set_avatar", { bytes });
 },
@@ -158,7 +150,6 @@ export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
 export type UnsupportedApi = { name: string; description: string; required_version: string; severity: string }
-export type UpdateInfo = { update_available: boolean; current_version: string; latest_version: string; download_url: string }
 
 /** tauri-specta globals **/
 
