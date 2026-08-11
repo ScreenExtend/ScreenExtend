@@ -21,6 +21,9 @@ import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+
+const DOWNLOAD_URL = "https://screenextend.app";
 
 function withBold(template: string, value: ReactNode): ReactNode {
   const [before, after = ""] = template.split(/\{\w+\}/);
@@ -56,6 +59,7 @@ export default function Bootstrap() {
   const [compatBlocking, setCompatBlocking] = useState(false);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const [updating, setUpdating] = useState(false);
+  const [updateFailed, setUpdateFailed] = useState(false);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
   const [downloaded, setDownloaded] = useState(0);
   const [total, setTotal] = useState(0);
@@ -155,12 +159,12 @@ export default function Bootstrap() {
       return true;
     } catch {
       setUpdating(false);
-      return false;
+      setUpdateFailed(true);
+      return true;
     }
   };
 
-  const start = async () => {
-    if (await runUpdate()) return;
+  const proceed = async () => {
     let report: CompatibilityReport;
     try {
       report = await commands.checkSystemRequirements();
@@ -182,6 +186,11 @@ export default function Bootstrap() {
       return;
     }
     await runSetup(true);
+  };
+
+  const start = async () => {
+    if (await runUpdate()) return;
+    await proceed();
   };
 
   useEffect(() => {
@@ -211,7 +220,7 @@ export default function Bootstrap() {
             <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
               <div
                 className={updatePct === null
-                  ? "h-full w-1/3 rounded-full bg-blue-600 animate-pulse"
+                  ? "h-full w-0 rounded-full bg-blue-600 animate-pulse"
                   : "h-full rounded-full bg-blue-600 transition-all duration-200"}
                 style={updatePct === null ? undefined : { width: `${updatePct}%` }}
               />
@@ -222,6 +231,41 @@ export default function Bootstrap() {
                 : t("bootstrap.update.progress", { pct: updatePct, downloaded: formatBytes(downloaded), total: formatBytes(total) })}
             </p>
           </div>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={updateFailed}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("bootstrap.updateFailed.title")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("bootstrap.updateFailed.bodyBeforeLink")}
+              <a
+                href={DOWNLOAD_URL}
+                onClick={e => { e.preventDefault(); void openUrl(DOWNLOAD_URL); }}
+                style={{ textDecoration: "underline" }}
+              >
+                {t("bootstrap.updateFailed.link")}
+              </a>
+              {t("bootstrap.updateFailed.bodyAfterLink")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction
+              className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+              onClick={() => commands.exitApp()}
+            >
+              {t("common.quit")}
+            </AlertDialogAction>
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white"
+              onClick={async () => {
+                setUpdateFailed(false);
+                void proceed();
+              }}
+            >
+              {t("common.continue")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
       <Loader2 className="animate-spin mb-4" size={48} />

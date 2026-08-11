@@ -120,6 +120,23 @@ jobs:
             fi
           done
 
+      - name: sync updater manifest URLs with renamed assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tmp=$(mktemp -d)
+          if ! gh release download "app-v${VERSION}" --pattern 'latest.json' --dir "$tmp"; then
+            echo "::error::latest.json not found on release app-v${VERSION}"
+            exit 1
+          fi
+          content=$(cat "$tmp/latest.json")
+          content=${content//_${VERSION}_/_}
+          printf '%s' "$content" > "$tmp/latest.json"
+          gh release upload "app-v${VERSION}" "$tmp/latest.json" --clobber
+          echo "Patched latest.json:"
+          cat "$tmp/latest.json"
+
       - name: publish release and mark as latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
