@@ -136,8 +136,7 @@ initializes the virtual display and populates `AppState`.
   marks it latest. (The README's mention of a `release` branch / `build-windows.yml` is
   stale — trust the workflow file.)
 - Auto-update: `tauri-plugin-updater` reads `latest.json` from GitHub Releases (pubkey in
-  `tauri.conf.json`); there is also a manual `check_for_update` command hitting the GitHub
-  API directly.
+  `tauri.conf.json`).
 
 ## Native resources & drivers
 
