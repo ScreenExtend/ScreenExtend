@@ -5,6 +5,7 @@
     "continue": "Continue",
     "done": "Done",
     "exit": "Exit",
+    "quit": "Quit",
     "dontShowAgain": "Don't show this message again",
     "supportEmail": "support@screenextend.app"
   },
@@ -139,6 +140,12 @@
       "preparing": "Preparing download…",
       "downloaded": "Downloaded {size}",
       "progress": "{pct}% • {downloaded} of {total}"
+    },
+    "updateFailed": {
+      "title": "Update Failed",
+      "bodyBeforeLink": "The latest update couldn't be downloaded or installed. You can get the newest version manually from ",
+      "link": "screenextend.app",
+      "bodyAfterLink": ". You can also continue with your current version for now."
     },
     "setupError": {
       "title": "Setup Error",
