@@ -526,7 +526,11 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
-    let portrait = false;
+    let client_portrait = height > width;
+    let portrait = override_for_ip
+        .map(|o| o.orientation_portrait)
+        .unwrap_or(client_portrait);
+    let swap_axes = portrait != client_portrait;
     let scale = override_for_ip
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
@@ -555,7 +559,7 @@ async fn start_session(
                 let name = prev.device_name.clone();
                 let name2 = name.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_mode(&name2, width, height, refresh, portrait)
+                    pipeline::set_display_mode(&name2, width, height, refresh, swap_axes)
                 })
                 .await;
                 if let Ok(Err(e)) = res {
@@ -607,7 +611,7 @@ async fn start_session(
             {
                 let name = device_name.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_mode(&name, width, height, refresh, portrait)
+                    pipeline::set_display_mode(&name, width, height, refresh, swap_axes)
                 })
                 .await;
                 match res {

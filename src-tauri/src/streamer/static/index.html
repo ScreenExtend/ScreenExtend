@@ -232,10 +232,11 @@
                 if (!portrait && h > w) { const t = w; w = h; h = t; }
                 return { width: w, height: h, portrait };
             }
+            function geomKey(g) { return g.width + 'x' + g.height + (g.portrait ? 'P' : 'L'); }
             function relayGeomChange() {
                 if (!isLive || reconfiguring || kicked || !joinData) return;
                 const g = screenGeom();
-                const key = g.width + 'x' + g.height;
+                const key = geomKey(g);
                 if (key === lastGeomKey) return;
                 lastGeomKey = key;
                 joinData.width = g.width;
@@ -249,6 +250,9 @@
             }
             window.addEventListener('resize', onGeomChange, { passive: true });
             window.addEventListener('orientationchange', onGeomChange, { passive: true });
+            if (window.screen && screen.orientation && screen.orientation.addEventListener) {
+                screen.orientation.addEventListener('change', onGeomChange);
+            }
 
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
 
@@ -888,7 +892,7 @@
                     width: g0.width,
                     height: g0.height,
                 };
-                lastGeomKey = g0.width + 'x' + g0.height;
+                lastGeomKey = geomKey(g0);
 
                 showError('');
                 kicked = false;

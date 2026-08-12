@@ -114,7 +114,7 @@ impl Device {
             ip: info.ip,
             name: info.name,
             scale: 100,
-            orientation: "Landscape".to_string(),
+            orientation: orientation_from_screen_size(&info.screen_size),
             refresh_rate,
             video_scale: 100,
             video_quality: 15,
@@ -122,6 +122,14 @@ impl Device {
             os: info.os,
             screen_size: info.screen_size,
         }
+    }
+}
+
+fn orientation_from_screen_size(screen_size: &str) -> String {
+    let mut dims = screen_size.split(['x', 'X']).map(|s| s.trim().parse::<u32>());
+    match (dims.next(), dims.next()) {
+        (Some(Ok(w)), Some(Ok(h))) if h > w => "Portrait".to_string(),
+        _ => "Landscape".to_string(),
     }
 }
 
