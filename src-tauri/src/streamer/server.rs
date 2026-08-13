@@ -505,7 +505,7 @@ async fn start_session(
         .device_overrides
         .as_ref()
         .and_then(|o| o.lock().unwrap().get(client_ip).copied());
-    let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(false);
+    let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
     if let Some(o) = override_for_ip {
         cfg.scale = ScalePercent::new(o.video_scale);
         cfg.qp = Some(o.video_quality);
@@ -526,10 +526,30 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
+    let existing = state
+        .config
+        .sessions
+        .as_ref()
+        .and_then(|s| session::get_live_display(s, client_ip));
+    let existed_before = existing.is_some();
     let client_portrait = height > width;
-    let portrait = override_for_ip
-        .map(|o| o.orientation_portrait)
-        .unwrap_or(client_portrait);
+    let prev_client_portrait = existing.as_ref().map(|p| p.height > p.width);
+    let device_rotated = prev_client_portrait == Some(!client_portrait);
+    let honor_device = existing.is_none() || device_rotated;
+    let portrait = if honor_device {
+        client_portrait
+    } else {
+        override_for_ip
+            .map(|o| o.orientation_portrait)
+            .unwrap_or(client_portrait)
+    };
+    if honor_device {
+        if let Some(overrides) = state.config.device_overrides.as_ref() {
+            if let Some(o) = overrides.lock().unwrap().get_mut(client_ip) {
+                o.orientation_portrait = client_portrait;
+            }
+        }
+    }
     let swap_axes = portrait != client_portrait;
     let scale = override_for_ip
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
@@ -544,13 +564,6 @@ async fn start_session(
         scale,
         portrait,
     };
-
-    let existing = state
-        .config
-        .sessions
-        .as_ref()
-        .and_then(|s| session::get_live_display(s, client_ip));
-    let existed_before = existing.is_some();
 
     let (display_id, device_name) = match existing {
         Some(prev) => {
@@ -680,6 +693,7 @@ async fn start_session(
             os: req.os.trim().to_string(),
             screen_size: format!("{}x{}", req.width, req.height),
             refresh_rate: detected_refresh,
+            portrait,
         });
     }
 
