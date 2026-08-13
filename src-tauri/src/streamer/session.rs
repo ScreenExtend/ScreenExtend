@@ -19,6 +19,7 @@ pub struct DeviceInfo {
     pub os: String,
     pub screen_size: String,
     pub refresh_rate: u32,
+    pub portrait: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

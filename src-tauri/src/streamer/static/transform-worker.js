@@ -24,12 +24,20 @@ const CODEC_CANDIDATES = [
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
 const BACKLOG_DROP_THRESHOLD = 4;
 
+let preferredCodec = null;
+
 self.onmessage = (e) => {
   if (e.data && e.data.type === 'canvas') {
     canvas = e.data.canvas;
     ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+  } else if (e.data && e.data.type === 'codechint') {
+    if (e.data.profileLevelId && /^[0-9a-fA-F]{6}$/.test(e.data.profileLevelId)) {
+      preferredCodec = 'avc1.' + e.data.profileLevelId.toUpperCase();
+    }
   } else if (e.data && e.data.type === 'stats') {
     postStats();
+  } else if (e.data && e.data.type === 'rendercount') {
+    self.postMessage({ type: 'rendercount', n: framesRendered });
   } else if (e.data && e.data.type === 'encodedstream') {
     self.postMessage({ type: 'transformstart', hasReadable: !!e.data.readable, hasSendKey: false });
     startPump(e.data.readable);
@@ -77,13 +85,22 @@ function makeDecoder() {
 
 async function ensureConfigured() {
   if (configured && decoder && decoder.state !== 'closed') return true;
-  let codec = CODEC_CANDIDATES[0];
+  const candidates = preferredCodec
+    ? [preferredCodec, ...CODEC_CANDIDATES.filter((c) => c !== preferredCodec)]
+    : CODEC_CANDIDATES.slice();
+  let codec = candidates[0];
   if (typeof VideoDecoder.isConfigSupported === 'function') {
-    for (const c of CODEC_CANDIDATES) {
+    let anySupported = false;
+    for (const c of candidates) {
       try {
         const s = await VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true });
-        if (s && s.supported) { codec = c; break; }
+        if (s && s.supported) { codec = c; anySupported = true; break; }
       } catch (_) {}
+    }
+    if (!anySupported) {
+      configError = 'no supported H.264 decoder configuration';
+      self.postMessage({ type: 'configerror', message: configError, codec });
+      throw new Error(configError);
     }
   }
   decoder = makeDecoder();

@@ -444,8 +444,8 @@
       sendState(OP.POINTERLOCK_STATE, document.pointerLockElement === surface || !!document.pointerLockElement);
     });
 
-    window.addEventListener('resize', () => { refreshSize(); sendResize(); }, { passive: true });
-    window.addEventListener('orientationchange', () => { refreshSize(); sendResize(); }, { passive: true });
+    window.addEventListener('resize', refreshSize, { passive: true });
+    window.addEventListener('orientationchange', refreshSize, { passive: true });
   }
 
   function forwardClipboard(opByte, e) {
@@ -480,6 +480,7 @@
 
   window.RemoteInput = {
     setup,
+    onViewportSettled() { refreshSize(); sendResize(); },
     get rtt() { return lastRttMs; },
   };
 })();

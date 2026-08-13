@@ -24,12 +24,6 @@ impl DeviceReporter for TauriDeviceReporter {
         let mut device = Device::defaults(info);
         if let Some(o) = self.overrides.lock().unwrap().get(&ip) {
             device.scale = o.scale;
-            device.orientation = if o.orientation_portrait {
-                "Portrait"
-            } else {
-                "Landscape"
-            }
-            .to_string();
             device.refresh_rate = o.refresh_rate;
             device.video_scale = o.video_scale;
             device.video_quality = o.video_quality as u32;
@@ -47,6 +41,7 @@ impl DeviceReporter for TauriDeviceReporter {
             os: String::new(),
             screen_size: String::new(),
             refresh_rate: 0,
+            portrait: false,
         });
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");

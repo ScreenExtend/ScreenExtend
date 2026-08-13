@@ -126,6 +126,10 @@
             let worker = null;
             let watchdog = null;
             let statsPoll = null;
+            let liveWatch = null;
+            let lastRendered = -1;
+            let lastBytes = -1;
+            let renderStalls = 0;
             let usingFallback = false;
             let joinData = null;
             let reconfigPoll = null;
@@ -173,6 +177,7 @@
                 setTimeout(() => { joinEl.style.display = 'none'; }, 450);
                 startLock();
                 startReconfigPoll();
+                refineRefreshRate();
             }
 
             async function startReconfigPoll() {
@@ -224,12 +229,48 @@
 
             let lastGeomKey = null;
             let geomTimer = 0;
+
+            const viewportSettledSubs = [];
+            function onViewportSettled(cb) { viewportSettledSubs.push(cb); }
+            function emitViewportSettled() {
+                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) {} }
+                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) {}
+            }
+
+            function readOrientationPortrait() {
+                const so = window.screen && (screen.orientation || screen.mozOrientation || screen.msOrientation);
+                const soType = so && (typeof so === 'string' ? so : so.type);
+                if (typeof soType === 'string' && soType) {
+                    if (soType.indexOf('portrait') === 0) return true;
+                    if (soType.indexOf('landscape') === 0) return false;
+                }
+                if (typeof window.orientation === 'number') {
+                    return window.orientation === 0 || window.orientation === 180;
+                }
+                if (window.matchMedia) {
+                    if (window.matchMedia('(orientation: portrait)').matches) return true;
+                    if (window.matchMedia('(orientation: landscape)').matches) return false;
+                }
+                const vw = (window.visualViewport && window.visualViewport.width) || window.innerWidth;
+                const vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+                return vh >= vw;
+            }
+            function engineSwapsScreenOnRotation() {
+                const p = navigator.platform || '';
+                const isIOS = /iPad|iPhone|iPod/.test(p) || (/Mac/.test(p) && navigator.maxTouchPoints > 1);
+                return !isIOS;
+            }
             function screenGeom() {
                 let w = Math.round(window.screen.width);
                 let h = Math.round(window.screen.height);
-                const portrait = (window.innerHeight || h) >= (window.innerWidth || w);
-                if (portrait && w > h) { const t = w; w = h; h = t; }
-                if (!portrait && h > w) { const t = w; w = h; h = t; }
+                const portrait = readOrientationPortrait();
+                const o = window.screen && screen.orientation;
+                if (o && typeof o.type === 'string') {
+                    if (!engineSwapsScreenOnRotation() && portrait !== (h >= w)) { const t = w; w = h; h = t; }
+                } else {
+                    if (portrait && w > h) { const t = w; w = h; h = t; }
+                    if (!portrait && h > w) { const t = w; w = h; h = t; }
+                }
                 return { width: w, height: h, portrait };
             }
             function geomKey(g) { return g.width + 'x' + g.height + (g.portrait ? 'P' : 'L'); }
@@ -246,12 +287,35 @@
             }
             function onGeomChange() {
                 if (geomTimer) clearTimeout(geomTimer);
-                geomTimer = setTimeout(relayGeomChange, 400);
+                let last = null, tries = 0;
+                const settle = () => {
+                    const key = geomKey(screenGeom());
+                    if (key === last || tries++ >= 5) {
+                        geomTimer = 0;
+                        relayGeomChange();
+                        emitViewportSettled();
+                        return;
+                    }
+                    last = key;
+                    geomTimer = setTimeout(settle, 120);
+                };
+                geomTimer = setTimeout(settle, 120);
             }
             window.addEventListener('resize', onGeomChange, { passive: true });
             window.addEventListener('orientationchange', onGeomChange, { passive: true });
-            if (window.screen && screen.orientation && screen.orientation.addEventListener) {
-                screen.orientation.addEventListener('change', onGeomChange);
+            if (window.screen && screen.orientation) {
+                if (screen.orientation.addEventListener) screen.orientation.addEventListener('change', onGeomChange);
+                else screen.orientation.onchange = onGeomChange;
+            } else if (window.screen && 'onorientationchange' in screen) {
+                screen.onorientationchange = onGeomChange;
+            }
+            if (window.matchMedia) {
+                const mqOrient = window.matchMedia('(orientation: portrait)');
+                if (mqOrient.addEventListener) mqOrient.addEventListener('change', onGeomChange);
+                else if (mqOrient.addListener) mqOrient.addListener(onGeomChange);
+            }
+            if (window.visualViewport && window.visualViewport.addEventListener) {
+                window.visualViewport.addEventListener('resize', onGeomChange, { passive: true });
             }
 
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
@@ -263,7 +327,7 @@
             let beforeUnloadHandler = null;
             let fullscreenHandler = null;
             let gestureHandler = null;
-            let viewportHandler = null;
+            let pageshowHandler = null;
             let locked = false;
 
             function enterFullscreen(el) {
@@ -327,20 +391,22 @@
                 }
             }
 
+            let viewportModeActive = false;
+            onViewportSettled(() => { if (viewportModeActive && !currentFullscreenEl()) sizeToViewport(); });
             function enterViewportMode() {
+                viewportModeActive = true;
                 sizeToViewport();
-                if (!viewportHandler) {
-                    viewportHandler = () => { if (!currentFullscreenEl()) sizeToViewport(); };
-                    window.addEventListener('resize', viewportHandler, { passive: true });
-                    window.addEventListener('orientationchange', viewportHandler, { passive: true });
-                }
             }
             function exitViewportMode() {
-                if (viewportHandler) {
-                    window.removeEventListener('resize', viewportHandler);
-                    window.removeEventListener('orientationchange', viewportHandler);
-                    viewportHandler = null;
-                }
+                viewportModeActive = false;
+            }
+
+            function enableNoSleep() {
+                try {
+                    if (noSleep.isEnabled) return;
+                    const p = noSleep.enable();
+                    if (p && p.catch) p.catch(() => {});
+                } catch (_) {}
             }
 
             async function startLock() {
@@ -353,7 +419,7 @@
                 if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
-                    noSleep.enable();
+                    enableNoSleep();
                     await acquireKeyboardLock();
                     if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
                 };
@@ -368,7 +434,7 @@
                         clearViewportSize();
                         acquirePointerLock(stage);
                         await acquireKeyboardLock();
-                        noSleep.enable();
+                        enableNoSleep();
                     } else {
                         enterViewportMode();
                         try { await enterFullscreen(fullscreenTarget()); } catch (_) {}
@@ -380,7 +446,11 @@
                 beforeUnloadHandler = (e) => { if (locked) { e.preventDefault(); e.returnValue = ''; } };
                 window.addEventListener('beforeunload', beforeUnloadHandler);
 
-                noSleep.enable();
+                if (pageshowHandler) window.removeEventListener('pageshow', pageshowHandler);
+                pageshowHandler = (e) => { if (locked && e.persisted) enableNoSleep(); };
+                window.addEventListener('pageshow', pageshowHandler);
+
+                enableNoSleep();
                 await enterFullscreen(fullscreenTarget()).catch(() => {});
 
                 if (currentFullscreenEl()) {
@@ -400,6 +470,7 @@
                 if (fullscreenHandler) { fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler)); fullscreenHandler = null; }
                 if (visibilityHandler) { document.removeEventListener('visibilitychange', visibilityHandler); visibilityHandler = null; }
                 if (beforeUnloadHandler) { window.removeEventListener('beforeunload', beforeUnloadHandler); beforeUnloadHandler = null; }
+                if (pageshowHandler) { window.removeEventListener('pageshow', pageshowHandler); pageshowHandler = null; }
                 removeGestureHandler();
                 exitViewportMode();
                 clearViewportSize();
@@ -440,7 +511,14 @@
                 return [];
             }
 
-            function waitForIceGathering(pc) {
+            function hasTurnServer(iceServers) {
+                return (iceServers || []).some((s) => {
+                    const urls = s && (s.urls || s.url);
+                    const arr = Array.isArray(urls) ? urls : [urls];
+                    return arr.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
+                });
+            }
+            function waitForIceGathering(pc, timeoutMs) {
                 if (pc.iceGatheringState === 'complete') return Promise.resolve();
                 return new Promise((resolve) => {
                     const check = () => {
@@ -450,7 +528,7 @@
                         }
                     };
                     pc.addEventListener('icegatheringstatechange', check);
-                    setTimeout(resolve, 3000);
+                    setTimeout(resolve, timeoutMs || 3000);
                 });
             }
 
@@ -467,6 +545,7 @@
             function teardownSession() {
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
+                if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
                 if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
                 try { if (pc) pc.close(); } catch (_) {}
@@ -479,6 +558,49 @@
                 console.warn('falling back to <video>:', reason);
                 teardownSession();
                 start(false);
+            }
+
+            async function handleRenderCount(n) {
+                let bytes = -1;
+                try {
+                    if (pc) {
+                        const rep = await pc.getStats();
+                        rep.forEach((s) => {
+                            if (s.type === 'inbound-rtp' && (s.kind === 'video' || s.mediaType === 'video' || s.kind === undefined)) {
+                                bytes = s.bytesReceived || 0;
+                            }
+                        });
+                    }
+                } catch (_) {}
+                const rendersAdvanced = n !== lastRendered;
+                const knowBytes = bytes >= 0;
+                const bytesAdvanced = knowBytes && bytes !== lastBytes;
+                lastRendered = n;
+                if (knowBytes) lastBytes = bytes;
+                if (rendersAdvanced) { renderStalls = 0; return; }
+                if (bytesAdvanced) {
+                    if (++renderStalls >= 2) fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                } else {
+                    renderStalls = 0;
+                }
+            }
+
+            function negotiatedProfileLevelId(sdp) {
+                if (!sdp) return null;
+                const lines = sdp.split(/\r?\n/);
+                const h264Pts = new Set();
+                for (const line of lines) {
+                    const m = /^a=rtpmap:(\d+)\s+H264\/90000/i.exec(line);
+                    if (m) h264Pts.add(m[1]);
+                }
+                for (const line of lines) {
+                    const m = /^a=fmtp:(\d+)\s+(.*)$/i.exec(line);
+                    if (m && h264Pts.has(m[1])) {
+                        const plm = /profile-level-id=([0-9a-fA-F]{6})/.exec(m[2]);
+                        if (plm) return plm[1].toLowerCase();
+                    }
+                }
+                return null;
             }
 
             async function start(preferWebCodecs) {
@@ -515,6 +637,8 @@
                                 console.log('[webcodecs] onrtctransform FIRED — readable=' + m.data.hasReadable + ' sendKeyFrameRequest=' + m.data.hasSendKey);
                             } else if (m.data.type === 'firstframe') {
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                            } else if (m.data.type === 'rendercount') {
+                                handleRenderCount(m.data.n);
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
@@ -524,7 +648,13 @@
                         if (hasScriptTransform) {
                             videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
                         } else {
-                            const { readable } = videoTransceiver.receiver.createEncodedStreams();
+                            let readable;
+                            try {
+                                ({ readable } = videoTransceiver.receiver.createEncodedStreams());
+                            } catch (err) {
+                                fallbackToVideo('createEncodedStreams failed: ' + err.message);
+                                return;
+                            }
                             worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
                         try {
@@ -562,7 +692,13 @@
                                     if (!foundInbound) console.log('[webcodecs] NO inbound-rtp stat yet; candidate-pair=' + pair);
                                 }).catch((err) => console.log('[webcodecs] getStats failed', err));
                             }, 1000);
-                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 8s'), 8000);
+                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 5s'), 5000);
+                            lastRendered = -1; lastBytes = -1; renderStalls = 0;
+                            if (liveWatch) clearInterval(liveWatch);
+                            liveWatch = setInterval(() => {
+                                if (document.visibilityState !== 'visible') { renderStalls = 0; return; }
+                                if (worker) worker.postMessage({ type: 'rendercount' });
+                            }, 2000);
                         } else {
                             video.srcObject = e.streams[0];
                             try {
@@ -596,7 +732,7 @@
 
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
-                    await waitForIceGathering(pc);
+                    await waitForIceGathering(pc, hasTurnServer(iceServers) ? 6000 : 3000);
 
                     const resp = await fetch('/whep', {
                         method: 'POST',
@@ -614,7 +750,13 @@
                     });
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
-                    await pc.setRemoteDescription({ type: 'answer', sdp: await resp.text() });
+                    const answerSdp = await resp.text();
+                    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+                    if (webcodecs && worker) {
+                        const plid = negotiatedProfileLevelId(answerSdp);
+                        if (plid) worker.postMessage({ type: 'codechint', profileLevelId: plid });
+                    }
                 } catch (err) {
                     console.error(err);
                     const isAuthError = /Invalid session ID or OTP/.test(err.message);
@@ -686,25 +828,45 @@
                 return 'Unknown';
             }
 
-            function getRefreshRate(samples = 180) {
+            function medianRate(times) {
+                const intervals = [];
+                for (let i = 1; i < times.length; i++) intervals.push(times[i] - times[i - 1]);
+                if (!intervals.length) return 0;
+                intervals.sort((a, b) => a - b);
+                const median = intervals[Math.floor(intervals.length / 2)];
+                return median > 0 ? Math.round(1000 / median) : 0;
+            }
+            function getRefreshRate(samples = 60) {
                 return new Promise((resolve) => {
                     const times = [];
+                    let done = false;
+                    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+                    const timer = setTimeout(() => finish(medianRate(times)), samples * 40 + 1000);
                     function frame(t) {
                         times.push(t);
-                        if (times.length < samples) {
-                            requestAnimationFrame(frame);
-                            return;
-                        }
-                        const intervals = [];
-                        for (let i = 1; i < times.length; i++) {
-                            intervals.push(times[i] - times[i - 1]);
-                        }
-                        intervals.sort((a, b) => a - b);
-                        const median = intervals[Math.floor(intervals.length / 2)];
-                        resolve(Math.round(1000 / median));
+                        if (times.length < samples) { requestAnimationFrame(frame); return; }
+                        clearTimeout(timer);
+                        finish(medianRate(times));
                     }
                     requestAnimationFrame(frame);
                 });
+            }
+            function screenRefreshRate() {
+                const r = window.screen && window.screen.refreshRate;
+                return (typeof r === 'number' && r >= 24 && r <= 500) ? Math.round(r) : 0;
+            }
+            function relayRefreshRate(rate) {
+                if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
+                const cur = joinData.refreshRate || 60;
+                if (Math.abs(rate - cur) < 5) return;
+                joinData.refreshRate = rate;
+                console.log('[refresh] refined to ' + rate + ' Hz; reconfiguring host display');
+                reconfigure();
+            }
+            async function refineRefreshRate() {
+                let rate = screenRefreshRate();
+                if (!rate) rate = await refreshRatePromise;
+                relayRefreshRate(rate);
             }
 
             function validate() {
@@ -888,7 +1050,7 @@
                     deviceName: nameInput.value.trim(),
                     otp: otpValue(),
                     os: detectOs(),
-                    refreshRate: 0,
+                    refreshRate: screenRefreshRate() || 0,
                     width: g0.width,
                     height: g0.height,
                 };
@@ -903,7 +1065,6 @@
                 connectBtn.disabled = true;
                 loadingEl.classList.add('show');
 
-                joinData.refreshRate = await refreshRatePromise || 0;
                 console.log('[join] connecting with', joinData);
 
                 beginStreaming();
