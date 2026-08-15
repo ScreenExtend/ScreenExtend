@@ -44,6 +44,11 @@ pub fn tune_process() {
     backend::tune_process();
 }
 
+pub fn prime() {
+    #[cfg(target_os = "macos")]
+    backend::prime_keyboard();
+}
+
 pub const FAST_CAP: usize = 512;
 
 #[derive(Clone)]

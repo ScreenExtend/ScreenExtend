@@ -5,6 +5,11 @@ use objc2_core_graphics::{
 
 use super::DisplayId;
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayBounds(display: DisplayId) -> objc2_core_foundation::CGRect;
+}
+
 const MAX_DISPLAYS: usize = 16;
 
 pub fn active_displays() -> Vec<DisplayId> {
@@ -43,6 +48,17 @@ pub fn display_geometry(display: DisplayId) -> (u32, u32, u32) {
     let h = unsafe { CGDisplayPixelsHigh(display) } as u32;
     let refresh = display_refresh_hz(display);
     (w, h, refresh)
+}
+
+/// Global-space bounds of a display: (left, top, width, height), in points.
+pub fn display_bounds(display: DisplayId) -> (i32, i32, u32, u32) {
+    let b = unsafe { CGDisplayBounds(display) };
+    (
+        b.origin.x.round() as i32,
+        b.origin.y.round() as i32,
+        b.size.width.round() as u32,
+        b.size.height.round() as u32,
+    )
 }
 
 fn display_refresh_hz(display: DisplayId) -> u32 {
