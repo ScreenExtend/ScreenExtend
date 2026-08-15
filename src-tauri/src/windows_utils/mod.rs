@@ -3,6 +3,7 @@ pub mod device_reporter;
 pub mod driver_ipc;
 pub mod hosted_network;
 pub mod networking;
+pub mod permissions;
 pub mod streamer;
 pub mod virtual_display;
 pub mod windows_capture;

@@ -9,6 +9,15 @@ export const commands = {
 async checkSystemRequirements() : Promise<CompatibilityReport> {
     return await TAURI_INVOKE("check_system_requirements");
 },
+async checkPermissions() : Promise<PermissionStatus[]> {
+    return await TAURI_INVOKE("check_permissions");
+},
+async requestPermission(key: string) : Promise<boolean> {
+    return await TAURI_INVOKE("request_permission", { key });
+},
+async openPermissionSettings(key: string) : Promise<void> {
+    await TAURI_INVOKE("open_permission_settings", { key });
+},
 async setup() : Promise<boolean> {
     return await TAURI_INVOKE("setup");
 },
@@ -146,6 +155,7 @@ export type HostedNetworkNoPassword = null
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
+export type PermissionStatus = { key: string; name: string; description: string; granted: boolean; required: boolean }
 export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }

@@ -1,7 +1,7 @@
 import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
-import { Loader2 } from "lucide-react";
+import { Check, Loader2, X } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,7 +15,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
-import { commands, type CompatibilityReport } from "@/lib/bindings";
+import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
@@ -58,6 +58,7 @@ export default function Bootstrap() {
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
+  const [permReport, setPermReport] = useState<PermissionStatus[] | null>(null);
   const [updating, setUpdating] = useState(false);
   const [updateFailed, setUpdateFailed] = useState(false);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
@@ -164,7 +165,42 @@ export default function Bootstrap() {
     }
   };
 
+  const ensurePermissions = async (): Promise<boolean> => {
+    let perms: PermissionStatus[];
+    try {
+      perms = await commands.checkPermissions();
+    } catch {
+      return false;
+    }
+    const missing = perms.filter(p => p.required && !p.granted);
+    if (missing.length === 0) return false;
+    for (const p of missing) {
+      try { await commands.requestPermission(p.key); } catch { /* ignore */ }
+    }
+    try {
+      setPermReport(await commands.checkPermissions());
+    } catch {
+      setPermReport(perms);
+    }
+    return true;
+  };
+
+  const recheckPermissions = async () => {
+    let perms: PermissionStatus[];
+    try {
+      perms = await commands.checkPermissions();
+    } catch {
+      return;
+    }
+    setPermReport(perms);
+    if (perms.every(p => !p.required || p.granted)) {
+      setPermReport(null);
+      void proceed();
+    }
+  };
+
   const proceed = async () => {
+    if (await ensurePermissions()) return;
     let report: CompatibilityReport;
     try {
       report = await commands.checkSystemRequirements();
@@ -365,6 +401,68 @@ export default function Bootstrap() {
               onClick={() => commands.exitApp()}
             >
               {t("common.exit")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={permReport !== null}>
+        <AlertDialogContent className="max-w-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Permissions needed</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3 text-left">
+                <div>
+                  ScreenExtend needs macOS permission to capture this screen and to control the
+                  keyboard and mouse from your connected devices. Enable each item below in System
+                  Settings, then relaunch.
+                </div>
+                <ul className="space-y-2">
+                  {permReport?.map(p => (
+                    <li
+                      key={p.key}
+                      className="flex items-start justify-between gap-3 rounded-md border p-3"
+                    >
+                      <div>
+                        <div className="font-semibold flex items-center gap-2">
+                          {p.granted
+                            ? <Check className="text-green-600" size={16} />
+                            : <X className="text-red-600" size={16} />}
+                          {p.name}
+                        </div>
+                        <div className="text-sm text-muted-foreground">{p.description}</div>
+                      </div>
+                      {!p.granted && (
+                        <button
+                          className="shrink-0 rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
+                          onClick={() => void commands.openPermissionSettings(p.key)}
+                        >
+                          Open Settings
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction
+              className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+              onClick={() => commands.exitApp()}
+            >
+              {t("common.quit")}
+            </AlertDialogAction>
+            <button
+              className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+              onClick={() => void recheckPermissions()}
+            >
+              Re-check
+            </button>
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white"
+              onClick={() => void relaunch()}
+            >
+              Relaunch
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

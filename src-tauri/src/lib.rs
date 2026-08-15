@@ -58,6 +58,15 @@ pub struct CloudStatusChange {
     pub detail: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Type)]
+pub struct PermissionStatus {
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub granted: bool,
+    pub required: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct SessionIdChange {
     #[serde(rename = "sessionId")]
@@ -250,6 +259,9 @@ pub fn run() {
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             compatibility::check_system_requirements,
+            permissions::check_permissions,
+            permissions::request_permission,
+            permissions::open_permission_settings,
             setup,
             //            get_devices,
             set_session_credentials,
@@ -320,6 +332,7 @@ pub fn run() {
         .menu(build_menu)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
+            crate::streamer::input::prime();
             if let Ok(matches) = app.cli().matches() {
                 match matches.subcommand {
                     Some(command) if command.name == "hostednetwork" => {
