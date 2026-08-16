@@ -1,22 +1,3 @@
-//! macOS injection backend — CoreGraphics event synthesis (`CGEventPost`).
-//!
-//! Mirrors the Windows backend's behavior wherever a public macOS API exists:
-//! absolute + relative mouse, all five buttons, line/pixel/page wheel, keyboard
-//! (scancode-equivalent virtual keys + Unicode fallback), text, clipboard set +
-//! auto-paste, focus/visibility release, and per-display geometry targeting.
-//!
-//! Degraded (no public inject API on macOS): pen and touch collapse to a single
-//! mouse pointer — pressure/tilt/twist/multi-touch are lost, exactly like the
-//! Windows path when its synthetic pen/touch devices are unavailable. File drop
-//! is unsupported (`WM_DROPFILES` has no macOS analog).
-//!
-//! Shortcut remap (per product decision): the client's Control key drives macOS
-//! **Command**, and the client's Meta/Windows(/Super) key drives macOS
-//! **Control** — so Ctrl+C on a Windows/Linux client becomes ⌘C on the Mac.
-//!
-//! Requires the Accessibility (TCC) grant, or `CGEventPost` silently no-ops
-//! against other apps.
-
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -28,7 +9,6 @@ use super::DisplayRect;
 
 pub const NAME: &str = "macos-cgevent";
 
-// ─── CoreGraphics event FFI (no CGEvent feature in objc2-core-graphics) ──────
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
 
@@ -46,7 +26,7 @@ unsafe extern "C" {
         keycode: u16,
         key_down: bool,
     ) -> CGEventRef;
-    // Variadic in C: (source, units, wheelCount, wheel1[, wheel2[, wheel3]]).
+    // (source, units, wheelCount, wheel1[, wheel2[, wheel3]]).
     fn CGEventCreateScrollWheelEvent(
         source: CGEventSourceRef,
         units: u32,
@@ -77,7 +57,7 @@ const ET_OTHER_DOWN: u32 = 25;
 const ET_OTHER_UP: u32 = 26;
 const ET_OTHER_DRAG: u32 = 27;
 
-// CGMouseButton (X1/X2 ride the "other" buttons 3/4)
+// CGMouseButton
 const MB_LEFT: u32 = 0;
 const MB_RIGHT: u32 = 1;
 const MB_CENTER: u32 = 2;
@@ -100,7 +80,6 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 const SCROLL_UNIT_PIXEL: u32 = 0;
 const SCROLL_UNIT_LINE: u32 = 1;
 
-// ─── macOS virtual keycodes (post-remap for modifiers) ──────────────────────
 const VK_COMMAND: u16 = 0x37;
 const VK_RCOMMAND: u16 = 0x36;
 const VK_SHIFT: u16 = 0x38;
@@ -112,9 +91,6 @@ const VK_RCONTROL: u16 = 0x3E;
 const VK_CAPSLOCK: u16 = 0x39;
 const VK_V: u16 = 0x09;
 
-/// Map a browser `KeyboardEvent.code` to a macOS virtual keycode. Modifiers are
-/// remapped: Control→Command, Meta/OS→Control (so client shortcuts land the way
-/// a Windows/Linux user expects on a Mac).
 fn code_to_keycode(code: &str) -> Option<u16> {
     let vk = match code {
         // Letters
@@ -178,11 +154,11 @@ fn code_to_keycode(code: &str) -> Option<u16> {
         // Modifiers (REMAPPED)
         "ShiftLeft" => VK_SHIFT as _,
         "ShiftRight" => VK_RSHIFT as _,
-        "ControlLeft" => VK_COMMAND as _, // Control → Command
+        "ControlLeft" => VK_COMMAND as _, // Control to Command
         "ControlRight" => VK_RCOMMAND as _,
         "AltLeft" => VK_OPTION as _,
         "AltRight" => VK_ROPTION as _,
-        "MetaLeft" | "OSLeft" => VK_CONTROL as _, // Windows/Super → Control
+        "MetaLeft" | "OSLeft" => VK_CONTROL as _, // Windows/Super to Control
         "MetaRight" | "OSRight" => VK_RCONTROL as _,
         "CapsLock" => VK_CAPSLOCK as _,
         // Function keys
@@ -376,7 +352,6 @@ impl Injector {
         self.mods = 0;
     }
 
-    // ── mouse ───────────────────────────────────────────────────────────────
     fn mouse_pointer(&mut self, x: f32, y: f32, buttons: u16, phase: Phase) {
         match phase {
             Phase::Leave | Phase::Out => return,
@@ -385,13 +360,9 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
-            // An absolute position arrived → leave relative/pointer-lock mode.
             Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
         }
-        // In relative (pointer-lock) mode the event's absolute x/y are frozen and
-        // meaningless, so act at the tracked cursor instead of warping to them —
-        // this is what makes a click land where the cursor actually is.
         if !self.mouse_relative {
             let pos = self.point(x, y);
             self.pos = pos;
@@ -418,9 +389,6 @@ impl Injector {
         self.pos = pos;
     }
 
-    /// Emit the move/drag event that carries the pointer to `pos`. Uses the
-    /// dragged event type when a button is held, and threads relative deltas so
-    /// pointer-lock consumers (games) see motion.
     fn motion(&self, pos: CGPoint, buttons: u16, dx: i64, dy: i64) {
         let (etype, button) = if buttons & btn::PRIMARY != 0 {
             (ET_LEFT_DRAG, MB_LEFT)
@@ -490,8 +458,6 @@ impl Injector {
             2 => (SCROLL_UNIT_LINE, 3.0f32),
             _ => (SCROLL_UNIT_PIXEL, 1.0f32),
         };
-        // wheel1 = vertical (positive scrolls content up → invert browser dy);
-        // wheel2 = horizontal.
         let v = (-dy * scale).round() as i32;
         let h = (-dx * scale).round() as i32;
         if v == 0 && h == 0 {
@@ -523,15 +489,12 @@ impl Injector {
             if ev.is_null() {
                 return;
             }
-            // Cmd+scroll = zoom in browsers/editors — the mac analog of the
-            // Windows Ctrl+wheel pinch trick under the Control→Command remap.
             CGEventSetFlags(ev, self.mods | FLAG_COMMAND);
             CGEventPost(HID_EVENT_TAP, ev);
             CFRelease(ev);
         }
     }
 
-    // ── keyboard / text ───────────────────────────────────────────────────────
     fn key(&mut self, down: bool, code: &str, key: &str) {
         if let Some(kc) = code_to_keycode(code) {
             if down {
@@ -543,7 +506,6 @@ impl Injector {
             self.post_key(kc, down, self.mods);
             return;
         }
-        // Unmapped printable key → inject as text on the down edge.
         if down {
             let mut chars = key.chars();
             if let (Some(c), None) = (chars.next(), chars.clone().next()) {
@@ -603,14 +565,13 @@ impl Injector {
                     continue;
                 }
                 CGEventKeyboardSetUnicodeString(ev, utf16.len(), utf16.as_ptr());
-                CGEventSetFlags(ev, 0); // typed text carries no stray modifiers
+                CGEventSetFlags(ev, 0);
                 CGEventPost(HID_EVENT_TAP, ev);
                 CFRelease(ev);
             }
         }
     }
 
-    // ── pen / touch (degrade to mouse) ────────────────────────────────────────
     fn pen(&mut self, x: f32, y: f32, pressure: f32, buttons: u16, phase: Phase) {
         let b = if pressure > 0.0 || buttons & btn::PRIMARY != 0 {
             btn::PRIMARY
@@ -638,7 +599,6 @@ impl Injector {
         }
     }
 
-    // ── clipboard ────────────────────────────────────────────────────────────
     fn clipboard(&mut self, op: u8, mime: &str, data: &[u8]) {
         if set_pasteboard(mime, data) {
             log::info!("clipboard set ({mime}, {} bytes, op={op})", data.len());
@@ -653,7 +613,6 @@ impl Injector {
         self.post_key(VK_V, false, FLAG_COMMAND);
     }
 
-    // ── lifecycle / misc ──────────────────────────────────────────────────────
     fn lifecycle(&mut self, l: Lifecycle) {
         match l {
             Lifecycle::Focus(false) | Lifecycle::Visibility(false) => self.release_all(),
@@ -669,9 +628,6 @@ impl Injector {
         }
     }
 
-    // ── coordinate mapping ────────────────────────────────────────────────────
-    /// Normalized [0,1] → global display point on the target display (or the
-    /// whole desktop when no specific display is bound).
     fn point(&self, nx: f32, ny: f32) -> CGPoint {
         let r = self.target.unwrap_or(self.desktop);
         CGPoint {
@@ -689,8 +645,6 @@ impl Drop for Injector {
     }
 }
 
-/// Current global cursor location, so relative/pointer-lock mode starts from the
-/// real cursor instead of a default position.
 fn current_mouse_location() -> Option<CGPoint> {
     unsafe {
         let ev = CGEventCreate(std::ptr::null_mut());
@@ -703,11 +657,6 @@ fn current_mouse_location() -> Option<CGPoint> {
     }
 }
 
-/// Warm up the CoreGraphics keyboard-event/TSM subsystem. MUST be called once on
-/// the **main thread** at startup: `CGEventCreateKeyboardEvent`'s lazy
-/// `key_translate` init (SkyLight/HIToolbox) is not thread-safe and SIGILLs if
-/// first triggered on the injector thread (Catalina). Priming here runs its
-/// dispatch_once on the main thread so later off-thread calls are safe.
 pub fn prime_keyboard() {
     unsafe {
         let src = CGEventSourceCreate(SOURCE_STATE_HID);
@@ -721,7 +670,6 @@ pub fn prime_keyboard() {
     }
 }
 
-/// Bounding rect of every active display, in the global point space.
 fn desktop_bounds() -> DisplayRect {
     use crate::macos_utils::streamer::pipeline::{monitor_device_names, monitor_rect};
     let mut acc: Option<(i32, i32, i32, i32)> = None; // (left, top, right, bottom)
