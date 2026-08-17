@@ -604,7 +604,7 @@ export default function Settings() {
                     {avatar ? "Remove" : "Change photo"}
                   </button>
                 </div>
-                <div className="relative outline-none flex-1">
+                <div className="ml-4 relative outline-none flex-1">
                   <Input
                     type="text"
                     placeholder="Name"
@@ -629,7 +629,7 @@ export default function Settings() {
                       description: t("toasts.account.updatedDescription"),
                     });
                   }
-                }}>
+                }} className="ml-4">
                   Save Name
                 </Button>
               </div>
