@@ -98,7 +98,7 @@ fn screen_recording_granted() -> bool {
     if preflight_screen_capture() == Some(false) {
         return false;
     }
-    let granted = crate::macos_utils::streamer::cgds::probe_screen_recording();
+    let granted = crate::macos_utils::streamer::probe_screen_recording();
     if granted {
         CONFIRMED.store(true, Ordering::Relaxed);
     }

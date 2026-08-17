@@ -82,34 +82,35 @@ pub fn screencapturekit_available() -> bool {
 }
 
 pub fn ensure_screen_recording_access() -> bool {
-    type AccessFn = unsafe extern "C" fn() -> bool;
-    unsafe {
-        let sym = |name: &str| -> Option<AccessFn> {
-            let cname = std::ffi::CString::new(name).ok()?;
-            let p = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
-            if p.is_null() {
-                None
-            } else {
-                Some(std::mem::transmute::<*mut std::ffi::c_void, AccessFn>(p))
-            }
-        };
-        let Some(preflight) = sym("CGPreflightScreenCaptureAccess") else {
-            return true;
-        };
-        if preflight() {
-            return true;
-        }
-        let granted = sym("CGRequestScreenCaptureAccess")
-            .map(|req| req())
-            .unwrap_or(false);
-        if !granted {
-            teprintln!(
-                "[tcc] Screen Recording permission not granted. Enable ScreenExtend under \
-                 System Settings → Privacy & Security → Screen Recording, then relaunch."
-            );
-        }
-        granted
+    if probe_screen_recording() {
+        return true;
     }
+    type AccessFn = unsafe extern "C" fn() -> bool;
+    let granted = unsafe {
+        let cname = std::ffi::CString::new("CGRequestScreenCaptureAccess").unwrap();
+        let p = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
+        if p.is_null() {
+            true
+        } else {
+            std::mem::transmute::<*mut std::ffi::c_void, AccessFn>(p)()
+        }
+    };
+    if !granted {
+        teprintln!(
+            "[tcc] Screen Recording permission not granted. Enable ScreenExtend under \
+             System Settings → Privacy & Security → Screen Recording, then relaunch."
+        );
+    }
+    granted
+}
+
+pub fn probe_screen_recording() -> bool {
+    if screencapturekit_available() {
+        if let Some(granted) = sck::probe_screen_recording() {
+            return granted;
+        }
+    }
+    cgds::probe_screen_recording()
 }
 
 pub fn start_capture(

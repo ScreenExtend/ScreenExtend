@@ -751,6 +751,22 @@ unsafe extern "C-unwind" {
     fn CFNumberGetValue(number: *const CFNumber, the_type: isize, value_ptr: *mut c_void) -> u8;
 }
 
+pub fn probe_screen_recording() -> Option<bool> {
+    let cls_content = AnyClass::get(c"SCShareableContent")?;
+
+    let (tx, rx) = mpsc::channel::<bool>();
+    let handler = RcBlock::new(move |content: *mut AnyObject, error: *mut AnyObject| {
+        let _ = tx.send(error.is_null() && !content.is_null());
+    });
+    unsafe {
+        let _: () = msg_send![
+            cls_content,
+            getShareableContentWithCompletionHandler: RcBlock::as_ptr(&handler),
+        ];
+    }
+    rx.recv_timeout(Duration::from_secs(5)).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

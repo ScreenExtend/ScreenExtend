@@ -424,8 +424,8 @@ export default function Bootstrap() {
                       <div>
                         <div className="font-semibold flex items-center gap-2">
                           {p.granted
-                            ? <Check className="text-green-600" size={16} />
-                            : <X className="text-red-600" size={16} />}
+                            ? <Check className="text-green-600 mr-2" size={16} />
+                            : <X className="text-red-600 mr-2" size={16} />}
                           {p.name}
                         </div>
                         <div className="text-sm text-muted-foreground">{p.description}</div>

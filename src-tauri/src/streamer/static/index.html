@@ -373,10 +373,12 @@
             }
             function acquirePointerLock(el) {
                 try {
-                    if (el.requestPointerLock) el.requestPointerLock();
+                    let p = null;
+                    if (el.requestPointerLock) p = el.requestPointerLock();
                     else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
                     else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
                     else { el.style.cursor = 'none'; el.style.userSelect = 'none'; el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none'; el.style.msUserSelect = 'none'; }
+                    if (p && p.catch) p.catch(() => {});
                 } catch (_) {}
             }
 
@@ -384,6 +386,10 @@
                 if (gestureHandler) return;
                 gestureHandler = () => {
                     if (!locked) return;
+                    if (!fullscreenMode) {
+                        if (!document.pointerLockElement) acquirePointerLock(stage);
+                        return;
+                    }
                     if (currentFullscreenEl()) {
                         if (!document.pointerLockElement) acquirePointerLock(stage);
                         return;
@@ -419,6 +425,7 @@
 
             async function startLock() {
                 locked = true;
+                installGestureHandler();
                 const el = liveEl();
                 el.tabIndex = -1;
                 el.focus();
@@ -443,9 +450,7 @@
 
                 enableNoSleep();
 
-                if (!fullscreenMode) return;
-
-                installGestureHandler();
+                if (!fullscreenMode) { enterViewportMode(); return; }
 
                 const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
                 if (fullscreenHandler) fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
@@ -798,6 +803,7 @@
                     if (joinData.deviceName) u.searchParams.set('name', joinData.deviceName);
                     if (joinData.otp) u.searchParams.set('otp', joinData.otp);
                 }
+                u.searchParams.set('fs', fullscreenMode ? '1' : '0');
                 return u.toString();
             }
             async function offerHttpsUpgrade() {
@@ -909,6 +915,12 @@
                 for (let k = 0; k < otp.length; k++) {
                     otpInputs[k].value = otp[k];
                     otpInputs[k].classList.add('filled');
+                }
+
+                const fs = params.get('fs');
+                if (fs === '0' || fs === '1') {
+                    fullscreenModeInput.checked = fs === '1';
+                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) {}
                 }
 
                 if (params.has('otp') || params.has('name')) {
