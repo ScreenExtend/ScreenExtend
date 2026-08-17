@@ -303,6 +303,43 @@ html, body {
     border-color: #3a4150;
 }
 
+.fs-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: .55rem;
+    margin-bottom: 1.25rem;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.fs-toggle input {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin: 1px 0 0;
+    accent-color: #2a6df0;
+    cursor: pointer;
+}
+
+.fs-toggle-text {
+    display: flex;
+    flex-direction: column;
+    gap: .15rem;
+}
+
+.fs-toggle-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #e6e9ef;
+}
+
+.fs-toggle-desc {
+    font-size: 12px;
+    line-height: 1.35;
+    color: #8b93a3;
+}
+
 .btn {
     width: 100%;
     height: 40px;

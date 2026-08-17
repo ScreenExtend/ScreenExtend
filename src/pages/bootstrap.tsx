@@ -75,7 +75,11 @@ export default function Bootstrap() {
       success = loaded;
     }
     if (success) {
-      const existing = await getConfig();
+      if (!(await getConfig())) {
+        await createConfig({ name: await commands.getUsername(), theme });
+      }
+      const existing = (await getConfig())!;
+      setTheme(existing.theme as Theme);
       const savedPorts = existing?.serverPorts;
       if (savedPorts) {
         await commands.setServerPorts(savedPorts.http, savedPorts.https);
@@ -110,11 +114,6 @@ export default function Bootstrap() {
       }
       setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
       setHostedNetworkOn(false);
-      if (!existing) {
-        await createConfig({ name: await commands.getUsername(), theme });
-      } else {
-        setTheme(existing.theme as Theme);
-      }
       const turn = (await getConfig())?.turnConfig;
       if (turn?.urls) {
         await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");

@@ -25,7 +25,7 @@ use objc2_io_surface::IOSurfaceRef;
 use super::frame::{Backing, Frame, FrameSink};
 use super::gpu::Gpu;
 use super::mach::mach_now;
-use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId};
+use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId, PIXEL_FORMAT_BGRA};
 
 type FrameHandler = RcBlock<
     dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate),
@@ -200,6 +200,54 @@ impl CaptureBackend for CgDisplayStreamBackend {
         self._queue = None;
         self._handler = None;
     }
+}
+
+pub fn probe_screen_recording() -> bool {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let Some(display_id) = super::display::select_display(0) else {
+        return false;
+    };
+
+    let props = make_cg_properties(60.0);
+    let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+        DispatchQoS::UserInteractive,
+    ));
+    let queue = DispatchQueue::new_with_target("com.screenextend.tcc-probe", None, Some(&ui_target));
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let handler: FrameHandler = RcBlock::new(
+        move |status: CGDisplayStreamFrameStatus,
+              _display_time: u64,
+              surface: *mut IOSurfaceRef,
+              _update: *const CGDisplayStreamUpdate| {
+            if status == CGDisplayStreamFrameStatus::FrameComplete && !surface.is_null() {
+                let _ = tx.send(());
+            }
+        },
+    );
+
+    let stream = unsafe {
+        CGDisplayStream::with_dispatch_queue(
+            display_id,
+            64,
+            64,
+            PIXEL_FORMAT_BGRA as i32,
+            Some(&props),
+            &queue,
+            RcBlock::as_ptr(&handler),
+        )
+    };
+    let Some(stream) = stream else {
+        return false;
+    };
+    if unsafe { CGDisplayStream::start(Some(&stream)) } != CGError::Success {
+        return false;
+    }
+    let got_frame = rx.recv_timeout(Duration::from_millis(700)).is_ok();
+    let _ = unsafe { CGDisplayStream::stop(Some(&stream)) };
+    got_frame
 }
 
 #[cfg(test)]

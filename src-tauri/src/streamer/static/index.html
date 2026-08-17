@@ -46,6 +46,13 @@
                                     <input inputmode="numeric" autocomplete="off" maxlength="1" />
                                 </div>
                             </div>
+                            <label class="fs-toggle" for="fullscreenMode">
+                                <input type="checkbox" id="fullscreenMode" checked />
+                                <span class="fs-toggle-text">
+                                    <span class="fs-toggle-title">Fullscreen mode</span>
+                                    <span class="fs-toggle-desc">Locks this tab fullscreen for a true second screen. Turn it off to keep everything else working while you multitask.</span>
+                                </span>
+                            </label>
                             <button class="btn" id="connect" type="submit" disabled>Connect</button>
                         </form>
                         <div class="err" id="errorMessage" role="alert"></div>
@@ -138,6 +145,7 @@
             let reconfiguring = false;
             let kicked = false;
             let compatBlocked = false;
+            let fullscreenMode = true;
 
             function showError(msg) {
                 errEl.textContent = msg || '';
@@ -411,7 +419,6 @@
 
             async function startLock() {
                 locked = true;
-                installGestureHandler();
                 const el = liveEl();
                 el.tabIndex = -1;
                 el.focus();
@@ -420,10 +427,25 @@
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
+                    if (!fullscreenMode) return;
                     await acquireKeyboardLock();
                     if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
+
+                if (beforeUnloadHandler) window.removeEventListener('beforeunload', beforeUnloadHandler);
+                beforeUnloadHandler = (e) => { if (locked) { e.preventDefault(); e.returnValue = ''; } };
+                window.addEventListener('beforeunload', beforeUnloadHandler);
+
+                if (pageshowHandler) window.removeEventListener('pageshow', pageshowHandler);
+                pageshowHandler = (e) => { if (locked && e.persisted) enableNoSleep(); };
+                window.addEventListener('pageshow', pageshowHandler);
+
+                enableNoSleep();
+
+                if (!fullscreenMode) return;
+
+                installGestureHandler();
 
                 const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
                 if (fullscreenHandler) fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
@@ -442,15 +464,6 @@
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
 
-                if (beforeUnloadHandler) window.removeEventListener('beforeunload', beforeUnloadHandler);
-                beforeUnloadHandler = (e) => { if (locked) { e.preventDefault(); e.returnValue = ''; } };
-                window.addEventListener('beforeunload', beforeUnloadHandler);
-
-                if (pageshowHandler) window.removeEventListener('pageshow', pageshowHandler);
-                pageshowHandler = (e) => { if (locked && e.persisted) enableNoSleep(); };
-                window.addEventListener('pageshow', pageshowHandler);
-
-                enableNoSleep();
                 await enterFullscreen(fullscreenTarget()).catch(() => {});
 
                 if (currentFullscreenEl()) {
@@ -810,6 +823,15 @@
             const nameInput = document.getElementById('name');
             const connectBtn = document.getElementById('connect');
             const otpInputs = Array.from(document.querySelectorAll('#otp input'));
+            const fullscreenModeInput = document.getElementById('fullscreenMode');
+
+            const FULLSCREEN_MODE_KEY = 'se.fullscreenMode';
+            try {
+                if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
+            } catch (_) {}
+            fullscreenModeInput.addEventListener('change', () => {
+                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) {}
+            });
 
             document.getElementById('brand').addEventListener('click', () => {
                 window.open('https://screenextend.app/', '_blank');
@@ -1055,6 +1077,8 @@
                     height: g0.height,
                 };
                 lastGeomKey = geomKey(g0);
+
+                fullscreenMode = fullscreenModeInput.checked;
 
                 showError('');
                 kicked = false;
