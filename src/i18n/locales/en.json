@@ -46,6 +46,14 @@
       "disabledDescription": "Video is now encoded on the CPU (software). This uses far more CPU and can lower quality or frame rate. Connected devices reconnect using the software encoder.",
       "enabledDescription": "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder."
     },
+    "autostart": {
+      "enabledTitle": "Launch at Startup Enabled",
+      "enabledDescription": "ScreenExtend will now open automatically when you sign in to your computer.",
+      "disabledTitle": "Launch at Startup Disabled",
+      "disabledDescription": "ScreenExtend will no longer open automatically when you sign in.",
+      "failureTitle": "Couldn't Update Launch at Startup",
+      "failureDescription": "The startup setting couldn't be changed. Please try again."
+    },
     "invalidPorts": {
       "title": "Invalid Ports",
       "description": "Enter two different port numbers between 1 and 65535 for HTTP and HTTPS."
