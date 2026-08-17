@@ -43,6 +43,7 @@ import { cn, buildQrValues, buildWifiQrValue } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
 import { type as getOsType } from "@tauri-apps/plugin-os";
+import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 
 const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 const IS_WINDOWS = getOsType() === "windows";
@@ -85,6 +86,7 @@ export default function Settings() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [disableGpuEncode, setDisableGpuEncode] = useState(false);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -127,6 +129,10 @@ export default function Settings() {
       setConfigLoaded(true);
     }
     void updateText();
+  }, []);
+
+  useEffect(() => {
+    isAutostartEnabled().then(setAutostartEnabled).catch(() => {});
   }, []);
 
   const saveDisconnectGrace = async () => {
@@ -182,6 +188,27 @@ export default function Settings() {
       toast({
         title: t("toasts.publicSessions.disabledTitle"),
         description: t("toasts.publicSessions.disabledDescription"),
+      });
+    }
+  };
+
+  const toggleAutostart = async (enabled: boolean) => {
+    try {
+      if (enabled) {
+        await enableAutostart();
+      } else {
+        await disableAutostart();
+      }
+      setAutostartEnabled(enabled);
+      toast({
+        title: enabled ? t("toasts.autostart.enabledTitle") : t("toasts.autostart.disabledTitle"),
+        description: enabled ? t("toasts.autostart.enabledDescription") : t("toasts.autostart.disabledDescription"),
+      });
+    } catch (e) {
+      setAutostartEnabled(await isAutostartEnabled().catch(() => !enabled));
+      toast({
+        title: t("toasts.autostart.failureTitle"),
+        description: t("toasts.autostart.failureDescription"),
       });
     }
   };
@@ -381,6 +408,31 @@ export default function Settings() {
                 <Switch
                   checked={publicSessionsEnabled}
                   onCheckedChange={(checked) => void togglePublicSessions(checked)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mb-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex flex-row items-center">
+                Launch at Startup
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center space-x-4 p-3 px-0">
+                <div className="flex-1 space-y-1">
+                  <p className="text-sm font-medium leading-none">
+                    {autostartEnabled ? "Start on login enabled" : "Start on login disabled"}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    Automatically open ScreenExtend when you sign in to your computer.
+                  </p>
+                </div>
+                <Switch
+                  checked={autostartEnabled}
+                  onCheckedChange={(checked) => void toggleAutostart(checked)}
                 />
               </div>
             </CardContent>
