@@ -79,15 +79,15 @@ The client is just a web page, so anything with a reasonably modern browser (Web
 
 ScreenExtend encodes captured displays with the host GPU. The matrix below lists the common hardware video-encoding APIs and reflects the **current** state of each path in ScreenExtend:
 
-| Encoding API | GPU Vendor | Linux | macOS | Windows |
+| Encoding API | GPU Vendor | Windows | macOS | Linux |
 | --- | --- | :---: | :---: | :---: |
-| AMF | AMD | ➖ |   | 🟡 |
-| NVENC | NVIDIA | ➖ |   | ✅ |
-| Quick Sync | Intel | ➖ |   | ✅ |
-| Media Foundation | Qualcomm |   |   | ➖ |
-| Video Toolbox | Apple |   | ✅ |   |
-| | Intel |   | ✅ |   |
-| Software | Any | ➖ | ➖ | ➖ |
+| AMF | AMD | 🟡 | | ➖ |
+| NVENC | NVIDIA | ✅ | | ➖ |
+| Quick Sync | Intel | ✅ | | ➖ |
+| Media Foundation | Qualcomm | ➖ | | |
+| Video Toolbox | Apple | | ✅ | |
+| | Intel | | ✅ | |
+| Software | Any | ✅ | | ➖ |
 
 ✅ Supported &nbsp;·&nbsp; 🟡 In progress &nbsp;·&nbsp; ➖ Not supported
 
