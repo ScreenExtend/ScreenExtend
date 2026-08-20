@@ -38,18 +38,20 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               )
             }
           </div>
-          <ProfileMenu />
+          <div id="tour-profile">
+            <ProfileMenu />
+          </div>
         </div>
         <div className="h-full flex-grow overflow-y-auto w-full overflow-hidden">
           {children}
         </div>
         <div className="flex items-center justify-end p-4 border-t">
-          <div className="flex flex-col mx-2 text-sm">
+          <div id="tour-session" className="flex flex-col mx-2 text-sm">
             <p>Session ID: {sessionId}</p>
             <p>Session OTP: {otp}</p>
           </div>
           <div className="flex-1"></div>
-          <div className="flex items-center space-x-2">
+          <div id="tour-theme" className="flex items-center space-x-2">
             <ModeToggle />
           </div>
         </div>

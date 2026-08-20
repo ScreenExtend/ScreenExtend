@@ -1,6 +1,8 @@
 import { useContext, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { useNextStep } from "nextstepjs";
 
-import { Power, Trash2, RotateCcw } from "lucide-react";
+import { Power, Trash2, RotateCcw, Compass } from "lucide-react";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import {
   DropdownMenu,
@@ -12,7 +14,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-import { updateConfig, getConfig } from "@/components/config-provider";
+import { updateConfig, flushConfig, getConfig } from "@/components/config-provider";
+import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands } from "@/lib/bindings";
 import defaultLogo from "@/assets/default.svg";
@@ -21,6 +24,15 @@ export function ProfileMenu() {
   const { windowClosing: [closing, setClosing], windowAvatar: [avatar] } = useContext(GlobalProviderContext);
   const [background, setBackground] = useState(false);
   const [name, setName] = useState("");
+  const navigate = useNavigate();
+  const { startNextStep } = useNextStep();
+
+  const replayTour = async () => {
+    await updateConfig({ walkthroughCompleted: false });
+    await flushConfig();
+    navigate("/dashboard");
+    startNextStep(WALKTHROUGH_TOUR);
+  };
 
   useEffect(() => {
     void (async () => {
@@ -66,6 +78,13 @@ export function ProfileMenu() {
           >
             <RotateCcw className="mr-2 h-4 w-4" />
             <span>Reset Preferences</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="cursor-pointer"
+            onClick={() => { void replayTour(); }}
+          >
+            <Compass className="mr-2 h-4 w-4" />
+            <span>Replay Tour</span>
           </DropdownMenuItem>
           <DropdownMenuItem
             className="cursor-pointer"

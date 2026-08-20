@@ -12,7 +12,10 @@ import Settings from "@/pages/settings";
 import Devices from "@/pages/devices";
 import { Loader2 } from "lucide-react";
 
-import { getConfig, updateConfig, type Device } from "@/components/config-provider";
+import { NextStepProvider, NextStepReact } from "nextstepjs";
+import { HighlightProxy, WalkthroughArrow, WalkthroughCard, walkthroughSteps } from "@/components/walkthrough";
+
+import { getConfig, updateConfig, flushConfig, type Device } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -167,6 +170,11 @@ function App() {
     await commands.exitApp();
   });
 
+  const markWalkthroughDone = async () => {
+    await updateConfig({ walkthroughCompleted: true });
+    await flushConfig();
+  };
+
   return (
     <GlobalProviderContext.Provider value={{
       windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn],
@@ -181,13 +189,27 @@ function App() {
       windowZoom: [zoom, setZoom]
     }}>
       <ThemeProvider defaultTheme="system">
-          <RouterProvider router={router} />
-          <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 999999 }}>
-            <div className="rounded-lg p-6 flex flex-col items-center">
-              <Loader2 className="animate-spin text-white mb-4" size={48} />
-              <p className="text-xl font-semibold text-white">{t("app.closing")}</p>
+        <NextStepProvider>
+          <NextStepReact
+            steps={walkthroughSteps}
+            cardComponent={WalkthroughCard}
+            onComplete={() => void markWalkthroughDone()}
+            onSkip={() => void markWalkthroughDone()}
+            shadowOpacity="0.5"
+            arrowComponent={WalkthroughArrow}
+            cardTransition={{ ease: "easeInOut", duration: 0.4 }}
+            disableConsoleLogs
+          >
+            <HighlightProxy />
+            <RouterProvider router={router} />
+            <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 999999 }}>
+              <div className="rounded-lg p-6 flex flex-col items-center">
+                <Loader2 className="animate-spin text-white mb-4" size={48} />
+                <p className="text-xl font-semibold text-white">{t("app.closing")}</p>
+              </div>
             </div>
-          </div>
+          </NextStepReact>
+        </NextStepProvider>
         </ThemeProvider>
     </GlobalProviderContext.Provider>
   );
