@@ -1,11 +1,12 @@
 import type { ArrowComponentProps, CardComponentProps, Step, Tour } from "nextstepjs";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef } from "react";
 import { useNextStep } from "nextstepjs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { cn } from "@/lib/utils";
 
 export const WALKTHROUGH_TOUR = "welcome";
@@ -91,6 +92,7 @@ export function HighlightProxy() {
     startNextStep,
     setCurrentStep,
   } = useNextStep();
+  const { windowZoom: [zoom] } = useContext(GlobalProviderContext);
   const proxyRef = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {
@@ -140,41 +142,51 @@ export function HighlightProxy() {
   const stateRef = useRef({ currentStep, currentTour, isNextStepVisible });
   stateRef.current = { currentStep, currentTour, isNextStepVisible };
 
-  useEffect(() => {
-    let settle = 0;
-    let pending = false;
-    let savedStep = 0;
-    const onResize = () => {
-      if (!pending) {
-        const s = stateRef.current;
-        if (!s.isNextStepVisible || s.currentTour !== WALKTHROUGH_TOUR) return;
-        pending = true;
-        savedStep = s.currentStep;
-        closeNextStep();
-      }
-      clearTimeout(settle);
-      settle = window.setTimeout(() => {
-        pending = false;
-        startNextStep(WALKTHROUGH_TOUR);
-        setCurrentStep(savedStep);
-      }, 200);
-    };
+  const settleRef = useRef(0);
+  const pendingRef = useRef(false);
+  const savedStepRef = useRef(0);
 
+  const scheduleReenter = useCallback(() => {
+    if (!pendingRef.current) {
+      const s = stateRef.current;
+      if (!s.isNextStepVisible || s.currentTour !== WALKTHROUGH_TOUR) return;
+      pendingRef.current = true;
+      savedStepRef.current = s.currentStep;
+      closeNextStep();
+    }
+    clearTimeout(settleRef.current);
+    settleRef.current = window.setTimeout(() => {
+      pendingRef.current = false;
+      startNextStep(WALKTHROUGH_TOUR);
+      setCurrentStep(savedStepRef.current);
+    }, 200);
+  }, [closeNextStep, startNextStep, setCurrentStep]);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void getCurrentWindow()
-      .onResized(onResize)
+      .onResized(() => scheduleReenter())
       .then((fn) => {
         if (disposed) fn();
         else unlisten = fn;
       });
-
     return () => {
       disposed = true;
       unlisten?.();
-      clearTimeout(settle);
     };
-  }, [closeNextStep, startNextStep, setCurrentStep]);
+  }, [scheduleReenter]);
+
+  const zoomReady = useRef(false);
+  useEffect(() => {
+    if (!zoomReady.current) {
+      zoomReady.current = true;
+      return;
+    }
+    scheduleReenter();
+  }, [zoom, scheduleReenter]);
+
+  useEffect(() => () => clearTimeout(settleRef.current), []);
 
   return (
     <div
