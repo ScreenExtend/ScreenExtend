@@ -22,6 +22,7 @@ export type Config = {
   publicSessionsEnabled: boolean,
   zoomFactor: number,
   disableGpuEncode: boolean,
+  walkthroughCompleted: boolean,
   serverPorts: {
     http: number,
     https: number
@@ -53,6 +54,7 @@ export const defaultConfig: Config = {
   publicSessionsEnabled: true,
   zoomFactor: 1,
   disableGpuEncode: false,
+  walkthroughCompleted: false,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,
     https: DEFAULT_HTTPS_PORT

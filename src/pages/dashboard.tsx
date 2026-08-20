@@ -15,12 +15,18 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
+import { useNextStep } from "nextstepjs";
+
 import { GlobalProviderContext } from "@/components/global-provider";
+import { getConfig } from "@/components/config-provider";
+import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { commands, events } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
 
 type CloudStatus = { state: string; detail: string };
+
+let walkthroughAutoStarted = false;
 
 function CloudBadge({ status }: { status: CloudStatus }) {
   const map: Record<string, { label: string; className: string }> = {
@@ -44,8 +50,21 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 
 export default function Dashboard() {
   const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled] } = useContext(GlobalProviderContext);
+  const { startNextStep } = useNextStep();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
+
+  useEffect(() => {
+    if (walkthroughAutoStarted) return;
+    let cancelled = false;
+    void (async () => {
+      const cfg = await getConfig();
+      if (cancelled || walkthroughAutoStarted || cfg?.walkthroughCompleted) return;
+      walkthroughAutoStarted = true;
+      requestAnimationFrame(() => { if (!cancelled) startNextStep(WALKTHROUGH_TOUR); });
+    })();
+    return () => { cancelled = true; };
+  }, [startNextStep]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -81,7 +100,7 @@ export default function Dashboard() {
       <div className="p-8">
         <h2 className="flex justify-center text-4xl font-semibold">What network is your device connected to?</h2>
       </div>
-      <div className="w-full overflow-hidden box-border mb-10">
+      <div id="tour-connect" className="w-full overflow-hidden box-border mb-10">
         <div className="px-8 overflow-auto max-w-full mx-auto box-content hidden lg:flex items-center justify-evenly">
           {cloudUrl && (
             <QrDisplay name="Anywhere (Internet)" url={cloudUrl} badge={<CloudBadge status={cloudStatus} />} blurred={!cloudReady} blurredLabel={cloudBlurredLabel} />

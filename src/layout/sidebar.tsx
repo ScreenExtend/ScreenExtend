@@ -16,7 +16,7 @@ export function Sidebar() {
       <div className="space-y-4 h-full flex flex-col w-full border-r">
         <div className="px-3 py-2 pt-0 h-full">
           <div className="flex items-center justify-between mb-2 px-4 pr-0">
-            <h2 className="text-4xl font-medium tracking-tight py-4" style={{ marginLeft: "-0.5rem" }}>
+            <h2 id="tour-brand" className="text-4xl font-medium tracking-tight py-4" style={{ marginLeft: "-0.5rem" }}>
               ScreenExtend
             </h2>
             <ChevronLeft
@@ -25,7 +25,7 @@ export function Sidebar() {
               id="hideArrow"
             />
           </div>
-          <div className="space-y-1">
+          <div className="space-y-1" id="tour-nav">
             <Link className="block" to="/dashboard">
               <Button
                 variant={

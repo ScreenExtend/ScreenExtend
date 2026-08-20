@@ -110,3 +110,7 @@
     display: none;
   }
 }
+
+[data-name="nextstep-pointer"] {
+  box-shadow: inset 0 0 0 2px hsl(var(--primary));
+}
