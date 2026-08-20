@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <CustomAction Id="ScreenExtendRemoveDrivers"
+                  FileKey="Path"
+                  ExeCommand="removedrivers"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="ScreenExtendRemoveDrivers" After="InstallInitialize">
+        (REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE
+      </Custom>
+    </InstallExecuteSequence>
+
+    <ComponentGroup Id="ScreenExtendDriverCleanup" Directory="INSTALLDIR">
+      <Component Id="ScreenExtendDriverCleanupMarker" Guid="*">
+        <RegistryValue Root="HKLM"
+                       Key="Software\ScreenExtend"
+                       Name="DriverCleanupHook"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
