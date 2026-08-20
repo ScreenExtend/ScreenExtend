@@ -42,6 +42,19 @@
     "macOS": {
       "entitlements": "./Entitlements.plist"
     },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "./windows/fragment.wxs"
+        ],
+        "componentGroupRefs": [
+          "ScreenExtendDriverCleanup"
+        ]
+      }
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {
