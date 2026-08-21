@@ -15,7 +15,7 @@ import { Loader2 } from "lucide-react";
 import { NextStepProvider, NextStepReact } from "nextstepjs";
 import { HighlightProxy, WalkthroughArrow, WalkthroughCard, walkthroughSteps } from "@/components/walkthrough";
 
-import { getConfig, updateConfig, flushConfig, type Device } from "@/components/config-provider";
+import { getConfig, updateConfig, flushConfig, recordKnownDevice, type Device } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -127,6 +127,12 @@ function App() {
           const next = prev.filter(d => d.ip !== device.ip);
           next.push(device);
           return next;
+        });
+        void recordKnownDevice({
+          ip: device.ip,
+          name: device.name,
+          os: device.os,
+          screenSize: device.screenSize,
         });
       }));
       unlisteners.push(await events.deviceModify.listen(event => {

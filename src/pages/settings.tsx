@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import { AvatarCropModal } from "@/components/avatar-crop-modal";
-import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown, QrCode } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown, QrCode, Ban, Trash2 } from "lucide-react";
 import defaultLogo from "@/assets/default.svg";
 import {
   InputOTP,
@@ -22,6 +22,14 @@ import {
   CardTitle
 } from "@/components/ui/card";
 import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -33,7 +41,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, flushConfig, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT } from "@/components/config-provider";
+import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type KnownDevice } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
@@ -50,8 +58,28 @@ const IS_WINDOWS = getOsType() === "windows";
 const IS_MACOS = getOsType() === "macos";
 const SUPPORTS_WIFI_QR = IS_WINDOWS || IS_MACOS;
 
+function isLikelyIp(value: string): boolean {
+  if (!value) return false;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) {
+    return value.split(".").every(octet => Number(octet) <= 255);
+  }
+  return value.includes(":") && /^[0-9a-fA-F:]+$/.test(value);
+}
+
+function formatLastSeen(ts: number): string {
+  if (!ts) return "—";
+  const mins = Math.floor((Date.now() - ts) / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hr${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
 export default function Settings() {
-  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom] } = useContext(GlobalProviderContext);
+  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom], windowDevices: [connectedDevices] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
   const { t } = useTranslation();
 
@@ -87,6 +115,8 @@ export default function Settings() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [disableGpuEncode, setDisableGpuEncode] = useState(false);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [knownDevices, setKnownDevices] = useState<KnownDevice[]>([]);
+  const [banIpInput, setBanIpInput] = useState("");
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -134,6 +164,52 @@ export default function Settings() {
   useEffect(() => {
     isAutostartEnabled().then(setAutostartEnabled).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    void getKnownDevices().then(setKnownDevices);
+  }, [connectedDevices]);
+
+  const isConnected = (ip: string) => connectedDevices.some(d => d.ip === ip);
+
+  const applyBan = async (ip: string, banned: boolean) => {
+    await commands.setDeviceBanned(ip, banned);
+    await setKnownDeviceBanned(ip, banned);
+    setKnownDevices(await getKnownDevices());
+    toast({
+      title: banned ? t("toasts.deviceBan.bannedTitle") : t("toasts.deviceBan.unbannedTitle"),
+      description: banned
+        ? t("toasts.deviceBan.bannedDescription", { ip })
+        : t("toasts.deviceBan.unbannedDescription", { ip }),
+    });
+  };
+
+  const banManualIp = async () => {
+    const ip = banIpInput.trim();
+    if (!isLikelyIp(ip)) {
+      toast({
+        title: t("toasts.deviceBan.invalidTitle"),
+        description: t("toasts.deviceBan.invalidDescription"),
+      });
+      return;
+    }
+    setBanIpInput("");
+    await applyBan(ip, true);
+  };
+
+  const forgetDevice = async (ip: string) => {
+    await commands.setDeviceBanned(ip, false);
+    await removeKnownDevice(ip);
+    setKnownDevices(await getKnownDevices());
+    toast({
+      title: t("toasts.device.removedTitle"),
+      description: t("toasts.device.removedDescription"),
+    });
+  };
+
+  const sortedKnownDevices = [...knownDevices].sort((a, b) => {
+    const connectedDelta = Number(isConnected(b.ip)) - Number(isConnected(a.ip));
+    return connectedDelta !== 0 ? connectedDelta : b.lastSeen - a.lastSeen;
+  });
 
   const saveDisconnectGrace = async () => {
     const parsed = Number(disconnectGrace);
@@ -609,6 +685,98 @@ export default function Settings() {
                   Save Timeout
                 </Button>
               </div>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="mb-4">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Past Devices</CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Every device that has connected to this PC. Ban a device to disconnect it and block it from joining again by its IP address.
+                </p>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center space-x-4 p-3 px-0 pt-0">
+                <div className="relative outline-none flex-1">
+                  <Input
+                    type="text"
+                    placeholder="IP address to ban (e.g. 192.168.1.42)"
+                    className="outline-none"
+                    value={banIpInput}
+                    onChange={event => setBanIpInput(event.target.value)}
+                    onKeyDown={event => { if (event.key === "Enter") void banManualIp(); }}
+                    hoverLabel={true}
+                  />
+                </div>
+                <Button variant="outline" onClick={() => void banManualIp()}>
+                  <Ban className="mr-2 h-4 w-4" />
+                  Ban IP
+                </Button>
+              </div>
+              {sortedKnownDevices.length > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[160px]">Device Name</TableHead>
+                      <TableHead>OS</TableHead>
+                      <TableHead>IP</TableHead>
+                      <TableHead>Last Seen</TableHead>
+                      <TableHead></TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody className="border-t">
+                    {sortedKnownDevices.map(device => (
+                      <TableRow key={device.ip} className={device.banned ? "opacity-60" : ""}>
+                        <TableCell className="font-medium">
+                          <div className="flex items-center gap-2">
+                            <span>{device.name || "Unknown device"}</span>
+                            {isConnected(device.ip) && (
+                              <span className="inline-flex items-center gap-1 text-xs text-green-600">
+                                <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
+                                Connected
+                              </span>
+                            )}
+                            {device.banned && (
+                              <span className="text-xs font-medium text-red-500">Banned</span>
+                            )}
+                          </div>
+                        </TableCell>
+                        <TableCell>{device.os || "—"}</TableCell>
+                        <TableCell>{device.ip}</TableCell>
+                        <TableCell className="text-muted-foreground">{formatLastSeen(device.lastSeen)}</TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className={device.banned ? "" : "text-red-600 hover:text-red-700"}
+                              onClick={() => void applyBan(device.ip, !device.banned)}
+                            >
+                              {device.banned ? "Unban" : "Ban"}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label="Forget device"
+                              title="Forget device"
+                              onClick={() => void forgetDevice(device.ip)}
+                            >
+                              <Trash2 className="h-4 w-4 text-muted-foreground" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <p className="text-sm text-muted-foreground py-2">
+                  No devices have connected yet.
+                </p>
+              )}
             </CardContent>
           </Card>
         </div>

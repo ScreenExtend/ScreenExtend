@@ -14,10 +14,20 @@ export type Device = {
   screenSize: string;
 };
 
+export type KnownDevice = {
+  ip: string;
+  name: string;
+  os: string;
+  screenSize: string;
+  lastSeen: number;
+  banned: boolean;
+};
+
 export type Config = {
   name: string,
   theme: string,
   devices: Device[],
+  knownDevices: KnownDevice[],
   sessionPassword: string,
   publicSessionsEnabled: boolean,
   zoomFactor: number,
@@ -50,6 +60,7 @@ export const defaultConfig: Config = {
   name: "",
   theme: "system",
   devices: [],
+  knownDevices: [],
   sessionPassword: "",
   publicSessionsEnabled: true,
   zoomFactor: 1,
@@ -118,4 +129,47 @@ export const saveDeviceSettings = async (device: Device) => {
 export const removeSavedDevice = async (ip: string) => {
   const existing = await getSavedDevices();
   await updateConfig({ devices: existing.filter(d => d.ip !== ip) });
+};
+
+export const getKnownDevices = async (): Promise<KnownDevice[]> => {
+  return (await getConfig())?.knownDevices ?? [];
+};
+
+export const recordKnownDevice = async (
+  info: { ip: string; name: string; os: string; screenSize: string }
+) => {
+  const existing = await getKnownDevices();
+  const prev = existing.find(d => d.ip === info.ip);
+  const merged: KnownDevice = {
+    ip: info.ip,
+    name: info.name.trim() || prev?.name || "",
+    os: info.os.trim() || prev?.os || "",
+    screenSize: info.screenSize.trim() || prev?.screenSize || "",
+    lastSeen: Date.now(),
+    banned: prev?.banned ?? false,
+  };
+  await updateConfig({ knownDevices: [...existing.filter(d => d.ip !== info.ip), merged] });
+};
+
+export const setKnownDeviceBanned = async (ip: string, banned: boolean) => {
+  const existing = await getKnownDevices();
+  let knownDevices: KnownDevice[];
+  if (existing.some(d => d.ip === ip)) {
+    knownDevices = existing.map(d => (d.ip === ip ? { ...d, banned } : d));
+  } else if (banned) {
+    knownDevices = [
+      ...existing,
+      { ip, name: "", os: "", screenSize: "", lastSeen: Date.now(), banned: true },
+    ];
+  } else {
+    return;
+  }
+  await updateConfig({ knownDevices });
+  await flushConfig();
+};
+
+export const removeKnownDevice = async (ip: string) => {
+  const existing = await getKnownDevices();
+  await updateConfig({ knownDevices: existing.filter(d => d.ip !== ip) });
+  await flushConfig();
 };
