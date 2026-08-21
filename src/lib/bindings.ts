@@ -81,6 +81,9 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
 },
+async setDeviceBanned(ip: string, banned: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_banned", { ip, banned });
+},
 async setDisconnectGrace(seconds: number) : Promise<void> {
     await TAURI_INVOKE("set_disconnect_grace", { seconds });
 },

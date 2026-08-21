@@ -1,8 +1,8 @@
 use std::net::Ipv4Addr;
 
 use super::session::{
-    SessionAuth, SharedDeviceOverrides, SharedDeviceReporter, SharedDisconnectGrace,
-    SharedLocalIps, SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
+    SessionAuth, SharedBannedIps, SharedDeviceOverrides, SharedDeviceReporter,
+    SharedDisconnectGrace, SharedLocalIps, SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -124,6 +124,7 @@ pub struct Config {
     pub sessions: Option<SharedSessions>,
     pub disconnect_grace: Option<SharedDisconnectGrace>,
     pub user_turn: Option<SharedTurnConfig>,
+    pub banned_ips: Option<SharedBannedIps>,
 }
 
 const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
@@ -169,6 +170,7 @@ impl Default for Config {
             sessions: None,
             disconnect_grace: None,
             user_turn: None,
+            banned_ips: None,
         }
     }
 }

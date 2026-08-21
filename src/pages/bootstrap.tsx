@@ -98,6 +98,11 @@ export default function Bootstrap() {
           device.remoteControl ?? false
         );
       }
+      for (const known of existing?.knownDevices ?? []) {
+        if (known.banned) {
+          await commands.setDeviceBanned(known.ip, true);
+        }
+      }
       const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
       setPublicSessionsEnabled(publicSessionsEnabled);
 

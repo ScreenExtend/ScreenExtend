@@ -401,7 +401,20 @@ pub async fn process_whep(
         req.sdp.len()
     );
 
-    // Refuse outright if this device is still serving an OTP lockout.
+    if state
+        .config
+        .banned_ips
+        .as_ref()
+        .is_some_and(|banned| session::is_ip_banned(banned, device_key))
+    {
+        tprintln!("join rejected: {device_key} is banned by the host");
+        return ProcessedResponse {
+            status: StatusCode::FORBIDDEN.as_u16(),
+            content_type: "text/plain",
+            body: "this device has been banned by the host".to_string(),
+        };
+    }
+
     if let Some(retry_after) = state.otp_limiter.locked_for(device_key) {
         let secs = retry_after.as_secs() + 1;
         tprintln!("join rejected: {device_key} locked out, {secs}s remaining on OTP timeout");

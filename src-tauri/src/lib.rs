@@ -287,6 +287,7 @@ pub fn run() {
             remove_drivers,
             set_device_override,
             remove_device_override,
+            set_device_banned,
             set_disconnect_grace,
             get_disconnect_grace,
             set_turn_config,

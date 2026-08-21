@@ -12,7 +12,7 @@ use crate::streamer::cloud::{
     CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
 };
 use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedDeviceOverrides, SharedDeviceReporter,
+    self, DeviceOverride, SessionAuth, SharedBannedIps, SharedDeviceOverrides, SharedDeviceReporter,
     SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
@@ -46,6 +46,7 @@ pub struct AppState {
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
+    pub banned_ips: SharedBannedIps,
     pub server_ports: SharedServerPorts,
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
@@ -264,6 +265,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
+        banned_ips: session::new_shared_banned_ips(),
         server_ports: session::new_shared_server_ports(),
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
@@ -310,6 +312,20 @@ pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
     state.device_overrides.lock().unwrap().remove(&ip);
     session::bump_kick_epoch(&state.sessions, &ip);
     session::signal_leave(&state.sessions, &ip);
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_banned(state: State<'_, AppState>, ip: String, banned: bool) {
+    if banned {
+        state.banned_ips.lock().unwrap().insert(ip.clone());
+        session::bump_kick_epoch(&state.sessions, &ip);
+        session::signal_leave(&state.sessions, &ip);
+        tprintln!("device {ip} banned; existing session (if any) kicked");
+    } else {
+        state.banned_ips.lock().unwrap().remove(&ip);
+        tprintln!("device {ip} unbanned");
+    }
 }
 
 #[tauri::command]
@@ -553,6 +569,7 @@ pub fn register_cloud_session(
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
+        banned_ips: Some(state.banned_ips.clone()),
         disable_gpu_encode: state
             .disable_gpu_encode
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -643,6 +660,7 @@ pub fn sync_streamers(state: &AppState) {
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
+            banned_ips: Some(state.banned_ips.clone()),
             disable_gpu_encode: state
                 .disable_gpu_encode
                 .load(std::sync::atomic::Ordering::Relaxed),

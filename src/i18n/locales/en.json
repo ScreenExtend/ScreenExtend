@@ -101,6 +101,14 @@
       "updatedDescription": "Your device settings have successfully been updated.",
       "removedTitle": "Device Removed",
       "removedDescription": "Your device has been successfully removed."
+    },
+    "deviceBan": {
+      "bannedTitle": "Device Banned",
+      "bannedDescription": "{ip} has been disconnected and blocked from joining again.",
+      "unbannedTitle": "Device Unbanned",
+      "unbannedDescription": "{ip} can join again.",
+      "invalidTitle": "Invalid IP Address",
+      "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban."
     }
   },
   "dialogs": {

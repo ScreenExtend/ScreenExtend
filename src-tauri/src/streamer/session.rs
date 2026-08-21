@@ -47,6 +47,16 @@ pub fn new_shared_local_ips() -> SharedLocalIps {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+pub type SharedBannedIps = Arc<Mutex<std::collections::HashSet<String>>>;
+
+pub fn new_shared_banned_ips() -> SharedBannedIps {
+    Arc::new(Mutex::new(std::collections::HashSet::new()))
+}
+
+pub fn is_ip_banned(banned: &SharedBannedIps, ip: &str) -> bool {
+    banned.lock().unwrap().contains(ip)
+}
+
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
 
 pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 10;
