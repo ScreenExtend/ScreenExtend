@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,17 @@ use tauri::AppHandle;
 use tauri_specta::Event;
 
 const MAX_BACKLOG: usize = 2000;
+
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct LogLine(pub String);
@@ -52,12 +64,16 @@ pub fn get_log_backlog() -> Vec<String> {
 #[macro_export]
 macro_rules! tprintln {
     () => {{
-        println!();
+        if $crate::logbus::verbose() {
+            println!();
+        }
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
-        println!("{}", __line);
+        if $crate::logbus::verbose() {
+            println!("{}", __line);
+        }
         $crate::logbus::push_line(__line);
     }};
 }
@@ -65,12 +81,16 @@ macro_rules! tprintln {
 #[macro_export]
 macro_rules! teprintln {
     () => {{
-        eprintln!();
+        if $crate::logbus::verbose() {
+            eprintln!();
+        }
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
-        eprintln!("{}", __line);
+        if $crate::logbus::verbose() {
+            eprintln!("{}", __line);
+        }
         $crate::logbus::push_line(__line);
     }};
 }

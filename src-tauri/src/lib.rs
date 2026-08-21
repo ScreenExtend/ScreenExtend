@@ -13,6 +13,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 #[macro_use]
 mod logbus;
+mod cli;
 mod single_instance;
 mod streamer;
 
@@ -256,6 +257,8 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    cli::fast_path();
+
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             compatibility::check_system_requirements,
@@ -308,7 +311,7 @@ pub fn run() {
         ]);
 
     #[cfg(debug_assertions)]
-    {
+    if std::env::args_os().nth(1).is_none() {
         builder
             .export(Typescript::default(), "../src/lib/bindings.ts")
             .expect("error while exporting typescript bindings");
@@ -336,6 +339,8 @@ pub fn run() {
         .menu(build_menu)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
+            builder.mount_events(app);
+            let _ = crate::cli::dispatch(app.handle());
             crate::streamer::input::prime();
             if let Ok(matches) = app.cli().matches() {
                 match matches.subcommand {
@@ -563,7 +568,6 @@ pub fn run() {
                             std::mem::forget(file);
                         }
 
-                        builder.mount_events(app);
                         logbus::attach(app.handle().clone());
                         let window = tauri::WebviewWindowBuilder::new(
                             app,
