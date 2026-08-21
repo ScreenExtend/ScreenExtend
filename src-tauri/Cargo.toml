@@ -75,6 +75,8 @@ rand = "0.9.1"
 thiserror = "2.0.3"
 wmi = "0.17.2"
 whoami = "2.1.2"
+qr2term = "0.3"
+ctrlc = "3.5.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS capture/encode backend
@@ -119,13 +121,13 @@ windows-future = "0.3.2"
 parking_lot = "0.12.5"
 rayon = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
-ctrlc = "3.5.2"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
     "Foundation_Collections",
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_ProcessStatus",
     "Win32_Graphics_Direct3D11",
     "Security_Cryptography",

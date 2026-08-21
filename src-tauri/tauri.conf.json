@@ -59,27 +59,196 @@
   },
   "plugins": {
     "cli": {
+      "description": "ScreenExtend — turn any device into a wireless second monitor. Run with no arguments to open the desktop app.",
       "subcommands": {
-        "hostednetwork": {
+        "serve": {
+          "description": "Run the streaming host headlessly (no window) until Ctrl+C.",
           "args": [
-            {
-              "name": "ssid",
-              "index": 1,
-              "takesValue": true
-            },
-            {
-              "name": "password",
-              "index": 2,
-              "takesValue": true
-            }
+            { "name": "http-port", "takesValue": true, "description": "Override the HTTP port." },
+            { "name": "https-port", "takesValue": true, "description": "Override the HTTPS port." },
+            { "name": "session-id", "takesValue": true, "description": "Use a specific session id (default: random)." },
+            { "name": "otp", "takesValue": true, "description": "Use a specific OTP (default: random)." },
+            { "name": "no-cloud", "description": "Do not register a public 'Anywhere (Internet)' session." },
+            { "name": "no-qr", "description": "Do not render QR codes in the terminal." },
+            { "name": "software-encode", "description": "Force CPU (software) video encoding." },
+            { "name": "verbose", "short": "v", "description": "Print internal diagnostic logs to the terminal." }
           ]
         },
-        "installdrivers": {
-          "args": []
+        "status": {
+          "description": "Show session, network, driver and config state.",
+          "args": [
+            { "name": "session-id", "takesValue": true, "description": "Build full join URLs for this session id." },
+            { "name": "json", "description": "Output JSON." }
+          ]
         },
-        "removedrivers": {
-          "args": []
-        }
+        "qr": {
+          "description": "Print join QR codes / URLs for a session.",
+          "args": [
+            { "name": "target", "short": "t", "takesValue": true, "possibleValues": ["lan", "cloud", "all"], "description": "Which targets to show (default: all)." },
+            { "name": "session-id", "takesValue": true, "description": "Use a specific session id (default: random)." },
+            { "name": "no-render", "description": "Print URLs only; do not draw QR codes." },
+            { "name": "json", "description": "Output JSON." }
+          ]
+        },
+        "session": {
+          "description": "Session credential helpers.",
+          "subcommands": {
+            "new": {
+              "description": "Generate a fresh session id + OTP and print join info.",
+              "args": [
+                { "name": "no-render", "description": "Print URLs only; do not draw QR codes." },
+                { "name": "json", "description": "Output JSON." }
+              ]
+            }
+          }
+        },
+        "devices": {
+          "description": "Manage saved per-device display overrides.",
+          "subcommands": {
+            "list": {
+              "description": "List saved device overrides.",
+              "args": [{ "name": "json", "description": "Output JSON." }]
+            },
+            "set": {
+              "description": "Save display overrides for a device.",
+              "args": [
+                { "name": "ip", "index": 1, "takesValue": true, "required": true, "description": "Device IP address." },
+                { "name": "scale", "takesValue": true, "description": "Display scale percent (25-200)." },
+                { "name": "orientation", "takesValue": true, "possibleValues": ["Portrait", "Landscape"], "description": "Display orientation." },
+                { "name": "refresh-rate", "takesValue": true, "description": "Refresh rate in Hz (15-500)." },
+                { "name": "video-scale", "takesValue": true, "description": "Video resolution percent (10-100)." },
+                { "name": "video-quality", "takesValue": true, "description": "Encoder quality 1 (best) to 51 (worst)." },
+                { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." }
+              ]
+            },
+            "reset": {
+              "description": "Clear saved overrides for a device.",
+              "args": [{ "name": "ip", "index": 1, "takesValue": true, "required": true, "description": "Device IP address." }]
+            }
+          }
+        },
+        "network": {
+          "description": "Hosted Wi-Fi network control.",
+          "subcommands": {
+            "start": {
+              "description": "Start a hosted Wi-Fi network.",
+              "args": [
+                { "name": "ssid", "index": 1, "takesValue": true, "required": true, "description": "Network name." },
+                { "name": "password", "index": 2, "takesValue": true, "required": true, "description": "Network password." }
+              ]
+            },
+            "stop": { "description": "Stop the hosted network." },
+            "status": {
+              "description": "Show hosted-network state.",
+              "args": [{ "name": "json", "description": "Output JSON." }]
+            },
+            "wifi-on": { "description": "Turn the Wi-Fi radio on." },
+            "wifi-qr": {
+              "description": "Print a Wi-Fi join QR for the saved hosted network.",
+              "args": [{ "name": "json", "description": "Output JSON." }]
+            }
+          }
+        },
+        "config": {
+          "description": "Read and write persisted settings.",
+          "subcommands": {
+            "list": {
+              "description": "Print all settings.",
+              "args": [{ "name": "json", "description": "Output JSON." }]
+            },
+            "get": {
+              "description": "Read a setting (dotted keys, e.g. serverPorts.http).",
+              "args": [{ "name": "key", "index": 1, "takesValue": true, "required": true, "description": "Setting key." }]
+            },
+            "set": {
+              "description": "Write a setting (value parsed as JSON, else string).",
+              "args": [
+                { "name": "key", "index": 1, "takesValue": true, "required": true, "description": "Setting key." },
+                { "name": "value", "index": 2, "takesValue": true, "required": true, "description": "Value." }
+              ]
+            },
+            "path": { "description": "Print the config.json path." }
+          }
+        },
+        "turn": {
+          "description": "TURN relay configuration.",
+          "subcommands": {
+            "show": {
+              "description": "Show the TURN configuration.",
+              "args": [{ "name": "json", "description": "Output JSON." }]
+            },
+            "set": {
+              "description": "Configure the TURN relay.",
+              "args": [
+                { "name": "urls", "index": 1, "takesValue": true, "required": true, "description": "Comma-separated TURN URLs." },
+                { "name": "username", "takesValue": true, "description": "TURN username." },
+                { "name": "credential", "takesValue": true, "description": "TURN credential." }
+              ]
+            },
+            "clear": { "description": "Remove the TURN configuration." }
+          }
+        },
+        "account": {
+          "description": "Host identity settings.",
+          "subcommands": {
+            "name": {
+              "description": "Show or set the host display name.",
+              "args": [{ "name": "value", "index": 1, "takesValue": true, "description": "New name (omit to show)." }]
+            },
+            "whoami": { "description": "Print the OS username." },
+            "avatar": {
+              "description": "Manage the profile picture.",
+              "subcommands": {
+                "set": {
+                  "description": "Set the avatar from an image file.",
+                  "args": [{ "name": "path", "index": 1, "takesValue": true, "required": true, "description": "Image file path." }]
+                },
+                "remove": { "description": "Remove the avatar." },
+                "show": { "description": "Show whether an avatar is set." }
+              }
+            }
+          }
+        },
+        "autostart": {
+          "description": "Launch-at-login control.",
+          "subcommands": {
+            "enable": { "description": "Enable launch at startup." },
+            "disable": { "description": "Disable launch at startup." },
+            "status": { "description": "Show launch-at-startup state." }
+          }
+        },
+        "drivers": {
+          "description": "Virtual display driver management.",
+          "subcommands": {
+            "install": { "description": "Install the virtual display driver (elevated)." },
+            "remove": { "description": "Remove the virtual display driver (elevated)." }
+          }
+        },
+        "doctor": {
+          "description": "Check system requirements and permissions.",
+          "args": [{ "name": "json", "description": "Output JSON." }]
+        },
+        "logs": {
+          "description": "Print the in-process log backlog.",
+          "args": [{ "name": "lines", "short": "n", "takesValue": true, "description": "Show only the last N lines." }]
+        },
+        "update": {
+          "description": "App updates.",
+          "subcommands": {
+            "check": { "description": "Check for updates." },
+            "install": { "description": "Download and install the latest update." }
+          }
+        },
+        "stop": { "description": "Ask a running instance to quit." },
+        "display-settings": { "description": "Open the OS display settings (arrange extended displays)." },
+        "hostednetwork": {
+          "args": [
+            { "name": "ssid", "index": 1, "takesValue": true },
+            { "name": "password", "index": 2, "takesValue": true }
+          ]
+        },
+        "installdrivers": { "args": [] },
+        "removedrivers": { "args": [] }
       }
     },
     "updater": {

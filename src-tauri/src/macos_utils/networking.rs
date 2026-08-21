@@ -196,6 +196,82 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         .collect()
 }
 
+pub fn cli_adapters() -> Vec<NetworkInfo> {
+    let mut flags: BTreeMap<String, i32> = BTreeMap::new();
+    let mut v4: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut v6: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    unsafe {
+        let mut ifap: *mut ifaddrs = std::ptr::null_mut();
+        if getifaddrs(&mut ifap) != 0 {
+            return Vec::new();
+        }
+
+        let mut ifa = ifap;
+        while !ifa.is_null() {
+            let name = CStr::from_ptr((*ifa).ifa_name)
+                .to_string_lossy()
+                .into_owned();
+            flags.insert(name.clone(), (*ifa).ifa_flags as i32);
+
+            let addr = (*ifa).ifa_addr;
+            if !addr.is_null() {
+                match (*addr).sa_family as i32 {
+                    AF_INET => {
+                        let sin = addr as *const libc::sockaddr_in;
+                        let ip = Ipv4Addr::from((*sin).sin_addr.s_addr.to_ne_bytes());
+                        v4.entry(name).or_default().push(ip.to_string());
+                    }
+                    AF_INET6 => {
+                        let sin6 = addr as *const libc::sockaddr_in6;
+                        let ip = Ipv6Addr::from((*sin6).sin6_addr.s6_addr);
+                        v6.entry(name).or_default().push(ip.to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            ifa = (*ifa).ifa_next;
+        }
+        freeifaddrs(ifap);
+    }
+
+    flags
+        .into_iter()
+        .filter_map(|(name, fl)| {
+            let want = IFF_UP | IFF_RUNNING;
+            if fl & (want | IFF_LOOPBACK) != want {
+                return None;
+            }
+            let status = media_status(&name)?;
+            if status & (IFM_AVALID | IFM_ACTIVE) != (IFM_AVALID | IFM_ACTIVE) {
+                return None;
+            }
+            let media = match functional_type(&name)? {
+                IFRTYPE_FUNCTIONAL_WIFI_INFRA => "Wi-Fi",
+                IFRTYPE_FUNCTIONAL_WIRED => "Ethernet",
+                _ => return None,
+            };
+            let interface_index = interface_index(&name)?;
+
+            let network_name = if media == "Wi-Fi" {
+                wifi_ssid(&name).unwrap_or_else(|| "Wi-Fi".to_string())
+            } else {
+                "Ethernet".to_string()
+            };
+
+            let mut ip_addresses = v4.remove(&name).unwrap_or_default();
+            ip_addresses.extend(v6.remove(&name).unwrap_or_default());
+
+            Some(NetworkInfo {
+                network_name,
+                interface_index,
+                ip_addresses,
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn watch_for_network_changes(app: AppHandle) {

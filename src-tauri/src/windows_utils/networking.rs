@@ -136,6 +136,80 @@ pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<N
         .collect()
 }
 
+pub fn cli_adapters() -> Vec<NetworkInfo> {
+    let _com = match COMLibrary::new() {
+        Ok(com) => com,
+        Err(_) => return Vec::new(),
+    };
+    let wmi_con =
+        match WMIConnection::with_namespace_path("root\\StandardCimv2", unsafe {
+            COMLibrary::assume_initialized()
+        }) {
+            Ok(connection) => connection,
+            Err(_) => return Vec::new(),
+        };
+
+    let adapter_query = "SELECT * FROM MSFT_NetAdapter\nWHERE EndPointInterface = False\nAND (NdisPhysicalMedium = 1 OR NdisPhysicalMedium = 9 OR NdisPhysicalMedium = 14)\nAND OperationalStatusDownMediaDisconnected = False";
+    let adapters: Vec<NetAdapter> = match wmi_con.raw_query(adapter_query) {
+        Ok(query) => query,
+        Err(_) => return Vec::new(),
+    };
+
+    let ip_addresses: Vec<NetIPAddress> = match wmi_con.raw_query("SELECT * FROM MSFT_NetIPAddress")
+    {
+        Ok(query) => query,
+        Err(_) => return Vec::new(),
+    };
+
+    let connection_profiles: Vec<NetConnectionProfile> =
+        match wmi_con.raw_query("SELECT * FROM MSFT_NetConnectionProfile") {
+            Ok(query) => query,
+            Err(_) => return Vec::new(),
+        };
+
+    let mut ip_map: HashMap<u32, Vec<&NetIPAddress>> = HashMap::new();
+    for ip in &ip_addresses {
+        if let Some(interface_index) = ip.interface_index {
+            ip_map.entry(interface_index).or_default().push(ip);
+        }
+    }
+
+    let mut profile_map: HashMap<u32, &NetConnectionProfile> = HashMap::new();
+    for profile in &connection_profiles {
+        if let Some(interface_index) = profile.interface_index {
+            profile_map.insert(interface_index, profile);
+        }
+    }
+
+    adapters
+        .iter()
+        .filter_map(|adapter| {
+            let interface_index = adapter.interface_index?;
+            let network_name = profile_map
+                .get(&interface_index)
+                .and_then(|profile| profile.name.as_deref())
+                .or(adapter.name.as_deref())
+                .unwrap_or("Unknown")
+                .to_string();
+
+            let ip_addresses = ip_map.get(&interface_index).map_or_else(Vec::new, |ips| {
+                let by_family = |family: u16| {
+                    ips.iter()
+                        .filter(move |ip| ip.address_family == Some(family))
+                        .filter_map(|ip| ip.ip_address.clone())
+                };
+                by_family(2).chain(by_family(23)).collect()
+            });
+
+            Some(NetworkInfo {
+                network_name,
+                interface_index,
+                ip_addresses,
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn watch_for_network_changes(app: AppHandle) {
