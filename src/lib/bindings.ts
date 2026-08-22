@@ -84,6 +84,9 @@ async removeDeviceOverride(ip: string) : Promise<void> {
 async setDeviceBanned(ip: string, banned: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_banned", { ip, banned });
 },
+async setDeviceApproved(ip: string, approved: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_approved", { ip, approved });
+},
 async setDisconnectGrace(seconds: number) : Promise<void> {
     await TAURI_INVOKE("set_disconnect_grace", { seconds });
 },

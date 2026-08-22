@@ -57,6 +57,16 @@ pub fn is_ip_banned(banned: &SharedBannedIps, ip: &str) -> bool {
     banned.lock().unwrap().contains(ip)
 }
 
+pub type SharedApprovedIps = Arc<Mutex<std::collections::HashSet<String>>>;
+
+pub fn new_shared_approved_ips() -> SharedApprovedIps {
+    Arc::new(Mutex::new(std::collections::HashSet::new()))
+}
+
+pub fn is_ip_approved(approved: &SharedApprovedIps, ip: &str) -> bool {
+    approved.lock().unwrap().contains(ip)
+}
+
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
 
 pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 10;

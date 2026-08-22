@@ -288,6 +288,7 @@ pub fn run() {
             set_device_override,
             remove_device_override,
             set_device_banned,
+            set_device_approved,
             set_disconnect_grace,
             get_disconnect_grace,
             set_turn_config,
