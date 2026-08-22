@@ -79,6 +79,31 @@ is the runtime dispatcher for capture/encode/tuning that calls into the per-OS b
 scaffolded but non-functional; AMD encode is stubbed. When adding a capability, add it to
 all three modules to keep the surface consistent (Linux/AMD paths may `bail!`).
 
+### Concurrency & locking
+
+Shared mutable state (`AppState` fields, the `streamer` session/override/ban maps, cloud
+status, etc.) is guarded with **`std::sync::Mutex` — this is the one blocking mutex type for
+first-party code.** Do not introduce `parking_lot::Mutex` outside `windows_utils/windows_capture/`
+(that module is a vendored fork of the `windows-capture` crate and keeps its own `parking_lot`
+locks — leave it as-is).
+
+**The rule: never hold a `std::sync::MutexGuard` across an `.await`.** Keep critical sections
+short — lock, read/copy/clone what you need, drop the guard, *then* await. This is also
+compiler-enforced in `Send` contexts (axum handlers, `async` Tauri commands) because
+`MutexGuard` is `!Send`, so a violation there fails to build; but it is *not* caught in
+non-`Send` closures/callbacks, so keep the discipline everywhere.
+
+Watch the temporary-lifetime footgun: a guard produced in an `if let` / `match` scrutinee
+(e.g. `if let Some(x) = map.lock().unwrap().get(k) { … }`) lives until the **end of the
+block**, not the end of the line — never put an `.await` inside such a block.
+
+Use an async-aware lock (`tokio::sync::Mutex`/`RwLock`) **only** when a lock genuinely must be
+held across an `.await`. There are two such cases today, both intentional:
+`DISPLAY_CORRELATION_LOCK` in `streamer/server.rs` (serializes virtual-display creation across
+its `spawn_blocking`/settle awaits) and `receive_error: RwLock<…>` in
+`windows_utils/driver_ipc/client.rs`. Prefer the sync mutex + short critical section for
+anything else.
+
 ### The `streamer` module (`src-tauri/src/streamer/`)
 
 Cross-platform core, OS-independent:

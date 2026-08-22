@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -420,7 +420,7 @@ pub async fn handle_whep_offer(
 
     let pc_state = Arc::clone(&pc);
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let closed_tx = Arc::new(std::sync::Mutex::new(closed_tx));
+    let closed_tx = Arc::new(Mutex::new(closed_tx));
     let input_tx_state = input_tx.clone();
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         tprintln!("peer connection state changed: {state:?}");
