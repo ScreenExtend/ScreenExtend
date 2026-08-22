@@ -10,8 +10,9 @@ use crate::streamer::cloud::{
     CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
 };
 use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedBannedIps, SharedDeviceOverrides, SharedDeviceReporter,
-    SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
+    self, DeviceOverride, SessionAuth, SharedApprovedIps, SharedBannedIps, SharedDeviceOverrides,
+    SharedDeviceReporter, SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
+    UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
 use device_reporter::TauriDeviceReporter;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
     pub banned_ips: SharedBannedIps,
+    pub approved_ips: SharedApprovedIps,
     pub server_ports: SharedServerPorts,
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
@@ -139,6 +141,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
         banned_ips: session::new_shared_banned_ips(),
+        approved_ips: session::new_shared_approved_ips(),
         server_ports: session::new_shared_server_ports(),
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
@@ -198,6 +201,18 @@ pub fn set_device_banned(state: State<'_, AppState>, ip: String, banned: bool) {
     } else {
         state.banned_ips.lock().unwrap().remove(&ip);
         tprintln!("device {ip} unbanned");
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_approved(state: State<'_, AppState>, ip: String, approved: bool) {
+    if approved {
+        state.approved_ips.lock().unwrap().insert(ip.clone());
+        tprintln!("device {ip} approved for auto-join");
+    } else {
+        state.approved_ips.lock().unwrap().remove(&ip);
+        tprintln!("device {ip} auto-join approval revoked");
     }
 }
 
@@ -383,6 +398,7 @@ pub fn register_cloud_session(
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
         banned_ips: Some(state.banned_ips.clone()),
+        approved_ips: Some(state.approved_ips.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -471,6 +487,7 @@ pub fn sync_streamers(state: &AppState) {
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
             banned_ips: Some(state.banned_ips.clone()),
+            approved_ips: Some(state.approved_ips.clone()),
             ..Config::default()
         };
 

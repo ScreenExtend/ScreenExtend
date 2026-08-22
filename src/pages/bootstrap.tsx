@@ -101,6 +101,8 @@ export default function Bootstrap() {
       for (const known of existing?.knownDevices ?? []) {
         if (known.banned) {
           await commands.setDeviceBanned(known.ip, true);
+        } else {
+          await commands.setDeviceApproved(known.ip, true);
         }
       }
       const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;

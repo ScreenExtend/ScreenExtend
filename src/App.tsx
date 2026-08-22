@@ -153,6 +153,7 @@ function App() {
           os: device.os,
           screenSize: device.screenSize,
         });
+        void commands.setDeviceApproved(device.ip, true);
         void notifyIfUnfocused(
           t("notifications.deviceJoin.title"),
           t("notifications.deviceJoin.body", { name: device.name || device.ip }),

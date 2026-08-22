@@ -415,45 +415,56 @@ pub async fn process_whep(
         };
     }
 
-    if let Some(retry_after) = state.otp_limiter.locked_for(device_key) {
-        let secs = retry_after.as_secs() + 1;
-        tprintln!("join rejected: {device_key} locked out, {secs}s remaining on OTP timeout");
-        return ProcessedResponse {
-            status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-            content_type: "text/plain",
-            body: format!("too many invalid OTP attempts; try again in {secs}s"),
-        };
-    }
+    let pre_approved = state
+        .config
+        .approved_ips
+        .as_ref()
+        .is_some_and(|approved| session::is_ip_approved(approved, device_key));
 
-    match state.config.session_auth.as_ref() {
-        Some(auth) if auth.validate(&req.session_id, &req.otp) => {
-            state.otp_limiter.record_success(device_key);
+    if pre_approved {
+        state.otp_limiter.record_success(device_key);
+        tprintln!("join accepted without OTP: {device_key} is a known device");
+    } else {
+        if let Some(retry_after) = state.otp_limiter.locked_for(device_key) {
+            let secs = retry_after.as_secs() + 1;
+            tprintln!("join rejected: {device_key} locked out, {secs}s remaining on OTP timeout");
+            return ProcessedResponse {
+                status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                content_type: "text/plain",
+                body: format!("too many invalid OTP attempts; try again in {secs}s"),
+            };
         }
-        _ => match state.otp_limiter.record_failure(device_key) {
-            OtpOutcome::LockedOut { retry_after } => {
-                let secs = retry_after.as_secs() + 1;
-                tprintln!(
-                    "join rejected: invalid OTP from {device_key}; \
-                     max attempts reached, locked out for {secs}s"
-                );
-                return ProcessedResponse {
-                    status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                    content_type: "text/plain",
-                    body: format!("too many invalid OTP attempts; try again in {secs}s"),
-                };
+
+        match state.config.session_auth.as_ref() {
+            Some(auth) if auth.validate(&req.session_id, &req.otp) => {
+                state.otp_limiter.record_success(device_key);
             }
-            OtpOutcome::Rejected { remaining } => {
-                tprintln!(
-                    "join rejected: invalid session id or OTP from {device_key} \
-                     ({remaining} attempt(s) left)"
-                );
-                return ProcessedResponse {
-                    status: StatusCode::UNAUTHORIZED.as_u16(),
-                    content_type: "text/plain",
-                    body: format!("invalid session id or OTP ({remaining} attempt(s) left)"),
-                };
-            }
-        },
+            _ => match state.otp_limiter.record_failure(device_key) {
+                OtpOutcome::LockedOut { retry_after } => {
+                    let secs = retry_after.as_secs() + 1;
+                    tprintln!(
+                        "join rejected: invalid OTP from {device_key}; \
+                         max attempts reached, locked out for {secs}s"
+                    );
+                    return ProcessedResponse {
+                        status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                        content_type: "text/plain",
+                        body: format!("too many invalid OTP attempts; try again in {secs}s"),
+                    };
+                }
+                OtpOutcome::Rejected { remaining } => {
+                    tprintln!(
+                        "join rejected: invalid session id or OTP from {device_key} \
+                         ({remaining} attempt(s) left)"
+                    );
+                    return ProcessedResponse {
+                        status: StatusCode::UNAUTHORIZED.as_u16(),
+                        content_type: "text/plain",
+                        body: format!("invalid session id or OTP ({remaining} attempt(s) left)"),
+                    };
+                }
+            },
+        }
     }
 
     match start_session(state, &req, device_key, ice_servers).await {

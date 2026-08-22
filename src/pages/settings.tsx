@@ -173,6 +173,7 @@ export default function Settings() {
 
   const applyBan = async (ip: string, banned: boolean) => {
     await commands.setDeviceBanned(ip, banned);
+    await commands.setDeviceApproved(ip, !banned);
     await setKnownDeviceBanned(ip, banned);
     setKnownDevices(await getKnownDevices());
     toast({
@@ -198,6 +199,7 @@ export default function Settings() {
 
   const forgetDevice = async (ip: string) => {
     await commands.setDeviceBanned(ip, false);
+    await commands.setDeviceApproved(ip, false);
     await removeKnownDevice(ip);
     setKnownDevices(await getKnownDevices());
     toast({
@@ -694,7 +696,7 @@ export default function Settings() {
               <div>
                 <CardTitle>Past Devices</CardTitle>
                 <p className="text-sm text-muted-foreground mt-1">
-                  Every device that has connected to this PC. Ban a device to disconnect it and block it from joining again by its IP address.
+                  Every device that has connected to this PC. These devices rejoin automatically without entering the code. Forget a device to require the code again, or ban it to disconnect and block it by its IP address.
                 </p>
               </div>
             </CardHeader>
@@ -738,6 +740,9 @@ export default function Settings() {
                                 <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
                                 Connected
                               </span>
+                            )}
+                            {!device.banned && !isConnected(device.ip) && (
+                              <span className="text-xs text-muted-foreground">Auto-join</span>
                             )}
                             {device.banned && (
                               <span className="text-xs font-medium text-red-500">Banned</span>
