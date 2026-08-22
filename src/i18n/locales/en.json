@@ -111,6 +111,16 @@
       "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban."
     }
   },
+  "notifications": {
+    "deviceJoin": {
+      "title": "Device Connected",
+      "body": "{name} joined as a second monitor."
+    },
+    "deviceRemove": {
+      "title": "Device Disconnected",
+      "body": "{name} left."
+    }
+  },
   "dialogs": {
     "editNetwork": {
       "trigger": "Save Settings",

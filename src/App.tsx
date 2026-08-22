@@ -19,6 +19,7 @@ import { getConfig, updateConfig, flushConfig, recordKnownDevice, type Device } 
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
@@ -100,8 +101,26 @@ function App() {
   const sessionIdRef = useRef(sessionId);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
 
+  const devicesRef = useRef(devices);
+  useEffect(() => { devicesRef.current = devices; }, [devices]);
+
+  const notifyGranted = useRef(false);
+  useEffect(() => {
+    void (async () => {
+      let granted = await isPermissionGranted();
+      if (!granted) granted = (await requestPermission()) === "granted";
+      notifyGranted.current = granted;
+    })();
+  }, []);
+
   const { toast } = useToast();
   const { t } = useTranslation();
+
+  const notifyIfUnfocused = async (title: string, body: string) => {
+    if (!notifyGranted.current) return;
+    if (await appWindow.isFocused()) return;
+    sendNotification({ title, body });
+  };
 
   useEffect(() => {
     if (sessionId && otp) {
@@ -134,6 +153,10 @@ function App() {
           os: device.os,
           screenSize: device.screenSize,
         });
+        void notifyIfUnfocused(
+          t("notifications.deviceJoin.title"),
+          t("notifications.deviceJoin.body", { name: device.name || device.ip }),
+        );
       }));
       unlisteners.push(await events.deviceModify.listen(event => {
         const device = event.payload as Device;
@@ -141,7 +164,13 @@ function App() {
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {
         const device = event.payload as Device;
+        const known = devicesRef.current.find(d => d.ip === device.ip);
+        const name = known?.name || device.name || device.ip;
         setDevices(prev => prev.filter(d => d.ip !== device.ip));
+        void notifyIfUnfocused(
+          t("notifications.deviceRemove.title"),
+          t("notifications.deviceRemove.body", { name }),
+        );
       }));
       unlisteners.push(await events.hostedNetworkNoPassword.listen(() => {
         toast({
