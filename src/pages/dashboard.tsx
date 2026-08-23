@@ -108,6 +108,7 @@ export default function Dashboard() {
           {lanValues.length ? (
             lanValues.map(qrValue => (
               <QrDisplay
+                key={qrValue.value}
                 name={qrValue.title}
                 url={qrValue.value}
               />
@@ -135,7 +136,7 @@ export default function Dashboard() {
                 </CarouselItem>
               )}
               {lanValues.map((qrValue) => (
-                <CarouselItem>
+                <CarouselItem key={qrValue.value}>
                   <QrDisplay
                     name={qrValue.title}
                     url={qrValue.value}

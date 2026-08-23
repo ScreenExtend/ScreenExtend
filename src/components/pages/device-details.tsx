@@ -101,23 +101,29 @@ export function DeviceDetails({ device }: { device: Device }) {
         videoScale: Number(values.videoScale),
         videoQuality: Number(values.videoQuality),
       };
-      await commands.setDeviceOverride(
-        normalized.ip,
-        normalized.scale,
-        normalized.orientation,
-        normalized.refreshRate,
-        normalized.videoScale,
-        normalized.videoQuality,
-        normalized.remoteControl
-      );
-      await saveDeviceSettings(normalized);
-      await events.deviceModify.emit(normalized);
-      setInProgress(false);
-      toast({
-        title: t("toasts.device.updatedTitle"),
-        description: t("toasts.device.updatedDescription"),
-      });
-      setOpen(false);
+      try {
+        await commands.setDeviceOverride(
+          normalized.ip,
+          normalized.scale,
+          normalized.orientation,
+          normalized.refreshRate,
+          normalized.videoScale,
+          normalized.videoQuality,
+          normalized.remoteControl
+        );
+        await saveDeviceSettings(normalized);
+        await events.deviceModify.emit(normalized);
+        toast({
+          title: t("toasts.device.updatedTitle"),
+          description: t("toasts.device.updatedDescription"),
+        });
+        setOpen(false);
+      } catch (e) {
+        console.error("failed to save device settings", e);
+        toast({ variant: "destructive", title: t("toasts.device.updatedTitle"), description: String(e) });
+      } finally {
+        setInProgress(false);
+      }
     },
   });
 

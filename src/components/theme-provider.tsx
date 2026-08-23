@@ -42,17 +42,24 @@ export function ThemeProvider({
     }
   }, [theme]);
 
-  void appWindow.onThemeChanged(async ({ payload: newTheme }) => {
-    if ((await getConfig())!.theme === "system") {
-      const root = window.document.documentElement;
-      if (!root.classList.contains(newTheme)) {
-        root.classList.remove("light", "dark");
-        root.classList.add(newTheme);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void appWindow.onThemeChanged(async ({ payload: newTheme }) => {
+      if ((await getConfig())?.theme === "system") {
+        const root = window.document.documentElement;
+        if (!root.classList.contains(newTheme)) {
+          root.classList.remove("light", "dark");
+          root.classList.add(newTheme);
+        }
+        setTheme(newTheme);
+        setTheme("system");
       }
-      setTheme(newTheme);
-      setTheme("system");
-    }
-  });
+    })
+    .then(un => {
+      unlisten = un;
+    });
+    return () => unlisten?.();
+  }, []);
 
   const value = {
     theme,
