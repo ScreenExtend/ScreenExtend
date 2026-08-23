@@ -4,7 +4,7 @@ use tauri::AppHandle;
 use tauri_specta::Event;
 
 use crate::streamer::session::{DeviceInfo, DeviceReporter, SharedDeviceOverrides};
-use crate::{Device, DeviceJoin, DeviceRemove};
+use crate::{Device, DeviceJoin, DeviceRemove, JoinAttemptsPaused};
 
 #[derive(Debug)]
 pub struct TauriDeviceReporter {
@@ -37,6 +37,7 @@ impl DeviceReporter for TauriDeviceReporter {
     fn report_remove(&self, ip: String) {
         let device = Device::defaults(DeviceInfo {
             ip,
+            token: String::new(),
             name: String::new(),
             os: String::new(),
             screen_size: String::new(),
@@ -45,6 +46,15 @@ impl DeviceReporter for TauriDeviceReporter {
         });
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");
+        }
+    }
+
+    fn report_join_attempts_paused(&self, retry_after_secs: u64) {
+        let event = JoinAttemptsPaused {
+            retry_after_secs: retry_after_secs as u32,
+        };
+        if let Err(e) = event.emit(&self.app) {
+            teprintln!("[device-reporter] emit JoinAttemptsPaused failed: {e:?}");
         }
     }
 }

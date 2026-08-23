@@ -3,6 +3,7 @@ import { generatePassword } from "@/lib/utils";
 
 export type Device = {
   ip: string;
+  token: string;
   name: string;
   scale: number;
   orientation: "Portrait" | "Landscape";
@@ -15,6 +16,7 @@ export type Device = {
 };
 
 export type KnownDevice = {
+  token: string;
   ip: string;
   name: string;
   os: string;
@@ -22,6 +24,9 @@ export type KnownDevice = {
   lastSeen: number;
   banned: boolean;
 };
+
+const sameDevice = (d: KnownDevice, token: string, ip: string) =>
+  token ? d.token === token : (!d.token && d.ip === ip);
 
 export type Config = {
   name: string,
@@ -132,34 +137,38 @@ export const removeSavedDevice = async (ip: string) => {
 };
 
 export const getKnownDevices = async (): Promise<KnownDevice[]> => {
-  return (await getConfig())?.knownDevices ?? [];
+  const raw = (await getConfig())?.knownDevices ?? [];
+  return raw.map(d => ({ ...d, token: d.token ?? "" }));
 };
 
 export const recordKnownDevice = async (
-  info: { ip: string; name: string; os: string; screenSize: string }
+  info: { token: string; ip: string; name: string; os: string; screenSize: string }
 ) => {
   const existing = await getKnownDevices();
-  const prev = existing.find(d => d.ip === info.ip);
+  const prev = existing.find(d => sameDevice(d, info.token, info.ip));
   const merged: KnownDevice = {
-    ip: info.ip,
+    token: info.token || prev?.token || "",
+    ip: info.ip || prev?.ip || "",
     name: info.name.trim() || prev?.name || "",
     os: info.os.trim() || prev?.os || "",
     screenSize: info.screenSize.trim() || prev?.screenSize || "",
     lastSeen: Date.now(),
     banned: prev?.banned ?? false,
   };
-  await updateConfig({ knownDevices: [...existing.filter(d => d.ip !== info.ip), merged] });
+  await updateConfig({
+    knownDevices: [...existing.filter(d => !sameDevice(d, info.token, info.ip)), merged],
+  });
 };
 
-export const setKnownDeviceBanned = async (ip: string, banned: boolean) => {
+export const setKnownDeviceBanned = async (token: string, ip: string, banned: boolean) => {
   const existing = await getKnownDevices();
   let knownDevices: KnownDevice[];
-  if (existing.some(d => d.ip === ip)) {
-    knownDevices = existing.map(d => (d.ip === ip ? { ...d, banned } : d));
+  if (existing.some(d => sameDevice(d, token, ip))) {
+    knownDevices = existing.map(d => (sameDevice(d, token, ip) ? { ...d, banned } : d));
   } else if (banned) {
     knownDevices = [
       ...existing,
-      { ip, name: "", os: "", screenSize: "", lastSeen: Date.now(), banned: true },
+      { token, ip, name: "", os: "", screenSize: "", lastSeen: Date.now(), banned: true },
     ];
   } else {
     return;
@@ -168,8 +177,8 @@ export const setKnownDeviceBanned = async (ip: string, banned: boolean) => {
   await flushConfig();
 };
 
-export const removeKnownDevice = async (ip: string) => {
+export const removeKnownDevice = async (token: string, ip: string) => {
   const existing = await getKnownDevices();
-  await updateConfig({ knownDevices: existing.filter(d => d.ip !== ip) });
+  await updateConfig({ knownDevices: existing.filter(d => !sameDevice(d, token, ip)) });
   await flushConfig();
 };

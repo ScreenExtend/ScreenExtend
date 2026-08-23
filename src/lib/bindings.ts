@@ -81,11 +81,11 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
 },
-async setDeviceBanned(ip: string, banned: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_device_banned", { ip, banned });
+async setDeviceBanned(token: string, ip: string, banned: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_banned", { token, ip, banned });
 },
-async setDeviceApproved(ip: string, approved: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_device_approved", { ip, approved });
+async setDeviceApproved(token: string, approved: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_approved", { token, approved });
 },
 async setDisconnectGrace(seconds: number) : Promise<void> {
     await TAURI_INVOKE("set_disconnect_grace", { seconds });
@@ -127,6 +127,7 @@ deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
 deviceRemoveAction: DeviceRemoveAction,
 hostedNetworkNoPassword: HostedNetworkNoPassword,
+joinAttemptsPaused: JoinAttemptsPaused,
 logLine: LogLine,
 networkChange: NetworkChange,
 sessionIdChange: SessionIdChange
@@ -138,6 +139,7 @@ deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
 deviceRemoveAction: "device-remove-action",
 hostedNetworkNoPassword: "hosted-network-no-password",
+joinAttemptsPaused: "join-attempts-paused",
 logLine: "log-line",
 networkChange: "network-change",
 sessionIdChange: "session-id-change"
@@ -151,13 +153,14 @@ sessionIdChange: "session-id-change"
 
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[] }
-export type Device = { ip: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; os: string; screenSize: string }
+export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
 export type HostedNetworkNoPassword = null
+export type JoinAttemptsPaused = { retryAfterSecs: number }
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }

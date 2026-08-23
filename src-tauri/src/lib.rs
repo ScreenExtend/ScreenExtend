@@ -74,6 +74,12 @@ pub struct SessionIdChange {
     pub session_id: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct JoinAttemptsPaused {
+    #[serde(rename = "retryAfterSecs")]
+    pub retry_after_secs: u32,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct UnsupportedApi {
     pub name: String,
@@ -94,6 +100,7 @@ pub struct CompatibilityReport {
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
     pub ip: String,
+    pub token: String,
     pub name: String,
     pub scale: u32,
     pub orientation: String,
@@ -122,9 +129,15 @@ impl Device {
         };
         Self {
             ip: info.ip,
+            token: info.token,
             name: info.name,
             scale: 100,
-            orientation: if info.portrait { "Portrait" } else { "Landscape" }.to_string(),
+            orientation: if info.portrait {
+                "Portrait"
+            } else {
+                "Landscape"
+            }
+            .to_string(),
             refresh_rate,
             video_scale: 100,
             video_quality: 15,
@@ -309,6 +322,7 @@ pub fn run() {
             HostedNetworkNoPassword,
             CloudStatusChange,
             SessionIdChange,
+            JoinAttemptsPaused,
             logbus::LogLine
         ]);
 
@@ -325,7 +339,11 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().default_version_comparator(|current, update| { update.version != current }).build())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .default_version_comparator(|current, update| update.version != current)
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -372,7 +390,7 @@ pub fn run() {
                         tauri::async_runtime::block_on(async {
                             app.shell()
                                 .command("netsh")
-                                .args(&[
+                                .args([
                                     "wlan",
                                     "set",
                                     "hostednetwork",
@@ -385,7 +403,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("netsh")
-                                .args(&["wlan", "start", "hostednetwork"])
+                                .args(["wlan", "start", "hostednetwork"])
                                 .output()
                                 .await
                                 .unwrap();
@@ -404,7 +422,7 @@ pub fn run() {
                             };
                             app.shell()
                                 .command("certutil")
-                                .args(&[
+                                .args([
                                     "-addstore",
                                     "-f",
                                     "root",
@@ -416,7 +434,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("certutil")
-                                .args(&[
+                                .args([
                                     "-addstore",
                                     "-f",
                                     "TrustedPublisher",
@@ -428,7 +446,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("nefconc")
-                                .args(&[
+                                .args([
                                     "--remove-device-node",
                                     "--hardware-id",
                                     "Root\\VirtualDisplayDriver",
@@ -441,7 +459,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("nefconc")
-                                .args(&[
+                                .args([
                                     "--create-device-node",
                                     "--class-name",
                                     "Display",
@@ -456,7 +474,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("nefconc")
-                                .args(&[
+                                .args([
                                     "--install-driver",
                                     "--inf-path",
                                     &resource_path("resources/VirtualDisplayDriver.inf"),
@@ -480,7 +498,7 @@ pub fn run() {
                             };
                             app.shell()
                                 .command("nefconc")
-                                .args(&[
+                                .args([
                                     "--remove-device-node",
                                     "--hardware-id",
                                     "Root\\VirtualDisplayDriver",
@@ -493,7 +511,7 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("nefconc")
-                                .args(&[
+                                .args([
                                     "--uninstall-driver",
                                     "--inf-path",
                                     &resource_path("resources/VirtualDisplayDriver.inf"),
@@ -504,22 +522,14 @@ pub fn run() {
                                 .unwrap();
                             app.shell()
                                 .command("certutil")
-                                .args(&[
-                                    "-delstore",
-                                    "root",
-                                    "ScreenExtend",
-                                ])
+                                .args(["-delstore", "root", "ScreenExtend"])
                                 .current_dir(app.path().resource_dir().unwrap())
                                 .output()
                                 .await
                                 .unwrap();
                             app.shell()
                                 .command("certutil")
-                                .args(&[
-                                    "-delstore",
-                                    "TrustedPublisher",
-                                    "ScreenExtend",
-                                ])
+                                .args(["-delstore", "TrustedPublisher", "ScreenExtend"])
                                 .current_dir(app.path().resource_dir().unwrap())
                                 .output()
                                 .await

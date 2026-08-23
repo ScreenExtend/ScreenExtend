@@ -15,6 +15,7 @@ pub struct LeaveSignal {
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub ip: String,
+    pub token: String,
     pub name: String,
     pub os: String,
     pub screen_size: String,
@@ -35,6 +36,7 @@ pub struct DeviceOverride {
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_join(&self, device: DeviceInfo);
     fn report_remove(&self, ip: String);
+    fn report_join_attempts_paused(&self, _retry_after_secs: u64) {}
 }
 
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
@@ -47,24 +49,30 @@ pub fn new_shared_local_ips() -> SharedLocalIps {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-pub type SharedBannedIps = Arc<Mutex<std::collections::HashSet<String>>>;
+pub fn mint_device_token() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
-pub fn new_shared_banned_ips() -> SharedBannedIps {
+pub type SharedBannedDevices = Arc<Mutex<std::collections::HashSet<String>>>;
+
+pub fn new_shared_banned_devices() -> SharedBannedDevices {
     Arc::new(Mutex::new(std::collections::HashSet::new()))
 }
 
-pub fn is_ip_banned(banned: &SharedBannedIps, ip: &str) -> bool {
-    banned.lock().unwrap().contains(ip)
+pub fn is_device_banned(banned: &SharedBannedDevices, token: &str, ip: &str) -> bool {
+    let set = banned.lock().unwrap();
+    (!token.is_empty() && set.contains(token)) || set.contains(ip)
 }
 
-pub type SharedApprovedIps = Arc<Mutex<std::collections::HashSet<String>>>;
+pub type SharedApprovedDevices = Arc<Mutex<std::collections::HashSet<String>>>;
 
-pub fn new_shared_approved_ips() -> SharedApprovedIps {
+pub fn new_shared_approved_devices() -> SharedApprovedDevices {
     Arc::new(Mutex::new(std::collections::HashSet::new()))
 }
 
-pub fn is_ip_approved(approved: &SharedApprovedIps, ip: &str) -> bool {
-    approved.lock().unwrap().contains(ip)
+pub fn is_device_approved(approved: &SharedApprovedDevices, token: &str) -> bool {
+    !token.is_empty() && approved.lock().unwrap().contains(token)
 }
 
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
@@ -308,12 +316,15 @@ pub struct SessionAuth {
 
 impl SessionAuth {
     pub fn validate(&self, session_id: &str, otp: &str) -> bool {
+        use subtle::ConstantTimeEq;
         let want_session = self.session_id.lock().unwrap();
         let want_otp = self.otp.lock().unwrap();
-        !want_session.is_empty()
-            && !want_otp.is_empty()
-            && want_session.as_str() == session_id
-            && want_otp.as_str() == otp
+        if want_session.is_empty() || want_otp.is_empty() {
+            return false;
+        }
+        let session_ok = want_session.as_bytes().ct_eq(session_id.as_bytes());
+        let otp_ok = want_otp.as_bytes().ct_eq(otp.as_bytes());
+        (session_ok & otp_ok).into()
     }
 }
 
@@ -322,37 +333,94 @@ pub const MAX_OTP_ATTEMPTS: u32 = 5;
 /// How long a device is locked out after exhausting its attempts.
 pub const OTP_LOCKOUT: Duration = Duration::from_secs(60);
 
+pub const MAX_GLOBAL_OTP_ATTEMPTS: u32 = 20;
+pub const GLOBAL_OTP_WINDOW: Duration = Duration::from_secs(60);
+pub const GLOBAL_OTP_PAUSE: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, Default)]
 struct OtpAttempt {
     failures: u32,
     locked_until: Option<Instant>,
 }
 
-/// Result of recording a failed OTP attempt.
+#[derive(Debug, Default)]
+struct GlobalOtpState {
+    failures: u32,
+    window_start: Option<Instant>,
+    paused_until: Option<Instant>,
+}
+
 pub enum OtpOutcome {
-    /// The attempt was rejected; `remaining` tries are left before lockout.
     Rejected { remaining: u32 },
-    /// The device has just been locked out for `retry_after`.
     LockedOut { retry_after: Duration },
 }
 
-/// Tracks failed OTP attempts per device and enforces a temporary lockout once
-/// [`MAX_OTP_ATTEMPTS`] is reached, mirroring the retry/timeout limiting used by
-/// the session relay.
 #[derive(Debug, Default)]
 pub struct OtpLimiter {
     attempts: Mutex<HashMap<String, OtpAttempt>>,
+    global: Mutex<GlobalOtpState>,
 }
 
 pub type SharedOtpLimiter = Arc<OtpLimiter>;
+
+pub fn new_shared_otp_limiter() -> SharedOtpLimiter {
+    Arc::new(OtpLimiter::new())
+}
 
 impl OtpLimiter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns `Some(retry_after)` if `key` is currently locked out, otherwise
-    /// `None`. Expired lockouts are cleared as a side effect.
+    pub fn global_paused(&self) -> Option<Duration> {
+        let mut g = self.global.lock().unwrap();
+        match g.paused_until {
+            Some(until) => {
+                let now = Instant::now();
+                if now < until {
+                    Some(until - now)
+                } else {
+                    *g = GlobalOtpState::default();
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+
+    pub fn note_global_failure(&self) -> Option<Duration> {
+        let mut g = self.global.lock().unwrap();
+        let now = Instant::now();
+
+        if let Some(until) = g.paused_until {
+            if now < until {
+                return None;
+            }
+            *g = GlobalOtpState::default();
+        }
+
+        match g.window_start {
+            Some(start) if now.duration_since(start) < GLOBAL_OTP_WINDOW => {}
+            _ => {
+                g.window_start = Some(now);
+                g.failures = 0;
+            }
+        }
+
+        g.failures += 1;
+        if g.failures >= MAX_GLOBAL_OTP_ATTEMPTS {
+            g.paused_until = Some(now + GLOBAL_OTP_PAUSE);
+            Some(GLOBAL_OTP_PAUSE)
+        } else {
+            None
+        }
+    }
+
+    pub fn reset(&self) {
+        self.attempts.lock().unwrap().clear();
+        *self.global.lock().unwrap() = GlobalOtpState::default();
+    }
+
     pub fn locked_for(&self, key: &str) -> Option<Duration> {
         let mut map = self.attempts.lock().unwrap();
         let entry = map.get_mut(key)?;
@@ -362,7 +430,6 @@ impl OtpLimiter {
                 if now < until {
                     Some(until - now)
                 } else {
-                    // Lockout served; start the device fresh.
                     *entry = OtpAttempt::default();
                     None
                 }
@@ -371,12 +438,10 @@ impl OtpLimiter {
         }
     }
 
-    /// Record a failed OTP attempt for `key` and return the resulting state.
     pub fn record_failure(&self, key: &str) -> OtpOutcome {
         let mut map = self.attempts.lock().unwrap();
         let entry = map.entry(key.to_string()).or_default();
 
-        // If a previous lockout has elapsed, reset before counting again.
         if let Some(until) = entry.locked_until {
             if Instant::now() >= until {
                 *entry = OtpAttempt::default();
@@ -396,9 +461,9 @@ impl OtpLimiter {
         }
     }
 
-    /// Clear all tracked failures for `key` after a successful authentication.
     pub fn record_success(&self, key: &str) {
         self.attempts.lock().unwrap().remove(key);
+        *self.global.lock().unwrap() = GlobalOtpState::default();
     }
 }
 
@@ -417,3 +482,91 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
 }
 
 pub type SharedVirtualDisplay = Arc<dyn VirtualDisplayController>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_key_lockout_still_applies() {
+        let lim = OtpLimiter::new();
+        let key = "1.2.3.4";
+        for _ in 0..MAX_OTP_ATTEMPTS - 1 {
+            assert!(matches!(
+                lim.record_failure(key),
+                OtpOutcome::Rejected { .. }
+            ));
+            assert!(lim.locked_for(key).is_none());
+        }
+        assert!(matches!(
+            lim.record_failure(key),
+            OtpOutcome::LockedOut { .. }
+        ));
+        assert!(lim.locked_for(key).is_some());
+    }
+
+    #[test]
+    fn rotating_keys_trips_the_global_guard() {
+        let lim = OtpLimiter::new();
+        let mut tripped = false;
+        for i in 0..MAX_GLOBAL_OTP_ATTEMPTS {
+            let key = format!("10.0.0.{i}");
+            assert!(matches!(
+                lim.record_failure(&key),
+                OtpOutcome::Rejected { .. }
+            ));
+            if lim.note_global_failure().is_some() {
+                tripped = true;
+            }
+        }
+        assert!(tripped, "global guard should trip once the window fills");
+        assert!(
+            lim.global_paused().is_some(),
+            "new joins should be paused after the guard trips"
+        );
+    }
+
+    #[test]
+    fn success_resets_per_key_and_global() {
+        let lim = OtpLimiter::new();
+        let key = "192.168.1.5";
+        for _ in 0..MAX_OTP_ATTEMPTS - 1 {
+            lim.record_failure(key);
+        }
+        for _ in 0..MAX_GLOBAL_OTP_ATTEMPTS - 1 {
+            assert!(lim.note_global_failure().is_none());
+        }
+        lim.record_success(key);
+        assert!(lim.locked_for(key).is_none());
+        assert!(lim.global_paused().is_none());
+        assert!(lim.note_global_failure().is_none());
+    }
+
+    #[test]
+    fn session_auth_matches_and_rejects() {
+        let auth = SessionAuth::default();
+        assert!(!auth.validate("ABCDEFGHJKLM", "123456"));
+        *auth.session_id.lock().unwrap() = "ABCDEFGHJKLM".to_string();
+        *auth.otp.lock().unwrap() = "123456".to_string();
+        assert!(auth.validate("ABCDEFGHJKLM", "123456"));
+        assert!(!auth.validate("ABCDEFGHJKLM", "123457")); // wrong otp
+        assert!(!auth.validate("XBCDEFGHJKLM", "123456")); // wrong session
+        assert!(!auth.validate("ABCDEFGHJKLM", "12345")); // short otp
+    }
+
+    #[test]
+    fn reset_clears_lockouts_and_pause() {
+        let lim = OtpLimiter::new();
+        for _ in 0..MAX_OTP_ATTEMPTS {
+            lim.record_failure("1.1.1.1");
+        }
+        for _ in 0..MAX_GLOBAL_OTP_ATTEMPTS {
+            lim.note_global_failure();
+        }
+        assert!(lim.locked_for("1.1.1.1").is_some());
+        assert!(lim.global_paused().is_some());
+        lim.reset();
+        assert!(lim.locked_for("1.1.1.1").is_none());
+        assert!(lim.global_paused().is_none());
+    }
+}

@@ -77,6 +77,22 @@ export function generatePassword(length = 12): string {
     return result;
 }
 
+export function generateOtp(length = 6): string {
+    const digits = "0123456789";
+    const limit = Math.floor(0x1_0000_0000 / digits.length) * digits.length;
+    const buf = new Uint32Array(length);
+    let result = "";
+    while (result.length < length) {
+        crypto.getRandomValues(buf);
+        for (let i = 0; i < buf.length && result.length < length; i++) {
+            if (buf[i] < limit) {
+                result += digits[buf[i] % digits.length];
+            }
+        }
+    }
+    return result;
+}
+
 export function generateSlug() {
     let result = "";
     const characters = "abcdefghijklmnopqrstuvwxyz";

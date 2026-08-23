@@ -5248,6 +5248,7 @@ dependencies = [
  "smol_str 0.3.2",
  "specta",
  "specta-typescript",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

@@ -406,22 +406,21 @@ fn parse_drop(b: &[u8]) -> Option<InputEvent> {
     for _ in 0..count {
         let name_len = rd_u16(b, pos)? as usize;
         pos += 2;
-        let name = std::str::from_utf8(b.get(pos..pos + name_len)?)
-            .ok()?
-            .to_string();
-        pos += name_len;
+        let name_end = pos.checked_add(name_len)?;
+        let name = std::str::from_utf8(b.get(pos..name_end)?).ok()?.to_string();
+        pos = name_end;
         let mime_len = rd_u32(b, pos)? as usize;
         pos += 4;
-        let mime = std::str::from_utf8(b.get(pos..pos + mime_len)?)
-            .ok()?
-            .to_string();
-        pos += mime_len;
+        let mime_end = pos.checked_add(mime_len)?;
+        let mime = std::str::from_utf8(b.get(pos..mime_end)?).ok()?.to_string();
+        pos = mime_end;
         let size = rd_u64(b, pos)?;
         pos += 8;
         let data_len = rd_u64(b, pos)? as usize;
         pos += 8;
-        let data = b.get(pos..pos + data_len)?.to_vec();
-        pos += data_len;
+        let data_end = pos.checked_add(data_len)?;
+        let data = b.get(pos..data_end)?.to_vec();
+        pos = data_end;
         items.push(DropItem {
             name,
             mime,

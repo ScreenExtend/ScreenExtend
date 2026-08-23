@@ -21,12 +21,24 @@ use super::session::{
 };
 use super::webrtc_session::{self, RTCIceServer};
 
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+const MAX_SESSION_ID_LEN: usize = 64;
+const MAX_OTP_LEN: usize = 32;
+const MAX_OS_LEN: usize = 64;
+const MAX_SDP_LEN: usize = 64 * 1024;
+
 #[derive(Deserialize)]
 struct JoinRequest {
     #[serde(rename = "sessionId")]
     session_id: String,
     otp: String,
-    #[serde(default, rename = "deviceName")]
+    #[serde(default, rename = "deviceToken")]
+    device_token: String,
+    #[serde(
+        default,
+        rename = "deviceName",
+        deserialize_with = "deserialize_device_name"
+    )]
     device_name: String,
     #[serde(default)]
     os: String,
@@ -35,6 +47,29 @@ struct JoinRequest {
     width: u32,
     height: u32,
     sdp: String,
+}
+
+fn sanitize_device_name(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c,
+                    '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}')
+        })
+        .take(MAX_DEVICE_NAME_CHARS)
+        .collect()
+}
+
+fn deserialize_device_name<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(d)?;
+    Ok(sanitize_device_name(&raw))
 }
 
 const DISPLAY_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -60,7 +95,10 @@ impl AppState {
         Self {
             ice_servers: Arc::new(build_ice_servers(&config)),
             net_json: Arc::new(build_net_json(&config)),
-            otp_limiter: Arc::new(OtpLimiter::new()),
+            otp_limiter: config
+                .otp_limiter
+                .clone()
+                .unwrap_or_else(|| Arc::new(OtpLimiter::new())),
             local_ips: config
                 .local_ips
                 .clone()
@@ -127,7 +165,6 @@ pub fn user_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
         urls: cfg.urls.clone(),
         username: cfg.username.clone(),
         credential: cfg.credential.clone(),
-        ..Default::default()
     })
 }
 
@@ -142,7 +179,6 @@ pub fn ephemeral_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
             urls: config.turn_urls.clone(),
             username,
             credential,
-            ..Default::default()
         }),
         Err(e) => {
             teprintln!("[turn] failed to mint ephemeral credentials: {e}");
@@ -153,7 +189,10 @@ pub fn ephemeral_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
 
 fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -181,10 +220,22 @@ pub struct ProcessedResponse {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+    pub device_token: Option<String>,
+}
+
+impl ProcessedResponse {
+    fn err(status: StatusCode, body: impl Into<String>) -> Self {
+        Self {
+            status: status.as_u16(),
+            content_type: "text/plain",
+            body: body.into(),
+            device_token: None,
+        }
+    }
 }
 
 pub async fn run(config: Config, handle: Option<axum_server::Handle>) -> Result<()> {
-    let handle = handle.unwrap_or_else(axum_server::Handle::new);
+    let handle = handle.unwrap_or_default();
 
     let state = AppState::new(config.clone());
 
@@ -245,6 +296,7 @@ fn router(state: AppState) -> Router {
         .route("/leave", post(leave))
         .route("/transform-worker.js", get(transform_worker))
         .route("/input.js", get(input_js))
+        .route("/nosleep.js", get(nosleep_js))
         .route("/logo.svg", get(logo))
         .route("/styles.css", get(styles))
         .route("/ice-config", get(ice_config))
@@ -281,6 +333,14 @@ async fn input_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript")],
         include_str!("static/input.js"),
+    )
+        .into_response()
+}
+
+async fn nosleep_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("static/nosleep.js"),
     )
         .into_response()
 }
@@ -367,12 +427,18 @@ async fn whep(
 ) -> Response {
     let ice = state.ice_with_turn(state.fallback_ice_servers());
     let out = process_whep(&state, &peer.ip().to_string(), &body, ice).await;
-    (
-        StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        [(header::CONTENT_TYPE, out.content_type)],
-        out.body,
-    )
-        .into_response()
+    let status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(out.content_type),
+    );
+    if let Some(token) = out.device_token.as_deref() {
+        if let Ok(value) = header::HeaderValue::from_str(token) {
+            headers.insert("x-device-token", value);
+        }
+    }
+    (status, headers, out.body).into_response()
 }
 
 pub async fn process_whep(
@@ -384,13 +450,20 @@ pub async fn process_whep(
     let req: JoinRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return ProcessedResponse {
-                status: StatusCode::BAD_REQUEST.as_u16(),
-                content_type: "text/plain",
-                body: format!("invalid join request: {e}"),
-            };
+            return ProcessedResponse::err(
+                StatusCode::BAD_REQUEST,
+                format!("invalid join request: {e}"),
+            );
         }
     };
+
+    if req.session_id.len() > MAX_SESSION_ID_LEN
+        || req.otp.len() > MAX_OTP_LEN
+        || req.os.len() > MAX_OS_LEN
+        || req.sdp.len() > MAX_SDP_LEN
+    {
+        return ProcessedResponse::err(StatusCode::BAD_REQUEST, "join request field too large");
+    }
 
     tprintln!(
         "join request: device={:?}, session={}, screen={}x{}, sdp_bytes={}",
@@ -401,73 +474,103 @@ pub async fn process_whep(
         req.sdp.len()
     );
 
+    let presented_token = req.device_token.trim().to_string();
+
     if state
         .config
-        .banned_ips
+        .banned_devices
         .as_ref()
-        .is_some_and(|banned| session::is_ip_banned(banned, device_key))
+        .is_some_and(|banned| session::is_device_banned(banned, &presented_token, device_key))
     {
         tprintln!("join rejected: {device_key} is banned by the host");
-        return ProcessedResponse {
-            status: StatusCode::FORBIDDEN.as_u16(),
-            content_type: "text/plain",
-            body: "this device has been banned by the host".to_string(),
-        };
+        return ProcessedResponse::err(
+            StatusCode::FORBIDDEN,
+            "this device has been banned by the host",
+        );
     }
 
     let pre_approved = state
         .config
-        .approved_ips
+        .approved_devices
         .as_ref()
-        .is_some_and(|approved| session::is_ip_approved(approved, device_key));
+        .is_some_and(|approved| session::is_device_approved(approved, &presented_token));
 
-    if pre_approved {
+    let device_token = if pre_approved {
         state.otp_limiter.record_success(device_key);
-        tprintln!("join accepted without OTP: {device_key} is a known device");
+        tprintln!("join accepted without OTP: {device_key} presented a known device token");
+        presented_token
     } else {
+        if let Some(retry_after) = state.otp_limiter.global_paused() {
+            let secs = retry_after.as_secs() + 1;
+            return ProcessedResponse::err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("join attempts temporarily paused; try again in {secs}s"),
+            );
+        }
+
         if let Some(retry_after) = state.otp_limiter.locked_for(device_key) {
             let secs = retry_after.as_secs() + 1;
             tprintln!("join rejected: {device_key} locked out, {secs}s remaining on OTP timeout");
-            return ProcessedResponse {
-                status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                content_type: "text/plain",
-                body: format!("too many invalid OTP attempts; try again in {secs}s"),
-            };
+            return ProcessedResponse::err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many invalid OTP attempts; try again in {secs}s"),
+            );
         }
 
         match state.config.session_auth.as_ref() {
             Some(auth) if auth.validate(&req.session_id, &req.otp) => {
                 state.otp_limiter.record_success(device_key);
             }
-            _ => match state.otp_limiter.record_failure(device_key) {
-                OtpOutcome::LockedOut { retry_after } => {
-                    let secs = retry_after.as_secs() + 1;
-                    tprintln!(
-                        "join rejected: invalid OTP from {device_key}; \
+            _ => {
+                if let Some(pause) = state.otp_limiter.note_global_failure() {
+                    let secs = pause.as_secs();
+                    teprintln!(
+                        "[security] brute-force guard tripped: {}+ failed OTP attempts across \
+                         devices within {}s; pausing new joins for {secs}s",
+                        session::MAX_GLOBAL_OTP_ATTEMPTS,
+                        session::GLOBAL_OTP_WINDOW.as_secs()
+                    );
+                    if let Some(reporter) = state.config.device_reporter.as_ref() {
+                        reporter.report_join_attempts_paused(secs);
+                    }
+                    state.otp_limiter.record_failure(device_key);
+                    return ProcessedResponse::err(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!("join attempts temporarily paused; try again in {secs}s"),
+                    );
+                }
+                match state.otp_limiter.record_failure(device_key) {
+                    OtpOutcome::LockedOut { retry_after } => {
+                        let secs = retry_after.as_secs() + 1;
+                        tprintln!(
+                            "join rejected: invalid OTP from {device_key}; \
                          max attempts reached, locked out for {secs}s"
-                    );
-                    return ProcessedResponse {
-                        status: StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                        content_type: "text/plain",
-                        body: format!("too many invalid OTP attempts; try again in {secs}s"),
-                    };
-                }
-                OtpOutcome::Rejected { remaining } => {
-                    tprintln!(
-                        "join rejected: invalid session id or OTP from {device_key} \
+                        );
+                        return ProcessedResponse::err(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            format!("too many invalid OTP attempts; try again in {secs}s"),
+                        );
+                    }
+                    OtpOutcome::Rejected { remaining } => {
+                        tprintln!(
+                            "join rejected: invalid session id or OTP from {device_key} \
                          ({remaining} attempt(s) left)"
-                    );
-                    return ProcessedResponse {
-                        status: StatusCode::UNAUTHORIZED.as_u16(),
-                        content_type: "text/plain",
-                        body: format!("invalid session id or OTP ({remaining} attempt(s) left)"),
-                    };
+                        );
+                        return ProcessedResponse::err(
+                            StatusCode::UNAUTHORIZED,
+                            format!("invalid session id or OTP ({remaining} attempt(s) left)"),
+                        );
+                    }
                 }
-            },
+            }
         }
-    }
 
-    match start_session(state, &req, device_key, ice_servers).await {
+        let token = session::mint_device_token();
+        tprintln!("issued a new device token to {device_key} after successful OTP");
+        token
+    };
+
+    match start_session(state, &req, device_key, &device_token, ice_servers).await {
         Ok(answer) => {
             tprintln!(
                 "join accepted: WHEP answer generated ({} bytes)",
@@ -477,15 +580,15 @@ pub async fn process_whep(
                 status: StatusCode::OK.as_u16(),
                 content_type: "application/sdp",
                 body: answer,
+                device_token: Some(device_token),
             }
         }
         Err(e) => {
             teprintln!("join failed: {e:?}");
-            ProcessedResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                content_type: "text/plain",
-                body: format!("join failed: {e}"),
-            }
+            ProcessedResponse::err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("join failed: {e}"),
+            )
         }
     }
 }
@@ -494,6 +597,7 @@ async fn start_session(
     state: &AppState,
     req: &JoinRequest,
     client_ip: &str,
+    device_token: &str,
     ice_servers: Vec<RTCIceServer>,
 ) -> Result<String> {
     let client = state
@@ -713,6 +817,7 @@ async fn start_session(
     if let Some(reporter) = state.config.device_reporter.as_ref() {
         reporter.report_join(DeviceInfo {
             ip: client_ip.to_string(),
+            token: device_token.to_string(),
             name: req.device_name.trim().to_string(),
             os: req.os.trim().to_string(),
             screen_size: format!("{}x{}", req.width, req.height),
@@ -933,6 +1038,28 @@ fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: 
         tprintln!(
             "HTTPS uses a self-signed dev cert: browser shows a one-time warning, accept to proceed; \
              supply --tls-cert/--tls-key for a trusted cert"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_name_is_sanitized() {
+        assert_eq!(sanitize_device_name("Nina's iPad"), "Nina's iPad");
+        assert_eq!(sanitize_device_name("  spaced  "), "spaced");
+        assert_eq!(
+            sanitize_device_name("evil\r\nINFO: fake log"),
+            "evilINFO: fake log"
+        );
+        assert_eq!(sanitize_device_name("null\0byte"), "nullbyte");
+        assert_eq!(sanitize_device_name("a\u{202E}b\u{200B}c"), "abc");
+        let long = "x".repeat(200);
+        assert_eq!(
+            sanitize_device_name(&long).chars().count(),
+            MAX_DEVICE_NAME_CHARS
         );
     }
 }
