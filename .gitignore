@@ -33,3 +33,6 @@ self-signed-key.pem
 
 # Temporary docs
 linux-vdd/
+
+# Hardening audit log
+AUDIT.md
