@@ -31,10 +31,11 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 - **Hardware-accelerated streaming.** Desktop capture is encoded with the GPU and delivered over WebRTC for low latency.
 - **Per-device settings.** Adjust resolution scale, orientation, refresh rate, and video scale/quality independently for each connected device.
-- **Password-protected sessions.** A session ID plus a one-time password (OTP) restrict any new join requests.
+- **Password-protected sessions.** A session ID plus a one-time password (OTP) gate new join requests, with per-device and global rate limiting on wrong guesses. **Exception:** once a device joins successfully it is issued a trust token and remembered, so known devices auto-rejoin **without** re-entering the code. Revoke or ban a device on the Devices screen.
+- **Full remote control of the host.** Joining a session grants that device **keyboard, mouse, and clipboard control** of the host — it is a second monitor you can also drive. Turn this off per device with the remote-control toggle (Devices screen, or `ScreenExtend devices set <ip> --control off`).
 - **Offline / no-internet mode.** The host can run its own ad-hoc Wi-Fi hosted network so devices can connect with no central router.
 - **Auto network discovery.** The host listens on every active network adapter and rebuilds join URLs/QR codes as network changes occur.
-- **Encrypted transport.** Streaming and signaling run over HTTPS/WebRTC with a self-signed certificate generated at runtime.
+- **Encrypted media; opt-in encrypted signaling.** The audio/video stream is always encrypted (WebRTC DTLS-SRTP). The LAN join page is served over plaintext **HTTP** by default so the QR scan just works (no certificate warning); on load it offers to switch to the **HTTPS** endpoint — backed by a self-signed certificate generated at runtime — so the join code is sent encrypted. Cross-network ("Anywhere") joins go through the cloud relay over HTTPS.
 
 ## How it works
 
@@ -71,7 +72,7 @@ Each client gets its own dedicated virtual display and video pipeline, so multip
 
 ## Platform support
 
-The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host is currently Windows + NVIDIA/Intel only.
+The client is just a web page, so anything with a reasonably modern browser (WebRTC + WebCodecs) can be a second monitor. The host runs on **Windows** (NVIDIA NVENC / Intel Quick Sync, with a libx264 software fallback) and **macOS** (VideoToolbox). Linux is scaffolded but not yet functional.
 
 **Minimum host OS:** Windows 10 version 2004 (build 19041) or later, including Windows 11. Only 64-bit (x86-64) machines are supported. macOS Catalina 10.15+.
 
@@ -133,7 +134,7 @@ ScreenExtend.exe removedrivers    # uninstall driver + certificate
 
 ### Releases
 
-Pushes to the `release` branch trigger `.github/workflows/build-windows.yml`, which builds the 64-bit Windows target via `tauri-action` and publishes a GitHub Release. Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
+Pushing a version tag matching `app-v*` (or running the workflow manually via **Run workflow**) triggers `.github/workflows/build-release.yml`, which builds Windows (x64) and macOS (Intel + Apple Silicon) via `tauri-action` and drafts a GitHub Release. Every pull request and push to `main` is checked by `.github/workflows/ci.yml` (build, lint, `cargo fmt`/`clippy`/`test`, and dependency audits). Prebuilt installers are available on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
 
 ## Contributing
 
