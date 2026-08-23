@@ -128,6 +128,9 @@ pub struct Config {
     pub banned_devices: Option<SharedBannedDevices>,
     pub approved_devices: Option<SharedApprovedDevices>,
     pub otp_limiter: Option<SharedOtpLimiter>,
+    /// Reference-counted, host-wide system-audio capture. Started on the first audio-enabled
+    /// device, stopped when the last leaves (PRD §7.4/§7.5). `None` in probe/CLI contexts.
+    pub audio_hub: Option<crate::streamer::audio::SharedAudioHub>,
 }
 
 const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
@@ -176,6 +179,7 @@ impl Default for Config {
             banned_devices: None,
             approved_devices: None,
             otp_limiter: None,
+            audio_hub: None,
         }
     }
 }

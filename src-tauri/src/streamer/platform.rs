@@ -75,6 +75,28 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     }
 }
 
+/// Start the single host-wide system-audio capture, dispatching to the per-OS backend
+/// (Windows: WASAPI loopback + Opus; macOS/Linux: an unsupported stub). Called by the
+/// reference-counted `streamer::audio::AudioHub` on the first audio-enabled subscriber.
+pub fn start_audio_capture() -> Result<crate::streamer::audio::AudioCapture> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_utils::audio::start_capture()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_utils::audio::start_capture()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_utils::audio::start_capture()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("system audio capture is not supported on this platform")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BackendConfig {
     pub width: u32,

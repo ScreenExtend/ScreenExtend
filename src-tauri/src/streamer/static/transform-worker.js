@@ -15,6 +15,17 @@ let framesRendered = 0;
 let lastKeyRequestAt = 0;
 let configError = null;
 
+// A/V sync (PRD §6.5): the host stamps each video frame's RTP timestamp from its monotonic epoch
+// at 90 kHz (see webrtc_session.rs). We invert that per drawn frame to recover the frame's
+// host-capture time, then report how far the client's *display* lags host capture. The audio path
+// consumes this to align playout to the picture. All timing uses timeOrigin+now() so the number is
+// comparable across the worker and the main/audio threads.
+const RTP_HZ = 90000;
+let rtpUnwrapLast = null;
+let rtpWraps = 0;
+let videoDelayEmaMs = null;
+let lastAvsyncPostMs = 0;
+
 const CODEC_CANDIDATES = [
   'avc1.640034', 'avc1.640028', 'avc1.64001F',
   'avc1.4D4034', 'avc1.4D401F',
@@ -44,6 +55,28 @@ self.onmessage = (e) => {
   }
 };
 
+// Recover a drawn frame's host-capture time from its (host-clock, 90 kHz) RTP timestamp and post
+// an EMA of the display lag to the main thread. `tsTicks` is the u32 RTP timestamp echoed through
+// the decoder; we unwrap it to survive the ~13.25 h wrap so the lag stays stable mid-session.
+function reportAvSync(tsTicks) {
+  const ts = tsTicks >>> 0;
+  if (rtpUnwrapLast !== null) {
+    const d = ts - rtpUnwrapLast;
+    if (d < -0x80000000) rtpWraps++;
+    else if (d > 0x80000000) rtpWraps--;
+  }
+  rtpUnwrapLast = ts;
+  const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
+  const drawAbsMs = performance.timeOrigin + performance.now();
+  const delta = drawAbsMs - videoHostMs;
+  videoDelayEmaMs = (videoDelayEmaMs === null) ? delta : videoDelayEmaMs * 0.95 + delta * 0.05;
+  const nowMs = performance.now();
+  if (nowMs - lastAvsyncPostMs > 200) {
+    lastAvsyncPostMs = nowMs;
+    self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs });
+  }
+}
+
 function postStats() {
   self.postMessage({
     type: 'stats',
@@ -67,6 +100,7 @@ function makeDecoder() {
         if (ctx && frame.timestamp >= renderFromTs) {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           framesRendered++;
+          reportAvSync(frame.timestamp);
           if (!renderedOnce) {
             renderedOnce = true;
             self.postMessage({ type: 'rendered' });

@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod compatibility;
 pub mod hosted_network;
 pub mod networking;

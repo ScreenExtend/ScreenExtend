@@ -71,7 +71,7 @@ Commands and events are defined in Rust and consumed type-safely in TS via
 
 `src-tauri/src/` has three `cfg`-gated sibling modules — `windows_utils/`, `macos_utils/`,
 `linux_utils/` — each exposing the **same surface** (`AppState`, `setup`, `networking`,
-`hosted_network`, `virtual_display`, `streamer`, `compatibility`, `device_reporter`).
+`hosted_network`, `virtual_display`, `streamer`, `compatibility`, `device_reporter`, `audio`).
 `lib.rs` glob-imports the active one (`use windows_utils::*` etc.), so the Tauri command
 list is identical across OSes and dispatch happens at compile time. `streamer/platform.rs`
 is the runtime dispatcher for capture/encode/tuning that calls into the per-OS backend.
@@ -120,13 +120,55 @@ Cross-platform core, OS-independent:
   header; the client stores it and presents it on rejoin. The IP is only a display hint. The
   `OtpLimiter` also has a global cross-key brute-force guard (defeats the cloud relay's
   rotating-`client_id` bypass).
-- `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers.
+- `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers. The video track is a raw
+  `TrackLocalStaticRTP` (not `TrackLocalStaticSample`): we packetize H.264 ourselves so each
+  frame's RTP timestamp carries the shared host clock (`host_ns_to_rtp90k`), which the client
+  inverts for A/V sync (§6.5). NACK/RTX (interceptors) and loss-based BWE (`getStats`) are
+  unaffected.
 - `pipeline.rs` — capture → encode → RTP feed.
 - `tls.rs` — self-signed cert generation at runtime (`rcgen`).
 - `cloud.rs` — cross-network relay control channel (WebSocket via `tokio-tungstenite`) +
   TURN. Cross-network joins require a configured TURN server (see the `turn-required-cross-network` memory).
 - `input/` — remote keyboard/mouse injection, with per-OS impls + a shared protocol.
-- `static/` — the client browser page (see top of this file).
+- `audio/` — cross-platform system-audio transport glue: `AudioPacket`, host-side
+  `AudioDiagnostics`, the shared host timebase (`host_now_ns` / `host_instant_to_ns` /
+  `host_ns_to_rtp90k` — **the one clock both audio `capture_ns` and the video RTP timestamp ride
+  for A/V sync**), the reference-counted `AudioHub` (one host-wide capture fanned out to N
+  sessions via `tokio::sync::broadcast`, started on the first audio-enabled subscriber and stopped
+  when the last leaves), and `protocol.rs` (the 13-byte DataChannel header: seq u32, capture ns
+  u64, flags u8 + raw Opus).
+- `static/` — the client browser page (see top of this file). Adds `audio.js` (WebCodecs
+  `AudioDecoder` → ring → worklet, plus the NetEQ track fallback) and `audio-worklet.js` (our
+  jitter buffer). A/V sync (§6.5) lives here: `transform-worker.js` recovers each video frame's
+  host-capture time from its RTP timestamp and reports the display lag; `audio.js` commands the
+  worklet a buffer depth so audio plays in step with the picture, and the worklet corrects drift
+  only at silence boundaries. Measured offset via `SEAudio.getSyncInfo()` (no on-screen HUD).
+
+### System audio (`windows_utils/audio/`, Windows only)
+
+Per-device system-audio capture + Opus encode. Design decisions are measured, not assumed —
+see `AUDIO_NOTES.md` (from the `examples/audio_spike.rs` throwaway spike):
+
+- `loopback.rs` — WASAPI **legacy `IAudioClient::Initialize` loopback** path (the IAudioClient3
+  low-latency path rejects the loopback flag). Runs on a **dedicated OS thread** with COM MTA +
+  MMCSS "Pro Audio", event-driven, re-acquiring on default-device change / `AUDCLNT_E_DEVICE_INVALIDATED`.
+- `silence.rs` — a **silent render companion** is mandatory: it is the clock source that makes
+  the loopback event fire and keeps packets flowing while the host is idle (measured: 0/20 event
+  signals without it, 20/20 with it). Started lazily, stopped with the capture.
+- `format.rs` — mix-format negotiation; 48 kHz float32 stereo is the zero-copy fast path,
+  everything else is `AUTOCONVERTPCM`'d / downmixed (ITU BS.775) / int→float.
+- `opus_sys.rs` + `encoder.rs` — hand-written libopus FFI (mirrors `x264_sys.rs`), `libopus.dll`
+  loaded via `libloading` and bundled in `resources/` (provenance in `resources/PROVENANCE.md`);
+  `RESTRICTED_LOWDELAY` (CELT-only), 5 ms frames.
+- `device.rs` — `IMMNotificationClient`; its callback runs on a COM thread we don't own, so it
+  only posts to the capture thread over `crossbeam-channel` (never blocks, never takes the
+  capture lock).
+
+**Capture-thread convention:** the audio capture thread is a real-time OS thread (MMCSS), never
+a tokio task. It never allocates or locks in the drain/encode path beyond the reused
+accumulator + the per-packet `Bytes` copy. It talks to the async world over `crossbeam-channel`
+(→ the `AudioHub` bridge → broadcast), the way the video pipeline does. macOS/Linux provide
+compiling stubs (`{macos,linux}_utils/audio.rs`) that return "unsupported".
 
 ### Desktop UI (`src/`)
 
@@ -176,8 +218,9 @@ initializes the virtual display and populates `AppState`.
 ## Native resources & drivers
 
 - Bundled resources (`tauri.conf.json` → `bundle.resources`): the signed Windows Virtual
-  Display Driver (`.dll`/`.cat`/`.inf`), its cert (`ScreenExtend.cer`), and `libx264-164.dll`
-  (software-encode fallback). `binaries/nefconc` is an `externalBin` used with `certutil`
+  Display Driver (`.dll`/`.cat`/`.inf`), its cert (`ScreenExtend.cer`), `libx264-164.dll`
+  (software-encode fallback), and `libopus.dll` (system-audio Opus encode, loaded via
+  `libloading`; provenance + SHA-256 in `resources/PROVENANCE.md` / `SHA256SUMS`). `binaries/nefconc` is an `externalBin` used with `certutil`
   to install the driver (requires Administrator, elevated via the `elevated-command` crate).
 - macOS uses a `tauri.macos.conf.json` overlay config (passed with `--config` in CI) and
   `Entitlements.plist`.

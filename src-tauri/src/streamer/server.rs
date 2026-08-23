@@ -27,6 +27,19 @@ const MAX_OTP_LEN: usize = 32;
 const MAX_OS_LEN: usize = 64;
 const MAX_SDP_LEN: usize = 64 * 1024;
 
+/// Client-declared decode/playback capabilities, so the host picks the audio transport (§7.3).
+/// `#[serde(default)]` on the field means older clients (which omit it) parse as all-false →
+/// the standard WebRTC-track fallback.
+#[derive(Deserialize, Default, Clone, Copy, Debug)]
+struct AudioCapabilities {
+    #[serde(default, rename = "webcodecsOpus")]
+    webcodecs_opus: bool,
+    #[serde(default)]
+    sab: bool,
+    #[serde(default)]
+    worklet: bool,
+}
+
 #[derive(Deserialize)]
 struct JoinRequest {
     #[serde(rename = "sessionId")]
@@ -34,6 +47,8 @@ struct JoinRequest {
     otp: String,
     #[serde(default, rename = "deviceToken")]
     device_token: String,
+    #[serde(default, rename = "audioCapabilities")]
+    audio_capabilities: AudioCapabilities,
     #[serde(
         default,
         rename = "deviceName",
@@ -296,6 +311,8 @@ fn router(state: AppState) -> Router {
         .route("/leave", post(leave))
         .route("/transform-worker.js", get(transform_worker))
         .route("/input.js", get(input_js))
+        .route("/audio.js", get(audio_js))
+        .route("/audio-worklet.js", get(audio_worklet_js))
         .route("/nosleep.js", get(nosleep_js))
         .route("/logo.svg", get(logo))
         .route("/styles.css", get(styles))
@@ -309,16 +326,35 @@ async fn health() -> &'static str {
     "ok"
 }
 
+// Cross-origin isolation (§6.4): with these on the document *and* a secure context (HTTPS or
+// localhost), `crossOriginIsolated` becomes true and the client can use the SharedArrayBuffer
+// ring buffer. Over plain HTTP they're inert (isolation stays off; client falls back to the
+// postMessage ring). All our sub-resources are same-origin, so COEP:require-corp does not block
+// them — verify the existing video worker still loads if this ever regresses.
+fn isolation_headers() -> [(header::HeaderName, header::HeaderValue); 2] {
+    [
+        (
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            header::HeaderValue::from_static("same-origin"),
+        ),
+        (
+            header::HeaderName::from_static("cross-origin-embedder-policy"),
+            header::HeaderValue::from_static("require-corp"),
+        ),
+    ]
+}
+
 async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Html<String> {
+) -> Response {
     let flag = if state.is_same_device(peer.ip()) {
         "true"
     } else {
         "false"
     };
-    Html(include_str!("static/index.html").replace("__SAME_DEVICE_FLAG__", flag))
+    let html = include_str!("static/index.html").replace("__SAME_DEVICE_FLAG__", flag);
+    (isolation_headers(), Html(html)).into_response()
 }
 
 async fn transform_worker() -> Response {
@@ -333,6 +369,22 @@ async fn input_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript")],
         include_str!("static/input.js"),
+    )
+        .into_response()
+}
+
+async fn audio_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("static/audio.js"),
+    )
+        .into_response()
+}
+
+async fn audio_worklet_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("static/audio-worklet.js"),
     )
         .into_response()
 }
@@ -634,6 +686,20 @@ async fn start_session(
         .as_ref()
         .and_then(|o| o.lock().unwrap().get(client_ip).copied());
     let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
+    // Audio defaults to false (§7.2). Forwarding reads the live flag, so we set the transport
+    // up whenever a hub exists and let it gate on `audio_enabled` (toggle without reconnect).
+    let audio_params = match (
+        state.config.audio_hub.as_ref(),
+        state.config.device_overrides.as_ref(),
+    ) {
+        (Some(hub), Some(overrides)) => Some(webrtc_session::AudioParams {
+            fast: req.audio_capabilities.webcodecs_opus && req.audio_capabilities.worklet,
+            hub: std::sync::Arc::clone(hub),
+            overrides: std::sync::Arc::clone(overrides),
+            device_key: client_ip.to_string(),
+        }),
+        _ => None,
+    };
     if let Some(o) = override_for_ip {
         cfg.scale = ScalePercent::new(o.video_scale);
         cfg.qp = Some(o.video_quality);
@@ -798,6 +864,7 @@ async fn start_session(
         Some(closed_tx),
         Some(device_name.clone()),
         control_enabled,
+        audio_params,
     )
     .await
     {

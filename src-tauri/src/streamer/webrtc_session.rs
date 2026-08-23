@@ -5,31 +5,67 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp::codecs::h264::H264Payloader;
+use webrtc::rtp::packetizer::Payloader;
+use webrtc::rtp::sequence::{new_random_sequencer, Sequencer};
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 use webrtc::rtp_transceiver::PayloadType;
 use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 pub use webrtc::ice_transport::ice_server::RTCIceServer;
 
+use super::audio::{self, protocol, SharedAudioHub};
 use super::bitrate::{estimate_from_loss, BitrateController, DEFAULT_MIN_BITRATE_BPS};
 use super::config::H264Profile;
 use super::input;
 use super::pipeline::Pipeline;
+use super::session::SharedDeviceOverrides;
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Fallback Opus fmtp: no in-band FEC (our custom decoder path doesn't use it), stereo (§6.3).
+const OPUS_FALLBACK_FMTP: &str = "minptime=10;useinbandfec=0;stereo=1;sprop-stereo=1";
+/// Drop audio packets once the DataChannel has this many bytes queued (§6.1 backpressure).
+const AUDIO_BACKPRESSURE_BYTES: usize = 256 * 1024;
+
+/// Everything the audio transport needs, resolved at join time (§7.2/§7.3). The transport
+/// (DataChannel or track) is created unconditionally so toggling `audio_enabled` takes effect
+/// without a reconnect; forwarding is gated on the live per-device flag.
+#[derive(Clone)]
+pub struct AudioParams {
+    /// true → WebCodecs fast path over an unordered DataChannel; false → standard Opus track.
+    pub fast: bool,
+    pub hub: SharedAudioHub,
+    pub overrides: SharedDeviceOverrides,
+    pub device_key: String,
+}
+
+impl AudioParams {
+    fn audio_enabled_now(&self) -> bool {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(&self.device_key)
+            .map(|o| o.audio_enabled)
+            .unwrap_or(false)
+    }
+}
 
 fn h264_fmtp(profile_level_id: &str) -> String {
     format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}")
@@ -104,6 +140,25 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
             )
             .context("register RTX codec")?;
     }
+
+    // Opus, for the standard-track audio fallback (§6.3). Registering it is harmless when the
+    // client's offer has no audio m-line (fast path uses a DataChannel instead of a track).
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
+                    rtcp_feedback: vec![],
+                },
+                payload_type: 111,
+                ..Default::default()
+            },
+            RTPCodecType::Audio,
+        )
+        .context("register Opus codec")?;
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
@@ -267,6 +322,7 @@ pub async fn handle_whep_offer(
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
     input_device: Option<String>,
     control_enabled: bool,
+    audio: Option<AudioParams>,
 ) -> Result<String> {
     let profile = pipeline.h264_profile;
     let api = build_api(profile)?;
@@ -327,7 +383,12 @@ pub async fn handle_whep_offer(
         }));
     }
 
-    let track = Arc::new(TrackLocalStaticSample::new(
+    // Raw-RTP video track (not TrackLocalStaticSample): we packetize H.264 ourselves so we can
+    // stamp every packet's RTP timestamp from the shared host clock (PRD §6.5). The crate's
+    // sample track derives the timestamp from a random base + frame durations, which the client
+    // can't map back to host-capture time. NACK/RTX and loss-based BWE are unaffected — they
+    // live in the interceptor chain / getStats, not the packetizer.
+    let track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
@@ -367,35 +428,62 @@ pub async fn handle_whep_offer(
 
     spawn_bitrate_driver(Arc::clone(&pc), pipeline.clone());
 
+    if let Some(audio) = audio {
+        if let Err(e) = setup_audio(&pc, audio).await {
+            teprintln!("audio: setup failed ({e:#}); continuing without audio");
+        }
+    }
+
     {
         let mut rx = pipeline.tx.subscribe();
-        let frame_duration = pipeline.frame_duration;
         let track = Arc::clone(&track);
         let pc_keepalive = Arc::clone(&pc);
         let pipeline = pipeline.clone();
         tokio::spawn(async move {
             let _pc = pc_keepalive;
-            let mut last_capture: Option<Instant> = None;
+            // Standard RTP payload MTU (1200) minus the 12-byte fixed RTP header — the same
+            // budget TrackLocalStaticSample's packetizer uses. One payloader + sequencer for the
+            // track's lifetime; the payloader caches SPS/PPS for STAP-A exactly as before.
+            const RTP_PAYLOAD_MTU: usize = 1200 - 12;
+            let mut payloader = H264Payloader::default();
+            let sequencer = new_random_sequencer();
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
-                        let duration = match last_capture {
-                            Some(prev) => frame
-                                .capture
-                                .saturating_duration_since(prev)
-                                .clamp(Duration::from_millis(1), Duration::from_millis(500)),
-                            None => frame_duration,
+                        // Every packet of this access unit shares the frame's host-capture time,
+                        // expressed on the 90 kHz RTP clock (PRD §6.5). The client inverts it.
+                        let rtp_ts =
+                            audio::host_ns_to_rtp90k(audio::host_instant_to_ns(frame.capture));
+                        let payloads = match payloader.payload(RTP_PAYLOAD_MTU, &frame.data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tprintln!("h264 payload failed ({e}); requesting IDR");
+                                pipeline.request_idr();
+                                continue;
+                            }
                         };
-                        last_capture = Some(frame.capture);
-                        if let Err(e) = track
-                            .write_sample(&Sample {
-                                data: frame.data,
-                                duration,
-                                ..Default::default()
-                            })
-                            .await
-                        {
-                            tprintln!("track write_sample failed ({e}); viewer writer stopping");
+                        let last = payloads.len().saturating_sub(1);
+                        let mut stop = false;
+                        for (i, payload) in payloads.into_iter().enumerate() {
+                            let pkt = webrtc::rtp::packet::Packet {
+                                header: webrtc::rtp::header::Header {
+                                    version: 2,
+                                    marker: i == last, // marker on the last packet of the frame
+                                    // payload_type and ssrc are overwritten per-binding by the
+                                    // track, so the values here are placeholders.
+                                    sequence_number: sequencer.next_sequence_number(),
+                                    timestamp: rtp_ts,
+                                    ..Default::default()
+                                },
+                                payload,
+                            };
+                            if let Err(e) = track.write_rtp_with_extensions(&pkt, &[]).await {
+                                tprintln!("track write_rtp failed ({e}); viewer writer stopping");
+                                stop = true;
+                                break;
+                            }
+                        }
+                        if stop {
                             break;
                         }
                     }
@@ -496,6 +584,187 @@ pub async fn handle_whep_offer(
     );
 
     Ok(local.sdp)
+}
+
+/// Wire up the audio transport (§6). The host **creates** the DataChannel (fast path) or adds
+/// the Opus track (fallback); forwarding is gated on the live `audio_enabled` flag so toggling
+/// it takes effect without reconnecting the device.
+async fn setup_audio(
+    pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    audio: AudioParams,
+) -> Result<()> {
+    if audio.fast {
+        let init = RTCDataChannelInit {
+            ordered: Some(false),
+            max_retransmits: Some(0), // late audio is worse than missing audio — never retransmit
+            ..Default::default()
+        };
+        let dc = pc
+            .create_data_channel("audio", Some(init))
+            .await
+            .context("create audio data channel")?;
+        tprintln!("audio: created unordered/no-retransmit DataChannel 'audio'");
+        let dc_for_open = Arc::clone(&dc);
+        let pc_for_open = Arc::clone(pc);
+        dc.on_open(Box::new(move || {
+            let dc = Arc::clone(&dc_for_open);
+            let pc = Arc::clone(&pc_for_open);
+            let audio = audio.clone();
+            Box::pin(async move {
+                tokio::spawn(forward_datachannel(pc, dc, audio));
+            })
+        }));
+    } else {
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                clock_rate: 48000,
+                channels: 2,
+                sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
+                rtcp_feedback: vec![],
+            },
+            "audio".to_owned(),
+            "webrtc-streamer".to_owned(),
+        ));
+        pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .context("add_track(opus fallback)")?;
+        tprintln!("audio: added standard Opus track (NetEQ fallback path)");
+        tokio::spawn(forward_track(Arc::clone(pc), track, audio));
+    }
+    Ok(())
+}
+
+fn pc_alive(pc: &webrtc::peer_connection::RTCPeerConnection) -> bool {
+    !matches!(
+        pc.connection_state(),
+        RTCPeerConnectionState::Closed
+            | RTCPeerConnectionState::Failed
+            | RTCPeerConnectionState::Disconnected
+    )
+}
+
+async fn subscribe_blocking(hub: &SharedAudioHub) -> Option<audio::AudioSubscription> {
+    let hub = Arc::clone(hub);
+    match tokio::task::spawn_blocking(move || hub.subscribe()).await {
+        Ok(Ok(sub)) => Some(sub),
+        Ok(Err(e)) => {
+            teprintln!("audio: subscribe failed ({e:#})");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+async fn unsubscribe_blocking(hub: &SharedAudioHub) {
+    let hub = Arc::clone(hub);
+    let _ = tokio::task::spawn_blocking(move || hub.unsubscribe()).await;
+}
+
+/// Fast path: header + raw Opus over the unordered DataChannel, dropping on backpressure.
+async fn forward_datachannel(
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    dc: Arc<RTCDataChannel>,
+    audio: AudioParams,
+) {
+    let mut sub: Option<audio::AudioSubscription> = None;
+    loop {
+        if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
+            break;
+        }
+        let want = audio.audio_enabled_now();
+        match (want, sub.is_some()) {
+            (true, false) => sub = subscribe_blocking(&audio.hub).await,
+            (false, true) => {
+                sub = None;
+                unsubscribe_blocking(&audio.hub).await;
+            }
+            _ => {}
+        }
+
+        let Some(s) = sub.as_mut() else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+
+        match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
+            Ok(Ok(pkt)) => {
+                if dc.buffered_amount().await > AUDIO_BACKPRESSURE_BYTES {
+                    s.diagnostics
+                        .dropped_backpressure
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                let msg = protocol::build_message(pkt.seq, pkt.capture_ns, pkt.flags, &pkt.data);
+                if dc.send(&Bytes::from(msg)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                sub = None; // capture stopped underneath us; will re-subscribe if re-enabled
+            }
+            Err(_) => continue, // timeout — loop to re-check the live flag / pc state
+        }
+    }
+    if sub.take().is_some() {
+        unsubscribe_blocking(&audio.hub).await;
+    }
+    tprintln!("audio: DataChannel forwarder stopped");
+}
+
+/// Fallback path: write raw Opus packets to a standard track (browser NetEQ plays them).
+async fn forward_track(
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    track: Arc<TrackLocalStaticSample>,
+    audio: AudioParams,
+) {
+    let frame_duration = Duration::from_millis(5); // 5 ms Opus frames
+    let mut sub: Option<audio::AudioSubscription> = None;
+    loop {
+        if !pc_alive(&pc) {
+            break;
+        }
+        let want = audio.audio_enabled_now();
+        match (want, sub.is_some()) {
+            (true, false) => sub = subscribe_blocking(&audio.hub).await,
+            (false, true) => {
+                sub = None;
+                unsubscribe_blocking(&audio.hub).await;
+            }
+            _ => {}
+        }
+
+        let Some(s) = sub.as_mut() else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+
+        match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
+            Ok(Ok(pkt)) => {
+                if track
+                    .write_sample(&Sample {
+                        data: pkt.data,
+                        duration: frame_duration,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                sub = None;
+            }
+            Err(_) => continue,
+        }
+    }
+    if sub.take().is_some() {
+        unsubscribe_blocking(&audio.hub).await;
+    }
+    tprintln!("audio: track forwarder stopped");
 }
 
 fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pipeline: Pipeline) {

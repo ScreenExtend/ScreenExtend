@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod bitrate;
 pub mod cli;
 pub mod cloud;

@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod compatibility;
 pub mod device_reporter;
 pub mod hosted_network;
@@ -164,6 +165,7 @@ pub fn set_device_override(
     video_scale: u32,
     video_quality: u32,
     control_enabled: bool,
+    audio_enabled: bool,
 ) {
     use crate::streamer::config::ScalePercent;
     use crate::streamer::server::{
@@ -179,6 +181,7 @@ pub fn set_device_override(
             video_scale: ScalePercent::new(video_scale).percent(),
             video_quality: video_quality.clamp(1, 51) as u8,
             control_enabled,
+            audio_enabled,
         },
     );
     session::bump_reconfig_epoch(&state.sessions, &ip);

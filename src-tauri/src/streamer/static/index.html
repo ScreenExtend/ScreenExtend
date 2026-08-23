@@ -53,7 +53,6 @@
                                     <span class="fs-toggle-desc">Locks this tab fullscreen for a true second screen. Turn it off to keep everything else working while you multitask.</span>
                                 </span>
                             </label>
-                            <p class="desc" style="font-size: 0.8em; opacity: 0.85; margin: 4px 0 8px;">Joining lets this device control the host's keyboard, mouse, and clipboard. The host can turn this off per device.</p>
                             <button class="btn" id="connect" type="submit" disabled>Connect</button>
                         </form>
                         <div class="err" id="errorMessage" role="alert"></div>
@@ -110,6 +109,7 @@
         </div>
 
         <script src="/input.js"></script>
+        <script src="/audio.js"></script>
         <!-- NoSleep.min.js v0.12.0 (Rich Tibbett, MIT) — served from /nosleep.js -->
         <script src="/nosleep.js"></script>
         <script>
@@ -125,6 +125,13 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
+
+            // System-audio capability detection (§7.8). The host picks the audio transport from
+            // these: fast WebCodecs-over-DataChannel path when webcodecsOpus && worklet, else the
+            // standard Opus-track (NetEQ) fallback. Audio is optional — never blocks the join.
+            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities())
+                || { webcodecsOpus: false, worklet: false, sab: false };
+            const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
 
@@ -565,6 +572,7 @@
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
                 if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
+                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
                 try { if (pc) pc.close(); } catch (_) {}
                 pc = null;
             }
@@ -634,6 +642,23 @@
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
                     try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
+
+                    // System audio (§6). Fast path: the host CREATES an "audio" DataChannel we
+                    // accept here. Fallback: we request a recvonly Opus track (host adds it).
+                    // Either transport is set up unconditionally so toggling host audio takes
+                    // effect without reconnecting; nothing plays until the host forwards data.
+                    if (window.SEAudio) {
+                        if (audioFast) {
+                            SEAudio.prepare();
+                            pc.ondatachannel = (ev) => {
+                                if (ev.channel && ev.channel.label === 'audio') {
+                                    SEAudio.attachDataChannel(ev.channel);
+                                }
+                            };
+                        } else {
+                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+                        }
+                    }
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
                     } catch (_) {}
@@ -656,6 +681,9 @@
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
+                            } else if (m.data.type === 'avsync') {
+                                // Video display lag (ms), host-clock referenced — align audio to it (§6.5).
+                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
@@ -681,6 +709,10 @@
                     }
 
                     pc.ontrack = (e) => {
+                        if (e.track.kind === 'audio') {
+                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) {}
+                            return;
+                        }
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
@@ -766,6 +798,7 @@
                             width: joinData.width,
                             height: joinData.height,
                             sdp: pc.localDescription.sdp,
+                            audioCapabilities: audioCaps,
                         }),
                     });
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
@@ -1128,6 +1161,9 @@
                 loadingEl.classList.add('show');
 
                 console.log('[join] connecting with', joinData);
+
+                // The AudioContext needs a user gesture to start; this submit is one (§7.8).
+                try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
 
                 beginStreaming();
             });

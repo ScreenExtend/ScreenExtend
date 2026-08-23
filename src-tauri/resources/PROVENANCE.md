@@ -30,6 +30,22 @@ against the upstream release the next time these are refreshed.
   loads. Public cert only — no private key.
 - **SHA-256:** `db896ceccd9cba9e5f5cbebdb1d61d27e8e984f076233f97bcc75840faf0492c`
 
+## libopus (`libopus.dll`)
+
+- **Upstream:** [xiph/opus](https://github.com/xiph/opus) — the reference Opus audio
+  codec. BSD-3-Clause.
+- **Used for:** low-delay (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, CELT-only) encode of
+  captured system audio before WebRTC transport. Loaded at runtime via `libloading`, the
+  same way `libx264-164.dll` is — see `windows_utils/audio/opus_sys.rs`.
+- **Version:** built from source at commit
+  `03647f524a40b05a1898522e92033810b58103c7` (2026-08-14). `opus_get_version_string()`
+  reports `libopus unknown` because the DLL was produced from a shallow git checkout that
+  lacks the generated `package_version` file; the commit hash above is the authoritative
+  pin. Built x64 Release, `-DBUILD_SHARED_LIBS=ON` (DRED/OSCE off — encoder-only path).
+- **License:** BSD-3-Clause (Xiph.Org / Skype et al.). Compatible with this project's
+  AGPL-3.0 (permissive → copyleft is fine).
+- **SHA-256:** `73924f6a4124a52c9a3e1b5cedb68339f4d21627826b2b5fce5c453dde2857b5`
+
 ## libx264 (`libx264-164.dll`)
 
 - **Upstream:** [videolan/x264](https://code.videolan.org/videolan/x264) — the

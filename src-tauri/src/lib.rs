@@ -112,6 +112,8 @@ pub struct Device {
     pub video_quality: u32,
     #[serde(rename = "remoteControl")]
     pub control_enabled: bool,
+    #[serde(rename = "systemAudio")]
+    pub audio_enabled: bool,
     pub os: String,
     #[serde(rename = "screenSize")]
     pub screen_size: String,
@@ -142,6 +144,7 @@ impl Device {
             video_scale: 100,
             video_quality: 15,
             control_enabled: true,
+            audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
         }

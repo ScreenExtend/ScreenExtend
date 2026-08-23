@@ -31,6 +31,9 @@ pub struct DeviceOverride {
     pub video_scale: u32,
     pub video_quality: u8,
     pub control_enabled: bool,
+    /// System audio streaming for this device. Default **false** — audio is privacy-relevant
+    /// (it captures everything the host plays) and must be opted in per device (PRD §7.1).
+    pub audio_enabled: bool,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {

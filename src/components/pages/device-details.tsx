@@ -48,6 +48,12 @@ import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 import { useFormik } from "formik";
+import { type as osType } from "@tauri-apps/plugin-os";
+
+// System audio capture is Windows-only (macOS/Linux backends are stubs). The toggle stays
+// visible but disabled elsewhere, with an explanatory tooltip, so it reads as unimplemented
+// rather than broken (PRD §7.10).
+const audioSupported = osType() === "windows";
 
 function TipLabel({
   text,
@@ -91,6 +97,7 @@ export function DeviceDetails({ device }: { device: Device }) {
   const deviceDetails = useFormik({
     initialValues: {
       ...device,
+      systemAudio: device.systemAudio ?? false,
     },
     onSubmit: async (values) => {
       setInProgress(true);
@@ -109,7 +116,8 @@ export function DeviceDetails({ device }: { device: Device }) {
           normalized.refreshRate,
           normalized.videoScale,
           normalized.videoQuality,
-          normalized.remoteControl
+          normalized.remoteControl,
+          normalized.systemAudio
         );
         await saveDeviceSettings(normalized);
         await events.deviceModify.emit(normalized);
@@ -265,6 +273,24 @@ export function DeviceDetails({ device }: { device: Device }) {
                 deviceDetails.setFieldValue("remoteControl", checked)
               }
               disabled={inProgress}
+            />
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+            <TipLabel
+              text={
+                audioSupported
+                  ? t("device.systemAudio.tip")
+                  : t("device.systemAudio.unsupported")
+              }
+            >
+              <Label>{t("device.systemAudio.label")}</Label>
+            </TipLabel>
+            <Switch
+              checked={deviceDetails.values.systemAudio}
+              onCheckedChange={(checked) =>
+                deviceDetails.setFieldValue("systemAudio", checked)
+              }
+              disabled={inProgress || !audioSupported}
             />
           </div>
           <div className="mt-4">

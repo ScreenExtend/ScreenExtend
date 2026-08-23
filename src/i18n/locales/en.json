@@ -115,6 +115,13 @@
       "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban."
     }
   },
+  "device": {
+    "systemAudio": {
+      "label": "System audio",
+      "tip": "Streams this computer's audio output to the device.",
+      "unsupported": "System audio is only available when hosting from Windows."
+    }
+  },
   "notifications": {
     "deviceJoin": {
       "title": "Device Connected",
