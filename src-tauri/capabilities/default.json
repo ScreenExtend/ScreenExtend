@@ -11,40 +11,103 @@
       "identifier": "shell:allow-execute",
       "allow": [
         {
-          "args": true,
-          "cmd": "",
           "name": "nefconc",
-          "sidecar": true
+          "sidecar": true,
+          "args": [
+            "--remove-device-node",
+            "--hardware-id",
+            "Root\\VirtualDisplayDriver",
+            "--class-guid",
+            "4D36E968-E325-11CE-BFC1-08002BE10318"
+          ]
         },
         {
-          "args": true,
-          "cmd": "certutil",
+          "name": "nefconc",
+          "sidecar": true,
+          "args": [
+            "--create-device-node",
+            "--class-name",
+            "Display",
+            "--class-guid",
+            "4D36E968-E325-11CE-BFC1-08002BE10318",
+            "--hardware-id",
+            "Root\\VirtualDisplayDriver"
+          ]
+        },
+        {
+          "name": "nefconc",
+          "sidecar": true,
+          "args": [
+            { "validator": "--(install|uninstall)-driver" },
+            "--inf-path",
+            { "validator": ".*VirtualDisplayDriver\\.inf$" }
+          ]
+        },
+        {
           "name": "certutil",
-          "sidecar": false
+          "cmd": "certutil",
+          "sidecar": false,
+          "args": [
+            "-addstore",
+            "-f",
+            { "validator": "root|TrustedPublisher" },
+            { "validator": ".*ScreenExtend\\.cer$" }
+          ]
         },
         {
-          "args": true,
-          "cmd": "screenextend",
+          "name": "certutil",
+          "cmd": "certutil",
+          "sidecar": false,
+          "args": [
+            "-delstore",
+            { "validator": "root|TrustedPublisher" },
+            "ScreenExtend"
+          ]
+        },
+        {
           "name": "screenextend",
-          "sidecar": false
+          "cmd": "screenextend",
+          "sidecar": false,
+          "args": [
+            { "validator": "hostednetwork|installdrivers|removedrivers" },
+            { "validator": ".*" },
+            { "validator": ".*" }
+          ]
         },
         {
-          "args": true,
-          "cmd": "netsh",
           "name": "netsh",
-          "sidecar": false
+          "cmd": "netsh",
+          "sidecar": false,
+          "args": [
+            "wlan",
+            { "validator": "set|start|stop|show" },
+            { "validator": "hostednetwork|drivers" },
+            { "validator": "mode=allow|.*" },
+            { "validator": "ssid=.*" },
+            { "validator": "key=.*" }
+          ]
         },
         {
-          "args": true,
-          "cmd": "control",
+          "name": "netsh",
+          "cmd": "netsh",
+          "sidecar": false,
+          "args": [
+            "wlan",
+            { "validator": "set|start|stop|show" },
+            { "validator": "hostednetwork|drivers" }
+          ]
+        },
+        {
           "name": "control",
-          "sidecar": false
+          "cmd": "control",
+          "sidecar": false,
+          "args": ["desk.cpl"]
         },
         {
-          "args": true,
-          "cmd": "open",
           "name": "open",
-          "sidecar": false
+          "cmd": "open",
+          "sidecar": false,
+          "args": ["x-apple.systempreferences:com.apple.preference.displays"]
         }
       ]
     },
