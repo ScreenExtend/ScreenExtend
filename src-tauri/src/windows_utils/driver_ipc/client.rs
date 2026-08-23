@@ -1,6 +1,5 @@
 use std::{io, sync::Arc, time::Duration};
 
-use log::error;
 use serde::Serialize;
 use tokio::{
     net::windows::named_pipe,

@@ -17,7 +17,12 @@ pub enum Command {
 }
 
 pub fn acquire_lock(path: &Path) -> Option<File> {
-    let file = File::options().write(true).create(true).open(path).ok()?;
+    let file = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
     match file.try_lock_exclusive() {
         Ok(true) => Some(file),
         _ => None,
@@ -108,5 +113,7 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
         Command::Focus => "FOCUS",
         Command::Quit => "QUIT",
     };
-    stream.write_all(format!("{token} {verb}\n").as_bytes()).is_ok()
+    stream
+        .write_all(format!("{token} {verb}\n").as_bytes())
+        .is_ok()
 }

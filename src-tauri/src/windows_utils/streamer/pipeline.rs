@@ -621,7 +621,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         timing_sum_ns += dt;
         timing_count += 1;
         timing_max_ns = timing_max_ns.max(dt);
-        if frames_sent % 60 == 0 {
+        if frames_sent.is_multiple_of(60) {
             let avg_ms = (timing_sum_ns / timing_count.max(1) as u128) as f64 / 1.0e6;
             let max_ms = timing_max_ns as f64 / 1.0e6;
             tprintln!(
@@ -754,6 +754,7 @@ impl EncodePath {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Nvenc { encoder: Encoder, path: EncodePath },
     Intel { encoder: IntelEncoder },
@@ -1127,6 +1128,7 @@ fn build_backend(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_repeater(
     core: Arc<Mutex<EncodeCore>>,
     tx: broadcast::Sender<EncodedFrame>,
@@ -1333,7 +1335,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         self.timing_sum_ns += dt;
         self.timing_count += 1;
         self.timing_max_ns = self.timing_max_ns.max(dt);
-        if self.frames_sent % 60 == 0 {
+        if self.frames_sent.is_multiple_of(60) {
             let avg_ms = (self.timing_sum_ns / self.timing_count.max(1) as u128) as f64 / 1.0e6;
             let max_ms = self.timing_max_ns as f64 / 1.0e6;
             tprintln!(

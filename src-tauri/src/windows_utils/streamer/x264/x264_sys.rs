@@ -400,7 +400,7 @@ const LIB_NAMES: &[&str] = &["libx264-164.dll", "libx264.dll", "x264.dll"];
 
 fn open_library() -> Result<Library> {
     let mut last_err: Option<String> = None;
-    let mut attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
+    let attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
         Library::new(&candidate)
     } {
         Ok(lib) => Some(lib),

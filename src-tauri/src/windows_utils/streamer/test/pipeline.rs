@@ -46,6 +46,7 @@ fn scale_never_produces_zero_dims() {
 }
 
 #[test]
+#[allow(clippy::field_reassign_with_default)]
 fn encoder_config_tolerates_max_fps_below_60() {
     let mut cfg = Config::default();
     cfg.fps = None;

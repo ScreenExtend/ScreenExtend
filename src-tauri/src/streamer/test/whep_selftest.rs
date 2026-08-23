@@ -147,20 +147,15 @@ pub async fn run(mut config: Config) -> Result<()> {
             Box::pin(async move {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1600];
-                    loop {
-                        match track.read(&mut buf).await {
-                            Ok((pkt, _)) => {
-                                let n = rtp_count.fetch_add(1, Ordering::Relaxed) + 1;
-                                if n == 1 || n % 30 == 0 {
-                                    tprintln!(
-                                        "[selftest] RTP #{n} seq={} ts={} payload={}B",
-                                        pkt.header.sequence_number,
-                                        pkt.header.timestamp,
-                                        pkt.payload.len()
-                                    );
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok((pkt, _)) = track.read(&mut buf).await {
+                        let n = rtp_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n.is_multiple_of(30) {
+                            tprintln!(
+                                "[selftest] RTP #{n} seq={} ts={} payload={}B",
+                                pkt.header.sequence_number,
+                                pkt.header.timestamp,
+                                pkt.payload.len()
+                            );
                         }
                     }
                 });

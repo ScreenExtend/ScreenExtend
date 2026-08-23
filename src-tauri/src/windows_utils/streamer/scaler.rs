@@ -194,9 +194,11 @@ impl Scaler {
         in_view: ID3D11VideoProcessorInputView,
         out_view: &ID3D11VideoProcessorOutputView,
     ) -> Result<()> {
-        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
-        stream.Enable = true.into();
-        stream.pInputSurface = core::mem::ManuallyDrop::new(Some(in_view));
+        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: true.into(),
+            pInputSurface: core::mem::ManuallyDrop::new(Some(in_view)),
+            ..Default::default()
+        };
 
         let result = unsafe {
             self.video_ctx.VideoProcessorBlt(
