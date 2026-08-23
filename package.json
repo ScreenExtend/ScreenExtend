@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "lint": "eslint .",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -38,7 +39,6 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "embla-carousel-react": "8.5.2",
-    "flowbite-react": "^0.10.2",
     "formik": "^2.4.6",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.475.0",
@@ -60,8 +60,8 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.2.7",
     "@types/node": "^22.13.4",
-    "@types/react": "^19.0.8",
-    "@types/react-dom": "^19.0.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
     "@typescript-eslint/eslint-plugin": "^8.24.0",
     "@typescript-eslint/parser": "^8.24.0",
     "@vitejs/plugin-react": "^4.3.4",
@@ -79,6 +79,22 @@
       "core-js-pure",
       "esbuild",
       "sharp"
-    ]
+    ],
+    "overrides": {
+      "react-router": "^7.14.1",
+      "postcss": ">=8.5.23",
+      "minimatch@9": ">=9.0.7",
+      "brace-expansion@2": ">=2.1.4",
+      "picomatch": ">=4.0.4",
+      "glob@10": ">=10.5.0",
+      "yaml@2": ">=2.8.3"
+    },
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-r5fr-rjxr-66jc",
+        "GHSA-f23m-r3pf-42rh",
+        "GHSA-xxjr-mmjv-4gpg"
+      ]
+    }
   }
 }
