@@ -6,6 +6,19 @@ use axum_server::tls_rustls::RustlsConfig;
 const DEV_CERT_FILE: &str = "self-signed-cert.pem";
 const DEV_KEY_FILE: &str = "self-signed-key.pem";
 
+fn dev_cert_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    };
+    base.map(|b| b.join("ScreenExtend"))
+}
+
 pub struct TlsMaterial {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
@@ -50,8 +63,15 @@ pub async fn rustls_config(material: &TlsMaterial) -> Result<RustlsConfig> {
 }
 
 fn generate_or_load_dev_cert(extra_sans: &[String]) -> Result<TlsMaterial> {
-    let cert_file = PathBuf::from(DEV_CERT_FILE);
-    let key_file = PathBuf::from(DEV_KEY_FILE);
+    let dir = dev_cert_dir();
+    let (cert_file, key_file) = match &dir {
+        Some(d) => (d.join(DEV_CERT_FILE), d.join(DEV_KEY_FILE)),
+        None => (PathBuf::from(DEV_CERT_FILE), PathBuf::from(DEV_KEY_FILE)),
+    };
+
+    if dir.is_some() {
+        migrate_stray_cwd_cert();
+    }
 
     if cert_file.exists() && key_file.exists() {
         if let (Ok(cert_pem), Ok(key_pem)) = (std::fs::read(&cert_file), std::fs::read(&key_file)) {
@@ -100,10 +120,43 @@ fn cache_dev_cert(
     key_file: &Path,
     key_pem: &[u8],
 ) -> Result<()> {
+    if let Some(parent) = key_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating cert dir {}", parent.display()))?;
+        }
+    }
     std::fs::write(cert_file, cert_pem)
         .with_context(|| format!("writing {}", cert_file.display()))?;
-    std::fs::write(key_file, key_pem).with_context(|| format!("writing {}", key_file.display()))?;
+    write_private_file(key_file, key_pem)
+        .with_context(|| format!("writing {}", key_file.display()))?;
     Ok(())
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn migrate_stray_cwd_cert() {
+    for name in [DEV_CERT_FILE, DEV_KEY_FILE] {
+        let stray = PathBuf::from(name);
+        if stray.exists() {
+            match std::fs::remove_file(&stray) {
+                Ok(()) => tprintln!(
+                    "TLS: removed stray dev cert file '{name}' from the working directory; \
+                     it now lives in the app data dir"
+                ),
+                Err(e) => teprintln!("TLS: could not remove stray '{name}' from working dir: {e}"),
+            }
+        }
+    }
 }
 
 fn subject_alt_names(extra_sans: &[String]) -> Vec<String> {
