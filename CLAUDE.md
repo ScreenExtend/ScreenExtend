@@ -32,9 +32,10 @@ pnpm build                       # tsc + vite build (type-check + web bundle onl
 
 Rust code lives in `src-tauri/`; run `cargo` commands from there (`cargo check`, `cargo build`, `cargo test`).
 
-There is **no lint script and no ESLint config file** despite ESLint devDependencies being
-installed — do not assume `pnpm lint` exists. TypeScript strictness is enforced via `tsc`
-in `pnpm build`.
+Linting is wired up: `pnpm lint` runs ESLint 9 (flat config in `eslint.config.js`, scoped to
+`src/`) with `react-hooks` (rules-of-hooks as an error), `react-refresh`, and
+`typescript-eslint`. It currently passes with a handful of non-blocking warnings. TypeScript
+strictness is additionally enforced via `tsc` in `pnpm build`. CI runs both.
 
 ### Host CLI subcommands (shipped binary)
 
@@ -113,6 +114,12 @@ Cross-platform core, OS-independent:
 - `session.rs` — per-client session state (keyed by client IP), device overrides, OTP
   limiter, disconnect grace. Settings changes apply live via **epoch bumps**
   (`bump_reconfig_epoch`, `bump_kick_epoch`) rather than tearing down the display.
+  **Device trust** (auto-join approval + bans) is keyed on a per-device **token**
+  (`mint_device_token`, `Shared{Approved,Banned}Devices`, `is_device_*`), *not* the IP —
+  the host mints the token on a successful OTP join and returns it via the `X-Device-Token`
+  header; the client stores it and presents it on rejoin. The IP is only a display hint. The
+  `OtpLimiter` also has a global cross-key brute-force guard (defeats the cloud relay's
+  rotating-`client_id` bypass).
 - `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers.
 - `pipeline.rs` — capture → encode → RTP feed.
 - `tls.rs` — self-signed cert generation at runtime (`rcgen`).
@@ -154,12 +161,15 @@ initializes the virtual display and populates `AppState`.
 - The version string is duplicated in **four** places and must be kept in sync:
   `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and the hardcoded
   `current_version()` in `src-tauri/src/lib.rs`.
-- **Release CI** (`.github/workflows/build-release.yml`) triggers on push to `main`
-  **only when the commit message footer ends with `rebuild`** (or via manual
-  `workflow_dispatch`). It builds Windows (x64) + macOS (Intel + Apple Silicon) via
-  `tauri-action`, drafts a GitHub Release, strips the version from asset filenames, then
-  marks it latest. (The README's mention of a `release` branch / `build-windows.yml` is
-  stale — trust the workflow file.)
+- **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
+  frontend build + `pnpm lint`, a Windows + macOS Rust matrix (`cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test`), and `pnpm audit`/`cargo audit`
+  plus a vendored-binary checksum check.
+- **Release CI** (`.github/workflows/build-release.yml`) triggers on pushing a tag matching
+  `app-v*` (or manual `workflow_dispatch`) — **not** on push to `main` (the old "commit
+  footer ends with `rebuild`" gate was replaced so a typo can't silently skip a release). It
+  builds Windows (x64) + macOS (Intel + Apple Silicon) via `tauri-action`, drafts a GitHub
+  Release, strips the version from asset filenames, then marks it latest.
 - Auto-update: `tauri-plugin-updater` reads `latest.json` from GitHub Releases (pubkey in
   `tauri.conf.json`).
 
