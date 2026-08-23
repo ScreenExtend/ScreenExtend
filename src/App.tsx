@@ -148,12 +148,13 @@ function App() {
           return next;
         });
         void recordKnownDevice({
+          token: device.token,
           ip: device.ip,
           name: device.name,
           os: device.os,
           screenSize: device.screenSize,
         });
-        void commands.setDeviceApproved(device.ip, true);
+        void commands.setDeviceApproved(device.token, true);
         void notifyIfUnfocused(
           t("notifications.deviceJoin.title"),
           t("notifications.deviceJoin.body", { name: device.name || device.ip }),
@@ -193,18 +194,36 @@ function App() {
         const cfg = await getConfig();
         setQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
       }));
+      unlisteners.push(await events.joinAttemptsPaused.listen(event => {
+        const seconds = (event.payload as { retryAfterSecs: number }).retryAfterSecs;
+        toast({
+          variant: "destructive",
+          title: t("toasts.joinAttemptsPaused.title"),
+          description: t("toasts.joinAttemptsPaused.description", { seconds }),
+        });
+      }));
     }
     void start_listener();
     return () => unlisteners.forEach(unlisten => unlisten());
   }, []);
 
-  void appWindow.onCloseRequested(async () => {
-    setClosing(true);
-    if (loaded) {
-      await commands.stopHostedNetwork();
-    }
-    await commands.exitApp();
-  });
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void appWindow.onCloseRequested(async () => {
+      setClosing(true);
+      try {
+        if (loaded) await commands.stopHostedNetwork();
+      } catch (e) {
+        console.error("stopHostedNetwork on close failed", e);
+      }
+      try {
+        await commands.exitApp();
+      } catch (e) {
+        console.error("exitApp failed", e);
+      }
+    }).then(un => { unlisten = un; });
+    return () => unlisten?.();
+  }, [loaded]);
 
   const markWalkthroughDone = async () => {
     await updateConfig({ walkthroughCompleted: true });

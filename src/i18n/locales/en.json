@@ -17,6 +17,10 @@
       "title": "Network Created Without Password",
       "description": "The secured network couldn't be started, so it was created as an open network with no password. Anyone nearby can connect to it."
     },
+    "joinAttemptsPaused": {
+      "title": "Join Attempts Paused",
+      "description": "Too many incorrect codes were entered from different devices — someone may be guessing your code. New joins are paused for {seconds} seconds."
+    },
     "displaySettingsUnavailable": {
       "title": "Unable to Open Display Settings",
       "description": "Please adjust your display settings manually."

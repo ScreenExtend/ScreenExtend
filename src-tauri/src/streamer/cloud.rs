@@ -89,13 +89,13 @@ impl IceServerWire {
             urls: self.urls,
             username: self.username,
             credential: self.credential,
-            ..Default::default()
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum RelayToHost {
     Registered {
         #[serde(rename = "sessionId")]
@@ -333,7 +333,7 @@ async fn connect_and_serve(
         display_name: config.display_name.clone(),
         capabilities: HostCapabilities::default(),
     };
-    tx.send(Message::Text(serde_json::to_string(&register)?.into()))
+    tx.send(Message::Text(serde_json::to_string(&register)?))
         .map_err(|_| anyhow!("failed to queue register message"))?;
 
     let writer = tokio::spawn(async move {
@@ -432,7 +432,7 @@ fn handle_relay_message(
                 .await;
                 match serde_json::to_string(&resp) {
                     Ok(text) => {
-                        let _ = tx.send(Message::Text(text.into()));
+                        let _ = tx.send(Message::Text(text));
                     }
                     Err(e) => teprintln!("[cloud] failed to serialize signal_response: {e}"),
                 }
@@ -443,7 +443,7 @@ fn handle_relay_message(
         }
         RelayToHost::Ping { ts } => {
             if let Ok(text) = serde_json::to_string(&HostToRelay::Pong { ts }) {
-                let _ = tx.send(Message::Text(text.into()));
+                let _ = tx.send(Message::Text(text));
             }
         }
         RelayToHost::Shutdown { reason, .. } => {
@@ -465,7 +465,12 @@ async fn dispatch(
 ) -> HostToRelay {
     use crate::streamer::server;
 
-    let (status, content_type, out_body): (u16, &'static str, String) = match (method, path) {
+    let (status, content_type, out_body, device_token): (
+        u16,
+        &'static str,
+        String,
+        Option<String>,
+    ) = match (method, path) {
         ("POST", "/whep") => {
             let base: Vec<RTCIceServer> = if ice_servers.is_empty() {
                 state.fallback_ice_servers()
@@ -477,25 +482,29 @@ async fn dispatch(
             };
             let ice = state.ice_with_turn(base);
             let r = server::process_whep(state, client_id, body.as_bytes(), ice).await;
-            (r.status, r.content_type, r.body)
+            (r.status, r.content_type, r.body, r.device_token)
         }
         ("GET", "/reconfig") => (
             200,
             "application/json",
             server::process_reconfig(state, client_id),
+            None,
         ),
         ("POST", "/leave") => {
             server::process_leave(state, client_id);
-            (204, "text/plain", String::new())
+            (204, "text/plain", String::new(), None)
         }
         _ => {
             teprintln!("[cloud] unsupported tunneled request {method} {path}");
-            (404, "text/plain", "not found".to_string())
+            (404, "text/plain", "not found".to_string(), None)
         }
     };
 
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), content_type.to_string());
+    if let Some(token) = device_token {
+        headers.insert("x-device-token".to_string(), token);
+    }
     HostToRelay::SignalResponse {
         request_id,
         status,

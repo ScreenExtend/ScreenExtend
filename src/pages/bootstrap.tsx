@@ -16,7 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
-import { buildQrValues } from "@/lib/utils";
+import { buildQrValues, generateOtp } from "@/lib/utils";
 import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { check } from "@tauri-apps/plugin-updater";
@@ -99,10 +99,13 @@ export default function Bootstrap() {
         );
       }
       for (const known of existing?.knownDevices ?? []) {
+        const token = known.token ?? "";
         if (known.banned) {
-          await commands.setDeviceBanned(known.ip, true);
+          await commands.setDeviceBanned(token, known.ip, true);
+        } else if (token) {
+          await commands.setDeviceApproved(token, true);
         } else {
-          await commands.setDeviceApproved(known.ip, true);
+          console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
         }
       }
       const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
@@ -110,7 +113,7 @@ export default function Bootstrap() {
 
       await commands.watchForNetworkChanges();
       const newSessionId = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'[b % 32]).join('');
-      const newOtp = [...Array(6)].reduce(a => a + "0123456789"[~~(Math.random() * "0123456789".length)], "");
+      const newOtp = generateOtp();
       setSessionId(newSessionId);
       setOtp(newOtp);
       await commands.setSessionCredentials(newSessionId, newOtp);

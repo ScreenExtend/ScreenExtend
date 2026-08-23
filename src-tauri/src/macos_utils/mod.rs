@@ -10,9 +10,9 @@ use crate::streamer::cloud::{
     CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
 };
 use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedApprovedIps, SharedBannedIps, SharedDeviceOverrides,
-    SharedDeviceReporter, SharedServerPorts, SharedSessions, SharedTurnConfig, SharedVirtualDisplay,
-    UserTurnConfig,
+    self, DeviceOverride, SessionAuth, SharedApprovedDevices, SharedBannedDevices,
+    SharedDeviceOverrides, SharedDeviceReporter, SharedOtpLimiter, SharedServerPorts,
+    SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
 use device_reporter::TauriDeviceReporter;
@@ -42,8 +42,9 @@ pub struct AppState {
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
-    pub banned_ips: SharedBannedIps,
-    pub approved_ips: SharedApprovedIps,
+    pub banned_devices: SharedBannedDevices,
+    pub approved_devices: SharedApprovedDevices,
+    pub otp_limiter: SharedOtpLimiter,
     pub server_ports: SharedServerPorts,
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
@@ -140,8 +141,9 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
-        banned_ips: session::new_shared_banned_ips(),
-        approved_ips: session::new_shared_approved_ips(),
+        banned_devices: session::new_shared_banned_devices(),
+        approved_devices: session::new_shared_approved_devices(),
+        otp_limiter: session::new_shared_otp_limiter(),
         server_ports: session::new_shared_server_ports(),
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
@@ -192,27 +194,37 @@ pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_banned(state: State<'_, AppState>, ip: String, banned: bool) {
+pub fn set_device_banned(state: State<'_, AppState>, token: String, ip: String, banned: bool) {
+    let key = if token.trim().is_empty() {
+        ip.clone()
+    } else {
+        token
+    };
     if banned {
-        state.banned_ips.lock().unwrap().insert(ip.clone());
-        session::bump_kick_epoch(&state.sessions, &ip);
-        session::signal_leave(&state.sessions, &ip);
+        state.banned_devices.lock().unwrap().insert(key);
+        if !ip.is_empty() {
+            session::bump_kick_epoch(&state.sessions, &ip);
+            session::signal_leave(&state.sessions, &ip);
+        }
         tprintln!("device {ip} banned; existing session (if any) kicked");
     } else {
-        state.banned_ips.lock().unwrap().remove(&ip);
+        state.banned_devices.lock().unwrap().remove(&key);
         tprintln!("device {ip} unbanned");
     }
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_approved(state: State<'_, AppState>, ip: String, approved: bool) {
+pub fn set_device_approved(state: State<'_, AppState>, token: String, approved: bool) {
+    if token.trim().is_empty() {
+        return;
+    }
     if approved {
-        state.approved_ips.lock().unwrap().insert(ip.clone());
-        tprintln!("device {ip} approved for auto-join");
+        state.approved_devices.lock().unwrap().insert(token);
+        tprintln!("device token approved for auto-join");
     } else {
-        state.approved_ips.lock().unwrap().remove(&ip);
-        tprintln!("device {ip} auto-join approval revoked");
+        state.approved_devices.lock().unwrap().remove(&token);
+        tprintln!("device token auto-join approval revoked");
     }
 }
 
@@ -380,6 +392,7 @@ pub fn remove_all_displays(client: &SharedVirtualDisplay) {
 pub fn set_session_credentials(state: State<'_, AppState>, session_id: String, otp: String) {
     *state.session_auth.session_id.lock().unwrap() = session_id;
     *state.session_auth.otp.lock().unwrap() = otp;
+    state.otp_limiter.reset();
 }
 
 #[tauri::command]
@@ -397,8 +410,9 @@ pub fn register_cloud_session(
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
-        banned_ips: Some(state.banned_ips.clone()),
-        approved_ips: Some(state.approved_ips.clone()),
+        banned_devices: Some(state.banned_devices.clone()),
+        approved_devices: Some(state.approved_devices.clone()),
+        otp_limiter: Some(state.otp_limiter.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -486,8 +500,9 @@ pub fn sync_streamers(state: &AppState) {
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
-            banned_ips: Some(state.banned_ips.clone()),
-            approved_ips: Some(state.approved_ips.clone()),
+            banned_devices: Some(state.banned_devices.clone()),
+            approved_devices: Some(state.approved_devices.clone()),
+            otp_limiter: Some(state.otp_limiter.clone()),
             ..Config::default()
         };
 

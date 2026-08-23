@@ -47,7 +47,7 @@ import { LogTerminal } from "@/components/log-terminal";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands } from "@/lib/bindings";
-import { cn, buildQrValues, buildWifiQrValue } from "@/lib/utils";
+import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
 import { type as getOsType } from "@tauri-apps/plugin-os";
@@ -171,10 +171,12 @@ export default function Settings() {
 
   const isConnected = (ip: string) => connectedDevices.some(d => d.ip === ip);
 
-  const applyBan = async (ip: string, banned: boolean) => {
-    await commands.setDeviceBanned(ip, banned);
-    await commands.setDeviceApproved(ip, !banned);
-    await setKnownDeviceBanned(ip, banned);
+  const applyBan = async (device: { token?: string; ip: string }, banned: boolean) => {
+    const token = device.token ?? "";
+    const ip = device.ip;
+    await commands.setDeviceBanned(token, ip, banned);
+    await commands.setDeviceApproved(token, !banned);
+    await setKnownDeviceBanned(token, ip, banned);
     setKnownDevices(await getKnownDevices());
     toast({
       title: banned ? t("toasts.deviceBan.bannedTitle") : t("toasts.deviceBan.unbannedTitle"),
@@ -194,13 +196,14 @@ export default function Settings() {
       return;
     }
     setBanIpInput("");
-    await applyBan(ip, true);
+    await applyBan({ ip, token: "" }, true);
   };
 
-  const forgetDevice = async (ip: string) => {
-    await commands.setDeviceBanned(ip, false);
-    await commands.setDeviceApproved(ip, false);
-    await removeKnownDevice(ip);
+  const forgetDevice = async (device: { token?: string; ip: string }) => {
+    const token = device.token ?? "";
+    await commands.setDeviceBanned(token, device.ip, false);
+    await commands.setDeviceApproved(token, false);
+    await removeKnownDevice(token, device.ip);
     setKnownDevices(await getKnownDevices());
     toast({
       title: t("toasts.device.removedTitle"),
@@ -334,7 +337,7 @@ export default function Settings() {
     if (spin) {
       const timer = setTimeout(() => {
         setSpin(false);
-        setOtp([...Array(6)].reduce(a=>a+"0123456789"[~~(Math.random()*"0123456789".length)], ""));
+        setOtp(generateOtp());
       }, 500);
       return () => clearTimeout(timer);
     }
@@ -758,7 +761,7 @@ export default function Settings() {
                               variant="outline"
                               size="sm"
                               className={device.banned ? "" : "text-red-600 hover:text-red-700"}
-                              onClick={() => void applyBan(device.ip, !device.banned)}
+                              onClick={() => void applyBan(device, !device.banned)}
                             >
                               {device.banned ? "Unban" : "Ban"}
                             </Button>
@@ -767,7 +770,7 @@ export default function Settings() {
                               size="icon"
                               aria-label="Forget device"
                               title="Forget device"
-                              onClick={() => void forgetDevice(device.ip)}
+                              onClick={() => void forgetDevice(device)}
                             >
                               <Trash2 className="h-4 w-4 text-muted-foreground" />
                             </Button>
@@ -1106,7 +1109,7 @@ export default function Settings() {
                 setDisabled(true);
                 await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editNetwork: dontShowAgain}});
                 setHostedNetworkName(oldHostedNetworkName);
-                setHostedNetworkPassword(oldHostedNetworkName);
+                setHostedNetworkPassword(oldHostedNetworkPassword);
                 setHostedNetworkModalOpen(false);
               }}
               disabled={disabled}
