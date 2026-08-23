@@ -214,7 +214,8 @@ pub fn probe_screen_recording() -> bool {
     let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
         DispatchQoS::UserInteractive,
     ));
-    let queue = DispatchQueue::new_with_target("com.screenextend.tcc-probe", None, Some(&ui_target));
+    let queue =
+        DispatchQueue::new_with_target("com.screenextend.tcc-probe", None, Some(&ui_target));
 
     let (tx, rx) = mpsc::channel::<()>();
     let handler: FrameHandler = RcBlock::new(

@@ -3,7 +3,6 @@ mod driver_client;
 
 use std::sync::LazyLock;
 
-pub use client::{Client, EventsSubscription};
 pub use driver_client::DriverClient;
 
 use tokio::runtime::{Builder, Runtime};

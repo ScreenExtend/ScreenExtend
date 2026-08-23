@@ -37,7 +37,7 @@ impl X264Encoder {
 
         let width = config.width as usize;
         let height = config.height as usize;
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("x264: invalid dimensions {width}x{height} (need even, non-zero)");
         }
 

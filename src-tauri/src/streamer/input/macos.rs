@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use objc2_core_foundation::CGPoint;
 
-use super::protocol::{btn, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH};
+use super::protocol::{
+    btn, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
+};
 use super::DisplayRect;
 
 pub const NAME: &str = "macos-cgevent";
@@ -36,7 +38,11 @@ unsafe extern "C" {
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
-    fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, unicode_string: *const u16);
+    fn CGEventKeyboardSetUnicodeString(
+        event: CGEventRef,
+        length: usize,
+        unicode_string: *const u16,
+    );
     fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CFRelease(cf: *const c_void);
@@ -410,23 +416,43 @@ impl Injector {
         let changed = old ^ new;
         let down = |bit: u16| new & bit != 0;
         if changed & btn::PRIMARY != 0 {
-            let t = if down(btn::PRIMARY) { ET_LEFT_DOWN } else { ET_LEFT_UP };
+            let t = if down(btn::PRIMARY) {
+                ET_LEFT_DOWN
+            } else {
+                ET_LEFT_UP
+            };
             self.post_mouse(t, pos, MB_LEFT, 0, 0);
         }
         if changed & btn::SECONDARY != 0 {
-            let t = if down(btn::SECONDARY) { ET_RIGHT_DOWN } else { ET_RIGHT_UP };
+            let t = if down(btn::SECONDARY) {
+                ET_RIGHT_DOWN
+            } else {
+                ET_RIGHT_UP
+            };
             self.post_mouse(t, pos, MB_RIGHT, 0, 0);
         }
         if changed & btn::AUXILIARY != 0 {
-            let t = if down(btn::AUXILIARY) { ET_OTHER_DOWN } else { ET_OTHER_UP };
+            let t = if down(btn::AUXILIARY) {
+                ET_OTHER_DOWN
+            } else {
+                ET_OTHER_UP
+            };
             self.post_mouse(t, pos, MB_CENTER, 0, 0);
         }
         if changed & btn::BACK != 0 {
-            let t = if down(btn::BACK) { ET_OTHER_DOWN } else { ET_OTHER_UP };
+            let t = if down(btn::BACK) {
+                ET_OTHER_DOWN
+            } else {
+                ET_OTHER_UP
+            };
             self.post_mouse(t, pos, MB_X1, 0, 0);
         }
         if changed & btn::FORWARD != 0 {
-            let t = if down(btn::FORWARD) { ET_OTHER_DOWN } else { ET_OTHER_UP };
+            let t = if down(btn::FORWARD) {
+                ET_OTHER_DOWN
+            } else {
+                ET_OTHER_UP
+            };
             self.post_mouse(t, pos, MB_X2, 0, 0);
         }
     }

@@ -169,7 +169,7 @@ mod desktop {
 
     use crate::single_instance;
     use crate::streamer::session::{
-        DEFAULT_DISCONNECT_GRACE_SECS, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT,
+        DEFAULT_DISCONNECT_GRACE_SECS, DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT,
     };
 
     #[cfg(target_os = "windows")]
@@ -204,7 +204,7 @@ mod desktop {
         arg_flag(m, "json")
     }
 
-    fn sub<'a>(m: &'a Matches) -> Option<(&'a str, &'a Matches)> {
+    fn sub(m: &Matches) -> Option<(&str, &Matches)> {
         m.subcommand
             .as_deref()
             .map(|s| (s.name.as_str(), &s.matches))
@@ -237,7 +237,9 @@ mod desktop {
     fn set_nested(store: &Cfg, key: &str, value: Value) {
         match key.split_once('.') {
             Some((head, rest)) => {
-                let mut root = store.get(head).unwrap_or_else(|| Value::Object(Default::default()));
+                let mut root = store
+                    .get(head)
+                    .unwrap_or_else(|| Value::Object(Default::default()));
                 if !root.is_object() {
                     root = Value::Object(Default::default());
                 }
@@ -410,15 +412,28 @@ mod desktop {
 
         let store = app.store(CONFIG_STORE).ok();
         let http = arg_u16(m, "http-port")
-            .or_else(|| store.as_deref().and_then(|s| cfg_u64(s, "serverPorts.http")).map(|n| n as u16))
+            .or_else(|| {
+                store
+                    .as_deref()
+                    .and_then(|s| cfg_u64(s, "serverPorts.http"))
+                    .map(|n| n as u16)
+            })
             .unwrap_or(DEFAULT_HTTP_PORT);
         let https = arg_u16(m, "https-port")
-            .or_else(|| store.as_deref().and_then(|s| cfg_u64(s, "serverPorts.https")).map(|n| n as u16))
+            .or_else(|| {
+                store
+                    .as_deref()
+                    .and_then(|s| cfg_u64(s, "serverPorts.https"))
+                    .map(|n| n as u16)
+            })
             .unwrap_or(DEFAULT_HTTPS_PORT);
         state.server_ports.set(http, https);
 
         let software = arg_flag(m, "software-encode")
-            || store.as_deref().and_then(|s| cfg_bool(s, "disableGpuEncode")).unwrap_or(false);
+            || store
+                .as_deref()
+                .and_then(|s| cfg_bool(s, "disableGpuEncode"))
+                .unwrap_or(false);
         if software {
             state
                 .disable_gpu_encode
@@ -435,7 +450,8 @@ mod desktop {
                     cfg_str(store, "turnConfig.credential").unwrap_or_default(),
                 );
             }
-            let grace = cfg_u64(store, "disconnectGraceSecs").unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS);
+            let grace =
+                cfg_u64(store, "disconnectGraceSecs").unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS);
             platform::set_disconnect_grace(app.state(), grace as u32);
             apply_saved_devices(app, store);
         }
@@ -447,7 +463,10 @@ mod desktop {
         platform::networking::watch_for_network_changes(app.clone());
 
         let cloud = !arg_flag(m, "no-cloud")
-            && store.as_deref().and_then(|s| cfg_bool(s, "publicSessionsEnabled")).unwrap_or(true);
+            && store
+                .as_deref()
+                .and_then(|s| cfg_bool(s, "publicSessionsEnabled"))
+                .unwrap_or(true);
         if cloud {
             platform::register_cloud_session(app.clone(), app.state(), session_id.clone());
         }
@@ -482,7 +501,11 @@ mod desktop {
                 continue;
             };
             let num = |key: &str, default: u32| {
-                device.get(key).and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(default)
+                device
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+                    .unwrap_or(default)
             };
             let orientation = device
                 .get("orientation")
@@ -523,13 +546,7 @@ mod desktop {
         });
     }
 
-    fn print_serve_banner(
-        http_port: u16,
-        session_id: &str,
-        otp: &str,
-        cloud: bool,
-        qr: bool,
-    ) {
+    fn print_serve_banner(http_port: u16, session_id: &str, otp: &str, cloud: bool, qr: bool) {
         println!("\n──────────────────────────────────────────");
         println!("Session:  {session_id}");
         println!("OTP:      {otp}");
@@ -584,13 +601,20 @@ mod desktop {
         }
 
         println!("ScreenExtend {}", env!("CARGO_PKG_VERSION"));
-        println!("  Host running:      {}", if running { "yes" } else { "no" });
+        println!(
+            "  Host running:      {}",
+            if running { "yes" } else { "no" }
+        );
         if let Some(name) = cfg_str(&store, "name") {
             println!("  Account name:      {name}");
         }
         println!(
             "  Public sessions:   {}",
-            if cfg_bool(&store, "publicSessionsEnabled").unwrap_or(true) { "enabled" } else { "disabled" }
+            if cfg_bool(&store, "publicSessionsEnabled").unwrap_or(true) {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
         println!(
             "  Server ports:      http {http}, https {}",
@@ -599,7 +623,11 @@ mod desktop {
         let turn = cfg_str(&store, "turnConfig.urls").unwrap_or_default();
         println!(
             "  TURN relay:        {}",
-            if turn.is_empty() { "not configured".to_string() } else { turn }
+            if turn.is_empty() {
+                "not configured".to_string()
+            } else {
+                turn
+            }
         );
         if let Some(hn) = cfg_str(&store, "hostedNetworkCredentials.name") {
             println!("  Hosted network:    {hn}");
@@ -640,7 +668,11 @@ mod desktop {
 
         let mut entries: Vec<(String, String)> = Vec::new();
         if target == "lan" || target == "all" {
-            entries.extend(lan_entries(&platform::networking::cli_adapters(), http, &session_id));
+            entries.extend(lan_entries(
+                &platform::networking::cli_adapters(),
+                http,
+                &session_id,
+            ));
         }
         if target == "cloud" || target == "all" {
             entries.push(("Anywhere (Internet)".to_string(), cloud_url(&session_id)));
@@ -684,7 +716,8 @@ mod desktop {
                     .as_deref()
                     .and_then(|s| cfg_bool(s, "publicSessionsEnabled"))
                     .unwrap_or(true);
-                let mut entries = lan_entries(&platform::networking::cli_adapters(), http, &session_id);
+                let mut entries =
+                    lan_entries(&platform::networking::cli_adapters(), http, &session_id);
                 if cloud {
                     entries.push(("Anywhere (Internet)".to_string(), cloud_url(&session_id)));
                 }
@@ -725,19 +758,27 @@ mod desktop {
         let store = open_store(app);
         match name {
             "list" => {
-                let devices = get_nested(&store, "devices").and_then(|v| match v {
-                    Value::Array(a) => Some(a),
-                    _ => None,
-                }).unwrap_or_default();
+                let devices = get_nested(&store, "devices")
+                    .and_then(|v| match v {
+                        Value::Array(a) => Some(a),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 if wants_json(sm) {
-                    println!("{}", serde_json::to_string_pretty(&Value::Array(devices)).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&Value::Array(devices)).unwrap()
+                    );
                     exit(0);
                 }
                 if devices.is_empty() {
                     println!("No saved device overrides.");
                     exit(0);
                 }
-                println!("{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8}", "IP", "SCALE", "ORIENT", "REFRESH", "VSCALE", "VQUAL", "CONTROL");
+                println!(
+                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8}",
+                    "IP", "SCALE", "ORIENT", "REFRESH", "VSCALE", "VQUAL", "CONTROL"
+                );
                 for d in &devices {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
                     let ip = s("ip").as_str().unwrap_or("").to_string();
@@ -749,7 +790,10 @@ mod desktop {
                     let control = s("remoteControl").as_bool().unwrap_or(true);
                     println!(
                         "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8}",
-                        scale, refresh, vscale, if control { "on" } else { "off" }
+                        scale,
+                        refresh,
+                        vscale,
+                        if control { "on" } else { "off" }
                     );
                 }
                 exit(0);
@@ -862,18 +906,31 @@ mod desktop {
             "wifi-qr" => {
                 let store = open_store(app);
                 let ssid = cfg_str(&store, "hostedNetworkCredentials.name").unwrap_or_default();
-                let password = cfg_str(&store, "hostedNetworkCredentials.password").unwrap_or_default();
+                let password =
+                    cfg_str(&store, "hostedNetworkCredentials.password").unwrap_or_default();
                 if ssid.is_empty() {
-                    eprintln!("No saved hosted-network name. Set one in the app or with `config set`.");
+                    eprintln!(
+                        "No saved hosted-network name. Set one in the app or with `config set`."
+                    );
                     exit(1);
                 }
                 let payload = wifi_qr_payload(&ssid, &password);
                 if wants_json(sm) {
-                    println!("{}", serde_json::json!({"ssid": ssid, "password": password, "qr": payload}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"ssid": ssid, "password": password, "qr": payload})
+                    );
                     exit(0);
                 }
                 println!("Network:  {ssid}");
-                println!("Password: {}", if password.is_empty() { "(open)" } else { &password });
+                println!(
+                    "Password: {}",
+                    if password.is_empty() {
+                        "(open)"
+                    } else {
+                        &password
+                    }
+                );
                 render_qr(&payload);
                 exit(0);
             }
@@ -894,7 +951,8 @@ mod desktop {
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
-                out.split("Status").any(|s| s.trim().starts_with(": Started"))
+                out.split("Status")
+                    .any(|s| s.trim().starts_with(": Started"))
             })
             .unwrap_or(false)
     }
@@ -940,7 +998,10 @@ mod desktop {
         if wants_json(m) {
             println!("{}", serde_json::json!({"started": started}));
         } else {
-            println!("Hosted network: {}", if started { "started" } else { "stopped" });
+            println!(
+                "Hosted network: {}",
+                if started { "started" } else { "stopped" }
+            );
         }
         exit(0);
     }
@@ -953,7 +1014,9 @@ mod desktop {
 
     #[cfg(not(windows))]
     fn network_stop() -> ! {
-        eprintln!("On macOS the hosted network stops when the host exits. Stop the app or `serve`.");
+        eprintln!(
+            "On macOS the hosted network stops when the host exits. Stop the app or `serve`."
+        );
         exit(1);
     }
 
@@ -986,7 +1049,10 @@ mod desktop {
                 let entries = store.entries();
                 if wants_json(sm) {
                     let map: serde_json::Map<String, Value> = entries.into_iter().collect();
-                    println!("{}", serde_json::to_string_pretty(&Value::Object(map)).unwrap());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&Value::Object(map)).unwrap()
+                    );
                 } else if entries.is_empty() {
                     println!("(config is empty — run the app once to create it)");
                 } else {
@@ -1024,7 +1090,10 @@ mod desktop {
                     eprintln!("error: failed to save config: {e}");
                     exit(1);
                 }
-                println!("set {key} = {}", get_nested(&store, &key).unwrap_or(Value::Null));
+                println!(
+                    "set {key} = {}",
+                    get_nested(&store, &key).unwrap_or(Value::Null)
+                );
                 exit(0);
             }
             other => {
@@ -1048,19 +1117,31 @@ mod desktop {
                 let username = cfg_str(&store, "turnConfig.username").unwrap_or_default();
                 let credential = cfg_str(&store, "turnConfig.credential").unwrap_or_default();
                 if wants_json(sm) {
-                    println!("{}", serde_json::json!({"urls": urls, "username": username, "credential": credential}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"urls": urls, "username": username, "credential": credential})
+                    );
                 } else if urls.is_empty() {
                     println!("TURN relay: not configured");
                 } else {
                     println!("URLs:       {urls}");
                     println!("Username:   {username}");
-                    println!("Credential: {}", if credential.is_empty() { "(none)" } else { "(set)" });
+                    println!(
+                        "Credential: {}",
+                        if credential.is_empty() {
+                            "(none)"
+                        } else {
+                            "(set)"
+                        }
+                    );
                 }
                 exit(0);
             }
             "set" => {
                 let Some(urls) = arg_str(sm, "urls") else {
-                    eprintln!("usage: ScreenExtend turn set <urls> [--username U] [--credential C]");
+                    eprintln!(
+                        "usage: ScreenExtend turn set <urls> [--username U] [--credential C]"
+                    );
                     exit(2);
                 };
                 let obj = serde_json::json!({
@@ -1077,7 +1158,10 @@ mod desktop {
                 exit(0);
             }
             "clear" => {
-                store.set("turnConfig", serde_json::json!({"urls": "", "username": "", "credential": ""}));
+                store.set(
+                    "turnConfig",
+                    serde_json::json!({"urls": "", "username": "", "credential": ""}),
+                );
                 if let Err(e) = store.save() {
                     eprintln!("error: failed to save config: {e}");
                     exit(1);
@@ -1213,7 +1297,10 @@ mod desktop {
             },
             "status" => {
                 let enabled = manager.is_enabled().unwrap_or(false);
-                println!("Launch at startup: {}", if enabled { "enabled" } else { "disabled" });
+                println!(
+                    "Launch at startup: {}",
+                    if enabled { "enabled" } else { "disabled" }
+                );
                 exit(0);
             }
             other => {
@@ -1271,9 +1358,15 @@ mod desktop {
             exit(0);
         }
 
-        println!("Operating system: {} — {}", report.os_name, report.os_version);
+        println!(
+            "Operating system: {} — {}",
+            report.os_name, report.os_version
+        );
         println!("Minimum required: {}", report.min_os_version);
-        println!("Supported:        {}", if report.os_supported { "yes" } else { "NO" });
+        println!(
+            "Supported:        {}",
+            if report.os_supported { "yes" } else { "NO" }
+        );
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {

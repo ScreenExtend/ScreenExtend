@@ -141,13 +141,12 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
         Ok(com) => com,
         Err(_) => return Vec::new(),
     };
-    let wmi_con =
-        match WMIConnection::with_namespace_path("root\\StandardCimv2", unsafe {
-            COMLibrary::assume_initialized()
-        }) {
-            Ok(connection) => connection,
-            Err(_) => return Vec::new(),
-        };
+    let wmi_con = match WMIConnection::with_namespace_path("root\\StandardCimv2", unsafe {
+        COMLibrary::assume_initialized()
+    }) {
+        Ok(connection) => connection,
+        Err(_) => return Vec::new(),
+    };
 
     let adapter_query = "SELECT * FROM MSFT_NetAdapter\nWHERE EndPointInterface = False\nAND (NdisPhysicalMedium = 1 OR NdisPhysicalMedium = 9 OR NdisPhysicalMedium = 14)\nAND OperationalStatusDownMediaDisconnected = False";
     let adapters: Vec<NetAdapter> = match wmi_con.raw_query(adapter_query) {

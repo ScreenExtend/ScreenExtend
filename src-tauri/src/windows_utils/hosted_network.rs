@@ -112,9 +112,10 @@ pub fn turn_on_wifi() -> bool {
             any_on = true;
             continue;
         }
-        match radio.SetStateAsync(RadioState::On).and_then(|op| op.join()) {
-            Ok(RadioAccessStatus::Allowed) => any_on = true,
-            _ => {}
+        if let Ok(RadioAccessStatus::Allowed) =
+            radio.SetStateAsync(RadioState::On).and_then(|op| op.join())
+        {
+            any_on = true
         }
     }
     any_on
@@ -124,11 +125,11 @@ fn supports_legacy_hosted_network_(app: AppHandle) -> bool {
     let output = tauri::async_runtime::block_on(async {
         app.shell()
             .command("netsh")
-            .args(&["wlan", "show", "drivers"])
+            .args(["wlan", "show", "drivers"])
             .output()
             .await
     });
-    output.map_or(false, |output| {
+    output.is_ok_and(|output| {
         String::from_utf8_lossy(&output.stdout).contains("Hosted network supported")
             && String::from_utf8_lossy(&output.stdout)
                 .split("Hosted network supported")
@@ -159,11 +160,11 @@ pub fn start_hosted_network(
         let output = tauri::async_runtime::block_on(async {
             app.shell()
                 .command("netsh")
-                .args(&["wlan", "show", "hostednetwork"])
+                .args(["wlan", "show", "hostednetwork"])
                 .output()
                 .await
         });
-        to_return = output.map_or(false, |output| {
+        to_return = output.is_ok_and(|output| {
             String::from_utf8_lossy(&output.stdout).contains("Status")
                 && String::from_utf8_lossy(&output.stdout)
                     .split("Status")
@@ -186,15 +187,10 @@ pub fn start_hosted_network(
         let mut stop_func = state.stop_hosted_network.lock().unwrap();
         *stop_func = Some(Box::new(move || {
             let publisher = wlan_hosted_network_helper.lock().unwrap();
-            match publisher.Status() {
-                Ok(status) => {
-                    if status == WiFiDirectAdvertisementPublisherStatus::Started {
-                        match publisher.Stop() {
-                            _ => (),
-                        }
-                    }
+            if let Ok(status) = publisher.Status() {
+                if status == WiFiDirectAdvertisementPublisherStatus::Started {
+                    let _ = publisher.Stop();
                 }
-                _ => (),
             };
         }));
         to_return = true;
@@ -212,7 +208,7 @@ pub fn stop_hosted_network(app: AppHandle, state: State<'_, AppState>) -> bool {
         let status = tauri::async_runtime::block_on(async {
             app.shell()
                 .command("netsh")
-                .args(&["wlan", "stop", "hostednetwork"])
+                .args(["wlan", "stop", "hostednetwork"])
                 .status()
                 .await
                 .unwrap()
@@ -238,11 +234,11 @@ pub fn is_hosted_network(app: AppHandle, state: State<'_, AppState>) -> bool {
         let output = tauri::async_runtime::block_on(async {
             app.shell()
                 .command("netsh")
-                .args(&["wlan", "show", "hostednetwork"])
+                .args(["wlan", "show", "hostednetwork"])
                 .output()
                 .await
         });
-        output.map_or(false, |output| {
+        output.is_ok_and(|output| {
             String::from_utf8_lossy(&output.stdout).contains("Status")
                 && String::from_utf8_lossy(&output.stdout)
                     .split("Status")

@@ -81,7 +81,10 @@ fn cg_bool_fn(name: &str) -> Option<unsafe extern "C" fn() -> bool> {
         if p.is_null() {
             None
         } else {
-            Some(std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> bool>(p))
+            Some(std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn() -> bool,
+            >(p))
         }
     }
 }

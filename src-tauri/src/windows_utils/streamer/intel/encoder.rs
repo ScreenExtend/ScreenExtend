@@ -41,7 +41,7 @@ enum SurfaceKind {
 
 #[inline]
 fn align_up_u16(v: u32, a: u32) -> u16 {
-    (((v + a - 1) / a) * a) as u16
+    (v.div_ceil(a) * a) as u16
 }
 
 struct InputBridge {
@@ -208,7 +208,7 @@ impl Encoder {
         let (src_w, src_h) = (native_w.max(config.width), native_h.max(config.height));
 
         let creation_flags = unsafe { device.GetCreationFlags() };
-        let capture_has_video = creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 as u32 != 0;
+        let capture_has_video = creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 != 0;
         let (enc_device, enc_context, bridge) = if capture_has_video {
             (device.clone(), context.clone(), None)
         } else {

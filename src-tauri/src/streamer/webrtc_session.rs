@@ -350,21 +350,16 @@ pub async fn handle_whep_offer(
             use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
             use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
             let mut rtcp_buf = vec![0u8; 1500];
-            loop {
-                match rtp_sender.read(&mut rtcp_buf).await {
-                    Ok((packets, _attrs)) => {
-                        for p in &packets {
-                            let any = p.as_any();
-                            if any.downcast_ref::<PictureLossIndication>().is_some() {
-                                tprintln!("RTCP PLI received, requesting IDR");
-                                pipeline.request_idr();
-                            } else if any.downcast_ref::<FullIntraRequest>().is_some() {
-                                tprintln!("RTCP FIR received, requesting IDR");
-                                pipeline.request_idr();
-                            }
-                        }
+            while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
+                for p in &packets {
+                    let any = p.as_any();
+                    if any.downcast_ref::<PictureLossIndication>().is_some() {
+                        tprintln!("RTCP PLI received, requesting IDR");
+                        pipeline.request_idr();
+                    } else if any.downcast_ref::<FullIntraRequest>().is_some() {
+                        tprintln!("RTCP FIR received, requesting IDR");
+                        pipeline.request_idr();
                     }
-                    Err(_) => break,
                 }
             }
         });

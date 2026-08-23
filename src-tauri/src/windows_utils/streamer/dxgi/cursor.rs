@@ -290,8 +290,8 @@ pub fn build_sprite(
 
     if info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32 {
         let h = info.Height / 2;
-        let mut and_px = vec![0u32; (w * h) as usize];
-        let mut xor_px = vec![0u32; (w * h) as usize];
+        let mut and_px = vec![0u32; w as usize * h as usize];
+        let mut xor_px = vec![0u32; w as usize * h as usize];
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let bit = |row: usize| -> u32 {
@@ -338,8 +338,8 @@ pub fn build_sprite(
     };
 
     if info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 as u32 {
-        let mut base_px = vec![0u32; (w * h) as usize];
-        let mut xor_px = vec![0u32; (w * h) as usize];
+        let mut base_px = vec![0u32; w as usize * h as usize];
+        let mut xor_px = vec![0u32; w as usize * h as usize];
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let [b, g, r, mask] = px_at(x, y);
@@ -369,7 +369,7 @@ pub fn build_sprite(
         bail!("unknown pointer shape type {}", info.Type);
     }
 
-    let mut px = vec![0u32; (w * h) as usize];
+    let mut px = vec![0u32; w as usize * h as usize];
     for y in 0..h as usize {
         for x in 0..w as usize {
             let [b, g, r, a] = px_at(x, y);
