@@ -200,12 +200,18 @@ pub fn set_display_mode(
     devmode.Anonymous1.Anonymous2.dmDisplayOrientation = DMDO_DEFAULT;
     devmode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
 
-    let result =
-        unsafe { ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None) };
-    if result == DISP_CHANGE_SUCCESSFUL {
-        Ok(())
-    } else {
-        bail!("ChangeDisplaySettingsExW({device_name}, {pels_w}x{pels_h}@{refresh}, portrait={portrait}) -> {result:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let result = unsafe {
+            ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None)
+        };
+        if result == DISP_CHANGE_SUCCESSFUL {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("ChangeDisplaySettingsExW({device_name}, {pels_w}x{pels_h}@{refresh}, portrait={portrait}) -> {result:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -328,19 +334,13 @@ fn source_path_for_device(device_name: &str) -> Result<(windows::Win32::Foundati
     bail!("no active path matched GDI name {device_name}")
 }
 
-pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
+fn ensure_dpi_at(device_name: &str, target_idx: i32) -> Result<bool> {
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_HEADER,
         DISPLAYCONFIG_DEVICE_INFO_TYPE,
     };
 
     let (adapter_id, source_id) = source_path_for_device(device_name)?;
-
-    let target = percent.clamp(100, 500);
-    let target_idx = DPI_PERCENT_VALUES
-        .iter()
-        .position(|&p| p >= target)
-        .unwrap_or(DPI_PERCENT_VALUES.len() - 1);
 
     let mut get = DisplayConfigGetDpi {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -358,9 +358,13 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
     }
 
     let recommended_idx = -get.min_scale_rel;
-    let desired_rel =
-        (target_idx as i32 - recommended_idx).clamp(get.min_scale_rel, get.max_scale_rel.max(0));
+    let current_idx = recommended_idx + get.cur_scale_rel;
+    if current_idx == target_idx {
+        return Ok(true);
+    }
 
+    let desired_rel =
+        (target_idx - recommended_idx).clamp(get.min_scale_rel, get.max_scale_rel.max(0));
     let set = DisplayConfigSetDpi {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(DISPLAYCONFIG_DEVICE_INFO_SET_DPI),
@@ -375,7 +379,45 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
     if unsafe { DisplayConfigSetDeviceInfo(header_ptr) } != 0 {
         bail!("DisplayConfigSetDeviceInfo(SET_DPI) failed for {device_name}");
     }
-    Ok(())
+    Ok(false)
+}
+
+pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
+    let target = percent.clamp(100, 500);
+    let target_idx = DPI_PERCENT_VALUES
+        .iter()
+        .position(|&p| p >= target)
+        .unwrap_or(DPI_PERCENT_VALUES.len() - 1) as i32;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+    let mut stable = 0u32;
+    let mut ever_set = false;
+    let mut last_err: Option<anyhow::Error> = None;
+    loop {
+        match ensure_dpi_at(device_name, target_idx) {
+            Ok(true) => {
+                stable += 1;
+                if stable >= 5 {
+                    return Ok(());
+                }
+            }
+            Ok(false) => {
+                stable = 0;
+                ever_set = true;
+            }
+            Err(e) => {
+                stable = 0;
+                last_err = Some(e);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_err {
+                Some(e) if !ever_set && stable == 0 => Err(e),
+                _ => Ok(()),
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 pub fn select_monitor_by_device_name(device_name: &str) -> Result<(Monitor, MonitorInfo)> {

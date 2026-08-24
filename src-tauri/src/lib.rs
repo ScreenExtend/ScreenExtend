@@ -115,6 +115,9 @@ pub struct Device {
     pub os: String,
     #[serde(rename = "screenSize")]
     pub screen_size: String,
+    pub dpr: f64,
+    #[serde(rename = "maxDpr")]
+    pub max_dpr: f64,
 }
 
 impl Device {
@@ -126,6 +129,12 @@ impl Device {
                 crate::streamer::server::MIN_REFRESH_RATE,
                 crate::streamer::server::MAX_REFRESH_RATE,
             )
+        };
+        let cap = crate::streamer::platform::max_display_dpr();
+        let native_dpr = if info.dpr.is_finite() && info.dpr >= 1.0 {
+            info.dpr.min(cap)
+        } else {
+            1.0
         };
         Self {
             ip: info.ip,
@@ -144,6 +153,8 @@ impl Device {
             control_enabled: true,
             os: info.os,
             screen_size: info.screen_size,
+            dpr: native_dpr,
+            max_dpr: native_dpr,
         }
     }
 }
