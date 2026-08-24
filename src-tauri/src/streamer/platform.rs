@@ -9,6 +9,17 @@ pub fn set_dpi_awareness() {
     crate::windows_utils::streamer::capture::set_dpi_awareness();
 }
 
+pub fn max_display_dpr() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        2.0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        4.0
+    }
+}
+
 pub fn apply_process_tuning() {
     #[cfg(target_os = "windows")]
     crate::windows_utils::streamer::tuning::apply_process_tuning();

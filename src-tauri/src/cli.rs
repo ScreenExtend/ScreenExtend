@@ -516,6 +516,7 @@ mod desktop {
                 .get("remoteControl")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let dpr = device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0);
             platform::set_device_override(
                 app.state(),
                 ip.to_string(),
@@ -525,6 +526,7 @@ mod desktop {
                 num("videoScale", 100),
                 num("videoQuality", 15),
                 control,
+                dpr,
             );
         }
     }
