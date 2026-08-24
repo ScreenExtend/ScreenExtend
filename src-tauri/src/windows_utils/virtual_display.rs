@@ -28,23 +28,47 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         height: u32,
         refresh_rate: u32,
     ) -> Result<u32, String> {
+        self.create_display_with_modes(name, width, height, refresh_rate, &[])
+    }
+
+    fn create_display_with_modes(
+        &self,
+        name: String,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        extra_modes: &[(u32, u32)],
+    ) -> Result<u32, String> {
         let mut client = self.client.lock().unwrap();
         client.refresh_state();
         let id = client
             .new_id(None)
             .ok_or_else(|| "no free display id".to_string())?;
-        let mut modes = vec![Mode {
-            width,
-            height,
-            refresh_rates: vec![refresh_rate],
-        }];
-        if width != height {
-            modes.push(Mode {
-                width: height,
-                height: width,
-                refresh_rates: vec![refresh_rate],
-            });
+
+        let mut dims: Vec<(u32, u32)> = Vec::new();
+        let mut candidates: Vec<(u32, u32)> = Vec::with_capacity(1 + extra_modes.len());
+        candidates.push((width, height));
+        candidates.extend_from_slice(extra_modes);
+        for (w, h) in candidates {
+            if w < 2 || h < 2 {
+                continue;
+            }
+            if !dims.contains(&(w, h)) {
+                dims.push((w, h));
+            }
+            if w != h && !dims.contains(&(h, w)) {
+                dims.push((h, w));
+            }
         }
+        let modes: Vec<Mode> = dims
+            .into_iter()
+            .map(|(w, h)| Mode {
+                width: w,
+                height: h,
+                refresh_rates: vec![refresh_rate],
+            })
+            .collect();
+
         let monitor = Monitor {
             id,
             enabled: true,

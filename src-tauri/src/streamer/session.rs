@@ -21,6 +21,7 @@ pub struct DeviceInfo {
     pub screen_size: String,
     pub refresh_rate: u32,
     pub portrait: bool,
+    pub dpr: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,7 @@ pub struct DeviceOverride {
     pub video_scale: u32,
     pub video_quality: u8,
     pub control_enabled: bool,
+    pub dpr: f64,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
@@ -479,6 +481,18 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
     fn remove_display(&self, id: u32);
 
     fn remove_all_displays(&self);
+
+    fn create_display_with_modes(
+        &self,
+        name: String,
+        width: u32,
+        height: u32,
+        refresh_rate: u32,
+        extra_modes: &[(u32, u32)],
+    ) -> Result<u32, String> {
+        let _ = extra_modes;
+        self.create_display(name, width, height, refresh_rate)
+    }
 }
 
 pub type SharedVirtualDisplay = Arc<dyn VirtualDisplayController>;
