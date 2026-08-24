@@ -91,6 +91,8 @@ export function DeviceDetails({ device }: { device: Device }) {
   const deviceDetails = useFormik({
     initialValues: {
       ...device,
+      dpr: device.dpr ?? device.maxDpr ?? 1,
+      maxDpr: device.maxDpr ?? device.dpr ?? 1,
     },
     onSubmit: async (values) => {
       setInProgress(true);
@@ -100,6 +102,7 @@ export function DeviceDetails({ device }: { device: Device }) {
         refreshRate: Number(values.refreshRate),
         videoScale: Number(values.videoScale),
         videoQuality: Number(values.videoQuality),
+        dpr: Number(values.dpr),
       };
       try {
         await commands.setDeviceOverride(
@@ -109,7 +112,8 @@ export function DeviceDetails({ device }: { device: Device }) {
           normalized.refreshRate,
           normalized.videoScale,
           normalized.videoQuality,
-          normalized.remoteControl
+          normalized.remoteControl,
+          normalized.dpr
         );
         await saveDeviceSettings(normalized);
         await events.deviceModify.emit(normalized);
@@ -281,6 +285,25 @@ export function DeviceDetails({ device }: { device: Device }) {
               max={200}
               step={25}
               disabled={inProgress}
+            />
+          </div>
+          <div className="mt-4">
+            <TipLabel
+              text="Renders this display at the device's pixel density for sharper text and UI. Defaults to the screen's native ratio; lower it toward 1x to save bandwidth and encoding load."
+              className="my-2"
+            >
+              <Label>Pixel Ratio - ({deviceDetails.values.dpr.toFixed(1)}×)</Label>
+            </TipLabel>
+            <Slider
+              value={[deviceDetails.values.dpr]}
+              defaultValue={[deviceDetails.values.dpr]}
+              onValueChange={(value) => {
+                deviceDetails.setFieldValue("dpr", value[0]);
+              }}
+              min={1}
+              max={Math.max(1, deviceDetails.values.maxDpr)}
+              step={0.5}
+              disabled={inProgress || deviceDetails.values.maxDpr <= 1}
             />
           </div>
           <div className="mt-4">

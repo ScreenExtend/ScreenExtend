@@ -13,6 +13,8 @@ export type Device = {
   remoteControl: boolean;
   os: string;
   screenSize: string;
+  dpr: number;
+  maxDpr: number;
 };
 
 export type KnownDevice = {
