@@ -119,7 +119,23 @@
     "systemAudio": {
       "label": "System audio",
       "tip": "Streams this computer's audio output to the device.",
-      "unsupported": "System audio is only available when hosting from Windows."
+      "unsupported": "System audio streaming isn't available on this host's operating system version (needs macOS 10.15 or later, or Windows 10 20H1 or later).",
+      "needsInstall": "System audio on this macOS version needs a one-time audio component install. Turning this on will guide you through it.",
+      "active": "System audio is active via the ScreenExtend Audio device on this macOS version.",
+      "installTitle": "Install ScreenExtend Audio?",
+      "installBody": "This macOS version has no built-in way to capture system audio, so ScreenExtend installs a small audio component. There's one admin prompt. While a device is streaming, ScreenExtend becomes your Mac's output device and restores your previous device automatically afterwards. Your volume keys keep working, and local volume is independent of the connected device's volume.",
+      "installConfirm": "Install",
+      "installing": "Installing audio component…",
+      "installedTitle": "System audio ready",
+      "installedBody": "ScreenExtend Audio is installed. System audio is now available.",
+      "installFailedTitle": "Install failed",
+      "installFailedBody": "The audio component could not be installed. You can retry from the audio toggle.",
+      "needsRebootTitle": "Restart required",
+      "needsRebootBody": "The audio component is installed but needs a restart to finish enabling. Restart your Mac, then turn system audio on again.",
+      "cancelledBody": "Installation was cancelled.",
+      "uninstall": "Remove audio component",
+      "uninstalledTitle": "Audio component removed",
+      "uninstalledBody": "ScreenExtend Audio was removed and your default output device restored."
     }
   },
   "notifications": {

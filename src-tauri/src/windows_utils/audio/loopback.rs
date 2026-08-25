@@ -25,10 +25,10 @@ use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
 use super::device::{
     create_enumerator, default_render_endpoint, DeviceEvent, NotifierRegistration,
 };
-use super::encoder::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES};
 use super::format::{convert_to_stereo_f32, parse_mix_format, MixFormat, SampleKind};
 use super::guards::{ComGuard, EventHandle, MmcssGuard};
 use super::silence::SilenceCompanion;
+use crate::streamer::audio::encoder::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES};
 use crate::streamer::audio::{
     host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioStopFn,
     FLAG_DISCONTINUITY, FLAG_SILENT,

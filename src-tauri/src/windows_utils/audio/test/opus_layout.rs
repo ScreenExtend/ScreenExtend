@@ -4,7 +4,7 @@
 //! changes one of these numbers silently misconfigures the encoder instead of failing to
 //! compile. Every value below is transcribed from `.sources/repos/opus/include/opus_defines.h`.
 
-use crate::windows_utils::audio::opus_sys as o;
+use crate::streamer::audio::opus_sys as o;
 
 #[test]
 fn application_and_signal_values() {
@@ -53,7 +53,7 @@ fn error_codes() {
 
 #[test]
 fn frame_math() {
-    use crate::windows_utils::audio::encoder::{FRAME_MS, FRAME_SAMPLES, OPUS_SAMPLE_RATE};
+    use crate::streamer::audio::encoder::{FRAME_MS, FRAME_SAMPLES, OPUS_SAMPLE_RATE};
     // 5 ms @ 48 kHz = 240 samples/channel — a valid Opus frame size.
     assert_eq!(OPUS_SAMPLE_RATE, 48000);
     assert_eq!(FRAME_MS, 5);

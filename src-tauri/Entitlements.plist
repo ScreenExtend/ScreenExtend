@@ -10,5 +10,12 @@
 
     <key>com.apple.security.app-sandbox</key>
     <false/>
+
+    <!-- System audio capture (macos-audio PRD §8.6). Under a hardened runtime this permits the
+         Core Audio Process Tap / ScreenCaptureKit audio input path. Kept minimal; confirm on real
+         14.2 hardware which entitlement the tap prompt actually requires (AUDIO_NOTES_MACOS.md
+         §4.6). SCK audio additionally relies on the existing Screen Recording TCC grant. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
 </dict>
 </plist>

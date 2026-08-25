@@ -6,12 +6,14 @@
 //! companion, and Opus-encodes 5 ms frames — see `loopback.rs`, `silence.rs`, `AUDIO_NOTES.md`.
 
 pub mod device;
-pub mod encoder;
 pub mod format;
 pub mod guards;
 pub mod loopback;
-pub mod opus_sys;
 pub mod silence;
+
+// The Opus FFI shim (`opus_sys`) and encoder wrapper (`encoder`) used to live here; they moved
+// to the OS-independent `crate::streamer::audio` so the macOS backend reuses them instead of
+// duplicating the libopus binding (PRD macos §6).
 
 #[cfg(test)]
 mod test;

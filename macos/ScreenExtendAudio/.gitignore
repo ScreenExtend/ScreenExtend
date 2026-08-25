@@ -1,0 +1,5 @@
+# Build output (assembled .driver bundle, object files, packaged .pkg).
+build/
+
+# Vendored libASPL, if a contributor drops it here instead of using the reference checkout.
+third_party/

@@ -64,16 +64,12 @@ pub fn get_log_backlog() -> Vec<String> {
 #[macro_export]
 macro_rules! tprintln {
     () => {{
-        if $crate::logbus::verbose() {
-            println!();
-        }
+        println!();
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
-        if $crate::logbus::verbose() {
-            println!("{}", __line);
-        }
+        println!("{}", __line);
         $crate::logbus::push_line(__line);
     }};
 }
@@ -81,16 +77,12 @@ macro_rules! tprintln {
 #[macro_export]
 macro_rules! teprintln {
     () => {{
-        if $crate::logbus::verbose() {
-            eprintln!();
-        }
+        eprintln!();
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
-        if $crate::logbus::verbose() {
-            eprintln!("{}", __line);
-        }
+        eprintln!("{}", __line);
         $crate::logbus::push_line(__line);
     }};
 }

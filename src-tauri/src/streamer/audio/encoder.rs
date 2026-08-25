@@ -1,4 +1,8 @@
-//! Opus encoder wrapper — lowest-delay configuration (PRD §5.2), RAII cleanup.
+//! Opus encoder wrapper — lowest-delay configuration (PRD §5.2), RAII cleanup. Shared by all
+//! OS capture backends (Windows WASAPI, macOS Process Tap / ScreenCaptureKit); the capture side
+//! feeds interleaved f32 frames in, this hands back Opus packets. libopus is cross-platform C,
+//! so this wrapper and `opus_sys` are OS-independent — only the bundled library file name
+//! differs (`opus_sys::LIB_NAMES`).
 //!
 //! `OPUS_APPLICATION_RESTRICTED_LOWDELAY` is the whole point: it disables SILK and forces
 //! CELT-only, cutting algorithmic delay from ~26.5 ms to ~6.5 ms at 48 kHz. The handle is

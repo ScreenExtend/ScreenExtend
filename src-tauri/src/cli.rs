@@ -138,6 +138,14 @@ pub fn fast_path() {
         print_version();
         exit(0);
     }
+    // Crash-recovery watchdog (macOS legacy audio tier, PRD-macos-legacy-audio §8.3). Runs headless
+    // from a LaunchAgent: restore the user's default output if we died holding it, then exit — never
+    // touch the GUI.
+    #[cfg(target_os = "macos")]
+    if first == "audio-recover" {
+        crate::macos_utils::audio::legacy::routing::watchdog_recover();
+        exit(0);
+    }
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {

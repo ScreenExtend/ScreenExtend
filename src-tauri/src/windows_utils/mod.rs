@@ -578,6 +578,28 @@ pub fn remove_drivers(app: tauri::AppHandle) -> bool {
     true
 }
 
+// System-audio driver commands exist only for the macOS 10.15–12.x legacy tier
+// (PRD-macos-legacy-audio §8.4). Windows captures system audio via WASAPI with no driver install,
+// so these are inert here — the frontend never calls them because Windows reports the `wasapi`
+// backend, not `needs_driver_install`.
+#[tauri::command]
+#[specta::specta]
+pub fn install_audio_driver(_app: tauri::AppHandle) -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn uninstall_audio_driver() -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn audio_driver_status() -> String {
+    "unsupported".to_string()
+}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();

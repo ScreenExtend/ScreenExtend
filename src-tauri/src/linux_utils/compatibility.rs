@@ -32,5 +32,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         min_os_version: "Linux".to_string(),
         os_supported: true,
         unsupported_apis: Vec::new(),
+        // No system-audio capture backend on Linux (stub returns unsupported).
+        audio_backend: "unsupported".to_string(),
     }
 }

@@ -68,11 +68,27 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
+    // System audio capture: tiered probe (Process Tap 14.2+ → SCK audio 13.0+ → virtual device
+    // 10.15–12.x → unsupported). `needs_driver_install` is an ACTIONABLE state (a one-time install
+    // triggered from the audio toggle), not a dead end, so it is NOT added to the unsupported list —
+    // the frontend reads the typed `audio_backend` and drives the install flow itself
+    // (PRD-macos-legacy-audio §4, §9.2). Only a genuine dead end (below 10.15) is surfaced here.
+    let audio_backend = super::audio::probe_audio_backend();
+    if audio_backend == super::audio::AudioBackend::Unsupported {
+        unsupported.push(UnsupportedApi {
+            name: "System Audio Capture".to_string(),
+            description: "Streams this Mac's audio output to connected devices.".to_string(),
+            required_version: "macOS 10.15 Catalina".to_string(),
+            severity: "optional".to_string(),
+        });
+    }
+
     CompatibilityReport {
         os_name: "macOS".to_string(),
         os_version: os_version_string(),
         min_os_version: "macOS 10.15 Catalina".to_string(),
         os_supported,
         unsupported_apis: unsupported,
+        audio_backend: audio_backend.as_str().to_string(),
     }
 }

@@ -110,6 +110,20 @@ objc2-core-video = { version = "0.3", features = [
 ] }
 objc2-core-media = { version = "0.3", features = [
     "CMBase", "CMTime", "CMSampleBuffer", "CMFormatDescription", "CMBlockBuffer",
+    # System-audio SCK backend: extract the AudioBufferList out of an audio CMSampleBuffer
+    # (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer / CMAudioFormatDescription...).
+    "objc2-core-audio-types",
+] }
+# System audio capture (Core Audio Process Tap, macOS 14.2+): see macos_utils/audio/process_tap.rs.
+# Only the types/constants and the floor-present (10.15) HAL functions are referenced from here;
+# the 14.2-only symbols (AudioHardwareCreate/DestroyProcessTap, CATapDescription) are resolved at
+# runtime via dlsym / AnyClass::get so the binary still dyld-loads on the 10.15 floor — same
+# no-link discipline the video SCK backend uses (macos_utils/streamer/sck.rs).
+objc2-core-audio = { version = "0.3", features = [
+    "AudioHardware", "objc2", "objc2-core-audio-types", "objc2-foundation", "std",
+] }
+objc2-core-audio-types = { version = "0.3", features = [
+    "CoreAudioBaseTypes", "objc2", "std",
 ] }
 objc2-video-toolbox = { version = "0.3", features = [
     "VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties",
@@ -117,6 +131,9 @@ objc2-video-toolbox = { version = "0.3", features = [
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSProcessInfo", "NSString", "NSObjCRuntime", "NSArray",
+    # Building the Process Tap's aggregate-device description (NSDictionary of NSString/NSNumber
+    # /NSArray) and the tap's UUID (NSUUID) — see macos_utils/audio/process_tap.rs.
+    "NSDictionary", "NSValue", "NSUUID",
 ] }
 objc2-core-wlan = "0.3"
 

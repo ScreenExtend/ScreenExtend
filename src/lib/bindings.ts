@@ -75,6 +75,30 @@ async installDrivers() : Promise<boolean> {
 async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
+/**
+ * Install the ScreenExtend Audio driver for the legacy virtual-device tier (macOS 10.15–12.x).
+ * Runs the bundled signed/notarized `.pkg` with a single admin prompt and returns the outcome as a
+ * stable string the frontend switches on: `installed` / `needs_reboot` / `cancelled` / `failed`
+ * (PRD-macos-legacy-audio §8.4, §9.2). No-op-worthy on 13.0+ (native backends), but the frontend
+ * only calls it when the backend is `needs_driver_install`.
+ */
+async installAudioDriver() : Promise<string> {
+    return await TAURI_INVOKE("install_audio_driver");
+},
+/**
+ * Fully remove the ScreenExtend Audio driver and restore the default output device
+ * (PRD-macos-legacy-audio §8.4). Reachable from Settings. Returns `uninstalled` / `needs_reboot` /
+ * `cancelled` / `failed`.
+ */
+async uninstallAudioDriver() : Promise<string> {
+    return await TAURI_INVOKE("uninstall_audio_driver");
+},
+/**
+ * Current legacy-driver health for the UI: `ready` / `needs_install` / `installed_but_unhealthy`.
+ */
+async audioDriverStatus() : Promise<string> {
+    return await TAURI_INVOKE("audio_driver_status");
+},
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, audioEnabled });
 },
@@ -152,7 +176,14 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[] }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; 
+/**
+ * Which system-audio capture backend is active on this host: `"process_tap"` /
+ * `"screencapturekit"` (macOS tiers), `"wasapi"` (Windows), or `"unsupported"`. Lets the
+ * frontend read audio availability typed rather than string-matching a description, and lets
+ * diagnostics distinguish the tiers (macos-audio PRD §8.4, §10).
+ */
+audio_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device

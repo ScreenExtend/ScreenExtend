@@ -27,3 +27,23 @@ pub fn focus_main_window(window: &tauri::WebviewWindow) {
 pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     command_exists("nmcli")
 }
+
+// System-audio driver commands are the macOS 10.15–12.x legacy tier only
+// (PRD-macos-legacy-audio §8.4); inert on Linux.
+#[tauri::command]
+#[specta::specta]
+pub fn install_audio_driver(_app: tauri::AppHandle) -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn uninstall_audio_driver() -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn audio_driver_status() -> String {
+    "unsupported".to_string()
+}

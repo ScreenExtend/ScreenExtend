@@ -8,6 +8,12 @@
 
 pub mod protocol;
 
+// Opus encode is OS-independent (libopus is cross-platform C), so the FFI shim and encoder
+// wrapper live here and are shared by every per-OS capture backend rather than duplicated
+// (PRD macos §6). The bundled library differs per OS (`opus_sys::LIB_NAMES`); nothing else does.
+pub mod encoder;
+pub mod opus_sys;
+
 #[cfg(test)]
 mod tests;
 

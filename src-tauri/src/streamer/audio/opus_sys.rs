@@ -1,12 +1,17 @@
-//! Hand-written libopus FFI, in the style of `windows_utils/streamer/x264/x264_sys.rs`.
+//! Hand-written libopus FFI, loaded at runtime with `libloading` (no build-time link, no
+//! `*-sys` crate). Shared by every OS's capture backend — the Windows WASAPI loopback path
+//! (`windows_utils/audio`) and the macOS Process Tap / ScreenCaptureKit paths
+//! (`macos_utils/audio`) all feed this one encoder. libopus itself is cross-platform C, so the
+//! only per-OS detail here is the bundled library's file name (`LIB_NAMES`).
 //!
-//! We bundle `libopus.dll` in `src-tauri/resources/` (provenance in
-//! `resources/PROVENANCE.md`) and load it at runtime with `libloading`, exactly the way
-//! x264 is loaded — no build-time link, no `*-sys` crate dependency.
+//! We bundle the library in `src-tauri/resources/` (provenance in `resources/PROVENANCE.md`):
+//! `libopus.dll` on Windows, `libopus.dylib` on macOS — loaded the same way `libx264-164.dll`
+//! is on Windows.
 //!
 //! The control-macro values below are transcribed from the real
-//! `.sources/repos/opus/include/opus_defines.h`. Getting one wrong silently misconfigures
-//! the encoder rather than failing to compile, so `test/opus_layout.rs` pins every value.
+//! `.sources/repos/opus/include/opus_defines.h`. Getting one wrong silently misconfigures the
+//! encoder rather than failing to compile, so `windows_utils/audio/test/opus_layout.rs` pins
+//! every value against the header.
 #![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::{c_char, c_int};
@@ -67,13 +72,17 @@ type FnEncoderDestroy = unsafe extern "C" fn(*mut OpusEncoder);
 type FnStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
 type FnGetVersion = unsafe extern "C" fn() -> *const c_char;
 
-// `opus_encoder_ctl(st, request, ...)` is variadic. Every control we issue passes exactly
-// one trailing argument — an `i32` for SETs, an `*mut i32` for the GETs we use. On the
-// x86_64 Windows C ABI both of those pass in the same integer register slot as the first
-// variadic argument would, so binding the one symbol under two concrete (non-variadic)
-// signatures is ABI-safe here. This mirrors how audiopus_sys/opus-rs treat the same call.
-type FnEncoderCtlSet = unsafe extern "C" fn(*mut OpusEncoder, c_int, i32) -> c_int;
-type FnEncoderCtlGet = unsafe extern "C" fn(*mut OpusEncoder, c_int, *mut i32) -> c_int;
+// `opus_encoder_ctl(st, request, ...)` is variadic. We bind it as a genuine C-variadic function
+// pointer rather than under a fixed non-variadic signature. That distinction is load-bearing on
+// **Apple arm64**, whose calling convention passes variadic arguments on the stack while named
+// arguments go in registers — a fixed `fn(_, c_int, i32)` binding would put the control value in
+// a register the callee never reads there, silently misconfiguring the encoder. (On x86_64 —
+// Windows and Intel macOS — the first few args share the same registers whether named or
+// variadic, so the two forms are identical there; this binding is correct on both.) Each control
+// we issue passes exactly one trailing argument: an `i32` for SETs, a `*mut i32` for the GETs we
+// use.
+type FnEncoderCtlSet = unsafe extern "C" fn(*mut OpusEncoder, c_int, ...) -> c_int;
+type FnEncoderCtlGet = unsafe extern "C" fn(*mut OpusEncoder, c_int, ...) -> c_int;
 
 pub struct OpusApi {
     pub encoder_get_size: FnEncoderGetSize,
@@ -89,12 +98,17 @@ pub struct OpusApi {
 }
 
 // SAFETY: the function pointers are stateless entry points into libopus; the encoder state
-// they operate on is owned separately (`OpusEncoderHandle`) and is not shared across threads
+// they operate on is owned separately (`OpusEncoder`) and is not shared across threads
 // without external synchronization. The `Library` stays loaded for the process lifetime.
 unsafe impl Send for OpusApi {}
 unsafe impl Sync for OpusApi {}
 
+#[cfg(target_os = "windows")]
 const LIB_NAMES: &[&str] = &["libopus.dll", "opus.dll", "libopus-0.dll"];
+#[cfg(target_os = "macos")]
+const LIB_NAMES: &[&str] = &["libopus.dylib", "libopus.0.dylib", "opus.dylib"];
+#[cfg(all(unix, not(target_os = "macos")))]
+const LIB_NAMES: &[&str] = &["libopus.so.0", "libopus.so"];
 
 fn open_library() -> Result<Library> {
     let mut last_err: Option<String> = None;
@@ -111,8 +125,17 @@ fn open_library() -> Result<Library> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in LIB_NAMES {
+                // App-bundle layout differs per OS: on macOS resources land in
+                // `<App>.app/Contents/Resources`, a sibling of the `MacOS` dir that holds the
+                // executable; on Windows they sit in a `resources/` dir next to the exe. Try
+                // both, plus the exe dir itself, before falling back to the loader search path.
                 if let Some(lib) = attempt(dir.join("resources").join(name), &mut last_err) {
                     return Ok(lib);
+                }
+                if let Some(parent) = dir.parent() {
+                    if let Some(lib) = attempt(parent.join("Resources").join(name), &mut last_err) {
+                        return Ok(lib);
+                    }
                 }
                 if let Some(lib) = attempt(dir.join(name), &mut last_err) {
                     return Ok(lib);
@@ -128,7 +151,7 @@ fn open_library() -> Result<Library> {
     }
 
     Err(anyhow!(
-        "could not load libopus (tried bundled resources, exe dir, and PATH for {:?}): {}",
+        "could not load libopus (tried bundled resources, exe dir, and loader path for {:?}): {}",
         LIB_NAMES,
         last_err.unwrap_or_default()
     ))

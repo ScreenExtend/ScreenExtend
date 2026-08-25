@@ -551,7 +551,7 @@ mod tests {
     use super::super::cgds::CgDisplayStreamBackend;
     use super::super::config::EncoderConfig;
     use super::super::encoder::Encoder;
-    use super::super::mach::{mach_age_ms, mach_now};
+    use super::super::mach::mach_age_ms;
     use super::super::{CaptureBackend, CaptureConfig, PIXEL_FORMAT_420F};
 
     #[test]

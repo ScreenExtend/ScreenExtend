@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Merged into the generated Info.plist by the Tauri macOS bundler.
+
+      System-audio capture (macos-audio PRD §4.6, §8.6). The Core Audio Process Tap path
+      (macOS 14.2+) triggers the "System Audio Recording Only" TCC prompt, which requires this
+      usage string. The ScreenCaptureKit fallback (13.0+) rides the existing Screen Recording
+      permission and needs no extra key here. On the 10.15 floor neither backend runs, so the
+      key is simply unused. Confirm the exact prompt/entitlement on real 14.2 hardware
+      (AUDIO_NOTES_MACOS.md §4.6).
+    -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>ScreenExtend streams this Mac's audio output to devices you connect, when you enable System Audio for a device.</string>
+
+    <!--
+      App Transport Security. In `tauri dev` the WKWebView loads the Vite dev server over plain
+      HTTP (devUrl http://localhost:1420). macOS 10.15 (Catalina) enforces ATS strictly and refuses
+      that load, so the whole UI comes up blank with "The resource could not be loaded because the
+      App Transport Security policy requires the use of a secure connection." Newer macOS is lenient
+      about loopback, which is why this only bites on the 10.15 floor.
+
+        - NSAllowsLocalNetworking exempts loopback / .local hosts (the dev server) from ATS.
+        - NSAllowsArbitraryLoadsInWebContent lets the WKWebView load plain-HTTP content while ATS
+          stays fully enforced for the rest of the app (NSURLSession, etc.). Scoped to web content
+          only — it does not disable ATS globally.
+
+      In a production build the frontend is served from the bundled `tauri://localhost` custom
+      scheme, which is not subject to ATS, so both keys are inert there (they only matter for dev).
+    -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

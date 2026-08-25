@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 
 import { Info } from "lucide-react";
 
@@ -48,12 +48,6 @@ import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 import { useFormik } from "formik";
-import { type as osType } from "@tauri-apps/plugin-os";
-
-// System audio capture is Windows-only (macOS/Linux backends are stubs). The toggle stays
-// visible but disabled elsewhere, with an explanatory tooltip, so it reads as unimplemented
-// rather than broken (PRD §7.10).
-const audioSupported = osType() === "windows";
 
 function TipLabel({
   text,
@@ -93,6 +87,61 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [tempQuality, setTempQuality] = useState(device.videoQuality);
   const { toast } = useToast();
   const { t } = useTranslation();
+
+  // System audio availability is per-host-OS: check_system_requirements reports the active capture
+  // backend — WASAPI (Windows), Core Audio Process Tap / ScreenCaptureKit (macOS 13+), the legacy
+  // virtual device (macOS 10.15–12), "needs_driver_install" (10.15–12, a one-time install), or
+  // "unsupported". The toggle stays visible; it's disabled only when truly unsupported, and on the
+  // legacy tier it drives a one-time install (PRD-macos-legacy-audio §9.2).
+  const [audioBackend, setAudioBackend] = useState<string>("unsupported");
+  const [audioInstalling, setAudioInstalling] = useState(false);
+  const [installPromptOpen, setInstallPromptOpen] = useState(false);
+  const refreshAudioBackend = React.useCallback(() => {
+    commands
+      .checkSystemRequirements()
+      .then((r) => setAudioBackend(r.audio_backend))
+      .catch(() => setAudioBackend("unsupported"));
+  }, []);
+  useEffect(() => {
+    refreshAudioBackend();
+  }, [refreshAudioBackend]);
+
+  const audioNeedsInstall = audioBackend === "needs_driver_install";
+  const audioUnsupported = audioBackend === "unsupported";
+  const audioActiveLegacy = audioBackend === "virtual_device";
+
+  const runAudioInstall = async () => {
+    setInstallPromptOpen(false);
+    setAudioInstalling(true);
+    try {
+      const outcome = await commands.installAudioDriver();
+      if (outcome === "installed") {
+        setAudioBackend("virtual_device");
+        // The component is installed, but sound stays off by default — the user turns it on
+        // explicitly from the toggle when they want it.
+        toast({
+          title: t("device.systemAudio.installedTitle"),
+          description: t("device.systemAudio.installedBody"),
+        });
+      } else if (outcome === "needs_reboot") {
+        toast({
+          title: t("device.systemAudio.needsRebootTitle"),
+          description: t("device.systemAudio.needsRebootBody"),
+        });
+      } else if (outcome === "cancelled") {
+        toast({ description: t("device.systemAudio.cancelledBody") });
+      } else {
+        toast({
+          variant: "destructive",
+          title: t("device.systemAudio.installFailedTitle"),
+          description: t("device.systemAudio.installFailedBody"),
+        });
+      }
+    } finally {
+      setAudioInstalling(false);
+      refreshAudioBackend();
+    }
+  };
 
   const deviceDetails = useFormik({
     initialValues: {
@@ -278,21 +327,48 @@ export function DeviceDetails({ device }: { device: Device }) {
           <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
             <TipLabel
               text={
-                audioSupported
-                  ? t("device.systemAudio.tip")
-                  : t("device.systemAudio.unsupported")
+                audioUnsupported
+                  ? t("device.systemAudio.unsupported")
+                  : audioNeedsInstall
+                    ? t("device.systemAudio.needsInstall")
+                    : audioActiveLegacy
+                      ? t("device.systemAudio.active")
+                      : t("device.systemAudio.tip")
               }
             >
               <Label>{t("device.systemAudio.label")}</Label>
             </TipLabel>
             <Switch
               checked={deviceDetails.values.systemAudio}
-              onCheckedChange={(checked) =>
-                deviceDetails.setFieldValue("systemAudio", checked)
-              }
-              disabled={inProgress || !audioSupported}
+              onCheckedChange={(checked) => {
+                // On the legacy tier, turning audio on runs the one-time install flow first.
+                if (checked && audioNeedsInstall) {
+                  setInstallPromptOpen(true);
+                  return;
+                }
+                deviceDetails.setFieldValue("systemAudio", checked);
+              }}
+              disabled={inProgress || audioInstalling || audioUnsupported}
             />
           </div>
+          <AlertDialog open={installPromptOpen} onOpenChange={setInstallPromptOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  {t("device.systemAudio.installTitle")}
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t("device.systemAudio.installBody")}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+                <AlertDialogAction onClick={runAudioInstall}>
+                  {t("device.systemAudio.installConfirm")}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
           <div className="mt-4">
             <TipLabel text="Zooms the extended desktop's content up or down." className="my-2">
               <Label>Scale - ({deviceDetails.values.scale}%)</Label>

@@ -1,0 +1,34 @@
+#!/bin/bash
+#
+# .pkg postinstall — runs as root after the bundle is laid down in
+# /Library/Audio/Plug-Ins/HAL/ScreenExtendAudio.driver (PRD-macos-legacy-audio.md §8.4).
+#
+# Two jobs: (1) make coreaudiod trust the bundle by giving it root:wheel ownership, and (2) get
+# coreaudiod to pick it up without a reboot if the OS allows it. On recent macOS the restart is
+# frequently refused ("Operation not permitted"); in that case we exit 0 anyway and the app tells
+# the user a reboot (or logout/login) is needed — we never leave a half-installed component with no
+# explanation (PRD §7.5, §13.3).
+set -u
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/ScreenExtendAudio.driver"
+
+# (1) Ownership + permissions the HAL requires.
+chown -R root:wheel "${DRIVER}" 2>/dev/null || true
+chmod -R go-w "${DRIVER}" 2>/dev/null || true
+
+# (2) Nudge coreaudiod. Try the modern kickstart first, then the legacy killall. Either may fail.
+restarted=0
+if launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null; then
+  restarted=1
+elif killall coreaudiod 2>/dev/null; then
+  restarted=1
+fi
+
+if [ "${restarted}" -eq 1 ]; then
+  echo "coreaudiod restarted; ScreenExtend Audio should appear immediately."
+else
+  echo "coreaudiod could not be restarted automatically; a reboot or re-login is required."
+fi
+
+# Always succeed: a failed restart is a 'needs reboot' state, not an install failure.
+exit 0

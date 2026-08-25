@@ -90,6 +90,9 @@ export function ProfileMenu() {
             className="cursor-pointer"
             onClick={async () => {
               setClosing(true);
+              // Removing drivers also removes the system-audio component (macOS legacy virtual
+              // device). Inert on Windows/Linux, where it returns "unsupported".
+              await commands.uninstallAudioDriver();
               await commands.removeDrivers();
               await commands.stopHostedNetwork();
               await commands.exitApp();

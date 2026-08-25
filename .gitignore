@@ -36,6 +36,3 @@ linux-vdd/
 
 # Hardening audit log
 AUDIT.md
-
-# Reference material fetched by generate-sources.sh (not a build dependency)
-.sources/

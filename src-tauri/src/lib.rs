@@ -95,6 +95,11 @@ pub struct CompatibilityReport {
     pub min_os_version: String,
     pub os_supported: bool,
     pub unsupported_apis: Vec<UnsupportedApi>,
+    /// Which system-audio capture backend is active on this host: `"process_tap"` /
+    /// `"screencapturekit"` (macOS tiers), `"wasapi"` (Windows), or `"unsupported"`. Lets the
+    /// frontend read audio availability typed rather than string-matching a description, and lets
+    /// diagnostics distinguish the tiers (macos-audio PRD §8.4, §10).
+    pub audio_backend: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
@@ -301,6 +306,9 @@ pub fn run() {
             hosted_network::turn_on_wifi,
             install_drivers,
             remove_drivers,
+            install_audio_driver,
+            uninstall_audio_driver,
+            audio_driver_status,
             set_device_override,
             remove_device_override,
             set_device_banned,
