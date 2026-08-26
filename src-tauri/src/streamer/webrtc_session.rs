@@ -37,12 +37,11 @@ use super::input;
 use super::pipeline::Pipeline;
 use super::session::SharedDeviceOverrides;
 
-const BWE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Fallback Opus fmtp: no in-band FEC (our custom decoder path doesn't use it), stereo (§6.3).
 const OPUS_FALLBACK_FMTP: &str = "minptime=10;useinbandfec=0;stereo=1;sprop-stereo=1";
-/// Drop audio packets once the DataChannel has this many bytes queued (§6.1 backpressure).
-const AUDIO_BACKPRESSURE_BYTES: usize = 256 * 1024;
+const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
 
 /// Everything the audio transport needs, resolved at join time (§7.2/§7.3). The transport
 /// (DataChannel or track) is created unconditionally so toggling `audio_enabled` takes effect
@@ -462,6 +461,10 @@ pub async fn handle_whep_offer(
                                 continue;
                             }
                         };
+                        if payloads.is_empty() {
+                            pipeline.request_idr();
+                            continue;
+                        }
                         let last = payloads.len().saturating_sub(1);
                         let mut stop = false;
                         for (i, payload) in payloads.into_iter().enumerate() {
@@ -668,6 +671,8 @@ async fn forward_datachannel(
     audio: AudioParams,
 ) {
     let mut sub: Option<audio::AudioSubscription> = None;
+    let mut since_bp_check: u32 = 0;
+    let mut over_backpressure = false;
     loop {
         if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
             break;
@@ -689,7 +694,11 @@ async fn forward_datachannel(
 
         match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
             Ok(Ok(pkt)) => {
-                if dc.buffered_amount().await > AUDIO_BACKPRESSURE_BYTES {
+                if since_bp_check == 0 {
+                    over_backpressure = dc.buffered_amount().await > AUDIO_BACKPRESSURE_BYTES;
+                }
+                since_bp_check = (since_bp_check + 1) % 4;
+                if over_backpressure {
                     s.diagnostics
                         .dropped_backpressure
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -161,6 +161,15 @@ fn bytes_per_sample(kind: SampleKind) -> usize {
 /// `out`. `src` must hold at least `frames * fmt.block_align` bytes. Output is clamped to
 /// [-1, 1]. The 48 kHz-float32-stereo case is a straight copy.
 pub fn convert_to_stereo_f32(src: &[u8], frames: usize, fmt: &MixFormat, out: &mut Vec<f32>) {
+    if fmt.is_fast_path() {
+        let n = (frames * 2).min(src.len() / 4);
+        out.reserve(n);
+        for c in src[..n * 4].chunks_exact(4) {
+            out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        return;
+    }
+
     let bps = bytes_per_sample(fmt.kind);
     let ch = fmt.channels as usize;
     let stride = fmt.block_align as usize;

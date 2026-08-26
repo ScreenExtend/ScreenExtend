@@ -258,7 +258,7 @@
     } catch (_) {}
   }
 
-  const TICK_MS = 8;
+  const TICK_MS = 4;
   const pendingMoves = new Map();
   const pendingStrokes = new Map();
   const rel = { dx: 0, dy: 0, buttons: 0, pending: false };

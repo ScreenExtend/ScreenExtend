@@ -125,6 +125,7 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
+            const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
 
             // System-audio capability detection (§7.8). The host picks the audio transport from
             // these: fast WebCodecs-over-DataChannel path when webcodecsOpus && worklet, else the
@@ -628,14 +629,31 @@
                 return null;
             }
 
+            let __workerBlobUrl = null;
+            async function makeTransformWorker() {
+                try {
+                    if (!__workerBlobUrl) {
+                        const src = await fetch('/transform-worker.js').then((r) => {
+                            if (!r.ok) throw new Error('worker fetch ' + r.status);
+                            return r.text();
+                        });
+                        __workerBlobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                    }
+                    return new Worker(__workerBlobUrl);
+                } catch (e) {
+                    console.warn('[webcodecs] blob worker load failed (' + e + '); trying direct URL');
+                    return new Worker('/transform-worker.js');
+                }
+            }
+
             async function start(preferWebCodecs) {
                 teardownSession();
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const iceServers = await getIceServers();
-                    const pcConfig = { iceServers };
-                    if (webcodecs && !hasScriptTransform) {
+                    const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
+                    if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
                         pcConfig.forceEncodedVideoInsertableStreams = true;
                     }
@@ -664,7 +682,7 @@
                     } catch (_) {}
 
                     if (webcodecs) {
-                        worker = new Worker('/transform-worker.js');
+                        worker = await makeTransformWorker();
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
                                 onStreamLive();
@@ -690,7 +708,7 @@
                         };
                         const off = freshCanvas().transferControlToOffscreen();
                         worker.postMessage({ type: 'canvas', canvas: off }, [off]);
-                        if (hasScriptTransform) {
+                        if (useScriptTransform) {
                             videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
                         } else {
                             let readable;
@@ -751,7 +769,8 @@
                         } else {
                             video.srcObject = e.streams[0];
                             try {
-                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 10;
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0; } catch (_) {}
                             } catch (_) {}
                             showVideo();
                             tryPlay();
@@ -929,9 +948,10 @@
                     requestAnimationFrame(frame);
                 });
             }
+            function clampRefresh(r) { return r > 0 ? Math.round(r) : 0; }
             function screenRefreshRate() {
                 const r = window.screen && window.screen.refreshRate;
-                return (typeof r === 'number' && r >= 24 && r <= 500) ? Math.round(r) : 0;
+                return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
             function relayRefreshRate(rate) {
                 if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
@@ -943,7 +963,7 @@
             }
             async function refineRefreshRate() {
                 let rate = screenRefreshRate();
-                if (!rate) rate = await refreshRatePromise;
+                if (!rate) rate = clampRefresh(await refreshRatePromise);
                 relayRefreshRate(rate);
             }
 

@@ -33,7 +33,7 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 4;
+const BACKLOG_DROP_THRESHOLD = 3;
 
 let preferredCodec = null;
 
@@ -69,7 +69,12 @@ function reportAvSync(tsTicks) {
   const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
   const drawAbsMs = performance.timeOrigin + performance.now();
   const delta = drawAbsMs - videoHostMs;
-  videoDelayEmaMs = (videoDelayEmaMs === null) ? delta : videoDelayEmaMs * 0.95 + delta * 0.05;
+  if (videoDelayEmaMs === null) {
+    videoDelayEmaMs = delta;
+  } else {
+    const a = delta < videoDelayEmaMs ? 0.30 : 0.05;
+    videoDelayEmaMs = videoDelayEmaMs * (1 - a) + delta * a;
+  }
   const nowMs = performance.now();
   if (nowMs - lastAvsyncPostMs > 200) {
     lastAvsyncPostMs = nowMs;
@@ -127,7 +132,7 @@ async function ensureConfigured() {
     let anySupported = false;
     for (const c of candidates) {
       try {
-        const s = await VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true });
+        const s = await VideoDecoder.isConfigSupported({ codec: c });
         if (s && s.supported) { codec = c; anySupported = true; break; }
       } catch (_) {}
     }
@@ -139,7 +144,7 @@ async function ensureConfigured() {
   }
   decoder = makeDecoder();
   try {
-    decoder.configure({ codec, optimizeForLatency: true });
+    decoder.configure({ codec });
   } catch (err) {
     configError = String(err);
     self.postMessage({ type: 'configerror', message: configError, codec });

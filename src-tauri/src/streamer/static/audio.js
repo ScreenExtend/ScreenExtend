@@ -88,9 +88,8 @@
                 state.residualOffsetMs.toFixed(1) + 'ms (videoDelay=' + state.videoDelayMs.toFixed(1) +
                 ' preEnqueue=' + state.preEnqueueEmaMs.toFixed(1) + ')');
         }
-        // Threshold + rate-limit so sub-ms noise doesn't churn the worklet.
         if (state.lastTargetMs !== null && Math.abs(target - state.lastTargetMs) < 3 &&
-            now - state.lastTargetAt < 1000) {
+            now - state.lastTargetAt < 300) {
             return;
         }
         state.lastTargetMs = target;
