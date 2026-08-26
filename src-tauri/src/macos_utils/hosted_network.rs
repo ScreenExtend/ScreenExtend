@@ -1,6 +1,6 @@
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2_core_wlan::{CWChannel, CWInterface, CWInterfaceMode, CWWiFiClient};
+use objc2_core_wlan::{CWChannel, CWChannelBand, CWInterface, CWInterfaceMode, CWWiFiClient};
 use objc2_foundation::{NSData, NSError, NSString};
 use tauri::{AppHandle, State};
 use tauri_specta::Event;
@@ -33,8 +33,24 @@ pub fn turn_on_wifi() -> bool {
     unsafe { interface.setPower_error(true) }.is_ok()
 }
 
+/// Clean UNII-1 5 GHz channels — non-DFS, low congestion, allowed for HostAP.
+const PREFERRED_5GHZ_CHANNELS: [isize; 4] = [36, 40, 44, 48];
+
 fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
     let channels = unsafe { interface.supportedWLANChannels() }?;
+
+    // First pass: prefer a clean 5 GHz UNII-1 channel. 2.4 GHz (e.g. ch 11) is 20 MHz-wide and
+    // congested by every nearby AP/BT/microwave — the dominant source of Wi-Fi jitter on the
+    // media path. A clean 5 GHz channel typically cuts p99 one-way jitter substantially.
+    for channel in channels.iter() {
+        let is_5ghz = unsafe { channel.channelBand() } == CWChannelBand::Band5GHz;
+        if is_5ghz && PREFERRED_5GHZ_CHANNELS.contains(&unsafe { channel.channelNumber() }) {
+            return Some(channel);
+        }
+    }
+
+    // Second pass: fall back to the previous 2.4 GHz channel-11 preference (Intel HostAP on older
+    // macOS may cap at 2.4 GHz, so this path still matters).
     let mut fallback: Option<Retained<CWChannel>> = None;
     for channel in channels.iter() {
         if unsafe { channel.channelNumber() } == PREFERRED_CHANNEL {
@@ -42,6 +58,8 @@ fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
         }
         fallback.get_or_insert(channel);
     }
+
+    // Final fallback: the first supported channel.
     fallback
 }
 
@@ -85,6 +103,26 @@ fn try_start_host_ap(
     success
 }
 
+fn try_start_on_channel(
+    interface: &objc2_core_wlan::CWInterface,
+    channel: &CWChannel,
+    name: &str,
+    password: &str,
+    had_password: bool,
+    fell_back: &mut bool,
+    app: &tauri::AppHandle,
+) -> bool {
+    if had_password && try_start_host_ap(interface, channel, name, Some(password)) {
+        return true;
+    }
+    let started_open = try_start_host_ap(interface, channel, name, None);
+    if started_open && had_password {
+        *fell_back = true;
+        let _ = crate::HostedNetworkNoPassword.emit(app);
+    }
+    started_open
+}
+
 fn stop_host_ap_mode() {
     if let Some(interface) = wifi_interface() {
         unsafe {
@@ -110,21 +148,46 @@ pub fn start_hosted_network(
         return false;
     };
 
+    // WEP (the only secured mode this private API supports) requires ≥10 chars.
+    // A shorter password would silently downgrade to an open network; reject it early.
     let had_password = !password.is_empty();
+    if had_password && password.len() < 10 {
+        *state.hosted_network_running.lock().unwrap() = false;
+        let _ = crate::HostedNetworkNoPassword.emit(&app);
+        return false;
+    }
+
+    // Try the preferred channel first, then fall back to the 2.4 GHz ch11 if the radio rejects
+    // the initial channel (e.g. older Intel HostAP caps at 2.4 GHz despite listing 5 GHz as
+    // "supported" for scanning). pick_channel already prefers 5 GHz, so this only kicks in on
+    // hardware that actually rejects that start attempt.
     let mut fell_back = false;
-    let started = if had_password && try_start_host_ap(&interface, &channel, name, Some(password)) {
-        true
+    let started = try_start_on_channel(&interface, &channel, name, password, had_password, &mut fell_back, &app);
+    let started = if !started {
+        // First attempt failed — try ch11 as the 2.4 GHz fallback if we used a 5 GHz channel.
+        let ch11_fallback = {
+            let channels = unsafe { interface.supportedWLANChannels() };
+            channels.and_then(|chs| {
+                chs.iter().find(|c| unsafe { c.channelNumber() } == PREFERRED_CHANNEL)
+            })
+        };
+        if let Some(ref ch11) = ch11_fallback {
+            let ch11_num = unsafe { ch11.channelNumber() };
+            let orig_num = unsafe { channel.channelNumber() };
+            if ch11_num != orig_num {
+                try_start_on_channel(&interface, ch11, name, password, had_password, &mut fell_back, &app)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     } else {
-        let started_open = try_start_host_ap(&interface, &channel, name, None);
-        fell_back = started_open && had_password;
-        started_open
+        started
     };
 
     if started {
         *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
-    }
-    if fell_back {
-        let _ = crate::HostedNetworkNoPassword.emit(&app);
     }
     *state.hosted_network_running.lock().unwrap() = started;
     started

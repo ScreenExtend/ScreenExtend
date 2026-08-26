@@ -17,6 +17,7 @@ type CGEventSourceRef = *mut c_void;
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSourceCreate(state_id: i32) -> CGEventSourceRef;
+    fn CGEventSourceSetLocalEventsSuppressionInterval(source: CGEventSourceRef, seconds: f64);
     fn CGEventCreateMouseEvent(
         source: CGEventSourceRef,
         mouse_type: u32,
@@ -96,6 +97,20 @@ const VK_CONTROL: u16 = 0x3B;
 const VK_RCONTROL: u16 = 0x3E;
 const VK_CAPSLOCK: u16 = 0x39;
 const VK_V: u16 = 0x09;
+
+/// Returns the CGEventFlags bit that corresponds to a modifier virtual key, or 0 for non-modifiers.
+/// Used by the key-down path to strip the modifier's own flag before posting the event, matching
+/// real HID behaviour where the self-flag is absent on the key-down event itself (M-12).
+fn modifier_self_flag(vk: u16) -> u64 {
+    match vk {
+        VK_COMMAND | VK_RCOMMAND => FLAG_COMMAND,
+        VK_SHIFT | VK_RSHIFT => FLAG_SHIFT,
+        VK_OPTION | VK_ROPTION => FLAG_OPTION,
+        VK_CONTROL | VK_RCONTROL => FLAG_CONTROL,
+        VK_CAPSLOCK => FLAG_CAPSLOCK,
+        _ => 0,
+    }
+}
 
 fn code_to_keycode(code: &str) -> Option<u16> {
     let vk = match code {
@@ -247,6 +262,11 @@ impl Injector {
         if source.is_null() {
             log::warn!("CGEventSourceCreate returned null; synthesized events may be degraded");
         }
+        // Suppress interval defaults to 0.25 s: every synthetic event would block real hardware
+        // pointer/keyboard events for 250 ms. Zero it so injected events don't suppress local input.
+        if !source.is_null() {
+            unsafe { CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0) };
+        }
         if !crate::macos_utils::permissions::accessibility_trusted() {
             log::warn!(
                 "Accessibility (TCC) not granted — injected input is dropped until ScreenExtend \
@@ -370,9 +390,12 @@ impl Injector {
             _ => {}
         }
         if !self.mouse_relative {
+            let prev = self.pos;
             let pos = self.point(x, y);
+            let dx = (pos.x - prev.x).round() as i64;
+            let dy = (pos.y - prev.y).round() as i64;
             self.pos = pos;
-            self.motion(pos, self.buttons, 0, 0);
+            self.motion(pos, self.buttons, dx, dy);
         }
         self.button_transitions(self.buttons, buttons, self.pos);
         self.buttons = buttons;
@@ -528,8 +551,22 @@ impl Injector {
             } else {
                 self.down_keys.remove(&kc);
             }
-            self.recompute_mods();
-            self.post_key(kc, down, self.mods);
+            // M-12: real HID posts a modifier key-down WITHOUT its own flag; the flag only
+            // becomes visible after the event is processed.  We replicate that by snapping
+            // the pre-recompute state and stripping the self-flag when posting a modifier
+            // key-down.  Key-up is already correct: the key was removed from down_keys
+            // above, so recompute_mods() will not set the self-flag in self.mods.
+            let flags_for_event = if down {
+                let pre_mods = self.mods;
+                self.recompute_mods();
+                // Strip this modifier's own flag from the event flags so the posted event
+                // reflects the state *before* this modifier was active, matching HID behaviour.
+                pre_mods & !modifier_self_flag(kc)
+            } else {
+                self.recompute_mods();
+                self.mods
+            };
+            self.post_key(kc, down, flags_for_event);
             return;
         }
         if down {

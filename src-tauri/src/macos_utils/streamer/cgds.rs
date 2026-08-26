@@ -17,7 +17,7 @@ use objc2_core_graphics::{
     kCGDisplayStreamMinimumFrameTime, kCGDisplayStreamPreserveAspectRatio,
     kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor, kCGDisplayStreamYCbCrMatrix,
     kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream, CGDisplayStreamFrameStatus,
-    CGDisplayStreamUpdate, CGError,
+    CGDisplayStreamUpdate, CGDisplayStreamUpdateRectType, CGError,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferCreateWithIOSurface};
 use objc2_io_surface::IOSurfaceRef;
@@ -67,7 +67,12 @@ impl CgDisplayStreamBackend {
 }
 
 fn make_cg_properties(fps: f64) -> CFRetained<CFDictionary> {
-    let min_frame_time = CFNumber::new_f64(1.0 / fps.max(1.0));
+    // MinimumFrameTime is a MIN-delta throttle, not a target: at exactly 1/fps a frame that
+    // WindowServer produces a hair early (well within scheduling jitter) is coalesced/dropped,
+    // adding up to a full frame of latency on that transition. Bias the floor ~5% below the
+    // nominal period so slightly-early frames pass, while still capping runaway rate. Mirrors the
+    // shipped Windows WGC change and research-3 §3.
+    let min_frame_time = CFNumber::new_f64((1.0 / fps.max(1.0)) * 0.95);
     let queue_depth = CFNumber::new_isize(2);
     let show_cursor = CFBoolean::new(true);
     let preserve_ar = CFBoolean::new(false);
@@ -106,10 +111,30 @@ fn handle_frame(
     height: usize,
     status: CGDisplayStreamFrameStatus,
     surface: *mut IOSurfaceRef,
+    update: *const CGDisplayStreamUpdate,
 ) {
     if status != CGDisplayStreamFrameStatus::FrameComplete {
         return;
     }
+
+    // Dirty-rect gate (parity with the SCK path, sck.rs:665-676): if the update carries an
+    // *empty* dirty-rect list nothing changed on screen, so skip encoding an identical frame —
+    // the pipeline repeater resends the last AU. Only skip when the update is non-null and we can
+    // positively read zero dirty rects; a null update (e.g. first frame) always publishes.
+    if let Some(update_ref) = unsafe { update.as_ref() } {
+        let mut rect_count: usize = 0;
+        unsafe {
+            CGDisplayStreamUpdate::rects(
+                Some(update_ref),
+                CGDisplayStreamUpdateRectType::DirtyRects,
+                NonNull::from(&mut rect_count),
+            )
+        };
+        if rect_count == 0 {
+            return;
+        }
+    }
+
     let Some(surface_ptr) = NonNull::new(surface) else {
         return;
     };
@@ -155,8 +180,8 @@ impl CaptureBackend for CgDisplayStreamBackend {
             move |status: CGDisplayStreamFrameStatus,
                   _display_time: u64,
                   surface: *mut IOSurfaceRef,
-                  _update: *const CGDisplayStreamUpdate| {
-                handle_frame(&sink, &frames, w, h, status, surface);
+                  update: *const CGDisplayStreamUpdate| {
+                handle_frame(&sink, &frames, w, h, status, surface, update);
             },
         );
 

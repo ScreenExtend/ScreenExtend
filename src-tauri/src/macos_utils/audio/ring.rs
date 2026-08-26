@@ -11,7 +11,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 struct Shared {
     /// `capacity` (a power of two) cells; only the producer writes, only the consumer reads.
@@ -36,6 +36,10 @@ unsafe impl Sync for Shared {}
 /// Producer half — held by the real-time capture callback.
 pub struct Producer {
     shared: Arc<Shared>,
+    /// Handle to the consumer (encoder) thread, set once via [`Producer::set_consumer_thread`].
+    /// After a successful push the producer signals this handle (wait-free futex), eliminating
+    /// the busy-spin on the consumer side. RT-safe: `unpark` never allocates or blocks.
+    consumer_thread: Arc<OnceLock<std::thread::Thread>>,
 }
 
 /// Consumer half — held by the encoder thread.
@@ -44,7 +48,11 @@ pub struct Consumer {
 }
 
 /// Create an SPSC f32 ring holding `capacity` samples (rounded up to a power of two, min 2).
-pub fn ring(capacity: usize) -> (Producer, Consumer) {
+///
+/// Returns `(producer, consumer, consumer_thread_handle)`. The caller should pass
+/// `consumer_thread_handle` to [`Producer::set_consumer_thread`] from the consumer thread once
+/// it has started, enabling event-driven wakeup instead of a timed park.
+pub fn ring(capacity: usize) -> (Producer, Consumer, Arc<OnceLock<std::thread::Thread>>) {
     let cap = capacity.next_power_of_two().max(2);
     let mut cells = Vec::with_capacity(cap);
     cells.resize_with(cap, || UnsafeCell::new(0.0f32));
@@ -55,18 +63,32 @@ pub fn ring(capacity: usize) -> (Producer, Consumer) {
         tail: AtomicUsize::new(0),
         overruns: AtomicU64::new(0),
     });
+    let consumer_thread: Arc<OnceLock<std::thread::Thread>> = Arc::new(OnceLock::new());
     (
         Producer {
             shared: Arc::clone(&shared),
+            consumer_thread: Arc::clone(&consumer_thread),
         },
         Consumer { shared },
+        consumer_thread,
     )
 }
 
 impl Producer {
+    /// Register the consumer thread so that [`push`] can unpark it after each write.
+    /// Call this once from the consumer thread itself (before entering the drain loop) so
+    /// `std::thread::current()` captures the right handle. Wait-free on subsequent calls
+    /// (OnceLock ignores them).
+    pub fn set_consumer_thread(&self, t: std::thread::Thread) {
+        self.consumer_thread.get_or_init(|| t);
+    }
+
     /// Push as many of `data`'s samples as fit. Never blocks. Any samples that don't fit are
     /// dropped and added to the overrun counter (returns the number dropped). Real-time safe:
     /// no allocation, no locking.
+    ///
+    /// After a successful (non-zero) write the consumer thread is unparked via a wait-free futex
+    /// signal, so the consumer does not need to spin between frames.
     pub fn push(&self, data: &[f32]) -> usize {
         let s = &*self.shared;
         let head = s.head.load(Ordering::Relaxed);
@@ -82,6 +104,12 @@ impl Producer {
             }
         }
         s.head.store(head.wrapping_add(n), Ordering::Release);
+        // Wake the consumer thread (wait-free futex signal; RT-safe — no allocation, no blocking).
+        if n > 0 {
+            if let Some(t) = self.consumer_thread.get() {
+                t.unpark();
+            }
+        }
         let dropped = data.len() - n;
         if dropped > 0 {
             s.overruns.fetch_add(dropped as u64, Ordering::Relaxed);
@@ -132,7 +160,7 @@ mod tests {
 
     #[test]
     fn round_trips_in_order() {
-        let (p, c) = ring(8);
+        let (p, c, _t) = ring(8);
         assert_eq!(p.push(&[1.0, 2.0, 3.0]), 0);
         let mut out = [0.0f32; 4];
         assert_eq!(c.pop(&mut out), 3);
@@ -142,7 +170,7 @@ mod tests {
 
     #[test]
     fn wraps_around_capacity() {
-        let (p, c) = ring(4); // capacity 4
+        let (p, c, _t) = ring(4); // capacity 4
         let mut out = [0.0f32; 4];
         for round in 0..10 {
             let a = round as f32;
@@ -154,8 +182,8 @@ mod tests {
 
     #[test]
     fn counts_overruns_without_blocking() {
-        let (p, c) = ring(4); // rounds up to 4 usable slots
-                              // Push 6 into a 4-slot ring: 4 fit, 2 dropped.
+        let (p, c, _t) = ring(4); // rounds up to 4 usable slots
+                                  // Push 6 into a 4-slot ring: 4 fit, 2 dropped.
         let dropped = p.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(dropped, 2);
         assert_eq!(p.overruns(), 2);

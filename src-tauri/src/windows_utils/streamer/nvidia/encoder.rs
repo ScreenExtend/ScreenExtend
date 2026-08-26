@@ -27,6 +27,31 @@ use crate::streamer::config::{Config, H264Profile};
 pub const KEY_WRITER: u64 = 0;
 pub const KEY_ENCODER: u64 = 1;
 pub const KEY_TIMEOUT_MS: u32 = 1000;
+
+/// Outcome type for [`Encoder::encode_input_slot`].
+///
+/// Distinguishes between a keyed-mutex acquire failure — which leaves the slot's
+/// mutex permanently wedged at `KEY_ENCODER` and requires the slot to be quarantined
+/// — and a plain encode failure, where the acquire succeeded and `ReleaseSync` has
+/// already run so the slot is safe to hold and recycle normally.
+pub enum SlotEncodeError {
+    /// `AcquireSync(KEY_ENCODER)` timed out or failed. The slot's mutex was NOT
+    /// acquired; it remains at `KEY_ENCODER`. The slot is poisoned and must never be
+    /// touched again (GPU hang or driver fault).
+    Poisoned(anyhow::Error),
+    /// Acquire succeeded but the encode or bitstream operation failed. The slot's
+    /// mutex has been released back to `KEY_WRITER` and is safe to recycle.
+    Encode(anyhow::Error),
+}
+
+impl std::fmt::Debug for SlotEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotEncodeError::Poisoned(e) => write!(f, "Poisoned: {e:?}"),
+            SlotEncodeError::Encode(e) => write!(f, "Encode: {e:?}"),
+        }
+    }
+}
 const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1;
 
 type CreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
@@ -43,6 +68,27 @@ pub struct EncoderConfig {
     pub intra_refresh: bool,
 }
 
+/// A ring of K shared NVENC input textures used by the async zero-copy path.
+///
+/// Each slot has its own keyed mutex (created SHARED_KEYEDMUTEX, initial key 0 =
+/// `KEY_WRITER`, so the capture/writer side acquires first) and its own NVENC
+/// registered-resource handle. The capture thread stages a frame into
+/// `input_textures[slot]` under `KEY_WRITER` and hands the slot to the encode
+/// thread, which encodes `registered_inputs[slot]` under `KEY_ENCODER`. Because a
+/// slot is only ever WRITER-acquired by capture *after* it appears in the pipeline's
+/// free-slot channel, and only ENCODER-released back to WRITER by the encode thread
+/// before it is returned to that channel, each slot's keyed mutex ping-pongs
+/// WRITER->ENCODER (capture) then ENCODER->WRITER (encode) in perfect balance.
+///
+/// Only ONE `bitstream` output buffer is kept (in the parent `Encoder`): encodes are
+/// serial on the single encode thread, so a single output buffer is sufficient.
+struct Ring {
+    input_textures: Vec<ID3D11Texture2D>,
+    registered_inputs: Vec<NV_ENC_REGISTERED_PTR>,
+    keyed_mutexes: Vec<IDXGIKeyedMutex>,
+    shared_handles: Vec<HANDLE>,
+}
+
 pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -52,6 +98,9 @@ pub struct Encoder {
     registered_input: NV_ENC_REGISTERED_PTR,
     input_keyed_mutex: Option<IDXGIKeyedMutex>,
     shared_handle: Option<HANDLE>,
+    // Populated only by `new_shared_ring`; `None` for every other constructor so
+    // the single-input path is entirely unaffected.
+    ring: Option<Ring>,
     bitstream: NV_ENC_OUTPUT_PTR,
     init_params: NV_ENC_INITIALIZE_PARAMS,
     encode_config: NV_ENC_CONFIG,
@@ -70,6 +119,121 @@ impl Encoder {
 
     pub fn new_shared(config: EncoderConfig) -> Result<Self> {
         Self::new_inner(config, true)
+    }
+
+    /// Like `new_shared`, but instead of a single shared input texture it creates a
+    /// ring of `ring` shared input textures (each with its own keyed mutex + NVENC
+    /// registered resource + shared NT handle). A single output bitstream buffer is
+    /// enough because encodes are serial on one encode thread.
+    ///
+    /// The single-input fields (`registered_input`, `input_keyed_mutex`,
+    /// `shared_handle`) are left inert so the existing single-path `Drop` cleanup is
+    /// a no-op for a ring encoder; the ring's own resources are freed in `Drop` when
+    /// `self.ring` is `Some`. `input_texture` is set to a refcount clone of ring slot
+    /// 0 (COM `.clone()` just bumps the refcount); it is NOT separately registered, so
+    /// Drop will not double-unregister it.
+    pub fn new_shared_ring(config: EncoderConfig, ring: usize) -> Result<Self> {
+        assert!(ring >= 1, "ring size must be >= 1");
+        let (device, context) = create_nvidia_d3d11_device()?;
+
+        let lib = unsafe { libloading::Library::new("nvEncodeAPI64.dll") }
+            .context("loading nvEncodeAPI64.dll (NVENC driver component)")?;
+
+        let mut fns: NV_ENCODE_API_FUNCTION_LIST = unsafe { zeroed() };
+        fns.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+        unsafe {
+            let create: libloading::Symbol<CreateInstanceFn> = lib
+                .get(b"NvEncodeAPICreateInstance\0")
+                .context("resolving NvEncodeAPICreateInstance")?;
+            check(
+                create(&mut fns),
+                "NvEncodeAPICreateInstance",
+                ptr::null_mut(),
+            )?;
+        }
+        if fns.nvEncOpenEncodeSessionEx.is_none() {
+            bail!("NVENC function list did not populate (driver too old?)");
+        }
+
+        let encoder = unsafe { open_session(&fns, device.as_raw())? };
+
+        // Create the K shared input textures up front (slot 0 also backs the inert
+        // `input_texture` field via a refcount clone).
+        let mut input_textures: Vec<ID3D11Texture2D> = Vec::with_capacity(ring);
+        for _ in 0..ring {
+            input_textures.push(create_input_texture(
+                &device,
+                config.width,
+                config.height,
+                /* shared = */ true,
+            )?);
+        }
+        let input_texture = input_textures[0].clone();
+
+        let mut this = Self {
+            device,
+            context,
+            fns,
+            encoder,
+            input_texture,
+            registered_input: ptr::null_mut(),
+            input_keyed_mutex: None,
+            shared_handle: None,
+            ring: None,
+            bitstream: ptr::null_mut(),
+            init_params: unsafe { zeroed() },
+            encode_config: unsafe { zeroed() },
+            config,
+            frame_index: 0,
+            idr_requested: false,
+            _lib: lib,
+        };
+
+        unsafe { this.initialize()? };
+        unsafe { this.create_bitstream()? };
+
+        // Register each ring texture, grab its keyed mutex, and create its shared
+        // NT handle (mirroring `setup_shared` for the single-input case).
+        let mut registered_inputs: Vec<NV_ENC_REGISTERED_PTR> = Vec::with_capacity(ring);
+        let mut keyed_mutexes: Vec<IDXGIKeyedMutex> = Vec::with_capacity(ring);
+        let mut shared_handles: Vec<HANDLE> = Vec::with_capacity(ring);
+        for tex in &input_textures {
+            let registered = unsafe { this.register_texture(tex)? };
+            registered_inputs.push(registered);
+            let resource: IDXGIResource1 = tex
+                .cast()
+                .context("ring input texture as IDXGIResource1 (is it SHARED?)")?;
+            let handle = unsafe {
+                resource.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_RW, PCWSTR::null())
+            }
+            .context("IDXGIResource1::CreateSharedHandle (ring)")?;
+            let mutex: IDXGIKeyedMutex = tex
+                .cast()
+                .context("ring input texture as IDXGIKeyedMutex")?;
+            keyed_mutexes.push(mutex);
+            shared_handles.push(handle);
+        }
+
+        this.ring = Some(Ring {
+            input_textures,
+            registered_inputs,
+            keyed_mutexes,
+            shared_handles,
+        });
+
+        tprintln!(
+            "NVENC H.264 ring encoder initialized (D3D11 / ULL): {}x{}@{}, bitrate_bps={}, ring={}, profile={:?}, rc={}, qp={:?}, intra_refresh={}",
+            config.width,
+            config.height,
+            config.fps,
+            config.bitrate_bps,
+            ring,
+            config.profile,
+            if config.qp.is_some() { "constqp" } else { "cbr" },
+            config.qp,
+            config.intra_refresh,
+        );
+        Ok(this)
     }
 
     fn new_inner(config: EncoderConfig, shared: bool) -> Result<Self> {
@@ -106,6 +270,7 @@ impl Encoder {
             registered_input: ptr::null_mut(),
             input_keyed_mutex: None,
             shared_handle: None,
+            ring: None,
             bitstream: ptr::null_mut(),
             init_params: unsafe { zeroed() },
             encode_config: unsafe { zeroed() },
@@ -158,6 +323,104 @@ impl Encoder {
 
     pub fn shared_handle(&self) -> Option<HANDLE> {
         self.shared_handle
+    }
+
+    /// The ring's K shared NT handles, in slot order, for the capture side to
+    /// `OpenSharedResource1`. Empty for a non-ring encoder.
+    pub fn shared_handles(&self) -> Vec<HANDLE> {
+        match &self.ring {
+            Some(ring) => ring.shared_handles.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Encode ring slot `slot`. The capture thread has already staged a frame into
+    /// this slot's shared texture under `KEY_WRITER` and released it to `KEY_ENCODER`,
+    /// so here we acquire `KEY_ENCODER`, map/encode/lock/copy/unmap the slot's
+    /// registered resource, and hand ownership back to the writer with
+    /// `ReleaseSync(KEY_WRITER)` — ALWAYS after a successful acquire, even on encode
+    /// error, so the keyed mutex never ends up stuck.
+    ///
+    /// Returns `Ok(au)` on success. Returns `Err(SlotEncodeError::Poisoned)` if
+    /// `AcquireSync(KEY_ENCODER)` fails — in that case the mutex was NOT acquired and
+    /// the slot must NOT be recycled through a normal `ENCODER->WRITER` release (it is
+    /// permanently wedged at `KEY_ENCODER`). Returns `Err(SlotEncodeError::Encode(_))`
+    /// for encode failures after a successful acquire; the slot is still released back
+    /// to `KEY_WRITER` and is safe to hold/recycle normally.
+    pub fn encode_input_slot(
+        &mut self,
+        slot: usize,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, SlotEncodeError> {
+        let (mutex, registered) = {
+            let ring = self
+                .ring
+                .as_ref()
+                .ok_or_else(|| anyhow!("encode_input_slot called on a non-ring encoder"))
+                .map_err(SlotEncodeError::Encode)?;
+            let mutex = ring
+                .keyed_mutexes
+                .get(slot)
+                .ok_or_else(|| anyhow!("encode_input_slot: slot {slot} out of range"))
+                .map_err(SlotEncodeError::Encode)?
+                .clone();
+            let registered = ring.registered_inputs[slot];
+            (mutex, registered)
+        };
+
+        // If AcquireSync fails the mutex was NOT acquired; the slot's mutex is stuck at
+        // KEY_ENCODER and can never be recovered without a full encoder rebuild. Signal
+        // Poisoned so the caller can quarantine the slot.
+        unsafe { mutex.AcquireSync(KEY_ENCODER, KEY_TIMEOUT_MS) }
+            .context("ring keyed mutex AcquireSync(encoder)")
+            .map_err(SlotEncodeError::Poisoned)?;
+
+        let force_idr = force_idr || self.idr_requested;
+        let res = unsafe { self.encode_mapped_resource(registered, force_idr) };
+        // Hand the slot back to the writer regardless of encode success/failure.
+        let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
+        let out = res.map_err(SlotEncodeError::Encode)?;
+        if force_idr {
+            self.idr_requested = false;
+        }
+        self.frame_index += 1;
+        Ok(out)
+    }
+
+    /// Re-encode ring slot `slot` WITHOUT the capture side staging a new frame (idle
+    /// keepalive). After a normal encode the slot's keyed mutex sits at `KEY_WRITER`
+    /// (the writer owns it), and capture has NOT re-taken it (otherwise a fresh
+    /// `ReadyMsg` would supersede this keepalive). So we briefly acquire `KEY_WRITER`
+    /// ourselves — matching the `encode_repeat` re-encode pattern for the single-input
+    /// path — then encode the slot's still-resident texture. The mutex is released
+    /// back to `KEY_WRITER` on ALL paths (incl. errors), keeping the ping-pong
+    /// balanced.
+    pub fn encode_repeat_slot(&mut self, slot: usize) -> Result<Vec<u8>> {
+        let (mutex, registered) = {
+            let ring = self
+                .ring
+                .as_ref()
+                .ok_or_else(|| anyhow!("encode_repeat_slot called on a non-ring encoder"))?;
+            let mutex = ring
+                .keyed_mutexes
+                .get(slot)
+                .ok_or_else(|| anyhow!("encode_repeat_slot: slot {slot} out of range"))?
+                .clone();
+            let registered = ring.registered_inputs[slot];
+            (mutex, registered)
+        };
+
+        unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+            .context("ring keepalive keyed mutex AcquireSync(writer)")?;
+        let force_idr = self.idr_requested;
+        let res = unsafe { self.encode_mapped_resource(registered, force_idr) };
+        let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
+        let out = res?;
+        if force_idr {
+            self.idr_requested = false;
+        }
+        self.frame_index += 1;
+        Ok(out)
     }
 
     pub fn device(&self) -> &ID3D11Device {
@@ -402,9 +665,11 @@ impl Encoder {
             h264.intraRefreshPeriod = (fps * 4).max(2);
             h264.intraRefreshCnt = (fps / 2).max(1);
         }
-        let slice_count = (self.config.height / 256).clamp(4, 8);
-        h264.sliceMode = 3;
-        h264.sliceModeData = slice_count;
+        // Single slice per frame: nvEncLockBitstream locks the whole frame at once
+        // (no sub-frame readback), so multiple slices add bitstream overhead (~2-4%)
+        // with no latency benefit.
+        h264.sliceMode = 0;
+        h264.sliceModeData = 0;
         h264.maxNumRefFrames = 1;
         h264.numRefL0 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
         h264.numRefL1 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
@@ -478,13 +743,25 @@ impl Encoder {
     }
 
     unsafe fn register_input(&mut self) -> Result<()> {
+        let registered = unsafe { self.register_texture(&self.input_texture.clone())? };
+        self.registered_input = registered;
+        Ok(())
+    }
+
+    /// Register an arbitrary D3D11 texture with NVENC and return its registered
+    /// resource pointer. Factored out of `register_input` so the ring path can
+    /// register each of its K shared input textures.
+    unsafe fn register_texture(
+        &self,
+        texture: &ID3D11Texture2D,
+    ) -> Result<NV_ENC_REGISTERED_PTR> {
         let mut reg: NV_ENC_REGISTER_RESOURCE = unsafe { zeroed() };
         reg.version = NV_ENC_REGISTER_RESOURCE_VER;
         reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
         reg.width = self.config.width;
         reg.height = self.config.height;
         reg.pitch = 0;
-        reg.resourceToRegister = self.input_texture.as_raw();
+        reg.resourceToRegister = texture.as_raw();
         reg.bufferFormat = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
         reg.bufferUsage = NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE;
         unsafe {
@@ -494,8 +771,7 @@ impl Encoder {
                 .expect("nvEncRegisterResource present");
             self.check(f(self.encoder, &mut reg), "nvEncRegisterResource")?;
         }
-        self.registered_input = reg.registeredResource;
-        Ok(())
+        Ok(reg.registeredResource)
     }
 
     unsafe fn create_bitstream(&mut self) -> Result<()> {
@@ -513,9 +789,22 @@ impl Encoder {
     }
 
     unsafe fn encode_mapped(&mut self, force_idr: bool) -> Result<Vec<u8>> {
+        let registered = self.registered_input;
+        unsafe { self.encode_mapped_resource(registered, force_idr) }
+    }
+
+    /// Map `registered` (a specific `NV_ENC_REGISTERED_PTR`), run the encode, and
+    /// unmap it. Factored out of `encode_mapped` so the ring path can encode any
+    /// slot's registered resource while the single-input path keeps calling
+    /// `encode_mapped` with `self.registered_input`.
+    unsafe fn encode_mapped_resource(
+        &mut self,
+        registered: NV_ENC_REGISTERED_PTR,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
         let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { zeroed() };
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        map.registeredResource = self.registered_input;
+        map.registeredResource = registered;
         unsafe {
             let f = self
                 .fns
@@ -601,6 +890,25 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe {
+            // Ring path: unregister every ring slot's resource and close its shared
+            // handle. The single-input fields are inert (null / None) for a ring
+            // encoder, so the single-path cleanup below is a no-op here.
+            if let Some(ring) = self.ring.take() {
+                for &registered in &ring.registered_inputs {
+                    if !registered.is_null() {
+                        if let Some(f) = self.fns.nvEncUnregisterResource {
+                            let st = f(self.encoder, registered);
+                            log_drop_status(st, "nvEncUnregisterResource (ring)");
+                        }
+                    }
+                }
+                for &h in &ring.shared_handles {
+                    let _ = CloseHandle(h);
+                }
+                // Drop the keyed mutexes / textures explicitly (COM release) before
+                // the encoder session is destroyed below.
+                drop(ring);
+            }
             if let Some(h) = self.shared_handle.take() {
                 let _ = CloseHandle(h);
             }

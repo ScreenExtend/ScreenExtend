@@ -193,9 +193,13 @@ impl GraphicsCaptureApi {
 
         let pixel_format = DirectXPixelFormat(color_format as i32);
 
-        // Create frame pool
+        // Create frame pool.
+        // numberOfBuffers = 3 (was 1): with the decoupled NVENC ring, encode(N) runs
+        // on a separate thread, so WGC must be able to produce frame N+1 while N is
+        // still being staged/encoded. A single-buffer pool would serialize capture
+        // behind encode. 3 matches the K=3 encode ring.
         let frame_pool =
-            Direct3D11CaptureFramePool::Create(&direct3d_device, pixel_format, 1, item.Size()?)?;
+            Direct3D11CaptureFramePool::Create(&direct3d_device, pixel_format, 3, item.Size()?)?;
         let frame_pool = Arc::new(frame_pool);
 
         // Create capture session

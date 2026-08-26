@@ -21,12 +21,13 @@ fn legacy_live_capture_roundtrip() {
         return;
     }
 
-    let (producer, consumer) = ring::ring(48_000 * 2);
+    let (producer, consumer, consumer_thread_lock) = ring::ring(48_000 * 2);
     let diagnostics = Arc::new(AudioDiagnostics::default());
     let sink = AudioFrameSink {
         producer: Arc::new(producer),
         diagnostics: Arc::clone(&diagnostics),
         control_tx: None,
+        consumer_thread: consumer_thread_lock,
     };
 
     let mut src = LegacyVirtualDeviceSource::new();

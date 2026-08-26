@@ -112,11 +112,12 @@ impl SckAudioCapture {
                 "ScreenCaptureKit not present (needs macOS 13.0+)".into(),
             ));
         }
-        let (producer, _consumer) = super::ring::ring(4096);
+        let (producer, _consumer, consumer_thread) = super::ring::ring(4096);
         let sink = AudioFrameSink {
             producer: Arc::new(producer),
             diagnostics: Arc::new(AudioDiagnostics::default()),
             control_tx: None,
+            consumer_thread,
         };
         let mut probe = SckAudioCapture::new();
         probe.build_and_start(&sink)?;

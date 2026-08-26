@@ -2,7 +2,7 @@ pub mod cursor;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HMODULE, POINT};
+use windows::Win32::Foundation::{HMODULE, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 
 use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
@@ -60,6 +61,13 @@ pub struct Duplicator {
     cursor_pos: POINT,
     cursor_visible: bool,
     shape_buf: Vec<u8>,
+    /// Reused scratch for GetFrameDirtyRects/GetFrameMoveRects metadata (dirty-rect skip).
+    meta_buf: Vec<u8>,
+    /// How many consecutive presents have been skipped due to an empty dirty region. When
+    /// this reaches the cap we force a CopyResource even if the rects still appear empty,
+    /// bounding worst-case stale-viewer time to ~N * frame_interval instead of the full
+    /// keepalive period.
+    consecutive_skips: u32,
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
@@ -297,6 +305,8 @@ impl Duplicator {
             cursor_pos: POINT::default(),
             cursor_visible: false,
             shape_buf: Vec::new(),
+            meta_buf: Vec::new(),
+            consecutive_skips: 0,
         })
     }
 
@@ -341,6 +351,67 @@ impl Duplicator {
         }
     }
 
+    /// Returns true only when we can positively prove this present changed no pixels (zero dirty
+    /// rects AND zero move rects), so the desktop copy + encode can be skipped. On any ambiguity
+    /// (no metadata reported, a query failure, or accumulated frames present) returns false so the
+    /// caller copies as before — the skip is a pure optimization that can only reduce work.
+    fn present_region_is_empty(
+        &mut self,
+        dup: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> bool {
+        // When multiple presents have coalesced into one AcquireNextFrame call the driver may
+        // under-report dirty/move rects (reporting only the delta of the last present rather than
+        // the union of all coalesced ones). Force a copy so we never miss pixel changes from the
+        // earlier presents in the batch.
+        if info.AccumulatedFrames > 1 {
+            return false;
+        }
+
+        // No metadata means the driver didn't report a rect region; don't risk skipping a real
+        // change — treat as non-empty.
+        if info.TotalMetadataBufferSize == 0 {
+            return false;
+        }
+        let needed = info.TotalMetadataBufferSize as usize;
+        if self.meta_buf.len() < needed {
+            self.meta_buf.resize(needed, 0);
+        }
+
+        // Move rects first (each move implies changed pixels at the destination).
+        let mut move_bytes = 0u32;
+        let move_ok = unsafe {
+            dup.GetFrameMoveRects(
+                self.meta_buf.len() as u32,
+                self.meta_buf.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+                &mut move_bytes,
+            )
+        };
+        if move_ok.is_err() {
+            return false;
+        }
+        if move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() > 0 {
+            return false;
+        }
+
+        // Dirty rects.
+        let mut dirty_bytes = 0u32;
+        let dirty_ok = unsafe {
+            dup.GetFrameDirtyRects(
+                self.meta_buf.len() as u32,
+                self.meta_buf.as_mut_ptr() as *mut RECT,
+                &mut dirty_bytes,
+            )
+        };
+        if dirty_ok.is_err() {
+            return false;
+        }
+        let dirty_count = dirty_bytes as usize / std::mem::size_of::<RECT>();
+
+        // Region is empty only when there are no dirty rects and no move rects.
+        dirty_count == 0
+    }
+
     pub fn poll(&mut self, timeout_ms: u32) -> Result<PollStatus> {
         let Some(dup) = self.dup.clone() else {
             self.redup()?;
@@ -363,12 +434,30 @@ impl Duplicator {
 
         if info.LastPresentTime != 0 {
             if let Some(res) = &resource {
-                let tex: ID3D11Texture2D = res
-                    .cast()
-                    .context("duplication resource as ID3D11Texture2D")?;
-                unsafe { self.context.CopyResource(&self.desktop, &tex) };
-                self.have_desktop = true;
-                dirty = true;
+                // Dirty-rect gate: if this present carries metadata that resolves to an empty
+                // changed region (no dirty rects, no move rects) we can skip the full-desktop
+                // CopyResource and leave the frame non-dirty — the pipeline repeater resends the
+                // last AU instead of re-encoding an identical frame. We only skip when we can
+                // POSITIVELY prove the region is empty; any query failure falls back to copying.
+                //
+                // Safety cap: after N consecutive skips we force a copy regardless, bounding
+                // worst-case viewer staleness to ~N * frame_interval rather than the full
+                // keepalive period (otherwise a pathological driver that always reports zero
+                // rects could stall the viewer for up to ~200 ms).
+                const MAX_CONSECUTIVE_SKIPS: u32 = 5;
+                let region_empty = self.present_region_is_empty(&dup, &info)
+                    && self.consecutive_skips < MAX_CONSECUTIVE_SKIPS;
+                if !region_empty {
+                    let tex: ID3D11Texture2D = res
+                        .cast()
+                        .context("duplication resource as ID3D11Texture2D")?;
+                    unsafe { self.context.CopyResource(&self.desktop, &tex) };
+                    self.have_desktop = true;
+                    dirty = true;
+                    self.consecutive_skips = 0;
+                } else {
+                    self.consecutive_skips += 1;
+                }
             }
         }
 

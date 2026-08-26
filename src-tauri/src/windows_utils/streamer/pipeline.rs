@@ -21,7 +21,9 @@ use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo};
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
-use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
+use super::nvidia::encoder::{
+    Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER, SlotEncodeError,
+};
 use super::scaler::{Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
@@ -38,7 +40,7 @@ const SP_WIDTH: u32 = 1280;
 const SP_HEIGHT: u32 = 720;
 const SP_FPS: u32 = 30;
 const SP_BITRATE_BPS: u32 = 6_000_000;
-const BROADCAST_CAPACITY: usize = 2;
+const BROADCAST_CAPACITY: usize = 4;
 
 #[derive(Clone)]
 pub struct Pipeline {
@@ -542,6 +544,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
     let mut dirty = false;
     let mut next_due = Instant::now();
+    let mut was_idle = true;
     let mut busy_streak: u32 = 0;
     let mut frames_sent: u64 = 0;
     let mut timing_sum_ns: u128 = 0;
@@ -557,10 +560,23 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             let rem = next_due.saturating_duration_since(Instant::now());
             (rem.as_micros() / 1000) as u32
         } else {
-            50
+            // Idle-branch AcquireNextFrame timeout. Kept small so the first frame after an idle
+            // gap isn't delayed up to a full block interval; still parks the thread (no busy-spin).
+            8
         };
         match dup.poll(timeout_ms) {
-            Ok(PollStatus::Dirty) => dirty = true,
+            Ok(PollStatus::Dirty) => {
+                if !dirty {
+                    // First dirty frame after an idle gap: reset the pacing gate so the burst's
+                    // first frame is emitted immediately rather than waiting up to one
+                    // frame_duration for the existing next_due to expire.
+                    if was_idle {
+                        next_due = Instant::now();
+                    }
+                    was_idle = false;
+                }
+                dirty = true;
+            }
             Ok(PollStatus::Timeout) => {}
             Err(e) => {
                 teprintln!("dxgi capture: {e:?}; stopping capture");
@@ -614,6 +630,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             capture,
         });
         dirty = false;
+        was_idle = true;
         next_due = capture + frame_duration;
 
         frames_sent += 1;
@@ -969,7 +986,12 @@ impl EncodeCore {
 }
 
 struct LiveCapture {
-    core: Arc<Mutex<EncodeCore>>,
+    core: Option<Arc<Mutex<EncodeCore>>>,
+    // Present ONLY for the NVENC zero-copy path; when `Some`, `core` is `None` and
+    // no repeater thread is spawned (the ring's encode thread handles both encode and
+    // keepalive). For every other backend `ring` is `None` and the classic
+    // `core`/`EncodeCore`/`spawn_repeater` path is used unchanged.
+    ring: Option<AsyncNvencRing>,
     tx: broadcast::Sender<EncodedFrame>,
     epoch: Instant,
     last_frame_at: Arc<AtomicU64>,
@@ -987,6 +1009,11 @@ struct LiveCapture {
 impl Drop for LiveCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Tear down the ring encode thread (sets its stop flag, joins). `AsyncNvencRing`'s
+        // own Drop also does this, but taking it here makes the ordering explicit.
+        if let Some(mut ring) = self.ring.take() {
+            ring.stop();
+        }
     }
 }
 
@@ -1013,6 +1040,431 @@ fn build_zero_copy(
             igpu_mutex,
         },
     ))
+}
+
+/// Like `build_zero_copy`, but builds a K-slot ring encoder and opens EACH of the
+/// encoder's K shared handles on the iGPU/capture device, returning one
+/// `(shared_texture, keyed_mutex)` pair per slot (in slot order).
+fn build_zero_copy_ring(
+    config: EncoderConfig,
+    igpu_device: &ID3D11Device,
+    igpu_context: &ID3D11DeviceContext,
+    ring: usize,
+) -> Result<(Encoder, Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>)> {
+    let _ = igpu_context; // context is passed for symmetry with build_zero_copy / used by caller
+    let encoder = Encoder::new_shared_ring(config, ring)?;
+    let handles = encoder.shared_handles();
+    if handles.len() != ring {
+        bail!(
+            "ring encoder produced {} handles, expected {}",
+            handles.len(),
+            ring
+        );
+    }
+    let device1: ID3D11Device1 = igpu_device.cast().context("iGPU device as ID3D11Device1")?;
+    let mut pairs: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)> = Vec::with_capacity(ring);
+    for handle in handles {
+        let shared_igpu: ID3D11Texture2D = unsafe { device1.OpenSharedResource1(handle) }
+            .context("OpenSharedResource1 on iGPU (ring)")?;
+        let igpu_mutex: IDXGIKeyedMutex = shared_igpu
+            .cast()
+            .context("opened shared ring texture as IDXGIKeyedMutex")?;
+        pairs.push((shared_igpu, igpu_mutex));
+    }
+    Ok((encoder, pairs))
+}
+
+/// Message from the capture side to the ring encode thread: encode this staged slot.
+struct ReadyMsg {
+    slot: usize,
+    force_idr: bool,
+    capture: Instant,
+}
+
+/// The async NVENC zero-copy ring. Owns the K capture-side `(shared_igpu, mutex)`
+/// pairs plus a dedicated encode thread (which owns the `Encoder`). Capture stages a
+/// frame into a free slot and enqueues it on `ready`; the encode thread encodes and
+/// returns the slot to `free_slots`. This decouples capture(N+1) from encode(N).
+///
+/// Keyed-mutex invariant (per slot): capture takes a slot ONLY after pulling it from
+/// `free_slots`, WRITER->ENCODER acquires+releases it, and enqueues it; the encode
+/// thread ENCODER->WRITER acquires+releases it and ONLY THEN returns it to
+/// `free_slots`. So each slot's mutex ping-pongs WRITER->ENCODER->WRITER in balance,
+/// and a dropped frame (no free slot, or a staging error) never leaves a slot
+/// half-acquired.
+struct AsyncNvencRing {
+    /// Per-slot capture-side shared texture + keyed mutex (indexed by slot).
+    shared_igpu: Vec<ID3D11Texture2D>,
+    igpu_mutex: Vec<IDXGIKeyedMutex>,
+    igpu_context: ID3D11DeviceContext,
+    scaler: Option<Scaler>,
+    /// Slots available for capture to stage into (pre-filled with 0..K).
+    free_slots: crossbeam_channel::Sender<usize>,
+    free_recv: crossbeam_channel::Receiver<usize>,
+    /// Slots staged by capture and awaiting encode.
+    ready: crossbeam_channel::Sender<ReadyMsg>,
+    encode_join: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    last_frame_at: Arc<AtomicU64>,
+    idr_request: Arc<AtomicBool>,
+    epoch: Instant,
+    frame_index: u64,
+}
+
+impl AsyncNvencRing {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        encoder: Encoder,
+        pairs: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+        igpu_context: ID3D11DeviceContext,
+        scaler: Option<Scaler>,
+        tx: broadcast::Sender<EncodedFrame>,
+        target_bitrate: Arc<AtomicU32>,
+        initial_bitrate: u32,
+        last_frame_at: Arc<AtomicU64>,
+        idr_request: Arc<AtomicBool>,
+        epoch: Instant,
+    ) -> Self {
+        let k = pairs.len();
+        let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+
+        let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<ReadyMsg>(k);
+        for slot in 0..k {
+            free_tx.send(slot).expect("prefill free_slots");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let encode_join = {
+            let stop = Arc::clone(&stop);
+            let free_tx = free_tx.clone();
+            let last_frame_at = Arc::clone(&last_frame_at);
+            std::thread::Builder::new()
+                .name("nvenc-ring-encode".to_string())
+                .spawn(move || {
+                    ring_encode_thread(
+                        encoder,
+                        ready_rx,
+                        free_tx,
+                        tx,
+                        target_bitrate,
+                        initial_bitrate,
+                        last_frame_at,
+                        stop,
+                    )
+                })
+                .expect("spawn nvenc ring encode thread")
+        };
+
+        Self {
+            shared_igpu,
+            igpu_mutex,
+            igpu_context,
+            scaler,
+            free_slots: free_tx,
+            free_recv: free_rx,
+            ready: ready_tx,
+            encode_join: Some(encode_join),
+            stop,
+            last_frame_at,
+            idr_request,
+            epoch,
+            frame_index: 0,
+        }
+    }
+
+    /// CAPTURE side. Take a free slot (latest-wins: if none is free, DROP this frame
+    /// and return without touching any mutex), stage `raw` into that slot's shared
+    /// texture under `KEY_WRITER`, release it to `KEY_ENCODER`, and enqueue it for the
+    /// encode thread. Returns `Ok(true)` if a frame was staged, `Ok(false)` if dropped.
+    ///
+    /// Slot lifecycle guarantee: the slot is only WRITER-acquired AFTER it came from
+    /// `free_slots`. If staging fails after we AcquireSync, we STILL ReleaseSync and
+    /// return the slot to `free_slots`, so a failed frame never leaks a slot or leaves
+    /// a mutex half-acquired.
+    fn stage(&mut self, raw: &ID3D11Texture2D) -> Result<bool> {
+        let slot = match self.free_recv.try_recv() {
+            Ok(s) => s,
+            // No free slot -> latest-wins drop (encode is still catching up). No mutex
+            // was touched, nothing to clean up.
+            Err(_) => return Ok(false),
+        };
+
+        // From here on we own `slot`. On ANY early return we must put it back in
+        // `free_slots` so it isn't leaked.
+        let mutex = &self.igpu_mutex[slot];
+        let dst = &self.shared_igpu[slot];
+
+        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+            .context("ring iGPU keyed mutex AcquireSync(writer)")
+        {
+            // We never got the mutex; just return the slot.
+            let _ = self.free_slots.send(slot);
+            return Err(e);
+        }
+
+        // Stage the WGC frame into the shared texture, then hand ownership to the
+        // encoder (KEY_ENCODER) regardless of copy success — mirroring the single-path
+        // `encode_gpu` which flushes and releases on all paths.
+        let staged = unsafe {
+            let r = match self.scaler.as_mut() {
+                Some(s) => s.scale_into(raw, dst),
+                None => {
+                    self.igpu_context.CopyResource(dst, raw);
+                    Ok(())
+                }
+            };
+            self.igpu_context.Flush();
+            r
+        };
+        let released = unsafe { mutex.ReleaseSync(KEY_ENCODER) };
+
+        if let Err(e) = staged {
+            // The copy failed, but ReleaseSync(ENCODER) already ran: the mutex now sits
+            // at KEY_ENCODER, so the slot MUST pass through an ENCODER->WRITER release
+            // before capture may reuse it. The only thing that does that release is the
+            // encode thread, so we fall through and enqueue the slot anyway; the encode
+            // thread ENCODER-acquires, encodes the (stale) texture, WRITER-releases, and
+            // recycles it. Just dropping the frame here would strand the mutex at
+            // KEY_ENCODER and eventually deadlock that slot.
+            teprintln!("ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle");
+        }
+        if let Err(e) = released {
+            // If ReleaseSync itself failed the mutex state is unknown; safest is to
+            // return the slot to free and hope the next AcquireSync(writer) recovers.
+            let _ = self.free_slots.send(slot);
+            return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
+        }
+
+        let force_idr = self.frame_index == 0 || self.idr_request.swap(false, Ordering::Relaxed);
+        self.frame_index += 1;
+        let msg = ReadyMsg {
+            slot,
+            force_idr,
+            capture: Instant::now(),
+        };
+        if self.ready.send(msg).is_err() {
+            // Encode thread is gone; we can't recycle through it. Return the slot.
+            let _ = self.free_slots.send(slot);
+            bail!("ring encode thread disconnected");
+        }
+        self.last_frame_at
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Dropping the ready sender disconnects the channel so the encode thread's
+        // `ready.recv()` returns Disconnected and it breaks out of its loop.
+        // We can't move `ready` out of &mut self, so rely on `stop` + the join:
+        if let Some(join) = self.encode_join.take() {
+            // Wake the thread if it's blocked on recv by nothing to send; the stop
+            // flag is checked after each recv timeout. Give it a bounded chance.
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for AsyncNvencRing {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The dedicated ring encode thread: pull a staged slot, apply any pending bitrate
+/// change, encode it (this is where the blocking `nvEncLockBitstream` runs, now OFF
+/// the WGC capture callback), publish the AU, and return the slot to `free_slots`.
+/// Keepalive is handled INSIDE this thread (see below) so we never need the old
+/// `spawn_repeater`, which would require the encoder that now lives here.
+#[allow(clippy::too_many_arguments)]
+fn ring_encode_thread(
+    mut encoder: Encoder,
+    ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
+    free_tx: crossbeam_channel::Sender<usize>,
+    tx: broadcast::Sender<EncodedFrame>,
+    target_bitrate: Arc<AtomicU32>,
+    initial_bitrate: u32,
+    last_frame_at: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    let _thread_tuning = tuning::tune_current_thread();
+    let mut current_bitrate = initial_bitrate;
+    let _ = last_frame_at; // capture side owns the idle clock; kept for construction symmetry.
+
+    // Keepalive lives INSIDE this thread (the encoder is owned here, so the old
+    // `spawn_repeater` — which needs the encoder — cannot be used for the ring).
+    //
+    // To make keepalive race-free, the encode thread HOLDS BACK the most-recently
+    // encoded slot instead of immediately returning it to `free_slots`. The held slot
+    // is owned exclusively by the encode thread, so capture can never be staging into
+    // it while we re-encode it for keepalive. When the next real frame arrives on a
+    // DIFFERENT slot, we return the previously-held slot to `free_slots` and hold the
+    // new one. With K=3, holding 1 back still leaves 2 slots for capture to overlap
+    // capture(N+1) with encode(N).
+    //
+    // Ping-pong balance: capture WRITER->ENCODER-acquires a slot it pulled from
+    // `free_slots`; the encode thread ENCODER->WRITER-releases it inside
+    // `encode_input_slot`; the slot then returns to `free_slots` only via `release`
+    // below. Keepalive re-encodes the held slot with `encode_repeat_slot`, which does a
+    // self-contained WRITER acquire+release, leaving the slot at KEY_WRITER exactly as
+    // it was — no imbalance, and the slot is never in `free_slots` during keepalive.
+    let keepalive = Duration::from_millis(200);
+    let mut held_slot: Option<usize> = None;
+
+    // Slots whose keyed mutex is permanently wedged at KEY_ENCODER due to an
+    // AcquireSync timeout (GPU hang / driver fault). Poisoned slots must never be
+    // passed to encode_input_slot or encode_repeat_slot again; their mutex cannot be
+    // recovered without a full encoder rebuild.
+    let mut poisoned_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // Return the previously held slot (if any) to capture, then remember `slot` as held.
+    let release_and_hold =
+        |free_tx: &crossbeam_channel::Sender<usize>, held: &mut Option<usize>, slot: usize| -> bool {
+            if let Some(prev) = held.take() {
+                if free_tx.send(prev).is_err() {
+                    return false;
+                }
+            }
+            *held = Some(slot);
+            true
+        };
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match ready_rx.recv_timeout(keepalive) {
+            Ok(msg) => {
+                // A poisoned slot's mutex is stuck at KEY_ENCODER; calling
+                // encode_input_slot on it would attempt AcquireSync(KEY_ENCODER) on an
+                // already-acquired mutex and time out again. Return it directly to
+                // free_slots so capture can avoid reusing it (capture will just drop
+                // frames until the slot comes back — but since it's poisoned it never
+                // should be reused; we send it anyway to keep the free-slot count
+                // correct and let the "all poisoned" check below catch the terminal
+                // case).
+                if poisoned_slots.contains(&msg.slot) {
+                    teprintln!(
+                        "ring encode: skipping poisoned slot {} (keyed mutex wedged at KEY_ENCODER)",
+                        msg.slot
+                    );
+                    let _ = free_tx.send(msg.slot);
+                    continue;
+                }
+
+                apply_pending_bitrate_atomic(&mut encoder, &target_bitrate, &mut current_bitrate);
+                match encoder.encode_input_slot(msg.slot, msg.force_idr) {
+                    Ok(au) => {
+                        let _ = tx.send(EncodedFrame {
+                            data: Bytes::from(au),
+                            capture: msg.capture,
+                        });
+                        // Free the previously-held slot and hold this one back for
+                        // keepalive. encode_input_slot has already ENCODER->WRITER-
+                        // released msg.slot, so it is safe to hold (mutex at
+                        // KEY_WRITER, owned only by us).
+                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                            break;
+                        }
+                    }
+                    Err(SlotEncodeError::Poisoned(e)) => {
+                        // AcquireSync failed: the mutex was NOT acquired, so
+                        // ReleaseSync(KEY_WRITER) has NOT run. The slot's mutex is
+                        // stuck at KEY_ENCODER. We must NOT call release_and_hold or
+                        // attempt encode_repeat_slot on this slot.
+                        teprintln!(
+                            "ring encode: slot {} poisoned (AcquireSync failed — GPU hang or driver fault): {e:?}",
+                            msg.slot
+                        );
+                        poisoned_slots.insert(msg.slot);
+
+                        // Check for total ring failure (all slots gone).
+                        // The ring size equals the channel capacity; we can infer it
+                        // from the sum of free + ready + held + poisoned. Simpler: the
+                        // ring was built with K slots; if every slot is poisoned the
+                        // ring is unrecoverable. We detect this when the held slot (if
+                        // any) is also poisoned and there are no more non-poisoned
+                        // slots that could arrive via ready_rx — conservatively check
+                        // whether the held slot is still healthy.
+                        let held_poisoned = held_slot.map_or(false, |s| poisoned_slots.contains(&s));
+                        if held_poisoned || held_slot.is_none() {
+                            // No held slot can serve keepalive; if all slots arriving
+                            // from the capture side are also poisoned the ring is dead.
+                            // We break here rather than spinning forever. The pipeline's
+                            // reconnect logic will rebuild the encoder.
+                            teprintln!(
+                                "ring encode: CRITICAL — held slot also poisoned or absent; \
+                                 ring is unrecoverable, stopping encode thread"
+                            );
+                            break;
+                        }
+                        // The slot is poisoned but there is still a healthy held slot;
+                        // continue serving keepalive frames while capture drains the
+                        // remaining slots.
+                    }
+                    Err(SlotEncodeError::Encode(e)) => {
+                        // Acquire succeeded; ReleaseSync(KEY_WRITER) has already run
+                        // inside encode_input_slot. The slot is clean at KEY_WRITER and
+                        // safe to hold/recycle normally.
+                        teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
+                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if let Some(slot) = held_slot {
+                    // Skip keepalive on a poisoned held slot (shouldn't happen if the
+                    // critical-error branch above ran, but guard defensively).
+                    if poisoned_slots.contains(&slot) {
+                        held_slot = None;
+                        continue;
+                    }
+                    apply_pending_bitrate_atomic(
+                        &mut encoder,
+                        &target_bitrate,
+                        &mut current_bitrate,
+                    );
+                    match encoder.encode_repeat_slot(slot) {
+                        Ok(au) => {
+                            let _ = tx.send(EncodedFrame {
+                                data: Bytes::from(au),
+                                capture: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            teprintln!("ring keepalive encode failed (slot={slot}): {e:?}");
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    tprintln!("nvenc ring encode thread stopped");
+}
+
+/// Bitrate application for the ring encode thread (mirrors `apply_pending_bitrate`
+/// but talks directly to an `Encoder` instead of a `Backend`).
+fn apply_pending_bitrate_atomic(
+    encoder: &mut Encoder,
+    target_bitrate: &AtomicU32,
+    current: &mut u32,
+) {
+    let pending = target_bitrate.swap(0, Ordering::Relaxed);
+    if pending == 0 || pending == *current {
+        return;
+    }
+    match encoder.set_bitrate(pending) {
+        Ok(()) => {
+            tprintln!("adapting bitrate: {} -> {pending} bps", *current);
+            *current = pending;
+        }
+        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+    }
 }
 
 fn build_backend(
@@ -1216,6 +1668,88 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         let thread_tuning = tuning::tune_current_thread();
         let keep_awake = tuning::KeepAwake::begin();
 
+        let epoch = Instant::now();
+        let last_frame_at = Arc::new(AtomicU64::new(0));
+        let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // --- NVENC zero-copy RING path (decoupled capture/encode) -----------------
+        // For Nvidia/Auto vendors, try the K=3 shared-texture ring first. On success
+        // we run the async ring (dedicated encode thread + slot pool) and DO NOT build
+        // the single-texture EncodeCore or spawn the classic repeater. On failure we
+        // fall through to `build_backend`, which handles the CPU-bridge, Intel, and
+        // x264 paths exactly as before.
+        use crate::streamer::config::EncoderVendor;
+        const RING: usize = 3;
+        let try_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
+        if try_ring {
+            match build_zero_copy_ring(config, &ctx.device, &ctx.device_context, RING) {
+                Ok((encoder, pairs)) => {
+                    tuning::raise_d3d11_gpu_priority(encoder.device());
+
+                    // The ring shares NVENC input textures with the encoder's own D3D11
+                    // device; capture stages into them via the WGC capture device. A
+                    // downscaler is needed iff the encode size differs from native.
+                    let scaler = if config.width != native_w || config.height != native_h {
+                        match Scaler::new(
+                            &ctx.device,
+                            &ctx.device_context,
+                            native_w,
+                            native_h,
+                            config.width,
+                            config.height,
+                        ) {
+                            Ok(s) => Some(s),
+                            Err(e) => return Err(e.context("building GPU downscaler for --scale")),
+                        }
+                    } else {
+                        None
+                    };
+
+                    let ring = AsyncNvencRing::new(
+                        encoder,
+                        pairs,
+                        ctx.device_context.clone(),
+                        scaler,
+                        tx.clone(),
+                        Arc::clone(&target_bitrate),
+                        config.bitrate_bps,
+                        Arc::clone(&last_frame_at),
+                        Arc::clone(&idr_request),
+                        epoch,
+                    );
+
+                    tprintln!(
+                        "pipeline: live capture ready -- NVENC ZERO-COPY RING (K={}) decoupled path ({}x{}@{})",
+                        RING, config.width, config.height, config.fps
+                    );
+
+                    return Ok(Self {
+                        core: None,
+                        ring: Some(ring),
+                        tx,
+                        epoch,
+                        last_frame_at,
+                        path_name: "zero-copy-ring",
+                        frames_sent: 0,
+                        busy_streak: 0,
+                        stop,
+                        _thread_tuning: thread_tuning,
+                        _keep_awake: keep_awake,
+                        timing_sum_ns: 0,
+                        timing_count: 0,
+                        timing_max_ns: 0,
+                    });
+                }
+                Err(e) => {
+                    teprintln!(
+                        "NVENC zero-copy ring unavailable ({e:?}); falling back to classic backend path"
+                    );
+                }
+            }
+        }
+
+        // --- Classic (non-ring) path: unchanged from before ------------------------
         let backend = build_backend(
             config,
             vendor,
@@ -1261,11 +1795,6 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             frame_index: 0,
         }));
 
-        let epoch = Instant::now();
-        let last_frame_at = Arc::new(AtomicU64::new(0));
-        let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
-        let stop = Arc::new(AtomicBool::new(false));
-
         spawn_repeater(
             Arc::clone(&core),
             tx.clone(),
@@ -1278,7 +1807,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         );
 
         Ok(Self {
-            core,
+            core: Some(core),
+            ring: None,
             tx,
             epoch,
             last_frame_at,
@@ -1302,8 +1832,28 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         let capture = Instant::now();
         let t0 = capture;
 
+        // --- NVENC zero-copy RING path: CAPTURE side only -------------------------
+        // Stage the WGC frame into a free ring slot and hand it to the encode thread;
+        // the actual encode (incl. the blocking nvEncLockBitstream) runs OFF this WGC
+        // callback so capture(N+1) can overlap encode(N). No free slot => drop frame
+        // (latest-wins). The encode thread publishes the AU and updates timing.
+        if let Some(ring) = self.ring.as_mut() {
+            match ring.stage(frame.as_raw_texture()) {
+                Ok(_staged) => {}
+                Err(e) => {
+                    teprintln!("ring capture stage failed: {e:?}");
+                }
+            }
+            return Ok(());
+        }
+
+        // --- Classic (non-ring) path: unchanged -----------------------------------
+        let core = self
+            .core
+            .as_ref()
+            .expect("classic path must have an EncodeCore");
         let encode_res = {
-            let mut core = self.core.lock().expect("encode core mutex poisoned");
+            let mut core = core.lock().expect("encode core mutex poisoned");
             core.encode_captured(frame)
         };
         let au = match encode_res {

@@ -324,11 +324,12 @@ impl ProcessTapCapture {
             ));
         }
         // Build against a throwaway sink; drop it (and its ring) immediately after.
-        let (producer, _consumer) = super::ring::ring(4096);
+        let (producer, _consumer, consumer_thread) = super::ring::ring(4096);
         let sink = AudioFrameSink {
             producer: Arc::new(producer),
             diagnostics: Arc::new(AudioDiagnostics::default()),
             control_tx: None,
+            consumer_thread,
         };
         let mut probe = ProcessTapCapture::new();
         probe.build_and_start(&sink)?;
@@ -536,9 +537,13 @@ impl AudioSource for ProcessTapCapture {
 
     fn reacquire(&mut self) -> Result<(), AudioCaptureError> {
         crate::tprintln!("audio: default output device changed; re-acquiring Process Tap");
-        // Tear down the old tap/aggregate first, then rebuild against the new default. The gap is
-        // covered by the encoder thread emitting silence (PRD §5.5).
-        self.resources = None; // Drop tears down in order
+        // SPSC single-producer invariant (M-4): the old IOProc MUST be fully torn down before the
+        // new one is created. Drop (AudioDeviceStop → AudioDeviceDestroyIOProcID → free ctx →
+        // AudioHardwareDestroyAggregateDevice → AudioHardwareDestroyProcessTap) happens
+        // synchronously inside TapResources::drop here. Do NOT start the new IOProc until this
+        // assignment completes — overlapping two producers on the same ring violates the SPSC
+        // contract and corrupts the lock-free state.
+        drop(self.resources.take()); // explicit drop order: old IOProc fully gone before rebuild
         if let Some(sink) = self.sink.clone() {
             self.build_and_start(&sink)?;
         }

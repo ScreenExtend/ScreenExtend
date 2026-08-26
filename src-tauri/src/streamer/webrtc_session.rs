@@ -39,8 +39,10 @@ use super::session::SharedDeviceOverrides;
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
-/// Fallback Opus fmtp: no in-band FEC (our custom decoder path doesn't use it), stereo (§6.3).
-const OPUS_FALLBACK_FMTP: &str = "minptime=10;useinbandfec=0;stereo=1;sprop-stereo=1";
+/// Fallback Opus fmtp: in-band FEC enabled for the standard RTP track path (NetEQ can
+/// conceal a lost packet using the redundancy embedded in the next packet). The fast
+/// DataChannel path doesn't use this fmtp so FEC overhead only applies to the fallback.
+const OPUS_FALLBACK_FMTP: &str = "minptime=5;useinbandfec=1;stereo=1;sprop-stereo=1";
 const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
 
 /// Everything the audio transport needs, resolved at join time (§7.2/§7.3). The transport
@@ -140,8 +142,10 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
             .context("register RTX codec")?;
     }
 
-    // Opus, for the standard-track audio fallback (§6.3). Registering it is harmless when the
-    // client's offer has no audio m-line (fast path uses a DataChannel instead of a track).
+    // Opus, for the standard-track audio fallback (§6.3). NACK lets the receiver request
+    // retransmission of lost packets; FEC (useinbandfec=1 above) provides loss concealment
+    // when the retransmit arrives too late. Registering it is harmless when the client's
+    // offer has no audio m-line (fast path uses a DataChannel instead of a track).
     media_engine
         .register_codec(
             RTCRtpCodecParameters {
@@ -150,7 +154,10 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
                     clock_rate: 48000,
                     channels: 2,
                     sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
-                    rtcp_feedback: vec![],
+                    rtcp_feedback: vec![RTCPFeedback {
+                        typ: "nack".to_string(),
+                        parameter: "".to_string(),
+                    }],
                 },
                 payload_type: 111,
                 ..Default::default()
@@ -158,6 +165,21 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
             RTPCodecType::Audio,
         )
         .context("register Opus codec")?;
+
+    // Sender-side "render as soon as possible": register the playout-delay(0,0) header
+    // extension so the receiver's jitter buffer targets minimum (complements the client-side
+    // jitterBufferTarget=0 / playoutDelayHint=0). Chrome/Safari honor min=max=0 for interactive
+    // streaming. Register for both video (stamped per-packet on the raw-RTP track) and audio
+    // (capability-only today; the Opus fallback track has no per-packet extension API).
+    media_engine
+        .register_header_extension(
+            webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability {
+                uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".to_owned(),
+            },
+            RTPCodecType::Video,
+            None,
+        )
+        .context("register playout-delay hdrext")?;
 
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
@@ -198,11 +220,13 @@ async fn detect_session_locality(
     let report = pc.get_stats().await;
 
     let mut cand_type: HashMap<String, String> = HashMap::new();
+    let mut cand_ip: HashMap<String, String> = HashMap::new();
     let mut nominated: Option<(String, String)> = None;
     for stat in report.reports.values() {
         match stat {
             StatsReportType::LocalCandidate(c) | StatsReportType::RemoteCandidate(c) => {
                 cand_type.insert(c.id.clone(), format!("{:?}", c.candidate_type));
+                cand_ip.insert(c.id.clone(), c.ip.clone());
             }
             StatsReportType::CandidatePair(p) if p.nominated => {
                 nominated = Some((p.local_candidate_id.clone(), p.remote_candidate_id.clone()));
@@ -226,7 +250,21 @@ async fn detect_session_locality(
         .to_lowercase();
     tprintln!("selected ICE candidate pair (local={lt}, remote={rt})");
 
+    let lip = cand_ip.get(&lid).cloned().unwrap_or_default();
+    let rip = cand_ip.get(&rid).cloned().unwrap_or_default();
+
     if lt.contains("relay") || rt.contains("relay") {
+        // If both endpoints are actually on the same private subnet yet we still ended up on a
+        // relay/cross-network path, the most common cause is AP client-isolation forcing LAN peers
+        // to hairpin through the router — an operator-fixable config that adds a full extra
+        // wireless hop of latency+jitter.
+        if is_private_ip(&lip) && is_private_ip(&rip) && same_subnet_24(&lip, &rip) {
+            teprintln!(
+                "WARNING: same-subnet peers ({lip} <-> {rip}) are routing via relay/router — \
+                 check AP client isolation (and AP-side WMM). Disabling client isolation lets \
+                 the host<->client pair take a direct Wi-Fi path and removes 10-40ms of latency."
+            );
+        }
         SessionLocality::CrossNetwork
     } else if lt.contains("host") && rt.contains("host") {
         SessionLocality::SameNetwork
@@ -234,6 +272,29 @@ async fn detect_session_locality(
         SessionLocality::Unknown
     } else {
         SessionLocality::CrossNetwork
+    }
+}
+
+/// True for RFC1918 / link-local private IPv4 literals.
+fn is_private_ip(ip: &str) -> bool {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_private() || v4.is_link_local() || v4.is_loopback()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
+    }
+}
+
+/// Cheap same-/24 (IPv4) check; used only for the client-isolation diagnostic.
+fn same_subnet_24(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(std::net::IpAddr::V4(x)), Ok(std::net::IpAddr::V4(y))) => {
+            let xo = x.octets();
+            let yo = y.octets();
+            xo[0] == yo[0] && xo[1] == yo[1] && xo[2] == yo[2]
+        }
+        _ => false,
     }
 }
 
@@ -357,15 +418,18 @@ pub async fn handle_whep_offer(
             let dc = Arc::clone(&dc);
             Box::pin(async move {
                 tprintln!("remote-input data channel open: {label}");
-                let dc_for_pong = Arc::clone(&dc);
+                // PONG is only sent on the reliable channel, so only that channel needs to hold a
+                // clone of the DataChannel. On the high-rate `fast`/`bulk` channels this avoids an
+                // atomic refcount bump per mouse-move/wheel message.
+                let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let tx = tx.clone();
-                    let dc_pong = Arc::clone(&dc_for_pong);
+                    let dc_pong = dc_for_pong.clone();
                     Box::pin(async move {
                         let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
                             return;
                         };
-                        if is_reliable {
+                        if let Some(dc_pong) = &dc_pong {
                             if let input::protocol::InputEvent::Ping { t_ns } = ev {
                                 let pong = input::protocol::build_pong(t_ns);
                                 let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
@@ -446,6 +510,10 @@ pub async fn handle_whep_offer(
             const RTP_PAYLOAD_MTU: usize = 1200 - 12;
             let mut payloader = H264Payloader::default();
             let sequencer = new_random_sequencer();
+            // Stamped on every video packet: "render as soon as possible" (see build_api).
+            let playout_delay = [webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
+                webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(0, 0),
+            )];
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
@@ -480,7 +548,9 @@ pub async fn handle_whep_offer(
                                 },
                                 payload,
                             };
-                            if let Err(e) = track.write_rtp_with_extensions(&pkt, &[]).await {
+                            if let Err(e) =
+                                track.write_rtp_with_extensions(&pkt, &playout_delay).await
+                            {
                                 tprintln!("track write_rtp failed ({e}); viewer writer stopping");
                                 stop = true;
                                 break;
@@ -508,6 +578,11 @@ pub async fn handle_whep_offer(
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(Mutex::new(closed_tx));
     let input_tx_state = input_tx.clone();
+    // Cancels any in-flight Disconnected grace timer when the connection recovers.
+    let (grace_cancel_tx, grace_cancel_rx) = tokio::sync::watch::channel(false);
+    let grace_cancel_tx = Arc::new(grace_cancel_tx);
+    // Clone before the move closure so the original stays alive for the post-closure borrow.
+    let grace_cancel_rx_closure = grace_cancel_rx.clone();
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         tprintln!("peer connection state changed: {state:?}");
         if matches!(
@@ -518,15 +593,17 @@ pub async fn handle_whep_offer(
         ) {
             input_tx_state.release_all();
         }
-        if state == RTCPeerConnectionState::Connected
-            && !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let pc = Arc::clone(&pc_state);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let locality = detect_session_locality(&pc).await;
-                tprintln!("session locality detected: {locality:?}");
-            });
+        if state == RTCPeerConnectionState::Connected {
+            // Cancel any pending Disconnected grace timer — the link recovered.
+            let _ = grace_cancel_tx.send(true);
+            if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let pc = Arc::clone(&pc_state);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let locality = detect_session_locality(&pc).await;
+                    tprintln!("session locality detected: {locality:?}");
+                });
+            }
         }
         if matches!(
             state,
@@ -538,18 +615,40 @@ pub async fn handle_whep_offer(
                 log_ice_diagnostics(&pc).await;
             });
         }
+        // Failed and Closed close immediately; Disconnected gets an 8-second grace
+        // period to recover from transient Wi-Fi blips before tearing down the session.
         if matches!(
             state,
-            RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Disconnected
-                | RTCPeerConnectionState::Closed
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
         ) {
             if let Some(tx) = closed_tx.lock().unwrap().take() {
                 let _ = tx.send(());
             }
+        } else if state == RTCPeerConnectionState::Disconnected {
+            let closed_tx = Arc::clone(&closed_tx);
+            let mut cancel_rx = grace_cancel_rx_closure.clone();
+            // Reset cancel signal so a subsequent Disconnected gets its own fresh timer.
+            let _ = grace_cancel_tx.send(false);
+            tokio::spawn(async move {
+                tprintln!("peer connection Disconnected — waiting 8s for recovery before closing");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                        tprintln!("peer connection Disconnected grace period expired — closing session");
+                        if let Some(tx) = closed_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            tprintln!("peer connection recovered before grace period expired — keeping session");
+                        }
+                    }
+                }
+            });
         }
         Box::pin(async {})
     }));
+    let _ = grace_cancel_rx; // keep receiver alive so the watch channel stays open
 
     tprintln!(
         "ICE candidates in remote offer (browser): {}",
@@ -673,6 +772,8 @@ async fn forward_datachannel(
     let mut sub: Option<audio::AudioSubscription> = None;
     let mut since_bp_check: u32 = 0;
     let mut over_backpressure = false;
+    // Reused across packets so the per-packet header write doesn't allocate a fresh Vec ~200/s.
+    let mut scratch: Vec<u8> = Vec::with_capacity(protocol::HEADER_LEN + 512);
     loop {
         if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
             break;
@@ -704,8 +805,15 @@ async fn forward_datachannel(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                let msg = protocol::build_message(pkt.seq, pkt.capture_ns, pkt.flags, &pkt.data);
-                if dc.send(&Bytes::from(msg)).await.is_err() {
+                scratch.resize(protocol::HEADER_LEN + pkt.data.len(), 0);
+                protocol::write_message(
+                    &mut scratch,
+                    pkt.seq,
+                    pkt.capture_ns,
+                    pkt.flags,
+                    &pkt.data,
+                );
+                if dc.send(&Bytes::copy_from_slice(&scratch)).await.is_err() {
                     break;
                 }
             }
@@ -779,6 +887,10 @@ async fn forward_track(
 fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pipeline: Pipeline) {
     use webrtc::stats::StatsReportType;
 
+    // RTT above this threshold is treated as an early congestion signal (rising queue
+    // depth) and triggers a more aggressive bitrate reduction before loss occurs.
+    const RTT_CONGESTION_THRESHOLD_MS: f64 = 80.0;
+
     let max_bps = pipeline.max_bitrate_bps;
     let mut controller = BitrateController::new(DEFAULT_MIN_BITRATE_BPS.min(max_bps), max_bps);
     let mut current_target = max_bps;
@@ -800,6 +912,7 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             let mut bytes_sent: u64 = 0;
             let mut have_outbound = false;
             let mut fraction_lost: f64 = 0.0;
+            let mut max_rtt_ms: f64 = 0.0;
             for stat in report.reports.values() {
                 match stat {
                     StatsReportType::OutboundRTP(s) => {
@@ -808,6 +921,10 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
                     }
                     StatsReportType::RemoteInboundRTP(s) => {
                         fraction_lost = fraction_lost.max(s.fraction_lost);
+                        // round_trip_time is Option<f64> in seconds; convert to ms.
+                        if let Some(rtt_s) = s.round_trip_time {
+                            max_rtt_ms = max_rtt_ms.max(rtt_s * 1000.0);
+                        }
                     }
                     _ => {}
                 }
@@ -835,10 +952,27 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             };
             last_bytes_sent = Some((bytes_sent, now));
 
-            let estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
+            let mut estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
+
+            // RTT early-congestion signal: if RTT is elevated but loss hasn't appeared
+            // yet, queues are building — cut more aggressively (×0.85 vs the ×0.95 that
+            // estimate_from_loss uses for mild loss). Only apply when the RTT signal is
+            // strictly stronger than what loss already indicated.
+            if max_rtt_ms > RTT_CONGESTION_THRESHOLD_MS {
+                let rtt_estimate = (current_target as f64 * 0.85) as u32;
+                if rtt_estimate < estimate {
+                    tprintln!(
+                        "BWE: RTT congestion signal (rtt_ms={max_rtt_ms:.1} > {RTT_CONGESTION_THRESHOLD_MS}ms); \
+                         clamping estimate {estimate} -> {rtt_estimate}"
+                    );
+                    estimate = rtt_estimate;
+                }
+            }
+
             if let Some(target) = controller.update(estimate, now) {
                 tprintln!(
-                    "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, fraction_lost={fraction_lost}, estimate={estimate}, target={target})"
+                    "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, \
+                     fraction_lost={fraction_lost}, rtt_ms={max_rtt_ms:.1}, estimate={estimate}, target={target})"
                 );
                 current_target = target;
                 pipeline.set_target_bitrate(target);

@@ -24,7 +24,7 @@ pub struct EncodedFrame {
     pub capture: Instant,
 }
 
-const BROADCAST_CAPACITY: usize = 2;
+const BROADCAST_CAPACITY: usize = 4;
 
 #[derive(Clone)]
 pub struct Pipeline {
@@ -54,6 +54,9 @@ pub struct SessionCapture {
     control: Option<Box<dyn CaptureBackend>>,
     stop: Arc<AtomicBool>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
+    // Held for the full session so App Nap and timer coalescing are suppressed from the
+    // first capture callback, not just once the encode thread has started (pipeline.rs audit).
+    _activity: super::activity::LatencyActivity,
 }
 
 impl SessionCapture {
@@ -134,7 +137,6 @@ fn run_encode_loop(
     super::qos::raise_current_thread_precedence();
     super::qos::pin_current_thread_encode_affinity();
     let _workgroup = super::qos::FrameWorkgroup::join(frame_duration.as_nanos() as u64);
-    let _activity = super::activity::begin_latency_critical_activity();
     let _keep_awake = super::power::KeepAwake::begin();
 
     let pending_ts: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -197,11 +199,9 @@ fn run_encode_loop(
                     teprintln!("encode submit failed; stopping encode loop");
                     break;
                 }
-                if !encoder.low_latency() && !source.peek_has_frame() {
-                    if let Err(e) = encoder.complete_pending() {
-                        teprintln!("complete_pending failed: {e:?}");
-                    }
-                }
+                // AllowFrameReordering=false + MaxFrameDelayCount<=1 means VT emits each
+                // sample immediately after encoding — no completion barrier needed on the hot
+                // path. complete_pending is kept only in the idle/keepalive branch below.
                 last_emit = Instant::now();
             }
             last_frame = Some(frame);
@@ -260,10 +260,14 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
+    // Begin App Nap suppression BEFORE start_capture so the capture dispatch queue's
+    // first callbacks already run without App Nap or timer coalescing.
+    let activity = super::activity::begin_latency_critical_activity();
     let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
 
     let (pipeline, _stop, _encode_thread) = spawn_pipeline(enc, source)?;
     std::mem::forget(backend);
+    std::mem::forget(activity);
     Ok(pipeline)
 }
 
@@ -284,6 +288,9 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
+    // Begin App Nap suppression BEFORE start_capture so the capture dispatch queue's
+    // first callbacks already run without App Nap or timer coalescing.
+    let activity = super::activity::begin_latency_critical_activity();
     let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
 
     let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source)?;
@@ -292,6 +299,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         control: Some(backend),
         stop,
         encode_thread: Some(encode_thread),
+        _activity: activity,
     })
 }
 

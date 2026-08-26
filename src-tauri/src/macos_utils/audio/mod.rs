@@ -29,6 +29,7 @@ mod test;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -40,9 +41,10 @@ use crate::streamer::audio::{
 };
 use opus_encoder::{OpusEncoder, OpusEncoderConfig, FRAME_INTERLEAVED};
 
-/// Ring capacity in f32 samples (~340 ms of 48 kHz stereo). Rounded up to a power of two by
-/// [`ring::ring`]. Big enough to absorb an encoder-thread scheduling hiccup without overrun.
-const RING_CAPACITY: usize = 48_000 * 2 / 3;
+/// Ring capacity in f32 samples (~80 ms of 48 kHz stereo). Rounded up to a power of two by
+/// [`ring::ring`]. 80 ms is enough to absorb a scheduler hiccup; monotonic burst timestamping
+/// (H-2) makes deep buffering unnecessary, and smaller capacity surfaces backpressure faster.
+const RING_CAPACITY: usize = 48_000 * 2 * 80 / 1000; // 7680 → rounds to 8192
 const ENCODE_WINDOW: usize = 4096;
 const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -97,6 +99,8 @@ pub struct AudioFrameSink {
     pub producer: Arc<ring::Producer>,
     pub diagnostics: Arc<AudioDiagnostics>,
     pub control_tx: Option<crossbeam_channel::Sender<ControlMsg>>,
+    /// Set once by the worker thread so the RT producer can unpark it after each push (M-3).
+    pub consumer_thread: Arc<OnceLock<Thread>>,
 }
 
 /// One shared interface over both backends (PRD §5.1). The encode/transport code above is written
@@ -210,12 +214,13 @@ pub fn start_capture() -> Result<AudioCapture> {
     }
 
     let diagnostics = Arc::new(AudioDiagnostics::default());
-    let (producer, consumer) = ring::ring(RING_CAPACITY);
+    let (producer, consumer, consumer_thread_lock) = ring::ring(RING_CAPACITY);
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<ControlMsg>(8);
     let sink = AudioFrameSink {
         producer: Arc::new(producer),
         diagnostics: Arc::clone(&diagnostics),
         control_tx: Some(ctrl_tx),
+        consumer_thread: consumer_thread_lock,
     };
 
     let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
@@ -321,6 +326,13 @@ fn worker(
     };
     let _ = ready_tx.send(Ok(lookahead));
 
+    // Register this thread with the ring producer so it can unpark us after each push (M-3).
+    // Must be done after the backend has started (and thus the sink's producer is live) but before
+    // we enter the drain loop. set_consumer_thread is idempotent (OnceLock).
+    sink.producer.set_consumer_thread(std::thread::current());
+    // Also publish through the sink's shared handle so backends that hold a sink clone can reach it.
+    sink.consumer_thread.get_or_init(|| std::thread::current());
+
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame starts a fresh timeline
@@ -328,6 +340,11 @@ fn worker(
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
+    // Per-burst monotonic timestamp: seed at burst-start so that frames batched together in one
+    // drain pass get correctly-spaced capture times instead of a cluster at encode completion.
+    const FRAME_NS: u64 = 5_000_000; // 5 ms per Opus frame at 48 kHz
+    let mut burst_t0: u64 = 0;
+    let mut burst_i: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         // React to device-change / invalidation (§5.5), off the real-time path.
@@ -340,6 +357,11 @@ fn worker(
         }
 
         let mut produced = false;
+        // Seed the burst timestamp once per drain pass (the first call to host_now_ns per burst).
+        // Subsequent frames in the same pass are spaced by FRAME_NS, giving monotonically-correct
+        // per-frame capture times even when multiple frames are batched.
+        burst_t0 = host_now_ns();
+        burst_i = 0;
         while consumer.available() >= FRAME_INTERLEAVED {
             if consumer.pop(&mut frame) < FRAME_INTERLEAVED {
                 break;
@@ -370,10 +392,11 @@ fn worker(
             }
             let pkt = AudioPacket {
                 seq,
-                capture_ns: host_now_ns(),
+                capture_ns: burst_t0.saturating_add(burst_i * FRAME_NS),
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
+            burst_i += 1;
             if pkt_tx.send(pkt).is_err() {
                 // No subscribers / bridge dropped — capture is being torn down.
                 backend.stop();
@@ -408,10 +431,14 @@ fn worker(
             last_diag = Instant::now();
         }
 
-        if !produced {
-            // Nothing ready — briefly park. 500 µs is well under the jitter-buffer budget and
-            // avoids a busy-spin. The RT callback keeps filling the ring meanwhile.
-            std::thread::park_timeout(Duration::from_micros(500));
+        if !produced && consumer.available() < FRAME_INTERLEAVED {
+            // Nothing ready — briefly park. 125 µs is well under the jitter-buffer budget and
+            // avoids a busy-spin (8x finer than the 5 ms frame period), while cutting the worst-
+            // case wait for a frame that lands just after the drain loop exits. The extra
+            // available() load gates the park so a frame completed between the while-exit and here
+            // makes us loop again immediately instead of parking. The RT callback keeps filling
+            // the ring meanwhile.
+            std::thread::park_timeout(Duration::from_micros(125));
         }
     }
 

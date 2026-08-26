@@ -106,7 +106,7 @@ impl AudioSource for LegacyVirtualDeviceSource {
         }
 
         // Monitor ring: shm/HAL reader is the producer, the playthrough IOProc is the consumer.
-        let (mon_prod, mon_cons) = ring::ring(MONITOR_RING_CAPACITY);
+        let (mon_prod, mon_cons, _mon_consumer_thread) = ring::ring(MONITOR_RING_CAPACITY);
         let mon_cons = Arc::new(mon_cons);
 
         let gain = MonitorGain::new();

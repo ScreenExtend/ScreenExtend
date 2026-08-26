@@ -33,7 +33,11 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 3;
+
+let estimatedFps = 60;
+let lastRtpTicks = null;
+let lastRtpWallMs = null;
+let backlogCount = 0;
 
 let preferredCodec = null;
 
@@ -75,7 +79,22 @@ function reportAvSync(tsTicks) {
     const a = delta < videoDelayEmaMs ? 0.30 : 0.05;
     videoDelayEmaMs = videoDelayEmaMs * (1 - a) + delta * a;
   }
+
+  // Estimate FPS from inter-frame RTP ticks so the backlog threshold scales with frame rate.
   const nowMs = performance.now();
+  if (lastRtpTicks !== null && lastRtpWallMs !== null) {
+    const tickDelta = ((ts - lastRtpTicks) >>> 0);
+    const wallDelta = nowMs - lastRtpWallMs;
+    if (tickDelta > 0 && wallDelta > 0 && wallDelta < 200) {
+      const frameFps = RTP_HZ / tickDelta;
+      if (frameFps >= 10 && frameFps <= 240) {
+        estimatedFps = estimatedFps * 0.95 + frameFps * 0.05;
+      }
+    }
+  }
+  lastRtpTicks = ts;
+  lastRtpWallMs = nowMs;
+
   if (nowMs - lastAvsyncPostMs > 200) {
     lastAvsyncPostMs = nowMs;
     self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs });
@@ -144,7 +163,7 @@ async function ensureConfigured() {
   }
   decoder = makeDecoder();
   try {
-    decoder.configure({ codec });
+    decoder.configure({ codec, optimizeForLatency: true });
   } catch (err) {
     configError = String(err);
     self.postMessage({ type: 'configerror', message: configError, codec });
@@ -216,12 +235,20 @@ function startPump(readable) {
         continue;
       }
 
-      if (renderedOnce && !waitingForKey && decoder &&
-          decoder.decodeQueueSize > BACKLOG_DROP_THRESHOLD && type !== 'key') {
-        self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
-        waitingForKey = true;
-        requestKey(false);
-        continue;
+      if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
+        const backlogThreshold = Math.max(3, Math.round(estimatedFps * 0.05));
+        if (decoder.decodeQueueSize > backlogThreshold) {
+          backlogCount++;
+          if (backlogCount >= 2) {
+            self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
+            waitingForKey = true;
+            backlogCount = 0;
+            requestKey(false);
+          }
+          continue;
+        } else {
+          backlogCount = 0;
+        }
       }
 
       try {
