@@ -314,7 +314,7 @@ fn start_live_capture(
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(frame_duration),
+        MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         CaptureFlags {

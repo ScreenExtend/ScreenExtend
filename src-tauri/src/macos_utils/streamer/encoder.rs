@@ -308,6 +308,10 @@ impl Encoder {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.complete_pending()
+    }
+
+    pub fn complete_pending(&mut self) -> Result<()> {
         let invalid = CMTime {
             value: 0,
             timescale: 0,

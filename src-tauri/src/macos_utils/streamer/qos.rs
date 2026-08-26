@@ -32,11 +32,15 @@ pub fn pin_current_thread_time_constraint(period_ns: u64) {
     if period_ns == 0 {
         return;
     }
-    let period = ns_to_mach_ticks(period_ns);
+    let computation_ns = period_ns / 8;
+    let constraint_ns = (period_ns / 2)
+        .min(4_000_000)
+        .max(computation_ns + 1_000_000)
+        .min(period_ns);
     let mut data = thread_time_constraint_policy_data_t {
-        period,
-        computation: ns_to_mach_ticks(period_ns / 8),
-        constraint: period,
+        period: ns_to_mach_ticks(period_ns),
+        computation: ns_to_mach_ticks(computation_ns),
+        constraint: ns_to_mach_ticks(constraint_ns),
         preemptible: 1,
     };
     unsafe {

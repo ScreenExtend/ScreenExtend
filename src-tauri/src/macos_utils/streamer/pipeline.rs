@@ -198,7 +198,9 @@ fn run_encode_loop(
                     break;
                 }
                 if !encoder.low_latency() && !source.peek_has_frame() {
-                    let _ = submit_one(&mut encoder, &pending_ts, frame.captured_at, pixbuf, false);
+                    if let Err(e) = encoder.complete_pending() {
+                        teprintln!("complete_pending failed: {e:?}");
+                    }
                 }
                 last_emit = Instant::now();
             }
@@ -211,7 +213,9 @@ fn run_encode_loop(
                         break;
                     }
                     if !encoder.low_latency() {
-                        let _ = submit_one(&mut encoder, &pending_ts, captured, pixbuf, false);
+                        if let Err(e) = encoder.complete_pending() {
+                            teprintln!("complete_pending failed: {e:?}");
+                        }
                     }
                     last_emit = Instant::now();
                 }

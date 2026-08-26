@@ -782,8 +782,8 @@
                         } else {
                             video.srcObject = e.streams[0];
                             try {
-                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
-                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0; } catch (_) {}
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
                             } catch (_) {}
                             showVideo();
                             tryPlay();
