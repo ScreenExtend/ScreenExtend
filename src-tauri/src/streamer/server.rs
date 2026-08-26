@@ -16,9 +16,8 @@ use tokio::sync::oneshot;
 
 use super::config::{Config, ScalePercent};
 use super::pipeline;
-use super::session::{
-    self, DeviceInfo, DeviceOverride, OtpLimiter, OtpOutcome, SharedLocalIps, SharedOtpLimiter,
-};
+use super::platform;
+use super::session::{self, DeviceInfo, OtpLimiter, OtpOutcome, SharedLocalIps, SharedOtpLimiter};
 use super::webrtc_session::{self, RTCIceServer};
 
 const MAX_DEVICE_NAME_CHARS: usize = 64;
@@ -61,7 +60,13 @@ struct JoinRequest {
     refresh_rate: u32,
     width: u32,
     height: u32,
+    #[serde(default = "default_dpr")]
+    dpr: f64,
     sdp: String,
+}
+
+fn default_dpr() -> f64 {
+    1.0
 }
 
 fn sanitize_device_name(raw: &str) -> String {
@@ -95,6 +100,7 @@ pub const MIN_REFRESH_RATE: u32 = 15;
 pub const MAX_REFRESH_RATE: u32 = 500;
 pub const MIN_DISPLAY_SCALE: u32 = 25;
 pub const MAX_DISPLAY_SCALE: u32 = 200;
+pub const MAX_EFFECTIVE_SCALE: u32 = 500;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -706,8 +712,14 @@ async fn start_session(
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
     }
 
-    let width = req.width.clamp(2, 16384) & !1;
-    let height = req.height.clamp(2, 16384) & !1;
+    let native_dpr = if req.dpr.is_finite() { req.dpr } else { 1.0 };
+    let dpr = override_for_ip
+        .map(|o| o.dpr)
+        .unwrap_or(native_dpr)
+        .clamp(1.0, platform::max_display_dpr());
+    let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
+    let width = backing(req.width);
+    let height = backing(req.height);
     let refresh = if cfg.max_fps == 0 {
         60
     } else {
@@ -745,9 +757,11 @@ async fn start_session(
         }
     }
     let swap_axes = portrait != client_portrait;
-    let scale = override_for_ip
+    let base_scale = override_for_ip
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
+    let scale =
+        ((dpr * base_scale as f64).round() as u32).clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
 
     let desired = session::LiveDisplay {
         display_id: 0,
@@ -772,8 +786,8 @@ async fn start_session(
                 if let Ok(Err(e)) = res {
                     teprintln!("could not apply display mode to {name}: {e}");
                 }
-                apply_display_scale(&name, override_for_ip).await;
                 wait_for_display_settle(&name).await;
+                apply_display_scale(&name, scale).await;
                 tprintln!(
                     "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh})",
                     prev.display_id
@@ -787,6 +801,7 @@ async fn start_session(
             (prev.display_id, prev.device_name.clone())
         }
         None => {
+            let extra_modes = dpr_mode_ladder(req.width, req.height, native_dpr);
             let (display_id, device_name) = {
                 let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
 
@@ -795,7 +810,13 @@ async fn start_session(
                 let display_id = {
                     let client = client.clone();
                     tokio::task::spawn_blocking(move || {
-                        client.create_display(display_name, width, height, refresh)
+                        client.create_display_with_modes(
+                            display_name,
+                            width,
+                            height,
+                            refresh,
+                            &extra_modes,
+                        )
                     })
                     .await
                     .context("create-display task")?
@@ -830,7 +851,8 @@ async fn start_session(
                 }
             }
 
-            apply_display_scale(&device_name, override_for_ip).await;
+            wait_for_display_settle(&device_name).await;
+            apply_display_scale(&device_name, scale).await;
             (display_id, device_name)
         }
     };
@@ -890,6 +912,7 @@ async fn start_session(
             screen_size: format!("{}x{}", req.width, req.height),
             refresh_rate: detected_refresh,
             portrait,
+            dpr: req.dpr,
         });
     }
 
@@ -992,10 +1015,30 @@ async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }
 
-async fn apply_display_scale(device_name: &str, over: Option<DeviceOverride>) {
-    let Some(o) = over else { return };
+fn dpr_mode_ladder(css_w: u32, css_h: u32, native_dpr: f64) -> Vec<(u32, u32)> {
+    let cap = platform::max_display_dpr();
+    let even = |v: f64| (v.round() as u32).clamp(2, 16384) & !1;
+    let mut ratios: Vec<f64> = Vec::new();
+    let mut r = 1.0_f64;
+    while r <= cap + 1e-9 {
+        ratios.push(r);
+        r += 0.5;
+    }
+    if native_dpr.is_finite() {
+        ratios.push(native_dpr.clamp(1.0, cap));
+    }
+    let mut modes: Vec<(u32, u32)> = ratios
+        .iter()
+        .map(|&r| (even(css_w as f64 * r), even(css_h as f64 * r)))
+        .collect();
+    modes.sort_unstable();
+    modes.dedup();
+    modes
+}
+
+async fn apply_display_scale(device_name: &str, percent: u32) {
     let name = device_name.to_string();
-    let scale = o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE);
+    let scale = percent.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
     let res = tokio::task::spawn_blocking(move || {
         if let Err(e) = pipeline::set_display_scale(&name, scale) {
             teprintln!("could not set scale for {name}: {e}");

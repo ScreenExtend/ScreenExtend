@@ -28,6 +28,7 @@ impl DeviceReporter for TauriDeviceReporter {
             device.video_scale = o.video_scale;
             device.video_quality = o.video_quality as u32;
             device.control_enabled = o.control_enabled;
+            device.dpr = o.dpr.min(device.max_dpr);
             device.audio_enabled = o.audio_enabled;
         }
         if let Err(e) = DeviceJoin(device).emit(&self.app) {
@@ -44,6 +45,7 @@ impl DeviceReporter for TauriDeviceReporter {
             screen_size: String::new(),
             refresh_rate: 0,
             portrait: false,
+            dpr: 1.0,
         });
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");

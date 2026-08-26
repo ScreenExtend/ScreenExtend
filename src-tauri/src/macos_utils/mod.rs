@@ -176,13 +176,20 @@ pub fn set_device_override(
     video_scale: u32,
     video_quality: u32,
     control_enabled: bool,
+    dpr: f64,
     audio_enabled: bool,
 ) {
     use crate::streamer::config::ScalePercent;
+    use crate::streamer::platform::max_display_dpr;
     use crate::streamer::server::{
         MAX_DISPLAY_SCALE, MAX_REFRESH_RATE, MIN_DISPLAY_SCALE, MIN_REFRESH_RATE,
     };
 
+    let dpr = if dpr.is_finite() {
+        dpr.clamp(1.0, max_display_dpr())
+    } else {
+        1.0
+    };
     state.device_overrides.lock().unwrap().insert(
         ip.clone(),
         DeviceOverride {
@@ -192,6 +199,7 @@ pub fn set_device_override(
             video_scale: ScalePercent::new(video_scale).percent(),
             video_quality: video_quality.clamp(1, 51) as u8,
             control_enabled,
+            dpr,
             audio_enabled,
         },
     );

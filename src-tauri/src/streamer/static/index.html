@@ -275,6 +275,19 @@
                 const isIOS = /iPad|iPhone|iPod/.test(p) || (/Mac/.test(p) && navigator.maxTouchPoints > 1);
                 return !isIOS;
             }
+            function getDpr() {
+                var dpr = window.devicePixelRatio;
+                if (typeof dpr === 'number' && isFinite(dpr) && dpr > 0) return dpr;
+                if (window.matchMedia) {
+                    for (var r = 4; r >= 1; r -= 0.5) {
+                        if (window.matchMedia('(min-resolution: ' + r + 'dppx)').matches ||
+                            window.matchMedia('(-webkit-min-device-pixel-ratio: ' + r + ')').matches) {
+                            return r;
+                        }
+                    }
+                }
+                return 1;
+            }
             function screenGeom() {
                 let w = Math.round(window.screen.width);
                 let h = Math.round(window.screen.height);
@@ -816,6 +829,7 @@
                             refreshRate: joinData.refreshRate,
                             width: joinData.width,
                             height: joinData.height,
+                            dpr: getDpr(),
                             sdp: pc.localDescription.sdp,
                             audioCapabilities: audioCaps,
                         }),

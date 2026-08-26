@@ -99,8 +99,8 @@ async uninstallAudioDriver() : Promise<string> {
 async audioDriverStatus() : Promise<string> {
     return await TAURI_INVOKE("audio_driver_status");
 },
-async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, audioEnabled: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, audioEnabled });
+async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, audioEnabled, dpr });
 },
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
@@ -176,7 +176,7 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; 
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[];
 /**
  * Which system-audio capture backend is active on this host: `"process_tap"` /
  * `"screencapturekit"` (macOS tiers), `"wasapi"` (Windows), or `"unsupported"`. Lets the
@@ -184,7 +184,7 @@ export type CompatibilityReport = { os_name: string; os_version: string; min_os_
  * diagnostics distinguish the tiers (macos-audio PRD §8.4, §10).
  */
 audio_backend: string }
-export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string }
+export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device

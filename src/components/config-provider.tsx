@@ -14,6 +14,8 @@ export type Device = {
   systemAudio: boolean;
   os: string;
   screenSize: string;
+  dpr: number;
+  maxDpr: number;
 };
 
 export type KnownDevice = {
