@@ -68,11 +68,22 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
+    let audio_backend = super::audio::probe_audio_backend();
+    if audio_backend == super::audio::AudioBackend::Unsupported {
+        unsupported.push(UnsupportedApi {
+            name: "System Audio Capture".to_string(),
+            description: "Streams this Mac's audio output to connected devices.".to_string(),
+            required_version: "macOS 10.15 Catalina".to_string(),
+            severity: "optional".to_string(),
+        });
+    }
+
     CompatibilityReport {
         os_name: "macOS".to_string(),
         os_version: os_version_string(),
         min_os_version: "macOS 10.15 Catalina".to_string(),
         os_supported,
         unsupported_apis: unsupported,
+        audio_backend: audio_backend.as_str().to_string(),
     }
 }

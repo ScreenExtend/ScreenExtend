@@ -29,6 +29,7 @@ impl DeviceReporter for TauriDeviceReporter {
             device.video_quality = o.video_quality as u32;
             device.control_enabled = o.control_enabled;
             device.dpr = o.dpr.min(device.max_dpr);
+            device.audio_enabled = o.audio_enabled;
         }
         if let Err(e) = DeviceJoin(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceJoin failed: {e:?}");

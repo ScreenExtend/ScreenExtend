@@ -1,0 +1,5 @@
+# build output (.driver bundle, object files, .pkg)
+build/
+
+# vendored libASPL
+third_party/

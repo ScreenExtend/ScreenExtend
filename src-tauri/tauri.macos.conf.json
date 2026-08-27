@@ -19,7 +19,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": [],
+    "resources": [
+      "resources/libopus.dylib"
+    ],
     "externalBin": [],
     "publisher": "Sarvesh Madullapalli",
     "copyright": "Copyright © 2026 Sarvesh Madullapalli All Rights Reserved",

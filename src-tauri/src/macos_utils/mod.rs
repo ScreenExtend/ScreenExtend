@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod compatibility;
 pub mod device_reporter;
 pub mod hosted_network;
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::path::BaseDirectory;
 use tauri::Manager;
 use tauri::State;
 use virtual_display::MacosVirtualDisplay;
@@ -49,6 +51,7 @@ pub struct AppState {
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
+    pub audio_hub: crate::streamer::audio::SharedAudioHub,
 }
 
 pub type SharedCloudStatus = Arc<Mutex<(String, String)>>;
@@ -115,6 +118,8 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     if app_handle.try_state::<AppState>().is_some() {
         return true;
     }
+
+    audio::legacy::routing::recover_on_launch();
     let virtual_display =
         tauri::async_runtime::spawn_blocking(MacosVirtualDisplay::new_shared).await;
 
@@ -148,6 +153,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
+        audio_hub: crate::streamer::audio::AudioHub::new(),
     };
     app_handle.manage(state);
     true
@@ -155,6 +161,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
 
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub fn set_device_override(
     state: State<'_, AppState>,
     ip: String,
@@ -165,6 +172,7 @@ pub fn set_device_override(
     video_quality: u32,
     control_enabled: bool,
     dpr: f64,
+    audio_enabled: bool,
 ) {
     use crate::streamer::config::ScalePercent;
     use crate::streamer::platform::max_display_dpr;
@@ -187,6 +195,7 @@ pub fn set_device_override(
             video_quality: video_quality.clamp(1, 51) as u8,
             control_enabled,
             dpr,
+            audio_enabled,
         },
     );
     session::bump_reconfig_epoch(&state.sessions, &ip);
@@ -390,6 +399,40 @@ pub fn remove_drivers(_app: tauri::AppHandle) -> bool {
     true
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn install_audio_driver(app: tauri::AppHandle) -> String {
+    let pkg = app
+        .path()
+        .resolve("resources/ScreenExtendAudio.pkg", BaseDirectory::Resource);
+    match pkg {
+        Ok(path) => audio::legacy::installer::install_pkg(&path)
+            .as_str()
+            .to_string(),
+        Err(e) => {
+            teprintln!("[audio] could not resolve installer package: {e}");
+            "failed".to_string()
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn uninstall_audio_driver() -> String {
+    audio::legacy::installer::uninstall().as_str().to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn audio_driver_status() -> String {
+    use audio::legacy::probe::LegacyState;
+    match audio::legacy::installer::health() {
+        LegacyState::Ready => "ready".to_string(),
+        LegacyState::NeedsInstall => "needs_install".to_string(),
+        LegacyState::InstalledButUnhealthy => "installed_but_unhealthy".to_string(),
+    }
+}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();
@@ -421,6 +464,7 @@ pub fn register_cloud_session(
         banned_devices: Some(state.banned_devices.clone()),
         approved_devices: Some(state.approved_devices.clone()),
         otp_limiter: Some(state.otp_limiter.clone()),
+        audio_hub: Some(state.audio_hub.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -511,6 +555,7 @@ pub fn sync_streamers(state: &AppState) {
             banned_devices: Some(state.banned_devices.clone()),
             approved_devices: Some(state.approved_devices.clone()),
             otp_limiter: Some(state.otp_limiter.clone()),
+            audio_hub: Some(state.audio_hub.clone()),
             ..Config::default()
         };
 
