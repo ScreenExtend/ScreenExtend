@@ -168,5 +168,6 @@ pub fn check_system_requirements() -> CompatibilityReport {
         min_os_version: "Windows 10 20H1 (build 19041) / Server 20H2 (build 19042)".to_string(),
         os_supported,
         unsupported_apis: unsupported,
+        audio_backend: "wasapi".to_string(),
     }
 }
