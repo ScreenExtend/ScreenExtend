@@ -1,0 +1,24 @@
+#!/bin/bash
+set -u
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/ScreenExtendAudio.driver"
+
+# ownership + permissions the HAL requires
+chown -R root:wheel "${DRIVER}" 2>/dev/null || true
+chmod -R go-w "${DRIVER}" 2>/dev/null || true
+
+# modern kickstart first, then legacy killall; either may fail
+restarted=0
+if launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null; then
+  restarted=1
+elif killall coreaudiod 2>/dev/null; then
+  restarted=1
+fi
+
+if [ "${restarted}" -eq 1 ]; then
+  echo "coreaudiod restarted; ScreenExtend Audio should appear immediately."
+else
+  echo "coreaudiod could not be restarted automatically; a reboot or re-login is required."
+fi
+
+exit 0

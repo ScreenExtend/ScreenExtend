@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>AudioServerPlugIn_MachServices</key>
+    <array/>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>ScreenExtendAudio</string>
+    <key>CFBundleIdentifier</key>
+    <string>app.screenextend.desktop.audio</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>ScreenExtend Audio</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+      <string>MacOSX</string>
+    </array>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFPlugInFactories</key>
+    <dict>
+      <key>70526F9B-C4FF-4A0E-883C-6805143705DB</key>
+      <string>ScreenExtendAudioEntryPoint</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+      <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+      <array>
+        <string>70526F9B-C4FF-4A0E-883C-6805143705DB</string>
+      </array>
+    </dict>
+    <key>NSHumanReadableCopyright</key>
+    <string>ScreenExtend — AGPL-3.0. Built on libASPL (MIT); see acknowledgements.</string>
+    <key>NSPrincipalClass</key>
+    <string></string>
+    <key>sandboxSafe</key>
+    <true/>
+  </dict>
+</plist>
