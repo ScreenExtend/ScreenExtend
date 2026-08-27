@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod compatibility;
 pub mod device_reporter;
 pub mod driver_ipc;
@@ -55,6 +56,7 @@ pub struct AppState {
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
+    pub audio_hub: crate::streamer::audio::SharedAudioHub,
 }
 
 pub type SharedCloudStatus = Arc<Mutex<(String, String)>>;
@@ -276,6 +278,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
+        audio_hub: crate::streamer::audio::AudioHub::new(),
     };
     app_handle.manage(state);
     true
@@ -294,6 +297,7 @@ pub fn set_device_override(
     video_quality: u32,
     control_enabled: bool,
     dpr: f64,
+    audio_enabled: bool,
 ) {
     use crate::streamer::config::ScalePercent;
     use crate::streamer::platform::max_display_dpr;
@@ -316,6 +320,7 @@ pub fn set_device_override(
             video_quality: video_quality.clamp(1, 51) as u8,
             control_enabled,
             dpr,
+            audio_enabled,
         },
     );
     session::bump_reconfig_epoch(&state.sessions, &ip);
@@ -579,6 +584,24 @@ pub fn remove_drivers(app: tauri::AppHandle) -> bool {
     true
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn install_audio_driver(_app: tauri::AppHandle) -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn uninstall_audio_driver() -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn audio_driver_status() -> String {
+    "unsupported".to_string()
+}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();
@@ -610,6 +633,7 @@ pub fn register_cloud_session(
         banned_devices: Some(state.banned_devices.clone()),
         approved_devices: Some(state.approved_devices.clone()),
         otp_limiter: Some(state.otp_limiter.clone()),
+        audio_hub: Some(state.audio_hub.clone()),
         disable_gpu_encode: state
             .disable_gpu_encode
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -703,6 +727,7 @@ pub fn sync_streamers(state: &AppState) {
             banned_devices: Some(state.banned_devices.clone()),
             approved_devices: Some(state.approved_devices.clone()),
             otp_limiter: Some(state.otp_limiter.clone()),
+            audio_hub: Some(state.audio_hub.clone()),
             disable_gpu_encode: state
                 .disable_gpu_encode
                 .load(std::sync::atomic::Ordering::Relaxed),
