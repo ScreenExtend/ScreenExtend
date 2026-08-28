@@ -15,6 +15,12 @@ let framesRendered = 0;
 let lastKeyRequestAt = 0;
 let configError = null;
 
+const RTP_HZ = 90000;
+let rtpUnwrapLast = null;
+let rtpWraps = 0;
+let videoDelayEmaMs = null;
+let lastAvsyncPostMs = 0;
+
 const CODEC_CANDIDATES = [
   'avc1.640034', 'avc1.640028', 'avc1.64001F',
   'avc1.4D4034', 'avc1.4D401F',
@@ -22,7 +28,11 @@ const CODEC_CANDIDATES = [
 ];
 
 const KEY_REQUEST_MIN_INTERVAL_MS = 250;
-const BACKLOG_DROP_THRESHOLD = 4;
+
+let estimatedFps = 60;
+let lastRtpTicks = null;
+let lastRtpWallMs = null;
+let backlogCount = 0;
 
 let preferredCodec = null;
 
@@ -43,6 +53,44 @@ self.onmessage = (e) => {
     startPump(e.data.readable);
   }
 };
+
+function reportAvSync(tsTicks) {
+  const ts = tsTicks >>> 0;
+  if (rtpUnwrapLast !== null) {
+    const d = ts - rtpUnwrapLast;
+    if (d < -0x80000000) rtpWraps++;
+    else if (d > 0x80000000) rtpWraps--;
+  }
+  rtpUnwrapLast = ts;
+  const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
+  const drawAbsMs = performance.timeOrigin + performance.now();
+  const delta = drawAbsMs - videoHostMs;
+  if (videoDelayEmaMs === null) {
+    videoDelayEmaMs = delta;
+  } else {
+    const a = delta < videoDelayEmaMs ? 0.30 : 0.05;
+    videoDelayEmaMs = videoDelayEmaMs * (1 - a) + delta * a;
+  }
+
+  const nowMs = performance.now();
+  if (lastRtpTicks !== null && lastRtpWallMs !== null) {
+    const tickDelta = ((ts - lastRtpTicks) >>> 0);
+    const wallDelta = nowMs - lastRtpWallMs;
+    if (tickDelta > 0 && wallDelta > 0 && wallDelta < 200) {
+      const frameFps = RTP_HZ / tickDelta;
+      if (frameFps >= 10 && frameFps <= 240) {
+        estimatedFps = estimatedFps * 0.95 + frameFps * 0.05;
+      }
+    }
+  }
+  lastRtpTicks = ts;
+  lastRtpWallMs = nowMs;
+
+  if (nowMs - lastAvsyncPostMs > 200) {
+    lastAvsyncPostMs = nowMs;
+    self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs });
+  }
+}
 
 function postStats() {
   self.postMessage({
@@ -67,6 +115,7 @@ function makeDecoder() {
         if (ctx && frame.timestamp >= renderFromTs) {
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           framesRendered++;
+          reportAvSync(frame.timestamp);
           if (!renderedOnce) {
             renderedOnce = true;
             self.postMessage({ type: 'rendered' });
@@ -93,7 +142,7 @@ async function ensureConfigured() {
     let anySupported = false;
     for (const c of candidates) {
       try {
-        const s = await VideoDecoder.isConfigSupported({ codec: c, optimizeForLatency: true });
+        const s = await VideoDecoder.isConfigSupported({ codec: c });
         if (s && s.supported) { codec = c; anySupported = true; break; }
       } catch (_) {}
     }
@@ -177,12 +226,20 @@ function startPump(readable) {
         continue;
       }
 
-      if (renderedOnce && !waitingForKey && decoder &&
-          decoder.decodeQueueSize > BACKLOG_DROP_THRESHOLD && type !== 'key') {
-        self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
-        waitingForKey = true;
-        requestKey(false);
-        continue;
+      if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
+        const backlogThreshold = Math.max(3, Math.round(estimatedFps * 0.05));
+        if (decoder.decodeQueueSize > backlogThreshold) {
+          backlogCount++;
+          if (backlogCount >= 2) {
+            self.postMessage({ type: 'backlog', size: decoder.decodeQueueSize });
+            waitingForKey = true;
+            backlogCount = 0;
+            requestKey(false);
+          }
+          continue;
+        } else {
+          backlogCount = 0;
+        }
       }
 
       try {

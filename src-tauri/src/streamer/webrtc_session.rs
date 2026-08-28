@@ -5,31 +5,61 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtp::codecs::h264::H264Payloader;
+use webrtc::rtp::packetizer::Payloader;
+use webrtc::rtp::sequence::{new_random_sequencer, Sequencer};
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
 use webrtc::rtp_transceiver::PayloadType;
 use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 pub use webrtc::ice_transport::ice_server::RTCIceServer;
 
+use super::audio::{self, protocol, SharedAudioHub};
 use super::bitrate::{estimate_from_loss, BitrateController, DEFAULT_MIN_BITRATE_BPS};
 use super::config::H264Profile;
 use super::input;
 use super::pipeline::Pipeline;
+use super::session::SharedDeviceOverrides;
 
-const BWE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+const OPUS_FALLBACK_FMTP: &str = "minptime=5;useinbandfec=1;stereo=1;sprop-stereo=1";
+const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone)]
+pub struct AudioParams {
+    pub fast: bool,
+    pub hub: SharedAudioHub,
+    pub overrides: SharedDeviceOverrides,
+    pub device_key: String,
+}
+
+impl AudioParams {
+    fn audio_enabled_now(&self) -> bool {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(&self.device_key)
+            .map(|o| o.audio_enabled)
+            .unwrap_or(false)
+    }
+}
 
 fn h264_fmtp(profile_level_id: &str) -> String {
     format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}")
@@ -105,6 +135,36 @@ fn build_api(profile: H264Profile) -> Result<webrtc::api::API> {
             .context("register RTX codec")?;
     }
 
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
+                    rtcp_feedback: vec![RTCPFeedback {
+                        typ: "nack".to_string(),
+                        parameter: "".to_string(),
+                    }],
+                },
+                payload_type: 111,
+                ..Default::default()
+            },
+            RTPCodecType::Audio,
+        )
+        .context("register Opus codec")?;
+
+    media_engine
+        .register_header_extension(
+            webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability {
+                uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".to_owned(),
+            },
+            RTPCodecType::Video,
+            None,
+        )
+        .context("register playout-delay hdrext")?;
+
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut media_engine)
         .context("register default interceptors")?;
@@ -144,11 +204,13 @@ async fn detect_session_locality(
     let report = pc.get_stats().await;
 
     let mut cand_type: HashMap<String, String> = HashMap::new();
+    let mut cand_ip: HashMap<String, String> = HashMap::new();
     let mut nominated: Option<(String, String)> = None;
     for stat in report.reports.values() {
         match stat {
             StatsReportType::LocalCandidate(c) | StatsReportType::RemoteCandidate(c) => {
                 cand_type.insert(c.id.clone(), format!("{:?}", c.candidate_type));
+                cand_ip.insert(c.id.clone(), c.ip.clone());
             }
             StatsReportType::CandidatePair(p) if p.nominated => {
                 nominated = Some((p.local_candidate_id.clone(), p.remote_candidate_id.clone()));
@@ -172,7 +234,17 @@ async fn detect_session_locality(
         .to_lowercase();
     tprintln!("selected ICE candidate pair (local={lt}, remote={rt})");
 
+    let lip = cand_ip.get(&lid).cloned().unwrap_or_default();
+    let rip = cand_ip.get(&rid).cloned().unwrap_or_default();
+
     if lt.contains("relay") || rt.contains("relay") {
+        if is_private_ip(&lip) && is_private_ip(&rip) && same_subnet_24(&lip, &rip) {
+            teprintln!(
+                "WARNING: same-subnet peers ({lip} <-> {rip}) are routing via relay/router — \
+                 check AP client isolation (and AP-side WMM). Disabling client isolation lets \
+                 the host<->client pair take a direct Wi-Fi path and removes 10-40ms of latency."
+            );
+        }
         SessionLocality::CrossNetwork
     } else if lt.contains("host") && rt.contains("host") {
         SessionLocality::SameNetwork
@@ -180,6 +252,27 @@ async fn detect_session_locality(
         SessionLocality::Unknown
     } else {
         SessionLocality::CrossNetwork
+    }
+}
+
+fn is_private_ip(ip: &str) -> bool {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_private() || v4.is_link_local() || v4.is_loopback()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
+    }
+}
+
+fn same_subnet_24(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(std::net::IpAddr::V4(x)), Ok(std::net::IpAddr::V4(y))) => {
+            let xo = x.octets();
+            let yo = y.octets();
+            xo[0] == yo[0] && xo[1] == yo[1] && xo[2] == yo[2]
+        }
+        _ => false,
     }
 }
 
@@ -267,6 +360,7 @@ pub async fn handle_whep_offer(
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
     input_device: Option<String>,
     control_enabled: bool,
+    audio: Option<AudioParams>,
 ) -> Result<String> {
     let profile = pipeline.h264_profile;
     let api = build_api(profile)?;
@@ -302,15 +396,15 @@ pub async fn handle_whep_offer(
             let dc = Arc::clone(&dc);
             Box::pin(async move {
                 tprintln!("remote-input data channel open: {label}");
-                let dc_for_pong = Arc::clone(&dc);
+                let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let tx = tx.clone();
-                    let dc_pong = Arc::clone(&dc_for_pong);
+                    let dc_pong = dc_for_pong.clone();
                     Box::pin(async move {
                         let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
                             return;
                         };
-                        if is_reliable {
+                        if let Some(dc_pong) = &dc_pong {
                             if let input::protocol::InputEvent::Ping { t_ns } = ev {
                                 let pong = input::protocol::build_pong(t_ns);
                                 let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
@@ -327,7 +421,7 @@ pub async fn handle_whep_offer(
         }));
     }
 
-    let track = Arc::new(TrackLocalStaticSample::new(
+    let track = Arc::new(TrackLocalStaticRTP::new(
         RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
@@ -367,35 +461,64 @@ pub async fn handle_whep_offer(
 
     spawn_bitrate_driver(Arc::clone(&pc), pipeline.clone());
 
+    if let Some(audio) = audio {
+        if let Err(e) = setup_audio(&pc, audio).await {
+            teprintln!("audio: setup failed ({e:#}); continuing without audio");
+        }
+    }
+
     {
         let mut rx = pipeline.tx.subscribe();
-        let frame_duration = pipeline.frame_duration;
         let track = Arc::clone(&track);
         let pc_keepalive = Arc::clone(&pc);
         let pipeline = pipeline.clone();
         tokio::spawn(async move {
             let _pc = pc_keepalive;
-            let mut last_capture: Option<Instant> = None;
+            const RTP_PAYLOAD_MTU: usize = 1200 - 12;
+            let mut payloader = H264Payloader::default();
+            let sequencer = new_random_sequencer();
+            let playout_delay = [webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
+                webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(0, 0),
+            )];
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
-                        let duration = match last_capture {
-                            Some(prev) => frame
-                                .capture
-                                .saturating_duration_since(prev)
-                                .clamp(Duration::from_millis(1), Duration::from_millis(500)),
-                            None => frame_duration,
+                        let rtp_ts =
+                            audio::host_ns_to_rtp90k(audio::host_instant_to_ns(frame.capture));
+                        let payloads = match payloader.payload(RTP_PAYLOAD_MTU, &frame.data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tprintln!("h264 payload failed ({e}); requesting IDR");
+                                pipeline.request_idr();
+                                continue;
+                            }
                         };
-                        last_capture = Some(frame.capture);
-                        if let Err(e) = track
-                            .write_sample(&Sample {
-                                data: frame.data,
-                                duration,
-                                ..Default::default()
-                            })
-                            .await
-                        {
-                            tprintln!("track write_sample failed ({e}); viewer writer stopping");
+                        if payloads.is_empty() {
+                            pipeline.request_idr();
+                            continue;
+                        }
+                        let last = payloads.len().saturating_sub(1);
+                        let mut stop = false;
+                        for (i, payload) in payloads.into_iter().enumerate() {
+                            let pkt = webrtc::rtp::packet::Packet {
+                                header: webrtc::rtp::header::Header {
+                                    version: 2,
+                                    marker: i == last,
+                                    sequence_number: sequencer.next_sequence_number(),
+                                    timestamp: rtp_ts,
+                                    ..Default::default()
+                                },
+                                payload,
+                            };
+                            if let Err(e) =
+                                track.write_rtp_with_extensions(&pkt, &playout_delay).await
+                            {
+                                tprintln!("track write_rtp failed ({e}); viewer writer stopping");
+                                stop = true;
+                                break;
+                            }
+                        }
+                        if stop {
                             break;
                         }
                     }
@@ -417,6 +540,9 @@ pub async fn handle_whep_offer(
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(Mutex::new(closed_tx));
     let input_tx_state = input_tx.clone();
+    let (grace_cancel_tx, grace_cancel_rx) = tokio::sync::watch::channel(false);
+    let grace_cancel_tx = Arc::new(grace_cancel_tx);
+    let grace_cancel_rx_closure = grace_cancel_rx.clone();
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
         tprintln!("peer connection state changed: {state:?}");
         if matches!(
@@ -427,15 +553,16 @@ pub async fn handle_whep_offer(
         ) {
             input_tx_state.release_all();
         }
-        if state == RTCPeerConnectionState::Connected
-            && !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let pc = Arc::clone(&pc_state);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let locality = detect_session_locality(&pc).await;
-                tprintln!("session locality detected: {locality:?}");
-            });
+        if state == RTCPeerConnectionState::Connected {
+            let _ = grace_cancel_tx.send(true);
+            if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let pc = Arc::clone(&pc_state);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let locality = detect_session_locality(&pc).await;
+                    tprintln!("session locality detected: {locality:?}");
+                });
+            }
         }
         if matches!(
             state,
@@ -449,16 +576,35 @@ pub async fn handle_whep_offer(
         }
         if matches!(
             state,
-            RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Disconnected
-                | RTCPeerConnectionState::Closed
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
         ) {
             if let Some(tx) = closed_tx.lock().unwrap().take() {
                 let _ = tx.send(());
             }
+        } else if state == RTCPeerConnectionState::Disconnected {
+            let closed_tx = Arc::clone(&closed_tx);
+            let mut cancel_rx = grace_cancel_rx_closure.clone();
+            let _ = grace_cancel_tx.send(false);
+            tokio::spawn(async move {
+                tprintln!("peer connection Disconnected — waiting 8s for recovery before closing");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => {
+                        tprintln!("peer connection Disconnected grace period expired — closing session");
+                        if let Some(tx) = closed_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            tprintln!("peer connection recovered before grace period expired — keeping session");
+                        }
+                    }
+                }
+            });
         }
         Box::pin(async {})
     }));
+    let _ = grace_cancel_rx; // keep receiver alive so the watch channel stays open
 
     tprintln!(
         "ICE candidates in remote offer (browser): {}",
@@ -498,8 +644,200 @@ pub async fn handle_whep_offer(
     Ok(local.sdp)
 }
 
+async fn setup_audio(
+    pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    audio: AudioParams,
+) -> Result<()> {
+    if audio.fast {
+        let init = RTCDataChannelInit {
+            ordered: Some(false),
+            max_retransmits: Some(0),
+            ..Default::default()
+        };
+        let dc = pc
+            .create_data_channel("audio", Some(init))
+            .await
+            .context("create audio data channel")?;
+        tprintln!("audio: created unordered/no-retransmit DataChannel 'audio'");
+        let dc_for_open = Arc::clone(&dc);
+        let pc_for_open = Arc::clone(pc);
+        dc.on_open(Box::new(move || {
+            let dc = Arc::clone(&dc_for_open);
+            let pc = Arc::clone(&pc_for_open);
+            let audio = audio.clone();
+            Box::pin(async move {
+                tokio::spawn(forward_datachannel(pc, dc, audio));
+            })
+        }));
+    } else {
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                clock_rate: 48000,
+                channels: 2,
+                sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
+                rtcp_feedback: vec![],
+            },
+            "audio".to_owned(),
+            "webrtc-streamer".to_owned(),
+        ));
+        pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .context("add_track(opus fallback)")?;
+        tprintln!("audio: added standard Opus track (NetEQ fallback path)");
+        tokio::spawn(forward_track(Arc::clone(pc), track, audio));
+    }
+    Ok(())
+}
+
+fn pc_alive(pc: &webrtc::peer_connection::RTCPeerConnection) -> bool {
+    !matches!(
+        pc.connection_state(),
+        RTCPeerConnectionState::Closed
+            | RTCPeerConnectionState::Failed
+            | RTCPeerConnectionState::Disconnected
+    )
+}
+
+async fn subscribe_blocking(hub: &SharedAudioHub) -> Option<audio::AudioSubscription> {
+    let hub = Arc::clone(hub);
+    match tokio::task::spawn_blocking(move || hub.subscribe()).await {
+        Ok(Ok(sub)) => Some(sub),
+        Ok(Err(e)) => {
+            teprintln!("audio: subscribe failed ({e:#})");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+async fn unsubscribe_blocking(hub: &SharedAudioHub) {
+    let hub = Arc::clone(hub);
+    let _ = tokio::task::spawn_blocking(move || hub.unsubscribe()).await;
+}
+
+async fn forward_datachannel(
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    dc: Arc<RTCDataChannel>,
+    audio: AudioParams,
+) {
+    let mut sub: Option<audio::AudioSubscription> = None;
+    let mut since_bp_check: u32 = 0;
+    let mut over_backpressure = false;
+    let mut scratch: Vec<u8> = Vec::with_capacity(protocol::HEADER_LEN + 512);
+    loop {
+        if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
+            break;
+        }
+        let want = audio.audio_enabled_now();
+        match (want, sub.is_some()) {
+            (true, false) => sub = subscribe_blocking(&audio.hub).await,
+            (false, true) => {
+                sub = None;
+                unsubscribe_blocking(&audio.hub).await;
+            }
+            _ => {}
+        }
+
+        let Some(s) = sub.as_mut() else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+
+        match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
+            Ok(Ok(pkt)) => {
+                if since_bp_check == 0 {
+                    over_backpressure = dc.buffered_amount().await > AUDIO_BACKPRESSURE_BYTES;
+                }
+                since_bp_check = (since_bp_check + 1) % 4;
+                if over_backpressure {
+                    s.diagnostics
+                        .dropped_backpressure
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                scratch.resize(protocol::HEADER_LEN + pkt.data.len(), 0);
+                protocol::write_message(
+                    &mut scratch,
+                    pkt.seq,
+                    pkt.capture_ns,
+                    pkt.flags,
+                    &pkt.data,
+                );
+                if dc.send(&Bytes::copy_from_slice(&scratch)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                sub = None;
+            }
+            Err(_) => continue,
+        }
+    }
+    if sub.take().is_some() {
+        unsubscribe_blocking(&audio.hub).await;
+    }
+    tprintln!("audio: DataChannel forwarder stopped");
+}
+
+async fn forward_track(
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    track: Arc<TrackLocalStaticSample>,
+    audio: AudioParams,
+) {
+    let frame_duration = Duration::from_millis(5); // 5 ms Opus frames
+    let mut sub: Option<audio::AudioSubscription> = None;
+    loop {
+        if !pc_alive(&pc) {
+            break;
+        }
+        let want = audio.audio_enabled_now();
+        match (want, sub.is_some()) {
+            (true, false) => sub = subscribe_blocking(&audio.hub).await,
+            (false, true) => {
+                sub = None;
+                unsubscribe_blocking(&audio.hub).await;
+            }
+            _ => {}
+        }
+
+        let Some(s) = sub.as_mut() else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+
+        match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
+            Ok(Ok(pkt)) => {
+                if track
+                    .write_sample(&Sample {
+                        data: pkt.data,
+                        duration: frame_duration,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                sub = None;
+            }
+            Err(_) => continue,
+        }
+    }
+    if sub.take().is_some() {
+        unsubscribe_blocking(&audio.hub).await;
+    }
+    tprintln!("audio: track forwarder stopped");
+}
+
 fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pipeline: Pipeline) {
     use webrtc::stats::StatsReportType;
+
+    const RTT_CONGESTION_THRESHOLD_MS: f64 = 80.0;
 
     let max_bps = pipeline.max_bitrate_bps;
     let mut controller = BitrateController::new(DEFAULT_MIN_BITRATE_BPS.min(max_bps), max_bps);
@@ -522,6 +860,7 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             let mut bytes_sent: u64 = 0;
             let mut have_outbound = false;
             let mut fraction_lost: f64 = 0.0;
+            let mut max_rtt_ms: f64 = 0.0;
             for stat in report.reports.values() {
                 match stat {
                     StatsReportType::OutboundRTP(s) => {
@@ -530,6 +869,9 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
                     }
                     StatsReportType::RemoteInboundRTP(s) => {
                         fraction_lost = fraction_lost.max(s.fraction_lost);
+                        if let Some(rtt_s) = s.round_trip_time {
+                            max_rtt_ms = max_rtt_ms.max(rtt_s * 1000.0);
+                        }
                     }
                     _ => {}
                 }
@@ -557,10 +899,23 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             };
             last_bytes_sent = Some((bytes_sent, now));
 
-            let estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
+            let mut estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
+
+            if max_rtt_ms > RTT_CONGESTION_THRESHOLD_MS {
+                let rtt_estimate = (current_target as f64 * 0.85) as u32;
+                if rtt_estimate < estimate {
+                    tprintln!(
+                        "BWE: RTT congestion signal (rtt_ms={max_rtt_ms:.1} > {RTT_CONGESTION_THRESHOLD_MS}ms); \
+                         clamping estimate {estimate} -> {rtt_estimate}"
+                    );
+                    estimate = rtt_estimate;
+                }
+            }
+
             if let Some(target) = controller.update(estimate, now) {
                 tprintln!(
-                    "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, fraction_lost={fraction_lost}, estimate={estimate}, target={target})"
+                    "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, \
+                     fraction_lost={fraction_lost}, rtt_ms={max_rtt_ms:.1}, estimate={estimate}, target={target})"
                 );
                 current_target = target;
                 pipeline.set_target_bitrate(target);
