@@ -136,6 +136,10 @@
       "uninstall": "Remove audio component",
       "uninstalledTitle": "Audio component removed",
       "uninstalledBody": "ScreenExtend Audio was removed and your default output device restored."
+    },
+    "volumeKeyProxy": {
+      "label": "Proxy volume keys",
+      "tip": "While ScreenExtend Audio is your Mac's output device, send the hardware volume and mute keys straight to it. Enable this only if the volume keys stop responding while streaming."
     }
   },
   "notifications": {

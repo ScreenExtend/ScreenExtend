@@ -316,6 +316,7 @@ pub fn run() {
             install_audio_driver,
             uninstall_audio_driver,
             audio_driver_status,
+            set_legacy_volume_key_proxy,
             set_device_override,
             remove_device_override,
             set_device_banned,

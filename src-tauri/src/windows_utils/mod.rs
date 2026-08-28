@@ -602,6 +602,10 @@ pub fn audio_driver_status() -> String {
     "unsupported".to_string()
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();

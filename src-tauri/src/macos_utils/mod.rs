@@ -433,6 +433,12 @@ pub fn audio_driver_status() -> String {
     }
 }
 
+#[tauri::command]
+#[specta::specta]
+pub fn set_legacy_volume_key_proxy(enabled: bool) {
+    audio::legacy::volume_keys::set_enabled(enabled);
+}
+
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
     let client = client.clone();
     let _ = std::thread::spawn(move || client.remove_all_displays()).join();
