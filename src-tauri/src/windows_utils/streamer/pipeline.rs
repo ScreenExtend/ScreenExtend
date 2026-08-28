@@ -21,7 +21,9 @@ use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo};
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
-use super::nvidia::encoder::{Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER};
+use super::nvidia::encoder::{
+    Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER, SlotEncodeError,
+};
 use super::scaler::{Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
@@ -38,7 +40,7 @@ const SP_WIDTH: u32 = 1280;
 const SP_HEIGHT: u32 = 720;
 const SP_FPS: u32 = 30;
 const SP_BITRATE_BPS: u32 = 6_000_000;
-const BROADCAST_CAPACITY: usize = 2;
+const BROADCAST_CAPACITY: usize = 4;
 
 #[derive(Clone)]
 pub struct Pipeline {
@@ -314,7 +316,7 @@ fn start_live_capture(
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(frame_duration),
+        MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3),
         DirtyRegionSettings::Default,
         ColorFormat::Bgra8,
         CaptureFlags {
@@ -542,6 +544,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
     let mut dirty = false;
     let mut next_due = Instant::now();
+    let mut was_idle = true;
     let mut busy_streak: u32 = 0;
     let mut frames_sent: u64 = 0;
     let mut timing_sum_ns: u128 = 0;
@@ -557,10 +560,18 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             let rem = next_due.saturating_duration_since(Instant::now());
             (rem.as_micros() / 1000) as u32
         } else {
-            50
+            8
         };
         match dup.poll(timeout_ms) {
-            Ok(PollStatus::Dirty) => dirty = true,
+            Ok(PollStatus::Dirty) => {
+                if !dirty {
+                    if was_idle {
+                        next_due = Instant::now();
+                    }
+                    was_idle = false;
+                }
+                dirty = true;
+            }
             Ok(PollStatus::Timeout) => {}
             Err(e) => {
                 teprintln!("dxgi capture: {e:?}; stopping capture");
@@ -614,6 +625,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             capture,
         });
         dirty = false;
+        was_idle = true;
         next_due = capture + frame_duration;
 
         frames_sent += 1;
@@ -969,7 +981,8 @@ impl EncodeCore {
 }
 
 struct LiveCapture {
-    core: Arc<Mutex<EncodeCore>>,
+    core: Option<Arc<Mutex<EncodeCore>>>,
+    ring: Option<AsyncNvencRing>,
     tx: broadcast::Sender<EncodedFrame>,
     epoch: Instant,
     last_frame_at: Arc<AtomicU64>,
@@ -987,6 +1000,9 @@ struct LiveCapture {
 impl Drop for LiveCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut ring) = self.ring.take() {
+            ring.stop();
+        }
     }
 }
 
@@ -1013,6 +1029,314 @@ fn build_zero_copy(
             igpu_mutex,
         },
     ))
+}
+
+fn build_zero_copy_ring(
+    config: EncoderConfig,
+    igpu_device: &ID3D11Device,
+    igpu_context: &ID3D11DeviceContext,
+    ring: usize,
+) -> Result<(Encoder, Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>)> {
+    let _ = igpu_context; // context is passed for symmetry with build_zero_copy / used by caller
+    let encoder = Encoder::new_shared_ring(config, ring)?;
+    let handles = encoder.shared_handles();
+    if handles.len() != ring {
+        bail!(
+            "ring encoder produced {} handles, expected {}",
+            handles.len(),
+            ring
+        );
+    }
+    let device1: ID3D11Device1 = igpu_device.cast().context("iGPU device as ID3D11Device1")?;
+    let mut pairs: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)> = Vec::with_capacity(ring);
+    for handle in handles {
+        let shared_igpu: ID3D11Texture2D = unsafe { device1.OpenSharedResource1(handle) }
+            .context("OpenSharedResource1 on iGPU (ring)")?;
+        let igpu_mutex: IDXGIKeyedMutex = shared_igpu
+            .cast()
+            .context("opened shared ring texture as IDXGIKeyedMutex")?;
+        pairs.push((shared_igpu, igpu_mutex));
+    }
+    Ok((encoder, pairs))
+}
+
+struct ReadyMsg {
+    slot: usize,
+    force_idr: bool,
+    capture: Instant,
+}
+
+struct AsyncNvencRing {
+    shared_igpu: Vec<ID3D11Texture2D>,
+    igpu_mutex: Vec<IDXGIKeyedMutex>,
+    igpu_context: ID3D11DeviceContext,
+    scaler: Option<Scaler>,
+    free_slots: crossbeam_channel::Sender<usize>,
+    free_recv: crossbeam_channel::Receiver<usize>,
+    ready: crossbeam_channel::Sender<ReadyMsg>,
+    encode_join: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    last_frame_at: Arc<AtomicU64>,
+    idr_request: Arc<AtomicBool>,
+    epoch: Instant,
+    frame_index: u64,
+}
+
+impl AsyncNvencRing {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        encoder: Encoder,
+        pairs: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+        igpu_context: ID3D11DeviceContext,
+        scaler: Option<Scaler>,
+        tx: broadcast::Sender<EncodedFrame>,
+        target_bitrate: Arc<AtomicU32>,
+        initial_bitrate: u32,
+        last_frame_at: Arc<AtomicU64>,
+        idr_request: Arc<AtomicBool>,
+        epoch: Instant,
+    ) -> Self {
+        let k = pairs.len();
+        let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+
+        let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<ReadyMsg>(k);
+        for slot in 0..k {
+            free_tx.send(slot).expect("prefill free_slots");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let encode_join = {
+            let stop = Arc::clone(&stop);
+            let free_tx = free_tx.clone();
+            let last_frame_at = Arc::clone(&last_frame_at);
+            std::thread::Builder::new()
+                .name("nvenc-ring-encode".to_string())
+                .spawn(move || {
+                    ring_encode_thread(
+                        encoder,
+                        ready_rx,
+                        free_tx,
+                        tx,
+                        target_bitrate,
+                        initial_bitrate,
+                        last_frame_at,
+                        stop,
+                    )
+                })
+                .expect("spawn nvenc ring encode thread")
+        };
+
+        Self {
+            shared_igpu,
+            igpu_mutex,
+            igpu_context,
+            scaler,
+            free_slots: free_tx,
+            free_recv: free_rx,
+            ready: ready_tx,
+            encode_join: Some(encode_join),
+            stop,
+            last_frame_at,
+            idr_request,
+            epoch,
+            frame_index: 0,
+        }
+    }
+
+    fn stage(&mut self, raw: &ID3D11Texture2D) -> Result<bool> {
+        let slot = match self.free_recv.try_recv() {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        let mutex = &self.igpu_mutex[slot];
+        let dst = &self.shared_igpu[slot];
+
+        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+            .context("ring iGPU keyed mutex AcquireSync(writer)")
+        {
+            let _ = self.free_slots.send(slot);
+            return Err(e);
+        }
+
+        let staged = unsafe {
+            let r = match self.scaler.as_mut() {
+                Some(s) => s.scale_into(raw, dst),
+                None => {
+                    self.igpu_context.CopyResource(dst, raw);
+                    Ok(())
+                }
+            };
+            self.igpu_context.Flush();
+            r
+        };
+        let released = unsafe { mutex.ReleaseSync(KEY_ENCODER) };
+
+        if let Err(e) = staged {
+            teprintln!("ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle");
+        }
+        if let Err(e) = released {
+            let _ = self.free_slots.send(slot);
+            return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
+        }
+
+        let force_idr = self.frame_index == 0 || self.idr_request.swap(false, Ordering::Relaxed);
+        self.frame_index += 1;
+        let msg = ReadyMsg {
+            slot,
+            force_idr,
+            capture: Instant::now(),
+        };
+        if self.ready.send(msg).is_err() {
+            let _ = self.free_slots.send(slot);
+            bail!("ring encode thread disconnected");
+        }
+        self.last_frame_at
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.encode_join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for AsyncNvencRing {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ring_encode_thread(
+    mut encoder: Encoder,
+    ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
+    free_tx: crossbeam_channel::Sender<usize>,
+    tx: broadcast::Sender<EncodedFrame>,
+    target_bitrate: Arc<AtomicU32>,
+    initial_bitrate: u32,
+    last_frame_at: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    let _thread_tuning = tuning::tune_current_thread();
+    let mut current_bitrate = initial_bitrate;
+    let _ = last_frame_at;
+    let keepalive = Duration::from_millis(200);
+    let mut held_slot: Option<usize> = None;
+    let mut poisoned_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let release_and_hold =
+        |free_tx: &crossbeam_channel::Sender<usize>, held: &mut Option<usize>, slot: usize| -> bool {
+            if let Some(prev) = held.take() {
+                if free_tx.send(prev).is_err() {
+                    return false;
+                }
+            }
+            *held = Some(slot);
+            true
+        };
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match ready_rx.recv_timeout(keepalive) {
+            Ok(msg) => {
+                if poisoned_slots.contains(&msg.slot) {
+                    teprintln!(
+                        "ring encode: skipping poisoned slot {} (keyed mutex wedged at KEY_ENCODER)",
+                        msg.slot
+                    );
+                    let _ = free_tx.send(msg.slot);
+                    continue;
+                }
+
+                apply_pending_bitrate_atomic(&mut encoder, &target_bitrate, &mut current_bitrate);
+                match encoder.encode_input_slot(msg.slot, msg.force_idr) {
+                    Ok(au) => {
+                        let _ = tx.send(EncodedFrame {
+                            data: Bytes::from(au),
+                            capture: msg.capture,
+                        });
+                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                            break;
+                        }
+                    }
+                    Err(SlotEncodeError::Poisoned(e)) => {
+                        teprintln!(
+                            "ring encode: slot {} poisoned (AcquireSync failed — GPU hang or driver fault): {e:?}",
+                            msg.slot
+                        );
+                        poisoned_slots.insert(msg.slot);
+
+                        let held_poisoned = held_slot.map_or(false, |s| poisoned_slots.contains(&s));
+                        if held_poisoned || held_slot.is_none() {
+                            teprintln!(
+                                "ring encode: CRITICAL — held slot also poisoned or absent; \
+                                 ring is unrecoverable, stopping encode thread"
+                            );
+                            break;
+                        }
+                    }
+                    Err(SlotEncodeError::Encode(e)) => {
+                        teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
+                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if let Some(slot) = held_slot {
+                    if poisoned_slots.contains(&slot) {
+                        held_slot = None;
+                        continue;
+                    }
+                    apply_pending_bitrate_atomic(
+                        &mut encoder,
+                        &target_bitrate,
+                        &mut current_bitrate,
+                    );
+                    match encoder.encode_repeat_slot(slot) {
+                        Ok(au) => {
+                            let _ = tx.send(EncodedFrame {
+                                data: Bytes::from(au),
+                                capture: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            teprintln!("ring keepalive encode failed (slot={slot}): {e:?}");
+                        }
+                    }
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    tprintln!("nvenc ring encode thread stopped");
+}
+
+fn apply_pending_bitrate_atomic(
+    encoder: &mut Encoder,
+    target_bitrate: &AtomicU32,
+    current: &mut u32,
+) {
+    let pending = target_bitrate.swap(0, Ordering::Relaxed);
+    if pending == 0 || pending == *current {
+        return;
+    }
+    match encoder.set_bitrate(pending) {
+        Ok(()) => {
+            tprintln!("adapting bitrate: {} -> {pending} bps", *current);
+            *current = pending;
+        }
+        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+    }
 }
 
 fn build_backend(
@@ -1216,6 +1540,78 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         let thread_tuning = tuning::tune_current_thread();
         let keep_awake = tuning::KeepAwake::begin();
 
+        let epoch = Instant::now();
+        let last_frame_at = Arc::new(AtomicU64::new(0));
+        let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        use crate::streamer::config::EncoderVendor;
+        const RING: usize = 3;
+        let try_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
+        if try_ring {
+            match build_zero_copy_ring(config, &ctx.device, &ctx.device_context, RING) {
+                Ok((encoder, pairs)) => {
+                    tuning::raise_d3d11_gpu_priority(encoder.device());
+
+                    let scaler = if config.width != native_w || config.height != native_h {
+                        match Scaler::new(
+                            &ctx.device,
+                            &ctx.device_context,
+                            native_w,
+                            native_h,
+                            config.width,
+                            config.height,
+                        ) {
+                            Ok(s) => Some(s),
+                            Err(e) => return Err(e.context("building GPU downscaler for --scale")),
+                        }
+                    } else {
+                        None
+                    };
+
+                    let ring = AsyncNvencRing::new(
+                        encoder,
+                        pairs,
+                        ctx.device_context.clone(),
+                        scaler,
+                        tx.clone(),
+                        Arc::clone(&target_bitrate),
+                        config.bitrate_bps,
+                        Arc::clone(&last_frame_at),
+                        Arc::clone(&idr_request),
+                        epoch,
+                    );
+
+                    tprintln!(
+                        "pipeline: live capture ready -- NVENC ZERO-COPY RING (K={}) decoupled path ({}x{}@{})",
+                        RING, config.width, config.height, config.fps
+                    );
+
+                    return Ok(Self {
+                        core: None,
+                        ring: Some(ring),
+                        tx,
+                        epoch,
+                        last_frame_at,
+                        path_name: "zero-copy-ring",
+                        frames_sent: 0,
+                        busy_streak: 0,
+                        stop,
+                        _thread_tuning: thread_tuning,
+                        _keep_awake: keep_awake,
+                        timing_sum_ns: 0,
+                        timing_count: 0,
+                        timing_max_ns: 0,
+                    });
+                }
+                Err(e) => {
+                    teprintln!(
+                        "NVENC zero-copy ring unavailable ({e:?}); falling back to classic backend path"
+                    );
+                }
+            }
+        }
+
         let backend = build_backend(
             config,
             vendor,
@@ -1261,11 +1657,6 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             frame_index: 0,
         }));
 
-        let epoch = Instant::now();
-        let last_frame_at = Arc::new(AtomicU64::new(0));
-        let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
-        let stop = Arc::new(AtomicBool::new(false));
-
         spawn_repeater(
             Arc::clone(&core),
             tx.clone(),
@@ -1278,7 +1669,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         );
 
         Ok(Self {
-            core,
+            core: Some(core),
+            ring: None,
             tx,
             epoch,
             last_frame_at,
@@ -1302,8 +1694,22 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         let capture = Instant::now();
         let t0 = capture;
 
+        if let Some(ring) = self.ring.as_mut() {
+            match ring.stage(frame.as_raw_texture()) {
+                Ok(_staged) => {}
+                Err(e) => {
+                    teprintln!("ring capture stage failed: {e:?}");
+                }
+            }
+            return Ok(());
+        }
+
+        let core = self
+            .core
+            .as_ref()
+            .expect("classic path must have an EncodeCore");
         let encode_res = {
-            let mut core = self.core.lock().expect("encode core mutex poisoned");
+            let mut core = core.lock().expect("encode core mutex poisoned");
             core.encode_captured(frame)
         };
         let au = match encode_res {

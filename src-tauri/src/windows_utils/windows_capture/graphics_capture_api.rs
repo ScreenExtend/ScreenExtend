@@ -193,9 +193,8 @@ impl GraphicsCaptureApi {
 
         let pixel_format = DirectXPixelFormat(color_format as i32);
 
-        // Create frame pool
         let frame_pool =
-            Direct3D11CaptureFramePool::Create(&direct3d_device, pixel_format, 1, item.Size()?)?;
+            Direct3D11CaptureFramePool::Create(&direct3d_device, pixel_format, 3, item.Size()?)?;
         let frame_pool = Arc::new(frame_pool);
 
         // Create capture session
