@@ -1,6 +1,6 @@
 use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2_core_wlan::{CWChannel, CWInterface, CWInterfaceMode, CWWiFiClient};
+use objc2_core_wlan::{CWChannel, CWChannelBand, CWInterface, CWInterfaceMode, CWWiFiClient};
 use objc2_foundation::{NSData, NSError, NSString};
 use tauri::{AppHandle, State};
 use tauri_specta::Event;
@@ -33,8 +33,18 @@ pub fn turn_on_wifi() -> bool {
     unsafe { interface.setPower_error(true) }.is_ok()
 }
 
+const PREFERRED_5GHZ_CHANNELS: [isize; 4] = [36, 40, 44, 48];
+
 fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
     let channels = unsafe { interface.supportedWLANChannels() }?;
+
+    for channel in channels.iter() {
+        let is_5ghz = unsafe { channel.channelBand() } == CWChannelBand::Band5GHz;
+        if is_5ghz && PREFERRED_5GHZ_CHANNELS.contains(&unsafe { channel.channelNumber() }) {
+            return Some(channel);
+        }
+    }
+
     let mut fallback: Option<Retained<CWChannel>> = None;
     for channel in channels.iter() {
         if unsafe { channel.channelNumber() } == PREFERRED_CHANNEL {
@@ -42,6 +52,7 @@ fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
         }
         fallback.get_or_insert(channel);
     }
+
     fallback
 }
 
@@ -85,6 +96,26 @@ fn try_start_host_ap(
     success
 }
 
+fn try_start_on_channel(
+    interface: &objc2_core_wlan::CWInterface,
+    channel: &CWChannel,
+    name: &str,
+    password: &str,
+    had_password: bool,
+    fell_back: &mut bool,
+    app: &tauri::AppHandle,
+) -> bool {
+    if had_password && try_start_host_ap(interface, channel, name, Some(password)) {
+        return true;
+    }
+    let started_open = try_start_host_ap(interface, channel, name, None);
+    if started_open && had_password {
+        *fell_back = true;
+        let _ = crate::HostedNetworkNoPassword.emit(app);
+    }
+    started_open
+}
+
 fn stop_host_ap_mode() {
     if let Some(interface) = wifi_interface() {
         unsafe {
@@ -111,20 +142,38 @@ pub fn start_hosted_network(
     };
 
     let had_password = !password.is_empty();
+    if had_password && password.len() < 10 {
+        *state.hosted_network_running.lock().unwrap() = false;
+        let _ = crate::HostedNetworkNoPassword.emit(&app);
+        return false;
+    }
+
     let mut fell_back = false;
-    let started = if had_password && try_start_host_ap(&interface, &channel, name, Some(password)) {
-        true
+    let started = try_start_on_channel(&interface, &channel, name, password, had_password, &mut fell_back, &app);
+    let started = if !started {
+        let ch11_fallback = {
+            let channels = unsafe { interface.supportedWLANChannels() };
+            channels.and_then(|chs| {
+                chs.iter().find(|c| unsafe { c.channelNumber() } == PREFERRED_CHANNEL)
+            })
+        };
+        if let Some(ref ch11) = ch11_fallback {
+            let ch11_num = unsafe { ch11.channelNumber() };
+            let orig_num = unsafe { channel.channelNumber() };
+            if ch11_num != orig_num {
+                try_start_on_channel(&interface, ch11, name, password, had_password, &mut fell_back, &app)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     } else {
-        let started_open = try_start_host_ap(&interface, &channel, name, None);
-        fell_back = started_open && had_password;
-        started_open
+        started
     };
 
     if started {
         *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
-    }
-    if fell_back {
-        let _ = crate::HostedNetworkNoPassword.emit(&app);
     }
     *state.hosted_network_running.lock().unwrap() = started;
     started
