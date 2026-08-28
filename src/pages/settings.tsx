@@ -736,10 +736,10 @@ export default function Settings() {
                     {sortedKnownDevices.map(device => (
                       <TableRow key={device.ip} className={device.banned ? "opacity-60" : ""}>
                         <TableCell className="font-medium">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center space-x-2">
                             <span>{device.name || "Unknown device"}</span>
                             {isConnected(device.ip) && (
-                              <span className="inline-flex items-center gap-1 text-xs text-green-600">
+                              <span className="inline-flex items-center space-x-1 text-xs text-green-600">
                                 <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
                                 Connected
                               </span>
@@ -756,7 +756,7 @@ export default function Settings() {
                         <TableCell>{device.ip}</TableCell>
                         <TableCell className="text-muted-foreground">{formatLastSeen(device.lastSeen)}</TableCell>
                         <TableCell className="text-right">
-                          <div className="flex items-center justify-end gap-2">
+                          <div className="flex items-center justify-end space-x-2">
                             <Button
                               variant="outline"
                               size="sm"
@@ -801,8 +801,8 @@ export default function Settings() {
                 className="hidden"
                 onChange={onFileSelected}
               />
-              <div className="flex items-center gap-5 px-0">
-                <div className="flex flex-col items-center gap-1.5">
+              <div className="flex items-center space-x-5 px-0">
+                <div className="flex flex-col items-center space-y-1.5">
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
@@ -875,7 +875,7 @@ export default function Settings() {
               </div>
             </CardHeader>
             <CardContent>
-              <div className="flex items-center gap-3 px-0">
+              <div className="flex items-center space-x-3 px-0">
                 <Button
                   variant="outline"
                   size="icon"
@@ -1204,11 +1204,11 @@ export default function Settings() {
             />
           </div>
           <div className="space-y-1 text-sm">
-            <div className="flex justify-between gap-4">
+            <div className="flex justify-between space-x-4">
               <span className="text-muted-foreground">{t("dialogs.wifiQr.networkLabel")}</span>
               <span className="break-all text-right font-medium">{oldHostedNetworkName}</span>
             </div>
-            <div className="flex justify-between gap-4">
+            <div className="flex justify-between space-x-4">
               <span className="text-muted-foreground">{t("dialogs.wifiQr.passwordLabel")}</span>
               <span className="break-all text-right font-medium">{oldHostedNetworkPassword || t("dialogs.wifiQr.noPassword")}</span>
             </div>

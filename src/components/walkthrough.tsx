@@ -237,7 +237,7 @@ export function WalkthroughCard({
 
   return (
     <Card className="w-[340px] max-w-[90vw] p-5 shadow-xl">
-      <div className="flex items-start gap-3">
+      <div className="flex items-start space-x-3">
         <h3 className="flex-1 text-base font-semibold leading-tight pt-0.5">{step.title}</h3>
         {skipTour && !isLast && (
           <button
@@ -252,7 +252,7 @@ export function WalkthroughCard({
       </div>
       <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{step.content}</p>
       <div className="mt-4 flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center space-x-1.5">
           {Array.from({ length: totalSteps }).map((_, i) => (
             <span
               key={i}
@@ -263,7 +263,7 @@ export function WalkthroughCard({
             />
           ))}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center space-x-2">
           {!isFirst && (
             <Button variant="ghost" size="sm" onClick={prevStep}>
               Back
