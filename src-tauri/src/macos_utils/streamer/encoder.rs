@@ -63,7 +63,6 @@ pub struct Encoder {
     fps: i32,
     frame_index: i64,
     low_latency: bool,
-    ltr_enabled: bool,
     qp_mode: bool,
 }
 
@@ -126,20 +125,18 @@ impl Encoder {
             fps: cfg.fps.max(1) as i32,
             frame_index: 0,
             low_latency,
-            ltr_enabled: false,
             qp_mode: cfg.qp.is_some(),
         };
         enc.configure(&cfg)?;
         unsafe { enc.session.prepare_to_encode_frames() };
         tprintln!(
-            "[vt] H.264 encoder ready: {}x{} @ {}fps, {} kbps, profile={:?}, low_latency={}, ltr={}",
+            "[vt] H.264 encoder ready: {}x{} @ {}fps, {} kbps, profile={:?}, low_latency={}",
             cfg.width,
             cfg.height,
             cfg.fps,
             cfg.bitrate_bps / 1000,
             cfg.profile,
             low_latency,
-            enc.ltr_enabled
         );
         Ok(enc)
     }
@@ -149,10 +146,20 @@ impl Encoder {
     }
 
     fn configure(&mut self, cfg: &EncoderConfig) -> Result<()> {
-        let ltr;
         {
             let s = self.vt_session();
-            set_bool(s, unsafe { kVTCompressionPropertyKey_RealTime }, true);
+            {
+                let st = unsafe {
+                    VTSessionSetProperty(
+                        s,
+                        kVTCompressionPropertyKey_RealTime,
+                        Some(cfbool(true)),
+                    )
+                };
+                if st != 0 {
+                    teprintln!("[vt] RealTime=true rejected: OSStatus {st} (non-fatal)");
+                }
+            }
             set_bool(
                 s,
                 unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
@@ -208,11 +215,19 @@ impl Encoder {
                 unsafe { kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration },
                 10.0,
             );
-            set_i32(
-                s,
-                unsafe { kVTCompressionPropertyKey_MaxFrameDelayCount },
-                0,
-            );
+            {
+                let n = CFNumber::new_i32(1);
+                let st = unsafe {
+                    VTSessionSetProperty(
+                        s,
+                        kVTCompressionPropertyKey_MaxFrameDelayCount,
+                        Some(&n),
+                    )
+                };
+                if st != 0 {
+                    teprintln!("[vt] MaxFrameDelayCount=1 rejected: OSStatus {st} (non-fatal, encoder may queue more frames)");
+                }
+            }
             set_bool(
                 s,
                 unsafe { kVTCompressionPropertyKey_MaximizePowerEfficiency },
@@ -223,7 +238,6 @@ impl Encoder {
                 unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
                 true,
             );
-            ltr = set_optional(s, "kVTCompressionPropertyKey_EnableLTR", cfbool(true));
             if cfg.intra_refresh {
                 teprintln!(
                     "[vt] intra-refresh requested but unsupported on macOS VideoToolbox \
@@ -232,7 +246,6 @@ impl Encoder {
             }
         }
 
-        self.ltr_enabled = ltr;
         self.configure_rate_control(cfg);
         self.log_hw_acceleration();
         Ok(())
@@ -253,7 +266,7 @@ impl Encoder {
             cfg.bitrate_bps as i32,
         );
         let cap_bytes = (((cfg.bitrate_bps as f64) * 1.5) / 8.0) as i64;
-        let limits = data_rate_limits(cap_bytes, 1.0);
+        let limits = data_rate_limits(cap_bytes, 0.5);
         set_cftype(
             s,
             unsafe { kVTCompressionPropertyKey_DataRateLimits },
@@ -308,6 +321,10 @@ impl Encoder {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.complete_pending()
+    }
+
+    pub fn complete_pending(&mut self) -> Result<()> {
         let invalid = CMTime {
             value: 0,
             timescale: 0,
@@ -332,7 +349,7 @@ impl Encoder {
             bps as i32,
         );
         let cap_bytes = (((bps as f64) * 1.5) / 8.0) as i64;
-        let limits = data_rate_limits(cap_bytes, 1.0);
+        let limits = data_rate_limits(cap_bytes, 0.5);
         set_cftype(
             s,
             unsafe { kVTCompressionPropertyKey_DataRateLimits },
