@@ -31,7 +31,13 @@ fn run_privileged(shell_cmd: &str) -> Result<(), InstallOutcome> {
     let mut cmd = StdCommand::new("/bin/sh");
     cmd.arg("-c").arg(quoted);
 
-    match ElevatedCommand::new(cmd).output() {
+    let mut elevated = ElevatedCommand::new(cmd);
+    elevated.name("ScreenExtend".to_string());
+    if let Some(icon) = bundle_icon_bytes() {
+        elevated.icon(icon);
+    }
+
+    match elevated.output() {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -42,6 +48,12 @@ fn run_privileged(shell_cmd: &str) -> Result<(), InstallOutcome> {
             Err(InstallOutcome::Cancelled)
         }
     }
+}
+
+fn bundle_icon_bytes() -> Option<Vec<u8>> {
+    let exe = std::env::current_exe().ok()?;
+    let resources = exe.parent()?.parent()?.join("Resources");
+    std::fs::read(resources.join("icon.icns")).ok()
 }
 
 pub fn install_pkg(pkg_path: &Path) -> InstallOutcome {
