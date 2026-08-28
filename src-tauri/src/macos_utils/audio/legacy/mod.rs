@@ -22,7 +22,6 @@ use super::{AudioCaptureError, AudioFrameSink, AudioSource};
 use playthrough::{MonitorGain, Playthrough};
 use routing::{DefaultChange, HalDefaultDevicePort, Router, RoutingEvent, RoutingListeners};
 use shm_reader::{CaptureTargets, Reader, Transport};
-use volume_keys::VolumeKeyTap;
 use volume_proxy::{VolumeEvent, VolumeListeners};
 
 const MONITOR_RING_CAPACITY: usize = 1 << 16;
@@ -129,17 +128,6 @@ impl AudioSource for LegacyVirtualDeviceSource {
         let volume_listeners = VolumeListeners::register(our_device, volume_tx);
         let format_listener = routing::FormatListener::register(target, routing_tx.clone());
 
-        let volume_keys = if std::env::var_os("SCREENEXTEND_LEGACY_VOLUME_TAP").is_some() {
-            VolumeKeyTap::start(our_device)
-        } else {
-            None
-        };
-        let key_mechanism = if volume_keys.is_some() {
-            "event_tap_fallback"
-        } else {
-            "device_volume_control"
-        };
-
         let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
         let runtime = ControlRuntime {
@@ -152,7 +140,6 @@ impl AudioSource for LegacyVirtualDeviceSource {
             mon_cons,
             _routing_listeners: routing_listeners,
             _volume_listeners: volume_listeners,
-            _volume_keys: volume_keys,
             format_listener,
             routing_tx,
             routing_rx,
@@ -164,6 +151,13 @@ impl AudioSource for LegacyVirtualDeviceSource {
             .name("se-audio-legacy-ctl".into())
             .spawn(move || runtime.run())
             .map_err(|e| AudioCaptureError::Setup(format!("control thread spawn failed: {e}")))?;
+
+        volume_keys::bind_device(our_device);
+        let key_mechanism = if volume_keys::is_active() {
+            "event_tap_fallback"
+        } else {
+            "device_volume_control"
+        };
 
         crate::tprintln!(
             "audio(legacy): virtual device active (transport={}, playthrough_dev={target}, \
@@ -181,6 +175,7 @@ impl AudioSource for LegacyVirtualDeviceSource {
 
     fn stop(&mut self) {
         self.control = None;
+        volume_keys::unbind();
     }
 
     fn backend_name(&self) -> &'static str {
@@ -206,7 +201,6 @@ struct ControlRuntime {
     mon_cons: Arc<ring::Consumer>,
     _routing_listeners: RoutingListeners,
     _volume_listeners: VolumeListeners,
-    _volume_keys: Option<VolumeKeyTap>,
     format_listener: Option<routing::FormatListener>,
     routing_tx: crossbeam_channel::Sender<RoutingEvent>,
     routing_rx: crossbeam_channel::Receiver<RoutingEvent>,

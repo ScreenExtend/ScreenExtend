@@ -45,3 +45,7 @@ pub fn uninstall_audio_driver() -> String {
 pub fn audio_driver_status() -> String {
     "unsupported".to_string()
 }
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_legacy_volume_key_proxy(_enabled: bool) {}

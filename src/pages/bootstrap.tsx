@@ -87,6 +87,9 @@ export default function Bootstrap() {
       if (existing?.disableGpuEncode) {
         await commands.setDisableGpuEncode(true);
       }
+      if (existing?.legacyVolumeKeyProxy) {
+        await commands.setLegacyVolumeKeyProxy(true);
+      }
       for (const device of existing?.devices ?? []) {
         await commands.setDeviceOverride(
           device.ip,

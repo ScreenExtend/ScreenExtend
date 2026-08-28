@@ -40,6 +40,7 @@ export type Config = {
   publicSessionsEnabled: boolean,
   zoomFactor: number,
   disableGpuEncode: boolean,
+  legacyVolumeKeyProxy: boolean,
   walkthroughCompleted: boolean,
   serverPorts: {
     http: number,
@@ -73,6 +74,7 @@ export const defaultConfig: Config = {
   publicSessionsEnabled: true,
   zoomFactor: 1,
   disableGpuEncode: false,
+  legacyVolumeKeyProxy: false,
   walkthroughCompleted: false,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,

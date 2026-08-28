@@ -1,5 +1,7 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::Command as StdCommand;
+
+use elevated_command::Command as ElevatedCommand;
 
 use super::{branding, probe};
 
@@ -25,21 +27,20 @@ impl InstallOutcome {
 }
 
 fn run_privileged(shell_cmd: &str) -> Result<(), InstallOutcome> {
-    let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("do shell script \"{escaped}\" with administrator privileges");
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| InstallOutcome::Failed(format!("failed to launch osascript: {e}")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("-128") || stderr.to_lowercase().contains("cancel") {
-        Err(InstallOutcome::Cancelled)
-    } else {
-        Err(InstallOutcome::Failed(stderr.trim().to_string()))
+    let quoted = format!("'{}'", shell_cmd.replace('\'', "'\\''"));
+    let mut cmd = StdCommand::new("/bin/sh");
+    cmd.arg("-c").arg(quoted);
+
+    match ElevatedCommand::new(cmd).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(InstallOutcome::Failed(stderr.trim().to_string()))
+        }
+        Err(e) => {
+            crate::teprintln!("[audio] elevated command failed (treating as cancelled): {e}");
+            Err(InstallOutcome::Cancelled)
+        }
     }
 }
 

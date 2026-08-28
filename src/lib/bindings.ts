@@ -84,6 +84,9 @@ async uninstallAudioDriver() : Promise<string> {
 async audioDriverStatus() : Promise<string> {
     return await TAURI_INVOKE("audio_driver_status");
 },
+async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_legacy_volume_key_proxy", { enabled });
+},
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },

@@ -1,5 +1,7 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use objc2::runtime::AnyObject;
@@ -217,4 +219,54 @@ fn tap_thread(our_device: AudioObjectID, ready_tx: mpsc::Sender<Option<usize>>) 
         CFRelease(port);
         drop(Box::from_raw(ctx));
     }
+}
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static STATE: Mutex<Manager> = Mutex::new(Manager {
+    device: 0,
+    tap: None,
+});
+
+struct Manager {
+    device: AudioObjectID,
+    tap: Option<VolumeKeyTap>,
+}
+
+fn env_forced() -> bool {
+    std::env::var_os("SCREENEXTEND_LEGACY_VOLUME_TAP").is_some()
+}
+
+fn desired() -> bool {
+    ENABLED.load(Ordering::Relaxed) || env_forced()
+}
+
+fn reconcile(m: &mut Manager) {
+    let want = desired() && m.device != 0;
+    if want && m.tap.is_none() {
+        m.tap = VolumeKeyTap::start(m.device);
+    } else if !want {
+        m.tap = None;
+    }
+}
+
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+    reconcile(&mut STATE.lock().unwrap());
+}
+
+pub fn bind_device(device: AudioObjectID) {
+    let mut m = STATE.lock().unwrap();
+    m.device = device;
+    m.tap = None;
+    reconcile(&mut m);
+}
+
+pub fn unbind() {
+    let mut m = STATE.lock().unwrap();
+    m.device = 0;
+    m.tap = None;
+}
+
+pub fn is_active() -> bool {
+    STATE.lock().unwrap().tap.is_some()
 }

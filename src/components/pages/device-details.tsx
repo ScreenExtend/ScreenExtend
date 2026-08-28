@@ -105,6 +105,11 @@ export function DeviceDetails({ device }: { device: Device }) {
   const audioUnsupported = audioBackend === "unsupported";
   const audioActiveLegacy = audioBackend === "virtual_device";
 
+  const [volumeKeyProxy, setVolumeKeyProxy] = useState(false);
+  useEffect(() => {
+    getConfig().then((c) => setVolumeKeyProxy(c?.legacyVolumeKeyProxy ?? false));
+  }, []);
+
   const runAudioInstall = async () => {
     setInstallPromptOpen(false);
     setAudioInstalling(true);
@@ -365,6 +370,22 @@ export function DeviceDetails({ device }: { device: Device }) {
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
+          {audioActiveLegacy && (
+            <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+              <TipLabel text={t("device.volumeKeyProxy.tip")}>
+                <Label>{t("device.volumeKeyProxy.label")}</Label>
+              </TipLabel>
+              <Switch
+                checked={volumeKeyProxy}
+                onCheckedChange={async (checked) => {
+                  setVolumeKeyProxy(checked);
+                  await commands.setLegacyVolumeKeyProxy(checked);
+                  await updateConfig({ legacyVolumeKeyProxy: checked });
+                }}
+                disabled={inProgress}
+              />
+            </div>
+          )}
           <div className="mt-4">
             <TipLabel text="Zooms the extended desktop's content up or down." className="my-2">
               <Label>Scale - ({deviceDetails.values.scale}%)</Label>
