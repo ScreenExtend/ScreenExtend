@@ -65,11 +65,20 @@
         return reliable;
     }
   }
+  const FAST_BUFFER_MAX = 8192;
   function rawSend(ch, buf, len) {
     if (!ch || ch.readyState !== 'open') return;
     try { ch.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) {}
   }
-  function send(op, buf, len) { rawSend(channelFor(op), buf, len); }
+  function fastSend(buf, len) {
+    if (!fast || fast.readyState !== 'open') return;
+    if (fast.bufferedAmount > FAST_BUFFER_MAX) return;
+    try { fast.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) {}
+  }
+  function send(op, buf, len) {
+    const ch = channelFor(op);
+    if (ch === fast) fastSend(buf, len); else rawSend(ch, buf, len);
+  }
 
   function modMask(e) {
     let m = 0;
@@ -258,7 +267,7 @@
     } catch (_) {}
   }
 
-  const TICK_MS = 8;
+  const TICK_MS = 4;
   const pendingMoves = new Map();
   const pendingStrokes = new Map();
   const rel = { dx: 0, dy: 0, buttons: 0, pending: false };
@@ -266,7 +275,10 @@
   let absGateOpen = true;
   let flushTimer = 0;
 
-  function armFlush() { if (!flushTimer) flushTimer = setTimeout(flushMoves, TICK_MS); }
+  const flushChannel = new MessageChannel();
+  flushChannel.port2.onmessage = () => { if (flushTimer) { flushTimer = 0; flushMoves(); } };
+
+  function armFlush() { if (!flushTimer) { flushTimer = 1; flushChannel.port1.postMessage(null); } }
   function flushStroke(id, st) {
     if (st.samples.length) sendPointerBatch(st.source, id, st.buttons, st.samples);
     st.samples.length = 0;
@@ -285,7 +297,8 @@
 
   function onPointerMove(e) {
     const src = sourceByte(e);
-    if (src === SRC.mouse && mouseRelative) {
+    const locked = mouseRelative && (document.pointerLockElement === surface || !!document.pointerLockElement);
+    if (src === SRC.mouse && locked) {
       const [ax, ay] = applyMouseCurve(e.movementX || 0, e.movementY || 0);
       rel.dx += ax; rel.dy += ay; rel.buttons = e.buttons || 0;
       if (mouseGateOpen && !rel.pending) {
@@ -294,6 +307,12 @@
         armFlush();
       } else {
         rel.pending = true; armFlush();
+      }
+    } else if (src === SRC.mouse) {
+      if (absGateOpen && pendingMoves.size === 0) {
+        absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush();
+      } else {
+        pendingMoves.set(e.pointerId, e); armFlush();
       }
     } else if (src === SRC.touch) {
       updatePinch(e);
@@ -369,7 +388,7 @@
     pinchPts.clear(); pinchDist = 0;
     rel.dx = 0; rel.dy = 0; rel.pending = false;
     mouseGateOpen = true; absGateOpen = true;
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+    if (flushTimer) { flushTimer = 0; }
   }
   function ndx(e) { return clamp01(e.clientX / (cssW || window.innerWidth)); }
   function ndy(e) { return clamp01(e.clientY / (cssH || window.innerHeight)); }
@@ -381,7 +400,11 @@
     imeSink = document.getElementById('imeSink');
     refreshSize();
 
-    surface.addEventListener('pointermove', onPointerMove);
+    if ('onpointerrawupdate' in surface) {
+      surface.addEventListener('pointerrawupdate', onPointerMove);
+    } else {
+      surface.addEventListener('pointermove', onPointerMove);
+    }
     surface.addEventListener('pointerdown', onPointerDown);
     surface.addEventListener('pointerup', e => endPointer(e, OP.POINTER_UP));
     surface.addEventListener('pointercancel', e => endPointer(e, OP.POINTER_CANCEL));
@@ -458,8 +481,8 @@
   function setup(pc) {
     if (!pc || typeof pc.createDataChannel !== 'function') return;
     try {
-      fast = pc.createDataChannel('fast', { ordered: false, maxRetransmits: 0 });
-      reliable = pc.createDataChannel('reliable', { ordered: true });
+      fast = pc.createDataChannel('fast', { ordered: false, maxRetransmits: 0, priority: 'high' });
+      reliable = pc.createDataChannel('reliable', { ordered: true, priority: 'high' });
       bulk = pc.createDataChannel('bulk', { ordered: true });
     } catch (_) { return; }
     fast.binaryType = 'arraybuffer';
