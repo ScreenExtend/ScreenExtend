@@ -110,10 +110,6 @@ impl X264Encoder {
             );
         }
 
-        // Probe whether this libx264 build accepts packed BGRA input.  If it does, x264 runs its
-        // own SIMD BGRA->I420 convert internally, letting us skip the rayon CSC pool entirely.
-        // We try opening a BGRA-csp encoder first; if that returns null (older or stripped builds
-        // won't support packed CSPs), we fall back to the standard I420 path.
         let mut p_bgra = p; // x264_param_t is Copy
         p_bgra.i_csp = X264_CSP_BGRA;
         let bgra_handle = unsafe { (api.encoder_open)(&mut p_bgra) };
@@ -321,11 +317,6 @@ impl X264Encoder {
         let (y_plane, rest) = self.i420.split_at_mut(self.y_size);
         let (u_plane, v_plane) = rest.split_at_mut(self.c_size);
 
-        // Run the BGRA->I420 convert on a DEDICATED, bounded, below-normal-priority pool rather
-        // than rayon's global (all-core) pool. The x264 encode thread is TIME_CRITICAL + MMCSS and
-        // x264 runs its own slice threads; letting the convert fan out across every core
-        // oversubscribes those hot threads and adds latency under CPU contention. A small
-        // below-normal pool does the convert without stealing cycles from the encode.
         CONVERT_POOL.get_or_init(build_convert_pool).install(|| {
             y_plane
                 .par_chunks_mut(2 * w)
@@ -372,9 +363,6 @@ impl Drop for X264Encoder {
     }
 }
 
-/// Dedicated pool for the BGRA->I420 software convert (see `convert_bgra_to_i420`): a few
-/// below-normal-priority workers, so the convert never oversubscribes the TIME_CRITICAL x264
-/// encode thread or x264's slice threads under CPU contention.
 static CONVERT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
 fn build_convert_pool() -> rayon::ThreadPool {
@@ -385,9 +373,6 @@ fn build_convert_pool() -> rayon::ThreadPool {
         .num_threads(n)
         .thread_name(|i| format!("x264-csc-{i}"))
         .start_handler(|_| unsafe {
-            // Workers run ABOVE_NORMAL so the TIME_CRITICAL encode thread blocked on install()
-            // is not stalled by lower-priority system work. They preempt normal threads and
-            // complete quickly, keeping the total blocked duration minimal.
             use windows::Win32::System::Threading::{
                 GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
             };

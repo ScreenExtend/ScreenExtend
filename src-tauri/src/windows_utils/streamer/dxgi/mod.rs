@@ -2,7 +2,7 @@ pub mod cursor;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use windows::core::Interface;
-use windows::Win32::Foundation::{HMODULE, POINT};
+use windows::Win32::Foundation::{HMODULE, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -21,7 +21,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 
 use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
@@ -60,6 +61,8 @@ pub struct Duplicator {
     cursor_pos: POINT,
     cursor_visible: bool,
     shape_buf: Vec<u8>,
+    meta_buf: Vec<u8>,
+    consecutive_skips: u32,
 }
 
 fn wide_to_string(wide: &[u16]) -> String {
@@ -297,6 +300,8 @@ impl Duplicator {
             cursor_pos: POINT::default(),
             cursor_visible: false,
             shape_buf: Vec::new(),
+            meta_buf: Vec::new(),
+            consecutive_skips: 0,
         })
     }
 
@@ -341,6 +346,54 @@ impl Duplicator {
         }
     }
 
+    fn present_region_is_empty(
+        &mut self,
+        dup: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> bool {
+        if info.AccumulatedFrames > 1 {
+            return false;
+        }
+
+        if info.TotalMetadataBufferSize == 0 {
+            return false;
+        }
+        let needed = info.TotalMetadataBufferSize as usize;
+        if self.meta_buf.len() < needed {
+            self.meta_buf.resize(needed, 0);
+        }
+
+        let mut move_bytes = 0u32;
+        let move_ok = unsafe {
+            dup.GetFrameMoveRects(
+                self.meta_buf.len() as u32,
+                self.meta_buf.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+                &mut move_bytes,
+            )
+        };
+        if move_ok.is_err() {
+            return false;
+        }
+        if move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() > 0 {
+            return false;
+        }
+
+        let mut dirty_bytes = 0u32;
+        let dirty_ok = unsafe {
+            dup.GetFrameDirtyRects(
+                self.meta_buf.len() as u32,
+                self.meta_buf.as_mut_ptr() as *mut RECT,
+                &mut dirty_bytes,
+            )
+        };
+        if dirty_ok.is_err() {
+            return false;
+        }
+        let dirty_count = dirty_bytes as usize / std::mem::size_of::<RECT>();
+
+        dirty_count == 0
+    }
+
     pub fn poll(&mut self, timeout_ms: u32) -> Result<PollStatus> {
         let Some(dup) = self.dup.clone() else {
             self.redup()?;
@@ -363,12 +416,20 @@ impl Duplicator {
 
         if info.LastPresentTime != 0 {
             if let Some(res) = &resource {
-                let tex: ID3D11Texture2D = res
-                    .cast()
-                    .context("duplication resource as ID3D11Texture2D")?;
-                unsafe { self.context.CopyResource(&self.desktop, &tex) };
-                self.have_desktop = true;
-                dirty = true;
+                const MAX_CONSECUTIVE_SKIPS: u32 = 5;
+                let region_empty = self.present_region_is_empty(&dup, &info)
+                    && self.consecutive_skips < MAX_CONSECUTIVE_SKIPS;
+                if !region_empty {
+                    let tex: ID3D11Texture2D = res
+                        .cast()
+                        .context("duplication resource as ID3D11Texture2D")?;
+                    unsafe { self.context.CopyResource(&self.desktop, &tex) };
+                    self.have_desktop = true;
+                    dirty = true;
+                    self.consecutive_skips = 0;
+                } else {
+                    self.consecutive_skips += 1;
+                }
             }
         }
 
