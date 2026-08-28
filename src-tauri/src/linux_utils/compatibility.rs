@@ -32,5 +32,6 @@ pub fn check_system_requirements() -> CompatibilityReport {
         min_os_version: "Linux".to_string(),
         os_supported: true,
         unsupported_apis: Vec::new(),
+        audio_backend: "unsupported".to_string(),
     }
 }

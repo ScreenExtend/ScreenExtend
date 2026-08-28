@@ -96,7 +96,8 @@ export default function Bootstrap() {
           device.videoScale,
           device.videoQuality,
           device.remoteControl ?? false,
-          device.dpr ?? device.maxDpr ?? 1
+          device.dpr ?? device.maxDpr ?? 1,
+          device.systemAudio ?? false
         );
       }
       for (const known of existing?.knownDevices ?? []) {

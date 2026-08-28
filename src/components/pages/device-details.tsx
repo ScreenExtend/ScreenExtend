@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 
 import { Info } from "lucide-react";
 
@@ -88,11 +88,60 @@ export function DeviceDetails({ device }: { device: Device }) {
   const { toast } = useToast();
   const { t } = useTranslation();
 
+  const [audioBackend, setAudioBackend] = useState<string>("unsupported");
+  const [audioInstalling, setAudioInstalling] = useState(false);
+  const [installPromptOpen, setInstallPromptOpen] = useState(false);
+  const refreshAudioBackend = React.useCallback(() => {
+    commands
+      .checkSystemRequirements()
+      .then((r) => setAudioBackend(r.audio_backend))
+      .catch(() => setAudioBackend("unsupported"));
+  }, []);
+  useEffect(() => {
+    refreshAudioBackend();
+  }, [refreshAudioBackend]);
+
+  const audioNeedsInstall = audioBackend === "needs_driver_install";
+  const audioUnsupported = audioBackend === "unsupported";
+  const audioActiveLegacy = audioBackend === "virtual_device";
+
+  const runAudioInstall = async () => {
+    setInstallPromptOpen(false);
+    setAudioInstalling(true);
+    try {
+      const outcome = await commands.installAudioDriver();
+      if (outcome === "installed") {
+        setAudioBackend("virtual_device");
+        toast({
+          title: t("device.systemAudio.installedTitle"),
+          description: t("device.systemAudio.installedBody"),
+        });
+      } else if (outcome === "needs_reboot") {
+        toast({
+          title: t("device.systemAudio.needsRebootTitle"),
+          description: t("device.systemAudio.needsRebootBody"),
+        });
+      } else if (outcome === "cancelled") {
+        toast({ description: t("device.systemAudio.cancelledBody") });
+      } else {
+        toast({
+          variant: "destructive",
+          title: t("device.systemAudio.installFailedTitle"),
+          description: t("device.systemAudio.installFailedBody"),
+        });
+      }
+    } finally {
+      setAudioInstalling(false);
+      refreshAudioBackend();
+    }
+  };
+
   const deviceDetails = useFormik({
     initialValues: {
       ...device,
       dpr: device.dpr ?? device.maxDpr ?? 1,
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
+      systemAudio: device.systemAudio ?? false,
     },
     onSubmit: async (values) => {
       setInProgress(true);
@@ -113,7 +162,8 @@ export function DeviceDetails({ device }: { device: Device }) {
           normalized.videoScale,
           normalized.videoQuality,
           normalized.remoteControl,
-          normalized.dpr
+          normalized.dpr,
+          normalized.systemAudio
         );
         await saveDeviceSettings(normalized);
         await events.deviceModify.emit(normalized);
@@ -271,6 +321,50 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
           </div>
+          <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+            <TipLabel
+              text={
+                audioUnsupported
+                  ? t("device.systemAudio.unsupported")
+                  : audioNeedsInstall
+                    ? t("device.systemAudio.needsInstall")
+                    : audioActiveLegacy
+                      ? t("device.systemAudio.active")
+                      : t("device.systemAudio.tip")
+              }
+            >
+              <Label>{t("device.systemAudio.label")}</Label>
+            </TipLabel>
+            <Switch
+              checked={deviceDetails.values.systemAudio}
+              onCheckedChange={(checked) => {
+                if (checked && audioNeedsInstall) {
+                  setInstallPromptOpen(true);
+                  return;
+                }
+                deviceDetails.setFieldValue("systemAudio", checked);
+              }}
+              disabled={inProgress || audioInstalling || audioUnsupported}
+            />
+          </div>
+          <AlertDialog open={installPromptOpen} onOpenChange={setInstallPromptOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  {t("device.systemAudio.installTitle")}
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t("device.systemAudio.installBody")}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+                <AlertDialogAction onClick={runAudioInstall}>
+                  {t("device.systemAudio.installConfirm")}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
           <div className="mt-4">
             <TipLabel text="Zooms the extended desktop's content up or down." className="my-2">
               <Label>Scale - ({deviceDetails.values.scale}%)</Label>

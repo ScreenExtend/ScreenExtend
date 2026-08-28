@@ -71,7 +71,7 @@ Commands and events are defined in Rust and consumed type-safely in TS via
 
 `src-tauri/src/` has three `cfg`-gated sibling modules — `windows_utils/`, `macos_utils/`,
 `linux_utils/` — each exposing the **same surface** (`AppState`, `setup`, `networking`,
-`hosted_network`, `virtual_display`, `streamer`, `compatibility`, `device_reporter`).
+`hosted_network`, `virtual_display`, `streamer`, `compatibility`, `device_reporter`, `audio`).
 `lib.rs` glob-imports the active one (`use windows_utils::*` etc.), so the Tauri command
 list is identical across OSes and dispatch happens at compile time. `streamer/platform.rs`
 is the runtime dispatcher for capture/encode/tuning that calls into the per-OS backend.
@@ -120,13 +120,108 @@ Cross-platform core, OS-independent:
   header; the client stores it and presents it on rejoin. The IP is only a display hint. The
   `OtpLimiter` also has a global cross-key brute-force guard (defeats the cloud relay's
   rotating-`client_id` bypass).
-- `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers.
+- `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers. The video track is a raw
+  `TrackLocalStaticRTP` (not `TrackLocalStaticSample`): we packetize H.264 ourselves so each
+  frame's RTP timestamp carries the shared host clock (`host_ns_to_rtp90k`), which the client
+  inverts for A/V sync (§6.5). NACK/RTX (interceptors) and loss-based BWE (`getStats`) are
+  unaffected.
 - `pipeline.rs` — capture → encode → RTP feed.
 - `tls.rs` — self-signed cert generation at runtime (`rcgen`).
 - `cloud.rs` — cross-network relay control channel (WebSocket via `tokio-tungstenite`) +
   TURN. Cross-network joins require a configured TURN server (see the `turn-required-cross-network` memory).
 - `input/` — remote keyboard/mouse injection, with per-OS impls + a shared protocol.
-- `static/` — the client browser page (see top of this file).
+- `audio/` — cross-platform system-audio transport glue: `AudioPacket`, host-side
+  `AudioDiagnostics`, the shared host timebase (`host_now_ns` / `host_instant_to_ns` /
+  `host_ns_to_rtp90k` — **the one clock both audio `capture_ns` and the video RTP timestamp ride
+  for A/V sync**), the reference-counted `AudioHub` (one host-wide capture fanned out to N
+  sessions via `tokio::sync::broadcast`, started on the first audio-enabled subscriber and stopped
+  when the last leaves), and `protocol.rs` (the 13-byte DataChannel header: seq u32, capture ns
+  u64, flags u8 + raw Opus). It also hosts the **OS-independent Opus encoder** — the hand-written
+  libopus FFI (`opus_sys.rs`) and the encoder wrapper (`encoder.rs`) — shared by every capture
+  backend (libopus is cross-platform C; only the bundled library name differs: `libopus.dll` vs
+  `libopus.dylib`).
+- `static/` — the client browser page (see top of this file). Adds `audio.js` (WebCodecs
+  `AudioDecoder` → ring → worklet, plus the NetEQ track fallback) and `audio-worklet.js` (our
+  jitter buffer). A/V sync (§6.5) lives here: `transform-worker.js` recovers each video frame's
+  host-capture time from its RTP timestamp and reports the display lag; `audio.js` commands the
+  worklet a buffer depth so audio plays in step with the picture, and the worklet corrects drift
+  only at silence boundaries. Measured offset via `SEAudio.getSyncInfo()` (no on-screen HUD).
+
+### System audio (`windows_utils/audio/`, Windows only)
+
+Per-device system-audio capture + Opus encode. Design decisions are measured, not assumed —
+see `AUDIO_NOTES.md` (from the `examples/audio_spike.rs` throwaway spike):
+
+- `loopback.rs` — WASAPI **legacy `IAudioClient::Initialize` loopback** path (the IAudioClient3
+  low-latency path rejects the loopback flag). Runs on a **dedicated OS thread** with COM MTA +
+  MMCSS "Pro Audio", event-driven, re-acquiring on default-device change / `AUDCLNT_E_DEVICE_INVALIDATED`.
+- `silence.rs` — a **silent render companion** is mandatory: it is the clock source that makes
+  the loopback event fire and keeps packets flowing while the host is idle (measured: 0/20 event
+  signals without it, 20/20 with it). Started lazily, stopped with the capture.
+- `format.rs` — mix-format negotiation; 48 kHz float32 stereo is the zero-copy fast path,
+  everything else is `AUTOCONVERTPCM`'d / downmixed (ITU BS.775) / int→float.
+- Opus encode uses the **shared** wrapper in `streamer/audio/` (`opus_sys.rs` + `encoder.rs`), not
+  a Windows-local copy: `libopus.dll` loaded via `libloading` and bundled in `resources/`
+  (provenance in `resources/PROVENANCE.md`); `RESTRICTED_LOWDELAY` (CELT-only), 5 ms frames.
+- `device.rs` — `IMMNotificationClient`; its callback runs on a COM thread we don't own, so it
+  only posts to the capture thread over `crossbeam-channel` (never blocks, never takes the
+  capture lock).
+
+**Capture-thread convention:** the audio capture thread is a real-time OS thread (MMCSS), never
+a tokio task. It never allocates or locks in the drain/encode path beyond the reused
+accumulator + the per-packet `Bytes` copy. It talks to the async world over `crossbeam-channel`
+(→ the `AudioHub` bridge → broadcast), the way the video pipeline does. Linux provides a compiling
+stub (`linux_utils/audio.rs`) that returns "unsupported"; macOS has a full backend (below).
+
+### System audio (`macos_utils/audio/`, tiered)
+
+macOS has **no single audio-capture API across 10.15–current**, so the backend probes at runtime in
+preference order and uses whichever is available (`AUDIO_NOTES_MACOS.md` has the full spike notes;
+the two working tiers can only be verified on 13.0+/14.2+ hardware, not the 10.15 dev box):
+
+- `process_tap.rs` — **Core Audio Process Tap** (`CATapDescription` + aggregate device + IOProc),
+  macOS **14.2+**, preferred (audio-only, no screen-recording indicator). The aggregate device's
+  tap-list UID must match the `CATapDescription` UUID or the tap returns `noErr` but pure silence
+  (the documented failure mode) — built exactly like the `AudioCap` reference. Teardown is RAII in
+  order stop→destroyIOProc→destroyAggregate→destroyTap so a leaked tap can't persist a hidden
+  capture.
+- `sck_audio.rs` — **ScreenCaptureKit `capturesAudio`**, macOS **13.0+**, fallback. SCK has no
+  audio-only mode, so it rides a minimal 2×2/1 fps dummy video stream; uses the existing Screen
+  Recording permission.
+- `format.rs` — parses the delivered `AudioStreamBasicDescription` (handles **planar** float, which
+  Windows never produces) → interleaved-stereo f32; BS.775 downmix duplicated from the Windows
+  sibling (the byte layouts diverge too much to share cleanly).
+- `mod.rs` — the shared `AudioSource` trait over all backends, the `probe_audio_backend()` tiering
+  (Process Tap → SCK → **VirtualDevice** (10.15–12.x) → `NeedsDriverInstall` → `Unsupported`; native
+  cached, legacy recomputed since install state flips at runtime), and the encoder worker.
+- `legacy/` — the **macOS 10.15–12.x virtual-device tier** (`PRD-macos-legacy-audio.md`,
+  `AUDIO_NOTES_MACOS_LEGACY.md`). Below 13.0 there is no native system-audio API at all, so this
+  ships ScreenExtend's own **AudioServerPlugIn** virtual device (built on libASPL/MIT, in
+  `macos/ScreenExtendAudio/`), sets it as the default output, and reads the captured mix back over a
+  POSIX shared-memory ring (`shm_reader.rs`, with a HAL-input fallback) into the same encoder ring —
+  zero new Opus/client code. `routing.rs` saves/switches/restores the default output (+ crash
+  recovery on launch); `playthrough.rs` plays the capture to the real device with a gain stage;
+  `volume_proxy.rs` + the driver's Volume/Mute controls keep the macOS volume keys working while the
+  virtual device is default (the classic UX regression this tier must repair), with `volume_keys.rs`
+  as a `CGEventTap` backstop that intercepts F10/F11/F12 directly if the OS doesn't re-enable them.
+  `installer.rs` runs a signed/notarized `.pkg` behind one admin prompt. **This tier is never selected on 13.0+** (native
+  wins). **Privacy:** it makes ScreenExtend the system output device while streaming — an extra
+  reason it is opt-in per device.
+
+**Dyld-safety (load-bearing):** the Process Tap 14.2 symbols and the SCK 13.0+ classes are **absent
+on the 10.15 floor**; a link-time reference would break the whole binary's dyld load there. So the
+14.2 tap functions are `dlsym`'d, `CATapDescription`/SCK classes come from `AnyClass::get`, and the
+SCK backend uses runtime `msg_send!` interop (**no `objc2-screen-capture-kit` dependency**) — the
+same no-link discipline as the video `streamer/sck.rs`. Only floor-present HAL/CoreMedia functions
+are linked. `check_system_requirements` reports the active backend via
+`CompatibilityReport.audio_backend`.
+
+**Capture-callback convention (macOS):** the real-time callback (the Process Tap `AudioDeviceIOProc`
+or the SCK sample handler) only converts to interleaved-stereo-f32 in preallocated scratch and
+pushes into a lock-free SPSC ring (`ring.rs`); the worker thread drains it and Opus-encodes. The A/V
+clock is the shared `streamer::audio::host_now_ns()` (a monotonic `Instant` epoch, itself backed by
+`mach_absolute_time` on macOS), *not* raw `mach_now()` ticks, so audio `capture_ns` and the video
+RTP stamps ride one epoch.
 
 ### Desktop UI (`src/`)
 
@@ -176,8 +271,12 @@ initializes the virtual display and populates `AppState`.
 ## Native resources & drivers
 
 - Bundled resources (`tauri.conf.json` → `bundle.resources`): the signed Windows Virtual
-  Display Driver (`.dll`/`.cat`/`.inf`), its cert (`ScreenExtend.cer`), and `libx264-164.dll`
-  (software-encode fallback). `binaries/nefconc` is an `externalBin` used with `certutil`
+  Display Driver (`.dll`/`.cat`/`.inf`), its cert (`ScreenExtend.cer`), `libx264-164.dll`
+  (software-encode fallback), and `libopus.dll` (system-audio Opus encode, loaded via
+  `libloading`; provenance + SHA-256 in `resources/PROVENANCE.md` / `SHA256SUMS`). `binaries/nefconc` is an `externalBin` used with `certutil`
   to install the driver (requires Administrator, elevated via the `elevated-command` crate).
-- macOS uses a `tauri.macos.conf.json` overlay config (passed with `--config` in CI) and
-  `Entitlements.plist`.
+- macOS uses a `tauri.macos.conf.json` overlay config (passed with `--config` in CI) that bundles
+  `libopus.dylib` (system-audio Opus encode; same shared wrapper as Windows) as its only resource,
+  plus `Entitlements.plist` (`com.apple.security.device.audio-input`) and `Info.plist`
+  (`NSAudioCaptureUsageDescription`, for the Process Tap prompt). The shipped dylib should be a
+  universal (x86_64 + arm64) build — see `resources/PROVENANCE.md`.

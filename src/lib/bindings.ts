@@ -75,8 +75,17 @@ async installDrivers() : Promise<boolean> {
 async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
-async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number) : Promise<void> {
-    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr });
+async installAudioDriver() : Promise<string> {
+    return await TAURI_INVOKE("install_audio_driver");
+},
+async uninstallAudioDriver() : Promise<string> {
+    return await TAURI_INVOKE("uninstall_audio_driver");
+},
+async audioDriverStatus() : Promise<string> {
+    return await TAURI_INVOKE("audio_driver_status");
+},
+async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
@@ -152,8 +161,8 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[] }
-export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string }
+export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device

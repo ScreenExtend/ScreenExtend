@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod compatibility;
 pub mod hosted_network;
 pub mod networking;
@@ -25,4 +26,22 @@ pub fn focus_main_window(window: &tauri::WebviewWindow) {
 #[specta::specta]
 pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     command_exists("nmcli")
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn install_audio_driver(_app: tauri::AppHandle) -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn uninstall_audio_driver() -> String {
+    "unsupported".to_string()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn audio_driver_status() -> String {
+    "unsupported".to_string()
 }

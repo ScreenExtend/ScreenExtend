@@ -24,7 +24,8 @@
       "resources/VirtualDisplayDriver.cat",
       "resources/VirtualDisplayDriver.inf",
       "resources/ScreenExtend.cer",
-      "resources/libx264-164.dll"
+      "resources/libx264-164.dll",
+      "resources/libopus.dll"
     ],
     "publisher": "Sarvesh Madullapalli",
     "copyright": "Copyright © 2026 Sarvesh Madullapalli All Rights Reserved",
@@ -118,7 +119,8 @@
                 { "name": "refresh-rate", "takesValue": true, "description": "Refresh rate in Hz (15-500)." },
                 { "name": "video-scale", "takesValue": true, "description": "Video resolution percent (10-100)." },
                 { "name": "video-quality", "takesValue": true, "description": "Encoder quality 1 (best) to 51 (worst)." },
-                { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." }
+                { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." },
+                { "name": "audio", "takesValue": true, "possibleValues": ["on", "off"], "description": "System audio streaming." }
               ]
             },
             "reset": {

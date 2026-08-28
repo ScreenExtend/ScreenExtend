@@ -138,6 +138,11 @@ pub fn fast_path() {
         print_version();
         exit(0);
     }
+    #[cfg(target_os = "macos")]
+    if first == "audio-recover" {
+        crate::macos_utils::audio::legacy::routing::watchdog_recover();
+        exit(0);
+    }
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
@@ -516,6 +521,10 @@ mod desktop {
                 .get("remoteControl")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let audio = device
+                .get("systemAudio")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let dpr = device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0);
             platform::set_device_override(
                 app.state(),
@@ -527,6 +536,7 @@ mod desktop {
                 num("videoQuality", 15),
                 control,
                 dpr,
+                audio,
             );
         }
     }
@@ -778,8 +788,8 @@ mod desktop {
                     exit(0);
                 }
                 println!(
-                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8}",
-                    "IP", "SCALE", "ORIENT", "REFRESH", "VSCALE", "VQUAL", "CONTROL"
+                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6}",
+                    "IP", "SCALE", "ORIENT", "REFRESH", "VSCALE", "VQUAL", "CONTROL", "AUDIO"
                 );
                 for d in &devices {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
@@ -790,19 +800,21 @@ mod desktop {
                     let vscale = s("videoScale").as_u64().unwrap_or(100);
                     let vqual = s("videoQuality").as_u64().unwrap_or(15);
                     let control = s("remoteControl").as_bool().unwrap_or(true);
+                    let audio = s("systemAudio").as_bool().unwrap_or(false);
                     println!(
-                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8}",
+                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6}",
                         scale,
                         refresh,
                         vscale,
-                        if control { "on" } else { "off" }
+                        if control { "on" } else { "off" },
+                        if audio { "on" } else { "off" }
                     );
                 }
                 exit(0);
             }
             "set" => {
                 let Some(ip) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off]");
+                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off]");
                     exit(2);
                 };
                 let mut existing = get_nested(&store, "devices")
@@ -819,7 +831,7 @@ mod desktop {
                         serde_json::json!({
                             "ip": ip, "name": "", "scale": 100, "orientation": "Landscape",
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
-                            "remoteControl": true, "os": "", "screenSize": ""
+                            "remoteControl": true, "systemAudio": false, "os": "", "screenSize": ""
                         })
                     });
                 let obj = device.as_object_mut().unwrap();
@@ -841,6 +853,9 @@ mod desktop {
                 }
                 if let Some(v) = arg_str(sm, "control") {
                     obj.insert("remoteControl".into(), Value::Bool(v == "on"));
+                }
+                if let Some(v) = arg_str(sm, "audio") {
+                    obj.insert("systemAudio".into(), Value::Bool(v == "on"));
                 }
 
                 existing.retain(|d| d.get("ip").and_then(|v| v.as_str()) != Some(ip.as_str()));
