@@ -95,6 +95,7 @@ pub struct CompatibilityReport {
     pub min_os_version: String,
     pub os_supported: bool,
     pub unsupported_apis: Vec<UnsupportedApi>,
+    pub audio_backend: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
@@ -112,6 +113,8 @@ pub struct Device {
     pub video_quality: u32,
     #[serde(rename = "remoteControl")]
     pub control_enabled: bool,
+    #[serde(rename = "systemAudio")]
+    pub audio_enabled: bool,
     pub os: String,
     #[serde(rename = "screenSize")]
     pub screen_size: String,
@@ -151,6 +154,7 @@ impl Device {
             video_scale: 100,
             video_quality: 15,
             control_enabled: true,
+            audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
             dpr: native_dpr,
@@ -309,6 +313,9 @@ pub fn run() {
             hosted_network::turn_on_wifi,
             install_drivers,
             remove_drivers,
+            install_audio_driver,
+            uninstall_audio_driver,
+            audio_driver_status,
             set_device_override,
             remove_device_override,
             set_device_banned,

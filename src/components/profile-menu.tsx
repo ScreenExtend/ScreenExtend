@@ -90,6 +90,7 @@ export function ProfileMenu() {
             className="cursor-pointer"
             onClick={async () => {
               setClosing(true);
+              await commands.uninstallAudioDriver();
               await commands.removeDrivers();
               await commands.stopHostedNetwork();
               await commands.exitApp();

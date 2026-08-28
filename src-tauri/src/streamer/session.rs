@@ -33,6 +33,7 @@ pub struct DeviceOverride {
     pub video_quality: u8,
     pub control_enabled: bool,
     pub dpr: f64,
+    pub audio_enabled: bool,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {

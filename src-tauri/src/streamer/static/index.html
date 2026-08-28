@@ -53,7 +53,6 @@
                                     <span class="fs-toggle-desc">Locks this tab fullscreen for a true second screen. Turn it off to keep everything else working while you multitask.</span>
                                 </span>
                             </label>
-                            <p class="desc" style="font-size: 0.8em; opacity: 0.85; margin: 4px 0 8px;">Joining lets this device control the host's keyboard, mouse, and clipboard. The host can turn this off per device.</p>
                             <button class="btn" id="connect" type="submit" disabled>Connect</button>
                         </form>
                         <div class="err" id="errorMessage" role="alert"></div>
@@ -110,6 +109,7 @@
         </div>
 
         <script src="/input.js"></script>
+        <script src="/audio.js"></script>
         <!-- NoSleep.min.js v0.12.0 (Rich Tibbett, MIT) — served from /nosleep.js -->
         <script src="/nosleep.js"></script>
         <script>
@@ -125,6 +125,9 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
+            const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
+            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false, sab: false };
+            const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
 
@@ -578,6 +581,7 @@
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
                 if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
+                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
                 try { if (pc) pc.close(); } catch (_) {}
                 pc = null;
             }
@@ -633,26 +637,55 @@
                 return null;
             }
 
+            let __workerBlobUrl = null;
+            async function makeTransformWorker() {
+                try {
+                    if (!__workerBlobUrl) {
+                        const src = await fetch('/transform-worker.js').then((r) => {
+                            if (!r.ok) throw new Error('worker fetch ' + r.status);
+                            return r.text();
+                        });
+                        __workerBlobUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                    }
+                    return new Worker(__workerBlobUrl);
+                } catch (e) {
+                    console.warn('[webcodecs] blob worker load failed (' + e + '); trying direct URL');
+                    return new Worker('/transform-worker.js');
+                }
+            }
+
             async function start(preferWebCodecs) {
                 teardownSession();
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const iceServers = await getIceServers();
-                    const pcConfig = { iceServers };
-                    if (webcodecs && !hasScriptTransform) {
+                    const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
+                    if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
                         pcConfig.forceEncodedVideoInsertableStreams = true;
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
                     try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
+                    if (window.SEAudio) {
+                        if (audioFast) {
+                            SEAudio.prepare();
+                            pc.ondatachannel = (ev) => {
+                                if (ev.channel && ev.channel.label === 'audio') {
+                                    SEAudio.attachDataChannel(ev.channel);
+                                }
+                            };
+                        } else {
+                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+                        }
+                    }
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
                     } catch (_) {}
 
                     if (webcodecs) {
-                        worker = new Worker('/transform-worker.js');
+                        worker = await makeTransformWorker();
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
                                 onStreamLive();
@@ -669,13 +702,15 @@
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
+                            } else if (m.data.type === 'avsync') {
+                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
                         };
                         const off = freshCanvas().transferControlToOffscreen();
                         worker.postMessage({ type: 'canvas', canvas: off }, [off]);
-                        if (hasScriptTransform) {
+                        if (useScriptTransform) {
                             videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
                         } else {
                             let readable;
@@ -694,6 +729,10 @@
                     }
 
                     pc.ontrack = (e) => {
+                        if (e.track.kind === 'audio') {
+                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) {}
+                            return;
+                        }
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
@@ -732,7 +771,8 @@
                         } else {
                             video.srcObject = e.streams[0];
                             try {
-                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 10;
+                                if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
                             } catch (_) {}
                             showVideo();
                             tryPlay();
@@ -780,6 +820,7 @@
                             height: joinData.height,
                             dpr: getDpr(),
                             sdp: pc.localDescription.sdp,
+                            audioCapabilities: audioCaps,
                         }),
                     });
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
@@ -910,9 +951,10 @@
                     requestAnimationFrame(frame);
                 });
             }
+            function clampRefresh(r) { return r > 0 ? Math.round(r) : 0; }
             function screenRefreshRate() {
                 const r = window.screen && window.screen.refreshRate;
-                return (typeof r === 'number' && r >= 24 && r <= 500) ? Math.round(r) : 0;
+                return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
             function relayRefreshRate(rate) {
                 if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
@@ -924,7 +966,7 @@
             }
             async function refineRefreshRate() {
                 let rate = screenRefreshRate();
-                if (!rate) rate = await refreshRatePromise;
+                if (!rate) rate = clampRefresh(await refreshRatePromise);
                 relayRefreshRate(rate);
             }
 
@@ -1142,6 +1184,8 @@
                 loadingEl.classList.add('show');
 
                 console.log('[join] connecting with', joinData);
+
+                try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
 
                 beginStreaming();
             });
