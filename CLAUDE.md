@@ -254,8 +254,10 @@ initializes the virtual display and populates `AppState`.
 ## Versioning & releases
 
 - The version string is duplicated in **four** places and must be kept in sync:
-  `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and the hardcoded
-  `current_version()` in `src-tauri/src/lib.rs`.
+  `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and
+  `src-tauri/tauri.macos.conf.json` (`src-tauri/Cargo.lock` then updates automatically).
+  The Rust side reads the version from Tauri's package info at runtime — there is no
+  hardcoded version literal in `src-tauri/src/`.
 - **CI** (`.github/workflows/ci.yml`) runs on every pull request and push to `main`:
   frontend build + `pnpm lint`, a Windows + macOS Rust matrix (`cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`), and `pnpm audit`/`cargo audit`
