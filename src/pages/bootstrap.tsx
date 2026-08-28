@@ -1,7 +1,7 @@
 import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
-import { Check, Loader2, X } from "lucide-react";
+import { Check, Info, Loader2, X } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -429,6 +429,15 @@ export default function Bootstrap() {
                   ScreenExtend needs macOS permission to capture this screen and to control the
                   keyboard and mouse from your connected devices. Enable each item below in System
                   Settings, then relaunch.
+                </div>
+                <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                  <Info className="mt-0.5 shrink-0 text-amber-600" size={16} />
+                  <div>
+                    <span className="font-semibold">Already enabled but still not working?</span>{" "}
+                    macOS sometimes shows a permission as on when it isn&apos;t actually granted. In
+                    System Settings, click the lock and authenticate, turn ScreenExtend off and back
+                    on for that permission, then click the lock again to save.
+                  </div>
                 </div>
                 <ul className="space-y-2">
                   {permReport?.map(p => (

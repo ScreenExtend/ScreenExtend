@@ -102,6 +102,12 @@ fn open_library() -> Result<Library> {
                     return Ok(lib);
                 }
                 if let Some(parent) = dir.parent() {
+                    if let Some(lib) = attempt(
+                        parent.join("Resources").join("resources").join(name),
+                        &mut last_err,
+                    ) {
+                        return Ok(lib);
+                    }
                     if let Some(lib) = attempt(parent.join("Resources").join(name), &mut last_err) {
                         return Ok(lib);
                     }
