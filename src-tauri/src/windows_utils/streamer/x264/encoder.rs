@@ -27,6 +27,8 @@ pub struct X264Encoder {
     c_size: usize,
     have_frame: bool,
     pts: i64,
+    use_bgra_csp: bool,
+    repeat_bgra: Vec<u8>,
 }
 
 unsafe impl Send for X264Encoder {}
@@ -108,18 +110,32 @@ impl X264Encoder {
             );
         }
 
-        let handle = unsafe { (api.encoder_open)(&mut p) };
-        if handle.is_null() {
-            bail!("x264_encoder_open returned null (invalid params or libx264 build mismatch)");
-        }
+        // Probe whether this libx264 build accepts packed BGRA input.  If it does, x264 runs its
+        // own SIMD BGRA->I420 convert internally, letting us skip the rayon CSC pool entirely.
+        // We try opening a BGRA-csp encoder first; if that returns null (older or stripped builds
+        // won't support packed CSPs), we fall back to the standard I420 path.
+        let mut p_bgra = p; // x264_param_t is Copy
+        p_bgra.i_csp = X264_CSP_BGRA;
+        let bgra_handle = unsafe { (api.encoder_open)(&mut p_bgra) };
+
+        let (handle, use_bgra_csp) = if !bgra_handle.is_null() {
+            (bgra_handle, true)
+        } else {
+            let h = unsafe { (api.encoder_open)(&mut p) };
+            if h.is_null() {
+                bail!("x264_encoder_open returned null (invalid params or libx264 build mismatch)");
+            }
+            (h, false)
+        };
 
         let y_size = width * height;
         let c_size = (width / 2) * (height / 2);
         let i420 = vec![0u8; y_size + 2 * c_size];
 
+        let csp_label = if use_bgra_csp { "BGRA" } else { "I420" };
         tprintln!(
             "pipeline: software x264 encoder ready ({width}x{height}@{fps}, {kbps} kbps, \
-             threads={}, profile={:?})",
+             threads={}, profile={:?}, csp={csp_label})",
             p.i_threads,
             config.profile,
         );
@@ -136,6 +152,8 @@ impl X264Encoder {
             c_size,
             have_frame: false,
             pts: 0,
+            use_bgra_csp,
+            repeat_bgra: Vec::new(),
         })
     }
 
@@ -149,13 +167,26 @@ impl X264Encoder {
         row_pitch: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>> {
-        self.convert_bgra_to_i420(data, row_pitch as usize)?;
-        self.encode_converted(force_idr)
+        if self.use_bgra_csp {
+            self.repeat_bgra.clear();
+            self.repeat_bgra.extend_from_slice(data);
+            let out = self.encode_with_bgra_direct(data, row_pitch, force_idr)?;
+            self.have_frame = true;
+            Ok(out)
+        } else {
+            self.convert_bgra_to_i420(data, row_pitch as usize)?;
+            self.encode_converted(force_idr)
+        }
     }
 
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         if !self.have_frame {
             return Ok(Vec::new());
+        }
+        if self.use_bgra_csp && !self.repeat_bgra.is_empty() {
+            let data = self.repeat_bgra.clone();
+            let row_pitch = (self.width * 4) as u32;
+            return self.encode_with_bgra_direct(&data, row_pitch, force_idr);
         }
         self.encode_converted(force_idr)
     }
@@ -175,6 +206,50 @@ impl X264Encoder {
             bail!("x264_encoder_reconfig failed ({rv})");
         }
         Ok(())
+    }
+
+    fn encode_with_bgra_direct(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let mut pic_in: x264_picture_t = unsafe { std::mem::zeroed() };
+        unsafe { (self.api.picture_init)(&mut pic_in) };
+        pic_in.img.i_csp = X264_CSP_BGRA;
+        pic_in.img.i_plane = 1;
+        pic_in.img.plane[0] = data.as_ptr() as *mut u8;
+        pic_in.img.i_stride[0] = row_pitch as c_int;
+        pic_in.i_pts = self.pts;
+        pic_in.i_type = if force_idr { X264_TYPE_IDR } else { X264_TYPE_AUTO };
+
+        let mut nals: *mut x264_nal_t = ptr::null_mut();
+        let mut n_nal: c_int = 0;
+        let mut pic_out: x264_picture_t = unsafe { std::mem::zeroed() };
+        let size = unsafe {
+            (self.api.encoder_encode)(
+                self.handle,
+                &mut nals,
+                &mut n_nal,
+                &mut pic_in,
+                &mut pic_out,
+            )
+        };
+        if size < 0 {
+            bail!("x264_encoder_encode (BGRA direct) failed ({size})");
+        }
+        self.pts += 1;
+
+        if size == 0 || n_nal == 0 || nals.is_null() {
+            return Ok(Vec::new());
+        }
+        debug_assert_eq!(
+            pic_out.i_dts, pic_out.i_pts,
+            "0 B-frames must keep dts == pts (no reordering)"
+        );
+
+        let out = unsafe { std::slice::from_raw_parts((*nals).p_payload, size as usize).to_vec() };
+        Ok(out)
     }
 
     fn encode_converted(&mut self, force_idr: bool) -> Result<Vec<u8>> {
@@ -246,17 +321,24 @@ impl X264Encoder {
         let (y_plane, rest) = self.i420.split_at_mut(self.y_size);
         let (u_plane, v_plane) = rest.split_at_mut(self.c_size);
 
-        y_plane
-            .par_chunks_mut(2 * w)
-            .zip(u_plane.par_chunks_mut(cw))
-            .zip(v_plane.par_chunks_mut(cw))
-            .enumerate()
-            .for_each(|(j, ((y2, urow), vrow))| {
-                let top = j * 2;
-                let row0 = &bgra[top * row_pitch..top * row_pitch + min_stride];
-                let row1 = &bgra[(top + 1) * row_pitch..(top + 1) * row_pitch + min_stride];
-                convert_row_pair(row0, row1, y2, urow, vrow, w);
-            });
+        // Run the BGRA->I420 convert on a DEDICATED, bounded, below-normal-priority pool rather
+        // than rayon's global (all-core) pool. The x264 encode thread is TIME_CRITICAL + MMCSS and
+        // x264 runs its own slice threads; letting the convert fan out across every core
+        // oversubscribes those hot threads and adds latency under CPU contention. A small
+        // below-normal pool does the convert without stealing cycles from the encode.
+        CONVERT_POOL.get_or_init(build_convert_pool).install(|| {
+            y_plane
+                .par_chunks_mut(2 * w)
+                .zip(u_plane.par_chunks_mut(cw))
+                .zip(v_plane.par_chunks_mut(cw))
+                .enumerate()
+                .for_each(|(j, ((y2, urow), vrow))| {
+                    let top = j * 2;
+                    let row0 = &bgra[top * row_pitch..top * row_pitch + min_stride];
+                    let row1 = &bgra[(top + 1) * row_pitch..(top + 1) * row_pitch + min_stride];
+                    convert_row_pair(row0, row1, y2, urow, vrow, w);
+                });
+        });
         Ok(())
     }
 }
@@ -288,6 +370,36 @@ impl Drop for X264Encoder {
         }
         self.handle = ptr::null_mut();
     }
+}
+
+/// Dedicated pool for the BGRA->I420 software convert (see `convert_bgra_to_i420`): a few
+/// below-normal-priority workers, so the convert never oversubscribes the TIME_CRITICAL x264
+/// encode thread or x264's slice threads under CPU contention.
+static CONVERT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+fn build_convert_pool() -> rayon::ThreadPool {
+    let n = std::thread::available_parallelism()
+        .map(|c| (c.get() / 2).clamp(1, 4))
+        .unwrap_or(2);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|i| format!("x264-csc-{i}"))
+        .start_handler(|_| unsafe {
+            // Workers run ABOVE_NORMAL so the TIME_CRITICAL encode thread blocked on install()
+            // is not stalled by lower-priority system work. They preempt normal threads and
+            // complete quickly, keeping the total blocked duration minimal.
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        })
+        .build()
+        .unwrap_or_else(|_| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("1-thread fallback rayon pool")
+        })
 }
 
 fn encode_thread_count() -> usize {
