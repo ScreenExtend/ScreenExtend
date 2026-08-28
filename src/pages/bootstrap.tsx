@@ -422,7 +422,7 @@ export default function Bootstrap() {
       <AlertDialog open={permReport !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Permissions needed</AlertDialogTitle>
+            <AlertDialogTitle>Permissions Needed</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3 text-left">
                 <div>

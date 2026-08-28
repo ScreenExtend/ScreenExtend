@@ -53,10 +53,12 @@ function TipLabel({
   text,
   children,
   className,
+  innerClassName,
 }: {
   text: string;
   children: React.ReactNode;
   className?: string;
+  innerClassName?: string;
 }) {
   return (
     <Tooltip>
@@ -71,7 +73,7 @@ function TipLabel({
         }
       >
         {children}
-        <Info className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <Info className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground", innerClassName)} />
       </TooltipTrigger>
       <TooltipContent className="max-w-[15rem]">{text}</TooltipContent>
     </Tooltip>
@@ -423,9 +425,9 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
-              <TipLabel text="How many frames per second the display targets (Hz).">
+              <div>
                 Refresh Rate -
-              </TipLabel>
+              </div>
               <div className="flex items-center ml-1">
                 <Input
                   name="refreshRate"
@@ -459,6 +461,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                   disabled={inProgress}
                 />
                 <span className="ml-1">Hz</span>
+                {/* @ts-expect-error no children for tooltip */}
+                <TipLabel text="How many frames per second the display targets (Hz)." innerClassName="ml-2" />
               </div>
             </Label>
             <Slider
@@ -492,9 +496,9 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
-              <TipLabel text="Higher encodes faster but looks worse. Pick the highest value that still looks good.">
+              <div>
                 Video Quality -
-              </TipLabel>
+              </div>
               <div className="flex items-center ml-1">
                 <Input
                   name="videoQuality"
@@ -525,6 +529,8 @@ export function DeviceDetails({ device }: { device: Device }) {
                   disabled={inProgress}
                 />
               </div>
+              {/* @ts-expect-error no children for tooltip */}
+              <TipLabel text="Higher encodes faster but looks worse. Pick the highest value that still looks good." innerClassName="ml-2" />
             </Label>
             <Slider
               value={[deviceDetails.values.videoQuality]}

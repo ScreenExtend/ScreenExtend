@@ -117,7 +117,7 @@
   },
   "device": {
     "systemAudio": {
-      "label": "System audio",
+      "label": "System Audio",
       "tip": "Streams this computer's audio output to the device.",
       "unsupported": "System audio streaming isn't available on this host's operating system version (needs macOS 10.15 or later, or Windows 10 20H1 or later).",
       "needsInstall": "System audio on this macOS version needs a one-time audio component install. Turning this on will guide you through it.",
@@ -138,7 +138,7 @@
       "uninstalledBody": "ScreenExtend Audio was removed and your default output device restored."
     },
     "volumeKeyProxy": {
-      "label": "Proxy volume keys",
+      "label": "Proxy Volume Keys",
       "tip": "While ScreenExtend Audio is your Mac's output device, send the hardware volume and mute keys straight to it. Enable this only if the volume keys stop responding while streaming."
     }
   },
