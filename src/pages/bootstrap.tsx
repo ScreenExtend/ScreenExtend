@@ -430,7 +430,7 @@ export default function Bootstrap() {
                   keyboard and mouse from your connected devices. Enable each item below in System
                   Settings, then relaunch.
                 </div>
-                <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                <div className="flex items-start space-x-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
                   <Info className="mt-0.5 shrink-0 text-amber-600" size={16} />
                   <div>
                     <span className="font-semibold">Already enabled but still not working?</span>{" "}
@@ -443,10 +443,10 @@ export default function Bootstrap() {
                   {permReport?.map(p => (
                     <li
                       key={p.key}
-                      className="flex items-start justify-between gap-3 rounded-md border p-3"
+                      className="flex items-start justify-between space-x-3 rounded-md border p-3"
                     >
                       <div>
-                        <div className="font-semibold flex items-center gap-2">
+                        <div className="font-semibold flex items-center space-x-2">
                           {p.granted
                             ? <Check className="text-green-600 mr-2" size={16} />
                             : <X className="text-red-600 mr-2" size={16} />}

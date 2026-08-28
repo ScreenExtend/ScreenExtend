@@ -167,7 +167,7 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
             />
           </div>
         </div>
-        <div className="mt-5 flex items-center gap-3">
+        <div className="mt-5 flex items-center space-x-3">
           <span className="text-xs text-muted-foreground">{t("dialogs.avatarCrop.zoom")}</span>
           <Slider
             value={[zoom]}
@@ -178,7 +178,7 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
             onValueChange={([value]) => applyZoom(value)}
           />
         </div>
-        <div className="mt-6 flex justify-end gap-2">
+        <div className="mt-6 flex justify-end space-x-2">
           <Button variant="outline" onClick={onCancel} disabled={saving}>
             {t("common.cancel")}
           </Button>

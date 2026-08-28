@@ -64,7 +64,7 @@ function TipLabel({
         render={
           <span
             className={cn(
-              "inline-flex w-fit cursor-help items-center gap-1",
+              "inline-flex w-fit cursor-help items-center space-x-1",
               className
             )}
           />
@@ -314,7 +314,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               hoverLabel={false}
             />
           </div>
-          <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+          <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
             <TipLabel text="Let this device control your PC with touch and keyboard. Turn off to keep the display view-only.">
               <Label>Remote Control</Label>
             </TipLabel>
@@ -326,7 +326,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               disabled={inProgress}
             />
           </div>
-          <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+          <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
             <TipLabel
               text={
                 audioUnsupported
@@ -371,7 +371,7 @@ export function DeviceDetails({ device }: { device: Device }) {
             </AlertDialogContent>
           </AlertDialog>
           {audioActiveLegacy && (
-            <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+            <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
               <TipLabel text={t("device.volumeKeyProxy.tip")}>
                 <Label>{t("device.volumeKeyProxy.label")}</Label>
               </TipLabel>
