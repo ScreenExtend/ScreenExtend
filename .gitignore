@@ -36,3 +36,6 @@ linux-vdd/
 
 # Hardening audit log
 AUDIT.md
+
+# Personal git workflow
+SSH-GIT.md
