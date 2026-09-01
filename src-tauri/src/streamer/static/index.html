@@ -8,6 +8,33 @@
         <link rel="icon" type="image/svg+xml" href="/logo.svg" />
         <title>ScreenExtend Session</title>
         <link rel="stylesheet" href="/styles.css" />
+        <style>
+            #permModal {
+                position: fixed;
+                inset: 0;
+                z-index: 20;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                padding: 1rem;
+                background: rgba(0, 0, 0, 0.66);
+            }
+            #permModal .card {
+                max-width: 430px;
+                background: #14171d;
+                border: 1px solid #2a2f3a;
+                border-radius: 14px;
+                padding: 1.25rem 1.4rem;
+                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+            }
+            #permModal h2 { margin: 0 0 .55rem; font-size: 16px; color: #e6e9ef; }
+            #permModal p { margin: 0 0 1rem; color: #aab2c2; }
+            #permModal .row { display: flex; flex-wrap: wrap; margin: -.3rem; }
+            #permModal .row > * { margin: .3rem; }
+            #permModal button { padding: .55rem 1rem; border: 0; border-radius: 9px; font-size: 14px; cursor: pointer; }
+            #permContinue { background: #2a6df0; color: #fff; }
+            #permSkip { background: #2a2f3a; color: #cdd3df; }
+        </style>
         <script>window.__SAME_DEVICE__ = __SAME_DEVICE_FLAG__;</script>
     </head>
     <body>
@@ -108,6 +135,17 @@
             </div>
         </div>
 
+        <div id="permModal" role="dialog" aria-modal="true" style="z-index: 9996">
+            <div class="card">
+                <h2>Allow microphone access</h2>
+                <p>To let the host choose where this device plays audio (a specific speaker, or the phone's earpiece), ScreenExtend needs brief microphone access to detect the available outputs. Your microphone is never recorded or streamed.</p>
+                <div class="row">
+                    <button id="permContinue" type="button">Continue</button>
+                    <button id="permSkip" type="button">Not now</button>
+                </div>
+            </div>
+        </div>
+
         <script src="/input.js"></script>
         <script src="/audio.js"></script>
         <!-- NoSleep.min.js v0.12.0 (Rich Tibbett, MIT) — served from /nosleep.js -->
@@ -153,7 +191,7 @@
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
-                    if (locked) stopLock();
+                    if (locked) stopLock(); else disableNoSleep();
                     isLive = false;
                     loadingEl.classList.remove('show');
                     joinEl.style.display = '';
@@ -204,6 +242,9 @@
                         const r = await fetch('/reconfig');
                         if (!r.ok) return;
                         const j = await r.json();
+                        if (typeof j.audioSink === 'string') {
+                            try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) {}
+                        }
                         if (kickEpoch !== null && j.kick !== kickEpoch) {
                             kickEpoch = j.kick;
                             kickDevice();
@@ -430,11 +471,15 @@
                 viewportModeActive = false;
             }
 
+            function disableNoSleep() {
+                try { noSleep.disable(); } catch (_) {}
+            }
+
             function enableNoSleep() {
                 try {
                     if (noSleep.isEnabled) return;
                     const p = noSleep.enable();
-                    if (p && p.catch) p.catch(() => {});
+                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => {});
                 } catch (_) {}
             }
 
@@ -510,7 +555,7 @@
 
                 if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
 
-                noSleep.disable();
+                disableNoSleep();
 
                 if (document.exitPointerLock) document.exitPointerLock();
                 else if (document.mozExitPointerLock) document.mozExitPointerLock();
@@ -829,6 +874,13 @@
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) {} }
                     const answerSdp = await resp.text();
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+                    try {
+                        if (window.SEAudio) {
+                            SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken);
+                            Promise.resolve(SEAudio._enumPromise).then(() => SEAudio.postOutputs()).catch(() => {});
+                        }
+                    } catch (_) {}
 
                     if (webcodecs && worker) {
                         const plid = negotiatedProfileLevelId(answerSdp);
@@ -1156,6 +1208,16 @@
                 m.classList.add('show');
             })();
 
+            function showPermModal(onContinue, onSkip) {
+                const m = document.getElementById('permModal');
+                const cont = document.getElementById('permContinue');
+                const skip = document.getElementById('permSkip');
+                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) {} };
+                cont.onclick = () => done(onContinue);
+                skip.onclick = () => done(onSkip);
+                m.style.display = 'flex';
+            }
+
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 if (connectBtn.disabled) return;
@@ -1187,7 +1249,17 @@
 
                 try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
 
-                beginStreaming();
+                const startAudioAndStream = () => {
+                    try { if (window.SEAudio) { SEAudio._enumPromise = SEAudio.unlockAndEnumerate(); } } catch (_) {}
+                    beginStreaming();
+                };
+                let needMic = false;
+                try { if (window.SEAudio) { SEAudio.initSpeakers(); needMic = await SEAudio.needsMicPermission(); } } catch (_) {}
+                if (needMic) {
+                    showPermModal(startAudioAndStream, () => beginStreaming());
+                } else {
+                    startAudioAndStream();
+                }
             });
         </script>
     </body>

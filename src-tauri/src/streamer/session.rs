@@ -36,10 +36,24 @@ pub struct DeviceOverride {
     pub audio_enabled: bool,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct AudioOutput {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct AudioOutputsReport {
+    pub supported: bool,
+    pub outputs: Vec<AudioOutput>,
+    pub selected: String,
+}
+
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_join(&self, device: DeviceInfo);
     fn report_remove(&self, ip: String);
     fn report_join_attempts_paused(&self, _retry_after_secs: u64) {}
+    fn report_audio_outputs(&self, _ip: String, _report: AudioOutputsReport) {}
 }
 
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
@@ -168,6 +182,9 @@ pub struct DeviceSessionState {
     pub live_display: Option<LiveDisplay>,
     pub leave: Option<Arc<LeaveSignal>>,
     pub active_capture: Option<(u64, CaptureStopper)>,
+    pub audio_outputs: Vec<AudioOutput>,
+    pub audio_outputs_supported: bool,
+    pub selected_audio_output: Option<String>,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -309,6 +326,48 @@ pub fn is_current_session(sessions: &SharedSessions, ip: &str, seq: u64) -> bool
         .get(ip)
         .map(|s| s.session_seq == seq)
         .unwrap_or(false)
+}
+
+pub fn set_audio_outputs(
+    sessions: &SharedSessions,
+    ip: &str,
+    supported: bool,
+    outputs: Vec<AudioOutput>,
+) {
+    let mut map = sessions.lock().unwrap();
+    let entry = map.entry(ip.to_string()).or_default();
+    entry.audio_outputs_supported = supported;
+    entry.audio_outputs = outputs;
+}
+
+pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputsReport {
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .map(|s| AudioOutputsReport {
+            supported: s.audio_outputs_supported,
+            outputs: s.audio_outputs.clone(),
+            selected: s.selected_audio_output.clone().unwrap_or_default(),
+        })
+        .unwrap_or_default()
+}
+
+pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Option<String>) {
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .selected_audio_output = sel;
+}
+
+pub fn selected_audio_output(sessions: &SharedSessions, ip: &str) -> Option<String> {
+    sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .and_then(|s| s.selected_audio_output.clone())
 }
 
 #[derive(Clone, Debug, Default)]

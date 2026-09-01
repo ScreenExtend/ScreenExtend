@@ -328,6 +328,26 @@ pub fn set_device_override(
 
 #[tauri::command]
 #[specta::specta]
+pub fn set_device_audio_output(state: State<'_, AppState>, ip: String, device_id: String) {
+    let sel = if device_id.trim().is_empty() {
+        None
+    } else {
+        Some(device_id)
+    };
+    session::set_selected_audio_output(&state.sessions, &ip, sel);
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_device_audio_outputs(
+    state: State<'_, AppState>,
+    ip: String,
+) -> crate::streamer::session::AudioOutputsReport {
+    session::audio_outputs_report(&state.sessions, &ip)
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
     state.device_overrides.lock().unwrap().remove(&ip);
     session::bump_kick_epoch(&state.sessions, &ip);

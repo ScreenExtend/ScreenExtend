@@ -49,3 +49,21 @@ pub fn audio_driver_status() -> String {
 #[tauri::command]
 #[specta::specta]
 pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_audio_output(
+    _state: tauri::State<'_, AppState>,
+    _ip: String,
+    _device_id: String,
+) {
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_device_audio_outputs(
+    _state: tauri::State<'_, AppState>,
+    _ip: String,
+) -> crate::streamer::session::AudioOutputsReport {
+    crate::streamer::session::AudioOutputsReport::default()
+}

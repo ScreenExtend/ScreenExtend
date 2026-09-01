@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useContext, useEffect, useState } from "react";
 
 import { Info } from "lucide-react";
 
@@ -43,6 +43,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { updateConfig, getConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
+import { GlobalProviderContext } from "@/components/global-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
@@ -112,6 +113,20 @@ export function DeviceDetails({ device }: { device: Device }) {
     getConfig().then((c) => setVolumeKeyProxy(c?.legacyVolumeKeyProxy ?? false));
   }, []);
 
+  const { windowAudioOutputsByIp } = useContext(GlobalProviderContext);
+  const [audioOutputsByIp, setAudioOutputsByIp] = windowAudioOutputsByIp;
+  const audioOutputs = audioOutputsByIp[device.ip];
+  useEffect(() => {
+    if (!open) return;
+    (async () => {
+      const r = await commands.getDeviceAudioOutputs(device.ip);
+      setAudioOutputsByIp((prev) => ({
+        ...prev,
+        [device.ip]: { supported: r.supported, outputs: r.outputs, selected: r.selected },
+      }));
+    })();
+  }, [open, device.ip, setAudioOutputsByIp]);
+
   const runAudioInstall = async () => {
     setInstallPromptOpen(false);
     setAudioInstalling(true);
@@ -149,6 +164,8 @@ export function DeviceDetails({ device }: { device: Device }) {
       dpr: device.dpr ?? device.maxDpr ?? 1,
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
       systemAudio: device.systemAudio ?? false,
+      audioOutputDeviceId: device.audioOutputDeviceId ?? "",
+      audioOutputDeviceLabel: device.audioOutputDeviceLabel ?? "",
     },
     onSubmit: async (values) => {
       setInProgress(true);
@@ -386,6 +403,58 @@ export function DeviceDetails({ device }: { device: Device }) {
                 }}
                 disabled={inProgress}
               />
+            </div>
+          )}
+          {deviceDetails.values.systemAudio && (
+            <div className="mt-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
+              <div className="flex items-center justify-between space-x-4">
+                <TipLabel text={t("device.audioOutput.tip")}>
+                  <Label>{t("device.audioOutput.label")}</Label>
+                </TipLabel>
+                {audioOutputs?.supported === false ? (
+                  <span className="text-sm text-muted-foreground text-right">
+                    {t("device.audioOutput.unsupported")}
+                  </span>
+                ) : (
+                  <Select
+                    value={(audioOutputs ? audioOutputs.selected : deviceDetails.values.audioOutputDeviceId) || "default"}
+                    onValueChange={async (v) => {
+                      const id = v === "default" ? "" : v;
+                      const label = audioOutputs?.outputs.find((o) => o.id === id)?.label ?? "";
+                      deviceDetails.setFieldValue("audioOutputDeviceId", id);
+                      deviceDetails.setFieldValue("audioOutputDeviceLabel", label);
+                      setAudioOutputsByIp((prev) => {
+                        const cur = prev[device.ip];
+                        return cur ? { ...prev, [device.ip]: { ...cur, selected: id } } : prev;
+                      });
+                      await commands.setDeviceAudioOutput(deviceDetails.values.ip, id);
+                    }}
+                    disabled={inProgress}
+                  >
+                    <SelectTrigger className="w-[55%] border-2">
+                      <SelectValue placeholder={t("device.audioOutput.default")} />
+                    </SelectTrigger>
+                    <SelectContent className="cursor-pointer">
+                      <SelectItem value="default">{t("device.audioOutput.default")}</SelectItem>
+                      {(audioOutputs?.outputs ?? []).map((o) => (
+                        <SelectItem key={o.id} value={o.id}>
+                          {o.id === "se:earpiece"
+                            ? t("device.audioOutput.earpiece")
+                            : o.id === "se:loudspeaker"
+                              ? t("device.audioOutput.speaker")
+                              : o.label || o.id.slice(0, 8)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </div>
+              {audioOutputs?.supported !== false &&
+                (!audioOutputs || audioOutputs.outputs.length === 0) && (
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {t("device.audioOutput.waiting")}
+                  </p>
+                )}
             </div>
           )}
           <div className="mt-4">

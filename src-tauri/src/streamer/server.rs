@@ -322,6 +322,7 @@ fn router(state: AppState) -> Router {
         .route("/ice-config", get(ice_config))
         .route("/net-config", get(net_config))
         .route("/reconfig", get(reconfig))
+        .route("/audio-outputs", post(audio_outputs))
         .with_state(state)
 }
 
@@ -448,6 +449,59 @@ async fn leave(
     StatusCode::NO_CONTENT.into_response()
 }
 
+const MAX_AUDIO_OUTPUTS: usize = 32;
+const MAX_AUDIO_OUTPUT_STR: usize = 256;
+
+#[derive(Deserialize)]
+struct AudioOutputEntry {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct AudioOutputsRequest {
+    #[serde(default)]
+    supported: bool,
+    #[serde(default)]
+    outputs: Vec<AudioOutputEntry>,
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+async fn audio_outputs(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    let req: AudioOutputsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
+    };
+    let ip = peer.ip().to_string();
+    let outputs: Vec<session::AudioOutput> = req
+        .outputs
+        .into_iter()
+        .take(MAX_AUDIO_OUTPUTS)
+        .map(|o| session::AudioOutput {
+            id: truncate_chars(&o.id, MAX_AUDIO_OUTPUT_STR),
+            label: truncate_chars(&o.label, MAX_AUDIO_OUTPUT_STR),
+        })
+        .collect();
+
+    if let Some(s) = state.config.sessions.as_ref() {
+        session::set_audio_outputs(s, &ip, req.supported, outputs);
+        if let Some(reporter) = state.config.device_reporter.as_ref() {
+            let report = session::audio_outputs_report(s, &ip);
+            reporter.report_audio_outputs(ip.clone(), report);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub fn process_reconfig(state: &AppState, device_key: &str) -> String {
     let (epoch, kick) = state
         .config
@@ -460,7 +514,13 @@ pub fn process_reconfig(state: &AppState, device_key: &str) -> String {
             )
         })
         .unwrap_or((0, 0));
-    serde_json::json!({ "epoch": epoch, "kick": kick }).to_string()
+    let audio_sink = state
+        .config
+        .sessions
+        .as_ref()
+        .and_then(|s| session::selected_audio_output(s, device_key))
+        .unwrap_or_default();
+    serde_json::json!({ "epoch": epoch, "kick": kick, "audioSink": audio_sink }).to_string()
 }
 
 pub fn process_leave(state: &AppState, device_key: &str) {
