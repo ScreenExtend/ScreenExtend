@@ -3,8 +3,12 @@ use std::sync::Arc;
 use tauri::AppHandle;
 use tauri_specta::Event;
 
-use crate::streamer::session::{DeviceInfo, DeviceReporter, SharedDeviceOverrides};
-use crate::{Device, DeviceJoin, DeviceRemove, JoinAttemptsPaused};
+use crate::streamer::session::{
+    AudioOutputsReport, DeviceInfo, DeviceReporter, SharedDeviceOverrides,
+};
+use crate::{
+    AudioOutput, Device, DeviceAudioOutputs, DeviceJoin, DeviceRemove, JoinAttemptsPaused,
+};
 
 #[derive(Debug)]
 pub struct TauriDeviceReporter {
@@ -58,6 +62,25 @@ impl DeviceReporter for TauriDeviceReporter {
         };
         if let Err(e) = event.emit(&self.app) {
             teprintln!("[device-reporter] emit JoinAttemptsPaused failed: {e:?}");
+        }
+    }
+
+    fn report_audio_outputs(&self, ip: String, report: AudioOutputsReport) {
+        let ev = DeviceAudioOutputs {
+            ip,
+            supported: report.supported,
+            outputs: report
+                .outputs
+                .into_iter()
+                .map(|o| AudioOutput {
+                    id: o.id,
+                    label: o.label,
+                })
+                .collect(),
+            selected: report.selected,
+        };
+        if let Err(e) = ev.emit(&self.app) {
+            teprintln!("[device-reporter] emit DeviceAudioOutputs failed: {e:?}");
         }
     }
 }

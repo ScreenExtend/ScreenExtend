@@ -140,6 +140,15 @@
     "volumeKeyProxy": {
       "label": "Proxy Volume Keys",
       "tip": "While ScreenExtend Audio is your Mac's output device, send the hardware volume and mute keys straight to it. Enable this only if the volume keys stop responding while streaming."
+    },
+    "audioOutput": {
+      "label": "Audio Output",
+      "tip": "Choose which of this device's speakers plays the streamed audio.",
+      "default": "System Default",
+      "speaker": "Speaker",
+      "earpiece": "Earpiece",
+      "waiting": "Waiting for this device to report its speakers…",
+      "unsupported": "This device's browser can't switch speakers; audio plays on its default output."
     }
   },
   "notifications": {

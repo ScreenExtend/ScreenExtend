@@ -20,7 +20,7 @@ import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { GlobalProviderContext, type AudioOutputsInfo } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
@@ -50,6 +50,7 @@ function App() {
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
   const [avatar, setAvatar] = useState<string | null>(null);
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
+  const [audioOutputsByIp, setAudioOutputsByIp] = useState<Record<string, AudioOutputsInfo>>({});
   const zoomReady = useRef(false);
 
   const [closing, setClosing] = useState(false);
@@ -164,6 +165,13 @@ function App() {
         const device = event.payload as Device;
         setDevices(prev => prev.map(d => d.ip === device.ip ? device : d));
       }));
+      unlisteners.push(await events.deviceAudioOutputs.listen(event => {
+        const p = event.payload;
+        setAudioOutputsByIp(prev => ({
+          ...prev,
+          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected },
+        }));
+      }));
       unlisteners.push(await events.deviceRemove.listen(event => {
         const device = event.payload as Device;
         const known = devicesRef.current.find(d => d.ip === device.ip);
@@ -241,7 +249,8 @@ function App() {
       windowDevices: [devices, setDevices],
       windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled],
       windowAvatar: [avatar, setAvatar],
-      windowZoom: [zoom, setZoom]
+      windowZoom: [zoom, setZoom],
+      windowAudioOutputsByIp: [audioOutputsByIp, setAudioOutputsByIp]
     }}>
       <ThemeProvider defaultTheme="system">
         <NextStepProvider>

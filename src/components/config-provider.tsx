@@ -12,6 +12,8 @@ export type Device = {
   videoQuality: number;
   remoteControl: boolean;
   systemAudio: boolean;
+  audioOutputDeviceId: string;
+  audioOutputDeviceLabel: string;
   os: string;
   screenSize: string;
   dpr: number;

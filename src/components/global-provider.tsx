@@ -1,6 +1,12 @@
 import React, { createContext } from "react";
 import { type Device } from "@/components/config-provider";
 
+export type AudioOutputsInfo = {
+  supported: boolean;
+  outputs: { id: string; label: string }[];
+  selected: string;
+};
+
 export const GlobalContextDefault = {
   hostedNetworkOn: false,
   otp: "",
@@ -10,7 +16,8 @@ export const GlobalContextDefault = {
   devices: [] as Device[],
   publicSessionsEnabled: true,
   avatar: null as string | null,
-  zoom: 1
+  zoom: 1,
+  audioOutputsByIp: {} as Record<string, AudioOutputsInfo>
 };
 
 export type GlobalContextType = {
@@ -23,7 +30,8 @@ export type GlobalContextType = {
   windowDevices: [Device[], React.Dispatch<React.SetStateAction<Device[]>>],
   windowPublicSessionsEnabled: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
   windowAvatar: [string | null, React.Dispatch<React.SetStateAction<string | null>>],
-  windowZoom: [number, React.Dispatch<React.SetStateAction<number>>]
+  windowZoom: [number, React.Dispatch<React.SetStateAction<number>>],
+  windowAudioOutputsByIp: [Record<string, AudioOutputsInfo>, React.Dispatch<React.SetStateAction<Record<string, AudioOutputsInfo>>>]
 }
 
 export const GlobalProviderContext = createContext<GlobalContextType>({
@@ -36,5 +44,6 @@ export const GlobalProviderContext = createContext<GlobalContextType>({
   windowDevices: [[] as Device[], () => {}],
   windowPublicSessionsEnabled: [true, () => {}],
   windowAvatar: [null, () => {}],
-  windowZoom: [1, () => {}]
+  windowZoom: [1, () => {}],
+  windowAudioOutputsByIp: [{}, () => {}]
 });

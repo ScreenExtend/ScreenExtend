@@ -32,6 +32,16 @@ mod linux_utils;
 #[cfg(target_os = "linux")]
 use linux_utils::*;
 
+pub use streamer::session::{AudioOutput, AudioOutputsReport};
+
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct DeviceAudioOutputs {
+    pub ip: String,
+    pub supported: bool,
+    pub outputs: Vec<AudioOutput>,
+    pub selected: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct DeviceJoin(Device);
 
@@ -318,6 +328,8 @@ pub fn run() {
             audio_driver_status,
             set_legacy_volume_key_proxy,
             set_device_override,
+            set_device_audio_output,
+            get_device_audio_outputs,
             remove_device_override,
             set_device_banned,
             set_device_approved,
@@ -333,6 +345,7 @@ pub fn run() {
         ])
         .events(collect_events![
             DeviceJoin,
+            DeviceAudioOutputs,
             DeviceModify,
             DeviceModifyAction,
             DeviceRemove,

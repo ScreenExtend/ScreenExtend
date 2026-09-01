@@ -38,6 +38,327 @@
         lastOffsetLogAt: 0,
     };
 
+    const SE_LOUDSPEAKER = 'se:loudspeaker';
+    const SE_EARPIECE = 'se:earpiece';
+
+    const speakers = {
+        inited: false,
+        hasEnumerate: false,
+        hasElemSink: false,
+        hasCtxSink: false,
+        hasSelectOut: false,
+        hasDeviceChange: false,
+        hasAudioSession: false,
+        isIOS: false,
+        hasEarpiece: false,
+        canSink: false,
+        canCategory: false,
+        supported: false,
+        watching: false,
+        poll: null,
+        firstDeviceChange: true,
+        debounceTimer: 0,
+        appliedSink: null,
+        msd: null,
+        sinkEl: null,
+        micHold: null,
+        sessionId: '',
+        deviceToken: '',
+    };
+
+    function detectIOS() {
+        try {
+            const ua = navigator.userAgent || '';
+            const iPad = navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1;
+            return /iPad|iPhone|iPod/.test(ua) || iPad;
+        } catch (_) { return false; }
+    }
+
+    function detectHasEarpiece() {
+        try { return /iPhone/.test(navigator.userAgent || ''); } catch (_) { return false; }
+    }
+
+    function initSpeakers() {
+        if (speakers.inited) return;
+        speakers.inited = true;
+        try {
+            const md = navigator.mediaDevices;
+            const AC = window.AudioContext || window.webkitAudioContext;
+            speakers.hasEnumerate = !!(md && md.enumerateDevices);
+            speakers.hasElemSink = 'setSinkId' in HTMLMediaElement.prototype;
+            speakers.hasCtxSink = !!(AC && 'setSinkId' in (AC.prototype || {}));
+            speakers.hasSelectOut = !!(md && typeof md.selectAudioOutput === 'function');
+            speakers.hasDeviceChange = !!(md && 'ondevicechange' in md);
+            speakers.hasAudioSession = 'audioSession' in navigator;
+            speakers.isIOS = detectIOS();
+            speakers.hasEarpiece = detectHasEarpiece();
+            speakers.canSink = speakers.hasEnumerate && (speakers.hasElemSink || speakers.hasCtxSink);
+            speakers.canCategory = speakers.hasEarpiece;
+            speakers.supported = speakers.canSink || speakers.canCategory;
+        } catch (_) {}
+        if (speakers.hasAudioSession) {
+            try { navigator.audioSession.type = 'playback'; } catch (_) {}
+        }
+    }
+
+    async function unlockAndEnumerate() {
+        initSpeakers();
+        if (!speakers.supported) return { supported: false, outputs: [] };
+        try {
+            let granted = false;
+            try {
+                const p = await navigator.permissions.query({ name: 'microphone' });
+                granted = p && p.state === 'granted';
+            } catch (_) {}
+            let enumerated = [];
+            if (speakers.canSink) {
+                enumerated = await listOutputs();
+                if (!enumerated.length || !enumerated.some((d) => d.label)) {
+                    let stream = null;
+                    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (_) {}
+                    enumerated = await listOutputs();
+                    if (stream) stream.getTracks().forEach((t) => t.stop());
+                }
+                if (enumerated.some((d) => d.label)) speakers._lastEnum = enumerated;
+            } else if (speakers.hasEarpiece && !speakers.hasAudioSession && !granted) {
+                try {
+                    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    s.getTracks().forEach((t) => t.stop());
+                } catch (_) {}
+            }
+            const outputs = buildOutputs(enumerated);
+            startDeviceWatch();
+            speakers._cache = { supported: speakers.supported, outputs };
+            return speakers._cache;
+        } catch (_) {
+            speakers._cache = { supported: speakers.supported, outputs: buildOutputs([]) };
+            return speakers._cache;
+        }
+    }
+
+    async function needsMicPermission() {
+        initSpeakers();
+        const wantMic = speakers.canSink || (speakers.hasEarpiece && !speakers.hasAudioSession);
+        if (!wantMic) return false;
+        try {
+            const p = await navigator.permissions.query({ name: 'microphone' });
+            if (p && p.state === 'granted') return false;
+        } catch (_) {}
+        return true;
+    }
+
+    async function listOutputs() {
+        try {
+            const devs = await navigator.mediaDevices.enumerateDevices();
+            return devs
+                .filter((d) => d.kind === 'audiooutput')
+                .map((d) => ({ id: d.deviceId, label: d.label || '' }));
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function buildOutputs(enumerated) {
+        const out = [];
+        if (speakers.canCategory) {
+            out.push({ id: SE_LOUDSPEAKER, label: 'Speaker' });
+            out.push({ id: SE_EARPIECE, label: 'Earpiece' });
+        }
+        if (speakers.canSink) {
+            for (const d of enumerated) out.push(d);
+        }
+        return out;
+    }
+
+    function applySession(type) {
+        if (!speakers.hasAudioSession) return false;
+        try { navigator.audioSession.type = type; return true; } catch (_) { return false; }
+    }
+
+    async function acquireMicHold() {
+        if (speakers.micHold) return true;
+        try {
+            speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
+            return true;
+        } catch (_) { speakers.micHold = null; return false; }
+    }
+
+    function releaseMicHold() {
+        if (!speakers.micHold) return;
+        try { speakers.micHold.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        speakers.micHold = null;
+    }
+
+    async function revertSink() {
+        if (speakers.msd) {
+            try { state.gain.disconnect(speakers.msd); } catch (_) {}
+            try { if (state.ctx) state.gain.connect(state.ctx.destination); } catch (_) {}
+            if (speakers.sinkEl) { try { speakers.sinkEl.pause(); } catch (_) {} speakers.sinkEl.srcObject = null; }
+            speakers.msd = null;
+        } else if (speakers.hasCtxSink && state.ctx) {
+            try { await state.ctx.setSinkId(''); } catch (_) {}
+        }
+        if (state.path === 'netEQ' && state.audioEl && typeof state.audioEl.setSinkId === 'function') {
+            try { await state.audioEl.setSinkId(''); } catch (_) {}
+        }
+    }
+
+    async function ensureCategoryBridge() {
+        if (!state.ctx || !state.gain) return;
+        if (!speakers.msd) {
+            speakers.msd = state.ctx.createMediaStreamDestination();
+            try { state.gain.disconnect(state.ctx.destination); } catch (_) {}
+            state.gain.connect(speakers.msd);
+        }
+        if (!speakers.sinkEl) {
+            const a = document.createElement('audio');
+            a.autoplay = true;
+            a.playsInline = true;
+            a.setAttribute('webkit-playsinline', '');
+            a.muted = false;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            speakers.sinkEl = a;
+        }
+        speakers.sinkEl.srcObject = speakers.msd.stream;
+        const pr = speakers.sinkEl.play();
+        if (pr && pr.catch) pr.catch(() => {});
+    }
+
+    function startDeviceWatch() {
+        if (speakers.watching) return;
+        speakers.watching = true;
+        if (!speakers.canSink) return;
+        const md = navigator.mediaDevices;
+        const onChange = () => {
+            if (speakers.firstDeviceChange) { speakers.firstDeviceChange = false; return; }
+            if (speakers.debounceTimer) clearTimeout(speakers.debounceTimer);
+            speakers.debounceTimer = setTimeout(reEnumerateAndPost, 500);
+        };
+        try {
+            if (md && md.addEventListener && speakers.hasDeviceChange) {
+                md.addEventListener('devicechange', onChange);
+            }
+        } catch (_) {}
+        try {
+            speakers.poll = setInterval(() => {
+                if (document.visibilityState !== 'visible') return;
+                reEnumerateAndPost();
+            }, 4000);
+        } catch (_) {}
+    }
+
+    async function reEnumerateAndPost() {
+        try {
+            let enumerated = speakers.canSink ? await listOutputs() : [];
+            if (speakers.canSink) {
+                const hasLabels = enumerated.some((d) => d.label);
+                if ((!enumerated.length || !hasLabels) && speakers._lastEnum && speakers._lastEnum.length) {
+                    enumerated = speakers._lastEnum;
+                } else if (enumerated.length && hasLabels) {
+                    speakers._lastEnum = enumerated;
+                }
+            }
+            speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
+            postOutputs();
+        } catch (_) {}
+    }
+
+    function postOutputs() {
+        try {
+            const cache = speakers._cache || { supported: speakers.supported, outputs: [] };
+            const body = JSON.stringify({
+                sessionId: speakers.sessionId || '',
+                deviceToken: speakers.deviceToken || '',
+                supported: cache.supported,
+                outputs: cache.outputs,
+                selected: speakers.appliedSink || '',
+            });
+            fetch('/audio-outputs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body,
+            }).catch(() => {});
+        } catch (_) {}
+    }
+
+    async function setSpeaker(deviceId) {
+        initSpeakers();
+        const raw = deviceId || '';
+        const id = (raw === 'default') ? '' : raw;
+        if (speakers.appliedSink === id) return;
+
+        if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
+            if (state.path === 'netEQ') { try { await revertSink(); } catch (_) {} }
+            else { try { await ensureCategoryBridge(); } catch (_) {} }
+            if (id === SE_EARPIECE) {
+                applySession('play-and-record');
+                if (!speakers.hasAudioSession && speakers.hasEarpiece)
+                    { try { await acquireMicHold(); } catch (_) {} }
+            } else {
+                applySession('playback');
+                releaseMicHold();
+            }
+            speakers.appliedSink = id;
+            return;
+        }
+
+        applySession('playback');
+        releaseMicHold();
+
+        try {
+            if (state.path === 'netEQ' && state.audioEl) {
+                if (typeof state.audioEl.setSinkId === 'function') {
+                    await state.audioEl.setSinkId(id);
+                    speakers.appliedSink = id;
+                }
+                return;
+            }
+            if (!state.ctx || !state.gain) return;
+
+            if (id === '') {
+                await revertSink();
+                speakers.appliedSink = '';
+                return;
+            }
+
+            if (speakers.hasCtxSink) {
+                await state.ctx.setSinkId(id);
+                speakers.appliedSink = id;
+                return;
+            }
+
+            if (speakers.hasElemSink) {
+                if (!speakers.msd) {
+                    speakers.msd = state.ctx.createMediaStreamDestination();
+                    try { state.gain.disconnect(state.ctx.destination); } catch (_) {}
+                    state.gain.connect(speakers.msd);
+                }
+                if (!speakers.sinkEl) {
+                    const a = document.createElement('audio');
+                    a.autoplay = true;
+                    a.playsInline = true;
+                    a.setAttribute('webkit-playsinline', '');
+                    a.muted = false;
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    speakers.sinkEl = a;
+                }
+                speakers.sinkEl.srcObject = speakers.msd.stream;
+                await speakers.sinkEl.setSinkId(id);
+                const p = speakers.sinkEl.play();
+                if (p && p.catch) p.catch(() => {});
+                speakers.appliedSink = id;
+                return;
+            }
+        } catch (_) {}
+    }
+
+    function setSpeakerIdentity(sessionId, deviceToken) {
+        speakers.sessionId = sessionId || '';
+        speakers.deviceToken = deviceToken || '';
+    }
+
     function outputLatencyMs() {
         const c = state.ctx;
         if (!c) return 0;
@@ -87,6 +408,7 @@
 
     async function prepare() {
         if (state.prepared) return true;
+        initSpeakers();
         const AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) return false;
         try {
@@ -196,6 +518,7 @@
             const a = document.createElement('audio');
             a.autoplay = true;
             a.playsInline = true;
+            a.setAttribute('webkit-playsinline', '');
             a.style.display = 'none';
             document.body.appendChild(a);
             state.audioEl = a;
@@ -247,5 +570,12 @@
         getSyncInfo,
         activePath,
         teardown,
+        initSpeakers,
+        unlockAndEnumerate,
+        needsMicPermission,
+        postOutputs,
+        setSpeaker,
+        setSpeakerIdentity,
+        _enumPromise: null,
     };
 })();

@@ -90,6 +90,12 @@ async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
+async setDeviceAudioOutput(ip: string, deviceId: string) : Promise<void> {
+    await TAURI_INVOKE("set_device_audio_output", { ip, deviceId });
+},
+async getDeviceAudioOutputs(ip: string) : Promise<AudioOutputsReport> {
+    return await TAURI_INVOKE("get_device_audio_outputs", { ip });
+},
 async removeDeviceOverride(ip: string) : Promise<void> {
     await TAURI_INVOKE("remove_device_override", { ip });
 },
@@ -133,6 +139,7 @@ async getLogBacklog() : Promise<string[]> {
 
 export const events = __makeEvents__<{
 cloudStatusChange: CloudStatusChange,
+deviceAudioOutputs: DeviceAudioOutputs,
 deviceJoin: DeviceJoin,
 deviceModify: DeviceModify,
 deviceModifyAction: DeviceModifyAction,
@@ -145,6 +152,7 @@ networkChange: NetworkChange,
 sessionIdChange: SessionIdChange
 }>({
 cloudStatusChange: "cloud-status-change",
+deviceAudioOutputs: "device-audio-outputs",
 deviceJoin: "device-join",
 deviceModify: "device-modify",
 deviceModifyAction: "device-modify-action",
@@ -163,9 +171,12 @@ sessionIdChange: "session-id-change"
 
 /** user-defined types **/
 
+export type AudioOutput = { id: string; label: string }
+export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceModifyAction = Device
