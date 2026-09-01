@@ -185,20 +185,35 @@ pub fn set_device_override(
     } else {
         1.0
     };
-    state.device_overrides.lock().unwrap().insert(
-        ip.clone(),
-        DeviceOverride {
-            scale: scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE),
-            orientation_portrait: orientation == "Portrait",
-            refresh_rate: refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE),
-            video_scale: ScalePercent::new(video_scale).percent(),
-            video_quality: video_quality.clamp(1, 51) as u8,
-            control_enabled,
-            dpr,
-            audio_enabled,
-        },
-    );
-    session::bump_reconfig_epoch(&state.sessions, &ip);
+    let next = DeviceOverride {
+        scale: scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE),
+        orientation_portrait: orientation == "Portrait",
+        refresh_rate: refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE),
+        video_scale: ScalePercent::new(video_scale).percent(),
+        video_quality: video_quality.clamp(1, 51) as u8,
+        control_enabled,
+        dpr,
+        audio_enabled,
+    };
+    let restart_needed = {
+        let mut overrides = state.device_overrides.lock().unwrap();
+        let restart = match overrides.get(&ip) {
+            Some(old) => {
+                old.scale != next.scale
+                    || old.orientation_portrait != next.orientation_portrait
+                    || old.refresh_rate != next.refresh_rate
+                    || old.video_scale != next.video_scale
+                    || old.video_quality != next.video_quality
+                    || (old.dpr - next.dpr).abs() > f64::EPSILON
+            }
+            None => true,
+        };
+        overrides.insert(ip.clone(), next);
+        restart
+    };
+    if restart_needed {
+        session::bump_reconfig_epoch(&state.sessions, &ip);
+    }
 }
 
 #[tauri::command]

@@ -189,6 +189,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           normalized.dpr,
           normalized.systemAudio
         );
+        await commands.setDeviceAudioOutput(normalized.ip, normalized.audioOutputDeviceId);
         await saveDeviceSettings(normalized);
         await events.deviceModify.emit(normalized);
         toast({
@@ -417,17 +418,12 @@ export function DeviceDetails({ device }: { device: Device }) {
                   </span>
                 ) : (
                   <Select
-                    value={(audioOutputs ? audioOutputs.selected : deviceDetails.values.audioOutputDeviceId) || "default"}
-                    onValueChange={async (v) => {
+                    value={deviceDetails.values.audioOutputDeviceId || "default"}
+                    onValueChange={(v) => {
                       const id = v === "default" ? "" : v;
                       const label = audioOutputs?.outputs.find((o) => o.id === id)?.label ?? "";
                       deviceDetails.setFieldValue("audioOutputDeviceId", id);
                       deviceDetails.setFieldValue("audioOutputDeviceLabel", label);
-                      setAudioOutputsByIp((prev) => {
-                        const cur = prev[device.ip];
-                        return cur ? { ...prev, [device.ip]: { ...cur, selected: id } } : prev;
-                      });
-                      await commands.setDeviceAudioOutput(deviceDetails.values.ip, id);
                     }}
                     disabled={inProgress}
                   >
