@@ -4,7 +4,7 @@
 
 **Extend your screen. Extend your possibilities. Unlock ultimate productivity.**
 
-A free desktop‑extension solution that turns any device with a web browser into a wireless second monitorm without any app to install on the client.
+A free desktop‑extension solution that turns any device with a web browser into a wireless second monitor without any app to install on the client.
 
 </div>
 
