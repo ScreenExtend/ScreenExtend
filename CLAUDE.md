@@ -197,7 +197,7 @@ the two working tiers can only be verified on 13.0+/14.2+ hardware, not the 10.1
 - `legacy/` — the **macOS 10.15–12.x virtual-device tier** (`PRD-macos-legacy-audio.md`,
   `AUDIO_NOTES_MACOS_LEGACY.md`). Below 13.0 there is no native system-audio API at all, so this
   ships ScreenExtend's own **AudioServerPlugIn** virtual device (built on libASPL/MIT, in
-  `macos/ScreenExtendAudio/`), sets it as the default output, and reads the captured mix back over a
+  `src-tauri/macos/ScreenExtendAudio/`), sets it as the default output, and reads the captured mix back over a
   POSIX shared-memory ring (`shm_reader.rs`, with a HAL-input fallback) into the same encoder ring —
   zero new Opus/client code. `routing.rs` saves/switches/restores the default output (+ crash
   recovery on launch); `playthrough.rs` plays the capture to the real device with a gain stage;

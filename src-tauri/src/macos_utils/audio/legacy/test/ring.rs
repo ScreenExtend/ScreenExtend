@@ -57,7 +57,7 @@ fn generation_change_means_resync_to_head() {
 
 #[test]
 fn layout_matches_cpp_abi_contract() {
-    // MUST match macos/ScreenExtendAudio/src/shm_ring.hpp's static_asserts
+    // MUST match src-tauri/macos/ScreenExtendAudio/src/shm_ring.hpp's static_asserts
     assert_eq!(layout::HEADER_BYTES, 64);
     assert_eq!(layout::OFF_WRITE_POS, 32);
     assert_eq!(layout::OFF_GENERATION, 40);

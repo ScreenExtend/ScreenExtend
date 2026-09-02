@@ -14,7 +14,7 @@ LIBASPL_DIR="${LIBASPL_DIR:-}"
 if [ -z "${LIBASPL_DIR}" ]; then
   for cand in \
     "${HERE}/third_party/libASPL" \
-    "${HERE}/../../.sources-macos-legacy-audio/repos/libASPL"; do
+    "${HERE}/../../../.sources-macos-legacy-audio/repos/libASPL"; do
     if [ -d "${cand}/include/aspl" ]; then LIBASPL_DIR="${cand}"; break; fi
   done
 fi
