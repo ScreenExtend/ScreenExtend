@@ -30,6 +30,7 @@
   let fast = null, reliable = null, bulk = null;
   let pingTimer = null;
   let installed = false;
+  let active = false;
   let surface = null;
   let imeSink = null;
 
@@ -393,48 +394,52 @@
   function ndx(e) { return clamp01(e.clientX / (cssW || window.innerWidth)); }
   function ndy(e) { return clamp01(e.clientY / (cssH || window.innerHeight)); }
 
+  function on(target, type, fn, opts) {
+    target.addEventListener(type, (e) => { if (active) fn(e); }, opts);
+  }
+
   function installListeners() {
     if (installed) return;
     installed = true;
     surface = document.getElementById('stage');
     imeSink = document.getElementById('imeSink');
-    refreshSize();
 
-    if ('onpointerrawupdate' in surface) {
-      surface.addEventListener('pointerrawupdate', onPointerMove);
+    if (window.PointerEvent && 'onpointerrawupdate' in window) {
+      on(surface, 'pointerrawupdate', onPointerMove);
     } else {
-      surface.addEventListener('pointermove', onPointerMove);
+      on(surface, 'pointermove', onPointerMove);
     }
-    surface.addEventListener('pointerdown', onPointerDown);
-    surface.addEventListener('pointerup', e => endPointer(e, OP.POINTER_UP));
-    surface.addEventListener('pointercancel', e => endPointer(e, OP.POINTER_CANCEL));
-    surface.addEventListener('pointerover', e => sendPointer(OP.POINTER_OVER, e));
-    surface.addEventListener('pointerout', e => sendPointer(OP.POINTER_OUT, e));
-    surface.addEventListener('pointerenter', e => sendPointer(OP.POINTER_ENTER, e));
-    surface.addEventListener('pointerleave', e => sendPointer(OP.POINTER_LEAVE, e));
+    on(surface, 'pointerdown', onPointerDown);
+    on(surface, 'pointerup', e => endPointer(e, OP.POINTER_UP));
+    on(surface, 'pointercancel', e => endPointer(e, OP.POINTER_CANCEL));
+    on(surface, 'pointerover', e => sendPointer(OP.POINTER_OVER, e));
+    on(surface, 'pointerout', e => sendPointer(OP.POINTER_OUT, e));
+    on(surface, 'pointerenter', e => sendPointer(OP.POINTER_ENTER, e));
+    on(surface, 'pointerleave', e => sendPointer(OP.POINTER_LEAVE, e));
 
-    surface.addEventListener('wheel', e => { e.preventDefault(); sendWheel(e); }, { passive: false });
-    surface.addEventListener('contextmenu', e => e.preventDefault());
+    on(surface, 'wheel', e => { e.preventDefault(); sendWheel(e); }, { passive: false });
+    on(surface, 'contextmenu', e => e.preventDefault());
 
-    for (const t of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) {
-      surface.addEventListener(t, e => e.preventDefault(), { passive: false });
-    }
-
-    surface.addEventListener('gesturestart', e => { e.preventDefault(); gestureScale = e.scale || 1; });
-    surface.addEventListener('gesturechange', e => {
-      e.preventDefault();
-      const r = ((e.scale || 1) - gestureScale) / (gestureScale || 1);
-      if (Math.abs(r) > 0.01) { sendZoom(r * 4); gestureScale = e.scale || 1; }
+    ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach((t) => {
+      on(surface, t, e => e.preventDefault(), { passive: false });
     });
-    surface.addEventListener('gestureend', e => e.preventDefault());
 
-    window.addEventListener('keydown', onKeyDown, true);
-    window.addEventListener('keyup', onKeyUp, true);
+    on(surface, 'gesturestart', e => { e.preventDefault(); gestureScale = e.scale || 1; });
+    on(surface, 'gesturechange', e => {
+      e.preventDefault();
+      const s = e.scale || 1;
+      if (gestureScale > 0) { sendZoom((s - gestureScale) * 4); }
+      gestureScale = s;
+    });
+    on(surface, 'gestureend', e => e.preventDefault());
+
+    on(window, 'keydown', onKeyDown, true);
+    on(window, 'keyup', onKeyUp, true);
 
     if (imeSink) {
-      imeSink.addEventListener('compositionupdate', e => sendText(OP.COMPOSITION_UPDATE, e.data || ''));
-      imeSink.addEventListener('compositionend', e => { sendText(OP.TEXT_INPUT, e.data || ''); imeSink.value = ''; });
-      imeSink.addEventListener('input', e => {
+      on(imeSink, 'compositionupdate', e => sendText(OP.COMPOSITION_UPDATE, e.data || ''));
+      on(imeSink, 'compositionend', e => { sendText(OP.TEXT_INPUT, e.data || ''); imeSink.value = ''; });
+      on(imeSink, 'input', e => {
         if (e.isComposing) return;
         if (e.inputType && (e.inputType.startsWith('insertComposition') || e.inputType === 'insertFromPaste')) {
           sendText(OP.TEXT_INPUT, e.data || '');
@@ -443,32 +448,32 @@
       });
     }
 
-    window.addEventListener('copy', e => forwardClipboard(0, e));
-    window.addEventListener('cut', e => forwardClipboard(1, e));
-    window.addEventListener('paste', e => forwardClipboard(2, e));
+    on(window, 'copy', e => forwardClipboard(0, e));
+    on(window, 'cut', e => forwardClipboard(1, e));
+    on(window, 'paste', e => forwardClipboard(2, e));
 
-    surface.addEventListener('dragenter', e => { e.preventDefault(); sendDrag(1, ndx(e), ndy(e)); });
-    surface.addEventListener('dragover', e => { e.preventDefault(); sendDrag(2, ndx(e), ndy(e)); });
-    surface.addEventListener('dragleave', e => { e.preventDefault(); sendDrag(3, ndx(e), ndy(e)); });
-    surface.addEventListener('drop', e => {
+    on(surface, 'dragenter', e => { e.preventDefault(); sendDrag(1, ndx(e), ndy(e)); });
+    on(surface, 'dragover', e => { e.preventDefault(); sendDrag(2, ndx(e), ndy(e)); });
+    on(surface, 'dragleave', e => { e.preventDefault(); sendDrag(3, ndx(e), ndy(e)); });
+    on(surface, 'drop', e => {
       e.preventDefault();
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) sendDrop(ndx(e), ndy(e), e.dataTransfer.files);
       else sendDrag(4, ndx(e), ndy(e));
     });
 
-    window.addEventListener('blur', () => { sendState(OP.FOCUS_STATE, false); clearHeld(); });
-    window.addEventListener('focus', () => sendState(OP.FOCUS_STATE, true));
-    document.addEventListener('visibilitychange', () => {
+    on(window, 'blur', () => { sendState(OP.FOCUS_STATE, false); clearHeld(); });
+    on(window, 'focus', () => sendState(OP.FOCUS_STATE, true));
+    on(document, 'visibilitychange', () => {
       const visible = document.visibilityState === 'visible';
       sendState(OP.VISIBILITY, visible);
       if (!visible) clearHeld();
     });
-    document.addEventListener('pointerlockchange', () => {
+    on(document, 'pointerlockchange', () => {
       sendState(OP.POINTERLOCK_STATE, document.pointerLockElement === surface || !!document.pointerLockElement);
     });
 
-    window.addEventListener('resize', refreshSize, { passive: true });
-    window.addEventListener('orientationchange', refreshSize, { passive: true });
+    on(window, 'resize', refreshSize, { passive: true });
+    on(window, 'orientationchange', refreshSize, { passive: true });
   }
 
   function forwardClipboard(opByte, e) {
@@ -499,10 +504,24 @@
     };
     reliable.onclose = () => { if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; } clearHeld(); };
     installListeners();
+    active = true;
+  }
+
+  function teardown() {
+    active = false;
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; }
+    clearHeld();
+    [fast, reliable, bulk].forEach((ch) => { try { if (ch) ch.close(); } catch (_) {} });
+    fast = reliable = bulk = null;
+    if (imeSink) {
+      imeSink.value = '';
+      try { imeSink.blur(); } catch (_) {}
+    }
   }
 
   window.RemoteInput = {
     setup,
+    teardown,
     onViewportSettled() { refreshSize(); sendResize(); },
     get rtt() { return lastRttMs; },
   };
