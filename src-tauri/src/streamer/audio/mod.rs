@@ -1,6 +1,6 @@
-pub mod protocol;
 pub mod encoder;
 pub mod opus_sys;
+pub mod protocol;
 
 #[cfg(test)]
 mod tests;

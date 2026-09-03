@@ -217,7 +217,11 @@ impl X264Encoder {
         pic_in.img.plane[0] = data.as_ptr() as *mut u8;
         pic_in.img.i_stride[0] = row_pitch as c_int;
         pic_in.i_pts = self.pts;
-        pic_in.i_type = if force_idr { X264_TYPE_IDR } else { X264_TYPE_AUTO };
+        pic_in.i_type = if force_idr {
+            X264_TYPE_IDR
+        } else {
+            X264_TYPE_AUTO
+        };
 
         let mut nals: *mut x264_nal_t = ptr::null_mut();
         let mut n_nal: c_int = 0;
