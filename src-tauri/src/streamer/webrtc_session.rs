@@ -257,9 +257,7 @@ async fn detect_session_locality(
 
 fn is_private_ip(ip: &str) -> bool {
     match ip.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            v4.is_private() || v4.is_link_local() || v4.is_loopback()
-        }
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
         Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
         Err(_) => false,
     }

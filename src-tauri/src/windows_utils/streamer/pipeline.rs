@@ -22,7 +22,7 @@ use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo}
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{
-    Encoder, EncoderConfig, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER, SlotEncodeError,
+    Encoder, EncoderConfig, SlotEncodeError, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER,
 };
 use super::scaler::{Scaler, TextureReader};
 use super::tuning;
@@ -1175,7 +1175,9 @@ impl AsyncNvencRing {
         let released = unsafe { mutex.ReleaseSync(KEY_ENCODER) };
 
         if let Err(e) = staged {
-            teprintln!("ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle");
+            teprintln!(
+                "ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle"
+            );
         }
         if let Err(e) = released {
             let _ = self.free_slots.send(slot);
@@ -1230,16 +1232,18 @@ fn ring_encode_thread(
     let mut held_slot: Option<usize> = None;
     let mut poisoned_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    let release_and_hold =
-        |free_tx: &crossbeam_channel::Sender<usize>, held: &mut Option<usize>, slot: usize| -> bool {
-            if let Some(prev) = held.take() {
-                if free_tx.send(prev).is_err() {
-                    return false;
-                }
+    let release_and_hold = |free_tx: &crossbeam_channel::Sender<usize>,
+                            held: &mut Option<usize>,
+                            slot: usize|
+     -> bool {
+        if let Some(prev) = held.take() {
+            if free_tx.send(prev).is_err() {
+                return false;
             }
-            *held = Some(slot);
-            true
-        };
+        }
+        *held = Some(slot);
+        true
+    };
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1274,7 +1278,8 @@ fn ring_encode_thread(
                         );
                         poisoned_slots.insert(msg.slot);
 
-                        let held_poisoned = held_slot.map_or(false, |s| poisoned_slots.contains(&s));
+                        let held_poisoned =
+                            held_slot.map_or(false, |s| poisoned_slots.contains(&s));
                         if held_poisoned || held_slot.is_none() {
                             teprintln!(
                                 "ring encode: CRITICAL — held slot also poisoned or absent; \

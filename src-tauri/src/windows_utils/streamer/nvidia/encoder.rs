@@ -676,10 +676,7 @@ impl Encoder {
         Ok(())
     }
 
-    unsafe fn register_texture(
-        &self,
-        texture: &ID3D11Texture2D,
-    ) -> Result<NV_ENC_REGISTERED_PTR> {
+    unsafe fn register_texture(&self, texture: &ID3D11Texture2D) -> Result<NV_ENC_REGISTERED_PTR> {
         let mut reg: NV_ENC_REGISTER_RESOURCE = unsafe { zeroed() };
         reg.version = NV_ENC_REGISTER_RESOURCE_VER;
         reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;

@@ -149,19 +149,36 @@ pub fn start_hosted_network(
     }
 
     let mut fell_back = false;
-    let started = try_start_on_channel(&interface, &channel, name, password, had_password, &mut fell_back, &app);
+    let started = try_start_on_channel(
+        &interface,
+        &channel,
+        name,
+        password,
+        had_password,
+        &mut fell_back,
+        &app,
+    );
     let started = if !started {
         let ch11_fallback = {
             let channels = unsafe { interface.supportedWLANChannels() };
             channels.and_then(|chs| {
-                chs.iter().find(|c| unsafe { c.channelNumber() } == PREFERRED_CHANNEL)
+                chs.iter()
+                    .find(|c| unsafe { c.channelNumber() } == PREFERRED_CHANNEL)
             })
         };
         if let Some(ref ch11) = ch11_fallback {
             let ch11_num = unsafe { ch11.channelNumber() };
             let orig_num = unsafe { channel.channelNumber() };
             if ch11_num != orig_num {
-                try_start_on_channel(&interface, ch11, name, password, had_password, &mut fell_back, &app)
+                try_start_on_channel(
+                    &interface,
+                    ch11,
+                    name,
+                    password,
+                    had_password,
+                    &mut fell_back,
+                    &app,
+                )
             } else {
                 false
             }
