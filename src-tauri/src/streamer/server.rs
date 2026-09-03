@@ -125,6 +125,37 @@ impl AppState {
         }
     }
 
+    pub fn display_slot_unavailable(&self, client_ip: &str) -> bool {
+        let Some(client) = self.config.virtual_display.as_ref() else {
+            return false;
+        };
+        let Some(max) = client.max_concurrent_displays() else {
+            return false;
+        };
+        let Some(sessions) = self.config.sessions.as_ref() else {
+            return false;
+        };
+        if session::get_live_display(sessions, client_ip).is_some() {
+            return false;
+        }
+        session::live_display_count(sessions) >= max
+    }
+
+    pub fn display_capacity(&self) -> (Option<usize>, usize) {
+        let max = self
+            .config
+            .virtual_display
+            .as_ref()
+            .and_then(|c| c.max_concurrent_displays());
+        let in_use = self
+            .config
+            .sessions
+            .as_ref()
+            .map(session::live_display_count)
+            .unwrap_or(0);
+        (max, in_use)
+    }
+
     pub fn is_same_device(&self, peer: IpAddr) -> bool {
         let ip = normalize_peer_ip(peer);
         ip.is_loopback() || self.local_ips.lock().unwrap().contains(&ip)
@@ -352,6 +383,9 @@ async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Response {
+    if state.display_slot_unavailable(&peer.ip().to_string()) {
+        return at_capacity_page();
+    }
     let flag = if state.is_same_device(peer.ip()) {
         "true"
     } else {
@@ -359,6 +393,16 @@ async fn index(
     };
     let html = include_str!("static/index.html").replace("__SAME_DEVICE_FLAG__", flag);
     (isolation_headers(), Html(html)).into_response()
+}
+
+fn at_capacity_page() -> Response {
+    const PAGE: &str = include_str!("static/at-capacity.html");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        PAGE,
+    )
+        .into_response()
 }
 
 async fn transform_worker() -> Response {
@@ -540,8 +584,17 @@ async fn whep(
     _headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let client_ip = peer.ip().to_string();
+    if state.display_slot_unavailable(&client_ip) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "This Mac can only drive one extended display at a time. Disconnect the device that              is using it, or upgrade to macOS 10.15 or later.",
+        )
+            .into_response();
+    }
     let ice = state.ice_with_turn(state.fallback_ice_servers());
-    let out = process_whep(&state, &peer.ip().to_string(), &body, ice).await;
+    let out = process_whep(&state, &client_ip, &body, ice).await;
     let status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -879,15 +932,29 @@ async fn start_session(
                 };
                 tprintln!("virtual display created (id={display_id}, {width}x{height}@{refresh})");
 
-                match wait_for_new_monitor(&before).await {
+                let named = {
+                    let client = client.clone();
+                    tokio::task::spawn_blocking(move || client.display_device_name(display_id))
+                        .await
+                        .ok()
+                        .flatten()
+                };
+
+                match named {
                     Some(name) => {
                         tprintln!("virtual display id={display_id} attached as {name}");
                         (display_id, name)
                     }
-                    None => {
-                        remove_display_async(client, display_id).await;
-                        bail!("virtual display {display_id} did not attach within timeout");
-                    }
+                    None => match wait_for_new_monitor(&before).await {
+                        Some(name) => {
+                            tprintln!("virtual display id={display_id} attached as {name}");
+                            (display_id, name)
+                        }
+                        None => {
+                            remove_display_async(client, display_id).await;
+                            bail!("virtual display {display_id} did not attach within timeout");
+                        }
+                    },
                 }
             };
 
@@ -913,6 +980,7 @@ async fn start_session(
     };
 
     if let Some(s) = state.config.sessions.as_ref() {
+        session::set_host_ip(s, client_ip, state.config.lan_ip.clone());
         session::set_live_display(
             s,
             client_ip,
@@ -1210,6 +1278,103 @@ fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct CappedDisplays(Option<usize>);
+
+    impl session::VirtualDisplayController for CappedDisplays {
+        fn create_display(&self, _: String, _: u32, _: u32, _: u32) -> Result<u32, String> {
+            Err("not used in this test".into())
+        }
+        fn remove_display(&self, _: u32) {}
+        fn remove_all_displays(&self) {}
+        fn max_concurrent_displays(&self) -> Option<usize> {
+            self.0
+        }
+    }
+
+    fn state_with(cap: Option<usize>, holders: &[&str]) -> AppState {
+        let sessions: session::SharedSessions = Default::default();
+        for ip in holders {
+            session::set_live_display(
+                &sessions,
+                ip,
+                session::LiveDisplay {
+                    display_id: 1,
+                    device_name: "1".into(),
+                    width: 1920,
+                    height: 1080,
+                    refresh: 60,
+                    scale: 100,
+                    portrait: false,
+                },
+            );
+        }
+        AppState::new(Config {
+            virtual_display: Some(std::sync::Arc::new(CappedDisplays(cap))),
+            sessions: Some(sessions),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn an_uncapped_backend_never_turns_anyone_away() {
+        let state = state_with(None, &["10.0.0.1", "10.0.0.2"]);
+        assert!(!state.display_slot_unavailable("10.0.0.9"));
+        assert_eq!(state.display_capacity(), (None, 2));
+    }
+
+    #[test]
+    fn a_single_display_backend_turns_away_a_second_device() {
+        let state = state_with(Some(1), &["10.0.0.1"]);
+        assert!(state.display_slot_unavailable("10.0.0.2"));
+        assert_eq!(state.display_capacity(), (Some(1), 1));
+    }
+
+    #[test]
+    fn the_device_already_holding_the_display_is_never_blocked() {
+        let state = state_with(Some(1), &["10.0.0.1"]);
+        assert!(!state.display_slot_unavailable("10.0.0.1"));
+    }
+
+    #[test]
+    fn the_slot_frees_up_when_the_holder_leaves() {
+        let state = state_with(Some(1), &[]);
+        assert!(!state.display_slot_unavailable("10.0.0.2"));
+        assert_eq!(state.display_capacity(), (Some(1), 0));
+    }
+
+    #[test]
+    fn the_holders_adapter_is_identifiable_for_keeping_its_server_up() {
+        let sessions: session::SharedSessions = Default::default();
+        session::set_host_ip(&sessions, "10.0.0.1", Some("192.168.1.5".into()));
+        session::set_live_display(
+            &sessions,
+            "10.0.0.1",
+            session::LiveDisplay {
+                display_id: 1,
+                device_name: "1".into(),
+                width: 1920,
+                height: 1080,
+                refresh: 60,
+                scale: 100,
+                portrait: false,
+            },
+        );
+        session::set_host_ip(&sessions, "10.0.0.2", Some("192.168.1.9".into()));
+
+        assert_eq!(
+            session::display_holder_host_ip(&sessions),
+            Some("192.168.1.5".into())
+        );
+    }
+
+    #[test]
+    fn no_adapter_is_singled_out_when_nobody_holds_a_display() {
+        let sessions: session::SharedSessions = Default::default();
+        session::set_host_ip(&sessions, "10.0.0.1", Some("192.168.1.5".into()));
+        assert_eq!(session::display_holder_host_ip(&sessions), None);
+    }
 
     #[test]
     fn device_name_is_sanitized() {

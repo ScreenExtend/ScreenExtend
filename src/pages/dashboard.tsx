@@ -25,6 +25,7 @@ import { commands, events } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
 
 type CloudStatus = { state: string; detail: string };
+type Capacity = { max: number | null; in_use: number; full: boolean; backend: string };
 
 let walkthroughAutoStarted = false;
 
@@ -49,10 +50,11 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 }
 
 export default function Dashboard() {
-  const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled] } = useContext(GlobalProviderContext);
+  const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled], windowDevices: [devices] } = useContext(GlobalProviderContext);
   const { startNextStep } = useNextStep();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
+  const [capacity, setCapacity] = useState<Capacity | null>(null);
 
   useEffect(() => {
     if (walkthroughAutoStarted) return;
@@ -85,6 +87,17 @@ export default function Dashboard() {
     return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const c = (await commands.getDisplayCapacity()) as Capacity;
+        if (!cancelled) setCapacity(c);
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [devices]);
+
   const cloudUrl = publicSessionsEnabled ? buildCloudQrValue(sessionId) : "";
   const lanValues = qrValues.filter((qr) => qr.value.length > 0);
   const cloudReady = cloudStatus.state === "registered";
@@ -94,6 +107,28 @@ export default function Dashboard() {
     : "Offline";
 
   if (!statusLoaded) return <Layout><></></Layout>;
+
+  if (capacity?.full) {
+    return (
+      <Layout>
+        <div className="p-8">
+          <h2 className="flex justify-center text-center text-4xl font-semibold">
+            Your display is in use
+          </h2>
+        </div>
+        <div id="tour-connect" className="w-full overflow-hidden box-border mb-10">
+          <div className="px-8 mx-auto max-w-xl text-center text-slate-700 dark:text-slate-300">
+            <p className="text-lg">
+              This Mac creates its extended display over <b>AirPlay</b>; hence, while a device is connected, no other device can join. Disconnect it from <b><Link to="/devices" className="underline">Devices</Link></b> to free the display slot.
+            </p>
+            <p className="mt-6 text-sm text-slate-500 dark:text-slate-400">
+              <b>macOS 10.15 Catalina or later</b> is required for more than one display at a time.
+            </p>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
 
   return (
     <Layout>
