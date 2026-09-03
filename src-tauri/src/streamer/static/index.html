@@ -191,7 +191,7 @@
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
-                    if (locked) stopLock(); else disableNoSleep();
+                    stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
                     joinEl.style.display = '';
@@ -621,6 +621,7 @@
             }
 
             function teardownSession() {
+                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) {}
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
@@ -1048,10 +1049,10 @@
                     try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) {}
                 }
 
-                if (params.has('otp') || params.has('name')) {
+                const consumed = ['otp', 'name', 'fs'];
+                if (consumed.some((k) => params.has(k))) {
                     const clean = new URL(window.location.href);
-                    clean.searchParams.delete('otp');
-                    clean.searchParams.delete('name');
+                    consumed.forEach((k) => clean.searchParams.delete(k));
                     history.replaceState(null, '', clean.toString());
                 }
 
