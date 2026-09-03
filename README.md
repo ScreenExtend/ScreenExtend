@@ -76,7 +76,7 @@ ScreenExtend drivers install   # virtual display driver (elevated)
 
 ## Platform support
 
-The client is a web page, so anything with a reasonably modern browser can be the second monitor. Hosts need **Windows 10 20H1 (build 19041) or later, x86-64 only**, or **macOS 10.15 Catalina or later**.
+The client is a web page, so anything with a reasonably modern browser can be the second monitor. Hosts need **Windows 10 20H1 (build 19041) or later, x86-64 only**, or **macOS 10.13 High Sierra or later** (10.14.4+ for the full-speed virtual-display path; 10.13–10.14.3 fall back to an AirPlay-created display, which is limited to one device at a time at a fixed set of landscape resolutions).
 
 ### Hardware encoder support
 

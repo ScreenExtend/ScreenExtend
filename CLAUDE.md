@@ -351,7 +351,22 @@ Cross-platform core, OS-independent:
   enumeration and modes; `mach.rs` — `mach_absolute_time`; `qos.rs`, `tuning.rs`, `power.rs`,
   `activity.rs` — thread QoS, process tuning, power/idle assertions.
 - `virtual_display.rs` — the private CoreGraphics `CGVirtualDisplay*` classes via
-  `extern_class!` / `extern_methods!` (they exist on 10.15, so link-time binding is fine here).
+  `extern_class!` / `extern_methods!` (objc2 resolves these at runtime, so a Mac without them
+  still loads the binary — but instantiating a missing class panics, hence the probe below).
+  It also owns the **display backend tiering**, mirroring the audio subsystem's:
+  `probe_display_backend()` → `CgVirtualDisplay` when `AnyClass::get("CGVirtualDisplay")`
+  succeeds (10.14.4+ — **not** 10.15, the classes predate Sidecar by a release), else
+  `AirPlayFallback`. `new_shared_controller()` is what `setup` calls; the chosen tier is
+  reported to the UI as `CompatibilityReport.display_backend`. **Probe by class lookup, never by
+  version number.**
+- `airplay/` — the **10.13–10.14.3 display tier**. A minimal fake AirPlay receiver
+  (Bonjour via a hand-written `dns_sd.h` FFI, a hand-rolled RTSP/1.0 + HTTP/1.1 socket because
+  hyper can parse neither, static `/fp-setup` tables, accept-and-discard for the H.264 stream)
+  plus an Accessibility driver for the Displays menu extra. macOS creates the display; we only
+  make it exist and then capture it with the unchanged CGDisplayStream pipeline. **No decode,
+  no decrypt, no VideoToolbox.** Design + measurements: `docs/airplay-fallback-design.md`.
+  Live harness: `cargo test --lib macos_utils::airplay::tests::live_end_to_end -- --ignored
+  --nocapture`.
 - `hosted_network.rs` + `hostap.m` — CoreWLAN ad-hoc network (prefers 5 GHz channels).
 
 ### System audio — Windows (`windows_utils/audio/`)
@@ -539,7 +554,8 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   (requires Administrator; elevation via the `elevated-command` crate). Installer integration
   lives in `windows/hooks.nsh` (NSIS) and `windows/fragment.wxs` (WiX driver cleanup).
 - **macOS** uses the `tauri.macos.conf.json` overlay (passed with `--config`), which bundles
-  `resources/libopus.dylib` as its only resource and sets `minimumSystemVersion` 10.15. The
+  `resources/libopus.dylib` as its only resource and sets `minimumSystemVersion` 10.13 (Tauri's
+  own floor; below 10.14.4 displays come from the AirPlay fallback). The
   shipped dylib should be a universal (x86_64 + arm64) build — see `resources/PROVENANCE.md`.
   `src-tauri/Entitlements.plist` grants `com.apple.security.device.audio-input`, disables the
   sandbox, and adds the `com.apple.CG.virtual-display` mach-lookup temporary exception (needed by
@@ -563,8 +579,12 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `collect_commands!`.
 - Use `tprintln!`/`teprintln!`, not `println!`/`eprintln!`, in the Rust core.
 - Keep `std::sync::Mutex` critical sections short and never hold one across `.await`.
-- No link-time references to macOS APIs newer than 10.15 — use `dlsym` / `AnyClass::get` /
-  `msg_send!`.
+- **No link-time references to macOS APIs newer than 10.13** — use `dlsym` / `AnyClass::get` /
+  `msg_send!`. An eagerly-bound symbol dyld cannot resolve kills the whole process before
+  `main()`, so this is a load bug, not a missing feature. `extern static` constants count:
+  two VideoToolbox property keys (`MaximizePowerEfficiency`, 10.14;
+  `PrioritizeEncodingSpeedOverQuality`, 11.0) had to move to `set_optional_bool` for exactly
+  this reason. Check with `nm -u target/release/ScreenExtend`.
 - The client page has no build step and no dependencies; it must keep working in older mobile
   browsers (that constraint is why, for instance, flex `gap` was replaced with margins).
 - Bump the version in all four files at once.
