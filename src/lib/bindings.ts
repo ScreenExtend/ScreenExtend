@@ -111,6 +111,9 @@ async setDisconnectGrace(seconds: number) : Promise<void> {
 async getDisconnectGrace() : Promise<number> {
     return await TAURI_INVOKE("get_disconnect_grace");
 },
+async getDisplayCapacity() : Promise<DisplayCapacity> {
+    return await TAURI_INVOKE("get_display_capacity");
+},
 async setTurnConfig(urls: string, username: string, credential: string) : Promise<void> {
     await TAURI_INVOKE("set_turn_config", { urls, username, credential });
 },
@@ -174,7 +177,7 @@ sessionIdChange: "session-id-change"
 export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device
@@ -182,6 +185,7 @@ export type DeviceModify = Device
 export type DeviceModifyAction = Device
 export type DeviceRemove = Device
 export type DeviceRemoveAction = Device
+export type DisplayCapacity = { max: number | null; in_use: number; full: boolean; backend: string }
 export type HostedNetworkNoPassword = null
 export type JoinAttemptsPaused = { retryAfterSecs: number }
 export type LogLine = string
