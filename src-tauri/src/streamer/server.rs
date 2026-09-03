@@ -589,7 +589,7 @@ async fn whep(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "text/plain")],
-            "This Mac can only drive one extended display at a time. Disconnect the device that              is using it, or upgrade to macOS 10.15 or later.",
+            "This Mac can only drive one extended display at a time. Disconnect the device that is using it, or upgrade to macOS 10.15 or later.",
         )
             .into_response();
     }
