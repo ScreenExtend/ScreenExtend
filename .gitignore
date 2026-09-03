@@ -39,3 +39,8 @@ AUDIT.md
 
 # Personal git workflow
 SSH-GIT.md
+
+# Temporary agent files
+docs/
+.agents/
+skills-lock.json
