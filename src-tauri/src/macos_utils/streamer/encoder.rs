@@ -18,12 +18,10 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxFrameDelayCount, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-    kVTCompressionPropertyKey_MaximizePowerEfficiency,
-    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
+    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
+    kVTProfileLevel_H264_Main_AutoLevel,
     kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
     VTEncodeInfoFlags, VTSession, VTSessionSetProperty,
@@ -150,11 +148,7 @@ impl Encoder {
             let s = self.vt_session();
             {
                 let st = unsafe {
-                    VTSessionSetProperty(
-                        s,
-                        kVTCompressionPropertyKey_RealTime,
-                        Some(cfbool(true)),
-                    )
+                    VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, Some(cfbool(true)))
                 };
                 if st != 0 {
                     teprintln!("[vt] RealTime=true rejected: OSStatus {st} (non-fatal)");
@@ -218,24 +212,20 @@ impl Encoder {
             {
                 let n = CFNumber::new_i32(1);
                 let st = unsafe {
-                    VTSessionSetProperty(
-                        s,
-                        kVTCompressionPropertyKey_MaxFrameDelayCount,
-                        Some(&n),
-                    )
+                    VTSessionSetProperty(s, kVTCompressionPropertyKey_MaxFrameDelayCount, Some(&n))
                 };
                 if st != 0 {
                     teprintln!("[vt] MaxFrameDelayCount=1 rejected: OSStatus {st} (non-fatal, encoder may queue more frames)");
                 }
             }
-            set_bool(
+            set_optional_bool(
                 s,
-                unsafe { kVTCompressionPropertyKey_MaximizePowerEfficiency },
+                "kVTCompressionPropertyKey_MaximizePowerEfficiency",
                 false,
             );
-            set_bool(
+            set_optional_bool(
                 s,
-                unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+                "kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality",
                 true,
             );
             if cfg.intra_refresh {
@@ -596,6 +586,10 @@ fn set_optional_i32(session: &VTSession, key_symbol: &str, value: i32) -> bool {
 fn set_optional_f64(session: &VTSession, key_symbol: &str, value: f64) -> bool {
     let n = CFNumber::new_f64(value);
     set_optional(session, key_symbol, &n)
+}
+
+fn set_optional_bool(session: &VTSession, key_symbol: &str, value: bool) -> bool {
+    set_optional(session, key_symbol, cfbool(value))
 }
 
 fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
