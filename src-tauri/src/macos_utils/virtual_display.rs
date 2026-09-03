@@ -227,7 +227,7 @@ unsafe fn create_cg_virtual_display(
     Ok(display)
 }
 
-fn activate_mode(display_id: u32, width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn activate_mode(display_id: u32, width: u32, height: u32) -> Result<(), String> {
     if unsafe { CGDisplayPixelsWide(display_id) } as u32 == width
         && unsafe { CGDisplayPixelsHigh(display_id) } as u32 == height
     {
@@ -314,6 +314,70 @@ fn registry() -> &'static Mutex<DisplayRegistry> {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DisplayBackend {
+    CgVirtualDisplay,
+    AirPlayFallback,
+    Unsupported,
+}
+
+impl DisplayBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisplayBackend::CgVirtualDisplay => "CGVirtualDisplay",
+            DisplayBackend::AirPlayFallback => "AirPlayFallback",
+            DisplayBackend::Unsupported => "Unsupported",
+        }
+    }
+}
+
+pub fn cg_virtual_display_available() -> bool {
+    use objc2::runtime::AnyClass;
+    AnyClass::get(c"CGVirtualDisplay").is_some()
+        && AnyClass::get(c"CGVirtualDisplayDescriptor").is_some()
+        && AnyClass::get(c"CGVirtualDisplaySettings").is_some()
+        && AnyClass::get(c"CGVirtualDisplayMode").is_some()
+}
+
+pub fn cd_virtual_display_available() -> bool {
+    let name = std::ffi::CString::new("CDVirtualDisplayCreate").unwrap();
+    !unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }.is_null()
+}
+
+pub fn probe_display_backend() -> DisplayBackend {
+    static CACHED: OnceLock<DisplayBackend> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if cg_virtual_display_available() {
+            return DisplayBackend::CgVirtualDisplay;
+        }
+        if cd_virtual_display_available() {
+            tprintln!(
+                "[display] CGVirtualDisplay is absent but CoreDisplay exports CDVirtualDisplayCreate \
+                 — a direct C path may be possible on this OS; please report this"
+            );
+        }
+        DisplayBackend::AirPlayFallback
+    })
+}
+
+pub fn new_shared_controller() -> Option<SharedVirtualDisplay> {
+    match probe_display_backend() {
+        DisplayBackend::CgVirtualDisplay => MacosVirtualDisplay::new_shared(),
+        DisplayBackend::AirPlayFallback => {
+            tprintln!(
+                "[display] using the AirPlay fallback to create displays (CGVirtualDisplay {})",
+                if cg_virtual_display_available() {
+                    "is present but overridden"
+                } else {
+                    "is absent on this macOS version"
+                }
+            );
+            super::airplay::AirPlayVirtualDisplay::new_shared()
+        }
+        DisplayBackend::Unsupported => None,
+    }
+}
+
 pub fn reconfigure_display(
     device_name: &str,
     width: u32,
@@ -326,6 +390,25 @@ pub fn reconfigure_display(
         .parse()
         .map_err(|_| format!("invalid display id {device_name:?}"))?;
     let refresh = if refresh == 0 { 60.0 } else { refresh as f64 };
+
+    if id == unsafe { CGMainDisplayID() } && !super::airplay::owns_display(id) {
+        return Err(format!(
+            "refusing to reconfigure display {id}: it is this Mac's main display, not a display ScreenExtend created"
+        ));
+    }
+
+    if super::airplay::owns_display(id) {
+        let (logical_w, logical_h) = if hidpi == 1 {
+            (width / 2, height / 2)
+        } else {
+            (width, height)
+        };
+        return activate_mode(id, logical_w, logical_h).map_err(|e| {
+            format!(
+                "{e}. This display was created over AirPlay, so its geometry is whatever macOS negotiated — only the modes macOS published for it can be selected."
+            )
+        });
+    }
 
     {
         let guard = registry().lock().unwrap();
@@ -402,6 +485,11 @@ impl VirtualDisplayController for MacosVirtualDisplay {
         Ok(id)
     }
 
+    fn display_device_name(&self, id: u32) -> Option<String> {
+        crate::macos_utils::streamer::display::display_by_name(&id.to_string())
+            .map(|id| id.to_string())
+    }
+
     fn remove_display(&self, id: u32) {
         if registry().lock().unwrap().displays.remove(&id).is_none() {
             teprintln!("virtual_display: remove_display({id}) — unknown display id");
@@ -410,5 +498,19 @@ impl VirtualDisplayController for MacosVirtualDisplay {
 
     fn remove_all_displays(&self) {
         registry().lock().unwrap().displays.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streamer::session::VirtualDisplayController;
+
+    #[test]
+    fn a_display_name_resolves_only_to_a_live_display() {
+        let vd = MacosVirtualDisplay;
+        let main = unsafe { CGMainDisplayID() };
+        assert_eq!(vd.display_device_name(main), Some(main.to_string()));
+        assert_eq!(vd.display_device_name(0xDEAD_BEEF), None);
     }
 }

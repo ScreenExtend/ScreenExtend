@@ -19,6 +19,7 @@ use crate::streamer::session::{
     SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
+use crate::DisplayCapacity;
 use device_reporter::TauriDeviceReporter;
 use elevated_command::Command;
 use networking::NetworkInfo;
@@ -424,6 +425,19 @@ pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
     state
         .disconnect_grace
         .load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
+    let max = state.virtual_display.max_concurrent_displays();
+    let in_use = session::live_display_count(&state.sessions);
+    DisplayCapacity {
+        max: max.map(|m| m as u32),
+        in_use: in_use as u32,
+        full: max.is_some_and(|m| in_use >= m),
+        backend: "IddDriver".to_string(),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]

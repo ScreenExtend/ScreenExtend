@@ -106,6 +106,15 @@ pub struct CompatibilityReport {
     pub os_supported: bool,
     pub unsupported_apis: Vec<UnsupportedApi>,
     pub audio_backend: String,
+    pub display_backend: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
+pub struct DisplayCapacity {
+    pub max: Option<u32>,
+    pub in_use: u32,
+    pub full: bool,
+    pub backend: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
@@ -335,6 +344,7 @@ pub fn run() {
             set_device_approved,
             set_disconnect_grace,
             get_disconnect_grace,
+            get_display_capacity,
             set_turn_config,
             get_turn_config,
             set_server_ports,

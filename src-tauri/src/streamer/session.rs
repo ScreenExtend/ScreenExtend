@@ -182,6 +182,7 @@ pub struct DeviceSessionState {
     pub live_display: Option<LiveDisplay>,
     pub leave: Option<Arc<LeaveSignal>>,
     pub active_capture: Option<(u64, CaptureStopper)>,
+    pub host_ip: Option<String>,
     pub audio_outputs: Vec<AudioOutput>,
     pub audio_outputs_supported: bool,
     pub selected_audio_output: Option<String>,
@@ -553,6 +554,42 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
         let _ = extra_modes;
         self.create_display(name, width, height, refresh_rate)
     }
+
+    fn display_device_name(&self, id: u32) -> Option<String> {
+        let _ = id;
+        None
+    }
+
+    fn max_concurrent_displays(&self) -> Option<usize> {
+        None
+    }
+}
+
+pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>) {
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .host_ip = host_ip;
+}
+
+pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
+    sessions
+        .lock()
+        .unwrap()
+        .values()
+        .find(|s| s.live_display.is_some())
+        .and_then(|s| s.host_ip.clone())
+}
+
+pub fn live_display_count(sessions: &SharedSessions) -> usize {
+    sessions
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| s.live_display.is_some())
+        .count()
 }
 
 pub type SharedVirtualDisplay = Arc<dyn VirtualDisplayController>;

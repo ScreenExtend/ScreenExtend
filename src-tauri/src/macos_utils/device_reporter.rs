@@ -20,6 +20,16 @@ impl TauriDeviceReporter {
     pub fn new_shared(app: AppHandle, overrides: SharedDeviceOverrides) -> Arc<Self> {
         Arc::new(Self { app, overrides })
     }
+
+    fn resync_streamers(&self) {
+        use tauri::Manager;
+        let app = self.app.clone();
+        std::thread::spawn(move || {
+            if let Some(state) = app.try_state::<super::AppState>() {
+                super::sync_streamers(&state);
+            }
+        });
+    }
 }
 
 impl DeviceReporter for TauriDeviceReporter {
@@ -38,6 +48,7 @@ impl DeviceReporter for TauriDeviceReporter {
         if let Err(e) = DeviceJoin(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceJoin failed: {e:?}");
         }
+        self.resync_streamers();
     }
 
     fn report_remove(&self, ip: String) {
@@ -54,6 +65,7 @@ impl DeviceReporter for TauriDeviceReporter {
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");
         }
+        self.resync_streamers();
     }
 
     fn report_join_attempts_paused(&self, retry_after_secs: u64) {
