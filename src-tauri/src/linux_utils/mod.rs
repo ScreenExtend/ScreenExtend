@@ -71,13 +71,9 @@ pub fn get_device_audio_outputs(
 
 #[tauri::command]
 #[specta::specta]
-pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
-    let max = state.virtual_display.max_concurrent_displays();
-    let in_use = session::live_display_count(&state.sessions);
+pub fn get_display_capacity(_state: tauri::State<'_, AppState>) -> DisplayCapacity {
     DisplayCapacity {
-        max: max.map(|m| m as u32),
-        in_use: in_use as u32,
-        full: max.is_some_and(|m| in_use >= m),
         backend: "unsupported".to_string(),
+        ..Default::default()
     }
 }

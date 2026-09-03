@@ -21,11 +21,10 @@ import { GlobalProviderContext } from "@/components/global-provider";
 import { getConfig } from "@/components/config-provider";
 import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { commands, events } from "@/lib/bindings";
+import { commands, events, type DisplayCapacity } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
 
 type CloudStatus = { state: string; detail: string };
-type Capacity = { max: number | null; in_use: number; full: boolean; backend: string };
 
 let walkthroughAutoStarted = false;
 
@@ -54,7 +53,7 @@ export default function Dashboard() {
   const { startNextStep } = useNextStep();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
-  const [capacity, setCapacity] = useState<Capacity | null>(null);
+  const [capacity, setCapacity] = useState<DisplayCapacity | null>(null);
 
   useEffect(() => {
     if (walkthroughAutoStarted) return;
@@ -91,7 +90,7 @@ export default function Dashboard() {
     let cancelled = false;
     void (async () => {
       try {
-        const c = (await commands.getDisplayCapacity()) as Capacity;
+        const c = await commands.getDisplayCapacity();
         if (!cancelled) setCapacity(c);
       } catch {}
     })();
