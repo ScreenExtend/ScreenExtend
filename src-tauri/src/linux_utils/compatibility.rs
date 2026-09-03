@@ -33,5 +33,6 @@ pub fn check_system_requirements() -> CompatibilityReport {
         os_supported: true,
         unsupported_apis: Vec::new(),
         audio_backend: "unsupported".to_string(),
+        display_backend: "unsupported".to_string(),
     }
 }

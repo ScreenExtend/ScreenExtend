@@ -6,6 +6,7 @@ pub mod permissions;
 pub mod streamer;
 pub mod virtual_display;
 
+use crate::DisplayCapacity;
 use std::process::Command;
 
 pub struct AppState {}
@@ -66,4 +67,17 @@ pub fn get_device_audio_outputs(
     _ip: String,
 ) -> crate::streamer::session::AudioOutputsReport {
     crate::streamer::session::AudioOutputsReport::default()
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
+    let max = state.virtual_display.max_concurrent_displays();
+    let in_use = session::live_display_count(&state.sessions);
+    DisplayCapacity {
+        max: max.map(|m| m as u32),
+        in_use: in_use as u32,
+        full: max.is_some_and(|m| in_use >= m),
+        backend: "unsupported".to_string(),
+    }
 }

@@ -128,6 +128,10 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 objc2-core-wlan = "0.3"
 
+# AirPlay virtual-display fallback
+plist = "1"
+httparse = "1"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52.0"
 windows-future = "0.3.2"

@@ -169,5 +169,6 @@ pub fn check_system_requirements() -> CompatibilityReport {
         os_supported,
         unsupported_apis: unsupported,
         audio_backend: "wasapi".to_string(),
+        display_backend: "IddDriver".to_string(),
     }
 }

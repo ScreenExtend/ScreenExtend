@@ -1,3 +1,4 @@
+pub mod airplay;
 pub mod audio;
 pub mod compatibility;
 pub mod device_reporter;
@@ -16,6 +17,7 @@ use crate::streamer::session::{
     SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
 use crate::streamer::{Config, Streamer};
+use crate::DisplayCapacity;
 use device_reporter::TauriDeviceReporter;
 use networking::NetworkInfo;
 use std::collections::HashMap;
@@ -25,7 +27,7 @@ use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 use tauri::State;
-use virtual_display::MacosVirtualDisplay;
+use virtual_display::new_shared_controller;
 
 pub struct StreamerHandle {
     handle: axum_server::Handle,
@@ -120,8 +122,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     }
 
     audio::legacy::routing::recover_on_launch();
-    let virtual_display =
-        tauri::async_runtime::spawn_blocking(MacosVirtualDisplay::new_shared).await;
+    let virtual_display = tauri::async_runtime::spawn_blocking(new_shared_controller).await;
 
     let virtual_display = match virtual_display {
         Ok(Some(vd)) => vd,
@@ -299,6 +300,21 @@ pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
     state
         .disconnect_grace
         .load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
+    let max = state.virtual_display.max_concurrent_displays();
+    let in_use = session::live_display_count(&state.sessions);
+    DisplayCapacity {
+        max: max.map(|m| m as u32),
+        in_use: in_use as u32,
+        full: max.is_some_and(|m| in_use >= m),
+        backend: virtual_display::probe_display_backend()
+            .as_str()
+            .to_string(),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
@@ -540,6 +556,14 @@ pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange 
     }
 }
 
+fn display_slot_holder(state: &AppState) -> Option<String> {
+    let max = state.virtual_display.max_concurrent_displays()?;
+    if session::live_display_count(&state.sessions) < max {
+        return None;
+    }
+    session::display_holder_host_ip(&state.sessions)
+}
+
 pub fn sync_streamers(state: &AppState) {
     let (desired, fresh_local_ips) = {
         let adapters = state.network_adapters.lock().unwrap();
@@ -557,6 +581,22 @@ pub fn sync_streamers(state: &AppState) {
     };
 
     *state.local_ips.lock().unwrap() = fresh_local_ips;
+
+    let desired = match display_slot_holder(state) {
+        Some(host_ip) => {
+            let kept: Vec<_> = desired
+                .into_iter()
+                .filter(|(ip, _)| *ip == host_ip)
+                .collect();
+            if kept.is_empty() {
+                tprintln!(
+                    "[streamer] display slot is taken by a client on an adapter that is gone; serving nobody until it frees up"
+                );
+            }
+            kept
+        }
+        None => desired,
+    };
 
     let (http_port, https_port) = state.server_ports.get();
 
