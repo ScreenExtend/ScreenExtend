@@ -120,11 +120,9 @@ export default function Devices() {
               try {
                 const osType = type();
                 if (osType === "windows") {
-                  const out = await Command.create("control", ["desk.cpl"]).execute();
-                  if (out.code !== 0) notifyFailure();
+                  await Command.create("control", ["desk.cpl"]).spawn();
                 } else if (osType === "macos") {
-                  const out = await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).execute();
-                  if (out.code !== 0) notifyFailure();
+                  await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).spawn();
                 } else {
                   toast({
                     title: t("toasts.displaySettingsUnavailable.title"),
