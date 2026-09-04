@@ -55,16 +55,28 @@ export default function Devices() {
             </TooltipProvider>
             <div className="flex-grow"></div>
             <Button variant="secondary" size="sm" onClick={async () => {
-              const osType = type();
-              if (osType === "windows") {
-                await Command.create("control", ["desk.cpl"]).execute();
-              } else if (osType === "macos") {
-                await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).execute();
-              } else {
-                toast({
-                  title: t("toasts.displaySettingsUnavailable.title"),
-                  description: t("toasts.displaySettingsUnavailable.description"),
-                });
+              const notifyFailure = () => toast({
+                variant: "destructive",
+                title: t("toasts.displaySettingsUnavailable.title"),
+                description: t("toasts.displaySettingsUnavailable.description"),
+              });
+              try {
+                const osType = type();
+                if (osType === "windows") {
+                  const out = await Command.create("control", ["desk.cpl"]).execute();
+                  if (out.code !== 0) notifyFailure();
+                } else if (osType === "macos") {
+                  const out = await Command.create("open", ["x-apple.systempreferences:com.apple.preference.displays"]).execute();
+                  if (out.code !== 0) notifyFailure();
+                } else {
+                  toast({
+                    title: t("toasts.displaySettingsUnavailable.title"),
+                    description: t("toasts.displaySettingsUnavailable.description"),
+                  });
+                }
+              } catch (e) {
+                console.error("failed to open display settings", e);
+                notifyFailure();
               }
             }}>
               <ExternalLink className="mr-2" size={16} />

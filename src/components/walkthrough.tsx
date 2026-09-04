@@ -83,6 +83,10 @@ export const walkthroughSteps: Tour[] = [
   },
 ];
 
+const stopListening = (unlisten: () => void) => {
+  void Promise.resolve(unlisten()).catch((e) => console.error("walkthrough: onResized unlisten failed", e));
+};
+
 export function HighlightProxy() {
   const {
     currentStep,
@@ -168,12 +172,15 @@ export function HighlightProxy() {
     void getCurrentWindow()
       .onResized(() => scheduleReenter())
       .then((fn) => {
-        if (disposed) fn();
+        if (disposed) stopListening(fn);
         else unlisten = fn;
+      })
+      .catch((e) => {
+        console.error("walkthrough: onResized registration failed", e);
       });
     return () => {
       disposed = true;
-      unlisten?.();
+      if (unlisten) stopListening(unlisten);
     };
   }, [scheduleReenter]);
 

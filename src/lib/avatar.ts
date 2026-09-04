@@ -11,12 +11,32 @@ export const blobToDataUrl = (blob: Blob): Promise<string> =>
   });
 
 export const loadAvatar = async (): Promise<string | null> => {
-  const bytes = await commands.getAvatar();
-  if (!bytes || bytes.length === 0) return null;
-  return blobToDataUrl(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+  try {
+    const bytes = await commands.getAvatar();
+    if (!bytes || bytes.length === 0) return null;
+    return await blobToDataUrl(
+      new Blob([new Uint8Array(bytes)], { type: "image/png" }),
+    );
+  } catch (e) {
+    console.error("getAvatar failed", e);
+    return null;
+  }
 };
 
-export const saveAvatar = (bytes: Uint8Array): Promise<boolean> =>
-  commands.setAvatar(Array.from(bytes));
+export const saveAvatar = async (bytes: Uint8Array): Promise<boolean> => {
+  try {
+    return await commands.setAvatar(Array.from(bytes));
+  } catch (e) {
+    console.error("setAvatar failed", e);
+    return false;
+  }
+};
 
-export const clearAvatar = (): Promise<boolean> => commands.removeAvatar();
+export const clearAvatar = async (): Promise<boolean> => {
+  try {
+    return await commands.removeAvatar();
+  } catch (e) {
+    console.error("removeAvatar failed", e);
+    return false;
+  }
+};

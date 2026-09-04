@@ -51,7 +51,7 @@ const ConfigJsonEditor = lazy(() =>
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
-import { commands } from "@/lib/bindings";
+import { commands, type ServerPorts } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, clampZoom, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
@@ -105,6 +105,7 @@ export default function Settings() {
   const [wifiTurningOn, setWifiTurningOn] = useState(false);
   const [disabled, setDisabled] = useState(false);
   const [inputDisabled, setInputDisabled] = useState(false);
+  const [credentialsUnlocked, setCredentialsUnlocked] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
   const [accountName, setAccountName] = useState("");
   const [disconnectGrace, setDisconnectGrace] = useState("");
@@ -127,6 +128,9 @@ export default function Settings() {
   const [configUnsavedOpen, setConfigUnsavedOpen] = useState(false);
   const [configDontShowAgain, setConfigDontShowAgain] = useState(true);
   const configProceeding = useRef(false);
+  const configLoadOk = useRef(false);
+  const credentialsSaveToastShown = useRef(false);
+  const knownDevicesLoaded = useRef(false);
 
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) =>
@@ -139,9 +143,13 @@ export default function Settings() {
       return;
     }
     void (async () => {
-      if ((await getConfig())?.dontShowAgain?.configEditor) {
-        blocker.proceed?.();
-      } else {
+      try {
+        if ((await getConfig())?.dontShowAgain?.configEditor) {
+          blocker.proceed?.();
+        } else {
+          setConfigUnsavedOpen(true);
+        }
+      } catch {
         setConfigUnsavedOpen(true);
       }
     })();
@@ -149,10 +157,16 @@ export default function Settings() {
   }, [blocker.state]);
 
   const rememberConfigDialogChoice = async () => {
-    await updateConfig({
-      dontShowAgain: { ...(await getConfig())!.dontShowAgain, configEditor: configDontShowAgain },
-    });
-    await flushConfig();
+    try {
+      const current = await getConfig();
+      if (!current) return;
+      await updateConfig({
+        dontShowAgain: { ...current.dontShowAgain, configEditor: configDontShowAgain },
+      });
+      await flushConfig();
+    } catch (e) {
+      console.error("failed to persist config editor dialog choice", e);
+    }
   };
 
   const handleConfigSaved = useCallback(async (config: Config) => {
@@ -171,14 +185,21 @@ export default function Settings() {
     setDisableGpuEncode(config.disableGpuEncode);
     setZoom(clampZoom(config.zoomFactor));
     setPublicSessionsEnabled(config.publicSessionsEnabled);
-    await setTheme(config.theme as Theme);
-    if (config.publicSessionsEnabled) {
-      if (sessionId) void commands.registerCloudSession(sessionId);
-    } else {
-      void commands.unregisterCloudSession();
+    try {
+      await setTheme(config.theme as Theme);
+      if (config.publicSessionsEnabled) {
+        if (sessionId) void commands.registerCloudSession(sessionId).catch(e => console.error("cloud session registration failed", e));
+      } else {
+        void commands.unregisterCloudSession().catch(e => console.error("cloud session unregistration failed", e));
+      }
+      if (sessionId) setQrValues(await buildQrValues(sessionId, config.serverPorts.http));
+      setKnownDevices(await getKnownDevices());
+    } catch {
+      toast({
+        title: t("toasts.configEditor.refreshFailedTitle"),
+        description: t("toasts.configEditor.refreshFailedDescription"),
+      });
     }
-    if (sessionId) setQrValues(await buildQrValues(sessionId, config.serverPorts.http));
-    setKnownDevices(await getKnownDevices());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
@@ -194,60 +215,96 @@ export default function Settings() {
     }
   };
 
+  const networkFieldsDisabled = (!hostedNetworkOn && !credentialsUnlocked) || inputDisabled;
+
   const togglePasswordVisibility = () => {
-    if ((!hostedNetworkOn || inputDisabled)) return;
+    if (networkFieldsDisabled) return;
     setShowHostedNetworkPassword(prev => !prev);
   }
 
   useEffect(() => {
     async function updateText() {
-      const config = (await getConfig())!;
-      setHostedNetworkName(config.hostedNetworkCredentials.name);
-      setHostedNetworkPassword(config.hostedNetworkCredentials.password);
-      setOldHostedNetworkName(config.hostedNetworkCredentials.name);
-      setOldHostedNetworkPassword(config.hostedNetworkCredentials.password);
-      setAccountName(config.name);
-      const turn = config.turnConfig ?? { urls: "", username: "", credential: "" };
-      setTurnUrls(turn.urls);
-      setTurnUsername(turn.username);
-      setTurnCredential(turn.credential);
-      const ports = config.serverPorts ?? { http: DEFAULT_HTTP_PORT, https: DEFAULT_HTTPS_PORT };
-      setHttpPort(String(ports.http));
-      setHttpsPort(String(ports.https));
-      setOldHttpPort(String(ports.http));
-      setOldHttpsPort(String(ports.https));
-      const seconds = await commands.getDisconnectGrace();
-      setDisconnectGrace(String(seconds));
-      setOldDisconnectGrace(String(seconds));
-      setDisableGpuEncode(config.disableGpuEncode ?? false);
-      setConfigLoaded(true);
+      try {
+        const config = await getConfig();
+        if (!config) throw new Error("config store is empty");
+        setHostedNetworkName(config.hostedNetworkCredentials.name);
+        setHostedNetworkPassword(config.hostedNetworkCredentials.password);
+        setOldHostedNetworkName(config.hostedNetworkCredentials.name);
+        setOldHostedNetworkPassword(config.hostedNetworkCredentials.password);
+        setAccountName(config.name);
+        const turn = config.turnConfig ?? { urls: "", username: "", credential: "" };
+        setTurnUrls(turn.urls);
+        setTurnUsername(turn.username);
+        setTurnCredential(turn.credential);
+        const ports = config.serverPorts ?? { http: DEFAULT_HTTP_PORT, https: DEFAULT_HTTPS_PORT };
+        setHttpPort(String(ports.http));
+        setHttpsPort(String(ports.https));
+        setOldHttpPort(String(ports.http));
+        setOldHttpsPort(String(ports.https));
+        setDisableGpuEncode(config.disableGpuEncode ?? false);
+        configLoadOk.current = true;
+        const seconds = await commands.getDisconnectGrace();
+        setDisconnectGrace(String(seconds));
+        setOldDisconnectGrace(String(seconds));
+      } catch {
+        toast({
+          variant: "destructive",
+          title: t("toasts.settings.loadFailedTitle"),
+          description: t("toasts.settings.loadFailedDescription"),
+        });
+      } finally {
+        setConfigLoaded(true);
+      }
     }
     void updateText();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    isAutostartEnabled().then(setAutostartEnabled).catch(() => {});
+    isAutostartEnabled().then(setAutostartEnabled).catch(e => console.error("failed to read autostart state", e));
   }, []);
 
   useEffect(() => {
-    void getKnownDevices().then(setKnownDevices);
+    const firstRun = !knownDevicesLoaded.current;
+    knownDevicesLoaded.current = true;
+    getKnownDevices().then(setKnownDevices).catch(e => {
+      console.error("failed to refresh known devices", e);
+      if (firstRun) return;
+      toast({
+        variant: "destructive",
+        title: t("toasts.knownDevices.loadFailedTitle"),
+        description: t("toasts.knownDevices.loadFailedDescription"),
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectedDevices]);
 
   const isConnected = (ip: string) => connectedDevices.some(d => d.ip === ip);
 
-  const applyBan = async (device: { token?: string; ip: string }, banned: boolean) => {
+  const applyBan = async (device: { token?: string; ip: string }, banned: boolean): Promise<boolean> => {
     const token = device.token ?? "";
     const ip = device.ip;
-    await commands.setDeviceBanned(token, ip, banned);
-    await commands.setDeviceApproved(token, !banned);
-    await setKnownDeviceBanned(token, ip, banned);
-    setKnownDevices(await getKnownDevices());
+    try {
+      await commands.setDeviceBanned(token, ip, banned);
+      await commands.setDeviceApproved(token, !banned);
+      await setKnownDeviceBanned(token, ip, banned);
+      setKnownDevices(await getKnownDevices());
+    } catch {
+      setKnownDevices(await getKnownDevices().catch(() => knownDevices));
+      toast({
+        variant: "destructive",
+        title: t("toasts.deviceBan.failureTitle"),
+        description: t("toasts.deviceBan.failureDescription"),
+      });
+      return false;
+    }
     toast({
       title: banned ? t("toasts.deviceBan.bannedTitle") : t("toasts.deviceBan.unbannedTitle"),
       description: banned
         ? t("toasts.deviceBan.bannedDescription", { ip })
         : t("toasts.deviceBan.unbannedDescription", { ip }),
     });
+    return true;
   };
 
   const banManualIp = async () => {
@@ -260,15 +317,25 @@ export default function Settings() {
       return;
     }
     setBanIpInput("");
-    await applyBan({ ip, token: "" }, true);
+    if (!(await applyBan({ ip, token: "" }, true))) setBanIpInput(ip);
   };
 
   const forgetDevice = async (device: { token?: string; ip: string }) => {
     const token = device.token ?? "";
-    await commands.setDeviceBanned(token, device.ip, false);
-    await commands.setDeviceApproved(token, false);
-    await removeKnownDevice(token, device.ip);
-    setKnownDevices(await getKnownDevices());
+    try {
+      await commands.setDeviceBanned(token, device.ip, false);
+      await commands.setDeviceApproved(token, false);
+      await removeKnownDevice(token, device.ip);
+      setKnownDevices(await getKnownDevices());
+    } catch {
+      setKnownDevices(await getKnownDevices().catch(() => knownDevices));
+      toast({
+        variant: "destructive",
+        title: t("toasts.device.removeFailedTitle"),
+        description: t("toasts.device.removeFailedDescription"),
+      });
+      return;
+    }
     toast({
       title: t("toasts.device.removedTitle"),
       description: t("toasts.device.removedDescription"),
@@ -289,7 +356,17 @@ export default function Settings() {
     const seconds = Math.min(600, Math.max(0, Math.round(parsed)));
     setDisconnectGrace(String(seconds));
     if (String(seconds) === oldDisconnectGrace) return;
-    await commands.setDisconnectGrace(seconds);
+    try {
+      await commands.setDisconnectGrace(seconds);
+    } catch {
+      setDisconnectGrace(oldDisconnectGrace);
+      toast({
+        variant: "destructive",
+        title: t("toasts.disconnectTimeout.failureTitle"),
+        description: t("toasts.disconnectTimeout.failureDescription"),
+      });
+      return;
+    }
     localStorage.setItem("disconnectGraceSecs", String(seconds));
     setOldDisconnectGrace(String(seconds));
     toast({
@@ -310,8 +387,17 @@ export default function Settings() {
     setTurnUrls(urls);
     setTurnUsername(username);
     setTurnCredential(credential);
-    await commands.setTurnConfig(urls, username, credential);
-    await updateConfig({ turnConfig: { urls, username, credential } });
+    try {
+      await commands.setTurnConfig(urls, username, credential);
+      await updateConfig({ turnConfig: { urls, username, credential } });
+    } catch {
+      toast({
+        variant: "destructive",
+        title: t("toasts.turn.failureTitle"),
+        description: t("toasts.turn.failureDescription"),
+      });
+      return;
+    }
     toast({
       title: urls ? t("toasts.turn.savedTitle") : t("toasts.turn.clearedTitle"),
       description: urls ? t("toasts.turn.savedDescription") : t("toasts.turn.clearedDescription"),
@@ -320,16 +406,26 @@ export default function Settings() {
 
   const togglePublicSessions = async (enabled: boolean) => {
     setPublicSessionsEnabled(enabled);
-    await updateConfig({ publicSessionsEnabled: enabled });
-    await flushConfig();
+    try {
+      await updateConfig({ publicSessionsEnabled: enabled });
+      await flushConfig();
+    } catch {
+      setPublicSessionsEnabled(!enabled);
+      toast({
+        variant: "destructive",
+        title: t("toasts.publicSessions.failureTitle"),
+        description: t("toasts.publicSessions.failureDescription"),
+      });
+      return;
+    }
     if (enabled) {
-      if (sessionId) void commands.registerCloudSession(sessionId);
+      if (sessionId) void commands.registerCloudSession(sessionId).catch(e => console.error("cloud session registration failed", e));
       toast({
         title: t("toasts.publicSessions.enabledTitle"),
         description: t("toasts.publicSessions.enabledDescription"),
       });
     } else {
-      void commands.unregisterCloudSession();
+      void commands.unregisterCloudSession().catch(e => console.error("cloud session unregistration failed", e));
       toast({
         title: t("toasts.publicSessions.disabledTitle"),
         description: t("toasts.publicSessions.disabledDescription"),
@@ -360,9 +456,19 @@ export default function Settings() {
 
   const toggleGpuEncode = async (disabled: boolean) => {
     setDisableGpuEncode(disabled);
-    await commands.setDisableGpuEncode(disabled);
-    await updateConfig({ disableGpuEncode: disabled });
-    await flushConfig();
+    try {
+      await commands.setDisableGpuEncode(disabled);
+      await updateConfig({ disableGpuEncode: disabled });
+      await flushConfig();
+    } catch {
+      setDisableGpuEncode(await commands.getDisableGpuEncode().catch(() => !disabled));
+      toast({
+        variant: "destructive",
+        title: t("toasts.gpuEncoding.failureTitle"),
+        description: t("toasts.gpuEncoding.failureDescription"),
+      });
+      return;
+    }
     toast({
       title: disabled ? t("toasts.gpuEncoding.disabledTitle") : t("toasts.gpuEncoding.enabledTitle"),
       description: disabled ? t("toasts.gpuEncoding.disabledDescription") : t("toasts.gpuEncoding.enabledDescription"),
@@ -383,14 +489,35 @@ export default function Settings() {
       return;
     }
     if (String(http) === oldHttpPort && String(https) === oldHttpsPort) return;
-    const applied = await commands.setServerPorts(http, https);
+    let applied: ServerPorts;
+    try {
+      applied = await commands.setServerPorts(http, https);
+    } catch {
+      setHttpPort(oldHttpPort);
+      setHttpsPort(oldHttpsPort);
+      toast({
+        variant: "destructive",
+        title: t("toasts.serverPorts.failureTitle"),
+        description: t("toasts.serverPorts.failureDescription"),
+      });
+      return;
+    }
     setHttpPort(String(applied.http));
     setHttpsPort(String(applied.https));
+    if (sessionId) setQrValues(await buildQrValues(sessionId, applied.http));
+    try {
+      await updateConfig({ serverPorts: { http: applied.http, https: applied.https } });
+      await flushConfig();
+    } catch {
+      toast({
+        variant: "destructive",
+        title: t("toasts.config.flushFailedTitle"),
+        description: t("toasts.config.flushFailedDescription"),
+      });
+      return;
+    }
     setOldHttpPort(String(applied.http));
     setOldHttpsPort(String(applied.https));
-    await updateConfig({ serverPorts: { http: applied.http, https: applied.https } });
-    await flushConfig();
-    if (sessionId) setQrValues(await buildQrValues(sessionId, applied.http));
     toast({
       title: t("toasts.serverPorts.title"),
       description: t("toasts.serverPorts.description", { http: applied.http, https: applied.https }),
@@ -408,7 +535,20 @@ export default function Settings() {
   }, [spin]);
 
   useEffect(() => {
-    if (configLoaded) void updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}});
+    if (!configLoaded || !configLoadOk.current) return;
+    updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}})
+      .then(() => { credentialsSaveToastShown.current = false; })
+      .catch(e => {
+        console.error("failed to persist hosted network credentials", e);
+        if (credentialsSaveToastShown.current) return;
+        credentialsSaveToastShown.current = true;
+        toast({
+          variant: "destructive",
+          title: t("toasts.settings.saveFailedTitle"),
+          description: t("toasts.settings.saveFailedDescription"),
+        });
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
 
   useEffect(() => {
@@ -416,8 +556,19 @@ export default function Settings() {
   }, [hostedNetworkOn]);
 
   const startNetworkWithFeedback = async (opts?: { fromWifiModal?: boolean }): Promise<boolean> => {
-    await commands.stopHostedNetwork();
-    const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+    let success = false;
+    try {
+      await commands.stopHostedNetwork();
+      success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+    } catch {
+      setHostedNetworkOn(false);
+      toast({
+        variant: "destructive",
+        title: t("toasts.networkCreate.failureTitle"),
+        description: t("toasts.networkCreate.failureDescription"),
+      });
+      return false;
+    }
     if (success) {
       setHostedNetworkOn(true);
       toast({
@@ -426,9 +577,15 @@ export default function Settings() {
       });
       return true;
     }
-    await commands.stopHostedNetwork();
     setHostedNetworkOn(false);
-    if (!opts?.fromWifiModal && !(await commands.isWifiOn())) {
+    let wifiOn = true;
+    try {
+      await commands.stopHostedNetwork();
+      wifiOn = await commands.isWifiOn();
+    } catch {
+      wifiOn = true;
+    }
+    if (!opts?.fromWifiModal && !wifiOn) {
       setWifiModalOpen(true);
     } else {
       toast({
@@ -606,11 +763,26 @@ export default function Settings() {
                     if ((!hostedNetworkOn || inputDisabled)) {
                       await startNetworkWithFeedback();
                     } else {
-                      await commands.stopHostedNetwork();
+                      let stopped = false;
+                      try {
+                        stopped = await commands.stopHostedNetwork();
+                      } catch {
+                        stopped = false;
+                      }
+                      if (!stopped) {
+                        setHostedNetworkOn(true);
+                        toast({
+                          variant: "destructive",
+                          title: t("toasts.networkStop.failureTitle"),
+                          description: t("toasts.networkStop.failureDescription"),
+                        });
+                        return;
+                      }
                       setHostedNetworkName(oldHostedNetworkName);
                       setHostedNetworkPassword(oldHostedNetworkPassword);
                       setShowHostedNetworkPassword(false);
                       setHostedNetworkOn(false);
+                      setCredentialsUnlocked(false);
                       toast({
                         title: t("toasts.networkStop.title"),
                         description: t("toasts.networkStop.description"),
@@ -622,7 +794,7 @@ export default function Settings() {
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0 mt-2",
-                  (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none",
+                  networkFieldsDisabled && "cursor-not-allowed select-none",
                   "mb-2"
                 )}
               >
@@ -632,7 +804,7 @@ export default function Settings() {
                     placeholder="Network Name"
                     className="outline-none"
                     value={hostedNetworkName}
-                    disabled={(!hostedNetworkOn || inputDisabled)}
+                    disabled={networkFieldsDisabled}
                     onChange={handleNetworkNameChange}
                     onBlur={() => setHostedNetworkName(hostedNetworkName.trim())}
                     hoverLabel={true}
@@ -647,7 +819,7 @@ export default function Settings() {
                       hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH && "border-red-500 focus:ring-red-500"
                     )}
                     value={hostedNetworkPassword}
-                    disabled={(!hostedNetworkOn || inputDisabled)}
+                    disabled={networkFieldsDisabled}
                     onChange={event => setHostedNetworkPassword(event.target.value)}
                     minLength={MIN_HOSTED_NETWORK_PASSWORD_LENGTH}
                     maxLength={63}
@@ -656,36 +828,44 @@ export default function Settings() {
                   <div
                     className={cn(
                       "absolute top-0 bottom-0 right-0 pr-3 flex items-center text-gray-400 cursor-pointer",
-                      (!hostedNetworkOn || inputDisabled) && "cursor-not-allowed select-none"
+                      networkFieldsDisabled && "cursor-not-allowed select-none"
                     )}
                   >
                     {showHostedNetworkPassword ? (
                       <EyeOff
                         className="h-5 w-5"
-                        style={{ opacity: hostedNetworkOn ? 1 : 0.5 }}
+                        style={{ opacity: networkFieldsDisabled ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility()}
                       />
                     ) : (
                       <Eye
                         className="h-5 w-5"
-                        style={{ opacity: hostedNetworkOn ? 1 : 0.5 }}
+                        style={{ opacity: networkFieldsDisabled ? 0.5 : 1 }}
                         onClick={() => togglePasswordVisibility()}
                       />
                     )}
                   </div>
                   <p className="text-red-500 text-xs mt-1" style={{ position: "absolute", display: (hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH ? "initial": "none") }}>A password must have at least {MIN_HOSTED_NETWORK_PASSWORD_LENGTH} characters</p>
                 </div>
-                <Button disabled={(!hostedNetworkOn || inputDisabled) || hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH} onClick={async () => {
+                <Button disabled={networkFieldsDisabled || hostedNetworkPassword.length < MIN_HOSTED_NETWORK_PASSWORD_LENGTH} onClick={async () => {
                     if (hostedNetworkName !== oldHostedNetworkName || hostedNetworkPassword !== oldHostedNetworkPassword) {
-                      if (!(await getConfig())!.dontShowAgain.editNetwork) {
+                      if (!(await getConfig().catch(() => undefined))?.dontShowAgain.editNetwork) {
                         setDisabled(false);
                         setHostedNetworkModalOpen(true);
                       } else {
                         setInputDisabled(true);
-                        await commands.stopHostedNetwork();
-                        const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
-                        setInputDisabled(false);
+                        let success = false;
+                        try {
+                          await commands.stopHostedNetwork();
+                          success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+                        } catch {
+                          success = false;
+                        } finally {
+                          setInputDisabled(false);
+                        }
                         if (success) {
+                          setHostedNetworkOn(true);
+                          setCredentialsUnlocked(false);
                           setOldHostedNetworkName(hostedNetworkName);
                           setOldHostedNetworkPassword(hostedNetworkPassword);
                           toast({
@@ -693,6 +873,8 @@ export default function Settings() {
                             description: t("toasts.networkSettings.successDescription"),
                           });
                         } else {
+                          setHostedNetworkOn(false);
+                          setCredentialsUnlocked(true);
                           setHostedNetworkName(oldHostedNetworkName);
                           setHostedNetworkPassword(oldHostedNetworkPassword);
                           toast({
@@ -909,16 +1091,25 @@ export default function Settings() {
                 </div>
                 <Button onClick={async () => {
                   const trimmed = accountName.trim();
-                  if (trimmed.length === 0) {
-                    setAccountName((await getConfig())!.name);
-                    return;
-                  }
-                  if ((await getConfig())!.name !== trimmed) {
-                    setAccountName(trimmed);
-                    await updateConfig({ name: trimmed });
+                  try {
+                    const current = await getConfig();
+                    if (trimmed.length === 0) {
+                      setAccountName(current?.name ?? "");
+                      return;
+                    }
+                    if (current?.name !== trimmed) {
+                      setAccountName(trimmed);
+                      await updateConfig({ name: trimmed });
+                      toast({
+                        title: t("toasts.account.updatedTitle"),
+                        description: t("toasts.account.updatedDescription"),
+                      });
+                    }
+                  } catch {
                     toast({
-                      title: t("toasts.account.updatedTitle"),
-                      description: t("toasts.account.updatedDescription"),
+                      variant: "destructive",
+                      title: t("toasts.account.updateFailedTitle"),
+                      description: t("toasts.account.updateFailedDescription"),
                     });
                   }
                 }} className="ml-4">
@@ -1198,10 +1389,19 @@ export default function Settings() {
           <AlertDialogFooter>
             <AlertDialogCancel onClick={async () => {
                 setDisabled(true);
-                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editNetwork: dontShowAgain}});
-                setHostedNetworkName(oldHostedNetworkName);
-                setHostedNetworkPassword(oldHostedNetworkPassword);
-                setHostedNetworkModalOpen(false);
+                try {
+                  const current = await getConfig();
+                  if (current) {
+                    await updateConfig({dontShowAgain: {...current.dontShowAgain, editNetwork: dontShowAgain}});
+                  }
+                } catch (e) {
+                  console.error("failed to persist edit network dialog choice", e);
+                } finally {
+                  setHostedNetworkName(oldHostedNetworkName);
+                  setHostedNetworkPassword(oldHostedNetworkPassword);
+                  setHostedNetworkModalOpen(false);
+                  setDisabled(false);
+                }
               }}
               disabled={disabled}
               className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
@@ -1213,11 +1413,27 @@ export default function Settings() {
               disabled={disabled}
               onClick={async () => {
                 setDisabled(true);
-                await commands.stopHostedNetwork();
-                const success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
-                setHostedNetworkModalOpen(false);
-                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editNetwork: dontShowAgain}});
+                let success = false;
+                try {
+                  await commands.stopHostedNetwork();
+                  success = await commands.startHostedNetwork(hostedNetworkName, hostedNetworkPassword);
+                } catch {
+                  success = false;
+                } finally {
+                  setHostedNetworkModalOpen(false);
+                  setDisabled(false);
+                }
+                try {
+                  const current = await getConfig();
+                  if (current) {
+                    await updateConfig({dontShowAgain: {...current.dontShowAgain, editNetwork: dontShowAgain}});
+                  }
+                } catch (e) {
+                  console.error("failed to persist edit network dialog choice", e);
+                }
                 if (success) {
+                  setHostedNetworkOn(true);
+                  setCredentialsUnlocked(false);
                   setOldHostedNetworkName(hostedNetworkName);
                   setOldHostedNetworkPassword(hostedNetworkPassword);
                   toast({
@@ -1225,6 +1441,8 @@ export default function Settings() {
                     description: t("toasts.networkSettings.successDescription"),
                   });
                 } else {
+                  setHostedNetworkOn(false);
+                  setCredentialsUnlocked(true);
                   setHostedNetworkName(oldHostedNetworkName);
                   setHostedNetworkPassword(oldHostedNetworkPassword);
                   toast({
@@ -1260,18 +1478,28 @@ export default function Settings() {
               className="disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {
                 setWifiTurningOn(true);
-                const turned = await commands.turnOnWifi();
-                if (turned) {
-                  await new Promise(resolve => setTimeout(resolve, 5000));
-                  await startNetworkWithFeedback({ fromWifiModal: true });
-                } else {
-                  toast({
-                    title: t("toasts.wifi.turnOnFailedTitle"),
-                    description: t("toasts.wifi.turnOnFailedDescription"),
-                  });
+                try {
+                  let turned = false;
+                  try {
+                    turned = await commands.turnOnWifi();
+                  } catch {
+                    turned = false;
+                  }
+                  if (turned) {
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await startNetworkWithFeedback({ fromWifiModal: true });
+                  } else {
+                    toast({
+                      title: t("toasts.wifi.turnOnFailedTitle"),
+                      description: t("toasts.wifi.turnOnFailedDescription"),
+                    });
+                  }
+                } catch (e) {
+                  console.error("wi-fi turn-on flow failed", e);
+                } finally {
+                  setWifiTurningOn(false);
+                  setWifiModalOpen(false);
                 }
-                setWifiTurningOn(false);
-                setWifiModalOpen(false);
               }}
             >
               {wifiTurningOn ? t("dialogs.turnOnWifi.turningOn") : t("dialogs.turnOnWifi.turnOn")}

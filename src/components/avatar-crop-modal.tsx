@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { useToast } from "@/components/ui/use-toast";
 import { AVATAR_OUTPUT_SIZE } from "@/lib/avatar";
 import { useTranslation } from "@/i18n";
 
@@ -17,6 +18,7 @@ type AvatarCropModalProps = {
 
 export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCropModalProps) {
   const { t } = useTranslation();
+  const { toast } = useToast();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const coverRef = useRef(1);
@@ -56,6 +58,11 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
     );
   }, [clampOffset]);
 
+  const onCancelRef = useRef(onCancel);
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  });
+
   useEffect(() => {
     if (!open || !imageSrc) return;
     setReady(false);
@@ -73,11 +80,20 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
       setReady(true);
       draw(cover);
     };
+    img.onerror = () => {
+      toast({
+        title: t("toasts.avatar.loadFailedTitle"),
+        description: t("toasts.avatar.loadFailedDescription"),
+        variant: "destructive",
+      });
+      onCancelRef.current();
+    };
     img.src = imageSrc;
     return () => {
       img.onload = null;
+      img.onerror = null;
     };
-  }, [open, imageSrc, draw]);
+  }, [open, imageSrc, draw, t, toast]);
 
   const applyZoom = useCallback((nextZoom: number) => {
     const oldScale = scaleRef.current;
@@ -116,6 +132,14 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
     }
   };
 
+  const saveFailed = () => {
+    toast({
+      title: t("toasts.avatar.saveFailedTitle"),
+      description: t("toasts.avatar.saveFailedDescription"),
+      variant: "destructive",
+    });
+  };
+
   const handleSave = async () => {
     const canvas = canvasRef.current;
     if (!canvas || saving) return;
@@ -124,9 +148,15 @@ export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCrop
       const blob = await new Promise<Blob | null>((resolve) =>
         canvas.toBlob(resolve, "image/png")
       );
-      if (!blob) return;
+      if (!blob) {
+        saveFailed();
+        return;
+      }
       const bytes = new Uint8Array(await blob.arrayBuffer());
       await onSave(bytes, canvas.toDataURL("image/png"));
+    } catch (e) {
+      console.error("avatar crop save failed", e);
+      saveFailed();
     } finally {
       setSaving(false);
     }

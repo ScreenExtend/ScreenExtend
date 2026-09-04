@@ -1,4 +1,4 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useNextStep } from "nextstepjs";
 
@@ -14,32 +14,39 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-import { updateConfig, flushConfig, getConfig } from "@/components/config-provider";
+import { updateConfig, flushConfig, useConfig } from "@/components/config-provider";
 import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
 import { GlobalProviderContext } from "@/components/global-provider";
+import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import { commands } from "@/lib/bindings";
 import defaultLogo from "@/assets/default.svg";
 
 export function ProfileMenu() {
   const { windowClosing: [closing, setClosing], windowAvatar: [avatar] } = useContext(GlobalProviderContext);
   const [background, setBackground] = useState(false);
-  const [name, setName] = useState("");
+  const name = useConfig()?.name ?? "";
   const navigate = useNavigate();
   const { startNextStep } = useNextStep();
+  const { toast } = useToast();
+  const { t } = useTranslation();
 
   const replayTour = async () => {
-    await updateConfig({ walkthroughCompleted: false });
-    await flushConfig();
+    try {
+      await updateConfig({ walkthroughCompleted: false });
+      await flushConfig();
+    } catch (e) {
+      console.error("failed to reset the walkthrough state", e);
+      toast({
+        variant: "destructive",
+        title: t("toasts.replayTour.failureTitle"),
+        description: t("toasts.replayTour.failureDescription"),
+      });
+      return;
+    }
     navigate("/dashboard");
     startNextStep(WALKTHROUGH_TOUR);
   };
-
-  useEffect(() => {
-    void (async () => {
-      const config = await getConfig();
-      if (config) setName(config.name);
-    })();
-  }, []);
 
   return (
     <DropdownMenu onOpenChange={setBackground}>
@@ -63,8 +70,22 @@ export function ProfileMenu() {
             className="cursor-pointer"
             onClick={async () => {
               setClosing(true);
-              await commands.stopHostedNetwork();
-              await commands.exitApp();
+              try {
+                await commands.stopHostedNetwork();
+              } catch (e) {
+                console.error("stopHostedNetwork on exit failed", e);
+              }
+              try {
+                await commands.exitApp();
+              } catch (e) {
+                console.error("exitApp failed", e);
+                setClosing(false);
+                toast({
+                  variant: "destructive",
+                  title: t("toasts.exitApp.failureTitle"),
+                  description: t("toasts.exitApp.failureDescription"),
+                });
+              }
             }}
           >
             <Power className="mr-2 h-4 w-4" />
@@ -73,7 +94,21 @@ export function ProfileMenu() {
           <DropdownMenuItem
             className="cursor-pointer"
             onClick={async () => {
-              await updateConfig({dontShowAgain: {editDevice: false, editNetwork: false, compatibility: false}});
+              try {
+                await updateConfig({dontShowAgain: {editDevice: false, editNetwork: false, compatibility: false, configEditor: false}});
+                await flushConfig();
+                toast({
+                  title: t("toasts.resetPreferences.successTitle"),
+                  description: t("toasts.resetPreferences.successDescription"),
+                });
+              } catch (e) {
+                console.error("failed to reset preferences", e);
+                toast({
+                  variant: "destructive",
+                  title: t("toasts.resetPreferences.failureTitle"),
+                  description: t("toasts.resetPreferences.failureDescription"),
+                });
+              }
             }}
           >
             <RotateCcw className="mr-2 h-4 w-4" />
@@ -90,10 +125,44 @@ export function ProfileMenu() {
             className="cursor-pointer"
             onClick={async () => {
               setClosing(true);
-              await commands.uninstallAudioDriver();
-              await commands.removeDrivers();
-              await commands.stopHostedNetwork();
-              await commands.exitApp();
+              try {
+                const outcome = await commands.uninstallAudioDriver();
+                if (outcome === "cancelled" || outcome === "failed") {
+                  setClosing(false);
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.uninstallDrivers.failureTitle"),
+                    description: t("toasts.uninstallDrivers.failureDescription"),
+                  });
+                  return;
+                }
+                await commands.removeDrivers();
+              } catch (e) {
+                console.error("failed to uninstall drivers", e);
+                setClosing(false);
+                toast({
+                  variant: "destructive",
+                  title: t("toasts.uninstallDrivers.failureTitle"),
+                  description: t("toasts.uninstallDrivers.failureDescription"),
+                });
+                return;
+              }
+              try {
+                await commands.stopHostedNetwork();
+              } catch (e) {
+                console.error("stopHostedNetwork on driver uninstall failed", e);
+              }
+              try {
+                await commands.exitApp();
+              } catch (e) {
+                console.error("exitApp failed", e);
+                setClosing(false);
+                toast({
+                  variant: "destructive",
+                  title: t("toasts.exitApp.failureTitle"),
+                  description: t("toasts.exitApp.failureDescription"),
+                });
+              }
             }}
           >
             <Trash2 className="mr-2 h-4 w-4" />

@@ -12,6 +12,7 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { Checkbox } from "@/components/ui/checkbox";
+import { useToast } from "@/components/ui/use-toast";
 
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
@@ -51,6 +52,7 @@ function formatBytes(bytes: number): string {
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
   const { t } = useTranslation();
+  const { toast } = useToast();
   const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
 
   const [error, setError] = useState(false);
@@ -67,81 +69,94 @@ export default function Bootstrap() {
   const running = useRef(false);
 
   const runSetup = async (tryInstall: boolean) => {
-    let success;
-    if (!loaded) {
-      success = await commands.setup();
-      setLoaded(success);
-    } else {
-      success = loaded;
-    }
-    if (success) {
-      if (!(await getConfig())) {
-        await createConfig({ name: await commands.getUsername(), theme });
+    try {
+      let success;
+      if (!loaded) {
+        success = await commands.setup();
+        setLoaded(success);
+      } else {
+        success = loaded;
       }
-      const existing = (await getConfig())!;
-      setTheme(existing.theme as Theme);
-      const savedPorts = existing?.serverPorts;
-      if (savedPorts) {
-        await commands.setServerPorts(savedPorts.http, savedPorts.https);
-      }
-      if (existing?.disableGpuEncode) {
-        await commands.setDisableGpuEncode(true);
-      }
-      if (existing?.legacyVolumeKeyProxy) {
-        await commands.setLegacyVolumeKeyProxy(true);
-      }
-      for (const device of existing?.devices ?? []) {
-        await commands.setDeviceOverride(
-          device.ip,
-          device.scale,
-          device.orientation,
-          device.refreshRate,
-          device.videoScale,
-          device.videoQuality,
-          device.remoteControl ?? false,
-          device.dpr ?? device.maxDpr ?? 1,
-          device.systemAudio ?? false
-        );
-      }
-      for (const known of existing?.knownDevices ?? []) {
-        const token = known.token ?? "";
-        if (known.banned) {
-          await commands.setDeviceBanned(token, known.ip, true);
-        } else if (token) {
-          await commands.setDeviceApproved(token, true);
+      if (success) {
+        if (!(await getConfig())) {
+          await createConfig({ name: await commands.getUsername(), theme });
+        }
+        const existing = await getConfig();
+        if (!existing) throw new Error("config store unreadable after setup");
+        setTheme(existing.theme as Theme);
+        const savedPorts = existing?.serverPorts;
+        if (savedPorts) {
+          await commands.setServerPorts(savedPorts.http, savedPorts.https);
+        }
+        if (existing?.disableGpuEncode) {
+          await commands.setDisableGpuEncode(true);
+        }
+        if (existing?.legacyVolumeKeyProxy) {
+          await commands.setLegacyVolumeKeyProxy(true);
+        }
+        for (const device of existing?.devices ?? []) {
+          await commands.setDeviceOverride(
+            device.ip,
+            device.scale,
+            device.orientation,
+            device.refreshRate,
+            device.videoScale,
+            device.videoQuality,
+            device.remoteControl ?? false,
+            device.dpr ?? device.maxDpr ?? 1,
+            device.systemAudio ?? false
+          );
+        }
+        for (const known of existing?.knownDevices ?? []) {
+          const token = known.token ?? "";
+          if (known.banned) {
+            await commands.setDeviceBanned(token, known.ip, true);
+          } else if (token) {
+            await commands.setDeviceApproved(token, true);
+          } else {
+            console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
+          }
+        }
+        const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
+        setPublicSessionsEnabled(publicSessionsEnabled);
+
+        await commands.watchForNetworkChanges();
+        const newSessionId = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'[b % 32]).join('');
+        const newOtp = generateOtp();
+        setSessionId(newSessionId);
+        setOtp(newOtp);
+        await commands.setSessionCredentials(newSessionId, newOtp);
+        if (publicSessionsEnabled) {
+          commands.registerCloudSession(newSessionId).catch((e: unknown) => {
+            console.error("registerCloudSession failed", e);
+            toast({
+              variant: "destructive",
+              title: t("toasts.cloudSession.failureTitle"),
+              description: t("toasts.cloudSession.failureDescription"),
+            });
+          });
         } else {
-          console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
+          commands.unregisterCloudSession().catch((e: unknown) => { console.error("unregisterCloudSession failed", e); });
+        }
+        setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
+        setHostedNetworkOn(false);
+        const turn = (await getConfig())?.turnConfig;
+        if (turn?.urls) {
+          await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");
+        }
+        document.getElementById("dashlink")!.click();
+      } else {
+        if (tryInstall) {
+          await commands.installDrivers();
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          await runSetup(false);
+        } else {
+          setError(true);
         }
       }
-      const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
-      setPublicSessionsEnabled(publicSessionsEnabled);
-
-      await commands.watchForNetworkChanges();
-      const newSessionId = Array.from(crypto.getRandomValues(new Uint8Array(12)), b => '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'[b % 32]).join('');
-      const newOtp = generateOtp();
-      setSessionId(newSessionId);
-      setOtp(newOtp);
-      await commands.setSessionCredentials(newSessionId, newOtp);
-      if (publicSessionsEnabled) {
-        void commands.registerCloudSession(newSessionId);
-      } else {
-        void commands.unregisterCloudSession();
-      }
-      setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
-      setHostedNetworkOn(false);
-      const turn = (await getConfig())?.turnConfig;
-      if (turn?.urls) {
-        await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");
-      }
-      document.getElementById("dashlink")!.click();
-    } else {
-      if (tryInstall) {
-        await commands.installDrivers();
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        runSetup(false);
-      } else {
-        setError(true);
-      }
+    } catch (e) {
+      console.error("setup failed", e);
+      setError(true);
     }
   };
 
@@ -204,38 +219,48 @@ export default function Bootstrap() {
     try {
       perms = await commands.checkPermissions();
     } catch {
+      toast({
+        variant: "destructive",
+        title: t("toasts.permissions.checkFailedTitle"),
+        description: t("toasts.permissions.checkFailedDescription"),
+      });
       return;
     }
     setPermReport(perms);
     if (perms.every(p => !p.required || p.granted)) {
       setPermReport(null);
-      void proceed();
+      proceed().catch(() => setError(true));
     }
   };
 
   const proceed = async () => {
-    if (await ensurePermissions()) return;
-    let report: CompatibilityReport;
     try {
-      report = await commands.checkSystemRequirements();
-    } catch {
+      if (await ensurePermissions()) return;
+      let report: CompatibilityReport;
+      try {
+        report = await commands.checkSystemRequirements();
+      } catch {
+        await runSetup(true);
+        return;
+      }
+      const hasBlocking =
+        !report.os_supported ||
+        report.unsupported_apis.some(api => api.severity === "blocking");
+      if (hasBlocking) {
+        setCompatReport(report);
+        setCompatBlocking(true);
+        return;
+      }
+      if (report.unsupported_apis.length > 0 && !(await getConfig())?.dontShowAgain?.compatibility) {
+        setCompatReport(report);
+        setCompatBlocking(false);
+        return;
+      }
       await runSetup(true);
-      return;
+    } catch (e) {
+      console.error("startup failed", e);
+      setError(true);
     }
-    const hasBlocking =
-      !report.os_supported ||
-      report.unsupported_apis.some(api => api.severity === "blocking");
-    if (hasBlocking) {
-      setCompatReport(report);
-      setCompatBlocking(true);
-      return;
-    }
-    if (report.unsupported_apis.length > 0 && !(await getConfig())?.dontShowAgain.compatibility) {
-      setCompatReport(report);
-      setCompatBlocking(false);
-      return;
-    }
-    await runSetup(true);
   };
 
   const start = async () => {
@@ -246,7 +271,7 @@ export default function Bootstrap() {
   useEffect(() => {
     if (running.current) return;
     running.current = true;
-    void start();
+    start().catch(() => setError(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -291,7 +316,16 @@ export default function Bootstrap() {
               {t("bootstrap.updateFailed.bodyBeforeLink")}
               <a
                 href={DOWNLOAD_URL}
-                onClick={e => { e.preventDefault(); void openUrl(DOWNLOAD_URL); }}
+                onClick={e => {
+                  e.preventDefault();
+                  openUrl(DOWNLOAD_URL).catch(() => {
+                    toast({
+                      variant: "destructive",
+                      title: t("toasts.openLink.failureTitle"),
+                      description: t("toasts.openLink.failureDescription"),
+                    });
+                  });
+                }}
                 style={{ textDecoration: "underline" }}
               >
                 {t("bootstrap.updateFailed.link")}
@@ -302,7 +336,15 @@ export default function Bootstrap() {
           <AlertDialogFooter>
             <AlertDialogAction
               className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
-              onClick={() => commands.exitApp()}
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
             >
               {t("common.quit")}
             </AlertDialogAction>
@@ -310,7 +352,11 @@ export default function Bootstrap() {
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={async () => {
                 setUpdateFailed(false);
-                void proceed();
+                try {
+                  await proceed();
+                } catch {
+                  setError(true);
+                }
               }}
             >
               {t("common.continue")}
@@ -333,9 +379,20 @@ export default function Bootstrap() {
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {
                 setLoading(true);
-                await commands.installDrivers();
-                await new Promise(resolve => setTimeout(resolve, 5000));
-                setLoading(false);
+                try {
+                  await commands.installDrivers();
+                  await new Promise(resolve => setTimeout(resolve, 5000));
+                } catch (e) {
+                  console.error("driver install failed", e);
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.driverInstall.failureTitle"),
+                    description: t("toasts.driverInstall.failureDescription"),
+                  });
+                  return;
+                } finally {
+                  setLoading(false);
+                }
                 setError(false);
                 await runSetup(false);
               }}
@@ -402,9 +459,26 @@ export default function Bootstrap() {
               <AlertDialogAction
                 className="bg-blue-600 hover:bg-blue-700 text-white"
                 onClick={async () => {
-                  await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, compatibility: compatDontShowAgain}});
                   setCompatReport(null);
-                  void runSetup(true);
+                  try {
+                    await runSetup(true);
+                  } catch {
+                    setError(true);
+                    return;
+                  }
+                  try {
+                    const current = await getConfig();
+                    if (current) {
+                      await updateConfig({dontShowAgain: {...current.dontShowAgain, compatibility: compatDontShowAgain}});
+                    }
+                  } catch (e) {
+                    console.error("saving compatibility preference failed", e);
+                    toast({
+                      variant: "destructive",
+                      title: t("toasts.compatibility.saveFailedTitle"),
+                      description: t("toasts.compatibility.saveFailedDescription"),
+                    });
+                  }
                 }}
               >
                 {t("common.continue")}
@@ -412,7 +486,15 @@ export default function Bootstrap() {
             )}
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
-              onClick={() => commands.exitApp()}
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
             >
               {t("common.exit")}
             </AlertDialogAction>
@@ -422,21 +504,17 @@ export default function Bootstrap() {
       <AlertDialog open={permReport !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Permissions Needed</AlertDialogTitle>
+            <AlertDialogTitle>{t("bootstrap.permissions.title")}</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3 text-left">
                 <div>
-                  ScreenExtend needs macOS permission to capture this screen and to control the
-                  keyboard and mouse from your connected devices. Enable each item below in System
-                  Settings, then relaunch.
+                  {t("bootstrap.permissions.body")}
                 </div>
                 <div className="flex items-start space-x-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
                   <Info className="mt-0.5 shrink-0 text-amber-600" size={16} />
                   <div>
-                    <span className="font-semibold">Already enabled but still not working?</span>{" "}
-                    macOS sometimes shows a permission as on when it isn&apos;t actually granted. In
-                    System Settings, click the lock and authenticate, turn ScreenExtend off and back
-                    on for that permission, then click the lock again to save.
+                    <span className="font-semibold">{t("bootstrap.permissions.tipTitle")}</span>{" "}
+                    {t("bootstrap.permissions.tipBody")}
                   </div>
                 </div>
                 <ul className="space-y-2">
@@ -457,7 +535,10 @@ export default function Bootstrap() {
                       {!p.granted && (
                         <button
                           className="shrink-0 rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
-                          onClick={() => void commands.openPermissionSettings(p.key)}
+                          onClick={() => {
+                            commands.openPermissionSettings(p.key)
+                              .catch((e: unknown) => { console.error("openPermissionSettings failed", e); });
+                          }}
                         >
                           Open Settings
                         </button>
@@ -471,7 +552,15 @@ export default function Bootstrap() {
           <AlertDialogFooter>
             <AlertDialogAction
               className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
-              onClick={() => commands.exitApp()}
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
             >
               {t("common.quit")}
             </AlertDialogAction>
@@ -479,13 +568,21 @@ export default function Bootstrap() {
               className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
               onClick={() => void recheckPermissions()}
             >
-              Re-check
+              {t("bootstrap.permissions.recheck")}
             </button>
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
-              onClick={() => void relaunch()}
+              onClick={() => {
+                relaunch().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.relaunch.failureTitle"),
+                    description: t("toasts.relaunch.failureDescription"),
+                  });
+                });
+              }}
             >
-              Relaunch
+              {t("bootstrap.permissions.relaunch")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

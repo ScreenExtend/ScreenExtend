@@ -15,7 +15,7 @@ import { Loader2 } from "lucide-react";
 import { NextStepProvider, NextStepReact } from "nextstepjs";
 import { HighlightProxy, WalkthroughArrow, WalkthroughCard, walkthroughSteps } from "@/components/walkthrough";
 
-import { getConfig, updateConfig, flushConfig, recordKnownDevice, type Device } from "@/components/config-provider";
+import { getConfig, getConfigSnapshot, subscribeToConfig, updateConfig, flushConfig, recordKnownDevice, type Device } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -28,6 +28,23 @@ import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
+
+const stopListening = (unlisten: () => void) => {
+  void Promise.resolve(unlisten()).catch(e => console.error("unlisten failed", e));
+};
+
+const DEVICE_OVERRIDE_KEYS = [
+  "scale",
+  "orientation",
+  "refreshRate",
+  "videoScale",
+  "videoQuality",
+  "remoteControl",
+  "systemAudio",
+  "dpr",
+  "audioOutputDeviceId",
+  "audioOutputDeviceLabel",
+] as const satisfies readonly (keyof Device)[];
 
 const router = createMemoryRouter(
   createRoutesFromElements(
@@ -52,8 +69,12 @@ function App() {
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
   const [audioOutputsByIp, setAudioOutputsByIp] = useState<Record<string, AudioOutputsInfo>>({});
   const zoomReady = useRef(false);
+  const appliedZoom = useRef(DEFAULT_ZOOM);
 
   const [closing, setClosing] = useState(false);
+
+  const { toast } = useToast();
+  const { t } = useTranslation();
 
   useEffect(() => {
     void (async () => {
@@ -67,18 +88,38 @@ function App() {
 
   useEffect(() => {
     void (async () => {
-      const cfg = await getConfig();
-      const saved = clampZoom(cfg?.zoomFactor ?? DEFAULT_ZOOM);
-      zoomReady.current = true;
-      await applyZoom(saved);
-      setZoom(saved);
+      let saved = DEFAULT_ZOOM;
+      try {
+        const cfg = await getConfig();
+        saved = clampZoom(cfg?.zoomFactor ?? DEFAULT_ZOOM);
+      } catch (e) {
+        console.error("reading the saved zoom failed", e);
+      } finally {
+        zoomReady.current = true;
+      }
+      try {
+        await applyZoom(saved);
+        appliedZoom.current = saved;
+        setZoom(saved);
+      } catch (e) {
+        console.error("applyZoom failed", e);
+      }
     })();
   }, []);
 
   useEffect(() => {
     if (!zoomReady.current) return;
-    void applyZoom(zoom);
-    void updateConfig({ zoomFactor: zoom });
+    void applyZoom(zoom).then(() => {
+      appliedZoom.current = zoom;
+      void updateConfig({ zoomFactor: zoom }).catch(e => console.error("persisting zoomFactor failed", e));
+    }).catch(() => {
+      setZoom(appliedZoom.current);
+      toast({
+        variant: "destructive",
+        title: t("toasts.zoom.failureTitle"),
+        description: t("toasts.zoom.failureDescription"),
+      });
+    });
   }, [zoom]);
 
   useEffect(() => {
@@ -105,28 +146,68 @@ function App() {
   const devicesRef = useRef(devices);
   useEffect(() => { devicesRef.current = devices; }, [devices]);
 
+  useEffect(() => {
+    const syncOverrides = () => {
+      const saved = getConfigSnapshot()?.devices;
+      if (!saved) return;
+      setDevices(prev => {
+        let changed = false;
+        const next = prev.map(device => {
+          const override = saved.find(d => d.ip === device.ip);
+          if (!override) return device;
+          const differs = DEVICE_OVERRIDE_KEYS.filter(
+            key => override[key] !== undefined && override[key] !== device[key]
+          );
+          if (differs.length === 0) return device;
+          changed = true;
+          const merged = { ...device };
+          for (const key of differs) {
+            (merged as Record<string, unknown>)[key] = override[key];
+          }
+          return merged;
+        });
+        return changed ? next : prev;
+      });
+    };
+    syncOverrides();
+    return subscribeToConfig(syncOverrides);
+  }, []);
+
   const notifyGranted = useRef(false);
   useEffect(() => {
     void (async () => {
-      let granted = await isPermissionGranted();
-      if (!granted) granted = (await requestPermission()) === "granted";
-      notifyGranted.current = granted;
+      try {
+        let granted = await isPermissionGranted();
+        if (!granted) granted = (await requestPermission()) === "granted";
+        notifyGranted.current = granted;
+      } catch (e) {
+        notifyGranted.current = false;
+        console.error("notification permission check failed", e);
+      }
     })();
   }, []);
 
-  const { toast } = useToast();
-  const { t } = useTranslation();
-
   const notifyIfUnfocused = async (title: string, body: string) => {
     if (!notifyGranted.current) return;
-    if (await appWindow.isFocused()) return;
-    sendNotification({ title, body });
+    try {
+      if (await appWindow.isFocused()) return;
+      sendNotification({ title, body });
+    } catch (e) {
+      console.error("notification failed", e);
+    }
   };
 
   useEffect(() => {
     if (sessionId && otp) {
-      void commands.setSessionCredentials(sessionId, otp);
+      void commands.setSessionCredentials(sessionId, otp).catch(() => {
+        toast({
+          variant: "destructive",
+          title: t("toasts.sessionCredentials.failureTitle"),
+          description: t("toasts.sessionCredentials.failureDescription"),
+        });
+      });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, otp]);
 
   useEffect(() => {
@@ -134,7 +215,7 @@ function App() {
     const stored = localStorage.getItem("disconnectGraceSecs");
     const seconds = Number(stored);
     if (stored !== null && Number.isFinite(seconds) && seconds >= 0) {
-      void commands.setDisconnectGrace(seconds);
+      void commands.setDisconnectGrace(seconds).catch(e => console.error("setDisconnectGrace on load failed", e));
     }
   }, [loaded]);
 
@@ -148,14 +229,26 @@ function App() {
           next.push(device);
           return next;
         });
-        void recordKnownDevice({
-          token: device.token,
-          ip: device.ip,
-          name: device.name,
-          os: device.os,
-          screenSize: device.screenSize,
-        });
-        void commands.setDeviceApproved(device.token, true);
+        void (async () => {
+          const results = await Promise.allSettled([
+            recordKnownDevice({
+              token: device.token,
+              ip: device.ip,
+              name: device.name,
+              os: device.os,
+              screenSize: device.screenSize,
+            }),
+            commands.setDeviceApproved(device.token, true),
+          ]);
+          const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+          if (!failed) return;
+          console.error("remembering the joined device failed", failed.reason);
+          toast({
+            variant: "destructive",
+            title: t("toasts.deviceApprove.failureTitle"),
+            description: t("toasts.deviceApprove.failureDescription"),
+          });
+        })();
         void notifyIfUnfocused(
           t("notifications.deviceJoin.title"),
           t("notifications.deviceJoin.body", { name: device.name || device.ip }),
@@ -193,14 +286,32 @@ function App() {
         const newId = (event.payload as { sessionId: string }).sessionId;
         if (!newId) return;
         setSessionId(newId);
-        const cfg = await getConfig();
-        setQrValues(await buildQrValues(newId, cfg?.serverPorts?.http));
+        try {
+          const cfg = await getConfig();
+          setQrValues(await buildQrValues(newId, cfg?.serverPorts?.http));
+        } catch {
+          setQrValues(await buildQrValues(newId, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
+          toast({
+            variant: "destructive",
+            title: t("toasts.qrRefresh.failureTitle"),
+            description: t("toasts.qrRefresh.failureDescription"),
+          });
+        }
       }));
       unlisteners.push(await events.networkChange.listen(async () => {
         const id = sessionIdRef.current;
         if (!id) return;
-        const cfg = await getConfig();
-        setQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
+        try {
+          const cfg = await getConfig();
+          setQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
+        } catch {
+          setQrValues(await buildQrValues(id, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
+          toast({
+            variant: "destructive",
+            title: t("toasts.qrRefresh.failureTitle"),
+            description: t("toasts.qrRefresh.failureDescription"),
+          });
+        }
       }));
       unlisteners.push(await events.joinAttemptsPaused.listen(event => {
         const seconds = (event.payload as { retryAfterSecs: number }).retryAfterSecs;
@@ -211,13 +322,21 @@ function App() {
         });
       }));
     }
-    void start_listener();
-    return () => unlisteners.forEach(unlisten => unlisten());
+    void start_listener().catch(e => {
+      console.error("event listener registration failed", e);
+      toast({
+        variant: "destructive",
+        title: t("toasts.eventBridge.failureTitle"),
+        description: t("toasts.eventBridge.failureDescription"),
+      });
+    });
+    return () => unlisteners.forEach(stopListening);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void appWindow.onCloseRequested(async () => {
+    void appWindow.onCloseRequested(async event => {
       setClosing(true);
       try {
         if (loaded) await commands.stopHostedNetwork();
@@ -227,15 +346,31 @@ function App() {
       try {
         await commands.exitApp();
       } catch (e) {
+        event.preventDefault();
         console.error("exitApp failed", e);
+        setClosing(false);
+        toast({
+          variant: "destructive",
+          title: t("toasts.exitApp.failureTitle"),
+          description: t("toasts.exitApp.failureDescription"),
+        });
       }
-    }).then(un => { unlisten = un; });
-    return () => unlisten?.();
+    }).then(un => { unlisten = un; }).catch(e => console.error("onCloseRequested registration failed", e));
+    return () => { if (unlisten) stopListening(unlisten); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
   const markWalkthroughDone = async () => {
-    await updateConfig({ walkthroughCompleted: true });
-    await flushConfig();
+    try {
+      await updateConfig({ walkthroughCompleted: true });
+      await flushConfig();
+    } catch {
+      toast({
+        variant: "destructive",
+        title: t("toasts.walkthrough.failureTitle"),
+        description: t("toasts.walkthrough.failureDescription"),
+      });
+    }
   };
 
   return (
