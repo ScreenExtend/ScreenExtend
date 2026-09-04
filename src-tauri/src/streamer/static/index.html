@@ -1004,7 +1004,7 @@
                     requestAnimationFrame(frame);
                 });
             }
-            function clampRefresh(r) { return r > 0 ? Math.round(r) : 0; }
+            function clampRefresh(r) { return r > 0 ? Math.round(r / 10) * 10 : 0; }
             function screenRefreshRate() {
                 const r = window.screen && window.screen.refreshRate;
                 return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
