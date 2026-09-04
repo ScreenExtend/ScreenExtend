@@ -1,3 +1,4 @@
+import { useEffect, useSyncExternalStore } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { generatePassword } from "@/lib/utils";
 
@@ -101,6 +102,22 @@ export const defaultConfig: Config = {
 };
 
 const ConfigDB = Store.load("config.json");
+ConfigDB.catch((e: unknown) => { console.error("failed to open config store", e); });
+
+let snapshot: Config | undefined;
+const listeners = new Set<() => void>();
+
+const publish = (config: Config | undefined) => {
+  snapshot = config;
+  listeners.forEach(listener => listener());
+};
+
+export const subscribeToConfig = (listener: () => void): (() => void) => {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+};
+
+export const getConfigSnapshot = (): Config | undefined => snapshot;
 
 export const getConfig = async (): Promise<Config | undefined> => {
   const db = await ConfigDB;
@@ -110,15 +127,41 @@ export const getConfig = async (): Promise<Config | undefined> => {
     const value = await db.get(key);
     if (value !== undefined) (config as Record<string, unknown>)[key] = value;
   }
+  publish(config);
   return config;
 };
 
 export const updateConfig = async (information: Partial<Config>) => {
-  const db = await ConfigDB;
-  for (const key of Object.keys(information) as (keyof Config)[]) {
-    await db.set(key, information[key]);
+  try {
+    const db = await ConfigDB;
+    for (const key of Object.keys(information) as (keyof Config)[]) {
+      await db.set(key, information[key]);
+    }
+  } catch (e) {
+    await getConfig().catch(() => undefined);
+    throw e;
   }
+  if (snapshot) publish({ ...snapshot, ...information });
+  else await getConfig();
 };
+
+let loading: Promise<Config | undefined> | null = null;
+let loadFailed = false;
+
+export function useConfig(): Config | undefined {
+  const config = useSyncExternalStore(subscribeToConfig, getConfigSnapshot);
+  useEffect(() => {
+    if (config !== undefined || loading !== null || loadFailed) return;
+    loading = getConfig()
+      .catch((e: unknown) => {
+        if (getConfigSnapshot() === undefined) loadFailed = true;
+        console.error("failed to load config", e);
+        return undefined;
+      })
+      .finally(() => { loading = null; });
+  }, [config]);
+  return config;
+}
 
 export const flushConfig = async () => {
   const db = await ConfigDB;
@@ -127,7 +170,6 @@ export const flushConfig = async () => {
 
 export const createConfig = async (information: Partial<Config> & { name: string }) => {
   await updateConfig({ ...defaultConfig, hostedNetworkCredentials: { name: "ScreenExtend" + ((information.name.length > 0) ? ("-" + information.name) : ""), password: generatePassword(12) }, ...information });
-  console.log({ ...defaultConfig, hostedNetworkCredentials: { name: "ScreenExtend" + ((information.name.length > 0) ? ("-" + information.name) : ""), password: generatePassword(12) }, ...information });
 };
 
 export const getSavedDevices = async (): Promise<Device[]> => {

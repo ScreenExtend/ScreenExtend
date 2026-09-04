@@ -7,7 +7,8 @@
     "exit": "Exit",
     "quit": "Quit",
     "dontShowAgain": "Don't show this message again",
-    "supportEmail": "support@screenextend.app"
+    "supportEmail": "support@screenextend.app",
+    "back": "Back"
   },
   "app": {
     "closing": "Closing"
@@ -30,25 +31,33 @@
       "immediate": "Displays of disconnected devices will now be removed immediately.",
       "delayed": "Disconnected devices now have {seconds} {unit} to reconnect before their display is removed.",
       "second": "second",
-      "seconds": "seconds"
+      "seconds": "seconds",
+      "failureTitle": "Couldn't Update Disconnect Timeout",
+      "failureDescription": "The timeout couldn't be applied. The previous value is still in use."
     },
     "turn": {
       "savedTitle": "TURN Server Saved",
       "clearedTitle": "TURN Server Cleared",
       "savedDescription": "Devices on other networks will now relay through this TURN server. It applies on the next connection.",
-      "clearedDescription": "No TURN server is configured. Connections across different networks may fail."
+      "clearedDescription": "No TURN server is configured. Connections across different networks may fail.",
+      "failureTitle": "Couldn't Save TURN Server",
+      "failureDescription": "The relay settings couldn't be saved. The previous settings are still in use."
     },
     "publicSessions": {
       "enabledTitle": "Public Sessions Enabled",
       "enabledDescription": "Devices on other networks can now join over the internet using your session link on the Add Device screen.",
       "disabledTitle": "Public Sessions Disabled",
-      "disabledDescription": "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app."
+      "disabledDescription": "The \"Anywhere (Internet)\" option is now hidden and this host is no longer reachable through session.screenextend.app.",
+      "failureTitle": "Couldn't Change Public Sessions",
+      "failureDescription": "The public session setting couldn't be applied. It is unchanged."
     },
     "gpuEncoding": {
       "disabledTitle": "GPU Video Encoding Disabled",
       "enabledTitle": "GPU Video Encoding Enabled",
       "disabledDescription": "Video is now encoded on the CPU (software). This uses far more CPU and can lower quality or frame rate. Connected devices reconnect using the software encoder.",
-      "enabledDescription": "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder."
+      "enabledDescription": "Video is encoded on the GPU again when hardware is available. Connected devices reconnect with the updated encoder.",
+      "failureTitle": "Couldn't Change Video Encoding",
+      "failureDescription": "The encoder setting couldn't be applied. The previous encoder is still in use."
     },
     "autostart": {
       "enabledTitle": "Launch at Startup Enabled",
@@ -64,7 +73,9 @@
     },
     "serverPorts": {
       "title": "Server Ports Updated",
-      "description": "Local network streaming now uses HTTP port {http} and HTTPS port {https}. Connected devices were disconnected and must rejoin using the updated links."
+      "description": "Local network streaming now uses HTTP port {http} and HTTPS port {https}. Connected devices were disconnected and must rejoin using the updated links.",
+      "failureTitle": "Couldn't Update Server Ports",
+      "failureDescription": "The ports couldn't be changed — another program may already be using them. The previous ports are still in use."
     },
     "networkCreate": {
       "successTitle": "Network Creation Success",
@@ -74,7 +85,9 @@
     },
     "networkStop": {
       "title": "Network Stop Success",
-      "description": "The hosted network has successfully been stopped. All devices have been disconnected."
+      "description": "The hosted network has successfully been stopped. All devices have been disconnected.",
+      "failureTitle": "Couldn't Stop Network",
+      "failureDescription": "The hosted network may still be running. Try again, or turn off the hotspot from Windows settings."
     },
     "networkSettings": {
       "successTitle": "Network Settings Update Success",
@@ -90,11 +103,15 @@
       "removeFailedTitle": "Couldn't Remove Photo",
       "removeFailedDescription": "There was a problem removing your profile picture. Please try again.",
       "removedTitle": "Profile Picture Removed",
-      "removedDescription": "Your profile picture has been reset to the default."
+      "removedDescription": "Your profile picture has been reset to the default.",
+      "loadFailedTitle": "Couldn’t Open Photo",
+      "loadFailedDescription": "That image couldn’t be read. Try a different file, or convert it to JPEG or PNG first."
     },
     "account": {
       "updatedTitle": "Account Settings Updated",
-      "updatedDescription": "Your name has been updated."
+      "updatedDescription": "Your name has been updated.",
+      "updateFailedTitle": "Couldn't Update Account",
+      "updateFailedDescription": "Your name couldn't be saved. Please try again."
     },
     "wifi": {
       "turnOnFailedTitle": "Couldn't Turn On Wi-Fi",
@@ -104,7 +121,10 @@
       "updatedTitle": "Device Settings Updated",
       "updatedDescription": "Your device settings have successfully been updated.",
       "removedTitle": "Device Removed",
-      "removedDescription": "Your device has been successfully removed."
+      "removedDescription": "Your device has been successfully removed.",
+      "updateFailedTitle": "Couldn't Update Device Settings",
+      "removeFailedTitle": "Couldn't Remove Device",
+      "removeFailedDescription": "This device couldn't be removed. It may still be able to join. Please try again."
     },
     "deviceBan": {
       "bannedTitle": "Device Banned",
@@ -112,7 +132,9 @@
       "unbannedTitle": "Device Unbanned",
       "unbannedDescription": "{ip} can join again.",
       "invalidTitle": "Invalid IP Address",
-      "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban."
+      "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban.",
+      "failureTitle": "Couldn't Update Device Ban",
+      "failureDescription": "The ban list couldn't be changed, so this device's access is unchanged. Please try again."
     },
     "configEditor": {
       "savedTitle": "Configuration saved",
@@ -121,7 +143,118 @@
       "parseFailedAt": "Line {line}, column {column}: {message}",
       "invalidTitle": "Configuration rejected",
       "invalidDescription": "{count} problems found. First: {first}",
-      "applyFailedTitle": "Could not apply configuration"
+      "applyFailedTitle": "Could not apply configuration",
+      "loadFailedTitle": "Couldn't Load Configuration",
+      "loadFailedDescription": "The configuration file couldn't be read, so the editor can't be opened. Reopen this page to try again.",
+      "copyFailedTitle": "Couldn't Copy Configuration",
+      "copyFailedDescription": "ScreenExtend couldn't write to the clipboard. Select the text in the editor and copy it manually.",
+      "refreshFailedTitle": "Saved, but the Page Didn't Refresh",
+      "refreshFailedDescription": "Your configuration was applied, but this page couldn't reload it. Reopen Settings to see the current values.",
+      "applyFailedDescription": "The configuration could not be applied to the running host. Your saved settings were not changed. See the problem list below for details."
+    },
+    "config": {
+      "saveFailedTitle": "Couldn't Save Settings",
+      "saveFailedDescription": "Your change couldn't be written to disk and may be lost when ScreenExtend closes. Please try again.",
+      "flushFailedTitle": "Couldn't Save Settings to Disk",
+      "flushFailedDescription": "The change is active for this session but couldn't be written to disk, so it may not survive a restart."
+    },
+    "settings": {
+      "loadFailedTitle": "Couldn't Load Settings",
+      "loadFailedDescription": "Some settings couldn't be read and may show default values. Reopen this page to try again.",
+      "saveFailedTitle": "Couldn't Save Settings",
+      "saveFailedDescription": "Your change couldn't be saved. Please try again."
+    },
+    "deviceApprove": {
+      "failureTitle": "Couldn't Remember Device",
+      "failureDescription": "This device is connected, but it wasn't saved as trusted and will need the join code again next time."
+    },
+    "volumeKeyProxy": {
+      "failureTitle": "Couldn't Update Volume Key Handling",
+      "failureDescription": "The volume key setting couldn't be applied to the audio driver. Your media keys behave as they did before."
+    },
+    "sessionCredentials": {
+      "failureTitle": "Couldn't Apply Session Code",
+      "failureDescription": "The host didn't accept the new session ID and join code, so the code on screen won't work. Restart ScreenExtend to try again."
+    },
+    "eventBridge": {
+      "failureTitle": "Live Updates Unavailable",
+      "failureDescription": "ScreenExtend can't receive updates from the host, so devices and status may not refresh. Restart the app to restore live updates."
+    },
+    "qrRefresh": {
+      "failureTitle": "Couldn't Refresh Join Links",
+      "failureDescription": "The join links and QR codes may be out of date. Reopen the Add Device screen to refresh them."
+    },
+    "cloudSession": {
+      "failureTitle": "Couldn't Register Public Session",
+      "failureDescription": "Devices on other networks may not be able to join. Local network joining still works."
+    },
+    "cloudStatus": {
+      "unavailableTitle": "Cloud Status Unavailable",
+      "unavailableDescription": "ScreenExtend can't read the public session status, so the indicator may be out of date."
+    },
+    "knownDevices": {
+      "loadFailedTitle": "Couldn't Load Past Devices",
+      "loadFailedDescription": "The list of past devices may be out of date. Reopen this page to refresh it."
+    },
+    "permissions": {
+      "checkFailedTitle": "Couldn't Check Permissions",
+      "checkFailedDescription": "ScreenExtend couldn't read the current permission status. Try again, or restart the app."
+    },
+    "driverInstall": {
+      "failureTitle": "Couldn't Install Drivers",
+      "failureDescription": "Driver installation didn't complete — it needs administrator approval. Try again and accept the prompt."
+    },
+    "uninstallDrivers": {
+      "failureTitle": "Couldn't Remove Drivers",
+      "failureDescription": "Driver removal didn't complete — it needs administrator approval. ScreenExtend stayed open so you can try again."
+    },
+    "exitApp": {
+      "failureTitle": "Couldn't Close ScreenExtend",
+      "failureDescription": "The app couldn't shut down cleanly. Close it from your taskbar or Dock."
+    },
+    "relaunch": {
+      "failureTitle": "Couldn't Restart ScreenExtend",
+      "failureDescription": "The app couldn't restart itself. Close it and open it again manually."
+    },
+    "resetPreferences": {
+      "successTitle": "Preferences Reset",
+      "successDescription": "Dialog and reminder preferences have been restored to their defaults.",
+      "failureTitle": "Couldn't Reset Preferences",
+      "failureDescription": "Your preferences couldn't be reset. Please try again."
+    },
+    "replayTour": {
+      "failureTitle": "Couldn't Start the Tour",
+      "failureDescription": "The walkthrough couldn't be started. Please try again."
+    },
+    "walkthrough": {
+      "failureTitle": "Couldn't Save Tour Progress",
+      "failureDescription": "The walkthrough may appear again next time you open ScreenExtend."
+    },
+    "theme": {
+      "failureTitle": "Couldn't Change Theme",
+      "failureDescription": "The theme couldn't be saved and may revert the next time you open ScreenExtend."
+    },
+    "zoom": {
+      "failureTitle": "Couldn't Change Zoom",
+      "failureDescription": "The zoom level couldn't be applied. Please try again."
+    },
+    "clipboard": {
+      "copyFailedTitle": "Couldn't Copy",
+      "copyFailedDescription": "ScreenExtend couldn't write to the clipboard. Select the text and copy it manually."
+    },
+    "openLink": {
+      "failureTitle": "Couldn't Open Link",
+      "failureDescription": "No browser could be opened for this link. Copy the address and open it manually."
+    },
+    "logs": {
+      "backlogFailedTitle": "Couldn't Load Logs",
+      "backlogFailedDescription": "Earlier log lines couldn't be read. New lines will still appear as they arrive.",
+      "streamFailedTitle": "Live Logs Unavailable",
+      "streamFailedDescription": "New log lines won't appear here. Reopen this page to reconnect."
+    },
+    "compatibility": {
+      "saveFailedTitle": "Couldn't Save Your Choice",
+      "saveFailedDescription": "This compatibility notice may appear again the next time you open ScreenExtend."
     }
   },
   "device": {
@@ -144,7 +277,8 @@
       "cancelledBody": "Installation was cancelled.",
       "uninstall": "Remove audio component",
       "uninstalledTitle": "Audio component removed",
-      "uninstalledBody": "ScreenExtend Audio was removed and your default output device restored."
+      "uninstalledBody": "ScreenExtend Audio was removed and your default output device restored.",
+      "checkFailed": "System audio support couldn’t be checked. Reopen this device to try again."
     },
     "volumeKeyProxy": {
       "label": "Proxy Volume Keys",
@@ -244,6 +378,14 @@
       "apiRequires": "(requires {version})",
       "upgradeBefore": "Please upgrade your operating system or contact support at ",
       "upgradeSuffix": "."
+    },
+    "permissions": {
+      "title": "Permissions Required",
+      "body": "ScreenExtend needs the permissions below before it can create a display and stream to your devices. Grant each one, then choose Re-check.",
+      "tipTitle": "After granting a permission",
+      "tipBody": "macOS may need ScreenExtend to restart before a newly granted permission takes effect. Use Restart if a permission still shows as missing.",
+      "recheck": "Re-check",
+      "relaunch": "Restart"
     }
   },
   "configEditor": {
@@ -263,6 +405,16 @@
       "errors": "{count} error(s)",
       "warnings": "{count} warning(s)",
       "schema": "Schema applied"
+    },
+    "conflict": {
+      "title": "Configuration changed since you started editing",
+      "description": "Settings were changed elsewhere in the app while this document had unsaved edits. Compare the two below, then choose which one to keep.",
+      "mine": "Your edits",
+      "mineCaption": "unsaved, in this editor",
+      "theirs": "Current configuration",
+      "theirsCaption": "in use by the app",
+      "useMine": "Save my version",
+      "useStored": "Discard mine, load current"
     }
   }
 }

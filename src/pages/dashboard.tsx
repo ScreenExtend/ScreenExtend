@@ -20,6 +20,8 @@ import { useNextStep } from "nextstepjs";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { getConfig } from "@/components/config-provider";
 import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
+import { useToast } from "@/components/ui/use-toast";
+import { useTranslation } from "@/i18n";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { commands, events, type DisplayCapacity } from "@/lib/bindings";
 import { buildCloudQrValue } from "@/lib/utils";
@@ -51,6 +53,8 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 export default function Dashboard() {
   const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled], windowDevices: [devices] } = useContext(GlobalProviderContext);
   const { startNextStep } = useNextStep();
+  const { t } = useTranslation();
+  const { toast } = useToast();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
   const [capacity, setCapacity] = useState<DisplayCapacity | null>(null);
@@ -59,10 +63,14 @@ export default function Dashboard() {
     if (walkthroughAutoStarted) return;
     let cancelled = false;
     void (async () => {
-      const cfg = await getConfig();
-      if (cancelled || walkthroughAutoStarted || cfg?.walkthroughCompleted) return;
-      walkthroughAutoStarted = true;
-      requestAnimationFrame(() => { if (!cancelled) startNextStep(WALKTHROUGH_TOUR); });
+      try {
+        const cfg = await getConfig();
+        if (cancelled || walkthroughAutoStarted || cfg?.walkthroughCompleted) return;
+        walkthroughAutoStarted = true;
+        requestAnimationFrame(() => { if (!cancelled) startNextStep(WALKTHROUGH_TOUR); });
+      } catch (e) {
+        console.error("walkthrough auto-start check failed", e);
+      }
     })();
     return () => { cancelled = true; };
   }, [startNextStep]);
@@ -71,20 +79,40 @@ export default function Dashboard() {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     let gotLiveEvent = false;
+    let haveStatus = false;
     void (async () => {
-      unlisten = await events.cloudStatusChange.listen((event) => {
-        gotLiveEvent = true;
-        setCloudStatus(event.payload as CloudStatus);
-        setStatusLoaded(true);
-      });
+      try {
+        unlisten = await events.cloudStatusChange.listen((event) => {
+          gotLiveEvent = true;
+          setCloudStatus(event.payload as CloudStatus);
+          setStatusLoaded(true);
+        });
+      } catch (e) {
+        console.error("cloudStatusChange.listen failed", e);
+      }
       try {
         const current = await commands.getCloudStatus();
+        haveStatus = true;
         if (!cancelled && !gotLiveEvent) setCloudStatus(current as CloudStatus);
-      } catch {}
-      if (!cancelled) setStatusLoaded(true);
+      } catch (e) {
+        console.error("getCloudStatus failed", e);
+      }
+      if (cancelled) return;
+      if (!haveStatus && !gotLiveEvent) {
+        setCloudStatus({ state: "error", detail: "" });
+        toast({
+          variant: "destructive",
+          title: t("toasts.cloudStatus.unavailableTitle"),
+          description: t("toasts.cloudStatus.unavailableDescription"),
+        });
+      }
+      setStatusLoaded(true);
     })();
-    return () => { cancelled = true; if (unlisten) unlisten(); };
-  }, []);
+    return () => {
+      cancelled = true;
+      if (unlisten) void Promise.resolve(unlisten() as unknown).catch((e) => console.error("cloudStatusChange unlisten failed", e));
+    };
+  }, [t, toast]);
 
   useEffect(() => {
     let cancelled = false;
@@ -92,7 +120,9 @@ export default function Dashboard() {
       try {
         const c = await commands.getDisplayCapacity();
         if (!cancelled) setCapacity(c);
-      } catch {}
+      } catch (e) {
+        console.error("getDisplayCapacity failed", e);
+      }
     })();
     return () => { cancelled = true; };
   }, [devices]);
@@ -193,13 +223,22 @@ export default function Dashboard() {
 
 const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; url: string; badge?: ReactNode; blurred?: boolean; blurredLabel?: string }) => {
   const [copied, setCopied] = useState(false);
+  const { t } = useTranslation();
+  const { toast } = useToast();
 
   const handleCopy = async () => {
     try {
       await writeText(url);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {}
+    } catch {
+      setCopied(false);
+      toast({
+        variant: "destructive",
+        title: t("toasts.clipboard.copyFailedTitle"),
+        description: t("toasts.clipboard.copyFailedDescription"),
+      });
+    }
   };
 
   return (

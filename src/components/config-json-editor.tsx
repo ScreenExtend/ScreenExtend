@@ -8,6 +8,7 @@ import {
   Minimize2,
   RotateCcw,
   Save,
+  X,
   ShieldCheck,
   WrapText,
   XCircle,
@@ -21,6 +22,14 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
@@ -28,10 +37,15 @@ import {
 } from "@/components/ui/tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
-import { getConfig, type Config } from "@/components/config-provider";
+import { getConfig, getConfigSnapshot, subscribeToConfig, type Config } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { configJsonSchema, validateConfig } from "@/lib/config-schema";
 import { applyConfig } from "@/lib/apply-config";
+
+interface Conflict {
+  mine: string;
+  theirs: string;
+}
 
 interface Problem {
   message: string;
@@ -43,7 +57,7 @@ interface Problem {
 interface ConfigJsonEditorProps {
   minHostedNetworkPasswordLength: number;
   onDirtyChange?: (dirty: boolean) => void;
-  onSaved?: (config: Config) => void;
+  onSaved?: (config: Config) => void | Promise<void>;
 }
 
 const serialize = (config: Config) => JSON.stringify(config, null, 2) + "\n";
@@ -90,6 +104,8 @@ export function ConfigJsonEditor({
 
   const editorRef = useRef<JsonEditorHandle>(null);
   const seed = useRef<string | null>(null);
+  const textRef = useRef("");
+  const baseRef = useRef("");
 
   const [text, setText] = useState("");
   const [savedText, setSavedText] = useState("");
@@ -98,6 +114,9 @@ export function ConfigJsonEditor({
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [ready, setReady] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [conflict, setConflict] = useState<Conflict | null>(null);
+  const [conflictKey, setConflictKey] = useState(0);
   const [theme, setTheme] = useState<"light" | "dark">(() =>
     document.documentElement.classList.contains("dark") ? "dark" : "light"
   );
@@ -115,22 +134,59 @@ export function ConfigJsonEditor({
     return () => clearTimeout(id);
   }, [zoom]);
 
-  useEffect(() => {
-    void (async () => {
+  const load = useCallback(async () => {
+    setLoadError(false);
+    try {
       const config = await getConfig();
-      if (!config) return;
+      if (!config) throw new Error("config store is empty");
       const initial = serialize(config);
       seed.current = initial;
       setText(initial);
       setSavedText(initial);
       setReady(true);
-    })();
-  }, []);
+    } catch {
+      setLoadError(true);
+      toast({
+        variant: "destructive",
+        title: t("toasts.configEditor.loadFailedTitle"),
+        description: t("toasts.configEditor.loadFailedDescription"),
+      });
+    }
+  }, [t, toast]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  textRef.current = text;
+  baseRef.current = savedText;
 
   const dirty = ready && text !== savedText;
   useEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
+
+  const adopt = useCallback((next: string) => {
+    setSavedText(next);
+    setText(next);
+    setSaveErrors([]);
+    baseRef.current = next;
+    textRef.current = next;
+    editorRef.current?.setValue(next);
+  }, []);
+
+  useEffect(
+    () =>
+      subscribeToConfig(() => {
+        const config = getConfigSnapshot();
+        if (!config) return;
+        const next = serialize(config);
+        if (next === baseRef.current) return;
+        if (textRef.current !== baseRef.current) return;
+        adopt(next);
+      }),
+    [adopt]
+  );
 
   const onChange = useCallback((next: string) => {
     setText(next);
@@ -160,7 +216,16 @@ export function ConfigJsonEditor({
   };
 
   const copy = async () => {
-    await navigator.clipboard.writeText(editorRef.current?.getValue() ?? text);
+    try {
+      await navigator.clipboard.writeText(editorRef.current?.getValue() ?? text);
+    } catch {
+      toast({
+        variant: "destructive",
+        title: t("toasts.configEditor.copyFailedTitle"),
+        description: t("toasts.configEditor.copyFailedDescription"),
+      });
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   };
@@ -170,7 +235,7 @@ export function ConfigJsonEditor({
     toast({ variant: "destructive", title, description });
   };
 
-  const save = async () => {
+  const commit = async () => {
     const raw = editorRef.current?.getValue() ?? text;
     setSaving(true);
     try {
@@ -209,25 +274,51 @@ export function ConfigJsonEditor({
       }
 
       const applied = await applyConfig(parsed as Config);
-      const canonical = serialize(applied);
-      setSaveErrors([]);
-      setSavedText(canonical);
-      setText(canonical);
-      editorRef.current?.setValue(canonical);
-      onSaved?.(applied);
+      adopt(serialize(getConfigSnapshot() ?? applied));
       toast({
         title: t("toasts.configEditor.savedTitle"),
         description: t("toasts.configEditor.savedDescription"),
       });
+      try {
+        await onSaved?.(applied);
+      } catch (e) {
+        console.error("config refresh after save failed", e);
+      }
     } catch (e) {
+      const storeWrite = e instanceof Error && e.message.startsWith("config.json:");
       fail(
         [{ message: String(e), severity: "error" }],
-        t("toasts.configEditor.applyFailedTitle"),
-        String(e)
+        storeWrite ? t("toasts.config.saveFailedTitle") : t("toasts.configEditor.applyFailedTitle"),
+        storeWrite
+          ? t("toasts.config.saveFailedDescription")
+          : t("toasts.configEditor.applyFailedDescription")
       );
     } finally {
       setSaving(false);
     }
+  };
+
+  const save = async () => {
+    const config = getConfigSnapshot();
+    const stored = config ? serialize(config) : null;
+    if (stored !== null && stored !== baseRef.current) {
+      setConflict({ mine: editorRef.current?.getValue() ?? text, theirs: stored });
+      setConflictKey(key => key + 1);
+      return;
+    }
+    await commit();
+  };
+
+  const resolveWithMine = async () => {
+    const stored = conflict?.theirs ?? null;
+    setConflict(null);
+    if (stored !== null) baseRef.current = stored;
+    await commit();
+  };
+
+  const resolveWithStored = () => {
+    if (conflict) adopt(conflict.theirs);
+    setConflict(null);
   };
 
   return (
@@ -286,6 +377,11 @@ export function ConfigJsonEditor({
             theme={theme}
             onMarkersChange={setMarkers}
           />
+        ) : loadError ? (
+          <div className="flex h-full items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
+            <XCircle className="h-4 w-4 shrink-0 text-destructive" />
+            {t("toasts.configEditor.loadFailedDescription")}
+          </div>
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -358,6 +454,92 @@ export function ConfigJsonEditor({
             {t("configEditor.actions.save")}
           </Button>
         </div>
+      </div>
+
+      <AlertDialog
+        open={conflict !== null}
+        onOpenChange={open => { if (!open) setConflict(null); }}
+      >
+        <AlertDialogContent className="w-[96vw] max-w-[96vw] gap-4">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("configEditor.conflict.title")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("configEditor.conflict.description")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute right-4 top-4 h-8 w-8"
+            onClick={() => setConflict(null)}
+          >
+            <X className="h-4 w-4" />
+            <span className="sr-only">{t("common.back")}</span>
+          </Button>
+          {conflict && (
+            <div className="grid gap-4 md:grid-cols-2">
+              <ComparePane
+                title={t("configEditor.conflict.mine")}
+                caption={t("configEditor.conflict.mineCaption")}
+                name={`config-conflict-mine-${conflictKey}`}
+                value={conflict.mine}
+                theme={theme}
+              />
+              <ComparePane
+                title={t("configEditor.conflict.theirs")}
+                caption={t("configEditor.conflict.theirsCaption")}
+                name={`config-conflict-stored-${conflictKey}`}
+                value={conflict.theirs}
+                theme={theme}
+              />
+            </div>
+          )}
+          <AlertDialogFooter className="sm:justify-between">
+            <Button variant="ghost" onClick={() => setConflict(null)}>
+              {t("common.back")}
+            </Button>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row">
+              <Button variant="outline" onClick={resolveWithStored}>
+                {t("configEditor.conflict.useStored")}
+              </Button>
+              <Button onClick={() => void resolveWithMine()}>
+                {t("configEditor.conflict.useMine")}
+              </Button>
+            </div>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+function ComparePane({
+  title,
+  caption,
+  name,
+  value,
+  theme,
+}: {
+  title: string;
+  caption: string;
+  name: string;
+  value: string;
+  theme: "light" | "dark";
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="flex items-baseline justify-between rounded-t-md border border-b-0 bg-muted/40 px-3 py-2">
+        <span className="text-sm font-medium">{title}</span>
+        <span className="text-xs text-muted-foreground">{caption}</span>
+      </div>
+      <div className="h-[min(52vh,460px)] rounded-b-md border bg-background">
+        <JsonEditor
+          name={name}
+          defaultValue={value}
+          theme={theme}
+          readOnly
+          maskedValuePaths={MASKED_PATHS}
+        />
       </div>
     </div>
   );

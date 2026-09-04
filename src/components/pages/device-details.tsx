@@ -42,7 +42,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
+import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -91,27 +91,34 @@ export function DeviceDetails({ device }: { device: Device }) {
   const { toast } = useToast();
   const { t } = useTranslation();
 
-  const [audioBackend, setAudioBackend] = useState<string>("unsupported");
+  const [audioBackend, setAudioBackend] = useState<string | null>(null);
+  const [audioCheckFailed, setAudioCheckFailed] = useState(false);
   const [audioInstalling, setAudioInstalling] = useState(false);
   const [installPromptOpen, setInstallPromptOpen] = useState(false);
   const refreshAudioBackend = React.useCallback(() => {
     commands
       .checkSystemRequirements()
-      .then((r) => setAudioBackend(r.audio_backend))
-      .catch(() => setAudioBackend("unsupported"));
+      .then((r) => {
+        setAudioBackend(r.audio_backend);
+        setAudioCheckFailed(false);
+      })
+      .catch((e) => {
+        console.error("failed to check the audio backend", e);
+        setAudioBackend(null);
+        setAudioCheckFailed(true);
+      });
   }, []);
   useEffect(() => {
+    if (!open) return;
     refreshAudioBackend();
-  }, [refreshAudioBackend]);
+  }, [open, refreshAudioBackend]);
 
   const audioNeedsInstall = audioBackend === "needs_driver_install";
   const audioUnsupported = audioBackend === "unsupported";
   const audioActiveLegacy = audioBackend === "virtual_device";
 
-  const [volumeKeyProxy, setVolumeKeyProxy] = useState(false);
-  useEffect(() => {
-    getConfig().then((c) => setVolumeKeyProxy(c?.legacyVolumeKeyProxy ?? false));
-  }, []);
+  const volumeKeyProxy = useConfig()?.legacyVolumeKeyProxy ?? false;
+  const [proxyBusy, setProxyBusy] = useState(false);
 
   const { windowAudioOutputsByIp } = useContext(GlobalProviderContext);
   const [audioOutputsByIp, setAudioOutputsByIp] = windowAudioOutputsByIp;
@@ -119,11 +126,15 @@ export function DeviceDetails({ device }: { device: Device }) {
   useEffect(() => {
     if (!open) return;
     (async () => {
-      const r = await commands.getDeviceAudioOutputs(device.ip);
-      setAudioOutputsByIp((prev) => ({
-        ...prev,
-        [device.ip]: { supported: r.supported, outputs: r.outputs, selected: r.selected },
-      }));
+      try {
+        const r = await commands.getDeviceAudioOutputs(device.ip);
+        setAudioOutputsByIp((prev) => ({
+          ...prev,
+          [device.ip]: { supported: r.supported, outputs: r.outputs, selected: r.selected },
+        }));
+      } catch (e) {
+        console.error("failed to read the device audio outputs", e);
+      }
     })();
   }, [open, device.ip, setAudioOutputsByIp]);
 
@@ -152,6 +163,13 @@ export function DeviceDetails({ device }: { device: Device }) {
           description: t("device.systemAudio.installFailedBody"),
         });
       }
+    } catch (e) {
+      console.error("failed to install the audio driver", e);
+      toast({
+        variant: "destructive",
+        title: t("device.systemAudio.installFailedTitle"),
+        description: t("device.systemAudio.installFailedBody"),
+      });
     } finally {
       setAudioInstalling(false);
       refreshAudioBackend();
@@ -159,6 +177,7 @@ export function DeviceDetails({ device }: { device: Device }) {
   };
 
   const deviceDetails = useFormik({
+    enableReinitialize: !open,
     initialValues: {
       ...device,
       dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -199,41 +218,49 @@ export function DeviceDetails({ device }: { device: Device }) {
         setOpen(false);
       } catch (e) {
         console.error("failed to save device settings", e);
-        toast({ variant: "destructive", title: t("toasts.device.updatedTitle"), description: String(e) });
+        toast({
+          variant: "destructive",
+          title: t("toasts.device.updateFailedTitle"),
+          description: t("toasts.settings.saveFailedDescription"),
+        });
       } finally {
         setInProgress(false);
       }
     },
   });
 
-  const considerClosing = async (event: CustomEvent<{originalEvent: PointerEvent}> | CustomEvent<{originalEvent: FocusEvent}> | KeyboardEvent) => {
-    event.preventDefault();
-    if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
-      setOpen(false);
-    } else {
-      if ((await getConfig())!.dontShowAgain.editDevice) {
-        setOpen(false);
-        deviceDetails.resetForm({ values: device });
-      } else {
-        setWarningDialogOpen(true);
-      }
+  const skipUnsavedWarning = async () => {
+    try {
+      return (await getConfig())?.dontShowAgain.editDevice ?? false;
+    } catch (e) {
+      console.error("failed to read the config", e);
+      return false;
     }
   };
 
-  const openChangeHandler = async (open: boolean) => {
+  const closeOrWarn = async () => {
+    if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
+      setOpen(false);
+      return;
+    }
+    if (await skipUnsavedWarning()) {
+      setOpen(false);
+      deviceDetails.resetForm({ values: device });
+    } else {
+      setWarningDialogOpen(true);
+    }
+  };
+
+  const considerClosing = (event: CustomEvent<{originalEvent: PointerEvent}> | CustomEvent<{originalEvent: FocusEvent}> | KeyboardEvent) => {
+    event.preventDefault();
+    void closeOrWarn();
+  };
+
+  const openChangeHandler = (open: boolean) => {
     if (open) {
       setOpen(true);
     } else {
-      if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
-        setOpen(false);
-      } else {
-        if ((await getConfig())!.dontShowAgain.editDevice) {
-          setOpen(false);
-          deviceDetails.resetForm({ values: device });
-        } else {
-          setWarningDialogOpen(true);
-        }
-      }
+      void closeOrWarn();
     }
   };
 
@@ -349,13 +376,15 @@ export function DeviceDetails({ device }: { device: Device }) {
           <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
             <TipLabel
               text={
-                audioUnsupported
-                  ? t("device.systemAudio.unsupported")
-                  : audioNeedsInstall
-                    ? t("device.systemAudio.needsInstall")
-                    : audioActiveLegacy
-                      ? t("device.systemAudio.active")
-                      : t("device.systemAudio.tip")
+                audioCheckFailed
+                  ? t("device.systemAudio.checkFailed")
+                  : audioUnsupported
+                    ? t("device.systemAudio.unsupported")
+                    : audioNeedsInstall
+                      ? t("device.systemAudio.needsInstall")
+                      : audioActiveLegacy
+                        ? t("device.systemAudio.active")
+                        : t("device.systemAudio.tip")
               }
             >
               <Label>{t("device.systemAudio.label")}</Label>
@@ -398,11 +427,28 @@ export function DeviceDetails({ device }: { device: Device }) {
               <Switch
                 checked={volumeKeyProxy}
                 onCheckedChange={async (checked) => {
-                  setVolumeKeyProxy(checked);
-                  await commands.setLegacyVolumeKeyProxy(checked);
-                  await updateConfig({ legacyVolumeKeyProxy: checked });
+                  const previous = volumeKeyProxy;
+                  setProxyBusy(true);
+                  try {
+                    await commands.setLegacyVolumeKeyProxy(checked);
+                    await updateConfig({ legacyVolumeKeyProxy: checked });
+                  } catch (e) {
+                    console.error("failed to update the volume key proxy", e);
+                    await commands
+                      .setLegacyVolumeKeyProxy(previous)
+                      .catch((err) => console.error("failed to revert the volume key proxy", err));
+                    await updateConfig({ legacyVolumeKeyProxy: previous })
+                      .catch((err) => console.error("failed to revert the stored volume key proxy", err));
+                    toast({
+                      variant: "destructive",
+                      title: t("toasts.volumeKeyProxy.failureTitle"),
+                      description: t("toasts.volumeKeyProxy.failureDescription"),
+                    });
+                  } finally {
+                    setProxyBusy(false);
+                  }
                 }}
-                disabled={inProgress}
+                disabled={inProgress || proxyBusy}
               />
             </div>
           )}
@@ -617,15 +663,25 @@ export function DeviceDetails({ device }: { device: Device }) {
             <DeleteDevice
               onClick={async () => {
                 setInProgress(true);
-                await commands.removeDeviceOverride(device.ip);
-                await removeSavedDevice(device.ip);
-                await events.deviceRemove.emit(device);
-                setInProgress(false);
-                toast({
-                  title: t("toasts.device.removedTitle"),
-                  description: t("toasts.device.removedDescription"),
-                });
-                setOpen(false);
+                try {
+                  await commands.removeDeviceOverride(device.ip);
+                  await removeSavedDevice(device.ip);
+                  await events.deviceRemove.emit(device);
+                  toast({
+                    title: t("toasts.device.removedTitle"),
+                    description: t("toasts.device.removedDescription"),
+                  });
+                  setOpen(false);
+                } catch (e) {
+                  console.error("failed to remove device", e);
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.device.removeFailedTitle"),
+                    description: t("toasts.device.removeFailedDescription"),
+                  });
+                } finally {
+                  setInProgress(false);
+                }
               }}
               disabled={inProgress}
             />
@@ -665,8 +721,16 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel onClick={async () => {
-                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editDevice: dontShowAgain}});
-                setWarningDialogOpen(false);
+                try {
+                  const current = await getConfig();
+                  if (current) {
+                    await updateConfig({dontShowAgain: {...current.dontShowAgain, editDevice: dontShowAgain}});
+                  }
+                } catch (e) {
+                  console.error("failed to save the dontShowAgain preference", e);
+                } finally {
+                  setWarningDialogOpen(false);
+                }
               }}
             >
               {t("common.cancel")}
@@ -674,10 +738,18 @@ export function DeviceDetails({ device }: { device: Device }) {
             <AlertDialogAction
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={async () => {
-                await updateConfig({dontShowAgain: {...(await getConfig())!.dontShowAgain, editDevice: dontShowAgain}});
-                setWarningDialogOpen(false);
-                setOpen(false);
-                deviceDetails.resetForm({ values: device });
+                try {
+                  const current = await getConfig();
+                  if (current) {
+                    await updateConfig({dontShowAgain: {...current.dontShowAgain, editDevice: dontShowAgain}});
+                  }
+                } catch (e) {
+                  console.error("failed to save the dontShowAgain preference", e);
+                } finally {
+                  setWarningDialogOpen(false);
+                  setOpen(false);
+                  deviceDetails.resetForm({ values: device });
+                }
               }}
             >
               {t("common.continue")}

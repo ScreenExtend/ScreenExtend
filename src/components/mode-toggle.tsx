@@ -7,10 +7,18 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-import { useTheme } from "@/components/theme-provider";
+import { useTheme, type Theme } from "@/components/theme-provider";
 
 export function ModeToggle() {
   const { setTheme } = useTheme();
+
+  const applyTheme = async (theme: Theme) => {
+    try {
+      await setTheme(theme);
+    } catch (e) {
+      console.error("failed to save theme preference", e);
+    }
+  };
 
   return (
     <DropdownMenu>
@@ -22,13 +30,13 @@ export function ModeToggle() {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        <DropdownMenuItem onClick={async () => setTheme("light")}>
+        <DropdownMenuItem onClick={() => void applyTheme("light")}>
           Light
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={async () => setTheme("dark")}>
+        <DropdownMenuItem onClick={() => void applyTheme("dark")}>
           Dark
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={async () => setTheme("system")}>
+        <DropdownMenuItem onClick={() => void applyTheme("system")}>
           System
         </DropdownMenuItem>
       </DropdownMenuContent>
