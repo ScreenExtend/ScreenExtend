@@ -1,5 +1,6 @@
-import React, { useState, useContext, useEffect, useRef } from "react";
+import React, { useState, useContext, useEffect, useRef, useCallback, lazy, Suspense } from "react";
 import QRCode from "react-qr-code";
+import { useBlocker } from "react-router-dom";
 
 import Layout from "@/layout/layout";
 import { Switch } from "@/components/ui/switch";
@@ -41,15 +42,19 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type KnownDevice } from "@/components/config-provider";
+import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type Config, type KnownDevice } from "@/components/config-provider";
 import { GlobalProviderContext } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
+const ConfigJsonEditor = lazy(() =>
+  import("@/components/config-json-editor").then(m => ({ default: m.ConfigJsonEditor }))
+);
+import { useTheme, type Theme } from "@/components/theme-provider";
 import { useToast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
-import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
+import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, clampZoom, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
 import { type as getOsType } from "@tauri-apps/plugin-os";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 
@@ -82,6 +87,7 @@ export default function Settings() {
   const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom], windowDevices: [connectedDevices] } = useContext(GlobalProviderContext);
   const { toast } = useToast();
   const { t } = useTranslation();
+  const { setTheme } = useTheme();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [cropSrc, setCropSrc] = useState<string | null>(null);
@@ -117,6 +123,64 @@ export default function Settings() {
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [knownDevices, setKnownDevices] = useState<KnownDevice[]>([]);
   const [banIpInput, setBanIpInput] = useState("");
+  const [configDirty, setConfigDirty] = useState(false);
+  const [configUnsavedOpen, setConfigUnsavedOpen] = useState(false);
+  const [configDontShowAgain, setConfigDontShowAgain] = useState(true);
+  const configProceeding = useRef(false);
+
+  const blocker = useBlocker(
+    ({ currentLocation, nextLocation }) =>
+      configDirty && currentLocation.pathname !== nextLocation.pathname
+  );
+
+  useEffect(() => {
+    if (blocker.state !== "blocked") {
+      setConfigUnsavedOpen(false);
+      return;
+    }
+    void (async () => {
+      if ((await getConfig())?.dontShowAgain?.configEditor) {
+        blocker.proceed?.();
+      } else {
+        setConfigUnsavedOpen(true);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocker.state]);
+
+  const rememberConfigDialogChoice = async () => {
+    await updateConfig({
+      dontShowAgain: { ...(await getConfig())!.dontShowAgain, configEditor: configDontShowAgain },
+    });
+    await flushConfig();
+  };
+
+  const handleConfigSaved = useCallback(async (config: Config) => {
+    setAccountName(config.name);
+    setHostedNetworkName(config.hostedNetworkCredentials.name);
+    setHostedNetworkPassword(config.hostedNetworkCredentials.password);
+    setOldHostedNetworkName(config.hostedNetworkCredentials.name);
+    setOldHostedNetworkPassword(config.hostedNetworkCredentials.password);
+    setTurnUrls(config.turnConfig.urls);
+    setTurnUsername(config.turnConfig.username);
+    setTurnCredential(config.turnConfig.credential);
+    setHttpPort(String(config.serverPorts.http));
+    setHttpsPort(String(config.serverPorts.https));
+    setOldHttpPort(String(config.serverPorts.http));
+    setOldHttpsPort(String(config.serverPorts.https));
+    setDisableGpuEncode(config.disableGpuEncode);
+    setZoom(clampZoom(config.zoomFactor));
+    setPublicSessionsEnabled(config.publicSessionsEnabled);
+    await setTheme(config.theme as Theme);
+    if (config.publicSessionsEnabled) {
+      if (sessionId) void commands.registerCloudSession(sessionId);
+    } else {
+      void commands.unregisterCloudSession();
+    }
+    if (sessionId) setQrValues(await buildQrValues(sessionId, config.serverPorts.http));
+    setKnownDevices(await getKnownDevices());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
   const handleNetworkNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     let value = e.target.value;
@@ -921,7 +985,7 @@ export default function Settings() {
             <div>
               <h3 className="text-lg font-semibold">Advanced</h3>
               <p className="text-sm text-muted-foreground mt-1">
-                TURN relay, server ports, and application logs.
+                TURN relay, server ports, the raw configuration file, and application logs.
               </p>
             </div>
             <ChevronDown
@@ -1066,6 +1130,33 @@ export default function Settings() {
                   </Card>
                 </div>
               )}
+              <div className="mb-4">
+                <Card>
+                  <CardHeader>
+                    <div>
+                      <CardTitle>Configuration File</CardTitle>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        Edit config.json directly. Hover a key for its description and allowed values, or press Ctrl+Space for suggestions. Saving validates the whole document and applies it immediately; nothing is written unless it is valid.
+                      </p>
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <Suspense
+                      fallback={
+                        <div className="flex h-[420px] items-center justify-center rounded-md border text-sm text-muted-foreground">
+                          {t("configEditor.loading")}
+                        </div>
+                      }
+                    >
+                      <ConfigJsonEditor
+                        minHostedNetworkPasswordLength={MIN_HOSTED_NETWORK_PASSWORD_LENGTH}
+                        onDirtyChange={setConfigDirty}
+                        onSaved={handleConfigSaved}
+                      />
+                    </Suspense>
+                  </CardContent>
+                </Card>
+              </div>
               <div>
                 <Card>
                   <CardHeader>
@@ -1216,6 +1307,56 @@ export default function Settings() {
           <AlertDialogFooter>
             <AlertDialogAction className="w-full hover:opacity-75" onClick={() => setWifiQrModalOpen(false)}>
               {t("common.done")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog
+        open={configUnsavedOpen}
+        onOpenChange={open => {
+          if (open) return;
+          setConfigUnsavedOpen(false);
+          if (configProceeding.current) {
+            configProceeding.current = false;
+            return;
+          }
+          blocker.reset?.();
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("dialogs.configEditorUnsaved.title")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("dialogs.configEditorUnsaved.description")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="flex items-center space-x-2 mb-4">
+            <Checkbox
+              id="configDontShowAgain"
+              checked={configDontShowAgain}
+              onCheckedChange={checked => setConfigDontShowAgain(checked === true)}
+            />
+            <label
+              htmlFor="configDontShowAgain"
+              className="text-sm text-muted-foreground cursor-pointer"
+            >
+              {t("common.dontShowAgain")}
+            </label>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => void rememberConfigDialogChoice()}>
+              {t("common.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-red-600 hover:bg-red-700 text-white"
+              onClick={async () => {
+                configProceeding.current = true;
+                setConfigDirty(false);
+                blocker.proceed?.();
+                await rememberConfigDialogChoice();
+              }}
+            >
+              {t("common.continue")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
