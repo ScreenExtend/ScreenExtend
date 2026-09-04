@@ -113,6 +113,15 @@
       "unbannedDescription": "{ip} can join again.",
       "invalidTitle": "Invalid IP Address",
       "invalidDescription": "Enter a valid IPv4 or IPv6 address to ban."
+    },
+    "configEditor": {
+      "savedTitle": "Configuration saved",
+      "savedDescription": "The new configuration was applied.",
+      "parseFailedTitle": "Invalid JSON",
+      "parseFailedAt": "Line {line}, column {column}: {message}",
+      "invalidTitle": "Configuration rejected",
+      "invalidDescription": "{count} problems found. First: {first}",
+      "applyFailedTitle": "Could not apply configuration"
     }
   },
   "device": {
@@ -195,6 +204,10 @@
       "zoom": "Zoom",
       "save": "Save Photo",
       "saving": "Saving…"
+    },
+    "configEditorUnsaved": {
+      "title": "Unsaved configuration",
+      "description": "You have unsaved changes in the config editor. Clicking continue will discard your edits."
     }
   },
   "bootstrap": {
@@ -231,6 +244,25 @@
       "apiRequires": "(requires {version})",
       "upgradeBefore": "Please upgrade your operating system or contact support at ",
       "upgradeSuffix": "."
+    }
+  },
+  "configEditor": {
+    "loading": "Loading editor…",
+    "problems": "Problems",
+    "unsavedBadge": "unsaved changes",
+    "actions": {
+      "format": "Format (Ctrl+Shift+F)",
+      "minify": "Minify",
+      "copy": "Copy",
+      "copied": "Copied",
+      "revert": "Revert to saved",
+      "save": "Save Config"
+    },
+    "status": {
+      "valid": "Valid",
+      "errors": "{count} error(s)",
+      "warnings": "{count} warning(s)",
+      "schema": "Schema applied"
     }
   }
 }

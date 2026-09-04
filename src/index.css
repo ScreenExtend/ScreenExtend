@@ -50,6 +50,9 @@
 
   * {
     @apply border-border;
+  }
+
+  html, body, input, textarea, button, select, optgroup, pre, code, kbd, samp {
     font-family: "Geist Variable", serif;
   }
 
@@ -108,6 +111,22 @@
 
   #mainQRCodeOuter::-webkit-scrollbar {
     display: none;
+  }
+
+  .monaco-editor textarea, .monaco-editor input {
+    transition: none !important;
+  }
+
+  .monaco-editor .se-masked-value {
+    -webkit-text-security: disc;
+  }
+
+  .monaco-editor .inline-folded::after {
+    content: none !important;
+  }
+
+  .monaco-editor .se-fold-tail {
+    color: hsl(var(--muted-foreground));
   }
 }
 
