@@ -46,7 +46,7 @@
     "monaco-editor": "^0.52.2",
     "motion": "^13.1.0",
     "nextstepjs": "^2.3.0",
-    "non.geist": "^1.0.4",
+    "non.geist": "^2.2.0",
     "react": "^18.0.0",
     "react-avatar": "^5.0.3",
     "react-dom": "^18.0.0",
