@@ -6,6 +6,9 @@
     const MIN_TARGET_MS = 10;
     const MAX_TARGET_MS = 400;
     const P_MS = 0x100000000 / 90;
+    const HDR_BYTES = 13;
+    const CTRL_BYTES = 64;
+    const CAP_FRAMES = 65536;
 
     function detectCapabilities() {
         const AC = window.AudioContext || window.webkitAudioContext;
@@ -14,21 +17,27 @@
             typeof window.AudioDecoder === 'function' &&
             typeof window.EncodedAudioChunk === 'function' &&
             typeof window.AudioData === 'function';
-        const sab = self.crossOriginIsolated === true && typeof SharedArrayBuffer !== 'undefined';
-        return { webcodecsOpus, worklet, sab };
+        return { webcodecsOpus, worklet };
+    }
+
+    function sharedMemoryOk() {
+        return self.crossOriginIsolated === true &&
+            typeof SharedArrayBuffer === 'function' &&
+            typeof Atomics === 'object';
     }
 
     const state = {
         ctx: null,
         node: null,
         gain: null,
-        decoder: null,
+        worker: null,
+        sab: null,
         dc: null,
         audioEl: null,
         path: null, // 'webcodecs' | 'netEQ' | null
         muted: false,
         prepared: false,
-        firstChunk: false,
+        stats: null,
         // A/V sync running state
         videoDelayMs: null,     // from the video worker (EMA of display lag)
         preEnqueueEmaMs: null,  // audio capture→enqueue latency, smoothed
@@ -461,11 +470,16 @@
         try {
             state.ctx = new AC({ latencyHint: 'interactive', sampleRate: SR });
             await state.ctx.audioWorklet.addModule('/audio-worklet.js');
+            state.sab = makeSharedRing();
             state.node = new AudioWorkletNode(state.ctx, 'audio-jitter', {
                 numberOfInputs: 0,
                 numberOfOutputs: 1,
                 outputChannelCount: [CH],
+                processorOptions: { capacityFrames: CAP_FRAMES, sab: state.sab },
             });
+            state.node.port.onmessage = (e) => {
+                if (e.data && e.data.type === 'stats') state.stats = e.data;
+            };
             state.gain = state.ctx.createGain();
             state.gain.gain.value = state.muted ? 0 : 1;
             state.node.connect(state.gain).connect(state.ctx.destination);
@@ -483,42 +497,44 @@
         }
     }
 
-    function makeDecoder() {
-        state.decoder = new AudioDecoder({
-            output: onDecoded,
-            error: (e) => console.warn('[audio] decoder error:', e),
-        });
-        state.decoder.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: CH });
+    function makeSharedRing() {
+        if (!sharedMemoryOk()) return null;
+        try {
+            return new SharedArrayBuffer(CTRL_BYTES + CAP_FRAMES * 4 * 2);
+        } catch (_) {
+            return null;
+        }
     }
 
-    function onDecoded(audioData) {
-        const frames = audioData.numberOfFrames;
-        const chs = audioData.numberOfChannels;
-        const captureHostMs = audioData.timestamp / 1000;
-        const inter = new Float32Array(frames * CH);
-        const tmp = new Float32Array(frames);
+    function startWorker() {
+        if (state.worker) return true;
+        let w;
         try {
-            audioData.copyTo(tmp, { planeIndex: 0, format: 'f32-planar' });
-            for (let i = 0; i < frames; i++) inter[i * CH] = tmp[i];
-            if (chs >= 2) {
-                audioData.copyTo(tmp, { planeIndex: 1, format: 'f32-planar' });
-                for (let i = 0; i < frames; i++) inter[i * CH + 1] = tmp[i];
-            } else {
-                for (let i = 0; i < frames; i++) inter[i * CH + 1] = inter[i * CH];
-            }
+            w = new Worker('/audio-worker.js');
         } catch (e) {
-            audioData.close();
-            return;
+            console.warn('[audio] decoder worker unavailable:', e);
+            return false;
         }
-        audioData.close();
+        w.onmessage = (ev) => {
+            const d = ev.data;
+            if (!d) return;
+            if (d.type === 'sync') {
+                state.preEnqueueEmaMs = d.preEnqueueMs;
+                maybeUpdateTarget();
+            } else if (d.type === 'samples') {
+                if (state.node) state.node.port.postMessage(d, [d.l.buffer, d.r.buffer]);
+            }
+        };
+        w.onerror = (e) => console.warn('[audio] decoder worker error:', e);
+        w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
+        state.worker = w;
+        return true;
+    }
 
-        const enqueueAbsMs = performance.timeOrigin + performance.now();
-        const preEnq = enqueueAbsMs - captureHostMs;
-        state.preEnqueueEmaMs = (state.preEnqueueEmaMs === null)
-            ? preEnq : state.preEnqueueEmaMs * 0.9 + preEnq * 0.1;
-        maybeUpdateTarget();
-
-        if (state.node) state.node.port.postMessage({ type: 'samples', data: inter }, [inter.buffer]);
+    function stopWorker() {
+        if (!state.worker) return;
+        try { state.worker.terminate(); } catch (_) {}
+        state.worker = null;
     }
 
     async function attachDataChannel(dc) {
@@ -526,38 +542,18 @@
             console.warn('[audio] cannot prepare WebCodecs path');
             return;
         }
-        makeDecoder();
+        if (!startWorker()) return;
         state.dc = dc;
-        state.lastSeq = null;
         dc.binaryType = 'arraybuffer';
         dc.onmessage = (ev) => {
             const buf = ev.data;
-            if (!(buf instanceof ArrayBuffer) || buf.byteLength < 13) return;
-            const dv = new DataView(buf);
-            const seq = dv.getUint32(0, true);
-            const captureNs = dv.getBigUint64(4, true);
-            if (state.lastSeq !== null) {
-                if (seq === state.lastSeq) return; // duplicate
-                if (((seq - state.lastSeq) >>> 0) >= 0x80000000) return; // older --> late
-            }
-            state.lastSeq = seq;
-            const opus = new Uint8Array(buf, 13);
-            if (opus.byteLength === 0) return;
-            try {
-                const chunk = new EncodedAudioChunk({
-                    type: 'key',
-                    timestamp: Number(captureNs / 1000n), // mew-s
-                    data: opus,
-                });
-                if (state.decoder && state.decoder.state === 'configured') state.decoder.decode(chunk);
-            } catch (e) {
-                console.warn('[audio] decode failed:', e);
-            }
+            if (!(buf instanceof ArrayBuffer) || buf.byteLength < HDR_BYTES) return;
+            state.worker.postMessage(buf, [buf]);
         };
         state.path = 'webcodecs';
-        state.firstChunk = true;
         setMuted(false); // default unmuted when the host has enabled audio
-        console.log('[audio] fast path active: Opus over DataChannel → WebCodecs');
+        console.log('[audio] fast path active: Opus over DataChannel → worker → ' +
+            (state.sab ? 'shared-memory ring' : 'postMessage ring'));
     }
 
     function attachFallbackStream(stream) {
@@ -584,8 +580,7 @@
     }
 
     function teardown() {
-        try { if (state.decoder && state.decoder.state !== 'closed') state.decoder.close(); } catch (_) {}
-        state.decoder = null;
+        stopWorker();
         if (state.dc) { try { state.dc.onmessage = null; } catch (_) {} state.dc = null; }
         if (state.audioEl) { try { state.audioEl.srcObject = null; } catch (_) {} }
         if (state.node) { try { state.node.port.postMessage({ type: 'reset' }); } catch (_) {} }
@@ -593,15 +588,22 @@
         state.preEnqueueEmaMs = null;
         state.lastTargetMs = null;
         state.residualOffsetMs = 0;
+        state.stats = null;
     }
 
     function getSyncInfo() {
+        const st = state.stats;
         return {
             path: state.path,
+            transport: state.sab ? 'shared' : 'postMessage',
             videoDelayMs: state.videoDelayMs,
             preEnqueueMs: state.preEnqueueEmaMs,
             targetMs: state.lastTargetMs,
             residualOffsetMs: state.residualOffsetMs,
+            depthMs: st ? st.depthMs : null,
+            underruns: st ? st.underruns : null,
+            overruns: st ? st.overruns : null,
+            corrections: st ? st.corrections : null,
         };
     }
 

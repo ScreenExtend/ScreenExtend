@@ -164,7 +164,7 @@
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
             const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
-            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false, sab: false };
+            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
             const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
