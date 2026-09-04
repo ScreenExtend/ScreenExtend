@@ -4,9 +4,29 @@ use crate::driver_ipc::{sync::DriverClient, Mode, Monitor};
 
 use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
 
+const COMMON_REFRESH_RATES: [u32; 2] = [60, 120];
+
+#[derive(Debug)]
+struct Inner {
+    client: DriverClient,
+    owned: Vec<Monitor>,
+}
+
+impl Inner {
+    fn commit(&mut self, monitors: Vec<Monitor>) -> Result<(), String> {
+        self.client
+            .set_monitors(&monitors)
+            .map_err(|e| format!("set monitors: {e}"))?;
+        self.owned = monitors;
+        self.client
+            .notify()
+            .map_err(|e| format!("notify driver: {e}"))
+    }
+}
+
 #[derive(Debug)]
 pub struct WindowsVirtualDisplay {
-    client: Mutex<DriverClient>,
+    inner: Mutex<Inner>,
 }
 
 impl WindowsVirtualDisplay {
@@ -15,7 +35,10 @@ impl WindowsVirtualDisplay {
         client.remove_all();
         let _ = client.notify();
         Some(Arc::new(Self {
-            client: Mutex::new(client),
+            inner: Mutex::new(Inner {
+                client,
+                owned: Vec::new(),
+            }),
         }))
     }
 }
@@ -39,10 +62,10 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         refresh_rate: u32,
         extra_modes: &[(u32, u32)],
     ) -> Result<u32, String> {
-        let mut client = self.client.lock().unwrap();
-        client.refresh_state();
-        let id = client
-            .new_id(None)
+        let mut inner = self.inner.lock().unwrap();
+        let mut monitors = inner.owned.clone();
+        let id = (0u32..)
+            .find(|candidate| !monitors.iter().any(|m| m.id == *candidate))
             .ok_or_else(|| "no free display id".to_string())?;
 
         let mut dims: Vec<(u32, u32)> = Vec::new();
@@ -60,41 +83,56 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
                 dims.push((h, w));
             }
         }
+
+        let mut refresh_rates = vec![refresh_rate];
+        for rate in COMMON_REFRESH_RATES {
+            if !refresh_rates.contains(&rate) {
+                refresh_rates.push(rate);
+            }
+        }
+
         let modes: Vec<Mode> = dims
             .into_iter()
             .map(|(w, h)| Mode {
                 width: w,
                 height: h,
-                refresh_rates: vec![refresh_rate],
+                refresh_rates: refresh_rates.clone(),
             })
             .collect();
 
-        let monitor = Monitor {
+        let name = if monitors
+            .iter()
+            .any(|m| m.name.as_deref() == Some(name.as_str()))
+        {
+            format!("{name} ({id})")
+        } else {
+            name
+        };
+
+        monitors.push(Monitor {
             id,
             enabled: true,
             name: Some(name),
             modes,
-        };
-        client
-            .add(monitor)
-            .map_err(|e| format!("add monitor: {e}"))?;
-        client.notify().map_err(|e| format!("notify driver: {e}"))?;
+        });
+        inner.commit(monitors)?;
         Ok(id)
     }
 
     fn remove_display(&self, id: u32) {
-        let mut client = self.client.lock().unwrap();
-        client.refresh_state();
-        client.remove(&[id]);
-        if let Err(e) = client.notify() {
-            teprintln!("virtual_display: notify after remove({id}) failed: {e:?}");
+        let mut inner = self.inner.lock().unwrap();
+        let mut monitors = inner.owned.clone();
+        monitors.retain(|m| m.id != id);
+        if let Err(e) = inner.commit(monitors) {
+            teprintln!("virtual_display: remove({id}) failed: {e}");
         }
     }
 
     fn remove_all_displays(&self) {
-        let mut client = self.client.lock().unwrap();
-        client.remove_all();
-        if let Err(e) = client.notify() {
+        let mut inner = self.inner.lock().unwrap();
+        inner.client.remove_all();
+        inner.owned.clear();
+        if let Err(e) = inner.client.notify() {
             teprintln!("virtual_display: notify after remove_all failed: {e:?}");
         }
     }

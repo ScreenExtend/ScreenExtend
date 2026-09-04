@@ -201,7 +201,7 @@ pub fn set_display_mode(
     devmode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
+    let last = loop {
         let result = unsafe {
             ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None)
         };
@@ -209,10 +209,24 @@ pub fn set_display_mode(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            bail!("ChangeDisplaySettingsExW({device_name}, {pels_w}x{pels_h}@{refresh}, portrait={portrait}) -> {result:?}");
+            break result;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    devmode.dmFields &= !DM_DISPLAYFREQUENCY;
+    devmode.dmDisplayFrequency = 0;
+    let result =
+        unsafe { ChangeDisplaySettingsExW(name, Some(&devmode), None, CDS_UPDATEREGISTRY, None) };
+    if result == DISP_CHANGE_SUCCESSFUL {
+        teprintln!(
+            "[display] {device_name} rejected {pels_w}x{pels_h}@{refresh} ({last:?}); \
+             applied {pels_w}x{pels_h} at its current refresh rate instead"
+        );
+        return Ok(());
     }
+
+    bail!("ChangeDisplaySettingsExW({device_name}, {pels_w}x{pels_h}@{refresh}, portrait={portrait}) -> {last:?}");
 }
 
 pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> {
@@ -280,7 +294,8 @@ struct DisplayConfigSetDpi {
 const DISPLAYCONFIG_DEVICE_INFO_GET_DPI: i32 = -3;
 const DISPLAYCONFIG_DEVICE_INFO_SET_DPI: i32 = -4;
 
-const DPI_PERCENT_VALUES: [u32; 12] = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+pub const DPI_PERCENT_VALUES: [u32; 12] =
+    [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
 fn source_path_for_device(device_name: &str) -> Result<(windows::Win32::Foundation::LUID, u32)> {
     use windows::Win32::Devices::Display::{

@@ -96,7 +96,7 @@ impl CloudStatusSink for TauriCloudStatusSink {
     }
 }
 
-pub fn set_display_topology_extend() {
+pub fn set_display_topology_extend() -> bool {
     use windows::Win32::Devices::Display::{
         GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_MODE_INFO,
         DISPLAYCONFIG_PATH_INFO, QDC_ALL_PATHS, SDC_APPLY, SDC_TOPOLOGY_EXTEND,
@@ -125,7 +125,7 @@ pub fn set_display_topology_extend() {
         unsafe { GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut path_count, &mut mode_count) }.ok()
     {
         teprintln!("[display] extend: GetDisplayConfigBufferSizes failed ({e})");
-        return;
+        return false;
     }
 
     let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
@@ -143,7 +143,7 @@ pub fn set_display_topology_extend() {
     .ok()
     {
         teprintln!("[display] extend: QueryDisplayConfig failed ({e})");
-        return;
+        return false;
     }
     paths.truncate(path_count as usize);
 
@@ -170,7 +170,7 @@ pub fn set_display_topology_extend() {
             active_targets.len(),
             active_sources.len()
         );
-        return;
+        return false;
     }
 
     let reason = if is_cloned {
@@ -192,11 +192,10 @@ pub fn set_display_topology_extend() {
     };
     if result == 0 {
         tprintln!("[display] extend topology applied");
-    } else {
-        teprintln!(
-            "[display] failed to apply extend topology (SetDisplayConfig win32 error {result})"
-        );
+        return true;
     }
+    teprintln!("[display] failed to apply extend topology (SetDisplayConfig win32 error {result})");
+    false
 }
 
 pub fn focus_main_window(window: &tauri::WebviewWindow) {
@@ -340,6 +339,18 @@ pub fn set_device_override(
     if restart_needed {
         session::bump_reconfig_epoch(&state.sessions, &ip);
     }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn refresh_device_stream(state: State<'_, AppState>, ip: String) -> bool {
+    if session::get_live_display(&state.sessions, &ip).is_none() {
+        tprintln!("stream refresh skipped: {ip} has no live display attached");
+        return false;
+    }
+    session::bump_reconfig_epoch(&state.sessions, &ip);
+    tprintln!("stream refresh requested for {ip}; client will renegotiate on its next poll");
+    true
 }
 
 #[tauri::command]

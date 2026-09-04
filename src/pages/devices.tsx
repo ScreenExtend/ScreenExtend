@@ -4,7 +4,7 @@ import { Link } from "react-router-dom";
 import Layout from "@/layout/layout";
 import { DeviceDetails } from "@/components/pages/device-details";
 import { buttonVariants, Button } from "@/components/ui/button";
-import { Plus, Info, ExternalLink } from "lucide-react";
+import { Plus, Info, ExternalLink, RefreshCw } from "lucide-react";
 import {
   Tooltip,
   TooltipContent,
@@ -25,7 +25,64 @@ import { useTranslation } from "@/i18n";
 import { Command } from "@tauri-apps/plugin-shell";
 import { type } from "@tauri-apps/plugin-os";
 import { GlobalProviderContext } from "@/components/global-provider";
+import { type Device } from "@/components/config-provider";
+import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
+
+function RefreshStream({ device }: { device: Device }) {
+  const [busy, setBusy] = useState(false);
+  const { toast } = useToast();
+  const { t } = useTranslation();
+  const name = device.name || device.ip;
+
+  const refresh = async () => {
+    setBusy(true);
+    try {
+      const restarted = await commands.refreshDeviceStream(device.ip);
+      toast(
+        restarted
+          ? {
+            title: t("toasts.device.refreshedTitle"),
+            description: t("toasts.device.refreshedDescription", { name }),
+          }
+          : {
+            title: t("toasts.device.refreshOfflineTitle"),
+            description: t("toasts.device.refreshOfflineDescription", { name }),
+          }
+      );
+    } catch (e) {
+      console.error("failed to refresh the device stream", e);
+      toast({
+        variant: "destructive",
+        title: t("toasts.device.refreshFailedTitle"),
+        description: t("toasts.device.refreshFailedDescription"),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="outline"
+            size="icon"
+            aria-label={t("device.refreshStream.label")}
+            disabled={busy}
+            onClick={refresh}
+          />
+        }
+      >
+        <RefreshCw size={16} className={cn(busy && "animate-spin")} />
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[220px]">
+        {t("device.refreshStream.tip")}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
@@ -86,6 +143,7 @@ export default function Devices() {
           <p className="text-gray-500">{ devices.length } Device{ devices.length !== 1 && "s" } Connected</p>
         </div>
         <div>
+          <TooltipProvider delay={150}>
           <Table>
             <TableHeader>
               <TableRow>
@@ -110,12 +168,16 @@ export default function Devices() {
                   <TableCell>{device.refreshRate} Hz</TableCell>
                   <TableCell>{device.screenSize}</TableCell>
                   <TableCell className="text-center">
-                    <DeviceDetails device={device} />
+                    <div className="flex items-center justify-center space-x-2">
+                      <RefreshStream device={device} />
+                      <DeviceDetails device={device} />
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
             </TableBody>
           </Table>
+          </TooltipProvider>
           {!devices.length && (
             <div className="w-full flex items-center justify-center py-4">
               <Link

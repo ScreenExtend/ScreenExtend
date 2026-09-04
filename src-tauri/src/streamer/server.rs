@@ -90,6 +90,7 @@ where
 }
 
 const DISPLAY_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TOPOLOGY_NUDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(600);
 const LEAVE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
 static DISPLAY_CORRELATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -589,7 +590,7 @@ async fn whep(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "text/plain")],
-            "This Mac can only drive one extended display at a time. Disconnect the device that is using it, or upgrade to macOS 10.15 or later.",
+            "This Mac creates its extended display over AirPlay and can only drive one at a time. The device already connected keeps it — disconnect that device to free the slot, or use macOS 10.15 or later, where every device gets its own display.",
         )
             .into_response();
     }
@@ -821,10 +822,7 @@ async fn start_session(
     }
 
     let native_dpr = if req.dpr.is_finite() { req.dpr } else { 1.0 };
-    let dpr = override_for_ip
-        .map(|o| o.dpr)
-        .unwrap_or(native_dpr)
-        .clamp(1.0, platform::max_display_dpr());
+    let dpr = platform::snap_display_dpr(override_for_ip.map(|o| o.dpr).unwrap_or(native_dpr));
     let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
     let width = backing(req.width);
     let height = backing(req.height);
@@ -881,7 +879,8 @@ async fn start_session(
         portrait,
     };
 
-    let (display_id, device_name) = match existing {
+    let mut mode_applied = true;
+    let (display_id, device_name) = match existing.clone() {
         Some(prev) => {
             let display_changed = prev.display_params() != desired.display_params();
             if display_changed {
@@ -891,13 +890,21 @@ async fn start_session(
                     pipeline::set_display_mode(&name2, width, height, refresh, swap_axes)
                 })
                 .await;
-                if let Ok(Err(e)) = res {
-                    teprintln!("could not apply display mode to {name}: {e}");
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        mode_applied = false;
+                        teprintln!("could not apply display mode to {name}: {e}");
+                    }
+                    Err(e) => {
+                        mode_applied = false;
+                        teprintln!("set-mode task for {name} panicked: {e}");
+                    }
                 }
                 wait_for_display_settle(&name).await;
                 apply_display_scale(&name, scale).await;
                 tprintln!(
-                    "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh})",
+                    "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh}, scale={scale}%)",
                     prev.display_id
                 );
             } else {
@@ -909,8 +916,8 @@ async fn start_session(
             (prev.display_id, prev.device_name.clone())
         }
         None => {
-            let extra_modes = dpr_mode_ladder(req.width, req.height, native_dpr);
-            let (display_id, device_name) = {
+            let extra_modes = dpr_mode_ladder(req.width, req.height);
+            let (display_id, device_name, topology_reset) = {
                 let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
 
                 let before = pipeline::monitor_device_names();
@@ -940,21 +947,19 @@ async fn start_session(
                         .flatten()
                 };
 
-                match named {
+                let (attached, topology_reset) = match named {
+                    Some(name) => (Some(name), false),
+                    None => wait_for_new_monitor(&before).await,
+                };
+                match attached {
                     Some(name) => {
                         tprintln!("virtual display id={display_id} attached as {name}");
-                        (display_id, name)
+                        (display_id, name, topology_reset)
                     }
-                    None => match wait_for_new_monitor(&before).await {
-                        Some(name) => {
-                            tprintln!("virtual display id={display_id} attached as {name}");
-                            (display_id, name)
-                        }
-                        None => {
-                            remove_display_async(client, display_id).await;
-                            bail!("virtual display {display_id} did not attach within timeout");
-                        }
-                    },
+                    None => {
+                        remove_display_async(client, display_id).await;
+                        bail!("virtual display {display_id} did not attach within timeout");
+                    }
                 }
             };
 
@@ -968,28 +973,59 @@ async fn start_session(
                     Ok(Ok(())) => tprintln!(
                         "virtual display {device_name} set to {width}x{height}@{refresh} (portrait={portrait})"
                     ),
-                    Ok(Err(e)) => teprintln!("could not force {device_name} to {width}x{height}: {e}"),
-                    Err(e) => teprintln!("set-mode task for {device_name} panicked: {e}"),
+                    Ok(Err(e)) => {
+                        mode_applied = false;
+                        teprintln!("could not force {device_name} to {width}x{height}: {e}");
+                    }
+                    Err(e) => {
+                        mode_applied = false;
+                        teprintln!("set-mode task for {device_name} panicked: {e}");
+                    }
                 }
             }
 
             wait_for_display_settle(&device_name).await;
             apply_display_scale(&device_name, scale).await;
+            if topology_reset {
+                if let Some(sessions) = state.config.sessions.as_ref() {
+                    let others = session::live_displays_except(sessions, client_ip);
+                    if !others.is_empty() {
+                        tokio::spawn(restore_displays(others));
+                    }
+                }
+            }
             (display_id, device_name)
         }
     };
 
     if let Some(s) = state.config.sessions.as_ref() {
         session::set_host_ip(s, client_ip, state.config.lan_ip.clone());
-        session::set_live_display(
-            s,
-            client_ip,
+        let landed = if mode_applied {
             session::LiveDisplay {
                 display_id,
                 device_name: device_name.clone(),
                 ..desired
-            },
-        );
+            }
+        } else {
+            let actual = read_back_dimensions(&device_name, swap_axes)
+                .await
+                .or_else(|| existing.as_ref().map(|p| (p.width, p.height)))
+                .unwrap_or((width, height));
+            teprintln!(
+                "virtual display {device_name} stayed at {}x{} instead of {width}x{height}; \
+                 will retry on the next reconfigure",
+                actual.0,
+                actual.1
+            );
+            session::LiveDisplay {
+                display_id,
+                device_name: device_name.clone(),
+                width: actual.0,
+                height: actual.1,
+                ..desired
+            }
+        };
+        session::set_live_display(s, client_ip, landed);
     }
 
     let session = match pipeline::start_on_monitor(&cfg, &device_name) {
@@ -1138,25 +1174,49 @@ async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }
 
-fn dpr_mode_ladder(css_w: u32, css_h: u32, native_dpr: f64) -> Vec<(u32, u32)> {
-    let cap = platform::max_display_dpr();
+fn dpr_mode_ladder(css_w: u32, css_h: u32) -> Vec<(u32, u32)> {
     let even = |v: f64| (v.round() as u32).clamp(2, 16384) & !1;
-    let mut ratios: Vec<f64> = Vec::new();
-    let mut r = 1.0_f64;
-    while r <= cap + 1e-9 {
-        ratios.push(r);
-        r += 0.5;
-    }
-    if native_dpr.is_finite() {
-        ratios.push(native_dpr.clamp(1.0, cap));
-    }
-    let mut modes: Vec<(u32, u32)> = ratios
-        .iter()
-        .map(|&r| (even(css_w as f64 * r), even(css_h as f64 * r)))
+    let mut modes: Vec<(u32, u32)> = platform::display_dpr_ladder()
+        .into_iter()
+        .map(|r| (even(css_w as f64 * r), even(css_h as f64 * r)))
         .collect();
     modes.sort_unstable();
     modes.dedup();
     modes
+}
+
+async fn read_back_dimensions(device_name: &str, swap_axes: bool) -> Option<(u32, u32)> {
+    let name = device_name.to_string();
+    let (w, h) = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
+        .await
+        .ok()
+        .flatten()?;
+    Some(if swap_axes { (h, w) } else { (w, h) })
+}
+
+async fn restore_displays(displays: Vec<session::LiveDisplay>) {
+    for display in displays {
+        let name = display.device_name.clone();
+        if name.is_empty() {
+            continue;
+        }
+        tprintln!("re-applying {name} after the extend topology was re-applied");
+        let (w, h, hz, swap) = (
+            display.width,
+            display.height,
+            display.refresh,
+            display.swap_axes(),
+        );
+        let name2 = name.clone();
+        let res =
+            tokio::task::spawn_blocking(move || pipeline::set_display_mode(&name2, w, h, hz, swap))
+                .await;
+        if let Ok(Err(e)) = res {
+            teprintln!("could not restore {name} to {w}x{h}: {e}");
+        }
+        wait_for_display_settle(&name).await;
+        apply_display_scale(&name, display.scale).await;
+    }
 }
 
 async fn apply_display_scale(device_name: &str, percent: u32) {
@@ -1193,17 +1253,23 @@ async fn wait_for_display_settle(device_name: &str) {
     }
 }
 
-async fn wait_for_new_monitor(before: &[String]) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + DISPLAY_ATTACH_TIMEOUT;
+async fn wait_for_new_monitor(before: &[String]) -> (Option<String>, bool) {
+    let start = tokio::time::Instant::now();
+    let deadline = start + DISPLAY_ATTACH_TIMEOUT;
+    let mut topology_reset = false;
     loop {
-        let _ = tokio::task::spawn_blocking(pipeline::set_display_topology_extend).await;
-
         let now = pipeline::monitor_device_names();
         if let Some(name) = now.iter().find(|n| !before.contains(n)) {
-            return Some(name.clone());
+            return (Some(name.clone()), topology_reset);
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return (None, topology_reset);
+        }
+        if tokio::time::Instant::now() - start >= TOPOLOGY_NUDGE_AFTER {
+            let applied = tokio::task::spawn_blocking(pipeline::set_display_topology_extend)
+                .await
+                .unwrap_or(false);
+            topology_reset |= applied;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -1391,5 +1457,56 @@ mod tests {
             sanitize_device_name(&long).chars().count(),
             MAX_DEVICE_NAME_CHARS
         );
+    }
+
+    #[test]
+    fn every_reachable_pixel_ratio_has_a_registered_mode() {
+        let (css_w, css_h) = (1280u32, 720u32);
+        let ladder = dpr_mode_ladder(css_w, css_h);
+        let even = |v: f64| (v.round() as u32).clamp(2, 16384) & !1;
+        for raw in [1.0, 1.4, 1.5, 2.0, 2.625, 3.0, 3.5, 4.0, 9.0] {
+            let dpr = platform::snap_display_dpr(raw);
+            let mode = (even(css_w as f64 * dpr), even(css_h as f64 * dpr));
+            assert!(
+                ladder.contains(&mode),
+                "{raw} snapped to {dpr}, whose {mode:?} is not in {ladder:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapped_ratio_can_be_expressed_as_a_display_scale() {
+        let steps = platform::display_scale_steps();
+        if steps.is_empty() {
+            return;
+        }
+        for raw in [1.0, 1.4, 1.5, 2.0, 2.625, 3.0, 4.0] {
+            let dpr = platform::snap_display_dpr(raw);
+            assert!(dpr <= raw + 1e-9, "{raw} snapped up to {dpr}");
+            let scale = (dpr * 100.0).round() as u32;
+            assert!(
+                steps.contains(&scale),
+                "{raw} snapped to {dpr}, needing an unavailable {scale}% scale"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_axes_is_recoverable_from_a_recorded_display() {
+        let upright = session::LiveDisplay {
+            display_id: 1,
+            device_name: "1".into(),
+            width: 1080,
+            height: 1920,
+            refresh: 60,
+            scale: 100,
+            portrait: true,
+        };
+        assert!(!upright.swap_axes());
+        let rotated = session::LiveDisplay {
+            portrait: false,
+            ..upright.clone()
+        };
+        assert!(rotated.swap_axes());
     }
 }

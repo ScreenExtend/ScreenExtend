@@ -53,6 +53,12 @@ pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
 
 #[tauri::command]
 #[specta::specta]
+pub fn refresh_device_stream(_state: tauri::State<'_, AppState>, _ip: String) -> bool {
+    false
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn set_device_audio_output(
     _state: tauri::State<'_, AppState>,
     _ip: String,

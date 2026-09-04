@@ -1120,14 +1120,46 @@
                 if (typeof fetch !== 'function') {
                     unsupported.push({
                         name: 'Fetch API',
-                        description: 'Required to negotiate the connection with the host.',
+                        description: 'Required to negotiate the connection and to pick up display changes made on the host.',
                         severity: 'blocking',
                     });
                 }
                 if (!canWebCodecs) {
                     unsupported.push({
-                        name: 'WebCodecs low-latency playback',
-                        description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode.',
+                        name: 'WebCodecs video',
+                        description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
+                        severity: 'optional',
+                        httpsFixable: true,
+                    });
+                }
+                if (!audioFast) {
+                    unsupported.push({
+                        name: 'WebCodecs audio and AudioWorklet',
+                        description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
+                        severity: 'optional',
+                        httpsFixable: true,
+                    });
+                }
+                const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
+                    typeof RTCPeerConnection.prototype.createDataChannel === 'function';
+                if (!hasDataChannel) {
+                    unsupported.push({
+                        name: 'WebRTC data channels',
+                        description: 'Carry remote control. Without them this device is view-only, and keyboard, mouse and clipboard stay on the host.',
+                        severity: 'optional',
+                    });
+                } else if (!window.PointerEvent) {
+                    unsupported.push({
+                        name: 'Pointer Events',
+                        description: 'Send your touches and mouse moves to the host. Without them the screen is view-only for touch; a physical keyboard and the clipboard still work.',
+                        severity: 'optional',
+                    });
+                }
+                if (!(stage.requestFullscreen || stage.webkitRequestFullscreen ||
+                    stage.mozRequestFullScreen || stage.msRequestFullscreen)) {
+                    unsupported.push({
+                        name: 'Fullscreen API',
+                        description: 'Without it, fullscreen mode only fills the browser window, so the address bar and tabs stay on screen.',
                         severity: 'optional',
                     });
                 }
@@ -1187,9 +1219,9 @@
                     return;
                 }
 
-                const optional = report.filter((a) => a.severity === 'optional');
-                const deferToHttps = location.protocol === 'http:' && !canWebCodecs;
-                if (optional.length > 0 && !deferToHttps && !compatPrefHidden()) {
+                const onHttp = location.protocol === 'http:';
+                const optional = report.filter((a) => a.severity === 'optional' && !(onHttp && a.httpsFixable));
+                if (optional.length > 0 && !compatPrefHidden()) {
                     renderCompatModal(optional, false);
                     document.getElementById('compatContinue').onclick = () => {
                         setCompatPrefHidden(document.getElementById('compatDontShow').checked);
@@ -1250,8 +1282,13 @@
 
                 try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
 
-                const startAudioAndStream = () => {
-                    try { if (window.SEAudio) { SEAudio._enumPromise = SEAudio.unlockAndEnumerate(); } } catch (_) {}
+                const startAudioAndStream = async () => {
+                    try {
+                        if (window.SEAudio) {
+                            SEAudio._enumPromise = SEAudio.unlockAndEnumerate();
+                            await SEAudio.micReady();
+                        }
+                    } catch (_) {}
                     beginStreaming();
                 };
                 let needMic = false;

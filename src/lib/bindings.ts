@@ -90,6 +90,9 @@ async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
+async refreshDeviceStream(ip: string) : Promise<boolean> {
+    return await TAURI_INVOKE("refresh_device_stream", { ip });
+},
 async setDeviceAudioOutput(ip: string, deviceId: string) : Promise<void> {
     await TAURI_INVOKE("set_device_audio_output", { ip, deviceId });
 },

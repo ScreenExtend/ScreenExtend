@@ -50,6 +50,10 @@ import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 import { useFormik } from "formik";
 
+function formatDpr(dpr: number): string {
+  return dpr.toFixed(2).replace(/\.?0+$/, "");
+}
+
 function TipLabel({
   text,
   children,
@@ -180,7 +184,7 @@ export function DeviceDetails({ device }: { device: Device }) {
     enableReinitialize: !open,
     initialValues: {
       ...device,
-      dpr: device.dpr ?? device.maxDpr ?? 1,
+      dpr: Math.min(device.dpr ?? device.maxDpr ?? 1, device.maxDpr ?? device.dpr ?? 1),
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
       systemAudio: device.systemAudio ?? false,
       audioOutputDeviceId: device.audioOutputDeviceId ?? "",
@@ -517,10 +521,10 @@ export function DeviceDetails({ device }: { device: Device }) {
           </div>
           <div className="mt-4">
             <TipLabel
-              text="Renders this display at the device's pixel density for sharper text and UI. Defaults to the screen's native ratio; lower it toward 1x to save bandwidth and encoding load."
+              text="Renders this display at the device's pixel density for sharper text and UI. Defaults to the screen's native ratio; raise it past that for extra sharpness, or lower it toward 1x to save bandwidth and encoding load."
               className="my-2"
             >
-              <Label>Pixel Ratio - ({deviceDetails.values.dpr.toFixed(1)}×)</Label>
+              <Label>Pixel Ratio - ({formatDpr(deviceDetails.values.dpr)}×)</Label>
             </TipLabel>
             <Slider
               value={[deviceDetails.values.dpr]}
@@ -530,7 +534,7 @@ export function DeviceDetails({ device }: { device: Device }) {
               }}
               min={1}
               max={Math.max(1, deviceDetails.values.maxDpr)}
-              step={0.5}
+              step={0.25}
               disabled={inProgress || deviceDetails.values.maxDpr <= 1}
             />
           </div>

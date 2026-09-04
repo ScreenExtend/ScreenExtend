@@ -152,12 +152,9 @@ impl Device {
                 crate::streamer::server::MAX_REFRESH_RATE,
             )
         };
-        let cap = crate::streamer::platform::max_display_dpr();
-        let native_dpr = if info.dpr.is_finite() && info.dpr >= 1.0 {
-            info.dpr.min(cap)
-        } else {
-            1.0
-        };
+        let native_dpr = crate::streamer::platform::snap_display_dpr(info.dpr);
+        const SLIDER_DPR_CEILING: f64 = 3.0;
+        let max_dpr = crate::streamer::platform::snap_display_dpr(info.dpr.max(SLIDER_DPR_CEILING));
         Self {
             ip: info.ip,
             token: info.token,
@@ -177,7 +174,7 @@ impl Device {
             os: info.os,
             screen_size: info.screen_size,
             dpr: native_dpr,
-            max_dpr: native_dpr,
+            max_dpr,
         }
     }
 }
@@ -337,6 +334,7 @@ pub fn run() {
             audio_driver_status,
             set_legacy_volume_key_proxy,
             set_device_override,
+            refresh_device_stream,
             set_device_audio_output,
             get_device_audio_outputs,
             remove_device_override,
