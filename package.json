@@ -42,7 +42,7 @@
     "embla-carousel-react": "8.5.2",
     "formik": "^2.4.6",
     "input-otp": "^1.4.2",
-    "lucide-react": "^0.475.0",
+    "lucide-react": "^1.38.0",
     "monaco-editor": "^0.52.2",
     "motion": "^13.1.0",
     "nextstepjs": "^2.3.0",
