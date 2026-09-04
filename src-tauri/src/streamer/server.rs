@@ -31,8 +31,6 @@ struct AudioCapabilities {
     #[serde(default, rename = "webcodecsOpus")]
     webcodecs_opus: bool,
     #[serde(default)]
-    sab: bool,
-    #[serde(default)]
     worklet: bool,
 }
 
@@ -348,6 +346,7 @@ fn router(state: AppState) -> Router {
         .route("/input.js", get(input_js))
         .route("/audio.js", get(audio_js))
         .route("/audio-worklet.js", get(audio_worklet_js))
+        .route("/audio-worker.js", get(audio_worker_js))
         .route("/nosleep.js", get(nosleep_js))
         .route("/logo.svg", get(logo))
         .route("/styles.css", get(styles))
@@ -434,6 +433,14 @@ async fn audio_worklet_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript")],
         include_str!("static/audio-worklet.js"),
+    )
+        .into_response()
+}
+
+async fn audio_worker_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript")],
+        include_str!("static/audio-worker.js"),
     )
         .into_response()
 }

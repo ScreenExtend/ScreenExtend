@@ -13,10 +13,10 @@ host creates a real virtual display per client, GPU-encodes it, and streams it o
 Two distinct frontends live in this repo:
 - `src/` — the **desktop control UI** (React, runs in the Tauri webview on the host).
 - `src-tauri/src/streamer/static/` — the **client web page** served to joining devices
-  (`index.html`, `input.js`, `audio.js`, `audio-worklet.js`, `transform-worker.js`,
-  `nosleep.js`, `styles.css`, `logo.svg`). This is plain HTML/JS/CSS served by the Rust HTTP
-  server, `include_str!`'d into the binary, NOT part of the Vite/React build. Edit it
-  directly; there is no bundler step for it and it must stay dependency-free.
+  (`index.html`, `input.js`, `audio.js`, `audio-worker.js`, `audio-worklet.js`,
+  `transform-worker.js`, `nosleep.js`, `styles.css`, `logo.svg`). This is plain HTML/JS/CSS
+  served by the Rust HTTP server, `include_str!`'d into the binary, NOT part of the Vite/React
+  build. Edit it directly; there is no bundler step for it and it must stay dependency-free.
 
 ## Repo map
 
@@ -270,12 +270,12 @@ Cross-platform core, OS-independent:
   `MAX_EFFECTIVE_SCALE` 500, the input caps (`MAX_SDP_LEN` 64 KiB, `MAX_DEVICE_NAME_CHARS` 64, …),
   `DISPLAY_ATTACH_TIMEOUT` 5 s and `LEAVE_SETTLE` 1.5 s. Routes: `/`, `/health`, `/whep`,
   `/leave`, `/reconfig`, `/ice-config`, `/net-config`, `/audio-outputs`, plus the static assets
-  (`/input.js`, `/audio.js`, `/audio-worklet.js`, `/transform-worker.js`, `/nosleep.js`,
-  `/styles.css`, `/logo.svg`). `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__`
+  (`/input.js`, `/audio.js`, `/audio-worker.js`, `/audio-worklet.js`, `/transform-worker.js`,
+  `/nosleep.js`, `/styles.css`, `/logo.svg`). `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__`
   substituted and the cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`)
-  that make `crossOriginIsolated` true on a secure context. The client reports that back as its
-  `sab` capability, but **nothing constructs a SharedArrayBuffer today** — the worklet ring is a
-  plain `postMessage` transfer either way, so the flag is currently inert on both sides.
+  that make `crossOriginIsolated` true on a secure context, which is what lets the audio ring be
+  a real `SharedArrayBuffer` (see `audio-worker.js`). The client does **not** report that back —
+  the transport is its own business; the host only needs `webcodecsOpus && worklet`.
   It also owns the DPR ladder: `dpr_mode_ladder` pre-registers one display mode per ratio in
   `platform::display_dpr_ladder()` (plus each transpose, so an orientation flip is already
   registered), and the effective ratio is snapped down by `platform::snap_display_dpr`.
@@ -470,10 +470,20 @@ SDK, but has never been signed, installed or loaded, so runtime behaviour is unv
   viewport/orientation/DPR reporting, and kick handling.
 - `transform-worker.js` — WebCodecs/insertable-streams video path; recovers each frame's
   host-capture time from its RTP timestamp and reports the display lag.
-- `audio.js` — WebCodecs `AudioDecoder` → ring → worklet, plus the NetEQ track fallback;
-  commands the worklet a buffer depth so audio plays in step with the picture. Measured offset
-  via `SEAudio.getSyncInfo()` (no on-screen HUD).
-- `audio-worklet.js` — our jitter buffer; corrects drift only at silence boundaries.
+- `audio.js` — owns the `AudioContext`, the worklet node and the decoder worker, plus the NetEQ
+  track fallback. On the fast path it does nothing per packet but transfer the DataChannel buffer
+  to the worker. It commands the worklet a buffer depth so audio plays in step with the picture;
+  measured offset via `SEAudio.getSyncInfo()` (no on-screen HUD).
+- `audio-worker.js` — Opus decode off the main thread: header parse, dedup, WebCodecs
+  `AudioDecoder`, deinterleave, ring write. An `RTCDataChannel` cannot be handed to a worker, so
+  the page still receives the packet — but nothing else happens there.
+- `audio-worklet.js` — our jitter buffer; corrects drift only at silence boundaries. The ring is
+  **planar** (separate L/R regions) so both sides are `set()` memcpys, and its byte layout is a
+  hard contract with `audio-worker.js` — change the two together. Cross-origin isolated, it is a
+  `SharedArrayBuffer` the worker writes and the worklet reads with `Atomics`, so a decoded packet
+  reaches the speakers without touching a message queue; otherwise the identical ring is private
+  and the worker's samples arrive by `postMessage` (via the page) as they always did. Positions
+  are absolute uint32 frame counters, which is why the capacity must stay a power of two.
 - `input.js` — pointer/keyboard/clipboard capture and the input wire protocol.
 - `nosleep.js` — keeps the client screen awake.
 
