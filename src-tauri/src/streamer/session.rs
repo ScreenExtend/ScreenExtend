@@ -170,6 +170,10 @@ impl LiveDisplay {
             self.portrait,
         )
     }
+
+    pub fn swap_axes(&self) -> bool {
+        self.portrait != (self.height > self.width)
+    }
 }
 
 pub type CaptureStopper = Box<dyn FnOnce() + Send>;
@@ -581,6 +585,16 @@ pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
         .values()
         .find(|s| s.live_display.is_some())
         .and_then(|s| s.host_ip.clone())
+}
+
+pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisplay> {
+    sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.as_str() != ip)
+        .filter_map(|(_, s)| s.live_display.clone())
+        .collect()
 }
 
 pub fn live_display_count(sessions: &SharedSessions) -> usize {

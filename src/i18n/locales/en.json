@@ -124,7 +124,13 @@
       "removedDescription": "Your device has been successfully removed.",
       "updateFailedTitle": "Couldn't Update Device Settings",
       "removeFailedTitle": "Couldn't Remove Device",
-      "removeFailedDescription": "This device couldn't be removed. It may still be able to join. Please try again."
+      "removeFailedDescription": "This device couldn't be removed. It may still be able to join. Please try again.",
+      "refreshedTitle": "Refreshing Stream",
+      "refreshedDescription": "{name} is reconnecting its video stream. Its extended display stays where it is.",
+      "refreshOfflineTitle": "Nothing to Refresh",
+      "refreshOfflineDescription": "{name} has no live stream right now. It will get a fresh one when it reconnects.",
+      "refreshFailedTitle": "Couldn't Refresh Stream",
+      "refreshFailedDescription": "The stream couldn't be restarted. The current connection is unchanged. Please try again."
     },
     "deviceBan": {
       "bannedTitle": "Device Banned",
@@ -258,6 +264,10 @@
     }
   },
   "device": {
+    "refreshStream": {
+      "label": "Refresh stream",
+      "tip": "Restarts this device's video stream without disturbing its extended display or making it rejoin."
+    },
     "systemAudio": {
       "label": "System Audio",
       "tip": "Streams this computer's audio output to the device.",
@@ -381,9 +391,10 @@
     },
     "permissions": {
       "title": "Permissions Required",
-      "body": "ScreenExtend needs the permissions below before it can create a display and stream to your devices. Grant each one, then choose Re-check.",
+      "body": "ScreenExtend needs the permissions below before it can create a display and stream to your devices. Grant each one and this window continues on its own — no need to come back and press anything.",
       "tipTitle": "After granting a permission",
       "tipBody": "macOS may need ScreenExtend to restart before a newly granted permission takes effect. Use Restart if a permission still shows as missing.",
+      "autoChecking": "Checking for changes…",
       "recheck": "Re-check",
       "relaunch": "Restart"
     }

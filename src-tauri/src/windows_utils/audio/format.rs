@@ -135,7 +135,7 @@ pub fn convert_to_stereo_f32(src: &[u8], frames: usize, fmt: &MixFormat, out: &m
         let n = (frames * 2).min(src.len() / 4);
         out.reserve(n);
         for c in src[..n * 4].chunks_exact(4) {
-            out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]).clamp(-1.0, 1.0));
         }
         return;
     }

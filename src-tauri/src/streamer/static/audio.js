@@ -40,6 +40,7 @@
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
     const SE_EARPIECE = 'se:earpiece';
+    const MIC_PRIME_TIMEOUT_MS = 12000;
 
     const speakers = {
         inited: false,
@@ -62,6 +63,10 @@
         msd: null,
         sinkEl: null,
         micHold: null,
+        micPrime: null,
+        micGranted: false,
+        primedStream: null,
+        wantPrime: null,
         sessionId: '',
         deviceToken: '',
     };
@@ -101,36 +106,64 @@
         }
     }
 
+    function micWanted() {
+        if (speakers.wantPrime !== null) return speakers.wantPrime;
+        return speakers.canSink || (speakers.hasEarpiece && !speakers.hasAudioSession);
+    }
+
+    function primeMicPermission() {
+        initSpeakers();
+        if (speakers.micPrime) return speakers.micPrime;
+        if (!speakers.supported || !micWanted()) {
+            speakers.micPrime = Promise.resolve(null);
+            return speakers.micPrime;
+        }
+        let req;
+        try {
+            req = navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (e) {
+            req = Promise.reject(e);
+        }
+        speakers.micPrime = req.then(
+            (s) => { speakers.micGranted = true; speakers.primedStream = s; return s; },
+            () => { speakers.micGranted = false; return null; }
+        );
+        return speakers.micPrime;
+    }
+
+    function micReady() {
+        const p = primeMicPermission();
+        return Promise.race([
+            p,
+            new Promise((r) => setTimeout(() => r(null), MIC_PRIME_TIMEOUT_MS)),
+        ]).catch(() => null);
+    }
+
+    function releasePrimedStream() {
+        if (!speakers.primedStream) return;
+        try { speakers.primedStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        speakers.primedStream = null;
+    }
+
     async function unlockAndEnumerate() {
         initSpeakers();
         if (!speakers.supported) return { supported: false, outputs: [] };
+        const primed = primeMicPermission();
         try {
-            let granted = false;
-            try {
-                const p = await navigator.permissions.query({ name: 'microphone' });
-                granted = p && p.state === 'granted';
-            } catch (_) {}
+            await primed;
             let enumerated = [];
             if (speakers.canSink) {
                 enumerated = await listOutputs();
-                if (!enumerated.length || !enumerated.some((d) => d.label)) {
-                    let stream = null;
-                    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (_) {}
-                    enumerated = await listOutputs();
-                    if (stream) stream.getTracks().forEach((t) => t.stop());
-                }
                 if (enumerated.some((d) => d.label)) speakers._lastEnum = enumerated;
-            } else if (speakers.hasEarpiece && !speakers.hasAudioSession && !granted) {
-                try {
-                    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    s.getTracks().forEach((t) => t.stop());
-                } catch (_) {}
+                else if (speakers._lastEnum && speakers._lastEnum.length) enumerated = speakers._lastEnum;
             }
+            releasePrimedStream();
             const outputs = buildOutputs(enumerated);
             startDeviceWatch();
             speakers._cache = { supported: speakers.supported, outputs };
             return speakers._cache;
         } catch (_) {
+            releasePrimedStream();
             speakers._cache = { supported: speakers.supported, outputs: buildOutputs([]) };
             return speakers._cache;
         }
@@ -138,13 +171,21 @@
 
     async function needsMicPermission() {
         initSpeakers();
-        const wantMic = speakers.canSink || (speakers.hasEarpiece && !speakers.hasAudioSession);
-        if (!wantMic) return false;
+        speakers.wantPrime = false;
+        if (!speakers.canSink && !(speakers.hasEarpiece && !speakers.hasAudioSession)) return false;
         try {
             const p = await navigator.permissions.query({ name: 'microphone' });
-            if (p && p.state === 'granted') return false;
+            speakers.micGranted = !!(p && p.state === 'granted');
         } catch (_) {}
-        return true;
+        if (speakers.canSink) {
+            const devs = await listOutputs();
+            if (devs.some((d) => d.label)) {
+                speakers._lastEnum = devs;
+                return false;
+            }
+        }
+        speakers.wantPrime = true;
+        return !speakers.micGranted;
     }
 
     async function listOutputs() {
@@ -177,6 +218,12 @@
 
     async function acquireMicHold() {
         if (speakers.micHold) return true;
+        if (speakers.primedStream) {
+            speakers.micHold = speakers.primedStream;
+            speakers.primedStream = null;
+            return true;
+        }
+        if (!speakers.micGranted) return false;
         try {
             speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
             return true;
@@ -573,6 +620,8 @@
         initSpeakers,
         unlockAndEnumerate,
         needsMicPermission,
+        primeMicPermission,
+        micReady,
         postOutputs,
         setSpeaker,
         setSpeakerIdentity,

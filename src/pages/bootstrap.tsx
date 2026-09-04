@@ -25,6 +25,13 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const DOWNLOAD_URL = "https://screenextend.app";
+const PERMISSION_POLL_MS = 200;
+
+function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): boolean {
+  return a !== null
+    && a.length === b.length
+    && a.every((p, i) => p.key === b[i].key && p.granted === b[i].granted);
+}
 
 function withBold(template: string, value: ReactNode): ReactNode {
   const [before, after = ""] = template.split(/\{\w+\}/);
@@ -274,6 +281,37 @@ export default function Bootstrap() {
     start().catch(() => setError(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const permissionGateOpen = permReport !== null;
+  useEffect(() => {
+    if (!permissionGateOpen) return;
+    let stopped = false;
+    let inFlight = false;
+    const tick = () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      commands.checkPermissions()
+        .then(perms => {
+          if (stopped) return;
+          setPermReport(prev => samePermissions(prev, perms) ? prev : perms);
+          if (perms.every(p => !p.required || p.granted)) {
+            stopped = true;
+            setPermReport(null);
+            proceed().catch(() => setError(true));
+          }
+        })
+        .catch(() => { /* transient; the next tick tries again */ })
+        .finally(() => { inFlight = false; });
+    };
+    const id = window.setInterval(tick, PERMISSION_POLL_MS);
+    window.addEventListener("focus", tick);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+      window.removeEventListener("focus", tick);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permissionGateOpen]);
 
   const updatePct = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null;
 
@@ -550,6 +588,10 @@ export default function Bootstrap() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
+            <div className="mr-auto flex items-center text-sm text-muted-foreground">
+              <Loader2 className="animate-spin mr-2" size={14} />
+              {t("bootstrap.permissions.autoChecking")}
+            </div>
             <AlertDialogAction
               className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
               onClick={() => {

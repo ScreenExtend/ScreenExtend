@@ -1278,8 +1278,7 @@ fn ring_encode_thread(
                         );
                         poisoned_slots.insert(msg.slot);
 
-                        let held_poisoned =
-                            held_slot.map_or(false, |s| poisoned_slots.contains(&s));
+                        let held_poisoned = held_slot.is_some_and(|s| poisoned_slots.contains(&s));
                         if held_poisoned || held_slot.is_none() {
                             teprintln!(
                                 "ring encode: CRITICAL — held slot also poisoned or absent; \

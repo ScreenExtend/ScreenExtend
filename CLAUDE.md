@@ -158,8 +158,9 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `start_hosted_network`, `stop_hosted_network`, `is_hosted_network`, `is_wifi_on`,
 `turn_on_wifi`, `install_drivers`, `remove_drivers`, `install_audio_driver`,
 `uninstall_audio_driver`, `audio_driver_status`, `set_legacy_volume_key_proxy`,
-`set_device_override`, `set_device_audio_output`, `get_device_audio_outputs`,
-`remove_device_override`, `set_device_banned`, `set_device_approved`, `set_disconnect_grace`,
+`set_device_override`, `refresh_device_stream`, `set_device_audio_output`,
+`get_device_audio_outputs`, `remove_device_override`, `set_device_banned`,
+`set_device_approved`, `set_disconnect_grace`,
 `get_disconnect_grace`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
 `get_server_ports`, `set_disable_gpu_encode`, `get_disable_gpu_encode`, `get_log_backlog`.
 
@@ -272,8 +273,12 @@ Cross-platform core, OS-independent:
   (`/input.js`, `/audio.js`, `/audio-worklet.js`, `/transform-worker.js`, `/nosleep.js`,
   `/styles.css`, `/logo.svg`). `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__`
   substituted and the cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`)
-  that let the client use a SharedArrayBuffer ring on a secure context; over plain HTTP they are
-  inert and the client falls back to a postMessage ring.
+  that make `crossOriginIsolated` true on a secure context. The client reports that back as its
+  `sab` capability, but **nothing constructs a SharedArrayBuffer today** — the worklet ring is a
+  plain `postMessage` transfer either way, so the flag is currently inert on both sides.
+  It also owns the DPR ladder: `dpr_mode_ladder` pre-registers one display mode per ratio in
+  `platform::display_dpr_ladder()` (plus each transpose, so an orientation flip is already
+  registered), and the effective ratio is snapped down by `platform::snap_display_dpr`.
 - `session.rs` — per-client session state keyed by client IP (`DeviceSessionState`, live
   display, capture stopper, sequence numbers), device overrides, the OTP limiter, disconnect
   grace (default 10 s, range 0–600), server ports, user TURN config, per-session audio-output
@@ -527,7 +532,7 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and
   `src-tauri/tauri.macos.conf.json` (`src-tauri/Cargo.lock` then updates automatically).
   The Rust side reads the version from `CARGO_PKG_VERSION` / Tauri package info at runtime —
-  there is no hardcoded version literal in `src-tauri/src/`. Current version: **0.5.3**.
+  there is no hardcoded version literal in `src-tauri/src/`. Current version: **0.5.4**.
 - **CI is currently disabled.** `.github/workflows/ci.yml` was removed in commit `e1d5d28`
   ("temporarily disable ci till further notice"); only `build-release.yml` and `dependabot.yml`
   remain, so **nothing runs `cargo fmt`/`clippy`/`test` or `pnpm lint` automatically — run them
@@ -587,6 +592,15 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   this reason. Check with `nm -u target/release/ScreenExtend`.
 - The client page has no build step and no dependencies; it must keep working in older mobile
   browsers (that constraint is why, for instance, flex `gap` was replaced with margins).
+- DPR is only correct when the resolution multiplier and the OS scale step are the **same
+  number**: resolution x `d`, DPI `100*d`%. Snap `d` with `platform::snap_display_dpr` (Windows
+  exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),
+  pre-register every ladder mode at create time — a live display cannot be given new ones — and
+  re-apply the DPI *after* the resolution change, which resets it.
+- Simultaneous displays are **uncapped**. `VirtualDisplayController::max_concurrent_displays()`
+  returns `None` everywhere except the macOS AirPlay tier, which returns `Some(1)` because macOS
+  itself owns that display. Do not cap the other backends, and never evict a connected device to
+  make room for a new one.
 - Bump the version in all four files at once.
 - New shell command → `capabilities/default.json`.
 - New user setting → TS config type/default + Rust command + the `serve`/`config` CLI path.

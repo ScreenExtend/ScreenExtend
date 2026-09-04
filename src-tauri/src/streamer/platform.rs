@@ -20,6 +20,59 @@ pub fn max_display_dpr() -> f64 {
     }
 }
 
+pub fn display_scale_steps() -> &'static [u32] {
+    #[cfg(target_os = "windows")]
+    {
+        &crate::windows_utils::streamer::capture::DPI_PERCENT_VALUES
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const MACOS: &[u32] = &[100, 200];
+        MACOS
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        const ANY: &[u32] = &[];
+        ANY
+    }
+}
+
+pub fn display_dpr_ladder() -> Vec<f64> {
+    let cap = max_display_dpr();
+    let steps = display_scale_steps();
+    if steps.is_empty() {
+        let mut ratios = Vec::new();
+        let mut r = 1.0_f64;
+        while r <= cap + 1e-9 {
+            ratios.push(r);
+            r += 0.5;
+        }
+        return ratios;
+    }
+    steps
+        .iter()
+        .map(|&s| s as f64 / 100.0)
+        .filter(|&r| r >= 1.0 && r <= cap + 1e-9)
+        .collect()
+}
+
+pub fn snap_display_dpr(requested: f64) -> f64 {
+    if !requested.is_finite() {
+        return 1.0;
+    }
+    let cap = max_display_dpr();
+    let want = requested.clamp(1.0, cap);
+    let steps = display_scale_steps();
+    if steps.is_empty() {
+        return want;
+    }
+    steps
+        .iter()
+        .map(|&s| s as f64 / 100.0)
+        .filter(|&r| r >= 1.0 && r <= cap + 1e-9 && r <= want + 1e-6)
+        .fold(1.0_f64, f64::max)
+}
+
 pub fn apply_process_tuning() {
     #[cfg(target_os = "windows")]
     crate::windows_utils::streamer::tuning::apply_process_tuning();

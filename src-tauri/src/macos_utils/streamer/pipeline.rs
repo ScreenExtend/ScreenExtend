@@ -541,7 +541,9 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
     reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
-pub fn set_display_topology_extend() {}
+pub fn set_display_topology_extend() -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {

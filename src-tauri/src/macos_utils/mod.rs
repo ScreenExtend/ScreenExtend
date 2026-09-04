@@ -219,6 +219,18 @@ pub fn set_device_override(
 
 #[tauri::command]
 #[specta::specta]
+pub fn refresh_device_stream(state: State<'_, AppState>, ip: String) -> bool {
+    if session::get_live_display(&state.sessions, &ip).is_none() {
+        tprintln!("stream refresh skipped: {ip} has no live display attached");
+        return false;
+    }
+    session::bump_reconfig_epoch(&state.sessions, &ip);
+    tprintln!("stream refresh requested for {ip}; client will renegotiate on its next poll");
+    true
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn set_device_audio_output(state: State<'_, AppState>, ip: String, device_id: String) {
     let sel = if device_id.trim().is_empty() {
         None

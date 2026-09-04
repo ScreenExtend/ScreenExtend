@@ -2,6 +2,8 @@ use std::ffi::{c_void, CString};
 use std::process::Command;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFDictionary,
@@ -23,6 +25,7 @@ unsafe extern "C" {
         attribute: *const c_void,
         value: *mut *const c_void,
     ) -> i32;
+    fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_seconds: f32) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -31,6 +34,8 @@ unsafe extern "C" {
 }
 
 const AX_ERROR_API_DISABLED: i32 = -25211;
+const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.5;
+const PROBE_REFRESH: Duration = Duration::from_secs(2);
 
 pub fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() && accessibility_api_enabled() }
@@ -42,6 +47,7 @@ fn accessibility_api_enabled() -> bool {
         if el.is_null() {
             return true;
         }
+        AXUIElementSetMessagingTimeout(el, AX_MESSAGING_TIMEOUT_SECS);
         let attr = CFString::from_str("AXFocusedApplication");
         let mut value: *const c_void = ptr::null();
         let err = AXUIElementCopyAttributeValue(el, (&*attr as *const CFString).cast(), &mut value);
@@ -93,18 +99,61 @@ fn preflight_screen_capture() -> Option<bool> {
     cg_bool_fn("CGPreflightScreenCaptureAccess").map(|f| unsafe { f() })
 }
 
+struct ProbeState {
+    started: bool,
+    running: bool,
+    last: Option<Instant>,
+}
+
+static CONFIRMED: AtomicBool = AtomicBool::new(false);
+static PROBE: Mutex<ProbeState> = Mutex::new(ProbeState {
+    started: false,
+    running: false,
+    last: None,
+});
+
+fn probe_and_latch() -> bool {
+    let granted = crate::macos_utils::streamer::probe_screen_recording();
+    if granted {
+        CONFIRMED.store(true, Ordering::Relaxed);
+    }
+    granted
+}
+
 fn screen_recording_granted() -> bool {
-    static CONFIRMED: AtomicBool = AtomicBool::new(false);
     if CONFIRMED.load(Ordering::Relaxed) {
         return true;
     }
     if preflight_screen_capture() == Some(false) {
         return false;
     }
-    let granted = crate::macos_utils::streamer::probe_screen_recording();
-    if granted {
-        CONFIRMED.store(true, Ordering::Relaxed);
+    let first = {
+        let mut st = PROBE.lock().unwrap();
+        if st.started {
+            let due = match st.last {
+                Some(at) => at.elapsed() >= PROBE_REFRESH,
+                None => true,
+            };
+            if due && !st.running {
+                st.running = true;
+                std::thread::spawn(|| {
+                    probe_and_latch();
+                    let mut st = PROBE.lock().unwrap();
+                    st.running = false;
+                    st.last = Some(Instant::now());
+                });
+            }
+            false
+        } else {
+            st.started = true;
+            true
+        }
+    };
+    if !first {
+        return false;
     }
+    let granted = probe_and_latch();
+    PROBE.lock().unwrap().last = Some(Instant::now());
     granted
 }
 
