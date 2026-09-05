@@ -42,9 +42,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: install frontend dependencies
-        run: |
-          pnpm install
-          pnpm approve-builds --all
+        run: pnpm install
 
       - uses: tauri-apps/tauri-action@v0
         env:
