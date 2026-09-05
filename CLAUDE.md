@@ -611,6 +611,17 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   returns `None` everywhere except the macOS AirPlay tier, which returns `Some(1)` because macOS
   itself owns that display. Do not cap the other backends, and never evict a connected device to
   make room for a new one.
+- The desktop UI must run on **Safari 13.1** (the WKWebView on the 10.15 floor). Anything
+  newer that a dependency reaches for is a hard crash, not a missing feature — monaco alone
+  needed six shims, and its MediaQueryList call runs at module scope, so it took down the whole
+  settings editor chunk. `src/lib/legacy-webview-polyfills.ts` carries the shims (imported first
+  from `main.tsx`, and from the two monaco worker wrappers, which never run the entry chunk);
+  `node scripts/check-legacy-webkit.mjs` re-derives the list from `dist/` after a build and
+  fails on anything unpatched. Keep the two in step. On the CSS side, `darkMode` is
+  `["variant", ".dark &"]` because tailwind 3.4's default class strategy compiles to
+  `:is(.dark *)`, which Safari 13 drops the whole rule over, and **flex** containers may not use
+  `gap-*` (13.1 has it for grid only, flex landed in 14.1) — reach for `space-x/y-*`, or a margin
+  on the icon when the sibling is a bare text node, which `space-*` does not select.
 - Bump the version in all four files at once.
 - New shell command → `capabilities/default.json`.
 - New user setting → TS config type/default + Rust command + the `serve`/`config` CLI path.

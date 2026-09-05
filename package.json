@@ -3,6 +3,10 @@
   "private": true,
   "version": "0.5.4",
   "type": "module",
+  "browserslist": [
+    "safari >= 13.1",
+    "chrome >= 87"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

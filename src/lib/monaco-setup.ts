@@ -1,13 +1,40 @@
-import "monaco-editor/esm/vs/editor/editor.all.js";
+import "monaco-editor/esm/vs/base/browser/ui/codicons/codiconStyles.js";
+import "monaco-editor/esm/vs/editor/common/standaloneStrings.js";
+import "monaco-editor/esm/vs/editor/browser/coreCommands.js";
+import "monaco-editor/esm/vs/editor/browser/widget/codeEditor/codeEditorWidget.js";
+import "monaco-editor/esm/vs/editor/contrib/bracketMatching/browser/bracketMatching.js";
+import "monaco-editor/esm/vs/editor/contrib/clipboard/browser/clipboard.js";
+import "monaco-editor/esm/vs/editor/contrib/contextmenu/browser/contextmenu.js";
+import "monaco-editor/esm/vs/editor/contrib/cursorUndo/browser/cursorUndo.js";
+import "monaco-editor/esm/vs/editor/contrib/dnd/browser/dnd.js";
+import "monaco-editor/esm/vs/editor/contrib/find/browser/findController.js";
+import "monaco-editor/esm/vs/editor/contrib/folding/browser/folding.js";
+import "monaco-editor/esm/vs/editor/contrib/format/browser/formatActions.js";
+import "monaco-editor/esm/vs/editor/contrib/gotoError/browser/gotoError.js";
+import "monaco-editor/esm/vs/editor/contrib/hover/browser/hoverContribution.js";
+import "monaco-editor/esm/vs/editor/contrib/lineSelection/browser/lineSelection.js";
+import "monaco-editor/esm/vs/editor/contrib/linesOperations/browser/linesOperations.js";
+import "monaco-editor/esm/vs/editor/contrib/longLinesHelper/browser/longLinesHelper.js";
+import "monaco-editor/esm/vs/editor/contrib/multicursor/browser/multicursor.js";
+import "monaco-editor/esm/vs/editor/contrib/readOnlyMessage/browser/contribution.js";
+import "monaco-editor/esm/vs/editor/contrib/snippet/browser/snippetController2.js";
+import "monaco-editor/esm/vs/editor/contrib/suggest/browser/suggestController.js";
+import "monaco-editor/esm/vs/editor/contrib/toggleTabFocusMode/browser/toggleTabFocusMode.js";
+import "monaco-editor/esm/vs/editor/contrib/unusualLineTerminators/browser/unusualLineTerminators.js";
+import "monaco-editor/esm/vs/editor/contrib/wordOperations/browser/wordOperations.js";
 import "monaco-editor/esm/vs/language/json/monaco.contribution";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { loader } from "@monaco-editor/react";
 import { scanJson } from "@/lib/json-structure";
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
+import editorWorker from "@/lib/monaco-editor.worker?worker";
+import jsonWorker from "@/lib/monaco-json.worker?worker";
 
 window.MonacoEnvironment = {
   getWorker(_workerId: string, label: string) {
+    if (import.meta.env.DEV) {
+      const name = label === "json" ? "monaco-json.worker" : "monaco-editor.worker";
+      return new Worker("/@classic-worker/" + name + ".js");
+    }
     return label === "json" ? new jsonWorker() : new editorWorker();
   },
 };
@@ -111,6 +138,11 @@ monaco.editor.defineTheme(THEME_LIGHT, {
 monaco.languages.json.jsonDefaults.setModeConfiguration({
   ...monaco.languages.json.jsonDefaults.modeConfiguration,
   foldingRanges: false,
+  colors: false,
+  diagnostics: false,
+  documentSymbols: false,
+  selectionRanges: false,
+  documentRangeFormattingEdits: false,
 });
 
 monaco.languages.registerFoldingRangeProvider("json", {
@@ -121,6 +153,64 @@ monaco.languages.registerFoldingRangeProvider("json", {
     }));
   },
 });
+
+export const editorOptions: monaco.editor.IStandaloneEditorConstructionOptions = {
+  minimap: { enabled: false },
+  fontSize: 14,
+  lineHeight: 1.7,
+  fontFamily:
+    'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+  fontLigatures: false,
+  tabSize: 2,
+  insertSpaces: true,
+  automaticLayout: true,
+  scrollBeyondLastLine: false,
+  cursorBlinking: "blink",
+  renderLineHighlight: "line",
+  lineNumbersMinChars: 3,
+  glyphMargin: false,
+  folding: true,
+  padding: { top: 12, bottom: 12 },
+  bracketPairColorization: { enabled: false },
+  guides: {
+    bracketPairs: false,
+    bracketPairsHorizontal: false,
+    highlightActiveBracketPair: false,
+    indentation: true,
+    highlightActiveIndentation: false,
+  },
+  overviewRulerLanes: 0,
+  hideCursorInOverviewRuler: true,
+  overviewRulerBorder: false,
+  stickyScroll: { enabled: false },
+  formatOnPaste: true,
+  suggest: { showWords: false },
+  wordBasedSuggestions: "off",
+  accessibilitySupport: "off",
+  links: false,
+  codeLens: false,
+  colorDecorators: false,
+  renderControlCharacters: false,
+  parameterHints: { enabled: false },
+  unicodeHighlight: {
+    ambiguousCharacters: false,
+    invisibleCharacters: false,
+    nonBasicASCII: false,
+  },
+  quickSuggestions: { other: true, strings: true },
+  quickSuggestionsDelay: 500,
+  suggestOnTriggerCharacters: false,
+  hover: { delay: 800 },
+  occurrencesHighlight: "off",
+  selectionHighlight: false,
+  renderWhitespace: "none",
+  scrollbar: {
+    verticalScrollbarSize: 10,
+    horizontalScrollbarSize: 10,
+    useShadows: false,
+    alwaysConsumeMouseWheel: false,
+  },
+};
 
 loader.config({ monaco });
 

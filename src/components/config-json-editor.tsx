@@ -206,6 +206,22 @@ export function ConfigJsonEditor({
     return rows;
   }, [markers, saveErrors]);
 
+  const stats = useMemo(() => {
+    let lineCount = 1;
+    let bytes = 0;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 10) lineCount++;
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        bytes += 4;
+        i++;
+      } else bytes += 3;
+    }
+    return { lines: lineCount, bytes };
+  }, [text]);
+
   const errorCount = problems.filter(p => p.severity === "error").length;
   const warningCount = problems.filter(p => p.severity === "warning").length;
 
@@ -324,8 +340,8 @@ export function ConfigJsonEditor({
   return (
     <div className="flex flex-col">
       <TooltipProvider delay={150}>
-        <div className="flex items-center justify-between gap-2 rounded-t-md border border-b-0 bg-muted/40 px-2 py-2">
-          <div className="flex items-center gap-2 pl-1">
+        <div className="flex items-center justify-between space-x-2 rounded-t-md border border-b-0 bg-muted/40 px-2 py-2">
+          <div className="flex items-center space-x-2 pl-1">
             <Braces className="h-4 w-4 text-muted-foreground" />
             <span className="text-sm font-medium">config.json</span>
             {dirty && (
@@ -334,7 +350,7 @@ export function ConfigJsonEditor({
               </span>
             )}
           </div>
-          <div className="flex items-center gap-0.5">
+          <div className="flex items-center space-x-0.5">
             <ToolButton
               label={t("configEditor.actions.format")}
               onClick={() => editorRef.current?.format()}
@@ -378,8 +394,8 @@ export function ConfigJsonEditor({
             onMarkersChange={setMarkers}
           />
         ) : loadError ? (
-          <div className="flex h-full items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
-            <XCircle className="h-4 w-4 shrink-0 text-destructive" />
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
+            <XCircle className="mr-2 h-4 w-4 shrink-0 text-destructive" />
             {t("toasts.configEditor.loadFailedDescription")}
           </div>
         ) : (
@@ -403,7 +419,7 @@ export function ConfigJsonEditor({
                   onClick={() =>
                     problem.line && editorRef.current?.revealLine(problem.line, problem.column)
                   }
-                  className="flex w-full items-start gap-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-accent"
+                  className="flex w-full items-start space-x-2.5 px-3 py-2 text-left text-sm transition-colors hover:bg-accent"
                 >
                   {problem.severity === "error" ? (
                     <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
@@ -423,26 +439,26 @@ export function ConfigJsonEditor({
         </div>
       )}
 
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-b-md border border-t-0 bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+      <div className="flex flex-wrap items-center rounded-b-md border border-t-0 bg-muted/40 px-3 pb-2 text-sm text-muted-foreground [&>*:not(:last-child)]:mr-4 [&>*]:mt-2">
         {errorCount === 0 && warningCount === 0 ? (
-          <Badge variant="outline" className="gap-1.5 font-normal">
-            <CheckCircle2 className="h-3.5 w-3.5" />
+          <Badge variant="outline" className="font-normal">
+            <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
             {t("configEditor.status.valid")}
           </Badge>
         ) : (
-          <Badge variant="destructive" className="gap-1.5 font-normal">
-            <XCircle className="h-3.5 w-3.5" />
+          <Badge variant="destructive" className="font-normal">
+            <XCircle className="mr-1.5 h-3.5 w-3.5" />
             {errorCount > 0
               ? t("configEditor.status.errors", { count: errorCount })
               : t("configEditor.status.warnings", { count: warningCount })}
           </Badge>
         )}
-        <span className="flex items-center gap-1.5">
-          <ShieldCheck className="h-4 w-4" />
+        <span className="flex items-center">
+          <ShieldCheck className="mr-1.5 h-4 w-4" />
           {t("configEditor.status.schema")}
         </span>
         <span className="font-mono tabular-nums">
-          {text.split("\n").length} lines, {formatBytes(new Blob([text]).size)}
+          {stats.lines} lines, {formatBytes(stats.bytes)}
         </span>
         <div className="ml-auto">
           <Button onClick={() => void save()} disabled={saving || !ready}>
@@ -498,7 +514,7 @@ export function ConfigJsonEditor({
             <Button variant="ghost" onClick={() => setConflict(null)}>
               {t("common.back")}
             </Button>
-            <div className="flex flex-col-reverse gap-2 sm:flex-row">
+            <div className="flex flex-col-reverse space-y-2 space-y-reverse sm:flex-row sm:space-x-2 sm:space-y-0">
               <Button variant="outline" onClick={resolveWithStored}>
                 {t("configEditor.conflict.useStored")}
               </Button>

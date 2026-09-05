@@ -18,6 +18,7 @@ import { createConfig, getConfig, updateConfig } from "@/components/config-provi
 import { GlobalProviderContext } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
 import { buildQrValues, generateOtp } from "@/lib/utils";
+import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
 import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { check } from "@tauri-apps/plugin-updater";
@@ -280,6 +281,10 @@ export default function Bootstrap() {
     running.current = true;
     start().catch(() => setError(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    scheduleConfigEditorPreload();
   }, []);
 
   const permissionGateOpen = permReport !== null;
