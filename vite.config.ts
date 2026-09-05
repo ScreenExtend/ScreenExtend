@@ -9,6 +9,7 @@ export default defineConfig(async () => ({
   plugins: [react()],
 
   build: {
+    target: ["es2020", "chrome87", "safari13"],
     rollupOptions: {
       input: {
         main: resolve(__dirname, "index.html"),
