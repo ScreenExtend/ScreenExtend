@@ -3,8 +3,9 @@ import "monaco-editor/esm/vs/language/json/monaco.contribution";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { loader } from "@monaco-editor/react";
 import { scanJson } from "@/lib/json-structure";
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
+// wrapped so the workers get the legacy-WebKit shims too; they never run the entry chunk
+import editorWorker from "@/lib/monaco-editor.worker?worker";
+import jsonWorker from "@/lib/monaco-json.worker?worker";
 
 window.MonacoEnvironment = {
   getWorker(_workerId: string, label: string) {

@@ -1,6 +1,8 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  darkMode: ["class"],
+  // ".dark &" instead of the default class strategy: tailwind 3.4 compiles that
+  // one to :is(.dark *), which safari 13 (macos 10.15) drops the whole rule over
+  darkMode: ["variant", ".dark &"],
   content: [
     "./pages/**/*.{ts,tsx}",
     "./components/**/*.{ts,tsx}",

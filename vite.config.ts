@@ -17,6 +17,11 @@ export default defineConfig(async () => ({
     },
   },
 
+  // dev serves prebundled deps straight to the webview, so they need the floor too
+  optimizeDeps: {
+    esbuildOptions: { target: "safari13" },
+  },
+
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
