@@ -36,6 +36,14 @@ async getCloudStatus() : Promise<CloudStatusChange> {
 async exitApp() : Promise<void> {
     await TAURI_INVOKE("exit_app");
 },
+async setWindowZoom(factor: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_window_zoom", { factor }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getUsername() : Promise<string> {
     return await TAURI_INVOKE("get_username");
 },
