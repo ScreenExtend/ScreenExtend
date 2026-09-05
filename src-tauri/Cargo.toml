@@ -133,7 +133,7 @@ plist = "1"
 httparse = "1"
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52.0"
+winreg = "0.55.0"
 windows-future = "0.3.2"
 windows-core = "0.62"
 parking_lot = "0.12.5"
