@@ -33,7 +33,18 @@ function pathOf(stack: Frame[]): string {
   return path;
 }
 
+let cachedText: string | null = null;
+let cachedStructure: JsonStructure = { pairs: [], strings: [] };
+
 export function scanJson(text: string): JsonStructure {
+  if (text === cachedText) return cachedStructure;
+  const structure = scanJsonUncached(text);
+  cachedText = text;
+  cachedStructure = structure;
+  return structure;
+}
+
+function scanJsonUncached(text: string): JsonStructure {
   const pairs: JsonBracketPair[] = [];
   const strings: JsonStringValue[] = [];
   const stack: Frame[] = [];

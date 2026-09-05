@@ -1,8 +1,8 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
-import { monaco, THEME_DARK, THEME_LIGHT } from "@/lib/monaco-setup";
-import { scanJson, type JsonStructure } from "@/lib/json-structure";
+import { monaco, editorOptions, THEME_DARK, THEME_LIGHT } from "@/lib/monaco-setup";
+import { scanJson, type JsonStructure, type JsonStringValue } from "@/lib/json-structure";
 import { cn } from "@/lib/utils";
 
 export interface JsonMarker {
@@ -44,14 +44,79 @@ const EMPTY_STRUCTURE: JsonStructure = { pairs: [], strings: [] };
 
 const MAX_FOLD_TAIL = 4;
 
+const WORKER_KEEPALIVE_MS = 60_000;
+
+const VALIDATE_IDLE_MS = 900;
+const MARKER_OWNER = "screenextend-json";
+
+interface LspPosition {
+  line: number;
+  character: number;
+}
+
+interface LspDiagnostic {
+  range: { start: LspPosition; end: LspPosition };
+  severity?: number;
+  message: string;
+  code?: string | number;
+  source?: string;
+}
+
+interface ValidatingWorker {
+  doValidation(uri: string): Promise<LspDiagnostic[]>;
+}
+
+const toSeverity = (severity?: number) =>
+  severity === 1
+    ? monaco.MarkerSeverity.Error
+    : severity === 2
+      ? monaco.MarkerSeverity.Warning
+      : severity === 4
+        ? monaco.MarkerSeverity.Hint
+        : monaco.MarkerSeverity.Info;
+
+const toMarker = (diagnostic: LspDiagnostic): Monaco.editor.IMarkerData => ({
+  severity: toSeverity(diagnostic.severity),
+  startLineNumber: diagnostic.range.start.line + 1,
+  startColumn: diagnostic.range.start.character + 1,
+  endLineNumber: diagnostic.range.end.line + 1,
+  endColumn: diagnostic.range.end.character + 1,
+  message: diagnostic.message,
+  code: typeof diagnostic.code === "number" ? String(diagnostic.code) : diagnostic.code,
+  source: diagnostic.source,
+});
+
+interface MaskedCache {
+  structure: JsonStructure;
+  paths: string[];
+  entries: { value: JsonStringValue; range: Monaco.Range }[];
+}
+
 const ARRAY_INDEX = /\[\d+\]/g;
+
+const LOADING = <div className="text-sm text-muted-foreground">Loading editor…</div>;
 
 const isMasked = (path: string, patterns: string[]) =>
   patterns.includes(path) || patterns.includes(path.replace(ARRAY_INDEX, "[]"));
 
 const schemaRegistry = new Map<string, Record<string, unknown>>();
+let appliedSchemas: Map<string, Record<string, unknown>> | null = null;
+
+function schemasUnchanged() {
+  if (!appliedSchemas || appliedSchemas.size !== schemaRegistry.size) return false;
+  for (const [name, schema] of schemaRegistry) {
+    if (appliedSchemas.get(name) !== schema) return false;
+  }
+  return true;
+}
 
 function applySchemas() {
+  if (schemasUnchanged()) return;
+  appliedSchemas = new Map(schemaRegistry);
+  applySchemasNow();
+}
+
+function applySchemasNow() {
   monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
     validate: true,
     allowComments: false,
@@ -69,47 +134,8 @@ function applySchemas() {
 const severityOf = (s: Monaco.MarkerSeverity): JsonMarker["severity"] =>
   s === 8 ? "error" : s === 4 ? "warning" : "info";
 
-const editorOptions: Monaco.editor.IStandaloneEditorConstructionOptions = {
-  minimap: { enabled: false },
-  fontSize: 15,
-  lineHeight: 1.7,
-  fontFamily:
-    'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
-  fontLigatures: true,
-  tabSize: 2,
-  insertSpaces: true,
-  automaticLayout: true,
-  scrollBeyondLastLine: false,
-  cursorBlinking: "blink",
-  renderLineHighlight: "line",
-  lineNumbersMinChars: 3,
-  glyphMargin: false,
-  folding: true,
-  padding: { top: 12, bottom: 12 },
-  bracketPairColorization: { enabled: false },
-  guides: {
-    bracketPairs: false,
-    bracketPairsHorizontal: false,
-    highlightActiveBracketPair: false,
-    indentation: true,
-    highlightActiveIndentation: false,
-  },
-  overviewRulerLanes: 0,
-  hideCursorInOverviewRuler: true,
-  overviewRulerBorder: false,
-  stickyScroll: { enabled: false },
-  formatOnPaste: true,
-  suggest: { showWords: false },
-  quickSuggestions: { other: true, strings: true },
-  scrollbar: {
-    verticalScrollbarSize: 10,
-    horizontalScrollbarSize: 10,
-    useShadows: false,
-    alwaysConsumeMouseWheel: false,
-  },
-};
 
-export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
+const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
   function JsonEditor(
     {
       defaultValue,
@@ -131,6 +157,8 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
     const structureRef = useRef<JsonStructure>(EMPTY_STRUCTURE);
     const pointerRef = useRef<Monaco.Position | null>(null);
     const decorationsRef = useRef<Monaco.editor.IEditorDecorationsCollection | null>(null);
+    const maskedCacheRef = useRef<MaskedCache | null>(null);
+    const decorationKeyRef = useRef("");
 
     useEffect(() => {
       if (schema) schemaRegistry.set(name, schema);
@@ -141,6 +169,18 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
         applySchemas();
       };
     }, [schema, name]);
+
+    useEffect(() => {
+      const touch = () => {
+        void monaco.languages.json
+          .getWorker()
+          .then(accessor => accessor())
+          .catch(() => {});
+      };
+      touch();
+      const id = window.setInterval(touch, WORKER_KEEPALIVE_MS);
+      return () => window.clearInterval(id);
+    }, []);
 
     useEffect(() => {
       if (!onMarkersChange) return;
@@ -173,22 +213,26 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
       return editor.getTopForLineNumber(startLine + 1) <= editor.getTopForLineNumber(startLine);
     }, []);
 
-    const maskedContent = useCallback(
-      () =>
-        structureRef.current.strings
-          .filter(value => isMasked(value.path, maskedRef.current))
-          .map(value => ({
-            value,
-            range: new monaco.Range(
-              value.line,
-              value.startColumn + 1,
-              value.line,
-              value.endColumn - 1
-            ),
-          }))
-          .filter(entry => entry.range.endColumn > entry.range.startColumn),
-      []
-    );
+    const maskedContent = useCallback(() => {
+      const structure = structureRef.current;
+      const paths = maskedRef.current;
+      const cached = maskedCacheRef.current;
+      if (cached && cached.structure === structure && cached.paths === paths) return cached.entries;
+      const entries = structure.strings
+        .filter(value => isMasked(value.path, paths))
+        .map(value => ({
+          value,
+          range: new monaco.Range(
+            value.line,
+            value.startColumn + 1,
+            value.line,
+            value.endColumn - 1
+          ),
+        }))
+        .filter(entry => entry.range.endColumn > entry.range.startColumn);
+      maskedCacheRef.current = { structure, paths, entries };
+      return entries;
+    }, []);
 
     const maskAt = useCallback(
       (position: Monaco.Position | null) =>
@@ -205,6 +249,7 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
       if (!editor || !model || !collection) return;
 
       const decorations: Monaco.editor.IModelDeltaDecoration[] = [];
+      let key = "";
       const selections = editor.getSelections() ?? [];
       const pointer = pointerRef.current;
 
@@ -214,6 +259,7 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
           (pointer !== null && range.containsPosition(pointer));
         if (revealed) continue;
         decorations.push({ range, options: { inlineClassName: "se-masked-value" } });
+        key += "m" + range.startLineNumber + "," + range.startColumn + "," + range.endColumn + ";";
       }
 
       for (const pair of structureRef.current.pairs) {
@@ -229,8 +275,11 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
             showIfCollapsed: true,
           },
         });
+        key += "f" + pair.openLine + "," + column + "," + content + ";";
       }
 
+      if (key === decorationKeyRef.current) return;
+      decorationKeyRef.current = key;
       collection.set(decorations);
     }, [isCollapsed, maskedContent]);
 
@@ -275,14 +324,43 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
       remeasureFonts: () => monaco.editor.remeasureFonts(),
     }));
 
-    const handleMount: OnMount = editor => {
+    const handleMount = useCallback<OnMount>(editor => {
       editorRef.current = editor;
       decorationsRef.current = editor.createDecorationsCollection();
+
+      let validateTimer: number | undefined;
+      let validateToken = 0;
+      const validate = () => {
+        const model = editor.getModel();
+        if (!model) return;
+        const token = ++validateToken;
+        void monaco.languages.json
+          .getWorker()
+          .then(accessor => accessor(model.uri))
+          .then(worker => (worker as unknown as ValidatingWorker).doValidation(model.uri.toString()))
+          .then(diagnostics => {
+            if (token !== validateToken || editor.getModel() !== model) return;
+            monaco.editor.setModelMarkers(model, MARKER_OWNER, diagnostics.map(toMarker));
+          })
+          .catch(() => {});
+      };
+      const scheduleValidate = () => {
+        window.clearTimeout(validateTimer);
+        validateTimer = window.setTimeout(validate, VALIDATE_IDLE_MS);
+      };
+      editor.onDidBlurEditorText(() => {
+        window.clearTimeout(validateTimer);
+        validate();
+      });
+      editor.onDidDispose(() => window.clearTimeout(validateTimer));
+      validate();
 
       const rescan = () => {
         const model = editor.getModel();
         structureRef.current = model ? scanJson(model.getValue()) : EMPTY_STRUCTURE;
+        decorationKeyRef.current = "";
         refreshDecorations();
+        scheduleValidate();
       };
       rescan();
 
@@ -297,7 +375,12 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
           event.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT
             ? event.target.position ?? null
             : null;
-        const before = maskAt(pointerRef.current);
+        const previous = pointerRef.current;
+        if (next === previous) return;
+        if (next && previous && next.lineNumber === previous.lineNumber && next.column === previous.column) {
+          return;
+        }
+        const before = maskAt(previous);
         pointerRef.current = next;
         if (before !== maskAt(next)) refreshDecorations();
       });
@@ -307,6 +390,7 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
         if (wasOver) refreshDecorations();
       });
       editor.onDidScrollChange(() => {
+        if (!pointerRef.current) return;
         const wasOver = maskAt(pointerRef.current);
         pointerRef.current = null;
         if (wasOver) refreshDecorations();
@@ -332,7 +416,12 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
         ],
         run: () => format(),
       });
-    };
+    }, [format, isCollapsed, maskAt, refreshDecorations]);
+
+    const options = useMemo(() => ({ ...editorOptions, readOnly }), [readOnly]);
+    const changeRef = useRef(onChange);
+    changeRef.current = onChange;
+    const handleChange = useCallback((next?: string) => changeRef.current?.(next ?? ""), []);
 
     return (
       <div className={cn("h-full w-full overflow-hidden", className)}>
@@ -340,15 +429,15 @@ export const JsonEditor = forwardRef<JsonEditorHandle, JsonEditorProps>(
           path={uri}
           language="json"
           defaultValue={defaultValue}
-          onChange={next => onChange?.(next ?? "")}
+          onChange={handleChange}
           onMount={handleMount}
           theme={theme === "dark" ? THEME_DARK : THEME_LIGHT}
-          options={{ ...editorOptions, readOnly }}
-          loading={
-            <div className="text-sm text-muted-foreground">Loading editor…</div>
-          }
+          options={options}
+          loading={LOADING}
         />
       </div>
     );
   }
 );
+
+export const JsonEditor = memo(JsonEditorBase);
