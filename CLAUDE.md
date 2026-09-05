@@ -43,8 +43,8 @@ macos/ScreenExtendAudio/    the macOS 10.15–12.x virtual audio device (AudioSe
 ## Commands
 
 ```sh
-pnpm install
-pnpm approve-builds --all        # approve native build scripts (esbuild, sharp, core-js-pure)
+pnpm install                     # native build scripts are pre-approved via allowBuilds in pnpm-workspace.yaml
+pnpm approve-builds              # interactive; only needed to approve a NEW dependency's build script
 
 pnpm tauri dev                   # run the full desktop app (host). Also regenerates src/lib/bindings.ts
 pnpm tauri build                 # production build -> src-tauri/target/release/bundle/

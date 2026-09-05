@@ -108,9 +108,6 @@ ScreenExtend encodes captured displays with the host GPU. The matrix below lists
 # Install frontend dependencies
 pnpm install
 
-# Approve native build scripts
-pnpm approve-builds --all
-
 # Run the app in dev mode
 pnpm tauri dev
 ```
