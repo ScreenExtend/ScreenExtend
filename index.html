@@ -30,6 +30,27 @@
       document.addEventListener("dragover", event => event.preventDefault());
       document.addEventListener("drop", event => event.preventDefault());
     </script>
+    <script>
+      window.addEventListener("error", function (event) {
+        var root = document.getElementById("root");
+        if (!root || root.firstChild) return;
+        var box = document.createElement("div");
+        box.style.cssText = "font:14px/1.6 -apple-system,system-ui,sans-serif;color:#111;background:#fff;padding:48px;max-width:34em;margin:0 auto";
+        var title = document.createElement("h1");
+        title.style.cssText = "font-size:17px;margin:0 0 12px";
+        title.appendChild(document.createTextNode("ScreenExtend could not start"));
+        var body = document.createElement("p");
+        body.style.cssText = "margin:0 0 16px";
+        body.appendChild(document.createTextNode("The interface failed to load in the system WebKit. On macOS, install the latest updates available, Safari 13.1 or newer, through Software Update, then reopen ScreenExtend."));
+        var detail = document.createElement("pre");
+        detail.style.cssText = "white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#666;margin:0";
+        detail.appendChild(document.createTextNode(String(event.message || event.error || "")));
+        box.appendChild(title);
+        box.appendChild(body);
+        box.appendChild(detail);
+        root.appendChild(box);
+      });
+    </script>
   </head>
   <body>
     <div id="root"></div>

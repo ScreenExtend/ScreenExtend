@@ -215,6 +215,25 @@ fn exit_app(app: tauri::AppHandle) {
 
 #[tauri::command]
 #[specta::specta]
+fn set_window_zoom(window: tauri::WebviewWindow, factor: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if !webview_zoom_supported() {
+        return Err("this WebKit has no page zoom; it arrived with Safari 14".to_string());
+    }
+    window.set_zoom(factor).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn webview_zoom_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        objc2::runtime::AnyClass::get(c"WKWebView")
+            .is_some_and(|class| class.responds_to(objc2::sel!(setPageZoom:)))
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
 fn get_username() -> String {
     whoami::username().unwrap_or_else(|_| "".to_string())
 }
@@ -302,6 +321,8 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     cli::fast_path();
+    #[cfg(target_os = "macos")]
+    macos_utils::objc_exception::install_logger();
 
     let builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
@@ -316,6 +337,7 @@ pub fn run() {
             unregister_cloud_session,
             get_cloud_status,
             exit_app,
+            set_window_zoom,
             get_username,
             set_avatar,
             get_avatar,
@@ -403,246 +425,244 @@ pub fn run() {
             builder.mount_events(app);
             let _ = crate::cli::dispatch(app.handle());
             crate::streamer::input::prime();
-            if let Ok(matches) = app.cli().matches() {
-                match matches.subcommand {
-                    Some(command) if command.name == "hostednetwork" => {
-                        let mut ssid = String::new();
-                        let mut password = String::new();
-                        for (key, arg_data) in &command.matches.args {
-                            match key.as_str() {
-                                "ssid" => {
-                                    ssid = arg_data
-                                        .value
-                                        .as_str()
-                                        .map(|s| s.to_string())
-                                        .expect("no ssid");
-                                }
-                                "password" => {
-                                    password = arg_data
-                                        .value
-                                        .as_str()
-                                        .map(|s| s.to_string())
-                                        .expect("no password");
-                                }
-                                _ => {}
+            match app.cli().matches().ok().and_then(|m| m.subcommand) {
+                Some(command) if command.name == "hostednetwork" => {
+                    let mut ssid = String::new();
+                    let mut password = String::new();
+                    for (key, arg_data) in &command.matches.args {
+                        match key.as_str() {
+                            "ssid" => {
+                                ssid = arg_data
+                                    .value
+                                    .as_str()
+                                    .map(|s| s.to_string())
+                                    .expect("no ssid");
                             }
+                            "password" => {
+                                password = arg_data
+                                    .value
+                                    .as_str()
+                                    .map(|s| s.to_string())
+                                    .expect("no password");
+                            }
+                            _ => {}
                         }
-                        tauri::async_runtime::block_on(async {
-                            app.shell()
-                                .command("netsh")
-                                .args([
-                                    "wlan",
-                                    "set",
-                                    "hostednetwork",
-                                    "mode=allow",
-                                    &format!("ssid={}", ssid),
-                                    &format!("key={}", password),
-                                ])
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("netsh")
-                                .args(["wlan", "start", "hostednetwork"])
-                                .output()
-                                .await
-                                .unwrap();
-                        });
-                        app.handle().exit(0);
                     }
-                    Some(command) if command.name == "installdrivers" => {
-                        tauri::async_runtime::block_on(async {
-                            let resource_path = |file: &str| {
-                                app.path()
-                                    .resolve(file, BaseDirectory::Resource)
-                                    .unwrap()
-                                    .into_os_string()
-                                    .into_string()
-                                    .unwrap()
-                            };
-                            app.shell()
-                                .command("certutil")
-                                .args([
-                                    "-addstore",
-                                    "-f",
-                                    "root",
-                                    &resource_path("resources/ScreenExtend.cer"),
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("certutil")
-                                .args([
-                                    "-addstore",
-                                    "-f",
-                                    "TrustedPublisher",
-                                    &resource_path("resources/ScreenExtend.cer"),
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("nefconc")
-                                .args([
-                                    "--remove-device-node",
-                                    "--hardware-id",
-                                    "Root\\VirtualDisplayDriver",
-                                    "--class-guid",
-                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("nefconc")
-                                .args([
-                                    "--create-device-node",
-                                    "--class-name",
-                                    "Display",
-                                    "--class-guid",
-                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                    "--hardware-id",
-                                    "Root\\VirtualDisplayDriver",
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("nefconc")
-                                .args([
-                                    "--install-driver",
-                                    "--inf-path",
-                                    &resource_path("resources/VirtualDisplayDriver.inf"),
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                        });
-                        app.handle().exit(0);
-                    }
-                    Some(command) if command.name == "removedrivers" => {
-                        tauri::async_runtime::block_on(async {
-                            let resource_path = |file: &str| {
-                                app.path()
-                                    .resolve(file, BaseDirectory::Resource)
-                                    .unwrap()
-                                    .into_os_string()
-                                    .into_string()
-                                    .unwrap()
-                            };
-                            app.shell()
-                                .command("nefconc")
-                                .args([
-                                    "--remove-device-node",
-                                    "--hardware-id",
-                                    "Root\\VirtualDisplayDriver",
-                                    "--class-guid",
-                                    "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("nefconc")
-                                .args([
-                                    "--uninstall-driver",
-                                    "--inf-path",
-                                    &resource_path("resources/VirtualDisplayDriver.inf"),
-                                ])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("certutil")
-                                .args(["-delstore", "root", "ScreenExtend"])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                            app.shell()
-                                .command("certutil")
-                                .args(["-delstore", "TrustedPublisher", "ScreenExtend"])
-                                .current_dir(app.path().resource_dir().unwrap())
-                                .output()
-                                .await
-                                .unwrap();
-                        });
-                        app.handle().exit(0);
-                    }
-                    _ => {
-                        let lock_dir = app.path().app_local_data_dir().unwrap();
-                        let _ = std::fs::create_dir_all(&lock_dir);
-                        let lock_path = lock_dir.join(single_instance::LOCK_FILE);
-                        let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
+                    tauri::async_runtime::block_on(async {
+                        app.shell()
+                            .command("netsh")
+                            .args([
+                                "wlan",
+                                "set",
+                                "hostednetwork",
+                                "mode=allow",
+                                &format!("ssid={}", ssid),
+                                &format!("key={}", password),
+                            ])
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("netsh")
+                            .args(["wlan", "start", "hostednetwork"])
+                            .output()
+                            .await
+                            .unwrap();
+                    });
+                    app.handle().exit(0);
+                }
+                Some(command) if command.name == "installdrivers" => {
+                    tauri::async_runtime::block_on(async {
+                        let resource_path = |file: &str| {
+                            app.path()
+                                .resolve(file, BaseDirectory::Resource)
+                                .unwrap()
+                                .into_os_string()
+                                .into_string()
+                                .unwrap()
+                        };
+                        app.shell()
+                            .command("certutil")
+                            .args([
+                                "-addstore",
+                                "-f",
+                                "root",
+                                &resource_path("resources/ScreenExtend.cer"),
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("certutil")
+                            .args([
+                                "-addstore",
+                                "-f",
+                                "TrustedPublisher",
+                                &resource_path("resources/ScreenExtend.cer"),
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("nefconc")
+                            .args([
+                                "--remove-device-node",
+                                "--hardware-id",
+                                "Root\\VirtualDisplayDriver",
+                                "--class-guid",
+                                "4D36E968-E325-11CE-BFC1-08002BE10318",
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("nefconc")
+                            .args([
+                                "--create-device-node",
+                                "--class-name",
+                                "Display",
+                                "--class-guid",
+                                "4D36E968-E325-11CE-BFC1-08002BE10318",
+                                "--hardware-id",
+                                "Root\\VirtualDisplayDriver",
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("nefconc")
+                            .args([
+                                "--install-driver",
+                                "--inf-path",
+                                &resource_path("resources/VirtualDisplayDriver.inf"),
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                    });
+                    app.handle().exit(0);
+                }
+                Some(command) if command.name == "removedrivers" => {
+                    tauri::async_runtime::block_on(async {
+                        let resource_path = |file: &str| {
+                            app.path()
+                                .resolve(file, BaseDirectory::Resource)
+                                .unwrap()
+                                .into_os_string()
+                                .into_string()
+                                .unwrap()
+                        };
+                        app.shell()
+                            .command("nefconc")
+                            .args([
+                                "--remove-device-node",
+                                "--hardware-id",
+                                "Root\\VirtualDisplayDriver",
+                                "--class-guid",
+                                "4D36E968-E325-11CE-BFC1-08002BE10318",
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("nefconc")
+                            .args([
+                                "--uninstall-driver",
+                                "--inf-path",
+                                &resource_path("resources/VirtualDisplayDriver.inf"),
+                            ])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("certutil")
+                            .args(["-delstore", "root", "ScreenExtend"])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                        app.shell()
+                            .command("certutil")
+                            .args(["-delstore", "TrustedPublisher", "ScreenExtend"])
+                            .current_dir(app.path().resource_dir().unwrap())
+                            .output()
+                            .await
+                            .unwrap();
+                    });
+                    app.handle().exit(0);
+                }
+                _ => {
+                    let lock_dir = app.path().app_local_data_dir().unwrap();
+                    let _ = std::fs::create_dir_all(&lock_dir);
+                    let lock_path = lock_dir.join(single_instance::LOCK_FILE);
+                    let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
 
-                        let mut lock = single_instance::acquire_lock(&lock_path);
+                    let mut lock = single_instance::acquire_lock(&lock_path);
 
-                        if lock.is_none() {
-                            let quit_other = app
-                                .dialog()
-                                .message("ScreenExtend is already running.")
-                                .title("ScreenExtend")
-                                .buttons(MessageDialogButtons::OkCancelCustom(
-                                    "Quit running instance".into(),
-                                    "Show running instance".into(),
-                                ))
-                                .blocking_show();
+                    if lock.is_none() {
+                        let quit_other = app
+                            .dialog()
+                            .message("ScreenExtend is already running.")
+                            .title("ScreenExtend")
+                            .buttons(MessageDialogButtons::OkCancelCustom(
+                                "Quit running instance".into(),
+                                "Show running instance".into(),
+                            ))
+                            .blocking_show();
 
-                            if quit_other {
-                                single_instance::signal_running_instance(
-                                    &ctrl_path,
-                                    single_instance::Command::Quit,
-                                );
-                                lock = single_instance::wait_for_lock(
-                                    &lock_path,
-                                    std::time::Duration::from_secs(10),
-                                );
-                                if lock.is_none() {
-                                    std::process::exit(0);
-                                }
-                            } else {
-                                single_instance::signal_running_instance(
-                                    &ctrl_path,
-                                    single_instance::Command::Focus,
-                                );
+                        if quit_other {
+                            single_instance::signal_running_instance(
+                                &ctrl_path,
+                                single_instance::Command::Quit,
+                            );
+                            lock = single_instance::wait_for_lock(
+                                &lock_path,
+                                std::time::Duration::from_secs(10),
+                            );
+                            if lock.is_none() {
                                 std::process::exit(0);
                             }
+                        } else {
+                            single_instance::signal_running_instance(
+                                &ctrl_path,
+                                single_instance::Command::Focus,
+                            );
+                            std::process::exit(0);
                         }
+                    }
 
-                        if let Some(file) = lock {
-                            std::mem::forget(file);
-                        }
+                    if let Some(file) = lock {
+                        std::mem::forget(file);
+                    }
 
-                        logbus::attach(app.handle().clone());
-                        let window = tauri::WebviewWindowBuilder::new(
-                            app,
-                            "main".to_string(),
-                            tauri::WebviewUrl::App("index.html".into()),
-                        )
-                        .min_inner_size(1050.0, 650.0)
-                        .inner_size(1200.0, 675.0)
-                        .title("ScreenExtend")
-                        .resizable(true)
-                        .maximized(true)
-                        .build()?;
+                    logbus::attach(app.handle().clone());
+                    let window = tauri::WebviewWindowBuilder::new(
+                        app,
+                        "main".to_string(),
+                        tauri::WebviewUrl::App("index.html".into()),
+                    )
+                    .min_inner_size(1050.0, 650.0)
+                    .inner_size(1200.0, 675.0)
+                    .title("ScreenExtend")
+                    .resizable(true)
+                    .maximized(true)
+                    .build()?;
 
-                        focus_main_window(&window);
+                    focus_main_window(&window);
 
-                        if let Err(e) = single_instance::start_control_server(
-                            app.handle().clone(),
-                            ctrl_path,
-                            focus_main_window,
-                        ) {
-                            teprintln!("[single-instance] failed to start control server: {e}");
-                        }
+                    if let Err(e) = single_instance::start_control_server(
+                        app.handle().clone(),
+                        ctrl_path,
+                        focus_main_window,
+                    ) {
+                        teprintln!("[single-instance] failed to start control server: {e}");
                     }
                 }
             }

@@ -4,6 +4,7 @@ pub mod compatibility;
 pub mod device_reporter;
 pub mod hosted_network;
 pub mod networking;
+pub mod objc_exception;
 pub mod permissions;
 pub mod streamer;
 pub mod virtual_display;

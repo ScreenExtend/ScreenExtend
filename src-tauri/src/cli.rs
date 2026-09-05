@@ -122,12 +122,31 @@ Most commands accept --json for machine-readable output.
     );
 }
 
+fn user_args() -> Vec<std::ffi::OsString> {
+    std::env::args_os()
+        .skip(1)
+        .filter(|a| !a.to_string_lossy().starts_with("-psn_"))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn launched_without_terminal() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 0 && libc::isatty(libc::STDERR_FILENO) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launched_without_terminal() -> bool {
+    false
+}
+
 pub fn fast_path() {
-    if std::env::args_os().nth(1).is_none() {
+    let raw: Vec<String> = user_args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let Some(first) = raw.first().map(String::as_str) else {
         return;
-    }
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let first = raw[0].as_str();
+    };
     if first == "help" || raw.iter().any(|a| a == "-h" || a == "--help") {
         attach_console();
         print_help();
@@ -146,7 +165,7 @@ pub fn fast_path() {
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
-    if std::env::args_os().nth(1).is_none() {
+    if user_args().is_empty() {
         return Outcome::LaunchGui;
     }
     attach_console();
@@ -345,6 +364,9 @@ mod desktop {
         let matches = match app.cli().matches() {
             Ok(m) => m,
             Err(e) => {
+                if user_args().is_empty() || launched_without_terminal() {
+                    return Outcome::LaunchGui;
+                }
                 eprintln!("error: {e}");
                 eprintln!("Run `ScreenExtend --help` for usage.");
                 exit(2);

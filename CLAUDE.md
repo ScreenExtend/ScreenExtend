@@ -364,7 +364,8 @@ Cross-platform core, OS-independent:
   `AirPlayFallback`. `new_shared_controller()` is what `setup` calls; the chosen tier is
   reported to the UI as `CompatibilityReport.display_backend`. **Probe by class lookup, never by
   version number.**
-- `airplay/` — the **10.13–10.14.3 display tier**. A minimal fake AirPlay receiver
+- `airplay/` — the **pre-10.14.4 display tier**, below the supported floor now and kept
+  only as a safety net. A minimal fake AirPlay receiver
   (Bonjour via a hand-written `dns_sd.h` FFI, a hand-rolled RTSP/1.0 + HTTP/1.1 socket because
   hyper can parse neither, static `/fp-setup` tables, accept-and-discard for the H.264 stream)
   plus an Accessibility driver for the Displays menu extra. macOS creates the display; we only
@@ -569,8 +570,7 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   (requires Administrator; elevation via the `elevated-command` crate). Installer integration
   lives in `windows/hooks.nsh` (NSIS) and `windows/fragment.wxs` (WiX driver cleanup).
 - **macOS** uses the `tauri.macos.conf.json` overlay (passed with `--config`), which bundles
-  `resources/libopus.dylib` as its only resource and sets `minimumSystemVersion` 10.13 (Tauri's
-  own floor; below 10.14.4 displays come from the AirPlay fallback). The
+  `resources/libopus.dylib` as its only resource and sets `minimumSystemVersion` 10.15. The
   shipped dylib should be a universal (x86_64 + arm64) build — see `resources/PROVENANCE.md`.
   `src-tauri/Entitlements.plist` grants `com.apple.security.device.audio-input`, disables the
   sandbox, and adds the `com.apple.CG.virtual-display` mach-lookup temporary exception (needed by
@@ -594,7 +594,7 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `collect_commands!`.
 - Use `tprintln!`/`teprintln!`, not `println!`/`eprintln!`, in the Rust core.
 - Keep `std::sync::Mutex` critical sections short and never hold one across `.await`.
-- **No link-time references to macOS APIs newer than 10.13** — use `dlsym` / `AnyClass::get` /
+- **No link-time references to macOS APIs newer than 10.15** — use `dlsym` / `AnyClass::get` /
   `msg_send!`. An eagerly-bound symbol dyld cannot resolve kills the whole process before
   `main()`, so this is a load bug, not a missing feature. `extern static` constants count:
   two VideoToolbox property keys (`MaximizePowerEfficiency`, 10.14;
