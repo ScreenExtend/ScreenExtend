@@ -1,3 +1,19 @@
 allowBuilds:
   core-js-pure: true
   esbuild: true
+  sharp: true
+
+overrides:
+  react-router: ^7.14.1
+  postcss: '>=8.5.23'
+  minimatch@9: '>=9.0.7'
+  brace-expansion@2: '>=2.1.4'
+  picomatch: '>=4.0.4'
+  glob@10: '>=10.5.0'
+  yaml@2: '>=2.8.3'
+
+auditConfig:
+  ignoreGhsas:
+    - GHSA-r5fr-rjxr-66jc
+    - GHSA-f23m-r3pf-42rh
+    - GHSA-xxjr-mmjv-4gpg
