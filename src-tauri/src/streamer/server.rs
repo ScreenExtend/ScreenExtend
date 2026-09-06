@@ -1045,13 +1045,17 @@ async fn start_session(
     }
 
     let (closed_tx, closed_rx) = oneshot::channel();
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let answer = match webrtc_session::handle_whep_offer(
         req.sdp.clone(),
         &session.pipeline,
         ice_servers,
         Some(closed_tx),
-        Some(device_name.clone()),
-        control_enabled,
+        webrtc_session::InputParams {
+            device: Some(device_name.clone()),
+            control_enabled,
+            control_rx: Some(control_rx),
+        },
         audio_params,
     )
     .await
@@ -1088,6 +1092,10 @@ async fn start_session(
         .as_ref()
         .map(|s| session::arm_leave(s, client_ip));
 
+    if let Some(s) = state.config.sessions.as_ref() {
+        session::set_control_sender(s, client_ip, control_tx.clone());
+    }
+
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
             session::set_active_capture(
@@ -1122,6 +1130,10 @@ async fn start_session(
                 false
             }
         };
+
+        if let Some(s) = sessions.as_ref() {
+            session::clear_control_sender(s, &report_ip, &control_tx);
+        }
 
         let stop = sessions
             .as_ref()

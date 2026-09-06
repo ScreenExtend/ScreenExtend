@@ -30,6 +30,48 @@ html, body {
     -webkit-user-select: none;
 }
 
+#linkStatus {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    z-index: 12;
+    display: none;
+    align-items: center;
+    max-width: 82vw;
+    padding: .45rem .85rem .45rem .7rem;
+    border: 1px solid #3a3320;
+    border-radius: 999px;
+    background: rgba(20, 23, 29, 0.92);
+    color: #e6cf9a;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    transform: translateX(-50%);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+
+#linkStatus.show {
+    display: flex;
+}
+
+#linkStatus .spin {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    margin-right: .5rem;
+    border: 2px solid #4a4432;
+    border-top-color: #e6cf9a;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+
+#stage.stalled #video, #stage.stalled #canvas {
+    opacity: .45;
+    transition: opacity .25s ease;
+}
+
 #unmute {
     position: fixed;
     bottom: 16px;

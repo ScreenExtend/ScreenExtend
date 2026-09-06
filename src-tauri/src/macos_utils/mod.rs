@@ -254,6 +254,7 @@ pub fn get_device_audio_outputs(
 #[specta::specta]
 pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
     state.device_overrides.lock().unwrap().remove(&ip);
+    session::send_bye(&state.sessions, &ip, session::ByeReason::Kicked);
     session::bump_kick_epoch(&state.sessions, &ip);
     session::signal_leave(&state.sessions, &ip);
 }
@@ -269,6 +270,7 @@ pub fn set_device_banned(state: State<'_, AppState>, token: String, ip: String, 
     if banned {
         state.banned_devices.lock().unwrap().insert(key);
         if !ip.is_empty() {
+            session::send_bye(&state.sessions, &ip, session::ByeReason::Kicked);
             session::bump_kick_epoch(&state.sessions, &ip);
             session::signal_leave(&state.sessions, &ip);
         }

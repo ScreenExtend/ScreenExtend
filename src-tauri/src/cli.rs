@@ -512,6 +512,11 @@ mod desktop {
         let _ = rx.recv();
 
         println!("\nStopping…");
+        crate::streamer::session::broadcast_bye(
+            &state.sessions,
+            crate::streamer::session::ByeReason::HostExit,
+            crate::BYE_FLUSH_TIMEOUT,
+        );
         platform::remove_all_displays(&state.virtual_display);
         exit(0);
     }
