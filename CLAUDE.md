@@ -545,8 +545,8 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   The Rust side reads the version from `CARGO_PKG_VERSION` / Tauri package info at runtime —
   there is no hardcoded version literal in `src-tauri/src/`. Current version: **0.5.4**.
 - **CI is currently disabled.** `.github/workflows/ci.yml` was removed in commit `e1d5d28`
-  ("temporarily disable ci till further notice"); only `build-release.yml` and `dependabot.yml`
-  remain, so **nothing runs `cargo fmt`/`clippy`/`test` or `pnpm lint` automatically — run them
+  ("temporarily disable ci till further notice"); only `build-release.yml` remains,
+  so **nothing runs `cargo fmt`/`clippy`/`test` or `pnpm lint` automatically — run them
   locally before pushing.** (`README.md` still describes the old always-on CI; that paragraph is
   stale.)
 - **Release CI** (`.github/workflows/build-release.yml`) triggers on pushing a tag matching
@@ -557,8 +557,6 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   latest, and force-moves the `latest` git tag onto the released commit.
 - Auto-update: `tauri-plugin-updater` reads `latest.json` from the GitHub "latest" release
   (pubkey + endpoint in `tauri.conf.json`; `installMode: passive` on Windows).
-- Dependabot covers cargo, npm and GitHub Actions; expect a steady stream of `dependabot/*`
-  branches.
 
 ## Native resources, drivers & permissions
 
