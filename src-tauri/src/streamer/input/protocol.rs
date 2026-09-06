@@ -2,7 +2,7 @@
 
 use smol_str::SmolStr;
 
-// ─── Opcodes (§3.1) ─────────────────────────────────────────────────────────
+// opcodes
 pub mod op {
     pub const POINTER_DOWN: u8 = 0x01;
     pub const POINTER_UP: u8 = 0x02;
@@ -29,14 +29,20 @@ pub mod op {
     pub const PING: u8 = 0x60;
     pub const PONG: u8 = 0x61;
     pub const STATS: u8 = 0x62;
+    pub const BYE: u8 = 0x63;
 }
 
-// ─── Source codes (§3.2) ────────────────────────────────────────────────────
+pub mod bye {
+    pub const KICKED: u8 = 0x01;
+    pub const HOST_EXIT: u8 = 0x02;
+}
+
+// source codes
 pub const SRC_MOUSE: u8 = 0x00;
 pub const SRC_TOUCH: u8 = 0x01;
 pub const SRC_PEN: u8 = 0x02;
 
-// ─── Modifier bitmask (§3.4) ────────────────────────────────────────────────
+// modifier bitmask
 pub mod modmask {
     pub const SHIFT: u16 = 1 << 0;
     pub const CONTROL: u16 = 1 << 1;
@@ -47,7 +53,7 @@ pub mod modmask {
     pub const NUMLOCK: u16 = 1 << 6;
 }
 
-// ─── Buttons bitmask (§3.3, mirrors MouseEvent.buttons) ─────────────────────
+// buttons bitmask
 pub mod btn {
     pub const PRIMARY: u16 = 1 << 0; // left
     pub const SECONDARY: u16 = 1 << 1; // right
@@ -449,6 +455,10 @@ pub fn build_pong(t_ns: u64) -> [u8; 9] {
     out
 }
 
+pub fn build_bye(reason: u8) -> [u8; 2] {
+    [op::BYE, reason]
+}
+
 pub fn build_stats(received: u64, dropped: u64, contacts: u32, queue_depth: u32) -> [u8; 25] {
     let mut out = [0u8; 25];
     out[0] = op::STATS;
@@ -599,5 +609,12 @@ mod tests {
             u64::from_le_bytes(pong[1..9].try_into().unwrap()),
             123456789
         );
+    }
+
+    #[test]
+    fn bye_carries_its_reason() {
+        assert_eq!(build_bye(bye::KICKED), [op::BYE, bye::KICKED]);
+        assert_eq!(build_bye(bye::HOST_EXIT), [op::BYE, bye::HOST_EXIT]);
+        assert!(parse(&build_bye(bye::HOST_EXIT)).is_none());
     }
 }

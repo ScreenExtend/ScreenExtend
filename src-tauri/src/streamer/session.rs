@@ -12,6 +12,29 @@ pub struct LeaveSignal {
     pub notify: Notify,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByeReason {
+    Kicked,
+    HostExit,
+}
+
+impl ByeReason {
+    pub fn code(self) -> u8 {
+        match self {
+            ByeReason::Kicked => crate::streamer::input::protocol::bye::KICKED,
+            ByeReason::HostExit => crate::streamer::input::protocol::bye::HOST_EXIT,
+        }
+    }
+}
+
+pub struct ControlMsg {
+    pub reason: ByeReason,
+    pub sent: Option<std::sync::mpsc::Sender<()>>,
+}
+
+pub type ControlSender = tokio::sync::mpsc::UnboundedSender<ControlMsg>;
+pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ControlMsg>;
+
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub ip: String,
@@ -185,6 +208,7 @@ pub struct DeviceSessionState {
     pub session_seq: u64,
     pub live_display: Option<LiveDisplay>,
     pub leave: Option<Arc<LeaveSignal>>,
+    pub control: Option<ControlSender>,
     pub active_capture: Option<(u64, CaptureStopper)>,
     pub host_ip: Option<String>,
     pub audio_outputs: Vec<AudioOutput>,
@@ -200,6 +224,7 @@ impl std::fmt::Debug for DeviceSessionState {
             .field("session_seq", &self.session_seq)
             .field("live_display", &self.live_display)
             .field("leave_armed", &self.leave.is_some())
+            .field("control_armed", &self.control.is_some())
             .field(
                 "active_capture_seq",
                 &self.active_capture.as_ref().map(|(s, _)| *s),
@@ -230,6 +255,69 @@ pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
     if let Some(s) = signal {
         s.left.store(true, Ordering::SeqCst);
         s.notify.notify_waiters();
+    }
+}
+
+pub fn set_control_sender(sessions: &SharedSessions, ip: &str, tx: ControlSender) {
+    sessions
+        .lock()
+        .unwrap()
+        .entry(ip.to_string())
+        .or_default()
+        .control = Some(tx);
+}
+
+pub fn clear_control_sender(sessions: &SharedSessions, ip: &str, tx: &ControlSender) {
+    let mut map = sessions.lock().unwrap();
+    if let Some(state) = map.get_mut(ip) {
+        if state.control.as_ref().is_some_and(|c| c.same_channel(tx)) {
+            state.control = None;
+        }
+    }
+}
+
+pub fn send_bye(sessions: &SharedSessions, ip: &str, reason: ByeReason) -> bool {
+    send_bye_acked(sessions, ip, reason, None)
+}
+
+fn send_bye_acked(
+    sessions: &SharedSessions,
+    ip: &str,
+    reason: ByeReason,
+    sent: Option<std::sync::mpsc::Sender<()>>,
+) -> bool {
+    let tx = sessions
+        .lock()
+        .unwrap()
+        .get(ip)
+        .and_then(|s| s.control.clone());
+    match tx {
+        Some(tx) => tx.send(ControlMsg { reason, sent }).is_ok(),
+        None => false,
+    }
+}
+
+pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Duration) {
+    let ips: Vec<String> = sessions.lock().unwrap().keys().cloned().collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut queued = 0usize;
+    for ip in &ips {
+        if send_bye_acked(sessions, ip, reason, Some(tx.clone())) {
+            queued += 1;
+        }
+    }
+    drop(tx);
+    if queued == 0 {
+        return;
+    }
+    let deadline = Instant::now() + timeout;
+    for _ in 0..queued {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if rx.recv_timeout(left).is_err() {
+            break;
+        }
     }
 }
 

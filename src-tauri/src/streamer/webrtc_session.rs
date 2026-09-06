@@ -35,12 +35,18 @@ use super::bitrate::{estimate_from_loss, BitrateController, DEFAULT_MIN_BITRATE_
 use super::config::H264Profile;
 use super::input;
 use super::pipeline::Pipeline;
-use super::session::SharedDeviceOverrides;
+use super::session::{self, SharedDeviceOverrides};
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 const OPUS_FALLBACK_FMTP: &str = "minptime=5;useinbandfec=1;stereo=1;sprop-stereo=1";
 const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
+
+pub struct InputParams {
+    pub device: Option<String>,
+    pub control_enabled: bool,
+    pub control_rx: Option<session::ControlReceiver>,
+}
 
 #[derive(Clone)]
 pub struct AudioParams {
@@ -356,8 +362,7 @@ pub async fn handle_whep_offer(
     pipeline: &Pipeline,
     ice_servers: Vec<RTCIceServer>,
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    input_device: Option<String>,
-    control_enabled: bool,
+    input: InputParams,
     audio: Option<AudioParams>,
 ) -> Result<String> {
     let profile = pipeline.h264_profile;
@@ -381,9 +386,15 @@ pub async fn handle_whep_offer(
             .context("new_peer_connection")?,
     );
 
+    let InputParams {
+        device: input_device,
+        control_enabled,
+        control_rx,
+    } = input;
     let (input_tx, _input_join) = input::spawn(input_device);
     {
         let input_tx = input_tx.clone();
+        let control_rx = Arc::new(Mutex::new(control_rx));
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
@@ -392,8 +403,24 @@ pub async fn handle_whep_offer(
             let is_reliable = label == "reliable";
             let tx = input_tx.clone();
             let dc = Arc::clone(&dc);
+            let control_rx = Arc::clone(&control_rx);
             Box::pin(async move {
                 tprintln!("remote-input data channel open: {label}");
+                let waiting = is_reliable
+                    .then(|| control_rx.lock().unwrap().take())
+                    .flatten();
+                if let Some(mut rx) = waiting {
+                    let dc_ctl = Arc::clone(&dc);
+                    tokio::spawn(async move {
+                        while let Some(msg) = rx.recv().await {
+                            let frame = input::protocol::build_bye(msg.reason.code());
+                            let _ = dc_ctl.send(&Bytes::copy_from_slice(&frame)).await;
+                            if let Some(sent) = msg.sent {
+                                let _ = sent.send(());
+                            }
+                        }
+                    });
+                }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let tx = tx.clone();

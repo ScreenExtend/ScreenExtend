@@ -7,7 +7,7 @@
     WHEEL: 0x10, ZOOM: 0x11, KEY: 0x20, TEXT_INPUT: 0x21, COMPOSITION_UPDATE: 0x22,
     CLIPBOARD: 0x30, DRAG: 0x40, DROP: 0x41,
     FOCUS_STATE: 0x50, VISIBILITY: 0x51, RESIZE: 0x52, POINTERLOCK_STATE: 0x53,
-    MOUSE_DELTA: 0x54, PING: 0x60, PONG: 0x61, STATS: 0x62,
+    MOUSE_DELTA: 0x54, PING: 0x60, PONG: 0x61, STATS: 0x62, BYE: 0x63,
   };
   const SRC = { mouse: 0x00, touch: 0x01, pen: 0x02 };
   const te = new TextEncoder();
@@ -260,10 +260,14 @@
   function onReliableMessage(ev) {
     try {
       const dv = new DataView(ev.data);
-      if (dv.getUint8(0) === OP.PONG && dv.byteLength >= 9) {
+      const op = dv.getUint8(0);
+      if (op === OP.PONG && dv.byteLength >= 9) {
         const echoed = dv.getBigUint64(1, true);
         const now = BigInt(Math.round(performance.now() * 1e6));
         lastRttMs = Number(now - echoed) / 1e6;
+        if (window.SEHealth) SEHealth.alive();
+      } else if (op === OP.BYE) {
+        if (window.SEHealth) SEHealth.bye(dv.byteLength >= 2 ? dv.getUint8(1) : 0);
       }
     } catch (_) {}
   }

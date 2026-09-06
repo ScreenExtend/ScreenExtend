@@ -34,6 +34,8 @@ use linux_utils::*;
 
 pub use streamer::session::{AudioOutput, AudioOutputsReport};
 
+pub const BYE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct DeviceAudioOutputs {
     pub ip: String,
@@ -208,6 +210,11 @@ impl Device {
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
+        streamer::session::broadcast_bye(
+            &state.sessions,
+            streamer::session::ByeReason::HostExit,
+            BYE_FLUSH_TIMEOUT,
+        );
         remove_all_displays(&state.virtual_display);
     }
     app.exit(0);

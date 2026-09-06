@@ -94,6 +94,7 @@
         <div id="stage">
             <canvas id="canvas"></canvas>
             <video id="video" autoplay playsinline muted tabindex="-1" disablepictureinpicture disableremoteplayback controlslist="nodownload noplaybackrate nofullscreen noremoteplayback"></video>
+            <div id="linkStatus" role="status" aria-live="polite"><span class="spin"></span><span id="linkStatusText"></span></div>
             <button id="unmute">Tap to start playback</button>
             <input id="imeSink" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" style="position: fixed; left: -9999px; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0;" />
         </div>
@@ -159,6 +160,8 @@
             const compatModal = document.getElementById('compatModal');
             const errEl = document.getElementById('errorMessage');
             const loadingEl = document.getElementById('loading');
+            const linkStatusEl = document.getElementById('linkStatus');
+            const linkStatusText = document.getElementById('linkStatusText');
 
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
@@ -186,6 +189,76 @@
             let kicked = false;
             let compatBlocked = false;
             let fullscreenMode = true;
+
+            const PROBE_OK_MS = 1000;
+            const PROBE_FAST_MS = 300;
+            const DEGRADE_AFTER_MS = 1200;
+            const DROP_AFTER_MS = 5000;
+            const REFUSED_MS = 400;
+            const REFUSED_STREAK = 3;
+
+            const BYE_HOST_EXIT = 0x02;
+
+            let lastAliveAt = 0;
+            let degraded = false;
+            let refusedStreak = 0;
+
+            function nowMs() { return (window.performance && performance.now) ? performance.now() : Date.now(); }
+
+            function showLinkStatus(msg) {
+                linkStatusText.textContent = msg || '';
+                linkStatusEl.classList.toggle('show', !!msg);
+                stage.classList.toggle('stalled', !!msg);
+            }
+
+            function markAlive() {
+                lastAliveAt = nowMs();
+                refusedStreak = 0;
+                if (degraded) {
+                    degraded = false;
+                    showLinkStatus('');
+                }
+            }
+
+            function enterDegraded() {
+                if (!isLive || kicked || reconfiguring) return;
+                degraded = true;
+                showLinkStatus(navigator.onLine === false ? 'Offline — waiting for your network' : 'Reconnecting…');
+            }
+
+            function evaluateLink() {
+                if (!isLive || kicked || reconfiguring) return;
+                const silent = nowMs() - lastAliveAt;
+                if (silent >= DEGRADE_AFTER_MS) enterDegraded();
+                if (navigator.onLine === false) return;
+                if (!degraded) return;
+                if (refusedStreak >= REFUSED_STREAK) {
+                    linkLost('The host is no longer reachable.');
+                } else if (silent >= DROP_AFTER_MS) {
+                    linkLost('Disconnected, reconnect to continue.');
+                }
+            }
+
+            function linkLost(msg) {
+                if (kicked) return;
+                teardownSession();
+                usingFallback = false;
+                showLinkStatus('');
+                showError(msg);
+            }
+
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') markAlive();
+            });
+
+            window.SEHealth = {
+                alive: markAlive,
+                bye(code) {
+                    kickDevice(code === BYE_HOST_EXIT
+                        ? 'The host stopped sharing this screen.'
+                        : 'You have been removed from this session.');
+                },
+            };
 
             function showError(msg) {
                 errEl.textContent = msg || '';
@@ -229,45 +302,73 @@
             }
 
             async function startReconfigPoll() {
+                markAlive();
                 if (reconfigPoll) return;
                 if (reconfigEpoch === null) {
                     try {
                         const r = await fetch('/reconfig');
-                        if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; }
+                        if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; markAlive(); }
                     } catch (_) {}
                 }
-                reconfigPoll = setInterval(async () => {
-                    if (reconfiguring || kicked) return;
-                    try {
-                        const r = await fetch('/reconfig');
-                        if (!r.ok) return;
-                        const j = await r.json();
-                        if (typeof j.audioSink === 'string') {
-                            try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) {}
-                        }
-                        if (kickEpoch !== null && j.kick !== kickEpoch) {
-                            kickEpoch = j.kick;
-                            kickDevice();
-                            return;
-                        }
-                        kickEpoch = j.kick;
-                        if (reconfigEpoch !== null && j.epoch !== reconfigEpoch) {
-                            reconfigEpoch = j.epoch;
-                            reconfigure();
-                        } else {
-                            reconfigEpoch = j.epoch;
-                        }
-                    } catch (_) {}
-                }, 1000);
+                armProbe();
             }
 
-            function kickDevice() {
+            function armProbe() {
+                if (reconfigPoll || kicked || reconfiguring || !isLive) return;
+                const suspect = degraded || refusedStreak > 0;
+                reconfigPoll = setTimeout(probeTick, suspect ? PROBE_FAST_MS : PROBE_OK_MS);
+            }
+
+            async function probeTick() {
+                reconfigPoll = null;
+                if (kicked || reconfiguring || !isLive) return;
+                const startedAt = nowMs();
+                let payload = null;
+                let unreachable = false;
+                try {
+                    const r = await fetch('/reconfig');
+                    if (r.ok) payload = await r.json();
+                    else if (r.status >= 502 && r.status <= 504) unreachable = true;
+                } catch (_) {
+                    unreachable = nowMs() - startedAt < REFUSED_MS;
+                }
+                if (kicked || reconfiguring || !isLive) return;
+                if (payload) {
+                    markAlive();
+                    applyReconfig(payload);
+                } else {
+                    refusedStreak = unreachable ? refusedStreak + 1 : 0;
+                    evaluateLink();
+                }
+                armProbe();
+            }
+
+            function applyReconfig(j) {
+                if (typeof j.audioSink === 'string') {
+                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) {}
+                }
+                if (kickEpoch !== null && j.kick !== kickEpoch) {
+                    kickEpoch = j.kick;
+                    kickDevice();
+                    return;
+                }
+                kickEpoch = j.kick;
+                if (reconfigEpoch !== null && j.epoch !== reconfigEpoch) {
+                    reconfigEpoch = j.epoch;
+                    reconfigure();
+                } else {
+                    reconfigEpoch = j.epoch;
+                }
+            }
+
+            function kickDevice(msg) {
                 if (kicked) return;
                 kicked = true;
                 teardownSession();
                 isLive = false;
                 stopLock();
-                showError('You have been removed from this session.');
+                showLinkStatus('');
+                showError(msg || 'You have been removed from this session.');
             }
 
             function reconfigure() {
@@ -625,7 +726,7 @@
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
-                if (reconfigPoll) { clearInterval(reconfigPoll); reconfigPoll = null; }
+                if (reconfigPoll) { clearTimeout(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
                 try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
                 try { if (pc) pc.close(); } catch (_) {}
@@ -657,6 +758,7 @@
                 const bytesAdvanced = knowBytes && bytes !== lastBytes;
                 lastRendered = n;
                 if (knowBytes) lastBytes = bytes;
+                if (rendersAdvanced || bytesAdvanced) markAlive();
                 if (rendersAdvanced) { renderStalls = 0; return; }
                 if (bytesAdvanced) {
                     if (++renderStalls >= 2) fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
@@ -832,18 +934,15 @@
                         if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
                             onStreamLive();
                         } else if (s === 'failed') {
-                            teardownSession();
-                            usingFallback = false;
-                            showError('Connection failed.');
+                            linkLost('Connection failed.');
                         }
                     };
                     pc.onconnectionstatechange = () => {
                         if (pc !== localPc || reconfiguring) return;
-                        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                            teardownSession();
-                            usingFallback = false;
-                            showError('Disconnected, reconnect to continue.');
-                        }
+                        const s = pc.connectionState;
+                        if (s === 'connected') markAlive();
+                        else if (s === 'disconnected') enterDegraded();
+                        else if (s === 'failed') linkLost('Disconnected, reconnect to continue.');
                     };
 
                     const offer = await pc.createOffer();
@@ -1270,6 +1369,9 @@
                 fullscreenMode = fullscreenModeInput.checked;
 
                 showError('');
+                showLinkStatus('');
+                degraded = false;
+                refusedStreak = 0;
                 kicked = false;
                 leaveSent = false;
                 usingFallback = false;
