@@ -41,6 +41,55 @@ reports `false` anywhere — the outcome the Apple Silicon question hangs on —
 the single most valuable result in this document, and the rest of the script does not
 apply to that machine.
 
+## What the 10.15.8 box has now answered
+
+The AP was started here after all, by running the measurement binary detached with a watchdog that
+restores the radio — the dev box's only network is the Wi-Fi interface the AP takes, so every
+remote session drops for about a minute. `docs/manual-tests/macos-hosted-network.md` §8 has the
+script. `macos_utils::hosted_network::tests::measure_hostap_start`, macOS 10.15.8 Intel, `en3`,
+run twice with identical results:
+
+```
+backend: HostApSpi
+channel 36 (5 GHz)
+interface Some("en3"), station address before the start Some(172.16.11.81)
+securityType 1024 (unconfirmed): accepted=false in 2.13s
+securityType  512 (unconfirmed): accepted=false in 2.08s
+securityType  256 (unconfirmed): accepted=false in 2.07s
+securityType  128 (unconfirmed): accepted=true  in 2.21s, ap_mode=true at 2.21s
+holding 'ScreenExtend-Measure' up for 45s
+  t+ 5s mode_is_ap=true ipv4=None
+  …
+  t+45s mode_is_ap=true ipv4=None
+```
+
+Three things, and the second is the important one.
+
+1. **`securityType 128` is accepted and brings the radio to AP mode in 2.21 s.** It is the first
+   new HostAP security constant this project has found, and it is outside the `[-127, 127]` window
+   the 2012 sweep covered — which is exactly why the shipped ladder starts at 1024 and works down.
+   1024, 512 and 256 are each refused, taking ~2.1 s to say so.
+
+2. **Nothing serves DHCP.** With the AP up and `interfaceMode()` reading HostAP for 45 s straight,
+   `en3` held no IPv4 address of its own at any point. So on this floor
+   `startHostAPModeWithSSID:securityType:channel:password:error:` brings up a *radio* and not a
+   *network*: a client can see the SSID, and if it associates it gets no lease and cannot reach
+   the host. This is the concrete shape of "slow and randomly fails", and it is why
+   `startHostAPMode:` (the no-argument variant, which plausibly reads the Internet Sharing
+   preferences and would therefore get `bootpd` and NAT with it) is the next thing to try — see §9.
+
+3. **The station address survives the switch.** At t+2.2 s, with the interface already in HostAP
+   mode, `getifaddrs` still reported `172.16.11.81` — the address of the network the Mac had just
+   left. A verification that accepts it reports the AP as working on the old LAN address, so
+   `wait_for_ipv4` now takes the pre-start address and refuses it.
+
+**Not established here:** what security `128` advertises. That needs a scan from a second device
+while the AP is up. A `netsh wlan show networks mode=bssid` from the Windows box during the 45 s
+window did not surface the SSID, which is inconclusive rather than negative — Windows serves
+cached scan results and will not force a fresh scan while associated. Since the AP serves no DHCP,
+a client could not join regardless of what it advertises, so (2) is the blocking question and this
+is the one after it.
+
 ## What "correct" means
 
 | Situation | Required behaviour |
@@ -166,3 +215,55 @@ practice — which is itself the result worth recording.
 After every case: stop the hosted network from the app and confirm
 `stop_hosted_network` returns true, `interfaceMode()` is back to Station, and the Mac
 rejoins its normal Wi-Fi network without the user touching the menu bar.
+
+## 8. Running the AP on a box whose only network is the Wi-Fi interface
+
+The dev box has one Wi-Fi interface and no Ethernet, so starting the AP drops every SSH session.
+The measurement still runs, detached, with two safeguards: the test binary is invoked **directly**
+rather than through cargo (so no build can start while the box is unreachable, and no shared cargo
+lock is held), and a watchdog restores the radio whether or not the measurement finishes.
+
+```sh
+# Build first, while the box is still reachable.
+cargo test --lib --no-run          # note the "Executable unittests" path it prints
+
+cat > /tmp/hostap.sh <<'SH'
+#!/bin/sh
+LOG=/tmp/hostap.log; IFACE=en3; BIN=<the path cargo printed>
+: > $LOG; rm -f /tmp/hostap.done
+restore() {
+  /usr/sbin/networksetup -setairportpower $IFACE off; sleep 4
+  /usr/sbin/networksetup -setairportpower $IFACE on;  sleep 25
+  ifconfig $IFACE | grep 'inet ' >> $LOG
+}
+( sleep 260; [ -f /tmp/hostap.done ] || { pkill -f "$BIN"; restore; } ) &
+SCREENEXTEND_HOSTAP_HOLD_SECS=45 $BIN --ignored --nocapture --test-threads 1   measure_hostap_start >> $LOG 2>&1
+touch /tmp/hostap.done
+restore
+SH
+chmod +x /tmp/hostap.sh
+nohup /bin/sh /tmp/hostap.sh > /dev/null 2>&1 < /dev/null &
+```
+
+Reconnect after about ninety seconds and read `/tmp/hostap.log`. `networksetup -setairportpower`
+needs no admin rights, and macOS rejoins its known network from the keychain on its own; the power
+cycle is belt and braces. Use `measure_hostap_start` (the shipped ladder, stops at the first
+success) rather than `sweep_security_types` (75 values, up to ten minutes off the network) unless
+the sweep is the point.
+
+## 9. The two HostAP surfaces nothing has ever called
+
+`report_hostap_surface` reports `startHostAPMode:`, `enableHostAPMode` and `disableHostAPMode` all
+present on 10.15.8, and nothing in the tree calls any of them. Given §"What the 10.15.8 box has now
+answered" (2) — the SSID-taking variant brings up a radio with no DHCP behind it — these are the
+most valuable remaining experiment in this document:
+
+1. Configure Internet Sharing in System Preferences (share from Ethernet to Wi-Fi), then call
+   `startHostAPMode:` with no SSID and no security type. Record whether the interface gets an
+   address, whether `bootpd` starts, and what the resulting network advertises.
+2. Try `enableHostAPMode` followed by `startHostAPModeWithSSID:…`, in case the pair is a
+   prepare/commit sequence and the SSID variant alone is only half of it.
+3. In both cases hold the AP up and associate a phone. An address on the client is the answer.
+
+If (1) works, the shipping path should probably be "configure sharing, then `startHostAPMode:`",
+with the SSID variant kept only for machines where that fails.
