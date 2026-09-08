@@ -1,5 +1,11 @@
-use objc2::msg_send;
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use objc2::rc::Retained;
+use objc2::runtime::Sel;
+use objc2::{msg_send, sel};
 use objc2_core_wlan::{CWChannel, CWChannelBand, CWInterface, CWInterfaceMode, CWWiFiClient};
 use objc2_foundation::{NSData, NSError, NSString};
 use tauri::{AppHandle, State};
@@ -7,12 +13,114 @@ use tauri_specta::Event;
 
 use crate::macos_utils::AppState;
 
+/// `securityType:` values for the private HostAP SPI.
+///
+/// 2 (open) and 16 (WEP) are the only two values ever confirmed, and they come from a 2012 sweep
+/// that only covered [-127, 127] — so nothing at or above 128 has ever been tried on any macOS.
+/// The candidates below are guesses ordered most-preferred first; the first one that both returns
+/// YES and brings the radio up is remembered for the rest of the process. Override the whole
+/// ladder with `SCREENEXTEND_HOSTAP_SECURITY=<n>` to sweep by hand on a machine we do not have.
 const SECURITY_OPEN: u64 = 2;
 const SECURITY_WEP: u64 = 16;
+const SECURED_CANDIDATES: &[u64] = &[1024, 512, 256, 128, 64, 32, SECURITY_WEP];
+
+/// `CWIBSSModeSecurity`: the deprecated public IBSS API offers open, WEP-40 and WEP-104 and
+/// nothing else.
+const IBSS_SECURITY_NONE: u64 = 0;
+const IBSS_SECURITY_WEP104: u64 = 2;
+
+/// 5 GHz first, because a 1080p60 stream does not fit comfortably in a crowded HT20 2.4 GHz
+/// channel. 44 and 149 are omitted deliberately: with 6 they are AWDL's three social channels,
+/// where every nearby Apple device parks its radio for AirDrop/Handoff discovery.
+const PREFERRED_5GHZ_CHANNELS: [isize; 6] = [36, 40, 48, 153, 157, 161];
+/// 2.4 GHz fallback. 11 rather than 6 for the same reason.
 const PREFERRED_CHANNEL: isize = 11;
+
+/// WPA-class passphrases are 8-63 characters; WEP-104 wants 13 ASCII. We accept the WPA floor and
+/// let the SPI reject what it cannot use.
+const MIN_PASSWORD_LEN: usize = 8;
+
+const MODE_SETTLE_TIMEOUT: Duration = Duration::from_millis(2500);
+const DHCP_SETTLE_TIMEOUT: Duration = Duration::from_millis(6000);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostedNetworkBackend {
+    /// The private CoreWLAN `startHostAPModeWithSSID:securityType:channel:password:error:`.
+    HostApSpi,
+    /// The deprecated public `startIBSSModeWithSSID:security:channel:password:error:`.
+    /// 2.4 GHz, 802.11g rates, open or WEP only.
+    Ibss,
+    /// Neither exists on this Mac: the user has to bring their own router.
+    Unsupported,
+}
+
+impl HostedNetworkBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostedNetworkBackend::HostApSpi => "HostAP",
+            HostedNetworkBackend::Ibss => "IBSS",
+            HostedNetworkBackend::Unsupported => "Unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HostedNetworkStatus {
+    pub backend: Option<&'static str>,
+    pub ssid: String,
+    pub channel: Option<isize>,
+    pub band: Option<&'static str>,
+    pub security: Option<String>,
+    /// The platform accepted the start request.
+    pub advertised: bool,
+    /// The host holds a routable IPv4 on the AP interface, i.e. `bootpd` is serving.
+    pub host_ipv4: Option<Ipv4Addr>,
+}
+
+fn status() -> &'static Mutex<HostedNetworkStatus> {
+    static STATUS: OnceLock<Mutex<HostedNetworkStatus>> = OnceLock::new();
+    STATUS.get_or_init(|| Mutex::new(HostedNetworkStatus::default()))
+}
+
+pub fn hosted_network_status() -> HostedNetworkStatus {
+    status().lock().unwrap().clone()
+}
+
+/// Bumped on every start and stop; the liveness watcher exits when its generation is stale.
+static WATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The `securityType:` value that last brought a secured AP up on this machine, so the guessing
+/// ladder is walked at most once per process.
+static KNOWN_SECURED_TYPE: OnceLock<u64> = OnceLock::new();
+
+fn sel_start_host_ap() -> Sel {
+    sel!(startHostAPModeWithSSID:securityType:channel:password:error:)
+}
+
+fn sel_stop_host_ap() -> Sel {
+    sel!(stopHostAPMode)
+}
+
+fn sel_start_ibss() -> Sel {
+    sel!(startIBSSModeWithSSID:security:channel:password:error:)
+}
+
+fn sel_stop_ibss() -> Sel {
+    sel!(stopIBSSMode)
+}
+
+fn responds(interface: &CWInterface, selector: Sel) -> bool {
+    unsafe { msg_send![interface, respondsToSelector: selector] }
+}
 
 fn wifi_interface() -> Option<Retained<CWInterface>> {
     unsafe { CWWiFiClient::sharedWiFiClient().interface() }
+}
+
+fn interface_bsd_name(interface: &CWInterface) -> Option<String> {
+    unsafe { interface.interfaceName() }.map(|n| n.to_string())
 }
 
 #[tauri::command]
@@ -33,15 +141,85 @@ pub fn turn_on_wifi() -> bool {
     unsafe { interface.setPower_error(true) }.is_ok()
 }
 
-const PREFERRED_5GHZ_CHANNELS: [isize; 4] = [36, 40, 44, 48];
+/// Which mechanism this Mac can actually use to create a network, decided by asking the live
+/// `CWInterface` whether it implements the selector — never by an OS version. A bare `msg_send!`
+/// to a selector the class does not implement raises an Obj-C exception through a non-unwinding
+/// Rust frame, which aborts the process, so this probe is load-bearing rather than cosmetic.
+pub fn probe_hosted_network_backend() -> HostedNetworkBackend {
+    static CACHED: OnceLock<HostedNetworkBackend> = OnceLock::new();
+    if let Some(cached) = CACHED.get() {
+        return *cached;
+    }
+    // No interface yet (radio hard-off, no Wi-Fi hardware) is not a verdict — do not cache it.
+    let Some(interface) = wifi_interface() else {
+        return HostedNetworkBackend::Unsupported;
+    };
+    let host_ap = responds(&interface, sel_start_host_ap());
+    let ibss = responds(&interface, sel_start_ibss());
+    let backend = if host_ap {
+        HostedNetworkBackend::HostApSpi
+    } else if ibss {
+        HostedNetworkBackend::Ibss
+    } else {
+        HostedNetworkBackend::Unsupported
+    };
+    let backend = *CACHED.get_or_init(|| backend);
+    tprintln!(
+        "[hosted-network] backend probe: {} (startHostAPMode… {}, startIBSSMode… {})",
+        backend.as_str(),
+        if host_ap { "present" } else { "absent" },
+        if ibss { "present" } else { "absent" }
+    );
+    backend
+}
+
+fn channel_band(channel: &CWChannel) -> &'static str {
+    match unsafe { channel.channelBand() } {
+        CWChannelBand::Band5GHz => "5 GHz",
+        CWChannelBand::Band2GHz => "2.4 GHz",
+        _ => "unknown band",
+    }
+}
+
+fn channel_override() -> Option<isize> {
+    std::env::var("SCREENEXTEND_HOSTAP_CHANNEL")
+        .ok()?
+        .trim()
+        .parse::<isize>()
+        .ok()
+}
+
+fn channel_numbered(interface: &CWInterface, number: isize) -> Option<Retained<CWChannel>> {
+    let channels = unsafe { interface.supportedWLANChannels() }?;
+    channels
+        .iter()
+        .find(|c| unsafe { c.channelNumber() } == number)
+}
 
 fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
+    if let Some(forced) = channel_override() {
+        match channel_numbered(interface, forced) {
+            Some(channel) => {
+                tprintln!(
+                    "[hosted-network] using channel {forced} from SCREENEXTEND_HOSTAP_CHANNEL"
+                );
+                return Some(channel);
+            }
+            None => teprintln!(
+                "[hosted-network] SCREENEXTEND_HOSTAP_CHANNEL={forced} is not supported by this \
+                 interface; falling back to the preferred list"
+            ),
+        }
+    }
+
     let channels = unsafe { interface.supportedWLANChannels() }?;
 
-    for channel in channels.iter() {
-        let is_5ghz = unsafe { channel.channelBand() } == CWChannelBand::Band5GHz;
-        if is_5ghz && PREFERRED_5GHZ_CHANNELS.contains(&unsafe { channel.channelNumber() }) {
-            return Some(channel);
+    for wanted in PREFERRED_5GHZ_CHANNELS {
+        for channel in channels.iter() {
+            let is_5ghz = unsafe { channel.channelBand() } == CWChannelBand::Band5GHz;
+            if is_5ghz && unsafe { channel.channelNumber() } == wanted {
+                return Some(channel);
+            }
         }
     }
 
@@ -56,17 +234,35 @@ fn pick_channel(interface: &CWInterface) -> Option<Retained<CWChannel>> {
     fallback
 }
 
-fn try_start_host_ap(
+fn security_override() -> Option<u64> {
+    std::env::var("SCREENEXTEND_HOSTAP_SECURITY")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn open_fallback_allowed() -> bool {
+    !matches!(
+        std::env::var("SCREENEXTEND_HOSTAP_ALLOW_OPEN").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    )
+}
+
+fn send_start_host_ap(
     interface: &CWInterface,
     channel: &CWChannel,
     ssid: &str,
+    security_type: u64,
     password: Option<&str>,
 ) -> bool {
+    if !responds(interface, sel_start_host_ap()) {
+        teprintln!("[hosted-network] startHostAPMode… is not implemented on this Mac");
+        return false;
+    }
+
     let ssid_data = NSData::with_bytes(ssid.as_bytes());
-    let (security_type, password_obj) = match password {
-        Some(pw) => (SECURITY_WEP, Some(NSString::from_str(pw))),
-        None => (SECURITY_OPEN, None),
-    };
+    let password_obj = password.map(NSString::from_str);
     let password_ptr: *const NSString = match &password_obj {
         Some(pw) => Retained::as_ptr(pw),
         None => std::ptr::null(),
@@ -88,40 +284,309 @@ fn try_start_host_ap(
         let detail = unsafe { error.as_ref() }
             .map(|e| e.localizedDescription().to_string())
             .unwrap_or_else(|| "unknown error".to_string());
-        teprintln!(
-            "[hosted-network] startHostAPMode (secured={}) failed: {detail}",
-            password.is_some()
-        );
+        tprintln!("[hosted-network] securityType {security_type} rejected: {detail}");
     }
     success
 }
 
-fn try_start_on_channel(
-    interface: &objc2_core_wlan::CWInterface,
-    channel: &CWChannel,
-    name: &str,
-    password: &str,
-    had_password: bool,
-    fell_back: &mut bool,
-    app: &tauri::AppHandle,
+fn send_start_ibss(
+    interface: &CWInterface,
+    channel_number: u64,
+    ssid: &str,
+    security: u64,
+    password: Option<&str>,
 ) -> bool {
-    if had_password && try_start_host_ap(interface, channel, name, Some(password)) {
-        return true;
+    if !responds(interface, sel_start_ibss()) {
+        return false;
     }
-    let started_open = try_start_host_ap(interface, channel, name, None);
-    if started_open && had_password {
-        *fell_back = true;
-        let _ = crate::HostedNetworkNoPassword.emit(app);
+
+    let ssid_data = NSData::with_bytes(ssid.as_bytes());
+    let password_obj = password.map(NSString::from_str);
+    let password_ptr: *const NSString = match &password_obj {
+        Some(pw) => Retained::as_ptr(pw),
+        None => std::ptr::null(),
+    };
+
+    let mut error: *mut NSError = std::ptr::null_mut();
+    let success: bool = unsafe {
+        msg_send![
+            interface,
+            startIBSSModeWithSSID: &*ssid_data,
+            security: security,
+            channel: channel_number,
+            password: password_ptr,
+            error: &mut error,
+        ]
+    };
+
+    if !success {
+        let detail = unsafe { error.as_ref() }
+            .map(|e| e.localizedDescription().to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        tprintln!("[hosted-network] IBSS start rejected: {detail}");
     }
-    started_open
+    success
 }
 
 fn stop_host_ap_mode() {
+    WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
     if let Some(interface) = wifi_interface() {
-        unsafe {
-            let _: () = msg_send![&*interface, stopHostAPMode];
+        if responds(&interface, sel_stop_host_ap()) {
+            unsafe {
+                let _: () = msg_send![&*interface, stopHostAPMode];
+            }
+        }
+        if responds(&interface, sel_stop_ibss()) {
+            unsafe {
+                let _: () = msg_send![&*interface, stopIBSSMode];
+            }
         }
     }
+    *status().lock().unwrap() = HostedNetworkStatus::default();
+}
+
+fn interface_mode_is_host_ap(interface: &CWInterface) -> bool {
+    let mode = unsafe { interface.interfaceMode() };
+    mode == CWInterfaceMode::HostAP || mode == CWInterfaceMode::IBSS
+}
+
+/// A start that returned YES has told us nothing about the radio. Wait for the interface to enter
+/// AP mode, then for the host to hold a routable IPv4 on it — which is what proves `bootpd` came
+/// up and a client will get a lease.
+fn verify_ap_up(interface: &CWInterface) -> (bool, Option<Ipv4Addr>) {
+    let mode_deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
+    let mut mode_ok = false;
+    loop {
+        if interface_mode_is_host_ap(interface) {
+            mode_ok = true;
+            break;
+        }
+        if Instant::now() >= mode_deadline {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    if !mode_ok {
+        return (false, None);
+    }
+
+    let Some(name) = interface_bsd_name(interface) else {
+        return (true, None);
+    };
+    let ip_deadline = Instant::now() + DHCP_SETTLE_TIMEOUT;
+    loop {
+        if let Some(ip) = super::networking::interface_ipv4(&name) {
+            return (true, Some(ip));
+        }
+        if Instant::now() >= ip_deadline {
+            return (true, None);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Notice an AP that goes away on its own — a radio reset, a Wi-Fi mode change from the menu bar,
+/// or the OS reclaiming the interface. Without this the dashboard keeps a green light on a dead AP.
+fn watch_liveness(app: AppHandle, generation: u64) {
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        loop {
+            std::thread::sleep(WATCH_INTERVAL);
+            if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            let still_up = wifi_interface()
+                .map(|i| interface_mode_is_host_ap(&i))
+                .unwrap_or(false);
+            if still_up {
+                continue;
+            }
+            if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            let ssid = status().lock().unwrap().ssid.clone();
+            teprintln!(
+                "[hosted-network] '{ssid}' is no longer in AP mode — the OS or the radio dropped it"
+            );
+            *status().lock().unwrap() = HostedNetworkStatus::default();
+            if let Some(state) = app.try_state::<AppState>() {
+                *state.hosted_network_running.lock().unwrap() = false;
+                *state.stop_hosted_network.lock().unwrap() = None;
+            }
+            return;
+        }
+    });
+}
+
+struct Attempt {
+    security: u64,
+    label: String,
+    password: Option<String>,
+}
+
+fn secured_attempts(password: &str) -> Vec<Attempt> {
+    if let Some(forced) = security_override() {
+        return vec![Attempt {
+            security: forced,
+            label: format!("securityType {forced} (SCREENEXTEND_HOSTAP_SECURITY)"),
+            password: Some(password.to_string()),
+        }];
+    }
+    if let Some(&known) = KNOWN_SECURED_TYPE.get() {
+        return vec![Attempt {
+            security: known,
+            label: format!("securityType {known} (previously accepted)"),
+            password: Some(password.to_string()),
+        }];
+    }
+    SECURED_CANDIDATES
+        .iter()
+        .map(|&security| Attempt {
+            security,
+            label: if security == SECURITY_WEP {
+                "securityType 16 (WEP — crackable, and modern phones warn about it)".to_string()
+            } else {
+                format!("securityType {security} (unconfirmed)")
+            },
+            password: Some(password.to_string()),
+        })
+        .collect()
+}
+
+struct StartOutcome {
+    channel: isize,
+    band: &'static str,
+    security: String,
+    host_ipv4: Option<Ipv4Addr>,
+}
+
+/// Try one (channel, security) pair and only report success once the radio agrees.
+fn try_attempt(
+    interface: &CWInterface,
+    channel: &CWChannel,
+    ssid: &str,
+    attempt: &Attempt,
+) -> Option<Option<Ipv4Addr>> {
+    let number = unsafe { channel.channelNumber() };
+    tprintln!(
+        "[hosted-network] trying '{ssid}' on channel {number} ({}) with {}",
+        channel_band(channel),
+        attempt.label
+    );
+    if !send_start_host_ap(
+        interface,
+        channel,
+        ssid,
+        attempt.security,
+        attempt.password.as_deref(),
+    ) {
+        return None;
+    }
+    let (mode_ok, ip) = verify_ap_up(interface);
+    if !mode_ok {
+        teprintln!(
+            "[hosted-network] {} returned YES but the interface never entered AP mode; \
+             stopping and moving on",
+            attempt.label
+        );
+        stop_host_ap_mode();
+        return None;
+    }
+    Some(ip)
+}
+
+fn try_ibss(
+    interface: &CWInterface,
+    ssid: &str,
+    password: Option<&str>,
+) -> Option<(u64, Option<Ipv4Addr>)> {
+    let (security, pw) = match password {
+        Some(pw) => (IBSS_SECURITY_WEP104, Some(pw)),
+        None => (IBSS_SECURITY_NONE, None),
+    };
+    tprintln!(
+        "[hosted-network] falling back to IBSS on 2.4 GHz channel {PREFERRED_CHANNEL}. IBSS is \
+         802.11g-rate and open/WEP only, so the link tops out near 20 Mbit/s of TCP goodput — \
+         enough for a scaled-down stream, not for 1080p60"
+    );
+    if !send_start_ibss(interface, PREFERRED_CHANNEL as u64, ssid, security, pw) {
+        return None;
+    }
+    let (mode_ok, ip) = verify_ap_up(interface);
+    if !mode_ok {
+        stop_host_ap_mode();
+        return None;
+    }
+    Some((security, ip))
+}
+
+fn start_via_host_ap(
+    interface: &CWInterface,
+    name: &str,
+    password: &str,
+    had_password: bool,
+    app: &AppHandle,
+) -> Option<StartOutcome> {
+    let primary = pick_channel(interface)?;
+    let fallback = if unsafe { primary.channelNumber() } == PREFERRED_CHANNEL {
+        None
+    } else {
+        channel_numbered(interface, PREFERRED_CHANNEL)
+    };
+    let channels: Vec<Retained<CWChannel>> = std::iter::once(primary).chain(fallback).collect();
+
+    if had_password {
+        for (index, channel) in channels.iter().enumerate() {
+            if index > 0 {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            for attempt in secured_attempts(password) {
+                if let Some(ip) = try_attempt(interface, channel, name, &attempt) {
+                    let _ = KNOWN_SECURED_TYPE.set(attempt.security);
+                    return Some(StartOutcome {
+                        channel: unsafe { channel.channelNumber() },
+                        band: channel_band(channel),
+                        security: attempt.label,
+                        host_ipv4: ip,
+                    });
+                }
+            }
+        }
+        if !open_fallback_allowed() {
+            teprintln!(
+                "[hosted-network] no secured start succeeded and the open fallback is disabled by \
+                 SCREENEXTEND_HOSTAP_ALLOW_OPEN"
+            );
+            return None;
+        }
+        teprintln!(
+            "[hosted-network] this Mac accepted none of the secured security types, so the only \
+             network it can create is unencrypted"
+        );
+    }
+
+    let open = Attempt {
+        security: SECURITY_OPEN,
+        label: "securityType 2 (open — no encryption)".to_string(),
+        password: None,
+    };
+    for (index, channel) in channels.iter().enumerate() {
+        if index > 0 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if let Some(ip) = try_attempt(interface, channel, name, &open) {
+            if had_password {
+                let _ = crate::HostedNetworkNoPassword.emit(app);
+            }
+            return Some(StartOutcome {
+                channel: unsafe { channel.channelNumber() },
+                band: channel_band(channel),
+                security: open.label,
+                host_ipv4: ip,
+            });
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -133,67 +598,98 @@ pub fn start_hosted_network(
     password: &str,
 ) -> bool {
     let Some(interface) = wifi_interface() else {
-        *state.hosted_network_running.lock().unwrap() = false;
-        return false;
-    };
-    let Some(channel) = pick_channel(&interface) else {
+        teprintln!("[hosted-network] no Wi-Fi interface — this Mac cannot host a network");
         *state.hosted_network_running.lock().unwrap() = false;
         return false;
     };
 
+    let backend = probe_hosted_network_backend();
+    if backend == HostedNetworkBackend::Unsupported {
+        teprintln!(
+            "[hosted-network] this Mac exposes neither the HostAP SPI nor IBSS, so ScreenExtend \
+             cannot create a network here. Connect both devices to the same Wi-Fi router instead."
+        );
+        *state.hosted_network_running.lock().unwrap() = false;
+        return false;
+    }
+
     let had_password = !password.is_empty();
-    if had_password && password.len() < 10 {
+    if had_password && password.len() < MIN_PASSWORD_LEN {
+        teprintln!(
+            "[hosted-network] password is {} characters; Wi-Fi passphrases must be at least \
+             {MIN_PASSWORD_LEN}",
+            password.len()
+        );
         *state.hosted_network_running.lock().unwrap() = false;
         let _ = crate::HostedNetworkNoPassword.emit(&app);
         return false;
     }
 
-    let mut fell_back = false;
-    let started = try_start_on_channel(
-        &interface,
-        &channel,
-        name,
-        password,
-        had_password,
-        &mut fell_back,
-        &app,
-    );
-    let started = if !started {
-        let ch11_fallback = {
-            let channels = unsafe { interface.supportedWLANChannels() };
-            channels.and_then(|chs| {
-                chs.iter()
-                    .find(|c| unsafe { c.channelNumber() } == PREFERRED_CHANNEL)
-            })
-        };
-        if let Some(ref ch11) = ch11_fallback {
-            let ch11_num = unsafe { ch11.channelNumber() };
-            let orig_num = unsafe { channel.channelNumber() };
-            if ch11_num != orig_num {
-                try_start_on_channel(
-                    &interface,
-                    ch11,
-                    name,
-                    password,
-                    had_password,
-                    &mut fell_back,
-                    &app,
-                )
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+    // Start from a known state: the OS or a previous run may have left the radio in AP mode.
+    stop_host_ap_mode();
+
+    let outcome = if backend == HostedNetworkBackend::HostApSpi {
+        start_via_host_ap(&interface, name, password, had_password, &app)
     } else {
-        started
+        let secured = if had_password { Some(password) } else { None };
+        try_ibss(&interface, name, secured)
+            .or_else(|| {
+                if had_password && open_fallback_allowed() {
+                    let started = try_ibss(&interface, name, None)?;
+                    let _ = crate::HostedNetworkNoPassword.emit(&app);
+                    Some(started)
+                } else {
+                    None
+                }
+            })
+            .map(|(security, ip)| StartOutcome {
+                channel: PREFERRED_CHANNEL,
+                band: "2.4 GHz",
+                security: format!("IBSS security {security}"),
+                host_ipv4: ip,
+            })
     };
 
-    if started {
-        *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
+    let Some(outcome) = outcome else {
+        teprintln!("[hosted-network] every start attempt failed; the Wi-Fi interface is unchanged");
+        *state.hosted_network_running.lock().unwrap() = false;
+        *status().lock().unwrap() = HostedNetworkStatus::default();
+        return false;
+    };
+
+    match outcome.host_ipv4 {
+        Some(ip) => tprintln!(
+            "[hosted-network] '{name}' verified on {} — channel {} ({}), {}, host address {ip}",
+            backend.as_str(),
+            outcome.channel,
+            outcome.band,
+            outcome.security
+        ),
+        None => teprintln!(
+            "[hosted-network] '{name}' is advertised on {} (channel {}, {}, {}) but the interface \
+             never got an IPv4 address; clients will see the network and fail to join because \
+             nothing is handing out DHCP leases",
+            backend.as_str(),
+            outcome.channel,
+            outcome.band,
+            outcome.security
+        ),
     }
-    *state.hosted_network_running.lock().unwrap() = started;
-    started
+
+    *status().lock().unwrap() = HostedNetworkStatus {
+        backend: Some(backend.as_str()),
+        ssid: name.to_string(),
+        channel: Some(outcome.channel),
+        band: Some(outcome.band),
+        security: Some(outcome.security),
+        advertised: true,
+        host_ipv4: outcome.host_ipv4,
+    };
+
+    *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
+    *state.hosted_network_running.lock().unwrap() = true;
+    watch_liveness(app, WATCH_GENERATION.load(Ordering::Relaxed));
+    true
 }
 
 #[tauri::command]
@@ -204,14 +700,150 @@ pub fn stop_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool 
         None => stop_host_ap_mode(),
     }
     *state.hosted_network_running.lock().unwrap() = false;
-    true
+
+    let stopped = !wifi_interface()
+        .map(|i| interface_mode_is_host_ap(&i))
+        .unwrap_or(false);
+    if !stopped {
+        teprintln!("[hosted-network] stop requested but the interface is still in AP mode");
+    }
+    stopped
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn is_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool {
     let live = wifi_interface()
-        .map(|interface| unsafe { interface.interfaceMode() } == CWInterfaceMode::HostAP)
+        .map(|interface| interface_mode_is_host_ap(&interface))
         .unwrap_or(false);
     live || *state.hosted_network_running.lock().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_channels_avoid_the_awdl_social_channels() {
+        for social in [6, 44, 149] {
+            assert!(
+                !PREFERRED_5GHZ_CHANNELS.contains(&social),
+                "channel {social} is an AWDL social channel"
+            );
+            assert_ne!(PREFERRED_CHANNEL, social);
+        }
+    }
+
+    #[test]
+    fn wep_is_the_last_secured_candidate() {
+        assert_eq!(SECURED_CANDIDATES.last(), Some(&SECURITY_WEP));
+        assert!(!SECURED_CANDIDATES.contains(&SECURITY_OPEN));
+    }
+
+    /// Read-only inventory of what this Mac's Wi-Fi interface offers. Safe to run anywhere — it
+    /// starts nothing and changes nothing:
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn report_hostap_surface() {
+        let Some(interface) = wifi_interface() else {
+            println!("no Wi-Fi interface");
+            return;
+        };
+        println!("interface        : {:?}", interface_bsd_name(&interface));
+        println!("interfaceMode    : {:?}", unsafe {
+            interface.interfaceMode()
+        });
+        println!("powerOn          : {}", unsafe { interface.powerOn() });
+        for (label, selector) in [
+            (
+                "startHostAPModeWithSSID:securityType:channel:password:error:",
+                sel_start_host_ap(),
+            ),
+            ("stopHostAPMode", sel_stop_host_ap()),
+            ("startHostAPMode:", sel!(startHostAPMode:)),
+            ("enableHostAPMode", sel!(enableHostAPMode)),
+            ("disableHostAPMode", sel!(disableHostAPMode)),
+            (
+                "startIBSSModeWithSSID:security:channel:password:error:",
+                sel_start_ibss(),
+            ),
+            ("stopIBSSMode", sel_stop_ibss()),
+        ] {
+            println!(
+                "responds         : {:<62} {}",
+                label,
+                responds(&interface, selector)
+            );
+        }
+        println!(
+            "backend          : {}",
+            probe_hosted_network_backend().as_str()
+        );
+        if let Some(channels) = unsafe { interface.supportedWLANChannels() } {
+            let mut five: Vec<isize> = Vec::new();
+            let mut two: Vec<isize> = Vec::new();
+            for channel in channels.iter() {
+                let n = unsafe { channel.channelNumber() };
+                match unsafe { channel.channelBand() } {
+                    CWChannelBand::Band5GHz => five.push(n),
+                    CWChannelBand::Band2GHz => two.push(n),
+                    _ => {}
+                }
+            }
+            five.sort_unstable();
+            two.sort_unstable();
+            println!("5 GHz channels   : {five:?}");
+            println!("2.4 GHz channels : {two:?}");
+        }
+        println!(
+            "would pick       : {:?}",
+            pick_channel(&interface).map(|c| unsafe { c.channelNumber() })
+        );
+    }
+
+    /// The security-type sweep the tree has been carrying as a 2012 comment. Run it on a real Mac
+    /// with a phone nearby:
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::hosted_network::tests::sweep_security_types -- --ignored --nocapture
+    /// ```
+    ///
+    /// It records, for every candidate, whether the SPI returned YES and whether the radio then
+    /// actually entered AP mode. Scan from a second device to see what each accepted value
+    /// advertises.
+    #[test]
+    #[ignore]
+    fn sweep_security_types() {
+        let Some(interface) = wifi_interface() else {
+            println!("no Wi-Fi interface");
+            return;
+        };
+        if !responds(&interface, sel_start_host_ap()) {
+            println!("startHostAPModeWithSSID:… is absent on this Mac");
+            return;
+        }
+        let Some(channel) = pick_channel(&interface) else {
+            println!("no usable channel");
+            return;
+        };
+        let ssid = "ScreenExtend-Sweep";
+        let password = "screenextend";
+        let mut candidates: Vec<u64> = (0..=64).collect();
+        candidates.extend([96, 128, 160, 192, 256, 384, 512, 768, 1024, 2048]);
+        for security in candidates {
+            let accepted = send_start_host_ap(&interface, &channel, ssid, security, Some(password));
+            let (mode_ok, ip) = if accepted {
+                verify_ap_up(&interface)
+            } else {
+                (false, None)
+            };
+            println!("securityType {security:5}: accepted={accepted} ap_mode={mode_ok} ip={ip:?}");
+            stop_host_ap_mode();
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    }
 }
