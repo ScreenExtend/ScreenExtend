@@ -1423,6 +1423,14 @@
                             try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
+                    // Both of these — and the host's PlayoutDelayExtension(0, 0) — only affect
+                    // a client that ends up on the <video> element. An encoded transform takes
+                    // the frame from RtpVideoStreamReceiver2::OnAssembledFrame *instead of*
+                    // entering the reference finder and the frame buffer, and the frame buffer
+                    // is what these are inputs to. Set them anyway: they cost nothing and they
+                    // are correct for the fallback, which is the one path that has a jitter
+                    // buffer at all. See findings and docs/OPTIMIZATIONS.md — the same branch
+                    // is why every receive-side timing field in getStats() reads zero here.
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
                     } catch (_) { noteSuppressed(); }
