@@ -626,6 +626,121 @@ mod test {
         }
     }
 
+    /// Times the two ways a connected device's geometry can change.
+    ///
+    /// A resolution already in the display's registered mode list is a `ChangeDisplaySettingsEx`
+    /// on a live monitor. One that is not needs the *mode list* to change, and the bundled
+    /// driver's `notify()` implements that as `IddCxMonitorDeparture` followed by
+    /// `IddCxMonitorCreate` + `IddCxMonitorArrival` — a full hot-unplug and re-plug, with the
+    /// desktop reflowing every window and the capture session rebuilt. That is why
+    /// `dpr_mode_ladder` pre-registers the whole ladder at create time.
+    ///
+    /// `IddCxMonitorUpdateModes` would replace the second path with an in-place update; it is
+    /// IddCx 1.0 API, below the IddCx 1.2 the bundled INF declares, and upstream simply never
+    /// used it. This harness is the before half of that comparison. Needs the driver installed;
+    /// creates a real display for a few seconds. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn report_mode_change_cost() {
+        use crate::windows_utils::streamer::capture::{monitor_device_names, set_display_mode};
+
+        let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
+            println!("driver unavailable; skipping");
+            return;
+        };
+        let before = monitor_device_names();
+        let id = display
+            .create_display_with_modes(
+                "ScreenExtend mode probe".to_string(),
+                1920,
+                1080,
+                60,
+                &[(1280, 720)],
+            )
+            .expect("create display");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut name = None;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(n) = monitor_device_names()
+                .into_iter()
+                .find(|n| !before.contains(n))
+            {
+                name = Some(n);
+                break;
+            }
+        }
+        let Some(name) = name else {
+            println!("the new display never appeared");
+            display.remove_display(id);
+            return;
+        };
+        println!("{name}: created, now at {:?}", current_display_mode(&name));
+
+        // In the registered ladder: no mode-list change, so no departure.
+        for (w, h) in [(1280u32, 720u32), (1920, 1080)] {
+            let t = Instant::now();
+            let applied = set_display_mode(&name, w, h, 60, false);
+            println!(
+                "  in-ladder {w}x{h}: {:?} in {:.1} ms -> {:?}",
+                applied,
+                t.elapsed().as_secs_f64() * 1000.0,
+                current_display_mode(&name)
+            );
+        }
+
+        // Outside it: the only way to reach a new mode today is to take the display away and
+        // build a new one, which is what a mode-list change costs.
+        let t = Instant::now();
+        display.remove_display(id);
+        // Wait for the old monitor to actually go, or the name search below would match the
+        // display we just asked to be removed and report a time that is not the reattach.
+        let gone = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < gone && monitor_device_names().iter().any(|n| n == &name) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        println!(
+            "  departure alone: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        let recreated = display
+            .create_display_with_modes(
+                "ScreenExtend mode probe".to_string(),
+                1600,
+                900,
+                60,
+                &[(1280, 720)],
+            )
+            .expect("recreate display");
+        let mut new_name = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(n) = monitor_device_names()
+                .into_iter()
+                .find(|n| !before.contains(n))
+            {
+                new_name = Some(n);
+                break;
+            }
+        }
+        println!(
+            "  out-of-ladder 1600x900 (remove + recreate + reattach): {:.1} ms -> {new_name:?}",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        if let Some(n) = &new_name {
+            let t = Instant::now();
+            let applied = set_display_mode(n, 1600, 900, 60, false);
+            println!(
+                "  then set 1600x900: {applied:?} in {:.1} ms -> {:?}",
+                t.elapsed().as_secs_f64() * 1000.0,
+                current_display_mode(n)
+            );
+        }
+        display.remove_display(recreated);
+    }
+
     /// Reports which display backend this machine probes to. Run with `--ignored --nocapture`.
     #[test]
     #[ignore]
