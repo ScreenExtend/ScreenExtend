@@ -76,9 +76,31 @@ let estimatedFps = 60;
 let lastRtpTicks = null;
 let lastRtpWallMs = null;
 
+// The negotiated profile-level-id and the coded size. They are posted by the page after the
+// WHEP round trip, but the pump starts as soon as the transform is installed — before
+// setRemoteDescription — so without a wait every client probed and configured avc1.640034
+// with no coded size at all, which is exactly the configuration isConfigSupported is least
+// able to answer honestly about and the thing "probe what you install" was meant to fix.
+// Waiting costs nothing: no frame can be decoded before the first keyframe anyway.
 let preferredCodec = null;
 let hintWidth = 0;
 let hintHeight = 0;
+const CODEC_HINT_DEADLINE_MS = 600;
+let codecHintPending = true;
+let codecHintResolve = null;
+const codecHintPromise = new Promise(function (resolve) { codecHintResolve = resolve; });
+function noteCodecHint() {
+  if (!codecHintPending) return;
+  codecHintPending = false;
+  if (codecHintResolve) codecHintResolve();
+}
+function waitForCodecHint() {
+  if (!codecHintPending) return Promise.resolve();
+  return Promise.race([
+    codecHintPromise,
+    new Promise(function (resolve) { setTimeout(resolve, CODEC_HINT_DEADLINE_MS); }),
+  ]);
+}
 
 // Which mechanisms are actually live, reported to the host in the stats frame. A degradation
 // nobody can see is a degradation nobody fixes.
@@ -292,6 +314,7 @@ self.onmessage = (e) => {
       hintWidth = e.data.width | 0;
       hintHeight = e.data.height | 0;
     }
+    noteCodecHint();
   } else if (e.data.type === 'outofbandkey') {
     // Revocable, not a latch: the page only learns whether the host parses the opcode once
     // the first PONG arrives, and a tier that cannot be withdrawn is a tier that lies.
@@ -541,6 +564,7 @@ function ensureConfigured() {
 }
 
 async function doConfigure() {
+  await waitForCodecHint();
   const candidates = preferredCodec
     ? [preferredCodec].concat(CODEC_CANDIDATES.filter((c) => c !== preferredCodec))
     : CODEC_CANDIDATES.slice();
@@ -684,7 +708,16 @@ self.onrtctransform = (event) => {
 function startPump(readable) {
   const reader = readable.getReader();
 
-  ensureConfigured().then(() => requestKey(true)).catch(note);
+  // Stamp the keyframe wait here, not inside the configure. `waitingSince` starts at 0, and
+  // the pump can see frames before the configure has run — so the "waited" it computed was
+  // performance.now(), i.e. however long the page had been open. On a page that had been up
+  // for more than KEY_WAIT_GIVE_UP_MS that reads as an instant give-up on the first delta.
+  setWaitingForKey(true);
+
+  // Ask for the first IDR straight away rather than behind the configure: the configure now
+  // waits for the codec hint, and the host should be producing the keyframe while it does.
+  requestKey(true);
+  ensureConfigured().catch(note);
 
   (async function pump() {
     for (;;) {
