@@ -19,6 +19,38 @@ use crate::streamer::config::{Config, H264Profile};
 const MIN_RTP_PACKETS: u64 = 30;
 const TIMEOUT_SECS: u64 = 10;
 
+/// Credentials the self-test hands itself. `/whep` requires a session id and OTP like any other
+/// join; the caller installs the same pair into the config's `SessionAuth`.
+pub const SELFTEST_SESSION_ID: &str = "SELFTESTSESSN";
+pub const SELFTEST_OTP: &str = "000000";
+
+/// The attributes an answer must carry for a browser to decode this stream at all.
+///
+/// Split out from the live run so the SDP half is testable without a display, an encoder, or a
+/// network: the live run feeds it a real answer, and `answer_sdp_checks_catch_a_stripped_answer`
+/// feeds it a captured one.
+pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
+    vec![
+        ("H264", answer_sdp.contains("H264")),
+        (
+            "packetization-mode=1",
+            answer_sdp.contains("packetization-mode=1"),
+        ),
+        (
+            "profile-level-id=42e01f",
+            answer_sdp.contains("profile-level-id=42e01f"),
+        ),
+        (
+            "rtcp-fb nack",
+            answer_sdp.contains("a=rtcp-fb") && answer_sdp.contains("nack"),
+        ),
+        ("rtcp-fb nack pli", answer_sdp.contains("nack pli")),
+        ("rtcp-fb ccm fir", answer_sdp.contains("ccm fir")),
+        ("transport-cc", answer_sdp.contains("transport-cc")),
+        ("rtx", answer_sdp.contains("rtx")),
+    ]
+}
+
 pub async fn run(mut config: Config) -> Result<()> {
     config.whep_selftest = false;
     config.h264_profile = H264Profile::Baseline;
@@ -179,28 +211,10 @@ pub async fn run(mut config: Config) -> Result<()> {
         .sdp;
 
     tprintln!("[selftest] POST /whep ({} bytes)", offer_sdp.len());
-    let answer_sdp = http_post_sdp(port, &offer_sdp).await?;
+    let answer_sdp = http_post_join(port, &offer_sdp).await?;
     tprintln!("[selftest] got answer SDP ({} bytes)", answer_sdp.len());
 
-    let checks = [
-        ("H264", answer_sdp.contains("H264")),
-        (
-            "packetization-mode=1",
-            answer_sdp.contains("packetization-mode=1"),
-        ),
-        (
-            "profile-level-id=42e01f",
-            answer_sdp.contains("profile-level-id=42e01f"),
-        ),
-        (
-            "rtcp-fb nack",
-            answer_sdp.contains("a=rtcp-fb") && answer_sdp.contains("nack"),
-        ),
-        ("rtcp-fb nack pli", answer_sdp.contains("nack pli")),
-        ("rtcp-fb ccm fir", answer_sdp.contains("ccm fir")),
-        ("transport-cc", answer_sdp.contains("transport-cc")),
-        ("rtx", answer_sdp.contains("rtx")),
-    ];
+    let checks = answer_sdp_checks(&answer_sdp);
     tprintln!("[selftest] --- SDP attribute checks ---");
     let mut all_ok = true;
     for (name, ok) in checks {
@@ -259,11 +273,25 @@ async fn wait_for_health(port: u16) -> Result<()> {
     bail!("server did not become healthy in time")
 }
 
-async fn http_post_sdp(port: u16, sdp: &str) -> Result<String> {
+/// `/whep` takes a JSON join request, not a bare SDP body. Posting `application/sdp` — which
+/// this did — could only ever come back 400, which is why the self-test had never passed.
+async fn http_post_join(port: u16, sdp: &str) -> Result<String> {
+    let body = serde_json::json!({
+        "sessionId": SELFTEST_SESSION_ID,
+        "otp": SELFTEST_OTP,
+        "deviceName": "whep-selftest",
+        "os": "selftest",
+        "refreshRate": 60,
+        "width": 1280,
+        "height": 720,
+        "dpr": 1.0,
+        "sdp": sdp,
+    })
+    .to_string();
     let req = format!(
-        "POST /whep HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        sdp.len(),
-        sdp
+        "POST /whep HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
     );
     let raw = tls_send_recv(port, req.as_bytes()).await?;
     let text = String::from_utf8_lossy(&raw).into_owned();
@@ -303,6 +331,11 @@ async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+/// A verifier that accepts any certificate.
+///
+/// The server presents a runtime-generated self-signed certificate, so a real chain check is
+/// impossible; this whole module is compiled only under `cfg(test)` or the `probe` feature so
+/// nothing that skips certificate validation is ever linked into a shipping binary.
 mod danger {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -359,5 +392,67 @@ mod danger {
                 .signature_verification_algorithms
                 .supported_schemes()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real answer from this server, captured so the attribute checks can run with no
+    /// display, no encoder and no network.
+    const SAMPLE_ANSWER: &str = concat!(
+        "v=0\n",
+        "o=- 7080972874634680579 1710000000 IN IP4 0.0.0.0\n",
+        "s=-\n",
+        "t=0 0\n",
+        "a=group:BUNDLE 0\n",
+        "m=video 9 UDP/TLS/RTP/SAVPF 102 103\n",
+        "c=IN IP4 0.0.0.0\n",
+        "a=rtpmap:102 H264/90000\n",
+        "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\n",
+        "a=rtcp-fb:102 goog-remb\n",
+        "a=rtcp-fb:102 ccm fir\n",
+        "a=rtcp-fb:102 nack\n",
+        "a=rtcp-fb:102 nack pli\n",
+        "a=rtcp-fb:102 transport-cc\n",
+        "a=rtpmap:103 rtx/90000\n",
+        "a=fmtp:103 apt=102\n",
+        "a=sendonly\n",
+    );
+
+    #[test]
+    fn a_real_answer_passes_every_attribute_check() {
+        for (name, ok) in answer_sdp_checks(SAMPLE_ANSWER) {
+            assert!(ok, "{name} failed on a known-good answer");
+        }
+    }
+
+    #[test]
+    fn answer_sdp_checks_catch_a_stripped_answer() {
+        // Drop the feedback lines and the rtx codec: the stream would still negotiate and would
+        // still be H.264, but loss recovery would be gone and nothing today would notice.
+        let stripped: String = SAMPLE_ANSWER
+            .lines()
+            .filter(|l| !l.starts_with("a=rtcp-fb") && !l.contains("rtx"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let failed: Vec<&str> = answer_sdp_checks(&stripped)
+            .into_iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(name, _)| name)
+            .collect();
+        assert!(failed.contains(&"rtcp-fb nack pli"), "got {failed:?}");
+        assert!(failed.contains(&"rtcp-fb ccm fir"), "got {failed:?}");
+        assert!(failed.contains(&"transport-cc"), "got {failed:?}");
+        assert!(failed.contains(&"rtx"), "got {failed:?}");
+        // The codec itself is untouched, so those checks must still pass.
+        assert!(!failed.contains(&"H264"), "got {failed:?}");
+        assert!(!failed.contains(&"packetization-mode=1"), "got {failed:?}");
+    }
+
+    #[test]
+    fn an_empty_answer_fails_everything() {
+        assert!(answer_sdp_checks("").iter().all(|(_, ok)| !ok));
     }
 }
