@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback, lazy, Suspense } from "react";
 import QRCode from "react-qr-code";
 import { useBlocker } from "react-router-dom";
 
@@ -284,7 +284,10 @@ export default function Settings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectedDevices]);
 
-  const isConnected = (ip: string) => connectedDevices.some(d => d.ip === ip);
+  // A `Set` rather than a linear scan, because the comparator below calls this twice per
+  // comparison: the sort was O(n log n * m) in the number of known and connected devices.
+  const connectedIps = useMemo(() => new Set(connectedDevices.map(d => d.ip)), [connectedDevices]);
+  const isConnected = (ip: string) => connectedIps.has(ip);
 
   const applyBan = async (device: { token?: string; ip: string }, banned: boolean): Promise<boolean> => {
     const token = device.token ?? "";
@@ -347,10 +350,16 @@ export default function Settings() {
     });
   };
 
-  const sortedKnownDevices = [...knownDevices].sort((a, b) => {
-    const connectedDelta = Number(isConnected(b.ip)) - Number(isConnected(a.ip));
-    return connectedDelta !== 0 ? connectedDelta : b.lastSeen - a.lastSeen;
-  });
+  // Recomputed on every render before this, which on this page means every keystroke in
+  // any of its eleven controlled inputs.
+  const sortedKnownDevices = useMemo(
+    () =>
+      [...knownDevices].sort((a, b) => {
+        const connectedDelta = Number(connectedIps.has(b.ip)) - Number(connectedIps.has(a.ip));
+        return connectedDelta !== 0 ? connectedDelta : b.lastSeen - a.lastSeen;
+      }),
+    [knownDevices, connectedIps]
+  );
 
   const saveDisconnectGrace = async () => {
     const parsed = Number(disconnectGrace);
@@ -451,6 +460,7 @@ export default function Settings() {
         description: enabled ? t("toasts.autostart.enabledDescription") : t("toasts.autostart.disabledDescription"),
       });
     } catch (e) {
+      console.error("toggling autostart failed", e);
       setAutostartEnabled(await isAutostartEnabled().catch(() => !enabled));
       toast({
         title: t("toasts.autostart.failureTitle"),

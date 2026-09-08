@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 
 import { Check, Info, Loader2, X } from "lucide-react";
 import {
@@ -27,7 +27,17 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const DOWNLOAD_URL = "https://screenextend.app";
-const PERMISSION_POLL_MS = 200;
+// The gate is open while the user is in System Settings, which is minutes, not seconds.
+// 200 ms was five IPC round-trips a second into TCC for the whole of it. The `focus`
+// listener below is what actually makes the dialog feel instant -- returning to the app
+// re-checks immediately -- so the interval only has to cover the case where the app never
+// loses focus. First two seconds at 200 ms, then 1 s, then 3 s: about 26 calls in the
+// first minute against roughly 300.
+const PERMISSION_POLL_STEPS = [
+  { until: 2000, every: 200 },
+  { until: 10000, every: 1000 },
+  { until: Infinity, every: 3000 },
+];
 const UPDATE_CHECK_DEADLINE_MS = 2000;
 
 function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): boolean {
@@ -73,6 +83,7 @@ function formatBytes(bytes: number): string {
 }
 
 export default function Bootstrap() {
+  const navigate = useNavigate();
   const { theme, setTheme } = useTheme();
   const { t } = useTranslation();
   const loaded = useLoaded();
@@ -178,7 +189,11 @@ export default function Bootstrap() {
           await installUpdate(update);
           return;
         }
-        document.getElementById("dashlink")!.click();
+        // Was `document.getElementById("dashlink")!.click()`. When the element was not
+        // in the document at that moment the TypeError landed in the catch below and the
+        // user got the driver-install dialog for what was a routing failure -- and its
+        // only action retried the same thing.
+        navigate("/dashboard");
         scheduleConfigEditorPreload();
         void loadDevices();
         void loadSettings();
@@ -245,17 +260,26 @@ export default function Bootstrap() {
     }
   };
 
+  // Returns true when startup must stop and wait for the user. A check that *failed* is
+  // not the same as "nothing was missing", so it says so on the log bus instead of being
+  // reported as a clean pass; startup still proceeds, since refusing to start over an
+  // unreadable probe would be worse.
   const ensurePermissions = async (): Promise<boolean> => {
     let perms: PermissionStatus[];
     try {
       perms = await commands.checkPermissions();
-    } catch {
+    } catch (e) {
+      console.error("the permission check failed; continuing as if nothing were missing", e);
       return false;
     }
     const missing = perms.filter(blocks);
     if (missing.length === 0) return false;
     for (const p of missing) {
-      try { await commands.requestPermission(p.key); } catch { /* ignore */ }
+      try {
+        await commands.requestPermission(p.key);
+      } catch (e) {
+        console.error(`requesting the ${p.key} permission failed`, e);
+      }
     }
     try {
       setPermReport(await commands.checkPermissions());
@@ -350,11 +374,22 @@ export default function Bootstrap() {
         .catch(() => { /* transient; the next tick tries again */ })
         .finally(() => { inFlight = false; });
     };
-    const id = window.setInterval(tick, PERMISSION_POLL_MS);
+    const opened = Date.now();
+    let id: number | undefined;
+    const schedule = () => {
+      if (stopped) return;
+      const elapsed = Date.now() - opened;
+      const step = PERMISSION_POLL_STEPS.find(s => elapsed < s.until) ?? PERMISSION_POLL_STEPS[PERMISSION_POLL_STEPS.length - 1];
+      id = window.setTimeout(() => {
+        tick();
+        schedule();
+      }, step.every);
+    };
+    schedule();
     window.addEventListener("focus", tick);
     return () => {
       stopped = true;
-      window.clearInterval(id);
+      if (id !== undefined) window.clearTimeout(id);
       window.removeEventListener("focus", tick);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -364,7 +399,6 @@ export default function Bootstrap() {
 
   return (
     <div className="h-screen w-full flex flex-col items-center justify-center">
-      <Link to="/dashboard" id="dashlink"></Link>
       <AlertDialog open={updating}>
         <AlertDialogContent>
           <AlertDialogHeader>
