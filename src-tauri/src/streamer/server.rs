@@ -32,6 +32,20 @@ struct AudioCapabilities {
     webcodecs_opus: bool,
     #[serde(default)]
     worklet: bool,
+    /// The client actually probed its decoder and built its worklet, rather than only checking
+    /// that the constructors exist. Absent means "unknown", which is what every client that
+    /// predates the probe sends.
+    #[serde(default)]
+    verified: bool,
+    /// The client knows how to switch to a standard Opus track if the WebCodecs path dies
+    /// mid-session, and wants one in the answer as a safety net.
+    ///
+    /// It has to ask rather than always be given one: a client that attaches every inbound
+    /// track on `ontrack` would report itself as being on the fallback path and play a silent
+    /// element alongside its worklet. The knowledge of whether a spare track is useful lives on
+    /// the client, so the request does too.
+    #[serde(default, rename = "wantsFallbackTrack")]
+    wants_fallback_track: bool,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +108,12 @@ static DISPLAY_CORRELATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 
 pub const MIN_REFRESH_RATE: u32 = 15;
 pub const MAX_REFRESH_RATE: u32 = 500;
+
+/// Compose cadence to ask the virtual display for, independent of the stream's frame rate.
+/// Every created display registers this rate alongside whatever was requested
+/// (`COMMON_REFRESH_RATES`), so selecting it costs nothing; if the driver refuses it the join
+/// carries on at whatever it did land on.
+pub const DISPLAY_COMPOSE_HZ: u32 = 120;
 pub const MIN_DISPLAY_SCALE: u32 = 25;
 pub const MAX_DISPLAY_SCALE: u32 = 200;
 pub const MAX_EFFECTIVE_SCALE: u32 = 500;
@@ -198,6 +218,39 @@ impl AppState {
             base.push(turn);
         }
         base
+    }
+
+    /// The ICE list for a session already known to be on this subnet, or for one that is not.
+    ///
+    /// TURN is always offered when configured: it is what a relayed path needs, and a
+    /// misclassified peer must still be able to connect. Only STUN is dropped, because a
+    /// reflexive candidate is exactly the thing a same-subnet pair has no use for.
+    pub fn ice_for(&self, locality: SessionLocality) -> Vec<RTCIceServer> {
+        let base = if locality == SessionLocality::SameNetwork {
+            Vec::new()
+        } else {
+            self.ice_servers.as_ref().clone()
+        };
+        self.ice_with_turn(base)
+    }
+
+    pub fn ice_json_for(&self, locality: SessionLocality) -> String {
+        if locality == SessionLocality::SameNetwork {
+            let mut servers: Vec<serde_json::Value> = Vec::new();
+            for turn in [
+                user_turn_ice_server(&self.config),
+                ephemeral_turn_ice_server(&self.config),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                servers.push(serde_json::json!({
+                    "urls": turn.urls, "username": turn.username, "credential": turn.credential
+                }));
+            }
+            return serde_json::json!({ "iceServers": servers }).to_string();
+        }
+        self.ice_json_live()
     }
 
     pub fn ice_json_live(&self) -> String {
@@ -512,10 +565,18 @@ async fn styles() -> Response {
         .into_response()
 }
 
-async fn ice_config(State(state): State<AppState>) -> Response {
+async fn ice_config(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    // A same-subnet peer needs no reflexive candidate, and handing it a STUN server makes both
+    // ends block on a round trip to the public internet before the join can even start: the
+    // client waits up to 3 s for its own gathering, the host up to 1.5 s for the answer's. An
+    // offline or hosted-network host pays both timeouts in full, for a candidate nobody uses.
+    let locality = state.locality_for(&peer.ip().to_string());
     (
         [(header::CONTENT_TYPE, "application/json")],
-        state.ice_json_live(),
+        state.ice_json_for(locality),
     )
         .into_response()
 }
@@ -644,7 +705,7 @@ async fn whep(
         )
             .into_response();
     }
-    let ice = state.ice_with_turn(state.fallback_ice_servers());
+    let ice = state.ice_for(state.locality_for(&client_ip));
     let out = process_whep(&state, &client_ip, &body, ice).await;
     let status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::new();
@@ -848,6 +909,13 @@ async fn start_session(
 
     let mut cfg = state.config.as_ref().clone();
     cfg.max_fps = detected_refresh;
+    // Rolling intra refresh. It has been plumbed through the NVENC, Quick Sync and VideoToolbox
+    // backends since they were written and no shipping path ever set it, so every recoverable
+    // loss cost a full IDR — the single largest frame the encoder emits, sent unpaced, on a link
+    // that had just demonstrated it could not carry the previous burst. With a refresh wave the
+    // decoder rebuilds over a few frames instead, and a client that missed the session's opening
+    // keyframe recovers on its own rather than sitting black behind an infinite GOP.
+    cfg.intra_refresh = true;
     let override_for_ip = state
         .config
         .device_overrides
@@ -858,12 +926,25 @@ async fn start_session(
         state.config.audio_hub.as_ref(),
         state.config.device_overrides.as_ref(),
     ) {
-        (Some(hub), Some(overrides)) => Some(webrtc_session::AudioParams {
-            fast: req.audio_capabilities.webcodecs_opus && req.audio_capabilities.worklet,
-            hub: std::sync::Arc::clone(hub),
-            overrides: std::sync::Arc::clone(overrides),
-            device_key: client_ip.to_string(),
-        }),
+        (Some(hub), Some(overrides)) => {
+            let caps = req.audio_capabilities;
+            let fast = caps.webcodecs_opus && caps.worklet;
+            tprintln!(
+                "audio capabilities: webcodecsOpus={} worklet={} verified={} wantsFallbackTrack={} -> {}",
+                caps.webcodecs_opus,
+                caps.worklet,
+                caps.verified,
+                caps.wants_fallback_track,
+                if fast { "DataChannel" } else { "Opus track" }
+            );
+            Some(webrtc_session::AudioParams {
+                fast,
+                fallback_track: caps.wants_fallback_track,
+                hub: std::sync::Arc::clone(hub),
+                overrides: std::sync::Arc::clone(overrides),
+                device_key: client_ip.to_string(),
+            })
+        }
         _ => None,
     };
     if let Some(o) = override_for_ip {
@@ -877,11 +958,20 @@ async fn start_session(
     let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
     let width = backing(req.width);
     let height = backing(req.height);
-    let refresh = if cfg.max_fps == 0 {
+    let stream_fps = if cfg.max_fps == 0 {
         60
     } else {
         cfg.max_fps.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
     };
+    // The virtual display's refresh rate and the stream's frame rate were one number. They are
+    // not the same thing: an indirect display has no hardware vblank, so the mode's refresh rate
+    // *is* DWM's compose cadence and therefore the ceiling on how fresh any captured frame can
+    // be. At 60 Hz a frame is on average 8.3 ms stale before capture even sees it; at 120 Hz,
+    // 4.2 ms. Every display is already created with 120 Hz registered alongside its requested
+    // rate, and it was simply never selected. `cfg.max_fps` stays the stream cap.
+    let refresh = stream_fps
+        .max(DISPLAY_COMPOSE_HZ)
+        .clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
 
     let display_name = if req.device_name.trim().is_empty() {
         "ScreenExtend".to_string()
@@ -1476,6 +1566,68 @@ fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_with_local_ips(ips: &[&str]) -> AppState {
+        let local_ips = session::new_shared_local_ips();
+        *local_ips.lock().unwrap() = ips.iter().map(|s| s.parse().unwrap()).collect();
+        AppState::new(Config {
+            local_ips: Some(local_ips),
+            stun_urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            ..Config::default()
+        })
+    }
+
+    #[test]
+    fn a_peer_on_our_subnet_is_classified_before_the_handshake() {
+        let s = state_with_local_ips(&["192.168.1.10", "10.0.0.5"]);
+        assert_eq!(
+            s.locality_for("192.168.1.44"),
+            SessionLocality::SameNetwork,
+            "same /24 as an adapter"
+        );
+        assert_eq!(s.locality_for("10.0.0.200"), SessionLocality::SameNetwork);
+        assert_eq!(s.locality_for("127.0.0.1"), SessionLocality::SameNetwork);
+    }
+
+    #[test]
+    fn a_private_peer_a_router_hop_away_is_not_claimed_as_lan() {
+        // Still behind the same NAT, so not a relay case — but it does not get the
+        // same-subnet shortcuts either, because the extra hop is where jitter comes from.
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        assert_eq!(s.locality_for("192.168.9.7"), SessionLocality::Unknown);
+    }
+
+    #[test]
+    fn a_public_peer_is_cross_network() {
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        assert_eq!(s.locality_for("203.0.113.9"), SessionLocality::CrossNetwork);
+        assert_eq!(
+            s.locality_for("not-an-ip"),
+            SessionLocality::Unknown,
+            "an unparseable key must not be optimistically treated as local"
+        );
+    }
+
+    #[test]
+    fn a_lan_peer_is_offered_no_stun_server() {
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        assert!(
+            s.ice_for(SessionLocality::SameNetwork).is_empty(),
+            "a same-subnet pair has no use for a reflexive candidate"
+        );
+        assert!(!s.ice_for(SessionLocality::CrossNetwork).is_empty());
+        let json = s.ice_json_for(SessionLocality::SameNetwork);
+        assert!(!json.contains("stun:"), "served to the client: {json}");
+        assert!(s
+            .ice_json_for(SessionLocality::CrossNetwork)
+            .contains("stun:"));
+    }
+
+    #[test]
+    fn portrait_geometry_is_read_back_with_its_axes_swapped() {
+        assert_eq!(monitor_dims(1080, 1920, false), (1080, 1920));
+        assert_eq!(monitor_dims(1080, 1920, true), (1920, 1080));
+    }
 
     #[derive(Debug)]
     struct CappedDisplays(Option<usize>);
