@@ -117,6 +117,9 @@ pub struct CompatibilityReport {
     pub unsupported_apis: Vec<UnsupportedApi>,
     pub audio_backend: String,
     pub display_backend: String,
+    pub capture_backend: String,
+    pub encoder_backend: String,
+    pub hosted_network_backend: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
@@ -387,7 +390,8 @@ pub fn run() {
             get_server_ports,
             set_disable_gpu_encode,
             get_disable_gpu_encode,
-            logbus::get_log_backlog
+            logbus::get_log_backlog,
+            logbus::log_frontend_error
         ])
         .events(collect_events![
             DeviceJoin,

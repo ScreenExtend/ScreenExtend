@@ -52,7 +52,7 @@ pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
 }
 
 pub async fn run(mut config: Config) -> Result<()> {
-    let hold_secs = config.selftest_secs;
+    let hold_secs = config.probe_secs;
     config.whep_selftest = false;
     config.h264_profile = H264Profile::Baseline;
     if config.port == 8080 {

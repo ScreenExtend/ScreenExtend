@@ -250,10 +250,9 @@ fn run_encode_loop(
             if let Some(frame) = last_frame.as_ref() {
                 if let Some(pixbuf) = frame.pixel_buffer() {
                     let captured = frame.captured_at;
-                    // Re-encoding the frame we already have: the picture did not change, and
-                    // that is worth counting rather than reporting as fresh capture.
-                    let mut timing = FrameTiming::entering_capture();
-                    timing.capture_available_ns = frame.os_time_ns;
+                    // Re-encoding the frame we already have: the picture did not change, so
+                    // it is counted and kept out of the capture-relative histograms.
+                    let timing = FrameTiming::repeating();
                     telemetry
                         .degradation
                         .frames_repeated
