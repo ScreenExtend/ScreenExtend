@@ -89,7 +89,7 @@ If the kickstart fails — it can under some MDM configurations — `postinstall
 
 ## Verifying a load, end to end
 
-On the target Mac, **from a console (GUI) session** — this cannot be done over SSH, see below:
+On the target Mac. All four steps run over SSH — see the note at the end:
 
 ```sh
 # 1. the plug-in loaded and opened its shared segment
@@ -112,7 +112,16 @@ clang tools/hal_render.c -o /tmp/hal_render -framework CoreAudio -framework Core
 cargo test --lib legacy_live -- --ignored --nocapture
 ```
 
-**Steps 3 and 4 need a console session.** macOS grants audio IO only to the session that owns the
-console: over SSH, `say` fails with `-128`, `afplay` with `AudioQueueStart -66681`, and a raw HAL
-IOProc runs zero IO cycles — against the built-in output device as much as against ours. Steps 1
-and 2 do work over SSH, which is how the driver's load path was verified on the 10.15.8 box.
+**All four steps work over SSH, including the ones that need audio to be playing.** An earlier
+version of this document said steps 3 and 4 needed a console session, on the reasoning that macOS
+grants audio IO only to the session that owns the console. That restriction is real, and it is why
+`say` and `afplay` fail over SSH against the *built-in* output — but it does not apply to this
+device, because this device is ours: its IO cycle is driven by our own plug-in inside
+`coreaudiod`, not by the console session's audio server. Once `legacy_live_capture_roundtrip` has
+made ScreenExtend Audio the default output, `say` renders into it perfectly well from an SSH
+shell.
+
+Measured that way on the 10.15.8 box: 2,083,840 samples through the shared ring with `readPos`
+tracking `writePos` at a backlog of 0 and `overruns` 0, and capture → Opus packet at
+p50 −0.57 / p90 3.59 / p99 4.54 ms. `docs/manual-tests/macos-audio.md` has the full numbers and
+the log lines that prove each tier.
