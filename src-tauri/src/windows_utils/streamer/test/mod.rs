@@ -1,3 +1,4 @@
+mod amd_layout;
 mod intel_encoder;
 mod intel_layout;
 mod nvenc_layout;
