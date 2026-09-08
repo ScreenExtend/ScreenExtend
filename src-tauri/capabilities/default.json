@@ -108,6 +108,22 @@
           "cmd": "open",
           "sidecar": false,
           "args": ["x-apple.systempreferences:com.apple.preference.displays"]
+        },
+        {
+          "name": "open",
+          "cmd": "open",
+          "sidecar": false,
+          "args": [
+            {
+              "validator": "x-apple\\.systempreferences:com\\.apple\\.(settings\\.PrivacySecurity\\.extension|preference\\.security)\\?Privacy(_ScreenCapture|_Accessibility)?"
+            }
+          ]
+        },
+        {
+          "name": "open",
+          "cmd": "open",
+          "sidecar": false,
+          "args": ["-n", "-a", { "validator": ".*\\.app$" }]
         }
       ]
     },

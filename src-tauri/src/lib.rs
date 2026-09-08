@@ -76,8 +76,16 @@ pub struct PermissionStatus {
     pub key: String,
     pub name: String,
     pub description: String,
-    pub granted: bool,
+    /// `granted` | `denied` | `unknown`. Tri-state on purpose: a probe that could
+    /// not learn the answer must not be reported as a refusal, because the caller
+    /// treats a refusal as a reason not to start.
+    pub state: String,
+    /// What the probe actually concluded, in the user's words.
+    pub detail: String,
     pub required: bool,
+    /// macOS binds some grants to the process that asked for them, so a permission
+    /// the user has just ticked can only reach a freshly launched copy.
+    pub relaunch_required: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
@@ -337,6 +345,7 @@ pub fn run() {
             permissions::check_permissions,
             permissions::request_permission,
             permissions::open_permission_settings,
+            permissions::relaunch_app,
             setup,
             //            get_devices,
             set_session_credentials,
