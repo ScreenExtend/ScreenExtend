@@ -144,9 +144,16 @@
   }
   const FAST_BUFFER_MAX = 8192;
   let fastDropped = 0;
+  let sendFailures = 0;
   function rawSend(ch, buf, len) {
     if (!ch || ch.readyState !== 'open') return;
-    try { ch.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) { noteSuppressed(); }
+    try { ch.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); }
+    catch (e) {
+      noteSuppressed();
+      // "Nothing to send" and "the send threw" used to look identical, which is how a whole
+      // feature could fail silently. Once per session is enough to name it.
+      if (sendFailures++ === 0) console.warn('[input] a ' + (ch.label || '?') + ' send threw: ' + e);
+    }
   }
   function fastSend(buf, len) {
     if (!fast || fast.readyState !== 'open') return;
@@ -323,8 +330,52 @@
       fr.readAsArrayBuffer(f);
     });
   }
+  // A dropped file is one SCTP message: there is no chunking opcode and no reassembly on the
+  // host, so anything above the negotiated maximum throws inside rawSend's catch and the whole
+  // feature fails with no transfer, no error and nothing logged on either side.
+  //
+  // The limit is only enforced where the browser actually reports one. `maxMessageSize` can be
+  // Infinity (both ends support partial delivery) and `pc.sctp` is absent below Chrome 76 and
+  // on Safari — refusing on a guess there would break drops that work today. The size check
+  // runs against `File.size`, before any read, so an over-large file never allocates.
+  let dropPc = null;
+  function bulkMessageLimit() {
+    try {
+      const s = dropPc && dropPc.sctp;
+      const m = s && s.maxMessageSize;
+      return (typeof m === 'number' && isFinite(m) && m > 0) ? m : 0;
+    } catch (_) { return 0; }
+  }
+  const DROP_HEADER = 12;
+  function dropItemOverhead(f) {
+    // u16 name len + name + u32 mime len + mime + u64 size + u64 data len.
+    return 2 + enc(f.name || '').length + 4 + enc(f.type || 'application/octet-stream').length + 16;
+  }
+  let dropsRefused = 0;
+  function screenDrop(files) {
+    const limit = bulkMessageLimit();
+    if (!limit) return files;
+    const kept = [];
+    let total = DROP_HEADER;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const need = dropItemOverhead(f) + (f.size || 0);
+      if (total + need > limit) {
+        dropsRefused++;
+        noteSuppressed();
+        console.warn('[drop] "' + f.name + '" is ' + f.size +
+          ' bytes and the data channel accepts ' + limit + ' per message; not sent');
+        continue;
+      }
+      total += need;
+      kept.push(f);
+    }
+    return kept;
+  }
+
   async function sendDrop(x, y, fileList) {
-    const files = Array.from(fileList);
+    const files = screenDrop(Array.from(fileList));
+    if (!files.length) return;
     const items = await Promise.all(files.map(async f => ({
       name: enc(f.name),
       mime: enc(f.type || 'application/octet-stream'),
@@ -802,6 +853,7 @@
 
   function setup(pc) {
     if (!pc || typeof pc.createDataChannel !== 'function') return;
+    dropPc = pc;
     try {
       fast = pc.createDataChannel('fast', { ordered: false, maxRetransmits: 0, priority: 'high' });
       reliable = pc.createDataChannel('reliable', { ordered: true, priority: 'high' });

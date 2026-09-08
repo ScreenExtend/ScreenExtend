@@ -1864,12 +1864,27 @@
                 ]);
                 return clampRefresh(measured) || 0;
             }
+            // The refinement is the safety net for a join-time measurement that was wrong, not
+            // the normal path: with REFRESH_SAMPLES at 24 the measurement lands inside the
+            // deadline and the first offer already carries the right rate. It is wrong when
+            // the page spent its first half-second in a background tab or behind a layout
+            // storm, where rAF is throttled and the measured rate is far too low — and a rate
+            // that only ever updated `joinData` was never corrected on a stationary tablet,
+            // because nothing else there ever reconfigures. So apply it, once, and only when
+            // the two disagree by more than the clamp step.
+            let refreshRefinementApplied = false;
             function noteRefinedRefreshRate(rate) {
                 if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
                 if (Math.abs(rate - cur) < 5) return;
                 joinData.refreshRate = rate;
-                console.log('[refresh] refined to ' + rate + ' Hz; will apply at the next reconfigure');
+                if (refreshRefinementApplied || !isLive || reconfiguring || kicked) {
+                    console.log('[refresh] refined to ' + rate + ' Hz; will apply at the next reconfigure');
+                    return;
+                }
+                refreshRefinementApplied = true;
+                console.log('[refresh] refined to ' + rate + ' Hz from ' + cur + '; rebuilding the host display');
+                reconfigure();
             }
 
             function validate() {
