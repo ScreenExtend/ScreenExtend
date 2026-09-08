@@ -62,6 +62,7 @@ const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 const IS_WINDOWS = getOsType() === "windows";
 const IS_MACOS = getOsType() === "macos";
 const SUPPORTS_WIFI_QR = IS_WINDOWS || IS_MACOS;
+const CREDENTIALS_PERSIST_DEBOUNCE_MS = 400;
 
 function isLikelyIp(value: string): boolean {
   if (!value) return false;
@@ -133,6 +134,7 @@ export default function Settings() {
   const configProceeding = useRef(false);
   const configLoadOk = useRef(false);
   const credentialsSaveToastShown = useRef(false);
+  const persistedCredentials = useRef<string | null>(null);
   const knownDevicesLoaded = useRef(false);
 
   const blocker = useBlocker(
@@ -537,20 +539,31 @@ export default function Settings() {
     }
   }, [spin, setOtp]);
 
+  // Both fields back controlled inputs, so this used to fire an IPC write and a global
+  // config notification per keystroke. Nothing reads the credentials back from the store
+  // while the page is open -- the Save button works off React state -- so the write can
+  // wait until typing settles. The inputs and the button's disabled state are unaffected.
   useEffect(() => {
     if (!configLoaded || !configLoadOk.current) return;
-    updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}})
-      .then(() => { credentialsSaveToastShown.current = false; })
-      .catch(e => {
-        console.error("failed to persist hosted network credentials", e);
-        if (credentialsSaveToastShown.current) return;
-        credentialsSaveToastShown.current = true;
-        toast({
-          variant: "destructive",
-          title: t("toasts.settings.saveFailedTitle"),
-          description: t("toasts.settings.saveFailedDescription"),
+    const pair = JSON.stringify([hostedNetworkName, hostedNetworkPassword]);
+    if (persistedCredentials.current === pair) return;
+    const timer = window.setTimeout(() => {
+      persistedCredentials.current = pair;
+      updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}})
+        .then(() => { credentialsSaveToastShown.current = false; })
+        .catch(e => {
+          persistedCredentials.current = null;
+          console.error("failed to persist hosted network credentials", e);
+          if (credentialsSaveToastShown.current) return;
+          credentialsSaveToastShown.current = true;
+          toast({
+            variant: "destructive",
+            title: t("toasts.settings.saveFailedTitle"),
+            description: t("toasts.settings.saveFailedDescription"),
+          });
         });
-      });
+    }, CREDENTIALS_PERSIST_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
 
