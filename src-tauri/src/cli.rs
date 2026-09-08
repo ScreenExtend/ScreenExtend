@@ -147,6 +147,11 @@ pub fn fast_path() {
     let Some(first) = raw.first().map(String::as_str) else {
         return;
     };
+    // `probe` has its own help and its own flags; the global scan for -h/--help would
+    // otherwise swallow `probe --help` and print the shipped command list instead.
+    if first == "probe" {
+        return;
+    }
     if first == "help" || raw.iter().any(|a| a == "-h" || a == "--help") {
         attach_console();
         print_help();

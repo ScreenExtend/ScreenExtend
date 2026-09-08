@@ -166,6 +166,12 @@ fn run(
     )));
 
     let mut accum: Vec<f32> = Vec::with_capacity(FRAME_INTERLEAVED * 16);
+    // Host-clock time of `accum[0]`, taken from the endpoint hardware rather than from
+    // whenever this thread got round to draining. `None` while the accumulator is empty.
+    let mut accum_start_ns: Option<u64> = None;
+    // Prime the QPC-to-host offset off the real-time path: the first call samples both clocks
+    // and stores them in a OnceLock, and the drain loop must not be the one to do that.
+    let _ = crate::windows_utils::streamer::clock::boot_ns_to_host_ns(1);
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame is a fresh timeline
     let mut encode_ns: Vec<u64> = Vec::with_capacity(ENCODE_WINDOW);
@@ -196,7 +202,15 @@ fn run(
 
         session.event.wait(100);
 
-        match unsafe { drain(&session, &mut accum, &mut pending_flags, &diagnostics) } {
+        match unsafe {
+            drain(
+                &session,
+                &mut accum,
+                &mut accum_start_ns,
+                &mut pending_flags,
+                &diagnostics,
+            )
+        } {
             Ok(()) => {}
             Err(DrainError::DeviceInvalidated) => {
                 crate::tprintln!("audio: device invalidated; re-acquiring");
@@ -204,6 +218,7 @@ fn run(
                 match unsafe { reacquire(&enumerator, &mut session) } {
                     Ok(()) => {
                         accum.clear();
+                        accum_start_ns = None;
                         pending_flags |= FLAG_DISCONTINUITY;
                     }
                     Err(e) => {
@@ -240,9 +255,12 @@ fn run(
 
             let flags = pending_flags;
             pending_flags = 0;
+            let capture_ns = accum_start_ns
+                .map(|start| start + i as u64 * FRAME_NS)
+                .unwrap_or_else(host_now_ns);
             let pkt = AudioPacket {
                 seq,
-                capture_ns: host_now_ns(),
+                capture_ns,
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
@@ -254,6 +272,11 @@ fn run(
         }
         if full > 0 {
             accum.drain(0..full * FRAME_INTERLEAVED);
+            accum_start_ns = if accum.is_empty() {
+                None
+            } else {
+                accum_start_ns.map(|start| start + full as u64 * FRAME_NS)
+            };
         }
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
@@ -271,9 +294,13 @@ enum DrainError {
     Fatal(anyhow::Error),
 }
 
+/// Nanoseconds of audio one interleaved stereo Opus frame represents (5 ms at 48 kHz).
+const FRAME_NS: u64 = 5_000_000;
+
 unsafe fn drain(
     session: &Session,
     accum: &mut Vec<f32>,
+    accum_start_ns: &mut Option<u64>,
     pending_flags: &mut u8,
     diagnostics: &AudioDiagnostics,
 ) -> Result<(), DrainError> {
@@ -310,7 +337,23 @@ unsafe fn drain(
 
         let is_silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
         let is_discont = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
-        let _ts_error = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0;
+        let ts_error = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0;
+
+        // `qpcpos` is when the endpoint device actually read this packet's first frame, in
+        // 100 ns units of QPC time since boot. It was being read into a variable and thrown
+        // away, so every packet was stamped with the moment the *encoder* got to it instead —
+        // which folds the drain interval, the encode time and any scheduling delay into what
+        // the client believes is the capture instant, and that is the number A/V sync is
+        // built on. Anchor the accumulator to it whenever the accumulator is empty; frames
+        // within a burst are then spaced by exactly one frame period.
+        if accum.is_empty() {
+            let host_ns = if ts_error || qpcpos == 0 {
+                0
+            } else {
+                crate::windows_utils::streamer::clock::boot_ns_to_host_ns(qpcpos * 100)
+            };
+            *accum_start_ns = Some(if host_ns != 0 { host_ns } else { host_now_ns() });
+        }
 
         if is_silent {
             diagnostics.silent_count.fetch_add(1, Ordering::Relaxed);
