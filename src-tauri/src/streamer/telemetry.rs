@@ -92,6 +92,19 @@ pub struct Histogram {
     max_ns: AtomicU64,
 }
 
+/// The derived form would print 512 buckets. Print what a reader wants instead.
+impl std::fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.snapshot();
+        f.debug_struct("Histogram")
+            .field("count", &s.count)
+            .field("p50_ns", &s.p50_ns)
+            .field("p99_ns", &s.p99_ns)
+            .field("max_ns", &s.max_ns)
+            .finish()
+    }
+}
+
 impl Default for Histogram {
     fn default() -> Self {
         Self::new()

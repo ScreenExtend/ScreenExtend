@@ -46,6 +46,11 @@ struct AudioCapabilities {
     /// the client, so the request does too.
     #[serde(default, rename = "wantsFallbackTrack")]
     wants_fallback_track: bool,
+    /// The client can parse a `FLAG_REDUNDANT` message (previous frame's Opus payload
+    /// appended). Absent in every client that predates the flag, and the host must not send
+    /// what the client cannot read, so `false` is the only safe default.
+    #[serde(default)]
+    redundancy: bool,
 }
 
 #[derive(Deserialize)]
@@ -930,16 +935,19 @@ async fn start_session(
             let caps = req.audio_capabilities;
             let fast = caps.webcodecs_opus && caps.worklet;
             tprintln!(
-                "audio capabilities: webcodecsOpus={} worklet={} verified={} wantsFallbackTrack={} -> {}",
+                "audio capabilities: webcodecsOpus={} worklet={} verified={} wantsFallbackTrack={} redundancy={} -> {}",
                 caps.webcodecs_opus,
                 caps.worklet,
                 caps.verified,
                 caps.wants_fallback_track,
+                caps.redundancy,
                 if fast { "DataChannel" } else { "Opus track" }
             );
             Some(webrtc_session::AudioParams {
                 fast,
                 fallback_track: caps.wants_fallback_track,
+                redundancy: caps.redundancy,
+                link_loss: None, // wired in by `start_session`, which owns the BWE
                 hub: std::sync::Arc::clone(hub),
                 overrides: std::sync::Arc::clone(overrides),
                 device_key: client_ip.to_string(),

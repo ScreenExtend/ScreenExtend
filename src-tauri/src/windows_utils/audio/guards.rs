@@ -1,11 +1,42 @@
 use anyhow::{Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_OBJECT_0};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::Media::Audio::WAVEFORMATEX;
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
     WaitForSingleObject,
 };
+
+/// Owns a `WAVEFORMATEX` that `IAudioClient::GetMixFormat` allocated with `CoTaskMemAlloc`.
+///
+/// Every early return between the `GetMixFormat` and the matching `CoTaskMemFree` used to leak
+/// it — and `acquire` sits on a 200 ms retry loop, so a format the parser rejects leaked about
+/// five times a second for as long as the condition lasted.
+pub struct MixFormatPtr(*mut WAVEFORMATEX);
+
+impl MixFormatPtr {
+    /// # Safety
+    /// `ptr` must be a live `CoTaskMemAlloc`'d `WAVEFORMATEX` that nothing else will free.
+    pub unsafe fn from_raw(ptr: *mut WAVEFORMATEX) -> Self {
+        Self(ptr)
+    }
+
+    pub fn as_ptr(&self) -> *const WAVEFORMATEX {
+        self.0
+    }
+}
+
+impl Drop for MixFormatPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CoTaskMemFree(Some(self.0 as *const _)) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
 
 pub struct ComGuard;
 
