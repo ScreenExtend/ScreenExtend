@@ -103,8 +103,21 @@ fn apply_pending_bitrate(
             warn_constant_qp_once(warned);
             *current = pending;
         }
-        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+        Err(e) => {
+            teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; will retry");
+            restore_pending_bitrate(target_bitrate, pending);
+        }
     }
+}
+
+/// Puts a failed target back so the next tick retries it.
+///
+/// Both appliers consume the request with `swap(0)` *before* attempting the reconfigure, so a
+/// transient `nvEncReconfigureEncoder` failure used to drop the congestion controller's response
+/// on the floor until it happened to publish a different number -- possibly never, if it had
+/// settled. `compare_exchange` so a newer target published in the meantime still wins.
+fn restore_pending_bitrate(target_bitrate: &AtomicU32, pending: u32) {
+    let _ = target_bitrate.compare_exchange(0, pending, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
@@ -126,6 +139,11 @@ const FRAME_POOL_BUFFERS_INLINE: u32 = 2;
 /// Frame-pool depth for the ring path, which only stages a copy in the callback and encodes
 /// elsewhere: one more buffer so the copy and the encode overlap.
 const FRAME_POOL_BUFFERS_RING: u32 = 3;
+
+/// How many consecutive "nothing changed" reports to trust before encoding anyway. The DXGI path
+/// carries the same valve for the same reason: a driver that under-reports dirty regions would
+/// otherwise serve a stale picture forever.
+const MAX_CONSECUTIVE_UNCHANGED: u32 = 5;
 
 fn is_transient_encode_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("device busy")
@@ -1198,6 +1216,9 @@ struct LiveCapture {
     /// Folded into telemetry from the callback, which is the only place that can see it move.
     stale_frames: Arc<AtomicU32>,
     stale_frames_reported: u32,
+    /// True when this build exposes `DirtyRegionMode`, so `Frame::dirty_regions()` is meaningful.
+    dirty_region_reporting: bool,
+    unchanged_streak: u32,
     _thread_tuning: tuning::ThreadTuning,
     _keep_awake: tuning::KeepAwake,
     telemetry: SharedTelemetry,
@@ -1240,10 +1261,8 @@ fn build_zero_copy(
 fn build_zero_copy_ring(
     config: EncoderConfig,
     igpu_device: &ID3D11Device,
-    igpu_context: &ID3D11DeviceContext,
     ring: usize,
 ) -> Result<(Encoder, Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>)> {
-    let _ = igpu_context; // context is passed for symmetry with build_zero_copy / used by caller
     let encoder = Encoder::new_shared_ring(config, ring)?;
     let handles = encoder.shared_handles();
     if handles.len() != ring {
@@ -1761,7 +1780,10 @@ fn apply_pending_bitrate_atomic(
             warn_constant_qp_once(warned);
             *current = pending;
         }
-        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+        Err(e) => {
+            teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; will retry");
+            restore_pending_bitrate(target_bitrate, pending);
+        }
     }
 }
 
@@ -2015,6 +2037,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
         let thread_tuning = tuning::tune_current_thread();
         let keep_awake = tuning::KeepAwake::begin();
+        let features = wgc_features();
 
         let epoch = Instant::now();
         let last_frame_at = Arc::new(AtomicU64::new(0));
@@ -2025,7 +2048,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         const RING: usize = 3;
         let try_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
         if try_ring {
-            match build_zero_copy_ring(config, &ctx.device, &ctx.device_context, RING) {
+            match build_zero_copy_ring(config, &ctx.device, RING) {
                 Ok((encoder, pairs)) => {
                     tuning::raise_d3d11_gpu_priority(encoder.device());
 
@@ -2081,6 +2104,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         frame_pool_buffers: FRAME_POOL_BUFFERS_RING,
                         stale_frames: Arc::new(AtomicU32::new(0)),
                         stale_frames_reported: 0,
+                        dirty_region_reporting: features.dirty_region,
+                        unchanged_streak: 0,
                         _thread_tuning: thread_tuning,
                         _keep_awake: keep_awake,
                         telemetry,
@@ -2172,6 +2197,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             frame_pool_buffers: FRAME_POOL_BUFFERS_INLINE,
             stale_frames: Arc::new(AtomicU32::new(0)),
             stale_frames_reported: 0,
+            dirty_region_reporting: features.dirty_region,
+            unchanged_streak: 0,
             _thread_tuning: thread_tuning,
             _keep_awake: keep_awake,
             telemetry,
@@ -2199,6 +2226,22 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             .timestamp()
             .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
             .unwrap_or(0);
+
+        // The DXGI backend has skipped unchanged frames since `present_region_is_empty` landed;
+        // WGC had no equivalent and re-encoded every delivered frame. `DirtyRegionMode::ReportOnly`
+        // (build 26100+, requested only where the property exists) gives the same information, and
+        // the repeater/keepalive already emits a frame every 200 ms so a skipped frame is not a
+        // stalled client. The consecutive cap is the same safety valve the DXGI path uses, for a
+        // driver that under-reports.
+        if self.dirty_region_reporting {
+            if let Ok(regions) = frame.dirty_regions() {
+                if regions.is_empty() && self.unchanged_streak < MAX_CONSECUTIVE_UNCHANGED {
+                    self.unchanged_streak += 1;
+                    return Ok(());
+                }
+                self.unchanged_streak = 0;
+            }
+        }
 
         let stale = self.stale_frames.load(Ordering::Relaxed);
         if stale != self.stale_frames_reported {
