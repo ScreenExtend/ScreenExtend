@@ -56,6 +56,67 @@ pub fn select_vendor(adapter_description: &str) -> Vendor {
     }
 }
 
+/// Which adapter the capture device should be created on, given the encoder we intend to use.
+///
+/// The point is not raw GPU power — it is that the capture device and the encoder device end up
+/// on the *same* adapter. The encoder input is a `SHARED_NTHANDLE | SHARED_KEYEDMUTEX` texture
+/// opened on the capture device, and that mechanism is same-adapter only; cross-adapter sharing
+/// needs `SHARED_CROSS_ADAPTER`, which cannot be an encoder input. When the two adapters differ,
+/// every frame falls back to a GPU→CPU→GPU round trip. WGC can capture any monitor from a device
+/// on any adapter, so this choice is free.
+#[cfg(target_os = "windows")]
+pub fn capture_gpu_preference(
+    vendor: crate::streamer::config::EncoderVendor,
+) -> crate::windows_capture::d3d11::GpuPreference {
+    use crate::streamer::config::EncoderVendor;
+    use crate::windows_capture::d3d11::GpuPreference;
+
+    match vendor {
+        EncoderVendor::Nvidia => GpuPreference::Vendor(NVIDIA_PCI_VENDOR_ID),
+        EncoderVendor::Intel => GpuPreference::Vendor(INTEL_PCI_VENDOR_ID),
+        EncoderVendor::Amd => GpuPreference::Vendor(AMD_PCI_VENDOR_ID),
+        // The `Auto` ladder is NVENC -> Quick Sync -> AMF, so the discrete GPU is where the first
+        // two candidates live.
+        EncoderVendor::Auto => GpuPreference::HighPerformance,
+        // x264 reads every frame back to the CPU. Reading back from the iGPU that composes the
+        // desktop is far cheaper than dragging it across PCIe from a discrete card.
+        EncoderVendor::Software => GpuPreference::MinimumPower,
+    }
+}
+
+/// Says, once per session, which GPU captures and which encodes, and whether they match.
+///
+/// A mismatch is not an error — it is the difference between a shared-texture handoff and a full
+/// readback every frame, and it was previously only inferable from a "zero-copy path unavailable"
+/// message that names no adapter.
+#[cfg(target_os = "windows")]
+pub fn report_adapter_pairing(
+    capture: &crate::windows_capture::d3d11::AdapterInfo,
+    encoder_device: Option<&windows::Win32::Graphics::Direct3D11::ID3D11Device>,
+) {
+    use crate::windows_capture::d3d11::device_adapter_info;
+
+    if capture.software {
+        teprintln!(
+            "adapters: capture is running on a SOFTWARE rasteriser -- {}. Every frame of this \
+             display is being composed on the CPU; expect very high latency and CPU use",
+            capture.label()
+        );
+    }
+    match encoder_device.and_then(device_adapter_info) {
+        Some(enc) => tprintln!(
+            "adapters: capture={} encode={} same_adapter={}",
+            capture.label(),
+            enc.label(),
+            enc.luid == capture.luid
+        ),
+        None => tprintln!(
+            "adapters: capture={} encode=cpu (software encoder)",
+            capture.label()
+        ),
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn device_vendor(device: &windows::Win32::Graphics::Direct3D11::ID3D11Device) -> Vendor {
     use windows::core::Interface;

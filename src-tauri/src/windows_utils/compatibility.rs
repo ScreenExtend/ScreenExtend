@@ -136,8 +136,29 @@ fn wgc_supported() -> bool {
     GraphicsCaptureSession::IsSupported().unwrap_or(false)
 }
 
+/// Whether the DXGI Desktop Duplication *fallback* can actually run here.
+///
+/// This used to be `CreateDXGIFactory1().is_ok()`, which is true on every Windows since 7 and
+/// says nothing about duplication. On a hybrid-graphics laptop `DuplicateOutput` returns
+/// `DXGI_ERROR_UNSUPPORTED` on the primary display, so the report claimed a fallback that could
+/// never start. Duplication is created and immediately dropped, once, on the probe thread.
 fn dxgi_supported() -> bool {
-    unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.is_ok()
+    if unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.is_err() {
+        return false;
+    }
+    match super::streamer::dxgi::probe_duplication() {
+        Ok(api) => {
+            tprintln!("dxgi: duplication fallback available via {}", api.name());
+            true
+        }
+        Err(e) => {
+            teprintln!(
+                "dxgi: duplication fallback is NOT available on this machine ({e:#}); \
+                 Windows.Graphics.Capture is the only capture path here"
+            );
+            false
+        }
+    }
 }
 
 fn type_present(type_name: &str) -> bool {
