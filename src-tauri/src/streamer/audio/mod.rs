@@ -77,6 +77,10 @@ pub struct AudioDiagnostics {
     pub dropped_backpressure: AtomicU64,
     /// Packets the broadcast dropped on a slow subscriber's behalf (`RecvError::Lagged`).
     pub lagged_packets: AtomicU64,
+    /// Drains whose endpoint timestamp was in the future and had to be clamped to the host
+    /// clock. On a Windows loopback stream this is the normal case, not an anomaly — see the
+    /// comment at the anchor in `windows_utils::audio::loopback::drain`.
+    pub capture_ts_clamped: AtomicU64,
     /// Opus encode duration per frame.
     pub encode: crate::streamer::telemetry::Histogram,
     /// Capture-thread wake-to-wake interval: the engine period as actually delivered, which is
@@ -101,7 +105,7 @@ impl AudioDiagnostics {
         format!(
             "audio diag: fmt={}Hz x{}ch period={}fr buffer={}fr, encode={}ms, wake={}ms, \
              capture->packet={}ms (p50/p90/p99/max), discontinuity={}, silent={}, \
-             dev_changes={}, companion_restarts={}, starvations={}, dc_drops={}, lagged={}",
+             dev_changes={}, companion_restarts={}, starvations={}, dc_drops={},              lagged={}, ts_clamped={}",
             self.sample_rate.load(Ordering::Relaxed),
             self.channels.load(Ordering::Relaxed),
             self.period_frames.load(Ordering::Relaxed),
@@ -116,6 +120,7 @@ impl AudioDiagnostics {
             self.event_starvations.load(Ordering::Relaxed),
             self.dropped_backpressure.load(Ordering::Relaxed),
             self.lagged_packets.load(Ordering::Relaxed),
+            self.capture_ts_clamped.load(Ordering::Relaxed),
         )
     }
 }

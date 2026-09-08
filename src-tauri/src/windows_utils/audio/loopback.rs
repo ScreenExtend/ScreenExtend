@@ -34,6 +34,11 @@ const OUT_SAMPLE_RATE: u32 = 48000;
 const OUT_CHANNELS: u16 = 2;
 const FRAME_INTERLEAVED: usize = FRAME_SAMPLES * OUT_CHANNELS as usize;
 const DIAG_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long each `WaitForSingleObject` on the capture event may block.
+const EVENT_WAIT_MS: u32 = 100;
+/// Consecutive unsignalled waits before the endpoint is treated as clockless and re-acquired.
+/// 20 x 100 ms = 2 s of nothing at all, against a 10 ms nominal period.
+const STARVED_WAITS_BEFORE_REACQUIRE: u32 = 20;
 
 pub fn start() -> Result<AudioCapture> {
     let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
@@ -169,6 +174,8 @@ fn run(
         encoder.lookahead_samples(),
     )));
 
+    spawn_diagnostics_reporter(Arc::clone(&diagnostics), Arc::clone(&stop));
+
     let mut accum: Vec<f32> = Vec::with_capacity(FRAME_INTERLEAVED * 16);
     // Host-clock time of `accum[0]`, taken from the endpoint hardware rather than from
     // whenever this thread got round to draining. `None` while the accumulator is empty.
@@ -178,20 +185,29 @@ fn run(
     let _ = crate::windows_utils::streamer::clock::boot_ns_to_host_ns(1);
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame is a fresh timeline
-    let mut last_diag = Instant::now();
+    let mut last_wake_ns: Option<u64> = None;
+    let mut starved_waits: u32 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        if let Ok(DeviceEvent::DefaultRenderChanged) = dev_rx.try_recv() {
-            crate::tprintln!("audio: default render device changed; re-acquiring");
+        // Drain the whole burst: a device-change storm used to queue N events and cost N full
+        // re-acquisitions, one per loop iteration, when only the last one matters.
+        let mut device_changed = false;
+        while let Ok(DeviceEvent::DefaultRenderChanged) = dev_rx.try_recv() {
+            device_changed = true;
             diagnostics.device_changes.fetch_add(1, Ordering::Relaxed);
-            match unsafe { reacquire(&enumerator, &mut session) } {
+        }
+        if device_changed {
+            crate::tprintln!("audio: default render device changed; re-acquiring");
+            match unsafe { reacquire(&enumerator, &mut session, &diagnostics) } {
                 Ok(()) => {
                     accum.clear();
+                    accum_start_ns = None;
                     pending_flags |= FLAG_DISCONTINUITY;
+                    starved_waits = 0;
                 }
                 Err(e) => {
                     crate::teprintln!("audio: re-acquire after device change failed: {e:#}");
@@ -203,7 +219,56 @@ fn run(
             continue;
         }
 
-        session.event.wait(100);
+        // The companion is the endpoint's clock. If its pump died — three error paths that
+        // used to `break` in silence — the capture event stops firing and nothing here would
+        // ever notice: the diagnostic line keeps printing with frozen counters, which reads as
+        // healthy. Two independent detectors, because either can fire first.
+        let signalled = session.event.wait(EVENT_WAIT_MS);
+        if signalled {
+            let now = host_now_ns();
+            if let Some(prev) = last_wake_ns {
+                diagnostics.wake_interval.record_span(prev, now);
+            }
+            last_wake_ns = Some(now);
+            starved_waits = 0;
+        } else {
+            starved_waits += 1;
+        }
+        let companion_dead = !session.companion.is_alive();
+        if companion_dead || starved_waits >= STARVED_WAITS_BEFORE_REACQUIRE {
+            if companion_dead {
+                crate::teprintln!(
+                    "audio: silent render companion died; restarting the endpoint (capture has \
+                     no clock without it)"
+                );
+                diagnostics
+                    .companion_restarts
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                crate::teprintln!(
+                    "audio: capture event unsignalled for {} ms; treating the endpoint as \
+                     starved and re-acquiring",
+                    starved_waits * EVENT_WAIT_MS
+                );
+                diagnostics
+                    .event_starvations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            starved_waits = 0;
+            last_wake_ns = None;
+            match unsafe { reacquire(&enumerator, &mut session, &diagnostics) } {
+                Ok(()) => {
+                    accum.clear();
+                    accum_start_ns = None;
+                    pending_flags |= FLAG_DISCONTINUITY;
+                }
+                Err(e) => {
+                    crate::teprintln!("audio: re-acquire after starvation failed: {e:#}");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            continue;
+        }
 
         match unsafe {
             drain(
@@ -218,7 +283,8 @@ fn run(
             Err(DrainError::DeviceInvalidated) => {
                 crate::tprintln!("audio: device invalidated; re-acquiring");
                 diagnostics.device_changes.fetch_add(1, Ordering::Relaxed);
-                match unsafe { reacquire(&enumerator, &mut session) } {
+                last_wake_ns = None;
+                match unsafe { reacquire(&enumerator, &mut session, &diagnostics) } {
                     Ok(()) => {
                         accum.clear();
                         accum_start_ns = None;
@@ -279,14 +345,30 @@ fn run(
                 accum_start_ns.map(|start| start + full as u64 * FRAME_NS)
             };
         }
-
-        if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
-            crate::tprintln!("{}", diagnostics.summary());
-            last_diag = Instant::now();
-        }
     }
 
     crate::tprintln!("audio: loopback capture stopped");
+}
+
+/// Print the 2 s diagnostic from an ordinary thread.
+///
+/// `summary()` builds a `format!` string and `tprintln!` takes the logbus mutex and emits a
+/// Tauri IPC event. Doing that on the MMCSS "Pro Audio" capture thread was a periodic
+/// priority inversion on the one thread whose scheduling guarantee the whole feature depends
+/// on. `AudioDiagnostics` is all atomics and lock-free histograms, so the reader needs nothing
+/// from the writer.
+fn spawn_diagnostics_reporter(diagnostics: Arc<AudioDiagnostics>, stop: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("audio-diag".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(DIAG_LOG_INTERVAL);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                crate::tprintln!("{}", diagnostics.summary());
+            }
+        });
 }
 
 enum DrainError {
@@ -339,20 +421,46 @@ unsafe fn drain(
         let is_discont = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
         let ts_error = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0;
 
-        // `qpcpos` is when the endpoint device actually read this packet's first frame, in
-        // 100 ns units of QPC time since boot. It was being read into a variable and thrown
-        // away, so every packet was stamped with the moment the *encoder* got to it instead —
-        // which folds the drain interval, the encode time and any scheduling delay into what
-        // the client believes is the capture instant, and that is the number A/V sync is
-        // built on. Anchor the accumulator to it whenever the accumulator is empty; frames
+        // Anchor the accumulator to the endpoint's own timestamp rather than to whenever this
+        // thread got round to draining, so the drain interval, the encode time and any
+        // scheduling delay stay out of the number the client's A/V sync is built on. Frames
         // within a burst are then spaced by exactly one frame period.
+        //
+        // `qpcpos` needs care on a **loopback** stream, though. The documented meaning is "the
+        // performance-counter value at the time the audio endpoint device read the device
+        // position" — and for loopback the endpoint is a *render* device, so that position is
+        // its play cursor, not a digitisation instant. The engine hands us mixed audio before
+        // the cursor reaches it, so `qpcpos` is a **playout** time, in the future. Measured on
+        // the dev box, idle: 1596/1601 packets stamped ahead of `host_now_ns()`, mean −14.7 ms,
+        // as far as −20.5 ms, and the offset moves with host load. Left alone that is a
+        // straight ~15 ms of surplus audio latency, because the client sizes its jitter buffer
+        // from `enqueue − capture_ns` and a capture time in the future makes that look shorter
+        // than it is.
+        //
+        // So take the endpoint's stamp only where it is physically possible: the audio in this
+        // read cannot have finished later than now, so the earliest frame is no later than
+        // `now − read_duration`. `min` of the two keeps a genuinely-past stamp (what a real
+        // capture endpoint reports) and clamps a play-ahead one.
         if accum.is_empty() {
-            let host_ns = if ts_error || qpcpos == 0 {
+            let now = host_now_ns();
+            let read_ns = nframes as u64 * 1_000_000_000 / OUT_SAMPLE_RATE as u64;
+            let latest_possible = now.saturating_sub(read_ns);
+            let qpc_host_ns = if ts_error || qpcpos == 0 {
                 0
             } else {
                 crate::windows_utils::streamer::clock::boot_ns_to_host_ns(qpcpos * 100)
             };
-            *accum_start_ns = Some(if host_ns != 0 { host_ns } else { host_now_ns() });
+            let anchor = if qpc_host_ns == 0 || qpc_host_ns > latest_possible {
+                if qpc_host_ns > latest_possible {
+                    diagnostics
+                        .capture_ts_clamped
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                latest_possible
+            } else {
+                qpc_host_ns
+            };
+            *accum_start_ns = Some(anchor);
         }
 
         if is_silent {
@@ -490,9 +598,14 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
     };
     // `GetDevicePeriod` is the period; `GetBufferSize` is the whole engine buffer, several
     // periods deep. The two were reported as the same number under the name `period_frames`.
-    let period_frames = engine::device_period_frames(&client, effective_mix.sample_rate)
-        .map(|(default, _min)| default)
-        .unwrap_or(0);
+    // When the companion negotiated a smaller engine period, that is what this stream is
+    // actually clocked at, and `GetDevicePeriod` still reports the device default.
+    let period_frames = match companion.granted_period_frames() {
+        0 => engine::device_period_frames(&client, effective_mix.sample_rate)
+            .map(|(default, _min)| default)
+            .unwrap_or(0),
+        granted => granted,
+    };
 
     if let Err(e) = client.Start() {
         let _ = client.Reset();
@@ -519,12 +632,28 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
     })
 }
 
-/// Tear down the current session and acquire a fresh one (device change / invalidation).
-unsafe fn reacquire(enumerator: &IMMDeviceEnumerator, session: &mut Session) -> Result<()> {
-    // Replace with a placeholder-free swap: build the new one first, then drop the old.
+/// Tear down the current session and acquire a fresh one (device change / invalidation /
+/// a dead companion).
+///
+/// The new session is built *before* the old one is dropped, deliberately: it keeps the
+/// endpoint clocked across the swap. The cost is that two silent render companions briefly
+/// coexist on the endpoint, each with its own COM MTA thread — correct, but worth saying out
+/// loud, because a device-change storm would otherwise stack them (which is why the caller
+/// coalesces the whole event burst into one call).
+unsafe fn reacquire(
+    enumerator: &IMMDeviceEnumerator,
+    session: &mut Session,
+    diagnostics: &AudioDiagnostics,
+) -> Result<()> {
     let fresh = acquire(enumerator)?;
     let old = std::mem::replace(session, fresh);
     drop(old); // stops old client + old companion
+    diagnostics
+        .period_frames
+        .store(session.period_frames, Ordering::Relaxed);
+    diagnostics
+        .buffer_frames
+        .store(session.buffer_frames, Ordering::Relaxed);
     Ok(())
 }
 
