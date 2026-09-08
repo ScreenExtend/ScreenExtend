@@ -1182,7 +1182,20 @@ async fn start_session(
                     }
                 };
 
-                {
+                // A backend that negotiates its geometry rather than being commanded already knows
+                // what it landed on, and forcing the mode again is a whole extra reconfiguration
+                // that is guaranteed to fail whenever the requested size is off the ladder the OS
+                // published. `None` means "the backend does not know", which is every commanded
+                // backend, and keeps the old behaviour.
+                let already_at_size = client.created_geometry(display_id)
+                    == Some(monitor_dims(width, height, swap_axes));
+                if already_at_size {
+                    tprintln!(
+                        "virtual display {device_name} was created at {width}x{height}; skipping the forced mode set"
+                    );
+                }
+
+                if !already_at_size {
                     let name = device_name.clone();
                     let res = tokio::task::spawn_blocking(move || {
                         pipeline::set_display_mode(&name, width, height, refresh, swap_axes)
@@ -1203,8 +1216,13 @@ async fn start_session(
                 }
                 }
 
-                wait_for_display_settle(&device_name, Some(monitor_dims(width, height, swap_axes)))
+                if !already_at_size {
+                    wait_for_display_settle(
+                        &device_name,
+                        Some(monitor_dims(width, height, swap_axes)),
+                    )
                     .await;
+                }
                 apply_display_scale(&device_name, scale).await;
                 if topology_reset {
                     if let Some(sessions) = state.config.sessions.as_ref() {
@@ -1902,5 +1920,91 @@ mod tests {
             ..upright.clone()
         };
         assert!(rotated.swap_axes());
+    }
+}
+
+#[cfg(test)]
+mod created_geometry_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Negotiating(Option<(u32, u32)>);
+
+    impl session::VirtualDisplayController for Negotiating {
+        fn create_display(&self, _: String, _: u32, _: u32, _: u32) -> Result<u32, String> {
+            Ok(0)
+        }
+        fn remove_display(&self, _: u32) {}
+        fn remove_all_displays(&self) {}
+        fn created_geometry(&self, _: u32) -> Option<(u32, u32)> {
+            self.0
+        }
+    }
+
+    #[derive(Debug)]
+    struct Commanded;
+
+    impl session::VirtualDisplayController for Commanded {
+        fn create_display(&self, _: String, _: u32, _: u32, _: u32) -> Result<u32, String> {
+            Ok(0)
+        }
+        fn remove_display(&self, _: u32) {}
+        fn remove_all_displays(&self) {}
+    }
+
+    /// The condition `start_session` uses to decide whether the forced mode set and the settle
+    /// poll can be skipped.
+    fn would_skip(
+        c: &dyn session::VirtualDisplayController,
+        w: u32,
+        h: u32,
+        swap_axes: bool,
+    ) -> bool {
+        c.created_geometry(0) == Some(monitor_dims(w, h, swap_axes))
+    }
+
+    #[test]
+    fn a_backend_that_landed_on_the_requested_size_skips_the_forced_mode_set() {
+        assert!(would_skip(
+            &Negotiating(Some((1920, 1080))),
+            1920,
+            1080,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_backend_that_landed_somewhere_else_still_forces_the_mode() {
+        assert!(!would_skip(
+            &Negotiating(Some((1920, 1080))),
+            2560,
+            1440,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_portrait_request_is_compared_in_monitor_coordinates() {
+        // The client asked for 1080x1920; the display is driven landscape and rotated, so the
+        // geometry to compare against is the transposed one.
+        assert!(would_skip(
+            &Negotiating(Some((1920, 1080))),
+            1080,
+            1920,
+            true
+        ));
+        assert!(!would_skip(
+            &Negotiating(Some((1080, 1920))),
+            1080,
+            1920,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_commanded_backend_keeps_the_old_behaviour() {
+        // Windows registers a mode list and the OS picks from it, so the backend genuinely does
+        // not know — the default `None` must never let the mode set be skipped.
+        assert!(!would_skip(&Commanded, 1920, 1080, false));
     }
 }

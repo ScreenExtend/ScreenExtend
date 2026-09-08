@@ -240,8 +240,7 @@ pub type SharedSessions = Arc<Mutex<HashMap<String, DeviceSessionState>>>;
 pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
     let signal = Arc::new(LeaveSignal::default());
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .leave = Some(signal.clone());
@@ -250,8 +249,7 @@ pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
 
 pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
     let signal = sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.leave.clone());
     if let Some(s) = signal {
@@ -262,8 +260,7 @@ pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
 
 pub fn set_control_sender(sessions: &SharedSessions, ip: &str, tx: ControlSender) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .control = Some(tx);
@@ -289,8 +286,7 @@ fn send_bye_acked(
     sent: Option<std::sync::mpsc::Sender<()>>,
 ) -> bool {
     let tx = sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.control.clone());
     match tx {
@@ -325,16 +321,14 @@ pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Dura
 
 pub fn get_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.live_display.clone())
 }
 
 pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDisplay) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .live_display = Some(display);
@@ -342,8 +336,7 @@ pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDispla
 
 pub fn take_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get_mut(ip)
         .and_then(|s| s.live_display.take())
 }
@@ -355,8 +348,7 @@ pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
 
 pub fn reconfig_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.reconfig_epoch)
         .unwrap_or(0)
@@ -369,8 +361,7 @@ pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
 
 pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.kick_epoch)
         .unwrap_or(0)
@@ -378,8 +369,7 @@ pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
 
 pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: CaptureStopper) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .active_capture = Some((seq, stop));
@@ -387,8 +377,7 @@ pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: C
 
 pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<CaptureStopper> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get_mut(ip)
         .and_then(|s| s.active_capture.take())
         .map(|(_, stop)| stop)
@@ -416,8 +405,7 @@ pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
 
 pub fn is_current_session(sessions: &SharedSessions, ip: &str, seq: u64) -> bool {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.session_seq == seq)
         .unwrap_or(false)
@@ -437,8 +425,7 @@ pub fn set_audio_outputs(
 
 pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputsReport {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| AudioOutputsReport {
             supported: s.audio_outputs_supported,
@@ -450,8 +437,7 @@ pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputs
 
 pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Option<String>) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .selected_audio_output = sel;
@@ -459,8 +445,7 @@ pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Optio
 
 pub fn selected_audio_output(sessions: &SharedSessions, ip: &str) -> Option<String> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.selected_audio_output.clone())
 }
@@ -654,6 +639,22 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The geometry the backend actually landed on, when it knows it.
+    ///
+    /// `create_display` returns a display id and nothing else, so the server always follows a
+    /// successful create with a forced `set_display_mode` and a settle poll — a whole extra
+    /// reconfiguration on a path that has already done several. That is unavoidable on a backend
+    /// that is *commanded* (the Windows IDD registers a mode list and the OS picks from it, so it
+    /// genuinely does not know), but wrong on one that *negotiates*: the macOS AirPlay tier
+    /// computes the closest mode from the ladder macOS published and then discards the answer, and
+    /// the forced set is guaranteed to fail whenever the requested size is off that ladder.
+    ///
+    /// Returning `None` means "ask the OS", which is the old behaviour and the default.
+    fn created_geometry(&self, id: u32) -> Option<(u32, u32)> {
+        let _ = id;
+        None
+    }
+
     fn max_concurrent_displays(&self) -> Option<usize> {
         None
     }
@@ -661,8 +662,7 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
 
 pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .host_ip = host_ip;
@@ -670,8 +670,7 @@ pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>)
 
 pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .values()
         .find(|s| s.live_display.is_some())
         .and_then(|s| s.host_ip.clone())
@@ -679,8 +678,7 @@ pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
 
 pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .iter()
         .filter(|(key, _)| key.as_str() != ip)
         .filter_map(|(_, s)| s.live_display.clone())
@@ -689,8 +687,7 @@ pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisp
 
 pub fn live_display_count(sessions: &SharedSessions) -> usize {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .values()
         .filter(|s| s.live_display.is_some())
         .count()
