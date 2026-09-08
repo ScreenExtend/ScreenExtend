@@ -26,6 +26,24 @@ pub struct RoutingState {
     pub saved_uid: String,
     pub changed: bool,
     pub timestamp: u64,
+    /// pid of the process that took the default output, so recovery can tell "the owner crashed"
+    /// from "the owner is still running". `0` in a file written by an older build.
+    #[serde(default)]
+    pub owner_pid: u32,
+}
+
+impl RoutingState {
+    /// Is the process that made this change still alive?
+    ///
+    /// `kill(pid, 0)` is a signal-existence check, not a fork — the whole point of not asking
+    /// `pgrep`. A file from an older build carries `owner_pid` 0, which reads as "no owner", and
+    /// recovery then falls back to the lock check alone exactly as before.
+    fn owner_alive(&self) -> bool {
+        if self.owner_pid == 0 || self.owner_pid == std::process::id() {
+            return false;
+        }
+        unsafe { libc::kill(self.owner_pid as libc::pid_t, 0) == 0 }
+    }
 }
 
 impl RoutingState {
@@ -109,6 +127,7 @@ impl<P: DefaultDevicePort> Router<P> {
             saved_uid: saved.unwrap_or_default(),
             changed: true,
             timestamp: now_secs,
+            owner_pid: std::process::id(),
         }
         .save(&self.state_path);
         Ok(())
@@ -160,6 +179,14 @@ impl<P: DefaultDevicePort> Router<P> {
 pub fn recover<P: DefaultDevicePort>(port: &P, our_uid: &str, state_path: &Path) -> bool {
     let state = RoutingState::load(state_path);
     if !state.changed {
+        return false;
+    }
+    // Recovery is for a host that *died* holding the default output. A host that is still running
+    // owns it, and pulling the device out from under it mid-stream would look exactly like the
+    // user switching away — which is how `probe --audio` caught this: the agent is bootstrapped
+    // with `RunAtLoad`, so it runs the instant the tier starts, and the probe takes no
+    // single-instance lock for `another_instance_running` to find.
+    if state.owner_alive() {
         return false;
     }
     let is_us = port.current_default_uid().as_deref() == Some(our_uid);
