@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 
@@ -14,7 +14,6 @@ export function LogTerminal() {
   const [lines, setLines] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
-  const { toast } = useToast();
   const { t } = useTranslation();
 
   useEffect(() => {

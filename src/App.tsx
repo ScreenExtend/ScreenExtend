@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Route,
   RouterProvider,
@@ -20,12 +20,26 @@ import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { GlobalProviderContext, type AudioOutputsInfo } from "@/components/global-provider";
+import {
+  AudioOutputsContext,
+  AvatarContext,
+  ClosingContext,
+  DevicesContext,
+  LoadedContext,
+  QrValuesContext,
+  SessionContext,
+  SettersContext,
+  ZoomContext,
+  useClosing,
+  type AudioOutputsInfo,
+  type GlobalSetters,
+  type QrValue,
+} from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
-import { useToast } from "@/components/ui/use-toast";
-import { useTranslation } from "@/i18n";
+import { toast } from "@/components/ui/use-toast";
+import { t, useTranslation } from "@/i18n";
 import "non.geist";
 const appWindow = getCurrentWebviewWindow();
 
@@ -57,11 +71,47 @@ const router = createMemoryRouter(
   )
 );
 
-function App() {
+const deviceEquals = (a: Device, b: Device): boolean => {
+  const keys = Object.keys(b) as (keyof Device)[];
+  if (keys.length !== Object.keys(a).length) return false;
+  return keys.every(key => a[key] === b[key]);
+};
+
+const markWalkthroughDone = async () => {
+  try {
+    await updateConfig({ walkthroughCompleted: true });
+    await flushConfig();
+  } catch {
+    toast({
+      variant: "destructive",
+      title: t("toasts.walkthrough.failureTitle"),
+      description: t("toasts.walkthrough.failureDescription"),
+    });
+  }
+};
+
+function ClosingOverlay() {
+  const closing = useClosing();
+  const { t } = useTranslation();
+  return (
+    <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 999999 }}>
+      <div className="rounded-lg p-6 flex flex-col items-center">
+        <Loader2 className="animate-spin text-white mb-4" size={48} />
+        <p className="text-xl font-semibold text-white">{t("app.closing")}</p>
+      </div>
+    </div>
+  );
+}
+
+// Owns every piece of global state and every backend subscription. It renders
+// `children` untouched, so the element tree below it is referentially stable and
+// React skips it when this component re-renders: only the consumers of the one
+// context that actually changed commit.
+function GlobalState({ children }: { children: ReactNode }) {
   const [hostedNetworkOn, setHostedNetworkOn] = useState(false);
   const [otp, setOtp] = useState("");
   const [sessionId, setSessionId] = useState("");
-  const [qrValues, setQrValues] = useState([] as { title: string; value: string; }[]);
+  const [qrValues, setQrValues] = useState<QrValue[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
@@ -70,11 +120,28 @@ function App() {
   const [audioOutputsByIp, setAudioOutputsByIp] = useState<Record<string, AudioOutputsInfo>>({});
   const zoomReady = useRef(false);
   const appliedZoom = useRef(DEFAULT_ZOOM);
+  const zoomPersist = useRef<number | undefined>(undefined);
 
   const [closing, setClosing] = useState(false);
 
-  const { toast } = useToast();
-  const { t } = useTranslation();
+  const setters = useMemo<GlobalSetters>(() => ({
+    setHostedNetworkOn,
+    setOtp,
+    setSessionId,
+    setQrValues,
+    setLoaded,
+    setClosing,
+    setDevices,
+    setPublicSessionsEnabled,
+    setAvatar,
+    setZoom,
+    setAudioOutputsByIp,
+  }), []);
+
+  const session = useMemo(
+    () => ({ sessionId, otp, publicSessionsEnabled, hostedNetworkOn }),
+    [sessionId, otp, publicSessionsEnabled, hostedNetworkOn]
+  );
 
   useEffect(() => {
     void (async () => {
@@ -107,11 +174,17 @@ function App() {
     })();
   }, []);
 
+  // The rescale is applied per keypress; only the store write is coalesced, so
+  // holding Ctrl+`+` through five steps is one write instead of five.
   useEffect(() => {
     if (!zoomReady.current) return;
     void applyZoom(zoom).then(() => {
       appliedZoom.current = zoom;
-      void updateConfig({ zoomFactor: zoom }).catch(e => console.error("persisting zoomFactor failed", e));
+      if (zoomPersist.current !== undefined) window.clearTimeout(zoomPersist.current);
+      zoomPersist.current = window.setTimeout(() => {
+        zoomPersist.current = undefined;
+        void updateConfig({ zoomFactor: appliedZoom.current }).catch(e => console.error("persisting zoomFactor failed", e));
+      }, 500);
     }).catch(() => {
       setZoom(appliedZoom.current);
       toast({
@@ -121,6 +194,10 @@ function App() {
       });
     });
   }, [zoom]);
+
+  useEffect(() => () => {
+    if (zoomPersist.current !== undefined) window.clearTimeout(zoomPersist.current);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -207,7 +284,6 @@ function App() {
         });
       });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, otp]);
 
   useEffect(() => {
@@ -256,7 +332,16 @@ function App() {
       }));
       unlisteners.push(await events.deviceModify.listen(event => {
         const device = event.payload as Device;
-        setDevices(prev => prev.map(d => d.ip === device.ip ? device : d));
+        setDevices(prev => {
+          const index = prev.findIndex(d => d.ip === device.ip);
+          if (index < 0) return prev;
+          // A no-op modify must not allocate a new array: `devices` identity
+          // drives an extra IPC burst in Dashboard and Settings.
+          if (deviceEquals(prev[index], device)) return prev;
+          const next = prev.slice();
+          next[index] = device;
+          return next;
+        });
       }));
       unlisteners.push(await events.deviceAudioOutputs.listen(event => {
         const p = event.payload;
@@ -357,36 +442,34 @@ function App() {
       }
     }).then(un => { unlisten = un; }).catch(e => console.error("onCloseRequested registration failed", e));
     return () => { if (unlisten) stopListening(unlisten); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
-  const markWalkthroughDone = async () => {
-    try {
-      await updateConfig({ walkthroughCompleted: true });
-      await flushConfig();
-    } catch {
-      toast({
-        variant: "destructive",
-        title: t("toasts.walkthrough.failureTitle"),
-        description: t("toasts.walkthrough.failureDescription"),
-      });
-    }
-  };
-
   return (
-    <GlobalProviderContext.Provider value={{
-      windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn],
-      windowOtp: [otp, setOtp],
-      windowSessionId: [sessionId, setSessionId],
-      windowQrValues: [qrValues, setQrValues],
-      windowLoaded: [loaded, setLoaded],
-      windowClosing: [closing, setClosing],
-      windowDevices: [devices, setDevices],
-      windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled],
-      windowAvatar: [avatar, setAvatar],
-      windowZoom: [zoom, setZoom],
-      windowAudioOutputsByIp: [audioOutputsByIp, setAudioOutputsByIp]
-    }}>
+    <SettersContext.Provider value={setters}>
+      <SessionContext.Provider value={session}>
+        <QrValuesContext.Provider value={qrValues}>
+          <DevicesContext.Provider value={devices}>
+            <AudioOutputsContext.Provider value={audioOutputsByIp}>
+              <AvatarContext.Provider value={avatar}>
+                <ZoomContext.Provider value={zoom}>
+                  <ClosingContext.Provider value={closing}>
+                    <LoadedContext.Provider value={loaded}>
+                      {children}
+                    </LoadedContext.Provider>
+                  </ClosingContext.Provider>
+                </ZoomContext.Provider>
+              </AvatarContext.Provider>
+            </AudioOutputsContext.Provider>
+          </DevicesContext.Provider>
+        </QrValuesContext.Provider>
+      </SessionContext.Provider>
+    </SettersContext.Provider>
+  );
+}
+
+function App() {
+  return (
+    <GlobalState>
       <ThemeProvider defaultTheme="system">
         <NextStepProvider>
           <NextStepReact
@@ -401,16 +484,11 @@ function App() {
           >
             <HighlightProxy />
             <RouterProvider router={router} />
-            <div className="fixed top-0 right-0 bottom-0 left-0 bg-black bg-opacity-80 flex items-center justify-center" style={{ display: closing ? "flex" : "none", zIndex: 999999 }}>
-              <div className="rounded-lg p-6 flex flex-col items-center">
-                <Loader2 className="animate-spin text-white mb-4" size={48} />
-                <p className="text-xl font-semibold text-white">{t("app.closing")}</p>
-              </div>
-            </div>
+            <ClosingOverlay />
           </NextStepReact>
         </NextStepProvider>
         </ThemeProvider>
-    </GlobalProviderContext.Provider>
+    </GlobalState>
   );
 }
 

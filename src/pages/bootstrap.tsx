@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { Check, Info, Loader2, X } from "lucide-react";
@@ -12,10 +12,10 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useGlobalSetters, useLoaded } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
 import { buildQrValues, generateOtp } from "@/lib/utils";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
@@ -73,8 +73,8 @@ function formatBytes(bytes: number): string {
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
   const { t } = useTranslation();
-  const { toast } = useToast();
-  const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
+  const loaded = useLoaded();
+  const { setLoaded, setOtp, setHostedNetworkOn, setSessionId, setQrValues, setPublicSessionsEnabled } = useGlobalSetters();
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);

@@ -1,4 +1,4 @@
-import React, { useState, useContext, useEffect, useRef, useCallback, lazy, Suspense } from "react";
+import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from "react";
 import QRCode from "react-qr-code";
 import { useBlocker } from "react-router-dom";
 
@@ -43,13 +43,13 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type Config, type KnownDevice } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useAvatar, useConnectedDevices, useGlobalSetters, useSession, useZoom } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 const ConfigJsonEditor = lazy(() =>
   import("@/components/config-json-editor").then(m => ({ default: m.ConfigJsonEditor }))
 );
 import { useTheme, type Theme } from "@/components/theme-provider";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, type ServerPorts } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
@@ -84,8 +84,11 @@ function formatLastSeen(ts: number): string {
 }
 
 export default function Settings() {
-  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom], windowDevices: [connectedDevices] } = useContext(GlobalProviderContext);
-  const { toast } = useToast();
+  const { otp, sessionId, publicSessionsEnabled, hostedNetworkOn } = useSession();
+  const avatar = useAvatar();
+  const zoom = useZoom();
+  const connectedDevices = useConnectedDevices();
+  const { setOtp, setHostedNetworkOn, setQrValues, setPublicSessionsEnabled, setAvatar, setZoom } = useGlobalSetters();
   const { t } = useTranslation();
   const { setTheme } = useTheme();
 
@@ -532,7 +535,7 @@ export default function Settings() {
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [spin]);
+  }, [spin, setOtp]);
 
   useEffect(() => {
     if (!configLoaded || !configLoadOk.current) return;
