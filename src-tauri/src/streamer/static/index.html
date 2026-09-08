@@ -320,6 +320,13 @@
                 },
             };
 
+            // A DOMException with an empty message — an AbortError from a cancelled
+            // setRemoteDescription, some InvalidStateErrors — used to reach showError as ''
+            // and leave the spinner up over a disabled Connect button with no text, forever.
+            function errorText(err) {
+                if (!err) return 'Connection failed.';
+                return (err.message && String(err.message)) || String(err) || 'Connection failed.';
+            }
             function showError(msg) {
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
@@ -359,6 +366,7 @@
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 reconfiguring = false;
+                clearReconfigWatchdog();
                 loadingEl.classList.remove('show');
                 if (isLive) { startReconfigPoll(); return; }
                 isLive = true;
@@ -442,11 +450,27 @@
                 showError(msg || 'You have been removed from this session.');
             }
 
+            // While `reconfiguring` is set, every recovery path on the page returns early —
+            // the probe tick, the link evaluation, the connection-state handler and the leave
+            // beacon. A rebuild that never completes therefore leaves the last decoded frame
+            // frozen with no spinner, no status and no reconnect, so it gets its own deadline.
+            const RECONFIG_DEADLINE_MS = 15000;
+            let reconfigWatchdog = null;
+            function clearReconfigWatchdog() {
+                if (reconfigWatchdog) { clearTimeout(reconfigWatchdog); reconfigWatchdog = null; }
+            }
             function reconfigure() {
                 if (reconfiguring) return;
                 reconfiguring = true;
                 teardownSession();
                 usingFallback = false;
+                clearReconfigWatchdog();
+                reconfigWatchdog = setTimeout(() => {
+                    reconfigWatchdog = null;
+                    if (!reconfiguring) return;
+                    reconfiguring = false;
+                    linkLost('Disconnected, reconnect to continue.');
+                }, RECONFIG_DEADLINE_MS);
                 start(true);
             }
 
@@ -953,7 +977,15 @@
                 }
             }
 
+            // Bumped by every teardown, checked by start() after each of its awaits. start()
+            // reads and writes pc, worker and usingFallback across seven suspension points and
+            // both watchdogs can tear the session down inside one of them; without a token the
+            // resumed call would POST a second /whep for the same device and hand the fresh
+            // connection the previous one's answer.
+            let startGen = 0;
+
             function teardownSession() {
+                startGen++;
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -1281,13 +1313,20 @@
                 }
             }
 
+            const TRANSFORM_START_TIMEOUT_MS = 2500;
+            const WHEP_TIMEOUT_MS = 10000;
+
             async function start(preferWebCodecs) {
                 teardownSession();
+                // After teardownSession, so this call owns the newest generation.
+                const gen = ++startGen;
+                const stale = () => gen !== startGen;
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const useScriptTransform = useScriptTransformNow();
                     const iceServers = await getIceServers();
+                    if (stale()) return;
                     // Computed once and carried into the gathering wait: without it the wait
                     // took the LAN branch on every session and cut gathering ~200 ms in, before
                     // any TURN allocation could return.
@@ -1316,7 +1355,19 @@
                     } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
-                        worker = await makeTransformWorker();
+                        const w = await makeTransformWorker();
+                        if (stale()) { try { w.terminate(); } catch (_) { noteSuppressed(); } return; }
+                        worker = w;
+                        // A worker whose script fails to load or parse is constructed
+                        // successfully and then simply never posts anything, so without this
+                        // the only net is a timeout — 2.5 s where there is a legacy transform
+                        // to fall back to, and five seconds of black screen on Safari, where
+                        // there is not.
+                        worker.onerror = (ev) => {
+                            noteSuppressed();
+                            fallbackToVideo('transform worker failed: ' + ((ev && ev.message) || 'unknown'));
+                        };
+                        worker.onmessageerror = noteSuppressed;
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
                                 onStreamLive();
@@ -1380,15 +1431,7 @@
                                 retryWithLegacyTransform('RTCRtpScriptTransform threw: ' + err.message);
                                 return;
                             }
-                            // If the standard transform is present but never fires, the
-                            // legacy path is a better answer than the <video> element.
-                            if (hasLegacyEncodedStreams) {
-                                transformStarted = false;
-                                transformWatchdog = setTimeout(() => {
-                                    transformWatchdog = null;
-                                    if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
-                                }, 2500);
-                            }
+                            transformStarted = false;
                         } else {
                             let readable;
                             try {
@@ -1408,6 +1451,24 @@
                             if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
                         } catch (_) { noteSuppressed(); }
                         if (PRESENT_PREF !== 'track') showCanvas();
+                    }
+
+                    // `onrtctransform` cannot fire until ICE has connected and the first
+                    // encoded frame has arrived, so 2500 ms measured from installing the
+                    // transform is well inside the setup budget this same function allots to
+                    // ICE alone — a slow or cross-network join was demoted off
+                    // RTCRtpScriptTransform for being slow, permanently losing
+                    // sendKeyFrameRequest(). Measure from the first sign that packets should
+                    // be flowing instead.
+                    let transformWatchdogArmed = false;
+                    function armTransformWatchdog() {
+                        if (transformWatchdogArmed || transformStarted) return;
+                        if (!(webcodecs && useScriptTransform && hasLegacyEncodedStreams)) return;
+                        transformWatchdogArmed = true;
+                        transformWatchdog = setTimeout(() => {
+                            transformWatchdog = null;
+                            if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
+                        }, TRANSFORM_START_TIMEOUT_MS);
                     }
 
                     pc.ontrack = (e) => {
@@ -1469,27 +1530,33 @@
                     pc.oniceconnectionstatechange = () => {
                         if (pc !== localPc) return;
                         const s = pc.iceConnectionState;
-                        if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
-                            onStreamLive();
+                        if (s === 'connected' || s === 'completed') {
+                            armTransformWatchdog();
+                            if (usingFallback || !canWebCodecs) onStreamLive();
                         } else if (s === 'failed') {
                             linkLost('Connection failed.');
                         }
                     };
                     pc.onconnectionstatechange = () => {
-                        if (pc !== localPc || reconfiguring) return;
+                        if (pc !== localPc) return;
                         const s = pc.connectionState;
+                        if (s === 'connected') armTransformWatchdog();
+                        if (reconfiguring) return;
                         if (s === 'connected') markAlive();
                         else if (s === 'disconnected') enterDegraded();
                         else if (s === 'failed') linkLost('Disconnected, reconnect to continue.');
                     };
 
                     const offer = await pc.createOffer();
+                    if (stale()) return;
                     await pc.setLocalDescription(offer);
+                    if (stale()) return;
                     await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
+                    if (stale()) return;
 
                     let storedToken = '';
                     try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
-                    const resp = await fetch('/whep', {
+                    const whepOpts = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1505,13 +1572,38 @@
                             sdp: pc.localDescription.sdp,
                             audioCapabilities: audioCaps,
                         }),
-                    });
+                    };
+                    // A host that accepts the connection and never answers — a wedged
+                    // display-correlation lock, a suspended VM, a black-holed route — parked
+                    // this await forever, and on the reconfigure path that is a frozen picture
+                    // with every recovery mechanism switched off.
+                    let whepAbort = null;
+                    let whepTimer = 0;
+                    if (typeof AbortController === 'function') {
+                        whepAbort = new AbortController();
+                        whepOpts.signal = whepAbort.signal;
+                        whepTimer = setTimeout(function () {
+                            try { whepAbort.abort(); } catch (_) { noteSuppressed(); }
+                        }, WHEP_TIMEOUT_MS);
+                    }
+                    let resp;
+                    try {
+                        resp = await fetch('/whep', whepOpts);
+                    } catch (err) {
+                        if (whepAbort && whepAbort.signal.aborted) throw new Error('The host did not answer in time.');
+                        throw err;
+                    } finally {
+                        if (whepTimer) clearTimeout(whepTimer);
+                    }
+                    if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
                     const issuedToken = resp.headers.get('X-Device-Token');
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     const answerSdp = await resp.text();
+                    if (stale()) return;
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                    if (stale()) return;
 
                     try {
                         if (window.SEAudio) {
@@ -1536,14 +1628,17 @@
                     }
                 } catch (err) {
                     console.error(err);
-                    const isAuthError = /Invalid session ID or OTP/.test(err.message);
+                    // A newer start() already owns pc and worker; this one's failure is about a
+                    // connection nobody is using any more.
+                    if (stale()) { noteSuppressed(); return; }
+                    const isAuthError = /Invalid session ID or OTP/.test(err && err.message);
                     if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
-                        fallbackToVideo('setup error: ' + err.message);
+                        fallbackToVideo('setup error: ' + errorText(err));
                     } else if (reconfiguring && isLive) {
                         reconfiguring = false;
                         startReconfigPoll();
                     } else {
-                        showError(err.message);
+                        showError(errorText(err));
                     }
                 }
             }
