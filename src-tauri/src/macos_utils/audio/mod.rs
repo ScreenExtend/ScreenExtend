@@ -173,6 +173,26 @@ fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {
     }
 }
 
+/// Ceiling on how long `start_capture` will wait for a backend to come up.
+///
+/// `AudioHub::subscribe` holds the hub mutex across this call, so an unbounded wait here freezes
+/// every other session's audio subscribe and unsubscribe. The candidate loop can try three
+/// backends, each of which now bounds its own blocking calls; this is the backstop for a backend
+/// that wedges somewhere none of them cover.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Say so when the worker thread died of a panic rather than returning an error.
+fn report_worker_panic(result: std::thread::Result<()>) {
+    if let Err(payload) = result {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown payload".to_string());
+        crate::teprintln!("audio: capture worker panicked: {what}");
+    }
+}
+
 pub fn start_capture() -> Result<AudioCapture> {
     let candidates = capable_backends();
     if candidates.is_empty() {
@@ -213,14 +233,19 @@ pub fn start_capture() -> Result<AudioCapture> {
             )
         })?;
 
-    let lookahead_samples = match ready_rx.recv() {
+    let lookahead_samples = match ready_rx.recv_timeout(SETUP_TIMEOUT) {
         Ok(Ok(l)) => l,
         Ok(Err(e)) => {
-            let _ = join.join();
+            report_worker_panic(join.join());
             return Err(e);
         }
-        Err(_) => {
-            let _ = join.join();
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            stop.store(true, Ordering::Relaxed);
+            report_worker_panic(join.join());
+            bail!("audio capture setup did not finish within {SETUP_TIMEOUT:?}");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            report_worker_panic(join.join());
             bail!("audio worker exited during setup");
         }
     };

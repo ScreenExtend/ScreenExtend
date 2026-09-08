@@ -12,6 +12,7 @@ use objc2_core_audio::{
 };
 use objc2_core_audio_types::AudioBufferList;
 
+use crate::macos_utils::audio::format;
 use crate::macos_utils::audio::ring;
 use crate::macos_utils::audio::ControlMsg;
 use crate::streamer::audio::AudioDiagnostics;
@@ -291,21 +292,33 @@ impl Drop for Reader {
     }
 }
 
-pub fn start(device_id: AudioObjectID, targets: CaptureTargets) -> Reader {
+pub fn start(device_id: AudioObjectID, mut targets: CaptureTargets) -> Reader {
     if let Some(map) = ShmMap::open() {
-        crate::tprintln!("audio(legacy): capture transport = shm ({SHM_NAME})");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
-        let join = std::thread::Builder::new()
+        let targets_for_fallback = targets.clone();
+        match std::thread::Builder::new()
             .name("se-audio-shm".into())
             .spawn(move || shm_reader_loop(map, targets, stop_thread))
-            .ok();
-        return Reader {
-            transport: Transport::Shm,
-            stop,
-            join,
-            hal_input: None,
-        };
+        {
+            Ok(join) => {
+                crate::tprintln!("audio(legacy): capture transport = shm ({SHM_NAME})");
+                return Reader {
+                    transport: Transport::Shm,
+                    stop,
+                    join: Some(join),
+                    hal_input: None,
+                };
+            }
+            Err(e) => {
+                // Discarding this used to leave `Transport::Shm` reported with no thread behind
+                // it: the success line already printed, and no audio produced, forever.
+                crate::teprintln!(
+                    "audio(legacy): shm reader thread spawn failed ({e}); falling back to HAL input"
+                );
+                targets = targets_for_fallback;
+            }
+        }
     }
 
     crate::tprintln!(
@@ -320,8 +333,21 @@ pub fn start(device_id: AudioObjectID, targets: CaptureTargets) -> Reader {
     }
 }
 
+/// How long the reader sleeps when the shared ring is empty.
+///
+/// A pure polling interval, not a wait: the producer is `coreaudiod` in another process writing to
+/// shared memory, so there is no cross-process wakeup to be had and nothing ever unparks this
+/// thread. It is a quarter of the driver's own 2.67 ms IO cycle (128 frames at 48 kHz), so a block
+/// waits at most a fraction of the period that produced it.
+const POLL_INTERVAL: Duration = Duration::from_micros(250);
+
 fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) {
-    crate::macos_utils::streamer::qos::pin_current_thread_time_constraint(5_000_000);
+    // Not a Mach time-constraint policy. That declares a periodic deadline the scheduler holds the
+    // thread to, and this thread then sleeps for an interval unrelated to it — a contract it
+    // cannot honour, whose usual reward is being demoted out of the real-time band anyway. The
+    // work here is a memcpy out of shared memory and a ring push; `user_interactive` is what it
+    // actually needs, and is what the SCK audio delivery queue asks for on the native tiers.
+    crate::macos_utils::streamer::qos::pin_current_thread_user_interactive();
 
     let mask = RING_CAPACITY - 1;
     let write_pos = map.atomic_u64_at(OFF_WRITE_POS);
@@ -346,7 +372,7 @@ fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) 
 
         let w0 = write_pos.load(Ordering::Acquire);
         if w0 == read_pos {
-            std::thread::park_timeout(Duration::from_micros(500));
+            std::thread::sleep(POLL_INTERVAL);
             continue;
         }
         let (new_read, avail, lapped) = clamp_read(read_pos, w0, RING_CAPACITY as u64);
@@ -378,6 +404,8 @@ fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) 
 struct HalInputCtx {
     targets: CaptureTargets,
     scratch: UnsafeCell<Box<[f32]>>,
+    /// what the device actually said it delivers, read once at start
+    desc: format::AudioFormatDesc,
 }
 
 unsafe impl Send for HalInputCtx {}
@@ -397,23 +425,80 @@ extern "C-unwind" fn input_ioproc(
     }
     let ctx = unsafe { &*(client_data as *const HalInputCtx) };
     let list = unsafe { in_input_data.as_ref() };
-    if list.mNumberBuffers == 0 {
+    let nbuf = list.mNumberBuffers as usize;
+    if nbuf == 0 {
         return 0;
     }
-    let b0 = unsafe { &*list.mBuffers.as_ptr() };
+    // SAFETY: `mBuffers` is a C flexible array of `mNumberBuffers` `AudioBuffer`s
+    let bufs = unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), nbuf) };
+    let b0 = &bufs[0];
     if b0.mData.is_null() {
         return 0;
     }
-    let n = (b0.mDataByteSize as usize) / 4;
-    let src = unsafe { std::slice::from_raw_parts(b0.mData as *const f32, n) };
+    let desc = &ctx.desc;
+    let bps = match desc.kind {
+        format::SampleKind::F32 | format::SampleKind::I32 => 4,
+        format::SampleKind::I16 => 2,
+    };
     let scratch = unsafe { &mut *ctx.scratch.get() };
-    let m = n.min(scratch.len());
-    scratch[..m].copy_from_slice(&src[..m]);
+
+    // Run the delivered layout through the same converter the native backends use, rather than
+    // reinterpreting whatever arrives as interleaved stereo f32. This is the path a host takes
+    // when the driver could not create its shared segment — the case where least is known about
+    // the running configuration, and the last place to be guessing at the format.
+    let written = if desc.non_interleaved {
+        let ch = nbuf.min(8);
+        let mut planes: [&[u8]; 8] = [&[][..]; 8];
+        let frames = b0.mDataByteSize as usize / bps;
+        for (i, p) in planes.iter_mut().enumerate().take(ch) {
+            let b = &bufs[i];
+            if b.mData.is_null() {
+                return 0;
+            }
+            // SAFETY: `mData` points at `mDataByteSize` bytes of channel `i`'s plane
+            *p = unsafe {
+                std::slice::from_raw_parts(b.mData as *const u8, b.mDataByteSize as usize)
+            };
+        }
+        format::convert_planar(&planes[..ch], frames, desc, scratch)
+    } else {
+        let stride = desc.channels as usize * bps;
+        if stride == 0 {
+            return 0;
+        }
+        let frames = b0.mDataByteSize as usize / stride;
+        // SAFETY: `mData` points at `mDataByteSize` bytes of interleaved frames
+        let src =
+            unsafe { std::slice::from_raw_parts(b0.mData as *const u8, b0.mDataByteSize as usize) };
+        format::convert_interleaved(src, frames, desc, scratch)
+    };
+    if written == 0 {
+        return 0;
+    }
     ctx.targets.publish(
-        &scratch[..m],
+        &scratch[..written],
         crate::macos_utils::audio::process_tap::block_host_ns(in_time),
     );
     0
+}
+
+/// `kAudioDevicePropertyStreamFormat`, input scope, parsed.
+fn read_input_format(device: AudioObjectID) -> Option<format::AudioFormatDesc> {
+    const SEL_STREAM_FORMAT: u32 = u32::from_be_bytes(*b"sfmt");
+    let addr = super::hal::addr(
+        SEL_STREAM_FORMAT,
+        objc2_core_audio::kAudioObjectPropertyScopeInput,
+        objc2_core_audio::kAudioObjectPropertyElementMain,
+    );
+    let asbd: objc2_core_audio_types::AudioStreamBasicDescription =
+        super::hal::get_pod(device, &addr)?;
+    match format::parse_asbd(&asbd) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            crate::teprintln!("audio(legacy): HAL input stream format unusable on {device}: {e}");
+            None
+        }
+    }
 }
 
 struct HalInputProc {
@@ -430,10 +515,33 @@ impl HalInputProc {
         if device == 0 {
             return None;
         }
+        let desc = read_input_format(device)?;
+        // Nothing in the macOS audio path resamples, and the ring's whole contract is 48 kHz — a
+        // rate mismatch here would encode at the wrong speed rather than fail, so refuse instead.
+        if desc.sample_rate != 48_000 {
+            crate::teprintln!(
+                "audio(legacy): HAL input on device {device} is {} Hz, not 48000; refusing the \
+                 fallback transport rather than encoding at the wrong speed",
+                desc.sample_rate
+            );
+            return None;
+        }
+        crate::tprintln!(
+            "audio(legacy): HAL input format {} Hz x{} {:?}{}",
+            desc.sample_rate,
+            desc.channels,
+            desc.kind,
+            if desc.non_interleaved {
+                " planar"
+            } else {
+                " interleaved"
+            }
+        );
         let scratch = vec![0.0f32; 8192 * 2].into_boxed_slice();
         let ctx = Box::into_raw(Box::new(HalInputCtx {
             targets,
             scratch: UnsafeCell::new(scratch),
+            desc,
         }));
         let mut proc_id: AudioDeviceIOProcID = None;
         let proc_fn: objc2_core_audio::AudioDeviceIOProc = Some(input_ioproc);
