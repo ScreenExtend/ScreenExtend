@@ -49,6 +49,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # src-tauri/.cargo/config.toml already sets this for every cargo invocation; it is
+          # repeated here so the value is visible to anyone reading the release job, and so a
+          # C or Objective-C dependency compiled by a build script inherits it too. Without
+          # it rustc's default for x86_64-apple-darwin is 10.12 and the shipped binary
+          # contradicts minimumSystemVersion 10.15.
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
           tagName: app-v__VERSION__
           releaseName: 'ScreenExtend v__VERSION__'
@@ -56,6 +62,28 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # The release is a draft until `finalize-release` publishes it, and that job needs this
+      # one, so failing here leaves the draft unpublished. One link-time reference to an API
+      # newer than 10.15 is bound by dyld before main(), which means the app does not launch
+      # on Catalina at all while launching fine on this runner and on every modern dev Mac.
+      #
+      # The 10.15 SDK is not on any hosted runner: the .tbd stub half of the check therefore
+      # weakens (a newer SDK's stubs are a superset), while the header-availability half
+      # still fails anything annotated as introduced after the floor. The strong verdict is
+      # the dev box run in docs/dev-workflow.md.
+      - name: macOS dyld floor check (universal binary)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          bin=src-tauri/target/universal-apple-darwin/release/ScreenExtend
+          lipo -info "$bin"
+          otool -l "$bin" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+          if otool -L "$bin" | grep -qE 'ScreenCaptureKit|Symbols\.framework|MediaExtension'; then
+            echo "::error::the shipped binary links a framework that is absent on macOS 10.15"
+            exit 1
+          fi
+          # nm -m -arch all covers both slices in one pass, so the arm64 half is audited too.
+          bash scripts/check-macos-dyld.sh "$bin" "$(xcrun --sdk macosx --show-sdk-path)" --floor 10.15
 
   finalize-release:
     needs: build-tauri
