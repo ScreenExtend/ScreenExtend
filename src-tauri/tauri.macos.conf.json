@@ -13,14 +13,15 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost; script-src 'self'; worker-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/libopus.dylib"
+      "resources/libopus.dylib",
+      "resources/ScreenExtendAudio.pkg"
     ],
     "externalBin": [],
     "publisher": "Sarvesh Madullapalli",
@@ -35,6 +36,7 @@
     ],
     "macOS": {
       "entitlements": "./Entitlements.plist",
+      "infoPlist": "./Info.plist",
       "minimumSystemVersion": "10.15"
     }
   }
