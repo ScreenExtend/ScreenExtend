@@ -169,21 +169,31 @@ pub struct Queued {
     pub ev: InputEvent,
     /// `host_now_ns()` at the moment the transport handed the event over.
     pub host_recv_ns: u64,
+    /// The frame's fast-channel sequence number, when it carried one.
+    pub seq: Option<u16>,
 }
 
 /// Whether an event is positional last-value-wins data that a fresher one supersedes.
 ///
 /// Everything else — keys, buttons, clipboard, lifecycle — is a state transition whose loss the
 /// host cannot recover from, so it is never dropped for age however far behind the injector is.
+///
+/// The decision is source-aware, and that distinction is the whole point. Only where a *cursor*
+/// is now is observable, so a 50 ms-old mouse position is worse than nothing. A pen or touch
+/// sample is not redundant with its neighbours — it is the shape of the line — so dropping one
+/// leaves a permanent straight segment where the user drew a curve and no later event repairs
+/// it. Late ink is still the right ink; a late cursor is the wrong place.
 fn is_supersedable(ev: &InputEvent) -> bool {
-    matches!(
-        ev,
+    match ev {
         InputEvent::Pointer {
             phase: protocol::Phase::Move | protocol::Phase::Enter | protocol::Phase::Over,
+            source,
             ..
-        } | InputEvent::PointerBatch { .. }
-            | InputEvent::MouseDelta { .. }
-    )
+        } => *source == protocol::SRC_MOUSE,
+        InputEvent::PointerBatch { source, .. } => *source == protocol::SRC_MOUSE,
+        InputEvent::MouseDelta { .. } => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -200,12 +210,16 @@ pub struct InjectorTx {
 
 impl InjectorTx {
     #[inline]
-    pub fn route(&self, ev: InputEvent, hot: bool, client_ns: u64) {
+    pub fn route(&self, ev: InputEvent, hot: bool, client_ns: u64, seq: Option<u16>) {
         let host_recv_ns = host_now_ns();
         if let Some(excess_ns) = self.offset.observe(client_ns, host_recv_ns) {
             self.telemetry.stages.input_recv.record(excess_ns);
         }
-        let q = Queued { ev, host_recv_ns };
+        let q = Queued {
+            ev,
+            host_recv_ns,
+            seq: if hot { seq } else { None },
+        };
         if hot {
             // Newest wins. Dropping the head rather than the tail is the whole point: when the
             // queue is full the events in it are the stale ones and the arriving event is where
@@ -233,6 +247,7 @@ impl InjectorTx {
         let _ = self.reliable.send(Queued {
             ev: InputEvent::Lifecycle(Lifecycle::Focus(false)),
             host_recv_ns: host_now_ns(),
+            seq: None,
         });
     }
 }
@@ -250,6 +265,10 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
             let mut inj = backend::Injector::new(client);
             tprintln!("injector thread up ({})", backend::NAME);
             let t = thread_telemetry;
+            // Highest fast-channel sequence number already injected. The fast channel is
+            // unordered with no retransmits, so two moves can arrive swapped; replaying the
+            // older one walks the cursor backwards and then forwards again for a frame.
+            let mut highest_seq: Option<u16> = None;
             loop {
                 let q = select! {
                     recv(rel_rx) -> m => match m {
@@ -269,6 +288,24 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
                         .input_stale_drops
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+                // Only supersedable frames are gated: a reordered button or key is a state
+                // transition the host cannot reconstruct, so it is injected whatever its
+                // sequence says.
+                if let Some(seq) = q.seq {
+                    if is_supersedable(&q.ev) {
+                        match highest_seq {
+                            Some(last) if !protocol::seq_is_newer(seq, last) => {
+                                t.degradation
+                                    .input_reorder_drops
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            _ => highest_seq = Some(seq),
+                        }
+                    } else {
+                        highest_seq = Some(seq);
+                    }
                 }
                 inj.dispatch(&q.ev);
                 t.stages
@@ -298,8 +335,12 @@ mod tests {
     use crate::streamer::input::protocol::Phase;
 
     fn pointer(phase: Phase) -> InputEvent {
+        pointer_from(protocol::SRC_MOUSE, phase)
+    }
+
+    fn pointer_from(source: u8, phase: Phase) -> InputEvent {
         InputEvent::Pointer {
-            source: protocol::SRC_MOUSE,
+            source,
             id: 0,
             x: 0.0,
             y: 0.0,
@@ -332,6 +373,57 @@ mod tests {
             code: "KeyA".into(),
             key: "a".into(),
         }));
+    }
+
+    fn batch(source: u8) -> InputEvent {
+        InputEvent::PointerBatch {
+            source,
+            id: 1,
+            buttons: 0,
+            samples: vec![protocol::MoveSample {
+                x: 0.1,
+                y: 0.1,
+                pressure: 0.5,
+                tilt_x: 0.0,
+                tilt_y: 0.0,
+                twist: 0.0,
+            }],
+            predicted: 0,
+        }
+    }
+
+    /// A stroke is a shape, so a late pen or touch sample is still the right ink; a late cursor
+    /// position is the wrong place. The age gate has to tell the two apart.
+    #[test]
+    fn ink_is_never_dropped_for_age_but_a_cursor_is() {
+        assert!(is_supersedable(&batch(protocol::SRC_MOUSE)));
+        assert!(!is_supersedable(&batch(protocol::SRC_PEN)));
+        assert!(!is_supersedable(&batch(protocol::SRC_TOUCH)));
+        assert!(is_supersedable(&pointer_from(
+            protocol::SRC_MOUSE,
+            Phase::Move
+        )));
+        assert!(!is_supersedable(&pointer_from(
+            protocol::SRC_PEN,
+            Phase::Move
+        )));
+        assert!(!is_supersedable(&pointer_from(
+            protocol::SRC_TOUCH,
+            Phase::Move
+        )));
+    }
+
+    #[test]
+    fn sequence_comparison_survives_the_u16_wrap() {
+        assert!(protocol::seq_is_newer(2, 1));
+        assert!(!protocol::seq_is_newer(1, 2));
+        assert!(!protocol::seq_is_newer(7, 7));
+        // 0 follows 65535.
+        assert!(protocol::seq_is_newer(0, u16::MAX));
+        assert!(!protocol::seq_is_newer(u16::MAX, 0));
+        // Half a space apart is the documented limit; beyond it the sign flips, which is why
+        // the gate only ever compares consecutive fast-channel frames.
+        assert!(protocol::seq_is_newer(3, u16::MAX - 3));
     }
 
     #[test]

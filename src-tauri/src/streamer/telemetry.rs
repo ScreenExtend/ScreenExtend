@@ -343,6 +343,12 @@ counters! {
     client_jitter_overruns => "client_jitter_overruns",
     input_queue_drops => "input_queue_drops",
     input_stale_drops => "input_stale_drops",
+    // `input_reorder_drops`: fast-channel frames whose sequence number was behind one already
+    // injected — the channel is unordered and zero-retransmit, so this is reorder, not loss.
+    // `input_parse_errors`: frames the input parser rejected; a drifted client page shows up
+    // here and nowhere else.
+    input_reorder_drops => "input_reorder_drops",
+    input_parse_errors => "input_parse_errors",
 }
 
 /// What a client last told us about its own half of the path. Written by the `OP::STATS` parser,
