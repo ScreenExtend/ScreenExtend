@@ -56,6 +56,9 @@ export async function applyConfig(config: Config): Promise<Config> {
   await at("legacyVolumeKeyProxy", () =>
     commands.setLegacyVolumeKeyProxy(applied.legacyVolumeKeyProxy)
   );
+  await at("disconnectGraceSecs", () =>
+    commands.setDisconnectGrace(applied.disconnectGraceSecs)
+  );
 
   for (const device of applied.devices) {
     await at(`devices[${device.ip}]`, async () => {
