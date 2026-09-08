@@ -27,7 +27,20 @@
     return view.getUint32(off, true) + view.getUint32(off + 4, true) * U32;
   }
   const SRC = { mouse: 0x00, touch: 0x01, pen: 0x02 };
-  const te = new TextEncoder();
+  // Constructed on first use, not here. This file is one IIFE: a throw at module scope takes
+  // RemoteInput and SEClock with it, so the page loses remote control, the clock sync and the
+  // whole telemetry channel at once — silently, with the Connect button still enabled.
+  let textEncoder = null;
+  function enc(s) {
+    if (!textEncoder) textEncoder = new TextEncoder();
+    return textEncoder.encode(s);
+  }
+  // performance.timeOrigin is Safari 15. Below it the expression that uses it is NaN, so the
+  // clock offset was NaN and the page reported CLOCK_VALID for a device that had no clock.
+  // This is what timeOrigin means, computed the long way.
+  const TIME_ORIGIN = (typeof performance.timeOrigin === 'number' && isFinite(performance.timeOrigin))
+    ? performance.timeOrigin
+    : (Date.now() - performance.now());
   const settings = { sensitivity: 1.0, accel: 0.0 };
   try {
     const saved = JSON.parse(localStorage.getItem('rib.settings') || '{}');
@@ -209,8 +222,8 @@
   }
 
   function sendKey(down, e) {
-    const code = te.encode(e.code || '');
-    const key = te.encode(e.key || '');
+    const code = enc(e.code || '');
+    const key = enc(e.key || '');
     if (code.length > 255 || key.length > 255) return;
     let o = 0;
     keyView.setUint8(o++, OP.KEY);
@@ -225,7 +238,7 @@
 
   function sendText(op, str) {
     if (!str) return;
-    const data = te.encode(str);
+    const data = enc(str);
     const buf = new ArrayBuffer(5 + data.length);
     const v = new DataView(buf);
     v.setUint8(0, op);
@@ -235,7 +248,7 @@
   }
 
   function sendClipboard(opByte, mime, dataBytes) {
-    const m = te.encode(mime);
+    const m = enc(mime);
     const buf = new ArrayBuffer(6 + m.length + 4 + dataBytes.length);
     const v = new DataView(buf);
     v.setUint8(0, OP.CLIPBOARD);
@@ -256,13 +269,25 @@
     v.setFloat32(6, clamp01(y), true);
     send(OP.DRAG, buf);
   }
+  // Blob.prototype.arrayBuffer is Chrome 76 / Safari 14 / Firefox 69. Below that the call
+  // throws inside an async function and the drop is discarded with nothing but an unhandled
+  // rejection to show for it.
+  function fileBytes(f) {
+    if (typeof f.arrayBuffer === 'function') return f.arrayBuffer();
+    return new Promise(function (resolve, reject) {
+      const fr = new FileReader();
+      fr.onload = function () { resolve(fr.result); };
+      fr.onerror = function () { reject(fr.error || new Error('FileReader failed')); };
+      fr.readAsArrayBuffer(f);
+    });
+  }
   async function sendDrop(x, y, fileList) {
     const files = Array.from(fileList);
     const items = await Promise.all(files.map(async f => ({
-      name: te.encode(f.name),
-      mime: te.encode(f.type || 'application/octet-stream'),
+      name: enc(f.name),
+      mime: enc(f.type || 'application/octet-stream'),
       size: f.size,
-      data: new Uint8Array(await f.arrayBuffer()),
+      data: new Uint8Array(await fileBytes(f)),
     })));
     let total = 12;
     for (const it of items) total += 2 + it.name.length + 4 + it.mime.length + 8 + 8 + it.data.length;
@@ -447,11 +472,13 @@
     if (dv.byteLength < 17 || !isFinite(rttMs) || rttMs < 0 || rttMs > 5000) return;
     if (!(rttMs <= clock.bestRttMs || nowMs - clock.bestAt > CLOCK_SAMPLE_TTL_MS)) return;
     const hostMs = getU64(dv, 9) / 1e6;
-    const midAbsMs = performance.timeOrigin + (echoedNs / 1e6 + nowMs) / 2;
+    const midAbsMs = TIME_ORIGIN + (echoedNs / 1e6 + nowMs) / 2;
+    const offsetMs = hostMs - midAbsMs;
+    if (!isFinite(offsetMs)) { noteSuppressed(); return; }
     clock.bestRttMs = rttMs;
     clock.bestAt = nowMs;
     clock.rttMs = rttMs;
-    clock.offsetMs = hostMs - midAbsMs;
+    clock.offsetMs = offsetMs;
     clock.samples++;
     notifyClock();
   }
@@ -544,7 +571,12 @@
       let mx = 0, my = 0;
       const c = coalescedOf(e);
       for (let i = 0; i < c.length; i++) { mx += c[i].movementX || 0; my += c[i].movementY || 0; }
-      if (c.length === 1 && c[0] === e) { mx = e.movementX || 0; my = e.movementY || 0; }
+      // movementX/Y are not populated on coalesced events in every engine — Firefox leaves
+      // them at 0, and Chromium did the same into its 70s. A sum of zero from a pointer that
+      // demonstrably moved means the samples carry no motion, so read the dispatched event
+      // instead; the old identity test only rescued the single-sample case, so as soon as the
+      // browser merged two raw updates the remote cursor stopped dead.
+      if (mx === 0 && my === 0) { mx = e.movementX || 0; my = e.movementY || 0; }
       const [ax, ay] = applyMouseCurve(mx, my);
       rel.dx += ax; rel.dy += ay; rel.buttons = e.buttons || 0;
       if (mouseGateOpen && !rel.pending) {
@@ -620,8 +652,11 @@
     mouseGateOpen = true; absGateOpen = true;
     if (flushTimer) { flushTimer = 0; }
   }
-  function ndx(e) { return clamp01(e.clientX / (cssW || window.innerWidth)); }
-  function ndy(e) { return clamp01(e.clientY / (cssH || window.innerHeight)); }
+  // Drag and drop land on the host desktop the same way a tap does, so they normalise against
+  // the same letterboxed picture rect. Left on the stage divisor they were offset by half the
+  // bar in exactly the case the pointer fix exists for.
+  function ndx(e) { return normX(e); }
+  function ndy(e) { return normY(e); }
 
   function on(target, type, fn, opts) {
     target.addEventListener(type, (e) => { if (active) fn(e); }, opts);
@@ -686,7 +721,7 @@
     on(surface, 'dragleave', e => { e.preventDefault(); sendDrag(3, ndx(e), ndy(e)); });
     on(surface, 'drop', e => {
       e.preventDefault();
-      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) sendDrop(ndx(e), ndy(e), e.dataTransfer.files);
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) sendDrop(ndx(e), ndy(e), e.dataTransfer.files).catch(noteSuppressed);
       else sendDrag(4, ndx(e), ndy(e));
     });
 
@@ -716,7 +751,7 @@
     const cd = e.clipboardData;
     if (!cd) return;
     const text = cd.getData('text/plain');
-    if (text) sendClipboard(opByte, 'text/plain', te.encode(text));
+    if (text) sendClipboard(opByte, 'text/plain', enc(text));
   }
 
   function setup(pc) {

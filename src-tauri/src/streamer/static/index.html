@@ -227,6 +227,9 @@
             if (typeof canvas.transferControlToOffscreen !== 'function') degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
             if (!(navigator.keyboard && navigator.keyboard.lock)) degrade(DEG.KEYBOARD_LOCK_UNAVAILABLE);
             if (typeof video.requestVideoFrameCallback !== 'function') degrade(DEG.RVFC_UNAVAILABLE);
+            if (!(window.PointerEvent && ('getCoalescedEvents' in PointerEvent.prototype))) {
+                degrade(DEG.COALESCED_EVENTS_UNAVAILABLE);
+            }
 
             let pc = null;
             let worker = null;
@@ -683,23 +686,44 @@
                         degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                         return;
                     }
+                    function lockPlain() {
+                        try {
+                            const q = el.requestPointerLock();
+                            if (q && q.catch) q.catch(function () { degrade(DEG.POINTER_LOCK_DENIED); });
+                        } catch (_) { degrade(DEG.POINTER_LOCK_DENIED); }
+                    }
                     let p = null;
-                    try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { p = null; }
+                    let threw = false;
+                    try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { threw = true; }
+                    if (threw) {
+                        // The options bag was rejected outright, so *no lock was requested at
+                        // all*. Without the plain retry, relative movement was dead for the
+                        // whole session and every mouse move went down the absolute path.
+                        noteSuppressed();
+                        pointerLockUnadjusted = false;
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        lockPlain();
+                        return;
+                    }
                     if (p && typeof p.then === 'function') {
-                        pointerLockUnadjusted = true;
-                        undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
-                        p.then(null, function () {
+                        // Set on fulfilment, not on the mere fact that a Promise came back: an
+                        // engine that returns one and ignores unknown dictionary members
+                        // resolves normally, and reporting raw deltas we are not getting is
+                        // worse than reporting none.
+                        p.then(function () {
+                            pointerLockUnadjusted = true;
+                            undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        }, function () {
                             pointerLockUnadjusted = false;
                             degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
-                            try {
-                                const q = el.requestPointerLock();
-                                if (q && q.catch) q.catch(function () { degrade(DEG.POINTER_LOCK_DENIED); });
-                            } catch (_) { degrade(DEG.POINTER_LOCK_DENIED); }
+                            lockPlain();
                         });
                         return;
                     }
-                    // No Promise came back, so the options bag was ignored: this engine is
-                    // old enough that it applies the OS pointer curve and says nothing.
+                    // No Promise came back. Chrome 88-110 honours unadjustedMovement and still
+                    // returns undefined, so this is genuinely unknown rather than unavailable —
+                    // but the bit is the only channel there is, and over-reporting raw deltas
+                    // is the more misleading of the two.
                     degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                     pointerLockUnadjusted = false;
                 } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
@@ -808,8 +832,11 @@
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
                     if (!fullscreenMode) return;
-                    await acquireKeyboardLock();
+                    // Fullscreen first: navigator.keyboard.lock() is specified to reject
+                    // outside it, so asking on the way back from the background asked at the
+                    // one moment it could not succeed and the rejection was swallowed.
                     if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); } }
+                    if (currentFullscreenEl()) await acquireKeyboardLock();
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
 
@@ -1202,8 +1229,10 @@
                 return info.transport === 'shared' ? AUDIO_PATH.workletSab : AUDIO_PATH.workletPost;
             }
 
+            // One definition, so the flag the host is told cannot disagree with the branch the
+            // page took: the other one omitted mozFullScreenElement.
             function isFullscreen() {
-                return !!(document.fullscreenElement || document.webkitFullscreenElement);
+                return !!currentFullscreenEl();
             }
 
             // Tier codes, mirrored in docs/TELEMETRY.md and in transform-worker.js.
@@ -1239,10 +1268,6 @@
                     const w = videoWorkerStats;
                     const fb = fallbackPercentiles();
                     const audio = (window.SEAudio && SEAudio.getSyncInfo()) || {};
-                    if (w && w.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
-                    if (w && w.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
-                    if (window.RemoteInput && RemoteInput.hasCoalescedEvents &&
-                        !RemoteInput.hasCoalescedEvents()) degrade(DEG.COALESCED_EVENTS_UNAVAILABLE);
                     const workerSuppressed = (w && w.suppressed) || 0;
                     return {
                         videoPath: activeVideoPath(),
@@ -1298,6 +1323,9 @@
 
             if (window.SEClock) {
                 SEClock.subscribe(function (offsetMs) {
+                    // Every other consumer screens this with isFinite; this one assigned it
+                    // straight through and then reported clockValid for a NaN offset.
+                    if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) { noteSuppressed(); return; }
                     hostClockOffsetMs = offsetMs;
                     try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) { noteSuppressed(); }
                     try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) { noteSuppressed(); }
@@ -1435,6 +1463,13 @@
                                 try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'videostats') {
                                 videoWorkerStats = m.data.stats;
+                                // Latched here rather than in SEVideo.getStats(), which is the
+                                // documented console read-side: typing it must not change what
+                                // the host is told.
+                                if (m.data.stats) {
+                                    if (m.data.stats.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
+                                    if (m.data.stats.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                }
                                 if (m.data.stats && m.data.stats.displayWidth) {
                                     try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.stats.displayWidth, m.data.stats.displayHeight); } catch (_) { noteSuppressed(); }
                                 }
@@ -1789,7 +1824,12 @@
             // way. If the rate is still unknown at submit time it stays unknown: a later
             // refinement only updates joinData, so the next reconfigure that happens for
             // some other reason (an orientation change, a host setting) carries it.
-            const REFRESH_DEADLINE_MS = 400;
+            // Long enough for REFRESH_SAMPLES rAF callbacks at 60 Hz (~383 ms) with room to
+            // spare. It used to be 400 ms against a 60-sample measurement, i.e. ~1 s at 60 Hz —
+            // so resolveRefreshRate returned 0 on essentially every join and the true rate was
+            // applied only if some unrelated reconfigure happened later, which for most
+            // sessions is never. A 120 Hz client ran the host display at the default rate.
+            const REFRESH_DEADLINE_MS = 500;
             const AUDIO_PREPARE_DEADLINE_MS = 2000;
             async function resolveRefreshRate() {
                 const reported = screenRefreshRate();
@@ -1880,7 +1920,8 @@
             sessionInput.addEventListener('input', validate);
             nameInput.addEventListener('input', validate);
 
-            const refreshRatePromise = getRefreshRate().catch(() => 0);
+            const REFRESH_SAMPLES = 24;
+            const refreshRatePromise = getRefreshRate(REFRESH_SAMPLES).catch(() => 0);
 
             const COMPAT_HIDE_KEY = 'se.compat.hideLimited';
 
@@ -1914,7 +1955,11 @@
                 // context. On a page that is already secure it fixes nothing, and telling an
                 // iPhone that HTTPS will bring back an AudioDecoder its Safari has never
                 // shipped is simply wrong.
-                const httpsCouldHelp = !window.isSecureContext;
+                // Absent below Safari 11.1, where `!undefined` is true even on an https page —
+                // which is exactly the misleading copy the comment above exists to avoid.
+                const httpsCouldHelp = (typeof window.isSecureContext === 'boolean')
+                    ? !window.isSecureContext
+                    : (location.protocol === 'http:');
                 if (!canWebCodecs) {
                     unsupported.push({
                         name: 'WebCodecs video',
@@ -2064,13 +2109,37 @@
             // renders only its own subtree, so a prompt raised while the stage is fullscreen
             // would be invisible and its promise would never settle; the host is told the
             // labels are unavailable instead, which is the truth either way.
+            const FULLSCREEN_EVENTS = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
             function permModalIfVisible(onContinue, onSkip) {
                 if (currentFullscreenEl()) {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
                     try { if (onSkip) onSkip(); } catch (_) { noteSuppressed(); }
                     return;
                 }
-                showPermModal(onContinue, onSkip);
+                // The check above is a single sample, and startLock() enters fullscreen
+                // asynchronously off onStreamLive — a modal raised a few hundred milliseconds
+                // earlier survived into the transition, became invisible inside the fullscreen
+                // subtree with its promise never settling, and then reappeared over the live
+                // picture the moment the user left fullscreen. Keep watching for the life of
+                // the modal and resolve it as skipped if that happens.
+                let watching = true;
+                const stopWatching = () => {
+                    if (!watching) return;
+                    watching = false;
+                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onFsChange));
+                };
+                const onFsChange = () => {
+                    if (!watching || !currentFullscreenEl()) return;
+                    stopWatching();
+                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
+                    document.getElementById('permModal').style.display = 'none';
+                    try { if (onSkip) onSkip(); } catch (_) { noteSuppressed(); }
+                };
+                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onFsChange));
+                showPermModal(
+                    () => { stopWatching(); if (onContinue) onContinue(); },
+                    () => { stopWatching(); if (onSkip) onSkip(); },
+                );
             }
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
