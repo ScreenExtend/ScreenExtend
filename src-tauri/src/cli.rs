@@ -1779,8 +1779,13 @@ mod desktop {
             #[allow(unused_mut)]
             let mut out = serde_json::json!({
                 "os": { "name": report.os_name, "version": report.os_version, "supported": report.os_supported, "minimum": report.min_os_version },
-                "audioBackend": report.audio_backend,
-                "displayBackend": report.display_backend,
+                "backends": {
+                    "capture": report.capture_backend,
+                    "encoder": report.encoder_backend,
+                    "display": report.display_backend,
+                    "audio": report.audio_backend,
+                    "hostedNetwork": report.hosted_network_backend,
+                },
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
                     "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
                 })).collect::<Vec<_>>(),
@@ -1834,8 +1839,11 @@ mod desktop {
             if report.os_supported { "yes" } else { "NO" }
         );
         println!("\nBackends:");
-        println!("  Audio:   {}", report.audio_backend);
-        println!("  Display: {}", report.display_backend);
+        println!("  Capture:        {}", report.capture_backend);
+        println!("  Encoder:        {}", report.encoder_backend);
+        println!("  Display:        {}", report.display_backend);
+        println!("  Audio:          {}", report.audio_backend);
+        println!("  Hosted network: {}", report.hosted_network_backend);
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {
