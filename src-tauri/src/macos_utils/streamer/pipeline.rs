@@ -88,6 +88,7 @@ impl Drop for SessionCapture {
 fn spawn_pipeline(
     enc: EncoderConfig,
     source: FrameSource,
+    telemetry: SharedTelemetry,
 ) -> Result<(Pipeline, Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
@@ -96,8 +97,6 @@ fn spawn_pipeline(
     let frame_duration = Duration::from_nanos(1_000_000_000 / enc.fps.max(1) as u64);
 
     let wake = source.wake_sender();
-    let telemetry = SessionTelemetry::new_shared();
-    telemetry.encoder.set("videotoolbox".into());
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
@@ -285,6 +284,15 @@ fn run_encode_loop(
     let _ = drain.join();
 }
 
+/// The session's telemetry has to exist before capture starts, not after: the capture backend
+/// counts what WindowServer drops, and a counter created afterwards would miss the burst that
+/// happens while the pipeline is still warming up.
+fn new_session_telemetry() -> SharedTelemetry {
+    let telemetry = SessionTelemetry::new_shared();
+    telemetry.encoder.set("videotoolbox".into());
+    telemetry
+}
+
 /// Record which capture tier started, and whether reaching it cost a fallback.
 fn note_capture_backend(pipeline: &Pipeline, backend: &dyn CaptureBackend) {
     let name = backend.name();
@@ -332,10 +340,12 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
+    let telemetry = new_session_telemetry();
     let activity = super::activity::begin_latency_critical_activity();
-    let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
+    let backend = start_capture(display, gpu, sink, cap_cfg, Arc::clone(&telemetry))
+        .context("starting capture backend")?;
 
-    let (pipeline, _stop, _encode_thread) = spawn_pipeline(enc, source)?;
+    let (pipeline, _stop, _encode_thread) = spawn_pipeline(enc, source, telemetry)?;
     note_capture_backend(&pipeline, backend.as_ref());
     std::mem::forget(backend);
     std::mem::forget(activity);
@@ -359,10 +369,12 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
+    let telemetry = new_session_telemetry();
     let activity = super::activity::begin_latency_critical_activity();
-    let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
+    let backend = start_capture(display, gpu, sink, cap_cfg, Arc::clone(&telemetry))
+        .context("starting capture backend")?;
 
-    let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source)?;
+    let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source, telemetry)?;
     note_capture_backend(&pipeline, backend.as_ref());
     Ok(SessionCapture {
         pipeline,
@@ -449,8 +461,8 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
         fps: cap_fps as i32,
         pixel_format: PIXEL_FORMAT_420F,
     };
-    let mut backend =
-        start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
+    let mut backend = start_capture(display, gpu, sink, cap_cfg, new_session_telemetry())
+        .context("starting capture backend")?;
     let mut encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
     let out = encoder.output();
 
@@ -655,7 +667,10 @@ mod tests {
             fps: fps as i32,
             pixel_format: PIXEL_FORMAT_420F,
         };
-        let mut backend = CgDisplayStreamBackend::new(display, gpu, sink, cap_cfg).unwrap();
+        let _cursor = display::CursorAnimation::start(display, w, h);
+        let mut backend =
+            CgDisplayStreamBackend::new(display, gpu, sink, cap_cfg, new_session_telemetry())
+                .unwrap();
         backend.start().expect("capture starts");
 
         let enc_cfg = EncoderConfig {
@@ -767,7 +782,10 @@ mod tests {
             fps: fps as i32,
             pixel_format: PIXEL_FORMAT_420F,
         };
-        let mut backend = CgDisplayStreamBackend::new(display, gpu, sink, cap_cfg).unwrap();
+        let _cursor = display::CursorAnimation::start(display, w, h);
+        let mut backend =
+            CgDisplayStreamBackend::new(display, gpu, sink, cap_cfg, new_session_telemetry())
+                .unwrap();
         backend.start().expect("capture starts");
 
         let enc = EncoderConfig {
@@ -781,7 +799,8 @@ mod tests {
             min_qp: None,
             intra_refresh: false,
         };
-        let (pipeline, stop, _encode_thread) = spawn_pipeline(enc, source).expect("pipeline");
+        let (pipeline, stop, _encode_thread) =
+            spawn_pipeline(enc, source, new_session_telemetry()).expect("pipeline");
         let mut rx = pipeline.tx.subscribe();
         pipeline.request_idr();
 

@@ -77,6 +77,8 @@ use objc2_core_video::{
 };
 use objc2_foundation::NSString;
 
+use crate::streamer::telemetry::SharedTelemetry;
+
 use super::frame::{Backing, Frame, FrameSink};
 use super::gpu::Gpu;
 use super::mach::mach_now;
@@ -152,6 +154,8 @@ pub struct SckBackend {
     cfg: CaptureConfig,
     /// Count of complete frames published — read by the latency probe.
     frames: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    telemetry: SharedTelemetry,
     // Kept alive for the session, mirroring cgds's stream/_queue/_handler:
     stream: Option<Retained<AnyObject>>,
     delegate: Option<Retained<AnyObject>>,
@@ -172,6 +176,7 @@ impl SckBackend {
         gpu: Arc<Gpu>,
         sink: Arc<FrameSink>,
         cfg: CaptureConfig,
+        telemetry: SharedTelemetry,
     ) -> Result<Self, CaptureError> {
         Ok(Self {
             display_id,
@@ -179,6 +184,7 @@ impl SckBackend {
             sink,
             cfg,
             frames: Arc::new(AtomicU64::new(0)),
+            telemetry,
             stream: None,
             delegate: None,
             _content_filter: None,

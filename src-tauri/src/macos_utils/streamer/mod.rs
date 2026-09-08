@@ -19,6 +19,8 @@ use std::sync::Arc;
 use frame::FrameSink;
 use gpu::Gpu;
 
+use crate::streamer::telemetry::SharedTelemetry;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("no Metal device available")]
@@ -133,9 +135,10 @@ pub fn start_capture(
     gpu: Arc<Gpu>,
     sink: Arc<FrameSink>,
     cfg: CaptureConfig,
+    telemetry: SharedTelemetry,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
     let sck_err = if screencapturekit_available() {
-        match start_sck(display, gpu.clone(), sink.clone(), cfg) {
+        match start_sck(display, gpu.clone(), sink.clone(), cfg, telemetry.clone()) {
             Ok(backend) => return Ok(backend),
             Err(e) => {
                 teprintln!(
@@ -149,7 +152,7 @@ pub fn start_capture(
         None
     };
 
-    match start_cgds(display, gpu, sink, cfg) {
+    match start_cgds(display, gpu, sink, cfg, telemetry) {
         Ok(backend) => Ok(backend),
         Err(cgds_err) => match sck_err {
             Some(sck_err) => Err(CaptureError::FallbackFailed {
@@ -166,8 +169,9 @@ fn start_sck(
     gpu: Arc<Gpu>,
     sink: Arc<FrameSink>,
     cfg: CaptureConfig,
+    telemetry: SharedTelemetry,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
-    let mut b = sck::SckBackend::new(display, gpu, sink, cfg)?;
+    let mut b = sck::SckBackend::new(display, gpu, sink, cfg, telemetry)?;
     b.start()?;
     Ok(Box::new(b))
 }
@@ -177,8 +181,9 @@ fn start_cgds(
     gpu: Arc<Gpu>,
     sink: Arc<FrameSink>,
     cfg: CaptureConfig,
+    telemetry: SharedTelemetry,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
-    let mut b = cgds::CgDisplayStreamBackend::new(display, gpu, sink, cfg)?;
+    let mut b = cgds::CgDisplayStreamBackend::new(display, gpu, sink, cfg, telemetry)?;
     b.start()?;
     Ok(Box::new(b))
 }
