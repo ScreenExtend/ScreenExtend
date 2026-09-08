@@ -184,10 +184,23 @@ struct TapResources {
     io_proc: AudioDeviceIOProcID,
     ctx: *mut IoCtx,
     started: bool,
+    /// the user's default output device, and the rate it was on before we changed it
+    restore_rate: Option<(AudioObjectID, f64)>,
 }
 
 impl Drop for TapResources {
     fn drop(&mut self) {
+        if let Some((dev, rate)) = self.restore_rate.take() {
+            let st = set_nominal_sample_rate(dev, rate);
+            if st == 0 {
+                crate::tprintln!("audio: restored output device {dev} to {rate} Hz");
+            } else {
+                crate::teprintln!(
+                    "audio: could not restore output device {dev} to {rate} Hz (OSStatus {st}); \
+                     it is still at 48000 Hz"
+                );
+            }
+        }
         unsafe {
             if self.aggregate_id != 0 {
                 if self.started {
@@ -321,6 +334,7 @@ impl ProcessTapCapture {
             io_proc: None,
             ctx: ptr::null_mut(),
             started: false,
+            restore_rate: None,
         };
 
         let asbd = read_tap_format(tap_id)?;
@@ -330,9 +344,32 @@ impl ProcessTapCapture {
         let output_dev = read_default_system_output_device()?;
         let output_uid = read_device_uid(output_dev)?;
 
-        let _ = set_nominal_sample_rate(output_dev, 48_000.0);
+        // The tap delivers whatever the output device runs at and nothing downstream resamples, so
+        // the device has to be at 48 kHz. That is the user's own interface — a 96 kHz DAC or a
+        // 44.1 kHz setting chosen for bit-perfect playback — so remember the old rate and put it
+        // back on teardown, rather than reconfiguring the machine permanently to stream to a phone.
+        let prior_rate = super::legacy::hal::nominal_sample_rate(output_dev);
+        match prior_rate {
+            Some(r) if (r - 48_000.0).abs() < 1.0 => {}
+            _ => {
+                let st = set_nominal_sample_rate(output_dev, 48_000.0);
+                crate::tprintln!(
+                    "audio: output device {output_dev} was {} Hz; set to 48000 (OSStatus {st})",
+                    prior_rate
+                        .map(|r| format!("{r}"))
+                        .unwrap_or_else(|| "unreadable".into())
+                );
+                if st == 0 {
+                    if let Some(r) = prior_rate {
+                        resources.restore_rate = Some((output_dev, r));
+                    }
+                }
+            }
+        }
+
         let aggregate_id = create_aggregate_device(&output_uid, &tap_uuid_string)?;
         resources.aggregate_id = aggregate_id;
+        set_aggregate_buffer_size(aggregate_id, &sink.diagnostics);
 
         let asbd = read_tap_format(tap_id).unwrap_or(asbd);
         let desc = format::parse_asbd(&asbd).unwrap_or(desc);
@@ -602,6 +639,43 @@ fn read_tap_format(
         )));
     }
     Ok(asbd)
+}
+
+/// Frames per IO cycle to ask the tap aggregate for.
+///
+/// The default for an aggregate whose main sub-device is a built-in output is commonly 512 frames
+/// = 10.67 ms at 48 kHz, and that whole cycle is added to every sample before the ring sees it —
+/// the largest single term in the macOS host budget, next to a ring sized at 80 ms, a 125 us drain
+/// poll and Opus's 7.5 ms. Chromium runs 256 on output and treats 128 as its floor, the 256 being
+/// a *render*-side under-run guard a capture IOProc does not have.
+const TARGET_BUFFER_FRAMES: u32 = 128;
+
+/// Ask the aggregate for a short IO cycle, and record what it granted.
+///
+/// Never fatal: an aggregate whose main sub-device is USB or Bluetooth may refuse, and whatever it
+/// grants still works. The logged range and granted value are the measurement — nobody has
+/// recorded what the HAL reports for a *tap* aggregate, the reference implementation this device
+/// is modelled on does not set it either.
+fn set_aggregate_buffer_size(aggregate_id: AudioObjectID, diagnostics: &AudioDiagnostics) {
+    use super::legacy::hal;
+    let before = hal::buffer_frame_size(aggregate_id);
+    let Some((lo, hi)) = hal::buffer_frame_size_range(aggregate_id) else {
+        crate::teprintln!("audio: tap aggregate reports no buffer-frame-size range; leaving it");
+        if let Some(b) = before {
+            diagnostics.period_frames.store(b, Ordering::Relaxed);
+        }
+        return;
+    };
+    let target = TARGET_BUFFER_FRAMES.clamp(lo, hi);
+    let st = hal::set_buffer_frame_size(aggregate_id, target);
+    let granted = hal::buffer_frame_size(aggregate_id).unwrap_or(target);
+    diagnostics.period_frames.store(granted, Ordering::Relaxed);
+    crate::tprintln!(
+        "audio: tap aggregate IO cycle: was {} fr, range [{lo},{hi}], asked {target}, got {granted} \
+         ({:.2} ms @ 48 kHz, OSStatus {st})",
+        before.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+        granted as f64 / 48.0
+    );
 }
 
 fn set_nominal_sample_rate(dev: AudioObjectID, rate: f64) -> i32 {
