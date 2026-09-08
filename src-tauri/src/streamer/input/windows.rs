@@ -730,6 +730,14 @@ impl Injector {
             if op == 2 {
                 self.paste_hotkey();
             }
+        } else {
+            // Silence here reads to the user as "paste from my phone does nothing", with no
+            // way to tell it from a network problem. the Windows clipboard can refuse for reasons
+            // outside our control -- another process holding it, a format it will not take.
+            teprintln!(
+                "clipboard: could not set {mime} ({} bytes); the paste will not carry it",
+                data.len()
+            );
         }
     }
 
