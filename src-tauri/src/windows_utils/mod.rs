@@ -802,11 +802,19 @@ pub fn sync_streamers(state: &AppState) {
 
         let thread_handle = handle.clone();
         let ip_for_log = ip.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
-                teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
-            }
-        });
+        // One thread per adapter, but they all drive the single shared transport runtime
+        // (`streamer::transport_runtime`) rather than each building one of their own.
+        let spawned = std::thread::Builder::new()
+            .name(format!("se-adapter-{ip}"))
+            .spawn(move || {
+                if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
+                    teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            teprintln!("[streamer] could not start a streamer for {ip}: {e}");
+            continue;
+        }
 
         tprintln!("[streamer] started streamer bound to {ip}");
         streamers.insert(ip, StreamerHandle { handle });
