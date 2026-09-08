@@ -1488,7 +1488,7 @@ fn ring_encode_thread(
                     );
                     match encoder.encode_repeat_slot(slot) {
                         Ok(au) => {
-                            let mut timing = FrameTiming::entering_capture();
+                            let mut timing = FrameTiming::repeating();
                             timing.mark_encode_submit();
                             timing.mark_encode_done();
                             telemetry
@@ -1695,7 +1695,7 @@ fn spawn_repeater(
                     continue;
                 }
                 let capture = Instant::now();
-                let mut timing = FrameTiming::entering_capture();
+                let mut timing = FrameTiming::repeating();
                 timing.mark_encode_submit();
                 let au = {
                     let mut core = match core.lock() {
