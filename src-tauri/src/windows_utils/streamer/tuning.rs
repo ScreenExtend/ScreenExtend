@@ -82,7 +82,131 @@ pub fn tune_current_thread() -> ThreadTuning {
     {
         let mmcss = register_mmcss();
         raise_current_thread_priority();
+        confine_to_performance_cores();
         ThreadTuning { mmcss }
+    }
+}
+
+/// The CPU sets belonging to the highest `EfficiencyClass` on a hybrid CPU, or `None` on a
+/// homogeneous one (and on any Windows without the API).
+///
+/// Thread priority orders threads *within* a core's queue; it says nothing about which core the
+/// scheduler picks. On an Alder Lake or Core Ultra part an MMCSS-critical capture thread can
+/// still be parked on an efficiency core, and the cost shows up as tail latency, not as a lower
+/// average. `SetThreadSelectedCpuSetMasks` is a soft restriction, unlike `SetThreadAffinityMask`,
+/// so the scheduler may still migrate the thread rather than deadlock behind it.
+///
+/// The probe is "does this machine report more than one distinct `EfficiencyClass`" — not a CPU
+/// model, not a Windows version.
+#[cfg(windows)]
+fn performance_core_masks(
+) -> Option<&'static Vec<windows::Win32::System::SystemInformation::GROUP_AFFINITY>> {
+    use std::sync::OnceLock;
+
+    use windows::Win32::System::SystemInformation::{
+        GetSystemCpuSetInformation, GROUP_AFFINITY, SYSTEM_CPU_SET_INFORMATION,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    static MASKS: OnceLock<Option<Vec<GROUP_AFFINITY>>> = OnceLock::new();
+    MASKS
+        .get_or_init(|| {
+            let mut needed: u32 = 0;
+            unsafe {
+                let _ = GetSystemCpuSetInformation(
+                    None,
+                    0,
+                    &mut needed,
+                    Some(GetCurrentProcess()),
+                    None,
+                );
+            }
+            if needed == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; needed as usize];
+            let mut written: u32 = 0;
+            if !unsafe {
+                GetSystemCpuSetInformation(
+                    Some(buf.as_mut_ptr().cast::<SYSTEM_CPU_SET_INFORMATION>()),
+                    needed,
+                    &mut written,
+                    Some(GetCurrentProcess()),
+                    None,
+                )
+            }
+            .as_bool()
+            {
+                return None;
+            }
+
+            // The buffer is a run of variable-size records; each one's `Size` is the stride.
+            let mut sets: Vec<(u8, u16, u8)> = Vec::new();
+            let mut offset = 0usize;
+            while offset + std::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>() <= written as usize {
+                let record = unsafe {
+                    &*buf
+                        .as_ptr()
+                        .add(offset)
+                        .cast::<SYSTEM_CPU_SET_INFORMATION>()
+                };
+                let size = record.Size as usize;
+                if size == 0 {
+                    break;
+                }
+                // `Type` 0 is `CpuSetInformation`, the only variant defined.
+                if record.Type.0 == 0 {
+                    let cpu_set = unsafe { record.Anonymous.CpuSet };
+                    sets.push((
+                        cpu_set.EfficiencyClass,
+                        cpu_set.Group,
+                        cpu_set.LogicalProcessorIndex,
+                    ));
+                }
+                offset += size;
+            }
+
+            let best = sets.iter().map(|(class, ..)| *class).max()?;
+            if sets.iter().any(|(class, ..)| *class != best) {
+                let mut by_group: std::collections::BTreeMap<u16, u64> =
+                    std::collections::BTreeMap::new();
+                for (class, group, index) in sets.iter().copied() {
+                    if class == best && index < 64 {
+                        *by_group.entry(group).or_default() |= 1u64 << index;
+                    }
+                }
+                let masks: Vec<GROUP_AFFINITY> = by_group
+                    .into_iter()
+                    .map(|(group, mask)| GROUP_AFFINITY {
+                        Mask: mask as usize,
+                        Group: group,
+                        Reserved: [0; 3],
+                    })
+                    .collect();
+                let cores: u32 = masks.iter().map(|m| (m.Mask as u64).count_ones()).sum();
+                tprintln!(
+                    "[cpu] hybrid CPU detected: confining capture/encode threads to the {cores} \
+                     logical processors of efficiency class {best}"
+                );
+                return Some(masks);
+            }
+            None
+        })
+        .as_ref()
+}
+
+#[cfg(windows)]
+fn confine_to_performance_cores() {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSetMasks};
+
+    let Some(masks) = performance_core_masks() else {
+        return;
+    };
+    if !unsafe { SetThreadSelectedCpuSetMasks(GetCurrentThread(), Some(masks)) }.as_bool() {
+        teprintln!(
+            "[cpu] SetThreadSelectedCpuSetMasks failed: {}",
+            windows::core::Error::from_thread()
+        );
     }
 }
 
@@ -202,18 +326,53 @@ impl Drop for KeepAwake {
     }
 }
 
+/// Tunes a tokio transport worker. Called from `on_thread_start`, so once per worker.
+///
+/// Both calls used to discard their result, which hid two things: a disabled MMCSS service or an
+/// exhausted per-process task quota left every transport thread unprioritised with no trace, and
+/// the returned MMCSS handle was dropped without `AvRevertMmThreadCharacteristics`, so a host that
+/// starts and stops many streams leaks registrations until *all* MMCSS registrations start
+/// failing -- including the capture thread's. The first failure of each kind is logged once per
+/// process; the handle is parked in a thread-local that reverts when the worker exits.
 #[cfg(windows)]
 pub fn tune_transport_thread() {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use windows::core::w;
     use windows::Win32::System::Threading::{
         AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
         THREAD_PRIORITY_ABOVE_NORMAL,
     };
 
+    thread_local! {
+        static MMCSS: RefCell<Option<ThreadTuning>> = const { RefCell::new(None) };
+    }
+    static MMCSS_WARNED: AtomicBool = AtomicBool::new(false);
+    static PRIORITY_WARNED: AtomicBool = AtomicBool::new(false);
+
     let mut task_index: u32 = 0;
-    let _ = unsafe { AvSetMmThreadCharacteristicsW(w!("Playback"), &mut task_index) };
-    unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    match unsafe { AvSetMmThreadCharacteristicsW(w!("Playback"), &mut task_index) } {
+        Ok(h) if !h.is_invalid() => {
+            MMCSS.with(|slot| {
+                *slot.borrow_mut() = Some(ThreadTuning {
+                    mmcss: h.0 as isize,
+                });
+            });
+        }
+        Ok(_) | Err(_) if !MMCSS_WARNED.swap(true, Ordering::Relaxed) => {
+            teprintln!(
+                "MMCSS registration failed for a transport thread; transport threads will run \
+                 unprioritised (is the MMCSS service running?)"
+            );
+        }
+        _ => {}
+    }
+
+    if let Err(e) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } {
+        if !PRIORITY_WARNED.swap(true, Ordering::Relaxed) {
+            teprintln!("SetThreadPriority(ABOVE_NORMAL) failed on a transport thread: {e}");
+        }
     }
 }
 
