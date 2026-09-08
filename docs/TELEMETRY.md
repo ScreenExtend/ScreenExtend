@@ -322,8 +322,9 @@ offset has arrived; before that the client reports 0 there and clears `CLOCK_VAL
 |---:|---|---|
 | 0 | none | none |
 | 1 | WebCodecs → canvas | worklet, SharedArrayBuffer ring |
-| 2 | WebCodecs → video | worklet, `postMessage` ring |
+| 2 | WebCodecs → video | worklet, private ring relayed by the page |
 | 3 | `<video>` element | Opus track (NetEQ) |
+| 4 | | worklet, private ring over a `MessagePort` |
 
 ### Flags
 
