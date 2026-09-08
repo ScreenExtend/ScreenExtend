@@ -30,6 +30,19 @@ use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
 
 const REDUP_MAX_RETRIES: u32 = 40;
 
+/// Grows `bounds` to also contain `r`.
+fn union_rect(bounds: &mut Option<RECT>, r: RECT) {
+    match bounds {
+        Some(b) => {
+            b.left = b.left.min(r.left);
+            b.top = b.top.min(r.top);
+            b.right = b.right.max(r.right);
+            b.bottom = b.bottom.max(r.bottom);
+        }
+        None => *bounds = Some(r),
+    }
+}
+
 pub enum PollStatus {
     Dirty,
     Timeout,
@@ -63,10 +76,25 @@ pub struct Duplicator {
 
     have_desktop: bool,
     sprite: Option<CursorSprite>,
-    cursor_pos: POINT,
+    /// The pointer position exactly as DXGI reported it, in desktop coordinates. Compared
+    /// against the next report to decide whether the pointer actually moved. It used to share a
+    /// field with the draw position below, which is a different coordinate system, so the
+    /// comparison never matched and every pointer update marked the frame dirty.
+    pointer_pos: POINT,
+    /// Top-left of the cursor sprite in composite coordinates: output-relative, hotspot applied.
+    draw_pos: POINT,
     cursor_visible: bool,
+    /// Where the cursor was drawn into `composite` last time, so it can be erased without
+    /// recopying the whole frame.
+    drawn_rect: Option<(i32, i32, u32, u32)>,
+    /// False until `composite` holds a full copy of `desktop`; the first composed frame and any
+    /// frame after a rotation change has to be a full copy.
+    composite_valid: bool,
     shape_buf: Vec<u8>,
     meta_buf: Vec<u8>,
+    /// Union of this frame's dirty and move rectangles in desktop coordinates, or `None` when the
+    /// driver reported none (which means "assume everything").
+    changed_bounds: Option<RECT>,
     consecutive_skips: u32,
 }
 
@@ -317,10 +345,14 @@ impl Duplicator {
             renderer,
             have_desktop: false,
             sprite: None,
-            cursor_pos: POINT::default(),
+            pointer_pos: POINT::default(),
+            draw_pos: POINT::default(),
             cursor_visible: false,
+            drawn_rect: None,
+            composite_valid: false,
             shape_buf: Vec::new(),
             meta_buf: Vec::new(),
+            changed_bounds: None,
             consecutive_skips: 0,
         })
     }
@@ -366,16 +398,26 @@ impl Duplicator {
         }
     }
 
-    fn present_region_is_empty(
+    /// Reads this frame's change metadata and records the union of it in `changed_bounds`.
+    ///
+    /// Returns true when the driver said, positively, that nothing in the desktop image changed —
+    /// the case worth skipping the copy and the encode for. Anything ambiguous (no metadata,
+    /// coalesced frames, a failed query) reports false, which is the safe direction.
+    ///
+    /// The rectangles themselves used to be fetched and thrown away. They are the cheapest
+    /// changed-region hint available, and `frame()` now uses them so that moving a cursor does
+    /// not cost a full-frame copy.
+    fn collect_change(
         &mut self,
         dup: &IDXGIOutputDuplication,
         info: &DXGI_OUTDUPL_FRAME_INFO,
     ) -> bool {
-        if info.AccumulatedFrames > 1 {
-            return false;
-        }
+        // "Assume everything changed" until the metadata says otherwise.
+        self.changed_bounds = None;
 
-        if info.TotalMetadataBufferSize == 0 {
+        // >1 means the OS coalesced updates while we held the previous frame, so the metadata
+        // describes more than one present and is not an exact region for this one.
+        if info.AccumulatedFrames > 1 || info.TotalMetadataBufferSize == 0 {
             return false;
         }
         let needed = info.TotalMetadataBufferSize as usize;
@@ -394,8 +436,30 @@ impl Duplicator {
         if move_ok.is_err() {
             return false;
         }
-        if move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() > 0 {
-            return false;
+        let move_count = move_bytes as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+        let mut bounds: Option<RECT> = None;
+        if move_count > 0 {
+            let moves = unsafe {
+                std::slice::from_raw_parts(
+                    self.meta_buf.as_ptr() as *const DXGI_OUTDUPL_MOVE_RECT,
+                    move_count,
+                )
+            };
+            // A move touches both the rectangle it reads from and the one it writes to.
+            for m in moves {
+                let w = m.DestinationRect.right - m.DestinationRect.left;
+                let h = m.DestinationRect.bottom - m.DestinationRect.top;
+                union_rect(&mut bounds, m.DestinationRect);
+                union_rect(
+                    &mut bounds,
+                    RECT {
+                        left: m.SourcePoint.x,
+                        top: m.SourcePoint.y,
+                        right: m.SourcePoint.x + w,
+                        bottom: m.SourcePoint.y + h,
+                    },
+                );
+            }
         }
 
         let mut dirty_bytes = 0u32;
@@ -410,8 +474,17 @@ impl Duplicator {
             return false;
         }
         let dirty_count = dirty_bytes as usize / std::mem::size_of::<RECT>();
+        if dirty_count > 0 {
+            let dirty = unsafe {
+                std::slice::from_raw_parts(self.meta_buf.as_ptr() as *const RECT, dirty_count)
+            };
+            for r in dirty {
+                union_rect(&mut bounds, *r);
+            }
+        }
 
-        dirty_count == 0
+        self.changed_bounds = bounds;
+        move_count == 0 && dirty_count == 0
     }
 
     /// Host-clock nanoseconds of the last present, or 0 if the driver has not reported one.
@@ -444,7 +517,7 @@ impl Duplicator {
                 super::clock::dxgi_present_time_to_host_ns(info.LastPresentTime);
             if let Some(res) = &resource {
                 const MAX_CONSECUTIVE_SKIPS: u32 = 5;
-                let region_empty = self.present_region_is_empty(&dup, &info)
+                let region_empty = self.collect_change(&dup, &info)
                     && self.consecutive_skips < MAX_CONSECUTIVE_SKIPS;
                 if !region_empty {
                     let tex: ID3D11Texture2D = res
@@ -493,12 +566,12 @@ impl Duplicator {
             if visible != self.cursor_visible {
                 dirty = true;
             }
-            if visible && (pos.x != self.cursor_pos.x || pos.y != self.cursor_pos.y) {
+            if visible && (pos.x != self.pointer_pos.x || pos.y != self.pointer_pos.y) {
                 dirty = true;
             }
             self.cursor_visible = visible;
             if visible {
-                self.cursor_pos = pos;
+                self.pointer_pos = pos;
             }
         }
 
@@ -534,7 +607,9 @@ impl Duplicator {
             && ci.ptScreenPos.y < self.origin_y + self.height as i32;
         self.cursor_visible = on_output;
         if on_output {
-            self.cursor_pos = POINT {
+            // A different coordinate system from `pointer_pos`: output-relative and with the
+            // hotspot subtracted, i.e. the sprite's top-left corner in composite space.
+            self.draw_pos = POINT {
                 x: ci.ptScreenPos.x - self.origin_x - sprite.hotspot_x,
                 y: ci.ptScreenPos.y - self.origin_y - sprite.hotspot_y,
             };
@@ -555,11 +630,42 @@ impl Duplicator {
         let cursor_on = self.cursor_visible && self.sprite.is_some();
 
         if identity && !cursor_on {
+            // Nothing to compose: the encoder reads the duplication copy directly. The composite
+            // is now stale, so the next composed frame must be a full copy.
+            self.composite_valid = false;
+            self.drawn_rect = None;
             return Ok(&self.desktop);
         }
 
         if identity {
-            unsafe { self.context.CopyResource(&self.composite, &self.desktop) };
+            // `composite` already holds the previous frame. Refreshing only what changed plus
+            // the rectangle the last cursor was drawn over turns a cursor move from a
+            // full-resolution copy (8.3 MB at 1080p, 14.7 MB at 1440p, every frame the pointer
+            // moves) into two small ones.
+            let incremental = self.composite_valid
+                && self
+                    .changed_bounds
+                    .is_none_or(|b| !self.covers_whole_output(b));
+            if incremental {
+                let mut restore: Vec<RECT> = Vec::with_capacity(2);
+                if let Some(b) = self.changed_bounds {
+                    restore.push(b);
+                }
+                if let Some((x, y, w, h)) = self.drawn_rect {
+                    restore.push(RECT {
+                        left: x,
+                        top: y,
+                        right: x + w as i32,
+                        bottom: y + h as i32,
+                    });
+                }
+                for r in restore {
+                    self.copy_region_from_desktop(r);
+                }
+            } else {
+                unsafe { self.context.CopyResource(&self.composite, &self.desktop) };
+            }
+            self.composite_valid = true;
         } else {
             self.renderer.draw(
                 &self.composite_rtv,
@@ -569,13 +675,18 @@ impl Duplicator {
                 self.width,
                 self.height,
             )?;
+            self.composite_valid = true;
         }
+        self.drawn_rect = None;
 
         if cursor_on {
-            let sprite = self.sprite.as_ref().unwrap();
+            let sprite = self
+                .sprite
+                .as_ref()
+                .ok_or_else(|| anyhow!("cursor sprite vanished mid-compose"))?;
             let verts = quad_verts(
-                self.cursor_pos.x,
-                self.cursor_pos.y,
+                self.draw_pos.x,
+                self.draw_pos.y,
                 sprite.width,
                 sprite.height,
                 self.width,
@@ -591,9 +702,66 @@ impl Duplicator {
                     self.height,
                 )?;
             }
+            self.drawn_rect = Some((
+                self.draw_pos.x,
+                self.draw_pos.y,
+                sprite.width,
+                sprite.height,
+            ));
         }
 
         Ok(&self.composite)
+    }
+
+    /// True when a rectangle already spans the whole output, in which case the incremental path
+    /// would cost more than a straight `CopyResource`.
+    fn covers_whole_output(&self, r: RECT) -> bool {
+        r.left <= 0 && r.top <= 0 && r.right >= self.width as i32 && r.bottom >= self.height as i32
+    }
+
+    /// Copies one clipped rectangle of `desktop` into the same place in `composite`.
+    fn copy_region_from_desktop(&self, r: RECT) {
+        use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
+
+        let left = r.left.clamp(0, self.width as i32);
+        let top = r.top.clamp(0, self.height as i32);
+        let right = r.right.clamp(0, self.width as i32);
+        let bottom = r.bottom.clamp(0, self.height as i32);
+        if right <= left || bottom <= top {
+            return;
+        }
+        let src = D3D11_BOX {
+            left: left as u32,
+            top: top as u32,
+            front: 0,
+            right: right as u32,
+            bottom: bottom as u32,
+            back: 1,
+        };
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &self.composite,
+                0,
+                left as u32,
+                top as u32,
+                0,
+                &self.desktop,
+                0,
+                Some(&src),
+            );
+        }
+    }
+
+    /// The union of this frame's dirty and move rectangles, in output coordinates, or `None` when
+    /// the driver reported none and the whole frame must be assumed changed. An encoder can use
+    /// it as a region hint.
+    pub fn changed_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        let r = self.changed_bounds?;
+        let left = r.left.clamp(0, self.width as i32) as u32;
+        let top = r.top.clamp(0, self.height as i32) as u32;
+        let right = r.right.clamp(0, self.width as i32) as u32;
+        let bottom = r.bottom.clamp(0, self.height as i32) as u32;
+        (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
     }
 
     pub fn cursor_drawn(&self) -> bool {
@@ -642,7 +810,7 @@ pub fn probe_to_bmp(requested_monitor: u32, path: &str) -> Result<()> {
     }
 
     let cursor_drawn = dup.cursor_drawn();
-    let (cx, cy) = (dup.cursor_pos.x, dup.cursor_pos.y);
+    let (cx, cy) = (dup.draw_pos.x, dup.draw_pos.y);
     let (cw, ch) = dup
         .sprite
         .as_ref()
