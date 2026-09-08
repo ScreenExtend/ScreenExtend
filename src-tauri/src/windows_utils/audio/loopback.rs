@@ -33,7 +33,6 @@ const OUT_SAMPLE_RATE: u32 = 48000;
 const OUT_CHANNELS: u16 = 2;
 const FRAME_INTERLEAVED: usize = FRAME_SAMPLES * OUT_CHANNELS as usize;
 const DIAG_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const ENCODE_WINDOW: usize = 4096;
 
 pub fn start() -> Result<AudioCapture> {
     let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
@@ -174,7 +173,6 @@ fn run(
     let _ = crate::windows_utils::streamer::clock::boot_ns_to_host_ns(1);
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame is a fresh timeline
-    let mut encode_ns: Vec<u64> = Vec::with_capacity(ENCODE_WINDOW);
     let mut last_diag = Instant::now();
 
     loop {
@@ -246,18 +244,16 @@ fn run(
                     continue;
                 }
             };
-            let dt = t0.elapsed().as_nanos() as u64;
-            if encode_ns.len() < ENCODE_WINDOW {
-                encode_ns.push(dt);
-            } else {
-                encode_ns[(seq as usize) % ENCODE_WINDOW] = dt;
-            }
+            diagnostics.record_encode_ns(t0.elapsed().as_nanos() as u64);
 
             let flags = pending_flags;
             pending_flags = 0;
             let capture_ns = accum_start_ns
                 .map(|start| start + i as u64 * FRAME_NS)
                 .unwrap_or_else(host_now_ns);
+            diagnostics
+                .capture_to_packet
+                .record_span(capture_ns, host_now_ns());
             let pkt = AudioPacket {
                 seq,
                 capture_ns,
@@ -280,7 +276,6 @@ fn run(
         }
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
-            update_encode_percentiles(&encode_ns, &diagnostics);
             crate::tprintln!("{}", diagnostics.summary());
             last_diag = Instant::now();
         }
@@ -496,15 +491,4 @@ fn target_wave_format() -> WAVEFORMATEX {
         wBitsPerSample: bits,
         cbSize: 0,
     }
-}
-
-fn update_encode_percentiles(samples: &[u64], diagnostics: &AudioDiagnostics) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut sorted: Vec<u64> = samples.to_vec();
-    sorted.sort_unstable();
-    let p = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
-    diagnostics.encode_p50_ns.store(p(0.50), Ordering::Relaxed);
-    diagnostics.encode_p99_ns.store(p(0.99), Ordering::Relaxed);
 }
