@@ -24,6 +24,7 @@
 #include "components/Component.h"
 #include "components/ComponentCaps.h"
 #include "components/VideoEncoderVCE.h"
+#include "components/ColorSpace.h"
 
 #define SZ(T)      printf("    assert_eq!(size_of::<%s>(), %zu, \"%s\");\n", #T, sizeof(T), #T)
 #define AL(T)      printf("    assert_eq!(align_of::<%s>(), %zu, \"%s\");\n", #T, _Alignof(T), #T)
@@ -36,6 +37,10 @@
 /* %ls prints a wchar_t* as the current locale's narrow string; every AMF property
  * name is plain ASCII, so this round-trips exactly. */
 #define PROP(C)    printf("    assert_wide(props::%s, \"%ls\", \"%s\");\n", #C, C, #C)
+/* Assert one of `amd/encoder.rs`'s hand-transcribed colour constants against the header
+ * enum value it stands for. The Rust name and the C name differ, hence two arguments. */
+#define COLORV(R, E) printf("    assert_eq!(enc::%s, %lld, \"%s == %s\");\n", \
+                            #R, (long long)(E), #R, #E)
 
 int main(void)
 {
@@ -247,6 +252,16 @@ int main(void)
     ENUMV(AMF_DX11_0); ENUMV(AMF_DX11_1); ENUMV(AMF_DX12);
     puts("");
     ENUMV(AMF_DATA_BUFFER); ENUMV(AMF_DATA_SURFACE);
+
+    /* Colour signalling. `amd/encoder.rs` transcribes these as plain `i64` constants rather
+     * than binding the enums, so this pins the transcription against the header. The enum is
+     * not densely packed — FULL_709 is 7, not 4, because ColorSpace.h leaves the G10/G2084
+     * values commented out in between — so counting instead of reading is how it goes wrong. */
+    COLORV(COLOR_PRIMARIES_BT709, AMF_COLOR_PRIMARIES_BT709);
+    COLORV(TRANSFER_CHARACTERISTIC_BT709, AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+    COLORV(MATRIX_COEFF_BT709, AMF_COLOR_MATRIX_COEFF_BT_709);
+    COLORV(COLOR_PROFILE_709, AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+    COLORV(COLOR_PROFILE_FULL_709, AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709);
     ENUMV(AMF_VARIANT_EMPTY); ENUMV(AMF_VARIANT_BOOL); ENUMV(AMF_VARIANT_INT64);
     ENUMV(AMF_VARIANT_DOUBLE); ENUMV(AMF_VARIANT_RECT); ENUMV(AMF_VARIANT_SIZE);
     ENUMV(AMF_VARIANT_POINT); ENUMV(AMF_VARIANT_RATE);
@@ -331,6 +346,7 @@ int main(void)
     PROP(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE);
     PROP(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC);
     PROP(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES);
+    PROP(AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF);
     PROP(AMF_VIDEO_ENCODER_QUERY_TIMEOUT);
     PROP(AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE);
     PROP(AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO);

@@ -376,6 +376,11 @@ type FnEncoderEncode = unsafe extern "C" fn(
 type FnEncoderReconfig = unsafe extern "C" fn(*mut x264_t, *mut x264_param_t) -> c_int;
 type FnEncoderIntraRefresh = unsafe extern "C" fn(*mut x264_t);
 type FnEncoderDelayedFrames = unsafe extern "C" fn(*mut x264_t) -> c_int;
+/// `void x264_encoder_parameters(x264_t *, x264_param_t *)` — the *effective* parameters, after
+/// the preset, the tune, `param_apply_profile` and libx264's own validation have all had their
+/// say. Without it every claim about the encoder's configuration is a claim about what was
+/// asked for.
+type FnEncoderParameters = unsafe extern "C" fn(*mut x264_t, *mut x264_param_t);
 type FnEncoderClose = unsafe extern "C" fn(*mut x264_t);
 type FnPictureInit = unsafe extern "C" fn(*mut x264_picture_t);
 
@@ -390,6 +395,7 @@ pub struct X264Api {
     pub encoder_reconfig: FnEncoderReconfig,
     pub encoder_intra_refresh: FnEncoderIntraRefresh,
     pub encoder_delayed_frames: FnEncoderDelayedFrames,
+    pub encoder_parameters: FnEncoderParameters,
     pub encoder_close: FnEncoderClose,
     pub picture_init: FnPictureInit,
     _lib: Library,
@@ -524,6 +530,9 @@ impl X264Api {
             let encoder_intra_refresh: Symbol<FnEncoderIntraRefresh> = lib
                 .get(b"x264_encoder_intra_refresh\0")
                 .context("resolving x264_encoder_intra_refresh")?;
+            let encoder_parameters: Symbol<FnEncoderParameters> = lib
+                .get(b"x264_encoder_parameters\0")
+                .context("resolving x264_encoder_parameters")?;
             let encoder_delayed_frames: Symbol<FnEncoderDelayedFrames> = lib
                 .get(b"x264_encoder_delayed_frames\0")
                 .context("resolving x264_encoder_delayed_frames")?;
@@ -555,6 +564,7 @@ impl X264Api {
                 encoder_reconfig: *encoder_reconfig,
                 encoder_intra_refresh: *encoder_intra_refresh,
                 encoder_delayed_frames: *encoder_delayed_frames,
+                encoder_parameters: *encoder_parameters,
                 encoder_close: *encoder_close,
                 picture_init: *picture_init,
                 _lib: lib,
