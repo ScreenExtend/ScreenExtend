@@ -28,6 +28,7 @@ pub fn run() -> Result<()> {
     if streamer.config().probe_bitrate {
         return streamer.probe_bitrate();
     }
+    #[cfg(any(test, feature = "probe"))]
     if streamer.config().whep_selftest {
         return streamer.whep_selftest();
     }

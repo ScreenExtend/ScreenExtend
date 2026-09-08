@@ -58,6 +58,8 @@ impl Streamer {
         server::run(self.config, None).await
     }
 
+    /// Feature-gated with the module it drives: see `streamer/test/mod.rs`.
+    #[cfg(any(test, feature = "probe"))]
     pub fn whep_selftest(self) -> Result<()> {
         Self::prepare();
         let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -165,11 +165,237 @@ pub fn fast_path() {
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
-    if user_args().is_empty() {
+    let args = user_args();
+    if args.is_empty() {
         return Outcome::LaunchGui;
     }
     attach_console();
+    // `probe` is intercepted here rather than declared in `tauri.conf.json` under
+    // `plugins.cli`. The harness has ~25 tuning flags parsed by hand in
+    // `streamer::config::Config::from_args`, and `tauri-plugin-cli` rejects any argument it has
+    // not been told about — declaring them twice, in two different syntaxes, to have them
+    // parsed twice would be the worse trade. It stays undocumented in `--help` because it is a
+    // developer tool, not a shipped command.
+    if args[0] == "probe" {
+        return probe::run(app);
+    }
     route(app)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod probe {
+    pub fn run(_app: &tauri::AppHandle) -> super::Outcome {
+        eprintln!("error: the probe harness is not built for this platform");
+        super::exit(2)
+    }
+}
+
+/// The developer probe harness, reachable as `ScreenExtend probe`.
+///
+/// It runs inside the Tauri app on purpose: `--live` and `--whep-selftest` need a real virtual
+/// display, which means `platform::setup` and the `AppState` it builds. The standalone
+/// `streamer::cli::run` entry point could never do that, which is why it was never wired into
+/// `main.rs` and had bit-rotted into unreachable code.
+#[cfg(any(windows, target_os = "macos"))]
+mod probe {
+    use super::exit;
+    use super::Outcome;
+
+    #[cfg(target_os = "windows")]
+    use crate::windows_utils as platform;
+
+    #[cfg(target_os = "macos")]
+    use crate::macos_utils as platform;
+
+    use crate::streamer::config::Config;
+    use crate::streamer::Streamer;
+
+    fn print_probe_help() {
+        println!(
+            r#"ScreenExtend probe — developer capture/encode/transport harness (not a shipped command)
+
+USAGE:
+    ScreenExtend probe <MODE> [TUNING FLAGS]
+
+MODES:
+    --capture [path]      one captured frame -> PNG           (default capture_probe.png)
+    --dxgi [path]         one DXGI-duplication frame -> BMP   (default dxgi_probe.bmp)
+    --encode [path]       300 synthetic frames -> Annex-B     (default out.h264)
+    --live [path]         150 live frames -> Annex-B          (default live.h264)
+    --bitrate             exercise the adaptive-bitrate reconfigure path
+    --whep-selftest       in-process WHEP client against a real virtual display;
+                          asserts the answer SDP and that RTP actually flows
+                          (requires a build with --features probe)
+
+TUNING FLAGS are the streamer's own and are parsed straight off the command line:
+    --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
+    --qp <1..51>   --h264-profile <baseline|main|high>   --intra-refresh <on|off>
+    --monitor <n>   --max-bitrate-kbps <n>   --synthetic-pattern   --disable-gpu-encode
+    --turn-url/--turn-username/--turn-credential/--turn-urls/--turn-secret/--turn-ttl
+    --stun <a,b,..>   --port <n>   --https-port <n>   --bind-ip <ip>   --lan-ip <ip>
+
+The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` plus
+`ScreenExtend status --json` in another shell is the fastest way to see the whole matrix."#
+        );
+    }
+
+    /// Which probe to run. Taken from the `probe` subcommand's own flags so the CLI reads
+    /// `probe --live` rather than `--probe-live`; the streamer's long spellings are still
+    /// accepted because `Config::from_args` scans the whole command line either way.
+    struct Mode {
+        capture: Option<String>,
+        dxgi: Option<String>,
+        encode: Option<String>,
+        live: Option<String>,
+        bitrate: bool,
+        selftest: bool,
+    }
+
+    fn parse_mode(args: &[String]) -> Mode {
+        let mut m = Mode {
+            capture: None,
+            dxgi: None,
+            encode: None,
+            live: None,
+            bitrate: false,
+            selftest: false,
+        };
+        let path_after = |i: usize, default: &str| -> String {
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with('-') => v.clone(),
+                _ => default.to_string(),
+            }
+        };
+        for (i, a) in args.iter().enumerate() {
+            match a.as_str() {
+                "--capture" | "--probe-capture" => {
+                    m.capture = Some(path_after(i, "capture_probe.png"))
+                }
+                "--dxgi" | "--probe-dxgi" => m.dxgi = Some(path_after(i, "dxgi_probe.bmp")),
+                "--encode" | "--probe-encode" => m.encode = Some(path_after(i, "out.h264")),
+                "--live" | "--probe-live" => m.live = Some(path_after(i, "live.h264")),
+                "--bitrate" | "--probe-bitrate" => m.bitrate = true,
+                "--whep-selftest" | "--selftest" => m.selftest = true,
+                _ => {}
+            }
+        }
+        m
+    }
+
+    /// Config wired to the real `AppState`, the way the shipping server builds it: same virtual
+    /// display, same session map, same audio hub. Bound to loopback on high ports so it cannot
+    /// collide with a host already serving on 8080/8443.
+    #[cfg(any(test, feature = "probe"))]
+    fn live_config(app: &tauri::AppHandle, base: Config) -> Config {
+        use tauri::Manager;
+        let state = app.state::<platform::AppState>();
+        *state.session_auth.session_id.lock().unwrap() =
+            crate::streamer::test::whep_selftest::SELFTEST_SESSION_ID.to_string();
+        *state.session_auth.otp.lock().unwrap() =
+            crate::streamer::test::whep_selftest::SELFTEST_OTP.to_string();
+        Config {
+            bind_ip: std::net::Ipv4Addr::LOCALHOST,
+            lan_ip: Some("127.0.0.1".to_string()),
+            local_ips: Some(state.local_ips.clone()),
+            virtual_display: Some(state.virtual_display.clone()),
+            session_auth: Some(state.session_auth.clone()),
+            device_overrides: Some(state.device_overrides.clone()),
+            sessions: Some(state.sessions.clone()),
+            disconnect_grace: Some(state.disconnect_grace.clone()),
+            user_turn: Some(state.user_turn.clone()),
+            banned_devices: Some(state.banned_devices.clone()),
+            approved_devices: Some(state.approved_devices.clone()),
+            otp_limiter: Some(state.otp_limiter.clone()),
+            audio_hub: Some(state.audio_hub.clone()),
+            ..base
+        }
+    }
+
+    fn finish(result: anyhow::Result<()>) -> ! {
+        for (key, t) in crate::streamer::telemetry::all() {
+            if t.frames_encoded.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                continue;
+            }
+            println!("[{key}] {}", t.summary_line());
+        }
+        match result {
+            Ok(()) => exit(0),
+            Err(e) => {
+                eprintln!("probe failed: {e:?}");
+                exit(1)
+            }
+        }
+    }
+
+    pub fn run(app: &tauri::AppHandle) -> Outcome {
+        let args: Vec<String> = super::user_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if args.iter().any(|a| a == "-h" || a == "--help") || args.len() == 1 {
+            print_probe_help();
+            exit(0);
+        }
+
+        // The harness is a diagnostic tool: everything it learns should reach the terminal.
+        crate::logbus::set_verbose(true);
+        let mode = parse_mode(&args);
+        let base = Config::from_args();
+
+        if let Some(path) = mode.capture {
+            finish(Streamer::new(base).probe_capture(&path));
+        }
+        if let Some(path) = mode.dxgi {
+            finish(Streamer::new(base).probe_dxgi(&path));
+        }
+        if let Some(path) = mode.encode {
+            finish(Streamer::new(base).probe_encode(&path));
+        }
+        if mode.bitrate {
+            finish(Streamer::new(base).probe_bitrate());
+        }
+
+        if (mode.live.is_some() || mode.selftest)
+            && !tauri::async_runtime::block_on(platform::setup(app.clone()))
+        {
+            eprintln!("error: could not initialize the virtual display driver.");
+            eprintln!("Install it first (Administrator): ScreenExtend drivers install");
+            eprintln!("Check the rest of the environment with: ScreenExtend doctor");
+            exit(1);
+        }
+
+        if let Some(path) = mode.live {
+            finish(Streamer::new(base).probe_live(&path));
+        }
+
+        if mode.selftest {
+            #[cfg(any(test, feature = "probe"))]
+            {
+                let mut cfg = live_config(app, base);
+                cfg.port = 18080;
+                cfg.https_port = 18443;
+                let telemetry_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                crate::streamer::telemetry::spawn_summary_printer(std::sync::Arc::clone(
+                    &telemetry_stop,
+                ));
+                let result = Streamer::new(cfg).whep_selftest();
+                telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                finish(result);
+            }
+            #[cfg(not(any(test, feature = "probe")))]
+            {
+                eprintln!(
+                    "error: --whep-selftest is not in this build. It carries a TLS verifier that \n\
+                     accepts any certificate, so it is compiled only with `--features probe`:\n\
+                     \n    cargo run --features probe -- probe --whep-selftest\n"
+                );
+                exit(2);
+            }
+        }
+
+        print_probe_help();
+        exit(2)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

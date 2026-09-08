@@ -402,7 +402,7 @@ pub fn print_help() {
     tprintln!(
         "ultra-low-latency WebRTC screen streamer\n\
 \n\
-USAGE: untitled17 [OPTIONS]\n\
+USAGE: ScreenExtend probe [OPTIONS]   (see `ScreenExtend probe --help`)\n\
 \n\
 SERVER\n\
   --port <n>              HTTP port (default 8080)\n\

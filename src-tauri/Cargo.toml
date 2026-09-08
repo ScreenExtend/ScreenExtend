@@ -20,6 +20,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "ScreenExtend"
 path = "src/main.rs"
 
+[features]
+default = []
+# Builds the developer probe harness into the binary. Off by default because the WHEP
+# self-test carries a TLS verifier that accepts any certificate, which must never ship.
+probe = []
+
 [lints.rust]
 dead_code = "allow"
 
