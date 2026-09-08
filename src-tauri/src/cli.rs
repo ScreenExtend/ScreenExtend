@@ -1296,7 +1296,7 @@ mod desktop {
             return;
         }
         if request_reload(app) {
-            println!("(Applied to the running host.)");
+            println!("(The running host reloaded its configuration.)");
         } else {
             println!("(A host is running but did not answer — restart it to apply.)");
         }
@@ -2108,6 +2108,11 @@ mod desktop {
                     get_nested(&store, &key).unwrap_or(Value::Null)
                 );
                 report_live_apply(app);
+                // The reload replays everything that can reach a live `AppState`; these two
+                // are read once, when the servers and the pipelines are built.
+                if key.starts_with("serverPorts") || key == "disableGpuEncode" {
+                    println!("(This one is read at startup — restart the host to apply it.)");
+                }
                 exit(0);
             }
             other => {
