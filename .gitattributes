@@ -1,1 +1,16 @@
 *.html text eol=lf
+
+# Vendored blobs. Without an explicit rule git's auto text detection converts the
+# NUL-free ones (the two darwin nefconc stubs) on a Windows checkout, which changes
+# their bytes and therefore their SHA-256.
+src-tauri/binaries/nefconc-*    binary
+src-tauri/resources/*.dll       binary
+src-tauri/resources/*.dylib     binary
+src-tauri/resources/*.cat       binary
+src-tauri/resources/*.inf       binary
+src-tauri/resources/*.cer       binary
+
+# `sha256sum -c` reads a trailing CR as part of the filename, so these must be LF
+# on every checkout or the verification job fails on the developer's machine.
+src-tauri/binaries/SHA256SUMS   text eol=lf
+src-tauri/resources/SHA256SUMS  text eol=lf

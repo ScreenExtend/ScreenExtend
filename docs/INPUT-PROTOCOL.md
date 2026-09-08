@@ -65,13 +65,40 @@ older client sends no tail and the host reads 0, which is the "not stamped" valu
 client may append further fields and this host reads the prefix it knows. The declared length is
 a floor, never an equality — the same rule the stats frame follows.
 
-| Frame | v1 length | Stamp at |
-|---|---:|---:|
-| `POINTER_*` (`0x01`–`0x08`) | 40 | 40 |
-| `POINTER_MOVE_BATCH` (`0x09`) | `10 + n*24` | `10 + n*24` |
-| `WHEEL` (`0x10`) | 15 | 15 |
-| `KEY` (`0x20`) | variable | just past the `key` string |
-| `MOUSE_DELTA` (`0x54`) | 8 | 9 |
+| Frame | v1 length | Stamp at | Sequence at |
+|---|---:|---:|---:|
+| `POINTER_*` (`0x01`–`0x08`) | 40 | 40 | 48 |
+| `POINTER_MOVE_BATCH` (`0x09`) | `10 + n*24` | `10 + n*24` | `20 + n*24` |
+| `WHEEL` (`0x10`) | 15 | 15 | 23 |
+| `KEY` (`0x20`) | variable | just past the `key` string | — |
+| `MOUSE_DELTA` (`0x54`) | 8 | 9 | 17 |
+
+## The optional fast-channel sequence
+
+The four fast frames above may carry a `u16` after the stamp: a per-session counter the client
+increments once per frame it sends on the `fast` channel.
+
+That channel is `ordered: false, maxRetransmits: 0`, and the host merges its two internal queues
+with a `crossbeam::select!` that picks **randomly** among ready operations, so there are three
+independent reorder points between "the user moved, then clicked" and "the host injected". The
+consequence that mattered — a click landing where the cursor used to be — is already fixed:
+`POINTER_DOWN`/`POINTER_UP` inject the coordinates they carry. What remains is that a *reordered*
+move is replayed rather than rejected, walking the cursor backwards and then forwards again for
+one frame. The 50 ms age gate bounds how stale a replayed move can be and says nothing about
+order, because there was nothing to compare.
+
+The host drops a **supersedable** fast event whose sequence is behind the highest it has already
+injected, comparing `(seq - last) as i16 > 0` so the wrap at 65535 is correct, and counts it in
+`input_reorder_drops`. Buttons, keys, clipboard and lifecycle are never gated: a reordered state
+transition is not recoverable and must be injected whatever its sequence says. A `POINTER_LEAVE`
+or `POINTER_OUT` — fast but not supersedable — advances the counter without being droppable.
+
+The sequence space is per channel. `parse` decides `fast` from the opcode alone and not from the
+channel a message arrived on, so a fast opcode sent on `reliable` still lands on the lossy
+internal queue; that is unchanged and intentional. Frames on `reliable` carry no sequence.
+
+**An absent tail means the session is simply not reorder-gated**, which is exactly right for a
+client older than the field: the host has nothing to compare and injects everything, as before.
 
 ## Frame layouts
 
@@ -112,8 +139,9 @@ backends.
 10     n * 24 bytes of sample: f32 x, y, pressure, tiltX, tiltY, twist
 --- optional tail ---
 N      u64  client stamp of the LAST sample, ns          (N = 10 + n*24)
-N+8    u8   flags (see below)
+N+8    u8   reserved, always 0
 N+9    u8   predicted count: how many TRAILING samples came from getPredictedEvents()
+N+10   u16  fast-channel sequence
 ```
 
 The predicted count is clamped to `n` rather than trusted. The host drops predicted samples for
@@ -171,6 +199,7 @@ contacts* capped at the device's `maxCount`, not a sequence over time. macOS has
 --- optional ---
 8      u8   flags (see below)
 9      u64  client stamp, ns
+17     u16  fast-channel sequence
 ```
 
 Byte 8 was already a zero pad every shipped client sent, so it became the flags byte without a
@@ -182,7 +211,10 @@ version bump: an old client reads as "no flags set".
 |---:|---|---|
 | 0 | `UNADJUSTED` | The client holds pointer lock with `unadjustedMovement: true`, so the deltas are raw device counts with no OS pointer curve applied |
 
-Applies to `MOUSE_DELTA` byte 8 and the `POINTER_MOVE_BATCH` tail flags byte. Without it the
+Applies to `MOUSE_DELTA` byte 8 only. The `POINTER_MOVE_BATCH` tail has a byte in the same
+position and it is reserved: `UNADJUSTED` means the client holds pointer lock with raw
+movement, and a locked pointer sends `MOUSE_DELTA` and never a batch, so no bit defined here
+can ever be set on one. The client writes 0 and the host does not read it. Without the flag the
 client's own OS has already curved the deltas, and the host must not curve them a second time —
 which is why both backends now inject relative motion absolutely from a position they track
 themselves, rather than letting the host OS's pointer ballistics compound with the client's.
@@ -228,7 +260,9 @@ knows and ignores the rest, and a host older than a field sends a shorter frame.
 
 ### `STATS` — `0x62`, C→H
 
-96 bytes in v2, 72 in v1. Layout, tier bytes and degradation flags are in `docs/TELEMETRY.md`.
+104 bytes in v3, 96 in v2, 72 in v1 — each tail read whole or not at all, so a host built
+against any of the three reads the prefix it knows. Layout, tier bytes, path codes and
+degradation flags are in `docs/TELEMETRY.md`.
 
 ### The remaining frames
 
@@ -259,8 +293,9 @@ const caps = dv.byteLength >= 19 ? dv.getUint16(17, true) : 0;
 | 2 | `UNRELIABLE_MOVE_CHANNEL` | accepts a separate unordered/unreliable channel for pointer moves |
 | 3 | `INPUT_TIMESTAMP` | reads the optional trailing client stamp and reports `input_recv` |
 | 4 | `INPUT_EVENT_FLAGS` | reads the `MOUSE_DELTA` flags byte, so `unadjustedMovement` is worth reporting |
+| 5 | `INPUT_SEQUENCE` | reads the optional fast-channel `u16` sequence and rejects a reordered positional event |
 
-This build sets bits 0, 1, 3 and 4. **Bit 2 is deliberately clear and is expected to stay clear**:
+This build sets bits 0, 1, 3, 4 and 5. **Bit 2 is deliberately clear and is expected to stay clear**:
 the existing `fast` channel is already `ordered: false, maxRetransmits: 0`, so a second one has
 nothing to add. The bit is reserved rather than reused so it cannot come to mean something else.
 
@@ -285,9 +320,19 @@ Two things can drop an event, and both are counted:
   one: when the queue is full the events in it are the stale ones and the arriving event is where
   the pointer actually is.
 - **`input_stale_drops`** — the event waited more than 50 ms (three 60 Hz frames) and is
-  positional. Only pointer moves, batches and mouse deltas can be dropped this way. Keys,
-  buttons, clipboard and lifecycle are state transitions the host cannot recover from, so they
-  are never dropped for age however far behind the injector is.
+  positional **from a mouse**. Keys, buttons, clipboard and lifecycle are state transitions the
+  host cannot recover from, so they are never dropped for age however far behind the injector is
+  — and neither are pen or touch samples. Only where a *cursor* is now is observable, so a 50 ms
+  old position is worse than nothing; a pen or touch sample is not redundant with its neighbours,
+  it is the shape of the line, so dropping one leaves a permanent straight segment where the user
+  drew a curve and no later event repairs it. Late ink is still the right ink.
+- **`input_reorder_drops`** — a supersedable fast event arrived with a sequence behind one
+  already injected. See "The optional fast-channel sequence" above.
+- **`input_parse_errors`** — the frame did not decode. `parse` returns a typed `ParseError`
+  naming the opcode, the length it needed and the reason (unknown opcode, truncated, a length
+  prefix past the end, invalid UTF-8), and the transport logs one line per distinct error per
+  channel so a client whose cached `input.js` has drifted from the host is diagnosable without a
+  flood.
 
 ## Adding a field
 
