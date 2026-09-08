@@ -10,7 +10,6 @@ mod test;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -24,6 +23,44 @@ use opus_encoder::{OpusEncoder, OpusEncoderConfig, FRAME_INTERLEAVED};
 
 const RING_CAPACITY: usize = 48_000 * 2 * 80 / 1000; // 7680 → rounds to 8192
 const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// nanoseconds of audio in one interleaved stereo Opus frame (5 ms at 48 kHz)
+const FRAME_NS: u64 = 5_000_000;
+/// interleaved stereo samples per second — the ring's unit
+const RING_SAMPLES_PER_SEC: i128 = 48_000 * format::OUT_CHANNELS as i128;
+/// how far the hardware clock may run ahead of the sample counter before the timeline is re-seated
+const RESYNC_NS: u64 = 50_000_000;
+
+/// Host-clock time of the sample at absolute ring index `pos`, extrapolated from `anchor`.
+///
+/// The rate is exact by construction (every backend delivers 48 kHz stereo), so this is a
+/// sample-counter timestamp seated on a real hardware stamp rather than a reading of the wall
+/// clock at drain time.
+fn anchored_ns(anchor: ring::Anchor, pos: u64) -> u64 {
+    let delta = pos as i128 - anchor.pos as i128;
+    let ns = anchor.host_ns as i128 + (delta * 1_000_000_000i128) / RING_SAMPLES_PER_SEC;
+    if ns <= 0 {
+        0
+    } else {
+        ns as u64
+    }
+}
+
+/// Pick the capture time of the frame about to be encoded, and say whether the timeline jumped.
+///
+/// `next` is where the sample counter says this frame belongs — one frame period after the last
+/// packet — and `hw` is what the capture hardware's own stamp says. The counter wins, so the
+/// sequence is exactly one frame apart and can never regress; the hardware only takes over when it
+/// has run more than [`RESYNC_NS`] ahead, which means samples were lost and the two would otherwise
+/// stay apart for good.
+fn choose_capture_ns(next: Option<u64>, hw: Option<u64>) -> (u64, bool) {
+    match (next, hw) {
+        (Some(n), Some(h)) if h > n.saturating_add(RESYNC_NS) => (h, true),
+        (Some(n), _) => (n, false),
+        (None, Some(h)) => (h, false),
+        (None, None) => (host_now_ns(), false),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioBackend {
@@ -64,7 +101,6 @@ pub struct AudioFrameSink {
     pub producer: Arc<ring::Producer>,
     pub diagnostics: Arc<AudioDiagnostics>,
     pub control_tx: Option<crossbeam_channel::Sender<ControlMsg>>,
-    pub consumer_thread: Arc<OnceLock<Thread>>,
 }
 
 pub trait AudioSource: Send {
@@ -80,40 +116,46 @@ pub trait AudioSource: Send {
 }
 
 pub fn probe_audio_backend() -> AudioBackend {
-    static NATIVE: OnceLock<Option<AudioBackend>> = OnceLock::new();
-    let native = *NATIVE.get_or_init(|| capable_native_backends().first().copied());
-    if let Some(b) = native {
+    if let Some(b) = native_backends().first().copied() {
         return b;
     }
-
-    if legacy::probe::eligible_os() {
-        match legacy::probe::legacy_state() {
-            legacy::probe::LegacyState::Ready => AudioBackend::VirtualDevice,
-            _ => AudioBackend::NeedsDriverInstall,
-        }
-    } else {
-        AudioBackend::Unsupported
+    match legacy::probe::legacy_state() {
+        legacy::probe::LegacyState::Ready => AudioBackend::VirtualDevice,
+        // Below 12.3 there is no native system-audio API at all and the driver is the answer, so
+        // there is nothing to report as unsupported: the app's own floor is 10.15 and the driver
+        // covers it.
+        _ => AudioBackend::NeedsDriverInstall,
     }
 }
 
-fn capable_native_backends() -> Vec<AudioBackend> {
-    use crate::macos_utils::streamer::{macos_at_least, screencapturekit_available};
-    let mut v = Vec::new();
-    if macos_at_least(14, 2) && process_tap::runtime_available() {
-        v.push(AudioBackend::ProcessTap);
-    }
-    if macos_at_least(13, 0)
-        && screencapturekit_available()
-        && sck_audio::SckAudioCapture::runtime_available()
-    {
-        v.push(AudioBackend::ScreenCaptureKitAudio);
-    }
-    v
+/// The native tiers this Mac can run, best first.
+///
+/// Probed by capability alone — `runtime_available()` dlsyms the Process Tap entry points and
+/// looks up `CATapDescription`, and the SCK one looks up `SCStream` and friends. There is
+/// deliberately no OS-version conjunct: a version gate adds a `sw_vers` subprocess and a
+/// fail-open path (`macos_at_least` returns true when it cannot read the version) to a question
+/// the class lookup already answers exactly. Cached, because neither answer can change while the
+/// process runs.
+fn native_backends() -> &'static [AudioBackend] {
+    static NATIVE: OnceLock<Vec<AudioBackend>> = OnceLock::new();
+    NATIVE.get_or_init(|| {
+        let mut v = Vec::new();
+        if process_tap::runtime_available() {
+            v.push(AudioBackend::ProcessTap);
+        }
+        if sck_audio::SckAudioCapture::runtime_available() {
+            v.push(AudioBackend::ScreenCaptureKitAudio);
+        }
+        v
+    })
 }
 
 fn capable_backends() -> Vec<AudioBackend> {
-    let mut v = capable_native_backends();
-    if v.is_empty() && legacy::probe::eligible_os() && legacy::probe::driver_healthy() {
+    let mut v = native_backends().to_vec();
+    // The driver is a real fallback, not a below-13.0-only tier. On 13.x with Screen Recording
+    // denied, SCK is selected, fails to start, and there is nothing after it — even when the
+    // driver is installed and would have worked.
+    if legacy::probe::driver_healthy() {
         v.push(AudioBackend::VirtualDevice);
     }
     v
@@ -130,31 +172,43 @@ fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {
     }
 }
 
+/// Ceiling on how long `start_capture` will wait for a backend to come up.
+///
+/// `AudioHub::subscribe` holds the hub mutex across this call, so an unbounded wait here freezes
+/// every other session's audio subscribe and unsubscribe. The candidate loop can try three
+/// backends, each of which now bounds its own blocking calls; this is the backstop for a backend
+/// that wedges somewhere none of them cover.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Say so when the worker thread died of a panic rather than returning an error.
+fn report_worker_panic(result: std::thread::Result<()>) {
+    if let Err(payload) = result {
+        let what = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown payload".to_string());
+        crate::teprintln!("audio: capture worker panicked: {what}");
+    }
+}
+
 pub fn start_capture(pkt_sink: AudioSink) -> Result<AudioCapture> {
     let candidates = capable_backends();
     if candidates.is_empty() {
-        let ver = os_version();
-        if legacy::probe::eligible_os() {
-            bail!(
-                "system audio on macOS {ver} needs the ScreenExtend Audio driver installed; \
-                 enable it from the device's audio toggle to run the one-time install"
-            );
-        }
         bail!(
-            "system audio capture is not supported on this macOS version ({ver}); \
-             it requires macOS 13 (ScreenCaptureKit) or 14.2+ (Process Tap), or 10.15–12.x with \
-             the ScreenExtend Audio driver"
+            "system audio on macOS {} needs the ScreenExtend Audio driver installed; \
+             enable it from the device's audio toggle to run the one-time install",
+            os_version()
         );
     }
 
     let diagnostics = Arc::new(AudioDiagnostics::default());
-    let (producer, consumer, consumer_thread_lock) = ring::ring(RING_CAPACITY);
+    let (producer, consumer) = ring::ring(RING_CAPACITY);
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<ControlMsg>(8);
     let sink = AudioFrameSink {
         producer: Arc::new(producer),
         diagnostics: Arc::clone(&diagnostics),
         control_tx: Some(ctrl_tx),
-        consumer_thread: consumer_thread_lock,
     };
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<i32>>();
@@ -177,14 +231,19 @@ pub fn start_capture(pkt_sink: AudioSink) -> Result<AudioCapture> {
             )
         })?;
 
-    let lookahead_samples = match ready_rx.recv() {
+    let lookahead_samples = match ready_rx.recv_timeout(SETUP_TIMEOUT) {
         Ok(Ok(l)) => l,
         Ok(Err(e)) => {
-            let _ = join.join();
+            report_worker_panic(join.join());
             return Err(e);
         }
-        Err(_) => {
-            let _ = join.join();
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            stop.store(true, Ordering::Relaxed);
+            report_worker_panic(join.join());
+            bail!("audio capture setup did not finish within {SETUP_TIMEOUT:?}");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            report_worker_panic(join.join());
             bail!("audio worker exited during setup");
         }
     };
@@ -253,16 +312,17 @@ fn worker(
     };
     let _ = ready_tx.send(Ok(lookahead));
 
-    sink.producer.set_consumer_thread(std::thread::current());
-    sink.consumer_thread.get_or_init(std::thread::current);
-
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame starts a fresh timeline
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
-    const FRAME_NS: u64 = 5_000_000; // 5 ms per Opus frame at 48 kHz
+    // Host-clock time of the next sample to be popped. Seeded from the capture hardware's own
+    // stamp and then advanced one frame at a time, so the sequence is exactly 5 ms apart and can
+    // never regress no matter how the drain loop is scheduled.
+    let mut next_capture_ns: Option<u64> = None;
+    let mut resyncs: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(ControlMsg::Reacquire) = ctrl_rx.try_recv() {
@@ -271,16 +331,25 @@ fn worker(
                 crate::teprintln!("audio: re-acquire failed: {e}");
             }
             pending_flags |= FLAG_DISCONTINUITY;
+            next_capture_ns = None; // new device, new timeline
         }
 
         let mut produced = false;
-        // seed once per drain pass; frames in the pass are then spaced by FRAME_NS
-        let burst_t0 = host_now_ns();
-        let mut burst_i: u64 = 0;
         while consumer.available() >= FRAME_INTERLEAVED {
+            let pos = consumer.read_pos();
             if consumer.pop(&mut frame) < FRAME_INTERLEAVED {
                 break;
             }
+            let hw_ns = consumer
+                .anchor()
+                .map(|a| anchored_ns(a, pos))
+                .filter(|&ns| ns != 0);
+            let (capture_ns, jumped) = choose_capture_ns(next_capture_ns, hw_ns);
+            if jumped {
+                resyncs += 1;
+                pending_flags |= FLAG_DISCONTINUITY;
+            }
+            next_capture_ns = Some(capture_ns.saturating_add(FRAME_NS));
             let is_silent = frame.iter().all(|&x| x == 0.0);
 
             let t0 = Instant::now();
@@ -301,11 +370,10 @@ fn worker(
             }
             let pkt = AudioPacket {
                 seq,
-                capture_ns: burst_t0.saturating_add(burst_i * FRAME_NS),
+                capture_ns,
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
-            burst_i += 1;
             diagnostics
                 .capture_to_packet
                 .record_span(pkt.capture_ns, host_now_ns());
@@ -314,13 +382,18 @@ fn worker(
             produced = true;
         }
 
-        // ring overruns (bumped by the RT callback) surface as backpressure drops
-        diagnostics
-            .dropped_backpressure
-            .store(consumer.overruns(), Ordering::Relaxed);
+        // `dropped_backpressure` is owned by the producers. Every capture callback already
+        // `fetch_add`s what `Producer::push` could not fit, and the legacy reader adds the samples
+        // it lost to a lapped shared-memory ring — a different loss with a different cause. The
+        // unconditional `store(consumer.overruns())` that used to sit here erased the second on
+        // the very next drain pass, reporting legacy-tier loss as zero.
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
-            crate::tprintln!("[{}] {}", backend.backend_name(), diagnostics.summary());
+            crate::tprintln!(
+                "[{}] {}, clock_resyncs={resyncs}",
+                backend.backend_name(),
+                diagnostics.summary()
+            );
             if !warned_silent
                 && start_instant.elapsed() >= Duration::from_secs(5)
                 && backend.nonsilent_samples() == 0

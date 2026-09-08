@@ -63,19 +63,60 @@ const NX_KEYTYPE_MUTE: i64 = 7;
 // macOS moves output volume in sixteenths per key press
 const VOLUME_STEP: f32 = 1.0 / 16.0;
 
+/// What a volume key press asks for. Sent to the worker; never acted on in the tap callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeAction {
+    Up,
+    Down,
+    ToggleMute,
+}
+
 struct TapCtx {
-    our_device: AudioObjectID,
+    tx: crossbeam_channel::Sender<VolumeAction>,
     port: CFTypeRef,
 }
 
 fn nudge_volume(dev: AudioObjectID, delta: f32) {
-    let cur = hal::output_volume_scalar(dev).unwrap_or(1.0);
-    let _ = hal::set_output_volume_scalar(dev, (cur + delta).clamp(0.0, 1.0));
+    let Some(cur) = hal::output_volume_scalar(dev) else {
+        crate::teprintln!(
+            "audio(legacy): device {dev} has no readable output volume; the volume keys cannot \
+             move it"
+        );
+        return;
+    };
+    let st = hal::set_output_volume_scalar(dev, (cur + delta).clamp(0.0, 1.0));
+    if st != 0 {
+        crate::teprintln!("audio(legacy): device {dev} refused a volume change (OSStatus {st})");
+    }
 }
 
 fn toggle_mute(dev: AudioObjectID) {
-    let muted = hal::output_mute(dev).unwrap_or(false);
-    let _ = hal::set_output_mute(dev, !muted);
+    let Some(muted) = hal::output_mute(dev) else {
+        crate::teprintln!("audio(legacy): device {dev} has no readable mute control");
+        return;
+    };
+    let st = hal::set_output_mute(dev, !muted);
+    if st != 0 {
+        crate::teprintln!("audio(legacy): device {dev} refused a mute change (OSStatus {st})");
+    }
+}
+
+/// Drains the actions the tap callback classified and performs the HAL round trips they need.
+///
+/// This exists so the callback does not. It is an *active* session-level event tap with
+/// `kCGEventTapOptionDefault`, so every keyboard and mouse event for the whole login session waits
+/// behind whatever it does — and what it used to do was two synchronous `AudioObject*` round trips
+/// to `coreaudiod`. When `coreaudiod` is busy (a hot-plug, a format change, another app
+/// enumerating devices) that overruns `kCGEventTapDisabledByTimeout` and macOS disables the tap,
+/// which is why the re-enable branch in `tap_callback` exists at all.
+fn action_worker(dev: AudioObjectID, rx: crossbeam_channel::Receiver<VolumeAction>) {
+    while let Ok(action) = rx.recv() {
+        match action {
+            VolumeAction::Up => nudge_volume(dev, VOLUME_STEP),
+            VolumeAction::Down => nudge_volume(dev, -VOLUME_STEP),
+            VolumeAction::ToggleMute => toggle_mute(dev),
+        }
+    }
 }
 
 extern "C-unwind" fn tap_callback(
@@ -126,11 +167,17 @@ extern "C-unwind" fn tap_callback(
         return event;
     }
     if act_on_down {
-        match key_code {
-            NX_KEYTYPE_SOUND_UP => nudge_volume(ctx.our_device, VOLUME_STEP),
-            NX_KEYTYPE_SOUND_DOWN => nudge_volume(ctx.our_device, -VOLUME_STEP),
-            NX_KEYTYPE_MUTE => toggle_mute(ctx.our_device),
-            _ => {}
+        let action = match key_code {
+            NX_KEYTYPE_SOUND_UP => Some(VolumeAction::Up),
+            NX_KEYTYPE_SOUND_DOWN => Some(VolumeAction::Down),
+            NX_KEYTYPE_MUTE => Some(VolumeAction::ToggleMute),
+            _ => None,
+        };
+        // try_send, never send: the whole point is that this callback cannot block. A full queue
+        // means the worker is behind on a burst of key repeats, and dropping one of those is
+        // invisible where stalling every input event in the session is not.
+        if let Some(a) = action {
+            let _ = ctx.tx.try_send(a);
         }
     }
     std::ptr::null_mut()
@@ -139,25 +186,54 @@ extern "C-unwind" fn tap_callback(
 pub struct VolumeKeyTap {
     run_loop: CFTypeRef,
     join: Option<JoinHandle<()>>,
+    /// dropping this ends `action_worker`'s `recv` loop
+    action_tx: Option<crossbeam_channel::Sender<VolumeAction>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 unsafe impl Send for VolumeKeyTap {}
 
+/// Queue depth for classified key presses.
+///
+/// A key repeat runs at roughly 30 Hz and each action is one pair of HAL round trips, so a handful
+/// of slots absorbs a burst; past that the presses are stale anyway and dropping them beats making
+/// the session's input path wait.
+const ACTION_QUEUE_DEPTH: usize = 16;
+
 impl VolumeKeyTap {
     pub fn start(our_device: AudioObjectID) -> Option<VolumeKeyTap> {
-        let (ready_tx, ready_rx) = mpsc::channel::<Option<usize>>();
-        let join = std::thread::Builder::new()
-            .name("se-audio-volkeys".into())
-            .spawn(move || tap_thread(our_device, ready_tx))
+        let (action_tx, action_rx) = crossbeam_channel::bounded::<VolumeAction>(ACTION_QUEUE_DEPTH);
+        let worker = std::thread::Builder::new()
+            .name("se-audio-volkeys-io".into())
+            .spawn(move || action_worker(our_device, action_rx))
             .ok()?;
+
+        let (ready_tx, ready_rx) = mpsc::channel::<Option<usize>>();
+        let tap_tx = action_tx.clone();
+        let join = match std::thread::Builder::new()
+            .name("se-audio-volkeys".into())
+            .spawn(move || tap_thread(tap_tx, ready_tx))
+        {
+            Ok(j) => j,
+            Err(e) => {
+                crate::teprintln!("audio(legacy): volume-key tap thread spawn failed: {e}");
+                drop(action_tx);
+                let _ = worker.join();
+                return None;
+            }
+        };
 
         match ready_rx.recv() {
             Ok(Some(rl)) => Some(VolumeKeyTap {
                 run_loop: rl as CFTypeRef,
                 join: Some(join),
+                action_tx: Some(action_tx),
+                worker: Some(worker),
             }),
             _ => {
                 let _ = join.join();
+                drop(action_tx);
+                let _ = worker.join();
                 None
             }
         }
@@ -172,12 +248,17 @@ impl Drop for VolumeKeyTap {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+        // the tap thread holds the other sender, so this only closes the channel once it is gone
+        self.action_tx = None;
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
     }
 }
 
-fn tap_thread(our_device: AudioObjectID, ready_tx: mpsc::Sender<Option<usize>>) {
+fn tap_thread(tx: crossbeam_channel::Sender<VolumeAction>, ready_tx: mpsc::Sender<Option<usize>>) {
     let ctx = Box::into_raw(Box::new(TapCtx {
-        our_device,
+        tx,
         port: std::ptr::null_mut(),
     }));
     let mask: u64 = 1u64 << NX_SYSDEFINED;
@@ -240,33 +321,60 @@ fn desired() -> bool {
     ENABLED.load(Ordering::Relaxed) || env_forced()
 }
 
-fn reconcile(m: &mut Manager) {
-    let want = desired() && m.device != 0;
-    if want && m.tap.is_none() {
-        m.tap = VolumeKeyTap::start(m.device);
-    } else if !want {
-        m.tap = None;
+/// A poisoned `STATE` must not take the volume keys down with it.
+///
+/// The guard is held across `VolumeKeyTap`'s `Drop`, which stops a run loop and joins two threads;
+/// a panic anywhere under it would otherwise turn every later `set_enabled`/`is_active` call into
+/// a panic of its own.
+fn state() -> std::sync::MutexGuard<'static, Manager> {
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bring the tap into line with `desired()`, starting or stopping it as needed.
+///
+/// `VolumeKeyTap::start` blocks on a handshake with the tap thread, so it runs with no lock held;
+/// the guard is taken only to read the intent and again to install the result. Two concurrent
+/// callers can therefore both build a tap, and the loser's is dropped — cheaper than serialising
+/// every caller behind a thread handshake.
+fn reconcile() {
+    let (want, device) = {
+        let m = state();
+        (desired() && m.device != 0, m.device)
+    };
+    if !want {
+        state().tap = None;
+        return;
+    }
+    if state().tap.is_some() {
+        return;
+    }
+    let tap = VolumeKeyTap::start(device);
+    let mut m = state();
+    if m.device == device && desired() && m.tap.is_none() {
+        m.tap = tap;
     }
 }
 
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
-    reconcile(&mut STATE.lock().unwrap());
+    reconcile();
 }
 
 pub fn bind_device(device: AudioObjectID) {
-    let mut m = STATE.lock().unwrap();
-    m.device = device;
-    m.tap = None;
-    reconcile(&mut m);
+    {
+        let mut m = state();
+        m.device = device;
+        m.tap = None;
+    }
+    reconcile();
 }
 
 pub fn unbind() {
-    let mut m = STATE.lock().unwrap();
+    let mut m = state();
     m.device = 0;
     m.tap = None;
 }
 
 pub fn is_active() -> bool {
-    STATE.lock().unwrap().tap.is_some()
+    state().tap.is_some()
 }
