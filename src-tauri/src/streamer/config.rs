@@ -105,6 +105,10 @@ pub struct Config {
     /// Paint a large frame number and elapsed-millisecond clock over it, for the
     /// camera-based glass-to-glass method in `docs/BASELINE.md`.
     pub counter: bool,
+    /// Seconds the WHEP self-test keeps streaming after it has proved RTP flows. 0 stops
+    /// as soon as the packet threshold is met, which is a liveness check, not a
+    /// measurement; a baseline run wants 30 or more.
+    pub selftest_secs: u64,
     pub scale: ScalePercent,
     pub stun_urls: Vec<String>,
     pub turn_url: Option<String>,
@@ -163,6 +167,7 @@ impl Default for Config {
             probe_bitrate: false,
             workload: crate::streamer::synthetic::Workload::default(),
             counter: false,
+            selftest_secs: 0,
             scale: ScalePercent::default(),
             stun_urls: vec![DEFAULT_STUN_URL.to_string()],
             turn_url: None,
@@ -417,6 +422,12 @@ impl Config {
                     c.counter = true;
                     i += 1;
                 }
+                "--duration" => {
+                    if let Some(v) = val(&args, i).and_then(|s| s.parse().ok()) {
+                        c.selftest_secs = v;
+                    }
+                    i += 2;
+                }
                 _ => i += 1,
             }
         }
@@ -480,6 +491,8 @@ PROBES / SELF-TEST (no browser)\n\
   --probe-live [path]     150 live frames -> Annex-B (default live.h264)\n\
   --probe-bitrate         exercise adaptive-bitrate reconfigure\n\
   --whep-selftest         in-process WHEP client, assert RTP flows\n\
+  --duration <secs>       keep the self-test streaming this long after RTP is proven,\n\
+                          so the stage histograms have something to describe (default 0)\n\
 \n\
   -h, --help              print this help and exit"
     );
