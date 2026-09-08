@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -36,9 +36,20 @@ pub struct CgDisplayStreamBackend {
     cfg: CaptureConfig,
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
+    /// Frames WindowServer produced that never reached us, summed from
+    /// `CGDisplayStreamUpdateGetDropCount`. CoreGraphics computes this on every delivery and
+    /// hands it to us in the update we were already holding; not reading it is why every
+    /// question about this capture path — is `queueDepth` starving us, is the
+    /// `minimumFrameTime` hold-off costing frames, is WindowServer contention the real problem —
+    /// could only be answered by hypothesis.
+    drops: Arc<AtomicU64>,
     stream: Option<CFRetained<CGDisplayStream>>,
     _queue: Option<DispatchRetained<DispatchQueue>>,
     _handler: Option<FrameHandler>,
+    /// Stops the once-a-second reporter. The delivery block is a real-time dispatch callback, so
+    /// it only ever does a relaxed `fetch_add`; the logging happens on a thread of its own.
+    report_stop: Option<Arc<AtomicBool>>,
+    report_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 unsafe impl Send for CgDisplayStreamBackend {}
@@ -55,14 +66,25 @@ impl CgDisplayStreamBackend {
             cfg,
             sink,
             frames: Arc::new(AtomicU64::new(0)),
+            drops: Arc::new(AtomicU64::new(0)),
             stream: None,
             _queue: None,
             _handler: None,
+            report_stop: None,
+            report_thread: None,
         })
     }
 
     pub fn frames_captured(&self) -> u64 {
         self.frames.load(Ordering::Relaxed)
+    }
+
+    /// Frames WindowServer dropped since this capture started.
+    ///
+    /// Near zero is the signal that the client is keeping up with WindowServer updates, which is
+    /// exactly the question `CGDisplayStream.h` says this counter exists to answer.
+    pub fn drops_captured(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
     }
 }
 
@@ -103,6 +125,7 @@ fn make_cg_properties(fps: f64) -> CFRetained<CFDictionary> {
 fn handle_frame(
     sink: &FrameSink,
     frames: &AtomicU64,
+    drops: &AtomicU64,
     width: usize,
     height: usize,
     status: CGDisplayStreamFrameStatus,
@@ -115,6 +138,12 @@ fn handle_frame(
     }
 
     if let Some(update_ref) = unsafe { update.as_ref() } {
+        // Read before the dirty-rect early-out: a delivery with no dirty rectangles can still
+        // be reporting frames that were dropped on the way to it.
+        let dropped = unsafe { CGDisplayStreamUpdate::drop_count(Some(update_ref)) };
+        if dropped != 0 {
+            drops.fetch_add(dropped as u64, Ordering::Relaxed);
+        }
         let mut rect_count: usize = 0;
         unsafe {
             CGDisplayStreamUpdate::rects(
@@ -173,13 +202,24 @@ impl CaptureBackend for CgDisplayStreamBackend {
 
         let sink = self.sink.clone();
         let frames = self.frames.clone();
+        let drops = self.drops.clone();
         let (w, h) = (self.cfg.width, self.cfg.height);
         let handler: FrameHandler = RcBlock::new(
             move |status: CGDisplayStreamFrameStatus,
                   display_time: u64,
                   surface: *mut IOSurfaceRef,
                   update: *const CGDisplayStreamUpdate| {
-                handle_frame(&sink, &frames, w, h, status, surface, update, display_time);
+                handle_frame(
+                    &sink,
+                    &frames,
+                    &drops,
+                    w,
+                    h,
+                    status,
+                    surface,
+                    update,
+                    display_time,
+                );
             },
         );
 
@@ -212,16 +252,66 @@ impl CaptureBackend for CgDisplayStreamBackend {
         self.stream = Some(stream);
         self._queue = Some(queue);
         self._handler = Some(handler);
+        self.start_drop_reporter();
         Ok(())
     }
 
     fn stop(&mut self) {
+        if let Some(stop) = self.report_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(join) = self.report_thread.take() {
+            let _ = join.join();
+        }
         if let Some(stream) = &self.stream {
             let _ = unsafe { CGDisplayStream::stop(Some(stream)) };
         }
         self.stream = None;
         self._queue = None;
         self._handler = None;
+        let dropped = self.drops.load(Ordering::Relaxed);
+        if dropped != 0 {
+            tprintln!(
+                "[cgds] capture stopped after {} frames, {dropped} dropped by WindowServer",
+                self.frames.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+impl CgDisplayStreamBackend {
+    /// One thread, one line a second, and only when the number moved.
+    ///
+    /// The delivery block runs on a `UserInteractive` dispatch queue and must not allocate or do
+    /// I/O — every logbus line is a JSON IPC event to the UI — so the callback only counts and
+    /// this reports.
+    fn start_drop_reporter(&mut self) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let drops = Arc::clone(&self.drops);
+        let frames = Arc::clone(&self.frames);
+        let Ok(join) = std::thread::Builder::new()
+            .name("cgds-drops".into())
+            .spawn(move || {
+                let mut last = 0u64;
+                while !thread_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let now = drops.load(Ordering::Relaxed);
+                    if now != last {
+                        tprintln!(
+                            "[cgds] WindowServer dropped {} frame(s) in the last second ({now} total, {} delivered)",
+                            now - last,
+                            frames.load(Ordering::Relaxed)
+                        );
+                        last = now;
+                    }
+                }
+            })
+        else {
+            return;
+        };
+        self.report_stop = Some(stop);
+        self.report_thread = Some(join);
     }
 }
 
@@ -406,8 +496,9 @@ mod tests {
         backend.stop();
 
         let delivered = backend.frames_captured();
+        let dropped = backend.drops_captured();
         println!(
-            "delivered={delivered} grabbed={} pixbuf_wrapped={wrapped_ok}",
+            "delivered={delivered} dropped_by_windowserver={dropped} grabbed={} pixbuf_wrapped={wrapped_ok}",
             samples.len()
         );
         if !samples.is_empty() {
