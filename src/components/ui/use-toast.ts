@@ -7,7 +7,11 @@ import type {
 } from "@/components/ui/toast"
 
 const TOAST_LIMIT = 1
-const TOAST_REMOVE_DELAY = 1000000
+// Upstream's placeholder is 1_000_000 ms -- 16 minutes during which a dismissed toast and
+// its `setTimeout` handle stay in `toastTimeouts`. The host process is normally left open
+// for the whole streaming session, so those entries only accumulate. Radix has already
+// unmounted the toast by then; this only controls when the bookkeeping is freed.
+const TOAST_REMOVE_DELAY = 5000
 
 type ToasterToast = ToastProps & {
   id: string
