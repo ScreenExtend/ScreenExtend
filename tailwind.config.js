@@ -3,8 +3,10 @@ module.exports = {
   darkMode: ["variant", ".dark &"],
   // Only `src/` exists. The three Next.js-shaped globs that shipped with the shadcn
   // scaffold pointed at directories this repo has never had, so they scanned nothing and
-  // cost a filesystem walk per build. `index.html` carries no class attributes.
-  content: ["./src/**/*.{ts,tsx}"],
+  // cost a filesystem walk per build. `index.html` carries no class attributes today and
+  // is listed only so that a class written there is not silently purged -- the emitted
+  // stylesheet is byte-identical with and without it.
+  content: ["./src/**/*.{ts,tsx}", "./index.html"],
   prefix: "",
   theme: {
     container: {

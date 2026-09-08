@@ -385,6 +385,11 @@ pub struct ClientStats {
     pub audio_target_us: u32,
     pub audio_concealed: u32,
     pub audio_output_latency_us: u32,
+    /// v3 tail. A redundant Opus copy that filled a real hole, and one that arrived for a
+    /// packet the client already had — the benefit and the cost of `FLAG_REDUNDANT`. A
+    /// client older than v3 leaves both at 0, which is also what "never sent one" means.
+    pub audio_redundant_used: u32,
+    pub audio_redundant_discarded: u32,
 }
 
 pub mod client_flags {
@@ -650,6 +655,16 @@ impl SessionTelemetry {
                     s.push_str(&format!(" degraded={}", degraded.join(",")));
                 }
             }
+            // Read as a pair: `used` climbing while `concealed` stays flat is redundancy
+            // working, and `discarded` climbing with `used` at zero is payload spent on a link
+            // that did not need it, which points at the send-side threshold rather than at the
+            // client. Printed only when the feature actually did something.
+            if c.version >= 3 && (c.audio_redundant_used > 0 || c.audio_redundant_discarded > 0) {
+                s.push_str(&format!(
+                    " redundant={}used/{}discarded",
+                    c.audio_redundant_used, c.audio_redundant_discarded
+                ));
+            }
         }
         s
     }
@@ -730,6 +745,8 @@ impl SessionTelemetry {
                 "audio_target_ms": c.audio_target_us as f64 / 1000.0,
                 "audio_concealed": c.audio_concealed,
                 "audio_output_latency_ms": c.audio_output_latency_us as f64 / 1000.0,
+                "audio_redundant_used": c.audio_redundant_used,
+                "audio_redundant_discarded": c.audio_redundant_discarded,
             })
         });
         serde_json::json!({

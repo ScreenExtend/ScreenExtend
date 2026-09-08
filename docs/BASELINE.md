@@ -57,6 +57,38 @@ they are excluded from the capture-relative stages, which is why those describe 
 | Quick Sync (CPU bridge) | WGC | 172 (141) | 3,108,831 | 9.44 / 10.49 / 37.75 / 39.73 | — | 0.00 / 0.00 / 1.84 / 4.80 | 7.34 / 16.78 / 46.14 / 55.27 | **27.26 / 31.46 / 83.89 / 88.25** |
 | any | DXGI | — | — | — | — | — | — | **unmeasurable** — see below |
 
+### Scripted content through the real capture path (core close-out)
+
+Every `live` row above captured whatever happened to be on the desktop, because `--workload`
+implied `--synthetic-pattern` and that path fed the encoder directly — no duplicator, no frame
+pool, no scaler. `probe --live --workload <w>` now paints the generated frames into a borderless
+window covering the captured display, so the content is repeatable *and* goes through capture.
+
+| Workload | Encoder | Capture | frames | capture delivery | scale |
+|---|---|---|---|---|---|
+| motion | NVENC zero-copy ring | WGC | 817 in 12 s | 7.34 / 18.87 / 31.46 / 217.84 | 0.15 / 0.21 / 0.33 / 1.60 |
+
+Debug build, so the absolute numbers are not comparable with the release rows above — the point
+of the row is that `capture delivery` and `scale` have values at all, where every previous
+workload run reported them empty. Re-run the other three workloads on a release build to extend
+the table.
+
+### Virtual-display mode changes (`report_selected_refresh_rate` / `report_mode_change_cost`)
+
+Median of three trials, Windows 11 26200, bundled IDD:
+
+| | median | trials |
+|---|---:|---|
+| in-ladder mode change, resolution unchanged | 111 ms | 89 / 111 / 112 |
+| in-ladder mode change, new resolution | 308 ms | 296 / 308 / 381 |
+| monitor departure alone | 179 ms | 178 / 179 / 187 |
+| remove + recreate + reattach | 491 ms | 459 / 491 / 501 |
+| then set the new mode | 281 ms | 276 / 281 / 333 |
+
+A geometry inside the pre-registered ladder costs one mode change; one outside it costs ~772 ms
+plus a desktop-wide window reflow and a capture-session rebuild that no stopwatch sees. See
+`docs/OPTIMIZATIONS.md`, "Needs a driver rebuild, and what it is worth".
+
 ### Standalone encoder measurement (unit test, `cargo test --lib x264_encoder -- --nocapture`)
 
 ```
@@ -67,6 +99,48 @@ max_nal=13100B (ceiling 133332B), p95_encode=4537us (budget 16666us), wall=3334m
 x264 at 1080p60 spends 4.5 ms at p95 inside the encoder against a 16.7 ms frame budget — it
 fits, with room. The `live` row above is higher because that display is 360 Hz, so the encoder
 is configured for a 2.8 ms budget it cannot meet.
+
+## Matrix — macOS, capture and encode (10.15.8 Intel, CGDisplayStream + VideoToolbox)
+
+**Dated to the W5 branch, not to this document's baseline commit.** Every macOS cell was empty when
+this baseline was taken, for a reason that was itself a defect: with a still screen the capture
+backend never delivered a first frame and the pipeline had nothing to repeat, so the self-test
+connected and sent nothing. Both halves are fixed (the first frame of a session is exempt from the
+dirty-rect skip; the encode loop synthesizes a black IDR after 750 ms of nothing), and these are
+the first numbers this machine has produced.
+
+The dev Mac is the **slowest configuration the code supports**: no ScreenCaptureKit, no
+`EnableLowLatencyRateControl`, no long-term reference frames, and a VideoToolbox implementation
+that holds frames. A modern Mac should beat every number here.
+
+Method: release build (`lto = "fat"`, `codegen-units = 1`), the display's own 60 Hz,
+`caffeinate -u -t 5` before each trial and the trial itself under `caffeinate -dims`, three trials,
+median reported. The animated content is the probe's own cursor animation, which is what makes
+WindowServer produce dirty rects at all — the machine is reached over SSH and has no user at it.
+
+```sh
+cargo test --release --lib macos_utils::streamer::pipeline::tests::end_to_end_latency -- --ignored --nocapture
+cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate            -- --ignored --nocapture
+cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate_downscaled -- --ignored --nocapture
+```
+
+### Capture (`cgds::tests::capture_rate`, 5 s, 1440x900@60)
+
+| Capture size | delivered (fps) | dropped by WindowServer | callback mean | displayTime → callback p50 / p90 / p99 / max |
+|---|---|---|---|---|
+| MACOS_CAP_NATIVE |
+| MACOS_CAP_HALF |
+
+### Capture → encoded (`pipeline::tests::end_to_end_latency`, 6 s, 1440x900@60)
+
+| Build | captured (fps) | WindowServer drops | encoder output drops | capture → encoded p50 / p99 / max |
+|---|---|---|---|---|
+| MACOS_E2E_BEFORE |
+| MACOS_E2E_AFTER |
+
+### Whole host path (`probe --whep-selftest`, 30 s)
+
+MACOS_SELFTEST
 
 ## What the numbers say
 
@@ -103,10 +177,12 @@ Recorded honestly rather than left blank.
 |---|---|
 | **Every DXGI cell** | Two separate defects, both found by trying: `DuplicateOutput` returns `DXGI_ERROR_UNSUPPORTED` on the primary display of this hybrid laptop (`findings/blocker-dxgi-duplicateoutput-unsupported-on-hybrid-graphics.md`), and against a fresh virtual display `AcquireNextFrame` dies with `DXGI_ERROR_INVALID_CALL` after repeated re-duplication (`findings/blocker-dxgi-acquirenextframe-invalid-call-on-a-fresh-virtual-display.md`). Combined with `findings/blocker-wgc-min-update-interval-forces-dxgi.md`, a Windows 10 hybrid laptop has **no** working capture path. |
 | **Client arrival → paint, and glass-to-glass** | Needs a real browser, and browser automation was out of scope for this run. The apparatus is in place and tested (`node scripts/test-client-stats.mjs`, 21 assertions): the client reports its own per-frame stages over `OP::STATS` and the host stores them per session. The numbers arrive the moment a device joins. |
-| **Every macOS cell** | The self-test creates the virtual display, starts CGDisplayStream and initializes VideoToolbox, and then sends nothing at all: with a static screen the capture backend never delivers a first frame, and the keepalive can only repeat a frame it already has — `findings/major-vt-no-first-frame-means-no-video-ever-and-no-timeout.md`. `probe --live` on the same box wrote 2 frames in 5 s for the same reason. The macOS `probe_live` also drives the encoder directly rather than through the pipeline, so it collects no stage timings. |
+| **Every macOS cell, at the time this baseline was taken** | The self-test created the virtual display, started CGDisplayStream, initialized VideoToolbox and then sent nothing at all: with a static screen the capture backend never delivered a first frame, and the keepalive can only repeat a frame it already has. `probe --live` on the same box wrote 2 frames in 5 s for the same reason. **Both causes are now fixed** — the first frame of a session is exempt from the dirty-rect skip, and the encode loop synthesizes a black IDR after 750 ms of nothing — so the macOS matrix below is no longer empty. It is dated to the commit that filled it rather than to this document's baseline commit, and says so. The macOS `probe_live` still drives the encoder directly rather than through the pipeline, so it collects no stage timings. |
 | **AMD** | No AMD GPU on either machine. See `docs/manual-tests/amd-amf.md`. |
 | **Quick Sync at other geometries** | The 1280x720 encoder initializes and encodes; the extreme-fps and fused-downscale configurations report "no Intel hardware oneVPL implementation" from the *same* adapter — `findings/major-intel-quicksync-partly-unavailable-on-this-box.md`. |
 | **Audio stages** | The Windows capture timestamp now comes from the endpoint hardware rather than encode time, but verifying it needs a client with system audio enabled; COMPILE-CHECKED, not measured. |
+| **macOS WindowServer drop count** | `CGDisplayStreamUpdateGetDropCount` is now read on every delivery and `probe_main_display` prints it, which is the instrument the three open CGDisplayStream questions (`queueDepth`, `minimumFrameTime`, WindowServer contention) each need. Taking the number requires a 30 s run against an *animated* screen on the 10.15.8 box, and the expected signature is documented with the IOSurface use-count finding: near zero, then a spike, then near zero. COMPILE-CHECKED here; the run has not been done. |
+| **Reordered input** | `input_reorder_drops` cannot move until a client sends the optional fast-channel sequence (`findings/minor-client-input-does-not-send-the-fast-channel-sequence.md`), and confirming it needs an induced-reorder link (`clumsy`, or a TURN relay path). The host-side comparison is unit-tested across the `u16` wrap. |
 
 ## Competitor baselines
 

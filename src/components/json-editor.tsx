@@ -56,7 +56,7 @@ function acquireWorkerKeepAlive(): () => void {
       void monaco.languages.json
         .getWorker()
         .then(accessor => accessor())
-        .catch(() => {});
+        .catch(e => console.error("the JSON worker keep-alive failed", e));
     };
     touch();
     keepAliveTimer = window.setInterval(touch, WORKER_KEEPALIVE_MS);
@@ -326,7 +326,10 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
         if (!current) return;
         try {
           replaceAll(JSON.stringify(JSON.parse(current)), false);
-        } catch {
+        } catch (e) {
+          // the document is not valid JSON, so there is nothing to minify; the markers
+          // in the gutter already say so
+          console.error("minify skipped: the document is not valid JSON", e);
         }
       },
       setValue: next => replaceAll(next, true),
@@ -360,7 +363,7 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
             if (token !== validateToken || editor.getModel() !== model) return;
             monaco.editor.setModelMarkers(model, MARKER_OWNER, diagnostics.map(toMarker));
           })
-          .catch(() => {});
+          .catch(e => console.error("JSON validation did not run", e));
       };
       const scheduleValidate = () => {
         window.clearTimeout(validateTimer);
