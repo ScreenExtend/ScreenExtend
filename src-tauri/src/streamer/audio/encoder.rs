@@ -3,10 +3,25 @@ use anyhow::{bail, Result};
 use super::opus_sys::{self, OpusApi};
 
 pub const OPUS_SAMPLE_RATE: u32 = 48000;
+
+/// Frame length. A deliberate latency-for-overhead trade that was previously unrecorded.
+///
+/// 5 ms is 200 packets/s. At 128 kbps the payload measures ~118 bytes of speech (3 bytes of
+/// pure silence) against a 13-byte app header plus roughly 50-70 bytes of SCTP/DTLS/UDP/IP,
+/// so well over a third of the audio bitrate on the wire is framing. 10 ms would halve that
+/// for +5 ms of latency; 2.5 ms is legal in CELT-only and would save 2.5 ms of the 7.5 ms
+/// codec delay while doubling an already overhead-dominated packet rate. 5 ms is the balance
+/// point for this product, and the total algorithmic delay is frame + lookahead = 5 + 2.5 ms,
+/// not 5.
 pub const FRAME_MS: u32 = 5;
 pub const FRAME_SAMPLES: usize = (OPUS_SAMPLE_RATE as usize * FRAME_MS as usize) / 1000;
 pub const DEFAULT_BITRATE_BPS: i32 = 128_000;
+/// Encode time at this setting measures p50 0.07-0.1 ms / p99 0.33 ms on the dev box, three
+/// orders of magnitude under the frame it produces, so there is nothing to buy by lowering it.
 pub const DEFAULT_COMPLEXITY: i32 = 5;
+/// Source depth. The mix arrives as float32, so 24 is the honest answer and also libopus's
+/// default; stated explicitly because the alternative is a silent assumption.
+pub const DEFAULT_LSB_DEPTH: i32 = 24;
 
 const MAX_PACKET_BYTES: usize = 4000;
 
@@ -17,6 +32,12 @@ pub struct OpusEncoderConfig {
     pub bitrate_bps: i32,
     pub complexity: i32,
     pub frame_samples: usize,
+    /// `OPUS_SET_PREDICTION_DISABLED`. Makes every frame nearly independent, which is what a
+    /// zero-retransmit unordered transport wants — a lost frame then does not degrade its
+    /// successors. It costs bitrate at fixed quality, so it is a listening-test decision, not
+    /// a free one, and it stays off until someone can A/B it on real hardware. Flipping this
+    /// default is the whole change.
+    pub disable_prediction: bool,
 }
 
 impl Default for OpusEncoderConfig {
@@ -27,6 +48,7 @@ impl Default for OpusEncoderConfig {
             bitrate_bps: DEFAULT_BITRATE_BPS,
             complexity: DEFAULT_COMPLEXITY,
             frame_samples: FRAME_SAMPLES,
+            disable_prediction: false,
         }
     }
 }
@@ -92,16 +114,67 @@ impl OpusEncoder {
             opus_sys::OPUS_SET_SIGNAL_REQUEST,
             opus_sys::OPUS_SIGNAL_MUSIC,
         )?;
-        enc.ctl_set(opus_sys::OPUS_SET_DTX_REQUEST, 0)?;
-        enc.ctl_set(opus_sys::OPUS_SET_INBAND_FEC_REQUEST, 0)?;
+        enc.ctl_set(opus_sys::OPUS_SET_LSB_DEPTH_REQUEST, DEFAULT_LSB_DEPTH)?;
         enc.ctl_set(opus_sys::OPUS_SET_VBR_REQUEST, 1)?;
-        enc.ctl_set(opus_sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, 0)?;
+        // Constrained VBR (libopus's own default, which the previous code explicitly turned
+        // off). Unconstrained VBR lets one frame's byte count run well above the nominal rate
+        // on a transient, and at 200 packets/s over Wi-Fi a size spike is an airtime spike is
+        // arrival jitter — which the client answers by *growing* its jitter buffer. Encoder
+        // peakiness converts fairly directly into client-side latency, so the bounded mode is
+        // the one a real-time stream wants.
+        enc.ctl_set(opus_sys::OPUS_SET_VBR_CONSTRAINT_REQUEST, 1)?;
+        if config.disable_prediction {
+            enc.ctl_set(opus_sys::OPUS_SET_PREDICTION_DISABLED_REQUEST, 1)?;
+        }
+        // `OPUS_SET_DTX` and `OPUS_SET_INBAND_FEC` are deliberately *not* issued. libopus
+        // documents both as "only applicable to the LPC layer"; the LPC layer is SILK, and
+        // `OPUS_APPLICATION_RESTRICTED_LOWDELAY` plus a sub-10 ms frame both force CELT-only.
+        // Setting either to 0 was writing down a default, and setting either to 1 would change
+        // nothing at all — so neither is an answer to packet loss here, and the code should
+        // not imply that it is. The answer is `protocol::FLAG_REDUNDANT`.
 
-        enc.lookahead_samples = enc
-            .ctl_get(opus_sys::OPUS_GET_LOOKAHEAD_REQUEST)
-            .unwrap_or(0);
+        enc.lookahead_samples = match enc.ctl_get(opus_sys::OPUS_GET_LOOKAHEAD_REQUEST) {
+            Ok(v) => v,
+            Err(e) => {
+                // A silent 0 here would be a claim of zero algorithmic delay, and the value is
+                // reported to the client and used to align playout.
+                crate::teprintln!("opus: could not read lookahead ({e:#}); reporting 0");
+                0
+            }
+        };
 
         Ok(enc)
+    }
+
+    /// What the encoder says it is, rather than what we asked for.
+    ///
+    /// `ctl_set` bails on a rejected value, which is better than most FFI wrappers manage, but
+    /// nothing ever asked the encoder to confirm its state — and Windows and macOS load
+    /// different libopus builds (`libopus.dll` / `libopus.dylib`), so "it worked on the other
+    /// platform" is not evidence.
+    pub fn describe_state(&self) -> String {
+        let get = |req| {
+            self.ctl_get(req)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "?".to_string())
+        };
+        format!(
+            "opus: {} — application={} bitrate={} complexity={} signal={} vbr={} \
+             vbr_constraint={} lsb_depth={} prediction_disabled={} lookahead={} samples \
+             ({:.2} ms), frame {} ms",
+            self.api.version(),
+            get(opus_sys::OPUS_GET_APPLICATION_REQUEST),
+            get(opus_sys::OPUS_GET_BITRATE_REQUEST),
+            get(opus_sys::OPUS_GET_COMPLEXITY_REQUEST),
+            get(opus_sys::OPUS_GET_SIGNAL_REQUEST),
+            get(opus_sys::OPUS_GET_VBR_REQUEST),
+            get(opus_sys::OPUS_GET_VBR_CONSTRAINT_REQUEST),
+            get(opus_sys::OPUS_GET_LSB_DEPTH_REQUEST),
+            get(opus_sys::OPUS_GET_PREDICTION_DISABLED_REQUEST),
+            self.lookahead_samples,
+            self.lookahead_samples as f64 * 1000.0 / OPUS_SAMPLE_RATE as f64,
+            FRAME_MS,
+        )
     }
 
     fn ctl_set(&self, request: std::ffi::c_int, value: i32) -> Result<()> {

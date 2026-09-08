@@ -46,8 +46,30 @@ use super::session::{self, SharedDeviceOverrides};
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
-const OPUS_FALLBACK_FMTP: &str = "minptime=5;useinbandfec=1;stereo=1;sprop-stereo=1";
-const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
+/// Floor on how often a client's out-of-band keyframe request may force an IDR.
+const MIN_IDR_REQUEST_GAP: Duration = Duration::from_millis(200);
+
+/// No `useinbandfec=1`: it used to be advertised and it was never true. libopus documents
+/// in-band FEC as an LPC-layer (SILK) feature, and this encoder runs
+/// `OPUS_APPLICATION_RESTRICTED_LOWDELAY` at 5 ms frames — both force CELT-only — so no FEC
+/// can be produced on either transport path. Telling the client to expect it was a lie that
+/// could only make its concealment worse.
+const OPUS_FALLBACK_FMTP: &str = "minptime=5;stereo=1;sprop-stereo=1";
+
+/// How much audio may sit unsent in the DataChannel before the forwarder starts dropping.
+///
+/// Expressed in milliseconds, not bytes. The old threshold was a flat 16 KiB, which at the
+/// measured ~93-byte message is about **a second** of audio queued before the drop policy
+/// engaged — by which point the listener is a second behind and every packet in the queue is
+/// worthless. 40 ms is two Opus frames more than the client's own maximum jitter target.
+const AUDIO_BACKPRESSURE_MS: usize = 40;
+
+/// The byte figure that `AUDIO_BACKPRESSURE_MS` works out to for the message size actually
+/// being sent, so the policy tracks the bitrate instead of assuming one.
+fn backpressure_limit_bytes(msg_len: usize) -> usize {
+    let frames = AUDIO_BACKPRESSURE_MS / crate::streamer::audio::encoder::FRAME_MS as usize;
+    frames * msg_len.max(1)
+}
 
 /// RTP payload MTU on a same-subnet path: 1200 bytes of datagram minus the 12-byte RTP header.
 const RTP_PAYLOAD_MTU_LAN: usize = 1200 - 12;
@@ -78,14 +100,6 @@ static LIVE_SESSIONS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI6
 pub fn live_sessions() -> i64 {
     LIVE_SESSIONS.load(Ordering::Relaxed)
 }
-
-/// The client's `KEYFRAME_REQUEST` opcode on the reliable input channel, sent when neither
-/// insertable-streams API on its side can ask for one through RTCP.
-///
-/// Read ahead of `input::protocol::parse` so it works whether or not the input protocol has a
-/// variant for it; when one exists, that arm should call [`KeyframeRequester::request`] too
-/// rather than reaching for `pipeline.request_idr()` directly.
-pub const OP_KEYFRAME_REQUEST: u8 = 0x64;
 
 /// The one path every keyframe request in a session takes.
 ///
@@ -158,6 +172,9 @@ fn payloads_carry_parameter_sets(payloads: &[Bytes]) -> bool {
 
 pub struct InputParams {
     pub device: Option<String>,
+    /// The `os` string the client reported at join, which decides the modifier layout on a
+    /// macOS host. Empty when the client did not say.
+    pub client_os: String,
     pub control_enabled: bool,
     pub control_rx: Option<session::ControlReceiver>,
 }
@@ -170,12 +187,42 @@ pub struct AudioParams {
     /// the client, because only the client knows whether it can switch to it — see
     /// `AudioCapabilities::wants_fallback_track`.
     pub fallback_track: bool,
+    /// The client said it can parse [`audio::FLAG_REDUNDANT`] messages. Old clients cannot, so
+    /// this is off unless the join request opted in.
+    pub redundancy: bool,
+    /// Link loss as measured by the video BWE, in hundredths of a percent. Wired in by
+    /// `start_session`; `None` outside a live session.
+    pub link_loss: Option<Arc<std::sync::atomic::AtomicU32>>,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
     pub device_key: String,
 }
 
+/// Loss at which duplicating the previous frame starts paying for itself.
+///
+/// Below this, redundancy is pure overhead: every packet doubles in payload to protect against
+/// a loss that is not happening. Above it, a single lost packet is an audible 5 ms hole with
+/// no codec-level concealment available (in-band FEC cannot exist in this configuration), so
+/// the trade inverts. 0.5 % — the same order as the point at which the video BWE starts to
+/// react.
+const AUDIO_REDUNDANCY_LOSS_THRESHOLD: u32 = 50; // hundredths of a percent
+
 impl AudioParams {
+    /// Should this packet carry the previous frame alongside it?
+    ///
+    /// Two conditions, both required: the client said it can parse the format, and the link is
+    /// actually losing packets. A client that cannot parse it must never be sent it, and a
+    /// clean link should not pay for it.
+    fn redundancy_now(&self) -> bool {
+        if !self.redundancy {
+            return false;
+        }
+        self.link_loss
+            .as_ref()
+            .map(|l| l.load(Ordering::Relaxed) >= AUDIO_REDUNDANCY_LOSS_THRESHOLD)
+            .unwrap_or(false)
+    }
+
     fn audio_enabled_now(&self) -> bool {
         self.overrides
             .lock()
@@ -579,10 +626,15 @@ pub async fn handle_whep_offer(
 
     let InputParams {
         device: input_device,
+        client_os,
         control_enabled,
         control_rx,
     } = input;
-    let (input_tx, input_join) = input::spawn(input_device);
+    let client = input::ClientProfile {
+        device_name: input_device,
+        platform: input::ClientPlatform::from_reported(&client_os),
+    };
+    let (input_tx, input_join) = input::spawn(client, Arc::clone(&pipeline.telemetry));
     {
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
@@ -617,51 +669,79 @@ pub async fn handle_whep_offer(
                     });
                 }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
+                let idr_keyframes = keyframes_dc.clone();
+                // The client rate-limits itself to one request per 200 ms, but that limit is
+                // advisory: a hostile or looping client must not be able to pin the encoder at
+                // one IDR per frame. `Instant` rather than the host clock because this is a
+                // local interval, not a stamp anything else compares against.
+                let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
+                // The Pong reply used to be written from inside the receive handler, which
+                // head-of-line blocked every later message on this channel behind an SCTP send.
+                // It goes to a task that owns the channel instead, so the handler only ever
+                // parses and enqueues.
+                let pong_tx = dc_for_pong.map(|dc_pong| {
+                    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    tokio::spawn(async move {
+                        while let Some(t_ns) = pong_rx.recv().await {
+                            let pong = input::protocol::build_pong(
+                                t_ns,
+                                crate::streamer::audio::host_now_ns(),
+                            );
+                            if dc_pong.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    pong_tx
+                });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let tx = tx.clone();
-                    let dc_pong = dc_for_pong.clone();
-                    let telemetry = Arc::clone(&telemetry_for_stats);
-                    let keyframes = keyframes_dc.clone();
-                    Box::pin(async move {
-                        // A client with neither `RTCRtpScriptTransform` nor
-                        // `createEncodedStreams` cannot make its browser emit a PLI, so it asks
-                        // in band. Answered before the control gate — a device with remote
-                        // control switched off still needs a picture — and through the same
-                        // rate limiter as every other keyframe request.
-                        if msg.data.first() == Some(&OP_KEYFRAME_REQUEST) {
-                            telemetry
+                    let Some(parsed) = input::protocol::parse(&msg.data) else {
+                        return Box::pin(async {});
+                    };
+                    // Both of these are transport business and are answered before the
+                    // remote-control gate: a device with control disabled still needs its
+                    // clock synced and still reports what its own pipeline is doing.
+                    match parsed.ev {
+                        input::protocol::InputEvent::ClientStats(stats) => {
+                            telemetry_for_stats.set_client_stats(*stats);
+                        }
+                        input::protocol::InputEvent::Ping { t_ns } => {
+                            if let Some(pong_tx) = &pong_tx {
+                                let _ = pong_tx.send(t_ns);
+                            }
+                        }
+                        // The receiver has no other way to ask: a client on the legacy encoded
+                        // transform runs instead of libwebrtc's reference finder, so no PLI is
+                        // ever emitted for it and a single lost keyframe would otherwise freeze
+                        // the picture until its own watchdog gave up on the WebCodecs path.
+                        input::protocol::InputEvent::KeyframeRequest { .. } => {
+                            let now = std::time::Instant::now();
+                            let allowed = last_idr_request
+                                .is_none_or(|t| now.duration_since(t) >= MIN_IDR_REQUEST_GAP);
+                            // The request is counted whether or not it is acted on: it is a real
+                            // observation about the client either way.
+                            telemetry_for_stats
                                 .degradation
                                 .keyframe_requests
                                 .fetch_add(1, Ordering::Relaxed);
-                            keyframes.request_quietly();
-                            return;
-                        }
-                        let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
-                            return;
-                        };
-                        // Both of these are transport business and are answered before the
-                        // remote-control gate: a device with control disabled still needs its
-                        // clock synced and still reports what its own pipeline is doing.
-                        if let input::protocol::InputEvent::ClientStats(stats) = ev {
-                            telemetry.set_client_stats(*stats);
-                            return;
-                        }
-                        if let Some(dc_pong) = &dc_pong {
-                            if let input::protocol::InputEvent::Ping { t_ns } = ev {
-                                let pong = input::protocol::build_pong(
-                                    t_ns,
-                                    crate::streamer::audio::host_now_ns(),
-                                );
-                                let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
-                                return;
+                            telemetry_for_stats
+                                .degradation
+                                .client_keyframe_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            if allowed {
+                                last_idr_request = Some(now);
+                                // Through the session's one rate-limited requester, not
+                                // `pipeline.request_idr()` directly: this floor guards against a
+                                // looping client, the gate guards against answering a decoder's
+                                // whole backlog with the largest frame the encoder emits.
+                                idr_keyframes.request_quietly();
                             }
                         }
-                        if !control_enabled {
-                            return;
-                        }
-                        tx.route(ev, hot);
-                    })
+                        ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),
+                        _ => {}
+                    }
+                    Box::pin(async {})
                 }));
             })
         }));
@@ -753,15 +833,22 @@ pub async fn handle_whep_offer(
         });
     }
 
+    // One loss estimate, shared: the video BWE already polls `getStats` every 120 ms and the
+    // audio DataChannel rides the same link, so audio does not need its own measurement — and
+    // could not get a better one, since SCTP does not report loss the way RTCP does.
+    let link_loss = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     spawn_bitrate_driver(
         Arc::clone(&pc),
         pipeline.clone(),
         Arc::clone(&feedback),
         Arc::clone(&keyframe_gate),
         Arc::clone(&pacing_target_bps),
+        Arc::clone(&link_loss),
     );
 
-    if let Some(audio) = audio {
+    if let Some(mut audio) = audio {
+        audio.link_loss = Some(link_loss);
         if let Err(e) = setup_audio(&pc, audio, Arc::clone(&pipeline.telemetry)).await {
             teprintln!("audio: setup failed ({e:#}); continuing without audio");
         }
@@ -1206,16 +1293,24 @@ async fn forward_datachannel(
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
     let mut sub: Option<audio::AudioSubscription> = None;
-    let mut since_bp_check: u32 = 0;
-    let mut over_backpressure = false;
-    let mut scratch: Vec<u8> = Vec::with_capacity(protocol::HEADER_LEN + 512);
+    // Sticky across iterations: any producer-side skip — a broadcast lag or a backpressure
+    // drop — leaves a hole the client must be told about, and it is told on the next packet
+    // that actually goes out. Without this the client sees a `seq` jump with `flags == 0`,
+    // which is indistinguishable from ordinary network loss, so it splices the new audio onto
+    // the old with no resync and keeps the offset for good.
+    let mut pending_discontinuity = false;
+    let mut prev_payload: Option<Bytes> = None;
     loop {
         if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
             break;
         }
         let want = audio.audio_enabled_now();
         match (want, sub.is_some()) {
-            (true, false) => sub = subscribe_blocking(&audio.hub).await,
+            (true, false) => {
+                sub = subscribe_blocking(&audio.hub).await;
+                pending_discontinuity = true;
+                prev_payload = None;
+            }
             (false, true) => {
                 sub = None;
                 unsubscribe_blocking(&audio.hub).await;
@@ -1230,27 +1325,40 @@ async fn forward_datachannel(
 
         match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
             Ok(Ok(pkt)) => {
-                if since_bp_check == 0 {
-                    over_backpressure = dc.buffered_amount().await > AUDIO_BACKPRESSURE_BYTES;
-                }
-                since_bp_check = (since_bp_check + 1) % 4;
-                if over_backpressure {
+                // Checked every packet, not one in four. The old sampling detected a backed-up
+                // channel up to 20 ms late and — worse — kept discarding for up to 20 ms after
+                // it had drained. `buffered_amount` is a read behind a lock in webrtc-rs, not a
+                // syscall.
+                let msg_len = protocol::HEADER_LEN + pkt.data.len();
+                if dc.buffered_amount().await > backpressure_limit_bytes(msg_len) {
                     s.diagnostics
                         .dropped_backpressure
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(1, Ordering::Relaxed);
+                    pending_discontinuity = true;
+                    prev_payload = None;
                     continue;
                 }
-                scratch.resize(protocol::HEADER_LEN + pkt.data.len(), 0);
-                protocol::write_message(
-                    &mut scratch,
+                let mut flags = pkt.flags;
+                if pending_discontinuity {
+                    flags |= audio::FLAG_DISCONTINUITY;
+                }
+                let redundant = if audio.redundancy_now() {
+                    prev_payload.as_deref()
+                } else {
+                    None
+                };
+                let msg = protocol::build_datachannel_message(
                     pkt.seq,
                     pkt.capture_ns,
-                    pkt.flags,
+                    flags,
                     &pkt.data,
+                    redundant,
                 );
-                if dc.send(&Bytes::copy_from_slice(&scratch)).await.is_err() {
+                if dc.send(&msg).await.is_err() {
                     break;
                 }
+                pending_discontinuity = false;
+                prev_payload = Some(pkt.data);
             }
             // The subscriber fell behind the host-wide capture and the broadcast dropped
             // packets on its behalf: a real audio gap, previously invisible.
@@ -1259,6 +1367,13 @@ async fn forward_datachannel(
                     .degradation
                     .audio_broadcast_lag_drops
                     .fetch_add(skipped, Ordering::Relaxed);
+                if let Some(s) = sub.as_ref() {
+                    s.diagnostics
+                        .lagged_packets
+                        .fetch_add(skipped, Ordering::Relaxed);
+                }
+                pending_discontinuity = true;
+                prev_payload = None;
                 continue;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -1279,7 +1394,13 @@ async fn forward_track(
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
-    let frame_duration = Duration::from_millis(5); // 5 ms Opus frames
+    let frame_duration = Duration::from_millis(crate::streamer::audio::encoder::FRAME_MS as u64);
+    // A gap longer than this is a device change or a stall, not a scheduling wobble; advancing
+    // the track's clock by the true elapsed time is right up to that point, and beyond it the
+    // sane thing is to treat the timeline as restarted rather than to jump the RTP clock by
+    // minutes.
+    const MAX_CATCHUP: Duration = Duration::from_millis(500);
+    let mut last_capture_ns: Option<u64> = None;
     let mut sub: Option<audio::AudioSubscription> = None;
     loop {
         if !pc_alive(&pc) {
@@ -1302,10 +1423,24 @@ async fn forward_track(
 
         match tokio::time::timeout(Duration::from_millis(250), s.rx.recv()).await {
             Ok(Ok(pkt)) => {
+                // `TrackLocalStaticSample` derives each RTP timestamp by *accumulating*
+                // `duration`, so a fixed 5 ms advanced the audio timeline by 5 ms per packet
+                // no matter what actually happened at capture. Every real gap — a device
+                // change, a broadcast lag, a backpressure drop — therefore left audio
+                // permanently 5 ms per lost packet behind the video, which rides the true host
+                // clock in its RTP timestamps, and nothing ever corrected it. Spacing samples
+                // by the real elapsed `capture_ns` puts both media back on one timeline.
+                let duration = match last_capture_ns {
+                    Some(prev) if pkt.capture_ns > prev => {
+                        Duration::from_nanos(pkt.capture_ns - prev).min(MAX_CATCHUP)
+                    }
+                    _ => frame_duration,
+                };
+                last_capture_ns = Some(pkt.capture_ns);
                 if track
                     .write_sample(&Sample {
                         data: pkt.data,
-                        duration: frame_duration,
+                        duration,
                         ..Default::default()
                     })
                     .await
@@ -1321,6 +1456,11 @@ async fn forward_track(
                     .degradation
                     .audio_broadcast_lag_drops
                     .fetch_add(skipped, Ordering::Relaxed);
+                if let Some(s) = sub.as_ref() {
+                    s.diagnostics
+                        .lagged_packets
+                        .fetch_add(skipped, Ordering::Relaxed);
+                }
                 continue;
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -1341,6 +1481,7 @@ fn spawn_bitrate_driver(
     feedback: Arc<SharedFeedback>,
     keyframe_gate: Arc<KeyframeGate>,
     pacing_target_bps: Arc<std::sync::atomic::AtomicU32>,
+    link_loss: Arc<std::sync::atomic::AtomicU32>,
 ) {
     use webrtc::stats::StatsReportType;
 
@@ -1399,6 +1540,13 @@ fn spawn_bitrate_driver(
             if !have_outbound {
                 continue;
             }
+
+            // Publish for the audio forwarder, in hundredths of a percent so it fits an
+            // integer without losing the range that matters (0.5 % to 10 %).
+            link_loss.store(
+                (fraction_lost.clamp(0.0, 1.0) * 10_000.0) as u32,
+                Ordering::Relaxed,
+            );
 
             let now = Instant::now();
             let measured_send_bps = match last_bytes_sent {

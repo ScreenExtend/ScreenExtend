@@ -158,6 +158,45 @@ recover from.
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
 
+## Audio stages
+
+Audio does not travel with a `FrameTiming`; there is one host-wide capture fanned out to every
+session, so its numbers live in `AudioDiagnostics` (`streamer/audio/mod.rs`) and are shared. Same
+rules as the video histograms — fixed log-scale buckets of `AtomicU64`, no allocation and no lock
+on the capture thread, reported as p50/p90/p99/max.
+
+| Histogram | What it measures |
+|---|---|
+| `wake_interval` | Capture-thread wake to wake: the engine period **as delivered**, which is what says whether a low-latency period request actually took effect. |
+| `encode` | Opus encode duration per 5 ms frame. |
+| `capture_to_packet` | `host_now_ns()` when a packet is handed to the transport, minus that packet's own `capture_ns`. The host-side half of the audio budget. |
+
+Counters alongside them: `period_frames` and `buffer_frames` (the engine period and the whole
+engine buffer — different numbers, and they used to be reported as the same one),
+`discontinuity_count`, `silent_count`, `device_changes`, `companion_restarts`,
+`event_starvations`, `dropped_backpressure`, `lagged_packets`, `capture_ts_clamped`.
+
+`companion_restarts` and `event_starvations` are the two that say the endpoint stopped producing:
+before they existed, a dead silent-render companion looked exactly like a healthy idle host,
+because the 2 s diagnostic kept printing with frozen counters. `capture_ts_clamped` counts drains
+whose endpoint timestamp was in the future — on a Windows loopback stream that is the normal
+case, not an anomaly, because the endpoint is a render device and its "device position" is a play
+cursor.
+
+### `ScreenExtend probe --audio`
+
+The audio counterpart of `--whep-selftest`. It drives an `AudioHub` the way a session's forwarder
+does, so it exercises the shipping capture backend, encoder and fan-out rather than a parallel
+harness, and it needs no virtual display. `--duration <secs>` sets the sampling window (default
+10); `--process-loopback` selects the second Windows capture tier, which is otherwise reached only
+when the endpoint tier fails and so cannot be measured.
+
+It prints packet rate and payload size, subscriber inter-arrival, capture -> subscriber latency,
+the signed skew of `capture_ns` against the host clock (including how many packets were stamped
+*ahead* of it, which is how the clamp above was found), and then the full `AudioDiagnostics`
+summary. A tier that delivers nothing reports that as a failure with the two explanations for it,
+rather than hanging.
+
 ## Client → host stats frame (`OP::STATS`, `0x62`)
 
 Sent on the **reliable** DataChannel once a second, alongside the `PING`. Fixed offsets, little
@@ -241,7 +280,8 @@ host's encoder is CELT-only at 5 ms, where libopus's in-band FEC is structurally
 carries `redundancy` alongside `webcodecsOpus` and `worklet`:
 
 ```json
-{ "webcodecsOpus": true, "worklet": true, "redundancy": true }
+{ "webcodecsOpus": true, "worklet": true, "redundancy": true,
+  "verified": true, "wantsFallbackTrack": true }
 ```
 
 `redundancy` describes *this client build* rather than the browser — `audio-worker.js` always
@@ -251,12 +291,16 @@ a redundant body at all. A client older than the field sends nothing and serde d
 `false`. A host must set `FLAG_REDUNDANT` only against a client that sent `true`: a client that
 cannot split the body decodes the two payloads as one packet.
 
-**Neither half is implemented on the host yet.** `streamer/audio/protocol.rs` defines no
-`FLAG_REDUNDANT` and `server.rs`'s `AudioCapabilities` deserializes only `webcodecsOpus` and
-`worklet` — the extra field is accepted and ignored, because the struct has no
-`deny_unknown_fields`. So on today's host both counters stay 0 and the flag never appears; the
-client half is in place so the host half can land without a client change, and so an old client
-and a new one are distinguishable at the join rather than by guesswork.
+Both halves are live. `streamer/audio/protocol.rs::build_message` takes an optional previous
+payload and sets the flag; `webrtc_session.rs::redundancy_now()` turns it on from the loss the
+video BWE already measures, and only for a session whose join advertised `redundancy: true`. The
+join body carries two more fields the client is the only side that can answer — `verified` (the
+decoder was actually probed, not sniffed) and `wantsFallbackTrack` (put a spare Opus track in
+the answer, because WHEP cannot add one later) — and the host logs the first and honours the
+second.
+
+The counters are still client-side only: `parse_client_stats` stops at 96, so the two v3 fields
+are the one part of this not visible from the host.
 
 The two counters are what the feature actually did once a host does send it. **used** (offset 96)
 is a copy that filled a hole the client would otherwise have concealed; **discarded** (offset

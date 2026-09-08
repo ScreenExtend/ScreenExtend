@@ -113,15 +113,17 @@ The change this workstream exists for. On row 1 (Chrome desktop):
 On row 3 (Chrome ≤ 140) the answer depends on the host, and the point of the row is that the
 client tells the truth about which one it is talking to:
 
-- **Host without the `0x64` arm** (`findings/major-host-keyframe-request-opcode-unhandled.md`
-  not yet landed): `SEVideo.getStats().keyTier` must be **0**, `keyRequests` must stay flat —
-  the client sends nothing it knows will be dropped — and `degraded` bit 11
-  (`KEYFRAME_REQUEST_IMPOSSIBLE`) must be set. Provoke a loss and confirm the picture demotes
-  to `videoPath` 3 within about four seconds rather than sitting frozen for eight.
-- **Host with the arm**: `keyTier` is **2**, `keyRequests` climbs, and the picture recovers
-  within roughly one round trip without demoting. Re-run this row after the host side lands;
-  a `keyTier` of 2 against a host that does not parse `0x64` is the exact bug this gate exists
-  to prevent.
+- **This host** parses `0x64`, routes it to the same `request_idr()` a PLI takes and advertises
+  capability bit 0 on the `PONG`, so expect `keyTier` **2**, `keyRequests` climbing, and the
+  picture recovering within roughly one round trip without demoting. On the host side
+  `client_keyframe_requests` in `ScreenExtend status --json` counts them separately from the
+  RTCP PLIs, so the two sources stay distinguishable.
+- **An older host** (one built before the arm, which sends a 17-byte `PONG`): `keyTier` must be
+  **0**, `keyRequests` must stay flat — the client sends nothing it knows will be dropped — and
+  `degraded` bit 11 (`KEYFRAME_REQUEST_IMPOSSIBLE`) must be set. Provoke a loss and confirm the
+  picture demotes to `videoPath` 3 within about four seconds rather than sitting frozen for
+  eight. A `keyTier` of 2 against a host that does not parse `0x64` is the exact bug this gate
+  exists to prevent, and it is the reason the tier is read off the wire rather than assumed.
 
 `node scripts/test-client-stats.mjs` asserts the gate itself (17-byte `PONG` → no capability,
 no `0x64` on the wire; 19-byte `PONG` with bit 0 → the request goes out), so the manual run only
