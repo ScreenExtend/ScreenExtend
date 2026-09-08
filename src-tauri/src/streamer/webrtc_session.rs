@@ -395,7 +395,7 @@ pub async fn handle_whep_offer(
         control_enabled,
         control_rx,
     } = input;
-    let (input_tx, _input_join) = input::spawn(input_device);
+    let (input_tx, _input_join) = input::spawn(input_device, Arc::clone(&pipeline.telemetry));
     {
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
@@ -429,36 +429,45 @@ pub async fn handle_whep_offer(
                 }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
-                dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let tx = tx.clone();
-                    let dc_pong = dc_for_pong.clone();
-                    let telemetry = Arc::clone(&telemetry_for_stats);
-                    Box::pin(async move {
-                        let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
-                            return;
-                        };
-                        // Both of these are transport business and are answered before the
-                        // remote-control gate: a device with control disabled still needs its
-                        // clock synced and still reports what its own pipeline is doing.
-                        if let input::protocol::InputEvent::ClientStats(stats) = ev {
-                            telemetry.client.set(Some(*stats));
-                            return;
-                        }
-                        if let Some(dc_pong) = &dc_pong {
-                            if let input::protocol::InputEvent::Ping { t_ns } = ev {
-                                let pong = input::protocol::build_pong(
-                                    t_ns,
-                                    crate::streamer::audio::host_now_ns(),
-                                );
-                                let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
-                                return;
+                // The Pong reply used to be written from inside the receive handler, which
+                // head-of-line blocked every later message on this channel behind an SCTP send.
+                // It goes to a task that owns the channel instead, so the handler only ever
+                // parses and enqueues.
+                let pong_tx = dc_for_pong.map(|dc_pong| {
+                    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    tokio::spawn(async move {
+                        while let Some(t_ns) = pong_rx.recv().await {
+                            let pong = input::protocol::build_pong(
+                                t_ns,
+                                crate::streamer::audio::host_now_ns(),
+                            );
+                            if dc_pong.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
+                                break;
                             }
                         }
-                        if !control_enabled {
-                            return;
+                    });
+                    pong_tx
+                });
+                dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let Some(parsed) = input::protocol::parse(&msg.data) else {
+                        return Box::pin(async {});
+                    };
+                    // Both of these are transport business and are answered before the
+                    // remote-control gate: a device with control disabled still needs its
+                    // clock synced and still reports what its own pipeline is doing.
+                    match parsed.ev {
+                        input::protocol::InputEvent::ClientStats(stats) => {
+                            telemetry_for_stats.client.set(Some(*stats));
                         }
-                        tx.route(ev, hot);
-                    })
+                        input::protocol::InputEvent::Ping { t_ns } => {
+                            if let Some(pong_tx) = &pong_tx {
+                                let _ = pong_tx.send(t_ns);
+                            }
+                        }
+                        ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),
+                        _ => {}
+                    }
+                    Box::pin(async {})
                 }));
             })
         }));

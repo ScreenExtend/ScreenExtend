@@ -3,7 +3,6 @@ use super::protocol::InputEvent;
 pub const NAME: &str = "generic-noop";
 
 pub fn boost_thread() {}
-pub fn tune_process() {}
 
 pub struct Injector;
 

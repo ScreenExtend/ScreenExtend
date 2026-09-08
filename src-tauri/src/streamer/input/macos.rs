@@ -246,8 +246,6 @@ pub fn boost_thread() {
     crate::macos_utils::streamer::qos::pin_current_thread_user_interactive();
 }
 
-pub fn tune_process() {}
-
 pub struct Injector {
     source: CGEventSourceRef,
     device_name: Option<String>,
@@ -261,7 +259,6 @@ pub struct Injector {
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
-
     warned_drop: bool,
 }
 
@@ -363,7 +360,9 @@ impl Injector {
             } => self.pointer_batch(*source, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
-            InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
+            InputEvent::MouseDelta {
+                dx, dy, buttons, ..
+            } => self.mouse_delta(*dx, *dy, *buttons),
             InputEvent::Key {
                 down, code, key, ..
             } => self.key(*down, code, key),
@@ -832,6 +831,7 @@ fn set_pasteboard(mime: &str, data: &[u8]) -> bool {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

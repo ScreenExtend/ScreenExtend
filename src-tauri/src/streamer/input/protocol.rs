@@ -28,6 +28,9 @@ pub mod op {
     pub const MOUSE_DELTA: u8 = 0x54;
     pub const PING: u8 = 0x60;
     pub const PONG: u8 = 0x61;
+    /// Client -> host only. The host-to-client twin this opcode once had was never sent; the
+    /// injector's own counters go to `SessionTelemetry` instead, where `status --json` reads
+    /// them alongside every other counter. See `docs/INPUT-PROTOCOL.md`.
     pub const STATS: u8 = 0x62;
     pub const BYE: u8 = 0x63;
 }
@@ -63,11 +66,32 @@ pub mod btn {
     pub const ERASER: u16 = 1 << 5; // pen eraser
 }
 
-/// Bytes of optional tail a `POINTER_MOVE_BATCH` may carry past its samples: a `u64` client
-/// stamp, a flags byte, and how many trailing samples were predicted rather than measured.
-/// The tail is optional and the declared length is a floor; see `docs/INPUT-PROTOCOL.md`.
+/// Per-event flag bits carried by the v2 tail of `MOUSE_DELTA` and `POINTER_MOVE_BATCH`.
+pub mod evflag {
+    /// The client holds pointer lock with `unadjustedMovement: true`, so its deltas are raw
+    /// device counts with no OS pointer curve applied. Without it the client's own OS has
+    /// already curved them and the host must not curve them a second time.
+    pub const UNADJUSTED: u8 = 1 << 0;
+}
+
+/// v1 wire lengths, and the offset each optional v2 tail starts at.
+pub const POINTER_LEN: usize = 40;
+pub const WHEEL_LEN: usize = 15;
+pub const MOUSE_DELTA_LEN: usize = 8;
+/// Bytes of tail: a `u64` client stamp, and for a batch two more bytes of flags + predicted
+/// count. Both tails are optional; see `docs/INPUT-PROTOCOL.md`.
 pub const STAMP_LEN: usize = 8;
 pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
+
+/// Read the trailing client stamp a v2 frame may carry at `at`, or 0 when it carries none.
+///
+/// Every tail is appended past the v1 length, so a v1 client reads as 0 and a client newer
+/// than this build can append further fields without breaking the parse. The declared length
+/// is a floor, never an equality — the same rule the client stats frame already follows.
+#[inline]
+fn rd_stamp(b: &[u8], at: usize) -> u64 {
+    rd_u64(b, at).unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -163,6 +187,8 @@ pub enum InputEvent {
         dx: i16,
         dy: i16,
         buttons: u16,
+        /// The client had `unadjustedMovement` granted: raw device counts, no OS curve.
+        unadjusted: bool,
     },
     Key {
         down: bool,
@@ -258,8 +284,21 @@ fn rd_f32(b: &[u8], o: usize) -> Option<f32> {
     Some(f32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
 }
 
-pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
+/// One decoded frame, plus the two things the transport needs to know about it.
+#[derive(Debug)]
+pub struct Parsed {
+    pub ev: InputEvent,
+    /// Belongs on the lossy latency-critical queue rather than the reliable one.
+    pub fast: bool,
+    /// The client's own monotonic nanosecond stamp for this event, or 0 when the frame carries
+    /// none. It rides the same client timebase as the `PING` stamp, so the host can measure how
+    /// long the event spent in flight without the client having to report anything back.
+    pub client_ns: u64,
+}
+
+pub fn parse(b: &[u8]) -> Option<Parsed> {
     let opcode = *b.first()?;
+    let mut client_ns = 0u64;
     let ev = match opcode {
         op::POINTER_DOWN
         | op::POINTER_UP
@@ -268,12 +307,20 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
         | op::POINTER_ENTER
         | op::POINTER_LEAVE
         | op::POINTER_OVER
-        | op::POINTER_OUT => parse_pointer(b)?,
-        op::POINTER_MOVE_BATCH => parse_pointer_batch(b)?,
-        op::WHEEL => parse_wheel(b)?,
+        | op::POINTER_OUT => {
+            let ev = parse_pointer(b)?;
+            client_ns = rd_stamp(b, POINTER_LEN);
+            ev
+        }
+        op::POINTER_MOVE_BATCH => parse_pointer_batch(b, &mut client_ns)?,
+        op::WHEEL => {
+            let ev = parse_wheel(b)?;
+            client_ns = rd_stamp(b, WHEEL_LEN);
+            ev
+        }
         op::ZOOM => parse_zoom(b)?,
-        op::MOUSE_DELTA => parse_mouse_delta(b)?,
-        op::KEY => parse_key(b)?,
+        op::MOUSE_DELTA => parse_mouse_delta(b, &mut client_ns)?,
+        op::KEY => parse_key(b, &mut client_ns)?,
         op::TEXT_INPUT | op::COMPOSITION_UPDATE => parse_text(b, opcode)?,
         op::CLIPBOARD => parse_clipboard(b)?,
         op::DRAG => parse_drag(b)?,
@@ -291,11 +338,15 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
         op::STATS => parse_client_stats(b)?,
         _ => return None,
     };
-    Some((ev, is_fast(opcode)))
+    Some(Parsed {
+        ev,
+        fast: is_fast(opcode),
+        client_ns,
+    })
 }
 
 fn parse_pointer(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 40 {
+    if b.len() < POINTER_LEN {
         return None;
     }
     Some(InputEvent::Pointer {
@@ -316,7 +367,7 @@ fn parse_pointer(b: &[u8]) -> Option<InputEvent> {
 
 const BATCH_HEADER: usize = 10;
 const SAMPLE_SIZE: usize = 24;
-fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
+fn parse_pointer_batch(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     let source = *b.get(1)?;
     let id = rd_u32(b, 2)?;
     let buttons = rd_u16(b, 6)?;
@@ -339,6 +390,7 @@ fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
         o += SAMPLE_SIZE;
     }
     let predicted = if b.len() >= need + BATCH_TAIL_LEN {
+        *client_ns = rd_stamp(b, need);
         // A client that claims more predictions than it sent samples is malformed; clamping
         // rather than rejecting keeps the real samples, which are still good.
         b[need + STAMP_LEN + 1].min(count as u8)
@@ -361,7 +413,7 @@ fn parse_zoom(b: &[u8]) -> Option<InputEvent> {
 }
 
 fn parse_wheel(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 15 {
+    if b.len() < WHEEL_LEN {
         return None;
     }
     Some(InputEvent::Wheel {
@@ -373,18 +425,23 @@ fn parse_wheel(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
-fn parse_mouse_delta(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 8 {
+fn parse_mouse_delta(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
+    if b.len() < MOUSE_DELTA_LEN {
         return None;
     }
+    // Byte 8 was a zero pad every client already sent, which is why it can become the flags
+    // byte without a version bump: an old client reads as "no flags set".
+    let flags = b.get(MOUSE_DELTA_LEN).copied().unwrap_or(0);
+    *client_ns = rd_stamp(b, MOUSE_DELTA_LEN + 1);
     Some(InputEvent::MouseDelta {
         dx: rd_i16(b, 2)?,
         dy: rd_i16(b, 4)?,
         buttons: rd_u16(b, 6)?,
+        unadjusted: flags & evflag::UNADJUSTED != 0,
     })
 }
 
-fn parse_key(b: &[u8]) -> Option<InputEvent> {
+fn parse_key(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     let flags = *b.get(1)?;
     let mods = rd_u16(b, 2)?;
     let code_len = *b.get(4)? as usize;
@@ -395,6 +452,7 @@ fn parse_key(b: &[u8]) -> Option<InputEvent> {
     let key_start = code_end + 1;
     let key_end = key_start + key_len;
     let key = std::str::from_utf8(b.get(key_start..key_end)?).ok()?;
+    *client_ns = rd_stamp(b, key_end);
     Some(InputEvent::Key {
         down: flags & 0b01 != 0,
         repeat: flags & 0b10 != 0,
@@ -438,10 +496,21 @@ fn parse_drag(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
+/// Smallest a `DropItem` can be on the wire: two length prefixes, a size and a data length.
+const DROP_ITEM_MIN: usize = 2 + 4 + 8 + 8;
+/// No real drag-and-drop carries more than this, and the count sizes a heap allocation.
+const MAX_DROP_ITEMS: usize = 256;
+
 fn parse_drop(b: &[u8]) -> Option<InputEvent> {
     let x = rd_f32(b, 2)?;
     let y = rd_f32(b, 6)?;
     let count = rd_u16(b, 10)? as usize;
+    // The count sizes a `Vec<DropItem>` (~72 B each), so it has to be bounded by what the
+    // message could actually contain before it is believed: a bare 12-byte header claiming
+    // 65535 items would otherwise allocate ~4.7 MB and then fail on the first read.
+    if count > MAX_DROP_ITEMS || b.len() < 12usize.checked_add(count.checked_mul(DROP_ITEM_MIN)?)? {
+        return None;
+    }
     let mut items = Vec::with_capacity(count);
     let mut pos = 12usize;
     for _ in 0..count {
@@ -544,16 +613,6 @@ pub fn build_bye(reason: u8) -> [u8; 2] {
     [op::BYE, reason]
 }
 
-pub fn build_stats(received: u64, dropped: u64, contacts: u32, queue_depth: u32) -> [u8; 25] {
-    let mut out = [0u8; 25];
-    out[0] = op::STATS;
-    out[1..9].copy_from_slice(&received.to_le_bytes());
-    out[9..17].copy_from_slice(&dropped.to_le_bytes());
-    out[17..21].copy_from_slice(&contacts.to_le_bytes());
-    out[21..25].copy_from_slice(&queue_depth.to_le_bytes());
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,9 +627,9 @@ mod tests {
         b[10..14].copy_from_slice(&0.25f32.to_le_bytes());
         b[14..18].copy_from_slice(&0.8f32.to_le_bytes());
         b[38..40].copy_from_slice(&btn::PRIMARY.to_le_bytes());
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(p.fast);
+        match p.ev {
             InputEvent::Pointer {
                 source,
                 id,
@@ -607,9 +666,10 @@ mod tests {
             b.extend_from_slice(&0f32.to_le_bytes());
             b.extend_from_slice(&0f32.to_le_bytes());
         }
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(p.fast);
+        assert_eq!(p.client_ns, 0, "a v1 batch carries no stamp");
+        match p.ev {
             InputEvent::PointerBatch {
                 source,
                 id,
@@ -633,7 +693,7 @@ mod tests {
     fn zoom_frame() {
         let mut b = vec![op::ZOOM];
         b.extend_from_slice(&0.15f32.to_le_bytes());
-        match parse(&b).unwrap().0 {
+        match parse(&b).unwrap().ev {
             InputEvent::Zoom { delta } => assert!((delta - 0.15).abs() < 1e-6),
             _ => panic!("wrong variant"),
         }
@@ -645,9 +705,9 @@ mod tests {
         b.extend_from_slice(b"KeyA");
         b.push(1);
         b.extend_from_slice(b"a");
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(!hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(!p.fast);
+        match p.ev {
             InputEvent::Key {
                 down, code, key, ..
             } => {
@@ -665,8 +725,8 @@ mod tests {
         let mut b = vec![op::TEXT_INPUT];
         b.extend_from_slice(&(s.len() as u32).to_le_bytes());
         b.extend_from_slice(s.as_bytes());
-        let (ev, _) = parse(&b).unwrap();
-        match ev {
+        let p = parse(&b).unwrap();
+        match p.ev {
             InputEvent::Text { composing, s: got } => {
                 assert!(!composing);
                 assert_eq!(got, "好");
@@ -685,8 +745,8 @@ mod tests {
     fn ping_pong() {
         let mut b = vec![op::PING];
         b.extend_from_slice(&123456789u64.to_le_bytes());
-        let (ev, _) = parse(&b).unwrap();
-        match ev {
+        let p = parse(&b).unwrap();
+        match p.ev {
             InputEvent::Ping { t_ns } => assert_eq!(t_ns, 123456789),
             _ => panic!(),
         }
@@ -718,9 +778,9 @@ mod tests {
         b[44..48].copy_from_slice(&1799u32.to_le_bytes());
         b[68..72].copy_from_slice(&4_100u32.to_le_bytes());
 
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(!hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(!p.fast);
+        match p.ev {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.version, CLIENT_STATS_VERSION);
                 assert_eq!(c.video_path, 1);
@@ -754,32 +814,12 @@ mod tests {
         b[0] = op::STATS;
         b[1] = 2;
         b[2] = 3;
-        match parse(&b).unwrap().0 {
+        match parse(&b).unwrap().ev {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.version, 2);
                 assert_eq!(c.video_path, 3);
             }
             _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn down_and_up_position_the_cursor_unless_the_pointer_is_locked() {
-        for phase in [
-            Phase::Down,
-            Phase::Up,
-            Phase::Move,
-            Phase::Enter,
-            Phase::Over,
-        ] {
-            assert!(positions_cursor(false, phase), "{phase:?} unlocked");
-            assert!(!positions_cursor(true, phase), "{phase:?} locked");
-        }
-        for phase in [Phase::Leave, Phase::Out, Phase::Cancel] {
-            assert!(
-                !positions_cursor(false, phase),
-                "{phase:?} carries no position"
-            );
         }
     }
 
@@ -803,8 +843,22 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_tail_carries_the_predicted_count() {
-        match parse(&batch_frame(4, Some((42, 0, 2)))).unwrap().0 {
+    fn a_v2_pointer_frame_carries_a_client_stamp_and_a_v1_one_does_not() {
+        let mut v1 = [0u8; POINTER_LEN];
+        v1[0] = op::POINTER_DOWN;
+        assert_eq!(parse(&v1).unwrap().client_ns, 0);
+
+        let mut v2 = [0u8; POINTER_LEN + STAMP_LEN];
+        v2[0] = op::POINTER_DOWN;
+        v2[POINTER_LEN..].copy_from_slice(&987_654_321u64.to_le_bytes());
+        assert_eq!(parse(&v2).unwrap().client_ns, 987_654_321);
+    }
+
+    #[test]
+    fn a_v2_batch_tail_carries_the_stamp_and_the_predicted_count() {
+        let p = parse(&batch_frame(4, Some((42, 0, 2)))).unwrap();
+        assert_eq!(p.client_ns, 42);
+        match p.ev {
             InputEvent::PointerBatch {
                 samples, predicted, ..
             } => {
@@ -817,7 +871,7 @@ mod tests {
 
     #[test]
     fn a_predicted_count_larger_than_the_batch_is_clamped_not_trusted() {
-        match parse(&batch_frame(2, Some((0, 0, 200)))).unwrap().0 {
+        match parse(&batch_frame(2, Some((0, 0, 200)))).unwrap().ev {
             InputEvent::PointerBatch {
                 samples, predicted, ..
             } => {
@@ -826,6 +880,78 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn mouse_delta_reads_the_unadjusted_flag_out_of_the_old_pad_byte() {
+        let mut v1 = vec![op::MOUSE_DELTA, 0];
+        v1.extend_from_slice(&3i16.to_le_bytes());
+        v1.extend_from_slice(&(-4i16).to_le_bytes());
+        v1.extend_from_slice(&0u16.to_le_bytes());
+        v1.push(0); // the pad byte every shipped client already sends
+        let p = parse(&v1).unwrap();
+        assert_eq!(p.client_ns, 0);
+        match p.ev {
+            InputEvent::MouseDelta {
+                dx, dy, unadjusted, ..
+            } => {
+                assert_eq!((dx, dy), (3, -4));
+                assert!(!unadjusted);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let mut v2 = v1[..MOUSE_DELTA_LEN].to_vec();
+        v2.push(evflag::UNADJUSTED);
+        v2.extend_from_slice(&7u64.to_le_bytes());
+        let p = parse(&v2).unwrap();
+        assert_eq!(p.client_ns, 7);
+        match p.ev {
+            InputEvent::MouseDelta { unadjusted, .. } => assert!(unadjusted),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_key_frame_stamp_sits_past_its_variable_tail() {
+        let mut b = vec![op::KEY, 0b01, 0, 0, 4];
+        b.extend_from_slice(b"KeyA");
+        b.push(1);
+        b.extend_from_slice(b"a");
+        assert_eq!(parse(&b).unwrap().client_ns, 0);
+        b.extend_from_slice(&555u64.to_le_bytes());
+        assert_eq!(parse(&b).unwrap().client_ns, 555);
+    }
+
+    #[test]
+    fn down_and_up_position_the_cursor_unless_the_pointer_is_locked() {
+        for phase in [
+            Phase::Down,
+            Phase::Up,
+            Phase::Move,
+            Phase::Enter,
+            Phase::Over,
+        ] {
+            assert!(positions_cursor(false, phase), "{phase:?} unlocked");
+            assert!(!positions_cursor(true, phase), "{phase:?} locked");
+        }
+        for phase in [Phase::Leave, Phase::Out, Phase::Cancel] {
+            assert!(
+                !positions_cursor(false, phase),
+                "{phase:?} carries no position"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_count_the_message_cannot_hold_is_rejected_before_it_allocates() {
+        let mut b = vec![0u8; 12];
+        b[0] = op::DROP;
+        b[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse(&b).is_none());
+
+        b[10..12].copy_from_slice(&((MAX_DROP_ITEMS + 1) as u16).to_le_bytes());
+        assert!(parse(&b).is_none());
     }
 
     #[test]

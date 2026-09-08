@@ -268,6 +268,11 @@ stages! {
     socket_write => "socket_write",
     capture_to_encode_done => "capture_to_encode",
     capture_to_socket => "capture_to_socket",
+    // Input. Recorded per event by `streamer::input`, not per frame, so these three are the
+    // only stages `record_frame` does not feed. See `docs/INPUT-PROTOCOL.md`.
+    input_recv => "input_recv",
+    input_queue => "input_queue",
+    input_inject => "input_inject",
 }
 
 macro_rules! counters {
@@ -300,6 +305,8 @@ counters! {
     audio_broadcast_lag_drops => "audio_broadcast_lag_drops",
     client_jitter_underruns => "client_jitter_underruns",
     client_jitter_overruns => "client_jitter_overruns",
+    input_queue_drops => "input_queue_drops",
+    input_stale_drops => "input_stale_drops",
 }
 
 /// What a client last told us about its own half of the path. Written by the `OP::STATS` parser,

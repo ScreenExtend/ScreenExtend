@@ -8,14 +8,12 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, HIGH_PRIORITY_CLASS,
-    THREAD_PRIORITY_TIME_CRITICAL,
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
@@ -70,13 +68,6 @@ const TOUCH_MASK_PRESSURE: u32 = 0x0000_0004;
 pub fn boost_thread() {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    }
-}
-
-pub fn tune_process() {
-    unsafe {
-        timeBeginPeriod(1);
-        let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     }
 }
 
@@ -237,7 +228,9 @@ impl Injector {
             } => self.pointer_batch(*source, *id, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
-            InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
+            InputEvent::MouseDelta {
+                dx, dy, buttons, ..
+            } => self.mouse_delta(*dx, *dy, *buttons),
             InputEvent::Key {
                 down, code, key, ..
             } => self.key(*down, code, key),
@@ -1044,7 +1037,6 @@ unsafe fn put_clipboard(format: u32, bytes: &[u8]) -> bool {
 fn bytemuck_u16(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
