@@ -196,6 +196,61 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
     }
 }
 
+/// IPv4 addresses currently held by the virtual adapter Windows creates for a hosted network
+/// (both the Wi-Fi Direct legacy AP and the Mobile Hotspot ride "Microsoft Wi-Fi Direct Virtual
+/// Adapter"). An AP that came up but is not serving DHCP has none, which is how "we asked for a
+/// hotspot" is told apart from "a client can actually get an address".
+pub fn hosted_network_ipv4() -> Vec<String> {
+    const ANY_ADAPTER: &str = "SELECT InterfaceIndex, Name, DriverDescription FROM MSFT_NetAdapter";
+
+    let com_con = com_for_this_thread();
+    let wmi_con = match WMIConnection::with_namespace_path("root\\StandardCimv2", com_con) {
+        Ok(connection) => connection,
+        Err(e) => {
+            teprintln!("[hosted-network] WMI connect failed while checking the AP address: {e}");
+            return Vec::new();
+        }
+    };
+
+    let adapters: Vec<NetAdapter> = match wmi_con.raw_query(ANY_ADAPTER) {
+        Ok(rows) => rows,
+        Err(e) => {
+            teprintln!("[hosted-network] MSFT_NetAdapter query failed: {e}");
+            return Vec::new();
+        }
+    };
+    let indices: Vec<u32> = adapters
+        .iter()
+        .filter(|adapter| {
+            adapter
+                .driver_description
+                .as_deref()
+                .is_some_and(|d| d.contains("Wi-Fi Direct Virtual Adapter"))
+        })
+        .filter_map(|adapter| adapter.interface_index)
+        .collect();
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let ips: Vec<NetIPAddress> = match wmi_con
+        .raw_query("SELECT InterfaceIndex, IPAddress, AddressFamily FROM MSFT_NetIPAddress WHERE AddressFamily = 2")
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            teprintln!("[hosted-network] MSFT_NetIPAddress query failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    ips.iter()
+        .filter(|ip| ip.interface_index.is_some_and(|i| indices.contains(&i)))
+        .filter_map(|ip| ip.ip_address.clone())
+        // 169.254/16 is what Windows assigns when the AP came up but DHCP did not.
+        .filter(|ip| !ip.starts_with("169.254."))
+        .collect()
+}
+
 static WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 static WAKE: OnceLock<crossbeam_channel::Sender<()>> = OnceLock::new();
 
