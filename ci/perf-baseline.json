@@ -1,0 +1,35 @@
+{
+  "readme": [
+    "Timing baselines for scripts/perf-gate.mjs. A key is one machine class, because a",
+    "number from a laptop with an RTX 3080 Ti means nothing on a shared GitHub runner.",
+    "The metric names and the regexes that produce them live in scripts/perf-gate.mjs.",
+    "",
+    "To seed or re-seed a key: run the measurement command on that machine and pipe it",
+    "through `node scripts/perf-gate.mjs --key <key> --seed`, then commit the diff with",
+    "the machine described in `machine` and a `source` saying what produced it. A key",
+    "that is absent is not a failure - the gate reports it, writes the observed numbers",
+    "as an artifact and passes, so the first CI run on a new runner tells you what to",
+    "paste back here.",
+    "",
+    "Tolerance is deliberately loose for hosted runners: they are shared VMs and the",
+    "encode numbers move several percent run to run. Tighten it once a key has a few",
+    "runs of history."
+  ],
+  "tolerance": 0.05,
+  "baselines": {
+    "dev-windows-rtx3080ti": {
+      "machine": "Windows 11 build 26200 (25H2), RTX 3080 Ti Laptop + Intel UHD, primary 1920x1080@360",
+      "source": "docs/BASELINE.md, release build at ddf9d76, `cargo test --release --lib x264_encoder -- --nocapture`",
+      "seeded": "2026-09-08",
+      "note": [
+        "This box, not a runner. Kept so a local run has something to compare against.",
+        "Four re-runs at 95dc755 with eleven other rustc/cargo processes on the box gave",
+        "p95_encode 4405 / 4883 / 5316 / 5787 us, so treat anything inside ~+/-15% of the",
+        "4537 us here as noise on a loaded machine and only trust the gate on an idle one.",
+        "x264_wall_ms is deliberately not baselined: it measures machine load rather than",
+        "the encoder (805 ms here against the 3334 ms in docs/BASELINE.md, same binary)."
+      ],
+      "x264_p95_encode_us": 4537
+    }
+  }
+}
