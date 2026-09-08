@@ -1633,6 +1633,7 @@
             // refinement only updates joinData, so the next reconfigure that happens for
             // some other reason (an orientation change, a host setting) carries it.
             const REFRESH_DEADLINE_MS = 400;
+            const AUDIO_PREPARE_DEADLINE_MS = 2000;
             async function resolveRefreshRate() {
                 const reported = screenRefreshRate();
                 if (reported) return reported;
@@ -1946,20 +1947,28 @@
                 // in the answer at all. A prepare() that fails after that point is total
                 // silence with no way back. Safari 26 and Firefox 130 both newly pass the
                 // old constructor sniff, which is what made this urgent.
-                if (window.SEAudio) {
-                    try {
-                        audioCaps = await SEAudio.verifyCapabilities();
-                    } catch (_) { noteSuppressed(); audioCaps = { webcodecsOpus: false, worklet: false }; }
-                    if (audioReady) {
-                        let ok = false;
-                        try { ok = await audioReady; } catch (_) { noteSuppressed(); }
-                        if (!ok) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
-                    }
+                // All three overlap: the worklet module is a fetch, the decoder probe is
+                // async on some engines, and the refresh-rate measurement has its own
+                // deadline. Serialising them would put the sum in front of the picture.
+                const capsPromise = (window.SEAudio ? SEAudio.verifyCapabilities() : Promise.resolve(null))
+                    .catch(() => { noteSuppressed(); return { webcodecsOpus: false, worklet: false }; });
+                // A worklet module that never loads must not hold the join open: past the
+                // deadline the client simply does not claim the fast path.
+                const readyPromise = audioReady
+                    ? Promise.race([
+                        Promise.resolve(audioReady).catch(() => { noteSuppressed(); return false; }),
+                        new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
+                    ])
+                    : Promise.resolve(true);
+                const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
+
+                if (results[0]) {
+                    audioCaps = results[0];
+                    if (!results[1]) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
                     audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
                     if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
                 }
-
-                joinData.refreshRate = await resolveRefreshRate();
+                joinData.refreshRate = results[2];
 
                 // Audio-output enumeration is for the host's device panel, not for playback:
                 // it must never stand between the user and the picture. It runs after the
