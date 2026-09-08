@@ -111,10 +111,14 @@ export function HighlightProxy() {
 
     const MARGIN = 3;
     let raf = 0;
+    let idle = 0;
+    let burstUntil = 0;
     let last = "";
+    let cached: Element | null = null;
 
-    const tick = () => {
-      const target = document.querySelector(cfg.target);
+    const measure = () => {
+      if (!cached || !cached.isConnected) cached = document.querySelector(cfg.target);
+      const target = cached;
       if (target) {
         const r = target.getBoundingClientRect();
         const { top, right, bottom, left } = cfg.padding;
@@ -137,10 +141,46 @@ export function HighlightProxy() {
         last = "hidden";
         proxy.style.display = "none";
       }
-      raf = requestAnimationFrame(tick);
     };
-    tick();
-    return () => cancelAnimationFrame(raf);
+
+    // This used to be an unconditional `requestAnimationFrame` loop: a `querySelector`
+    // plus a `getBoundingClientRect` -- a synchronous layout flush -- at the display's
+    // refresh rate for as long as a step was on screen, on a host that is simultaneously
+    // capturing, encoding and streaming a display. It runs at full rate only while
+    // something is actually moving the target: a scroll, a window resize, or a CSS
+    // transition anywhere in the document (which is what the 300 ms sidebar collapse is).
+    // `IDLE_MS` is the safety net for a move nothing announced.
+    const BURST_MS = 700;
+    const IDLE_MS = 250;
+
+    const tick = () => {
+      measure();
+      if (performance.now() < burstUntil) {
+        raf = requestAnimationFrame(tick);
+      } else {
+        raf = 0;
+      }
+    };
+    const burst = () => {
+      burstUntil = performance.now() + BURST_MS;
+      if (!raf) raf = requestAnimationFrame(tick);
+    };
+
+    measure();
+    burst();
+    idle = window.setInterval(measure, IDLE_MS);
+
+    const events = ["scroll", "resize", "transitionrun", "transitionend", "animationstart"];
+    for (const name of events) window.addEventListener(name, burst, true);
+    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(burst) : null;
+    observer?.observe(document.documentElement);
+
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      window.clearInterval(idle);
+      for (const name of events) window.removeEventListener(name, burst, true);
+      observer?.disconnect();
+    };
   }, [currentStep, currentTour, isNextStepVisible]);
 
   const stateRef = useRef({ currentStep, currentTour, isNextStepVisible });

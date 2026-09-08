@@ -87,6 +87,11 @@ const JS_CHECKS = [
   { label: "Promise.withResolvers", re: /\bwithResolvers\s*\(/g, since: "17.4" },
   { label: "URL.canParse", re: /\bURL\s*\.\s*canParse\b/g, since: "17" },
   { label: "checkVisibility", re: /\.checkVisibility\s*\(/g, since: "17.4" },
+  // Anchored on the write, not on the identifier: `inert` is also a React prop name that
+  // react-remove-scroll passes around, and that is not the DOM attribute. This is the one
+  // Base UI reaches for in every focus-managing component (`floating-ui-react/utils/
+  // markOthers`), and it degrades silently -- focus simply is not trapped, no error.
+  { label: "inert attribute", re: /(?:set|toggle|remove)Attribute\s*\(\s*["']inert["']|\.inert\s*=[^=]/g, since: "15.5" },
   { label: "scrollend", re: /["']scrollend["']/g, since: "18" },
   {
     label: "RegExp d/v flag",
