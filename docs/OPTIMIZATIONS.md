@@ -209,6 +209,15 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
+### What the core close-out could not verify here
+
+Seven of the rows above are COMPILE-CHECKED or unit-tested only, each because the acceptance test
+needs hardware, an OS locale or a link neither dev box has: two simultaneous pen clients, a Mac
+with Accessibility revoked, a localized Windows with a hosted-network-capable driver, a relayed
+audio session, a 30 s animated-screen run on the 10.15.8 box, a deliberately wedged display
+driver, and an induced-reorder link. Each is written up with its exact command and expected
+reading in `docs/manual-tests/core-closeout.md` rather than left to be re-derived.
+
 ### Needs a driver rebuild, and what it is worth (core close-out)
 
 The bundled indirect display driver is a locally built fork of MolotovCherry/virtual-display-rs
@@ -298,6 +307,35 @@ as the two items above, together with two more worth evaluating there:
 `IDDCX_ADAPTER_FLAGS_PREFER_PRECISE_PRESENT_REGIONS` (IddCx 1.8 — more accurate dirty-region
 tracking at "a small CPU usage overhead", a direct win for dirty-rect-aware capture) and
 `IddCxSetRealtimeGPUPriority` (IddCx 1.9).
+
+### One injector per session, and why it stays that way (core close-out)
+
+`speculative-input-per-session-injector-thread-and-devices.md` proposed hoisting the injector to
+one process-wide thread. The concrete defects it named are all fixed and elsewhere: the discarded
+`JoinHandle` (W1 close-out — `SessionHandle::close` now joins the thread), the synthetic-device
+leak (`Drop for Injector`, row 47), and the hardcoded pen id (row 191). What is left is the hoist
+itself, and it is **not** taken, for two reasons worth writing down rather than rediscovering.
+
+*The measurement it needs cannot be taken here.* Its own acceptance test is four simultaneous
+clients with remote control enabled, all dragging at once, compared against a single-client
+baseline on host CPU, glass-to-glass latency and handle count. No machine on this project can
+produce four real clients. The steady-state cost is meanwhile argued rather than measured, and
+the argument holds: every injector thread sits blocked in `crossbeam::select!` whenever its client
+is idle, so N idle sessions cost N blocked threads and nothing else. The case the finding actually
+worries about — N priority-15 threads each making a syscall per pointer sample, competing with the
+capture and encode threads that decide glass-to-glass — is also smaller than when it was written,
+because a `POINTER_MOVE_BATCH` is now one `SendInput` array call rather than one per sample
+(row 45).
+
+*The hoist does not fix the thing that makes it attractive.* There is one physical cursor and one
+keyboard focus, so two clients dragging at once already fight, today, silently. A process-wide
+injector gives that conflict somewhere to live but still needs an arbitration policy — last writer
+wins, first grabber holds, partition by display — and picking one is a product decision with a UI
+consequence, not a latency change. Deciding it while the UI is frozen would be deciding it badly.
+
+*What would change the answer:* a measurement showing those threads actually displacing the encode
+thread. The four-client procedure is in `docs/manual-tests/core-closeout.md`; run it before
+building anything.
 
 ### UI-visible recommendations (core close-out)
 
