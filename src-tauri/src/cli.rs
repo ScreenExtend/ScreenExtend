@@ -1405,23 +1405,87 @@ mod desktop {
 
     // doctor
 
+    /// `doctor` exits 1 for an unsupported OS and 3 when the OS is fine but a
+    /// required permission is denied, so a support script can tell the two apart.
+    const DOCTOR_EXIT_PERMISSION: i32 = 3;
+
+    fn tri_state_label(state: &str) -> &'static str {
+        match state {
+            "granted" => "granted",
+            "denied" => "MISSING",
+            _ => "unknown",
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tribool(v: Option<bool>) -> &'static str {
+        match v {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+    }
+
     fn run_doctor(app: &tauri::AppHandle, m: &Matches) -> ! {
+        let _ = app;
         let report = platform::compatibility::check_system_requirements();
         let permissions = platform::permissions::check_permissions();
+        let permission_missing = permissions
+            .iter()
+            .any(|p| p.required && p.state == "denied");
+
+        #[cfg(target_os = "macos")]
+        let probes = platform::permissions::raw_probes();
+        #[cfg(target_os = "macos")]
+        let identity = platform::permissions::identity_report();
 
         if wants_json(m) {
-            let out = serde_json::json!({
+            #[allow(unused_mut)]
+            let mut out = serde_json::json!({
                 "os": { "name": report.os_name, "version": report.os_version, "supported": report.os_supported, "minimum": report.min_os_version },
+                "audioBackend": report.audio_backend,
+                "displayBackend": report.display_backend,
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
                     "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
                 })).collect::<Vec<_>>(),
                 "permissions": permissions.iter().map(|p| serde_json::json!({
-                    "key": p.key, "name": p.name, "granted": p.granted, "required": p.required,
+                    "key": p.key, "name": p.name, "state": p.state, "required": p.required,
+                    "relaunchRequired": p.relaunch_required, "description": p.description, "detail": p.detail,
                 })).collect::<Vec<_>>(),
             });
+            #[cfg(target_os = "macos")]
+            {
+                out["macos"] = serde_json::json!({
+                    "executable": identity.exe_path,
+                    "bundle": identity.bundle_path,
+                    "translocated": identity.translocated,
+                    "designatedRequirement": identity.designated_requirement,
+                    "quarantine": identity.quarantine,
+                    "sip": identity.sip,
+                    "osBuild": identity.os_version,
+                    "pid": identity.pid,
+                    "parentPid": identity.parent_pid,
+                    "parentCommand": identity.parent_command,
+                    "probes": {
+                        "cgPreflightScreenCaptureAccess": probes.preflight,
+                        "cgPreflightScreenCaptureAccessUs": probes.preflight_us,
+                        "windowListNameProbe": probes.window_name,
+                        "windowListNameProbeUs": probes.window_name_us,
+                        "axIsProcessTrusted": probes.ax_trusted,
+                        "axSystemWideElement": probes.ax_secondary,
+                        "axSystemWideElementUs": probes.ax_secondary_us,
+                        "screenCaptureKitAvailable": probes.sck_available,
+                        "scShareableContent": probes.sck,
+                        "scShareableContentUs": probes.sck_us,
+                    },
+                    "resetCommands": [
+                        "tccutil reset ScreenCapture app.screenextend.desktop",
+                        "tccutil reset Accessibility app.screenextend.desktop",
+                    ],
+                });
+            }
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
-            let _ = app;
-            exit(0);
+            exit(doctor_code(report.os_supported, permission_missing));
         }
 
         println!(
@@ -1433,6 +1497,9 @@ mod desktop {
             "Supported:        {}",
             if report.os_supported { "yes" } else { "NO" }
         );
+        println!("\nBackends:");
+        println!("  Audio:   {}", report.audio_backend);
+        println!("  Display: {}", report.display_backend);
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {
@@ -1441,18 +1508,95 @@ mod desktop {
                 println!("  [{}] {} — {}", api.severity, api.name, api.description);
             }
         }
-        if !permissions.is_empty() {
+        if permissions.is_empty() {
+            println!("\nPermissions: none are required on this platform.");
+        } else {
             println!("\nPermissions:");
             for p in &permissions {
                 println!(
                     "  [{}] {} ({})",
-                    if p.granted { "granted" } else { "MISSING" },
+                    tri_state_label(&p.state),
                     p.name,
                     if p.required { "required" } else { "optional" }
                 );
+                println!("      {}", p.description);
+                if !p.detail.is_empty() && p.detail != p.description {
+                    println!("      {}", p.detail);
+                }
+                if p.relaunch_required {
+                    println!("      Quit and reopen ScreenExtend for this to take effect.");
+                }
             }
         }
-        exit(if report.os_supported { 0 } else { 1 });
+
+        #[cfg(target_os = "macos")]
+        {
+            println!("\nmacOS TCC identity:");
+            println!("  Executable:   {}", identity.exe_path);
+            println!(
+                "  Bundle:       {}",
+                identity.bundle_path.as_deref().unwrap_or("(not a bundle)")
+            );
+            println!(
+                "  Translocated: {}",
+                if identity.translocated {
+                    "YES — Gatekeeper is running a read-only copy; move the app to /Applications"
+                } else {
+                    "no"
+                }
+            );
+            println!("  Quarantine:   {}", identity.quarantine);
+            println!("  SIP:          {}", identity.sip);
+            println!("  OS build:     {}", identity.os_version);
+            println!(
+                "  Process:      pid {}, parent {} ({})",
+                identity.pid, identity.parent_pid, identity.parent_command
+            );
+            println!("  Designated requirement (this is what TCC matches against):");
+            for line in identity.designated_requirement.lines() {
+                println!("    {line}");
+            }
+            println!("\nmacOS raw probes (read them against each other, not on their own):");
+            println!(
+                "  CGPreflightScreenCaptureAccess: {:<8} ({} us) — cached per process; a false here means nothing on its own",
+                tribool(probes.preflight),
+                probes.preflight_us
+            );
+            println!(
+                "  window-list name probe:         {:<8} ({} us) — the live read; unknown means no other window was on screen",
+                tribool(probes.window_name),
+                probes.window_name_us
+            );
+            println!("  AXIsProcessTrusted:             {}", probes.ax_trusted);
+            println!(
+                "  AX system-wide element:         {:<8} ({} us)",
+                probes.ax_secondary, probes.ax_secondary_us
+            );
+            println!("  ScreenCaptureKit available:     {}", probes.sck_available);
+            println!(
+                "  SCShareableContent:             {:<8} ({} us)",
+                tribool(probes.sck),
+                probes.sck_us
+            );
+            println!(
+                "\nIf System Settings shows the toggle on but a probe above says denied, the grant \
+                 is bound to\na different code identity. Reset it and grant again:\n  \
+                 tccutil reset ScreenCapture app.screenextend.desktop\n  \
+                 tccutil reset Accessibility app.screenextend.desktop"
+            );
+        }
+
+        exit(doctor_code(report.os_supported, permission_missing));
+    }
+
+    fn doctor_code(os_supported: bool, permission_missing: bool) -> i32 {
+        if !os_supported {
+            1
+        } else if permission_missing {
+            DOCTOR_EXIT_PERMISSION
+        } else {
+            0
+        }
     }
 
     // logs
