@@ -826,13 +826,18 @@ pub mod hostcap {
     pub const INPUT_TIMESTAMP: u16 = 1 << 3;
     /// Reads the `MOUSE_DELTA` flags byte, so reporting `unadjustedMovement` is worth doing.
     pub const INPUT_EVENT_FLAGS: u16 = 1 << 4;
+    /// Reads the optional fast-channel `u16` sequence and rejects a positional event whose
+    /// sequence is behind one already injected. A client that does not see this bit can skip
+    /// the two bytes; sending them to a host that ignores them costs nothing either way.
+    pub const INPUT_SEQUENCE: u16 = 1 << 5;
 }
 
 /// The bits this build sets. See `docs/INPUT-PROTOCOL.md`, "Host capabilities".
 pub const HOST_CAPABILITIES: u16 = hostcap::KEYFRAME_REQUEST
     | hostcap::STATS_V2
     | hostcap::INPUT_TIMESTAMP
-    | hostcap::INPUT_EVENT_FLAGS;
+    | hostcap::INPUT_EVENT_FLAGS
+    | hostcap::INPUT_SEQUENCE;
 
 /// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16]`.
 ///
@@ -1095,6 +1100,10 @@ mod tests {
         assert!(
             caps & hostcap::INPUT_EVENT_FLAGS != 0,
             "the MOUSE_DELTA flags byte is read"
+        );
+        assert!(
+            caps & hostcap::INPUT_SEQUENCE != 0,
+            "the fast-channel sequence is read and reorder-gated"
         );
         assert!(
             caps & hostcap::UNRELIABLE_MOVE_CHANNEL == 0,
