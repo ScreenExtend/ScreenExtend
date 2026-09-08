@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Route,
   RouterProvider,
@@ -7,10 +7,16 @@ import {
 } from "react-router-dom";
 
 import Bootstrap from "@/pages/bootstrap";
-import Dashboard from "@/pages/dashboard";
-import Settings from "@/pages/settings";
-import Devices from "@/pages/devices";
+import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { Loader2 } from "lucide-react";
+
+// React Router 7 wraps navigations in `startTransition`, so a route that has not finished
+// loading holds the current screen rather than flashing the fallback. Bootstrap warms the
+// dashboard chunk while the Rust `setup()` runs and the other two once it has painted, so
+// in practice these are resolved before anything navigates to them.
+const Dashboard = lazy(loadDashboard);
+const Devices = lazy(loadDevices);
+const Settings = lazy(loadSettings);
 
 import { NextStepProvider, NextStepReact } from "nextstepjs";
 import { HighlightProxy, WalkthroughArrow, WalkthroughCard, walkthroughSteps } from "@/components/walkthrough";
@@ -64,9 +70,9 @@ const router = createMemoryRouter(
   createRoutesFromElements(
     <>
       <Route path="/" element={<Bootstrap />} />
-      <Route path="/dashboard" element={<Dashboard />} />
-      <Route path="/devices" element={<Devices />} />
-      <Route path="/settings" element={<Settings />} />
+      <Route path="/dashboard" element={<Suspense fallback={null}><Dashboard /></Suspense>} />
+      <Route path="/devices" element={<Suspense fallback={null}><Devices /></Suspense>} />
+      <Route path="/settings" element={<Suspense fallback={null}><Settings /></Suspense>} />
     </>
   )
 );
