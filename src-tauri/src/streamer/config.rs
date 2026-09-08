@@ -427,12 +427,13 @@ impl Config {
                     c.counter = true;
                     i += 1;
                 }
-                "--capture" => {
+                "--capture-backend" => {
                     match val(&args, i).as_deref() {
                         Some("dxgi") => c.force_dxgi = true,
                         Some("wgc") | Some("auto") => c.force_dxgi = false,
                         other => teprintln!(
-                            "--capture takes wgc | dxgi | auto (got {other:?}); leaving it auto"
+                            "--capture-backend takes wgc | dxgi | auto (got {other:?}); \
+                             leaving it auto"
                         ),
                     }
                     i += 2;
@@ -480,7 +481,7 @@ CAPTURE / ENCODE\n\
                           software = CPU-only libx264 fallback, needs libx264.dll)\n\
   --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
                           paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
-  --capture <c>           capture backend: wgc (default) | dxgi | auto. Windows only;\n\
+  --capture-backend <c>   capture backend: wgc (default) | dxgi | auto. Windows only;\n\
                           dxgi is otherwise only reached by WGC failing first\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
   --workload <w>          scripted synthetic workload, implies --synthetic-pattern:\n\
