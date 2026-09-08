@@ -97,14 +97,394 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 73 | audio (all) | Opus `OPUS_SET_VBR_CONSTRAINT` 0 -> 1; `OPUS_SET_DTX` / `OPUS_SET_INBAND_FEC` removed; encoder state read back and logged | libopus defaults `VBR_CONSTRAINT` to 1 and the code opted out with no recorded reason. Unconstrained VBR spikes packet size on transients; at 200 packets/s that is arrival jitter, which the client answers by growing its buffer. DTX and in-band FEC are LPC-layer (SILK) features and structurally inert under `RESTRICTED_LOWDELAY` at 5 ms. | settings applied and never confirmed; `vbr_constraint=0` | `application=2051 bitrate=128000 complexity=5 signal=3002 vbr=1 vbr_constraint=1 lsb_depth=24 prediction_disabled=0 lookahead=120 samples (2.50 ms)` | VERIFIED in force (read back); the packet-size distribution is UNVERIFIED — an idle host encodes 3-byte silence frames, so the peakiness claim needs real audio | yes | `OPUS_SET_PREDICTION_DISABLED` is wired as a config field defaulting **off**: right for a zero-retransmit transport, but it costs bitrate at fixed quality and deserves a listening test rather than a blind landing. |
 | 74 | audio (all) | DataChannel backpressure checked every packet against 40 ms of audio, instead of one packet in four against a flat 16 KiB | 16 KiB at the measured ~93-byte message is about a second of queued audio before dropping starts, and sampling detected both entry *and exit* up to 20 ms late. | ~1 s of queued audio; 20 ms detection lag in both directions | 40 ms, evaluated per packet, threshold derived from the message size actually being sent | COMPILE-CHECKED — needs an induced-congestion run to observe | yes | Drops now also set `FLAG_DISCONTINUITY` on the next packet sent, so the client resyncs instead of splicing. |
 | 75 | audio (all) | Opus-track fallback samples spaced by real elapsed `capture_ns` instead of a hardcoded 5 ms | `TrackLocalStaticSample` derives RTP timestamps by accumulating `duration`, so every producer-side gap left audio permanently 5 ms per lost packet behind video, which rides the true host clock. | offset grows 5 ms per lost packet and never recovers | audio and video RTP timelines both follow `host_now_ns` | COMPILE-CHECKED — needs a browser forced onto the NetEQ path | yes | This is the path old mobile browsers land on, i.e. the compatibility target of this engagement. |
-| 76 | logbus (all) | `tprintln!` moved off the calling thread: a bounded-channel `try_send` that moves the already-formatted string, a single writer thread owning the 2000-line ring, batches of up to 64 lines or 50 ms per `LogLine`, and no event emitted at all until something has read the backlog | Every one of the 440 call sites took a process-global mutex, allocated the line a second time for the ring, and — whenever `attach()` had run, i.e. always in the GUI — emitted a Tauri event. `EmitArgs::new` serializes the payload to JSON *before* the listener check (`tauri-2.11.5/src/manager/mod.rs:534-552`), so with the Settings log panel closed every line paid a JSON serialization and two more mutexes for a message nobody received. The ring mutex was shared by the capture thread, the encode thread, the MMCSS audio thread and every tokio worker. | `logbus::tests::bench_push_line`, release, panel closed: **132 ns/line** at 1 thread, **351 ns/line** at 4 threads. Excludes the emit, which the "before" arm cannot reach from a test — so both numbers understate the real cost. | **181 ns/line** at 1 thread (0.73x), **126 ns/line** at 4 threads (**2.80x**, 0 dropped) | VERIFIED (microbenchmark); the removed JSON serialization is reasoned from the vendored crate source, not timed | yes | The single-thread regression is real and deliberate: waking a sleeping consumer costs more than an uncontended mutex push. It does not matter — one thread logging alone is the sparse case. The contended shape is the one on the latency path. Overflow drops the line and says so in-band on the next batch rather than blocking a real-time thread. Verified by grep that no `tprintln!` sits on a per-frame success path: the densest file, `windows_utils/streamer/pipeline.rs` (50 sites), has them on error paths and one 60-frame-throttled probe line. |
-| 77 | streamer (all) | One process-wide tokio runtime (`streamer::transport_runtime()`, `OnceLock`, `worker_threads` clamped to 4) instead of one full runtime per network adapter | `Streamer::run_with_handle` built a complete multi-thread runtime every call and `sync_streamers` calls it once per adapter IP. `worker_threads` was never set, so each runtime took `available_parallelism()`: three adapters on a 16-thread CPU meant 48 priority-boosted workers, nearly all idle, competing with the encoder. A Wi-Fi roam that changes the IP tore down and rebuilt a whole runtime. | **50 threads** (release `serve -v --no-cloud --no-qr`, one adapter, `Get-Process ScreenExtend`, 2 trials both 50); startup to `server listening` **388 ms** (median of 5: 325/388/391/403/416) | **38 threads** (same conditions); startup to `server listening` — see below | VERIFIED (thread count, one adapter). The 3-adapter case is UNVERIFIED: this box has one adapter, so the 48 -> 4 figure is arithmetic (`available_parallelism() * N`), not measured. | yes | The adapter still gets its own OS thread and `block_on`s its own `server::run` there, so one accept loop still cannot starve another; only the worker pool is shared. `on_thread_start(tune_transport_thread)` is unchanged. Threads are named `se-adapter-<ip>` / `se-transport` so a dump is legible. The change is in `streamer/mod.rs` and therefore applies to macOS with no edit; only the Windows call site got the naming and spawn-failure hardening — see `findings/major-session-tokio-runtime-per-adapter.md`. |
+| 76 | logbus (all) | `tprintln!` moved off the calling thread: a bounded-channel `try_send` that moves the already-formatted string, a single writer thread owning the 2000-line ring, batches of up to 64 lines or 50 ms per `LogLine`, and no event emitted at all until something has read the backlog | Every one of the 440 call sites took a process-global mutex, allocated the line a second time for the ring, and — whenever `attach()` had run, i.e. always in the GUI — emitted a Tauri event. `EmitArgs::new` serializes the payload to JSON *before* the listener check (`tauri-2.11.5/src/manager/mod.rs:534-552`), so with the Settings log panel closed every line paid a JSON serialization and two more mutexes for a message nobody received. The ring mutex was shared by the capture thread, the encode thread, the MMCSS audio thread and every tokio worker. | `logbus::tests::bench_push_line`, release, panel closed: **132 ns/line** at 1 thread, **351 ns/line** at 4 threads. Excludes the emit, which the "before" arm cannot reach from a test — so both numbers understate the real cost. | **181 ns/line** at 1 thread (0.73x), **126 ns/line** at 4 threads (**2.80x**, 0 dropped) | VERIFIED (microbenchmark); the removed JSON serialization is reasoned from the vendored crate source, not timed | yes | The single-thread regression is real and deliberate: waking a sleeping consumer costs more than an uncontended mutex push. It does not matter — one thread logging alone is the sparse case. The contended shape is the one on the latency path. Overflow drops the line and says so in-band on the next batch rather than blocking a real-time thread. Verified by grep that no `tprintln!` sits on a per-frame success path: the densest file, `windows_utils/streamer/pipeline.rs` (50 sites), has them on error paths and one 60-frame-throttled probe line. **Not fully closed:** the `STREAMING` flag arms on the first `get_log_backlog` and never disarms, because Tauri 2 exposes no way to ask whether a JS listener is still attached — so once the Settings log panel has been opened, the emits continue at up to 20 batches/s for the rest of the process instead of stopping when it closes. Bounded and much smaller than one emit per line, but real: `findings/minor-cli-logbus-streaming-flag-latches-on-and-never-turns-off.md`. |
+| 77 | streamer (all) | One process-wide tokio runtime (`streamer::transport_runtime()`, `OnceLock`, `worker_threads` clamped to 4) instead of one full runtime per network adapter | `Streamer::run_with_handle` built a complete multi-thread runtime every call and `sync_streamers` calls it once per adapter IP. `worker_threads` was never set, so each runtime took `available_parallelism()`: three adapters on a 16-thread CPU meant 48 priority-boosted workers, nearly all idle, competing with the encoder. A Wi-Fi roam that changes the IP tore down and rebuilt a whole runtime. | **50 threads** (release `serve -v --no-cloud --no-qr`, one adapter, `Get-Process ScreenExtend`, 2 trials both 50); startup to `server listening` median **391 ms** (5 trials: 325/388/391/403/416) | **38 threads** (same conditions, 2 trials both 38); startup to `server listening` median **460 ms** (9 warm trials: 375/416/455/457/460/475/504/504/521) | VERIFIED (thread count, one adapter, both directions). The 3-adapter case is UNVERIFIED: this box has one adapter, so the 48 -> 4 figure is arithmetic (`available_parallelism() * N`), not measured. **Startup: no improvement, and the medians are 69 ms apart in the wrong direction.** Both runs shared the box with 4-11 concurrent `rustc` processes and the spreads overlap (before 325-416, after 375-521), so this is noise, not a regression — but it is recorded rather than dropped, because building 4 worker threads instead of 16 cannot plausibly make startup slower and a clean-box re-measurement would settle it. | yes | The adapter still gets its own OS thread and `block_on`s its own `server::run` there, so one accept loop still cannot starve another; only the worker pool is shared. `on_thread_start(tune_transport_thread)` is unchanged. Threads are named `se-adapter-<ip>` / `se-transport` so a dump is legible. The change is in `streamer/mod.rs` and therefore applies to macOS with no edit; only the Windows call site got the naming and spawn-failure hardening — see `findings/major-session-tokio-runtime-per-adapter.md`. |
 | 78 | build (Windows) | `-Clink-arg=/MANIFESTDEPENDENCY:…Common-Controls…version='6.0.0.0'…` for every Windows target, in a new `src-tauri/.cargo/config.toml` | `tauri_build` writes the common-controls v6 dependency into the *app binary's* manifest, but nothing gives one to a `cargo test` harness. The moment dead-code elimination keeps the dialog path alive, the test binary imports `comctl32!TaskDialogIndirect`, the loader binds comctl32 to the v5 copy in System32, and the process dies at load with `STATUS_ENTRYPOINT_NOT_FOUND` (0xc0000139) before a single test runs. | reproduced on this box: an unrelated edit to `logbus.rs` flipped `cargo test --lib` from 170 passing to an unloadable binary — no output, no diagnostic, no stack | `cargo test` 171 passed / 0 failed; `cargo build --release` links clean | VERIFIED | yes | This is the "latent Windows linker trap" the resume brief asked about. It is not caused by any change in this branch; it is a pre-existing hazard that surfaces whenever DCE happens to retain the dialog path, which is why it appeared to be triggered by edits nowhere near it. Pinning it in `.cargo/config.toml` removes the coin flip. |
 | 79 | build (macOS) | `MACOSX_DEPLOYMENT_TARGET = "10.15"` in `src-tauri/.cargo/config.toml`, repeated in the `tauri-action` env in `build-release.yml` | rustc's default for `x86_64-apple-darwin` is 10.12 and nothing in the repo set it, so the shipped binary's load command contradicted `minimumSystemVersion: "10.15"` — it claimed to run on three releases it cannot — and clang's availability/weak-import machinery was calibrated three releases too low. | measured over SSH on the dev Mac 2026-09-08, debug binary at `80e28c7a`: `LC_VERSION_MIN_MACOSX version 10.12, sdk 11.1`, x86_64 only | pinned; the artifact check is `docs/manual-tests/macos-build.md` and the `dyld-floor` CI job, which reads `minimumSystemVersion` out of `tauri.macos.conf.json` and asserts the load command against it | UNVERIFIED on an artifact — the Mac is at its build-capacity limit and no release build with the pin exists yet. `findings/minor-build-verify-lc-build-version-minos-after-merge.md` is the post-merge step. | yes | The SDK is deliberately **not** pinned: `SDKROOT` is an absolute path that is wrong on every other machine, and on CI no 10.15 SDK exists at all. Gating the artifact is portable where pinning the SDK is not. |
 | 80 | build (all) | `.gitattributes` marks the vendored blobs `binary` and both `SHA256SUMS` `text eol=lf`; the two darwin `nefconc` hashes re-pinned from the blob content | The two darwin stubs contain no NUL byte, so git's auto text detection rewrote them to CRLF on a Windows checkout — 19 bytes instead of the 17 in the blob, and a different SHA-256. `binaries/SHA256SUMS` pinned that CRLF hash. Both checksum files were themselves CRLF, and `sha256sum -c` reads a trailing CR as part of the filename. | `resources`: 7 x `FAILED open or read` on Windows. `binaries`: passed on Windows, would have failed on the ubuntu CI job (`306c6ca7…` vs pinned `be43f00b…`) | `sha256sum -c` passes in both directories on this checkout; the `blob-checksums` CI job is the standing guard | VERIFIED | yes | This is plausibly part of *why* CI was disabled four minutes after it was added — the `blob-checksums` job would have failed on day one. |
 | 81 | cli / security | `single_instance`: constant-time control-token comparison, `screenextend.ctrl` created 0o600 and re-chmodded if wider, per-connection read timeout 2 s -> 500 ms, bad tokens logged | The token was compared with `!=` on `&str` while the join OTP two modules over already used `subtle::ConstantTimeEq`. The ctrl file took whatever the umask gave it, and whoever can read it can `QUIT` the host. Connections are served one at a time, so anything that connected and said nothing stalled a real `stop` for 2 s. | `!=`, umask-dependent mode, 2 s stall, silent drop | constant-time, 0o600, 500 ms, one log line per bad token | COMPILE-CHECKED (the loopback path is not exercised by a test) | yes | The two remaining items in that finding change `acquire_lock`'s signature and every caller, and every caller is in `cli.rs`/`lib.rs` — retagged W13b, with the suggested `LockOutcome` enum written out. |
-| 82 | build / CI | `.github/workflows/ci.yml` (six jobs), a dyld-floor gate on the release job, `scripts/perf-gate.mjs` + `ci/perf-baseline.json` | CI was added and deleted 4m13s apart in 2026-08 and has never run, so nothing gated `cargo fmt`/`clippy`/`test`/`pnpm lint`, nothing verified the blob checksums the two PROVENANCE files claim are "verified in CI", and nothing checked the shipped macOS binary against the 10.15 dyld floor — a load failure that is invisible on every machine that could debug it. | no gate of any kind since 2026-08-22 | frontend (eslint, build, Safari 13.1 re-derivation, client-stats harness), rust matrix (windows + macos-13/14/15), macos-smoke (doctor's probed tiers + the `#[ignore]`d VideoToolbox encode tests), dyld-floor, blob-checksums, perf-gate | UNVERIFIED — the workflow cannot run until the user pushes; validated by parsing the YAML and checking every job/step key, not by an actual run | yes | The macOS matrix is the point: the dev Mac is 10.15, so `macos-13/14/15` are the only machines on the project where ScreenCaptureKit, the Core Audio process tap and VideoToolbox execute at all. `macos-smoke` asserts the audio probe picks `screencapturekit` on 13 and `process_tap` on 14/15 — a silent demotion is exactly the regression nobody here can see. |
+| 82 | build / CI | `.github/workflows/ci.yml` (six jobs), a dyld-floor gate on the release job, `scripts/perf-gate.mjs` + `ci/perf-baseline.json` | CI was added and deleted 4m13s apart in 2026-08 and has never run, so nothing gated `cargo fmt`/`clippy`/`test`/`pnpm lint`, nothing verified the blob checksums the two PROVENANCE files claim are "verified in CI", and nothing checked the shipped macOS binary against the 10.15 dyld floor — a load failure that is invisible on every machine that could debug it. | no gate of any kind since 2026-08-22 | frontend (eslint, build, Safari 13.1 re-derivation, client-stats harness), rust matrix (windows + macos-13/14/15), macos-smoke (doctor's probed tiers + the `#[ignore]`d VideoToolbox encode tests), dyld-floor, blob-checksums, perf-gate | UNVERIFIED — the workflow cannot run until the user pushes; validated by parsing the YAML and checking every job/step key, not by an actual run | yes | The macOS matrix is the point: the dev Mac is 10.15, so `macos-13/14/15` are the only machines on the project where ScreenCaptureKit, the Core Audio process tap and VideoToolbox execute at all. `macos-smoke` asserts the audio probe picks `screencapturekit` on 13 and `process_tap` on 14/15 — a silent demotion is exactly the regression nobody here can see. || 95 | capture-win (wgc) | `MinUpdateInterval`, `DirtyRegionMode` and `IsBorderRequired` are each probed with `ApiInformation::IsPropertyPresent` and the setter skipped when absent, instead of `GraphicsCaptureApi::new` failing on the first missing one. The feature set is logged and carried in telemetry as `capture_features`. | The three are **build 26100** (Win 11 24H2) / **20348** properties. Requesting any absent one made the whole WGC session fail, so **every Windows 10 host and every Windows 11 before 24H2** fell silently through to DXGI Desktop Duplication — losing the NVENC zero-copy ring and serializing capture against encode. Sunshine's shape is per-property probing. | every pre-24H2 host: DXGI, no ring | those hosts stay on WGC; the dev box (26200) reports `+cursor +border +secondary-windows +min-update-interval +dirty-region +free-threaded-pool (build 26100+)` and is unchanged | VERIFIED on 26200 (no regression); the pre-26100 half is COMPILE-CHECKED | yes | The change here with the largest population behind it and the least ability to measure it locally. Script: `docs/manual-tests/windows-capture.md` §1-2 |
+| 96 | capture-win (wgc) | Frame-pool depth is per-path — 2 for the handler that encodes inline, 3 for the ring that only stages — and `TryGetNextFrame` drains to the **newest** frame, counting what it discards into `frames_dropped_stale`. | `Recreate` passed buffer count 1 while `Create` passed 3, so a content-size change silently undid the capture/encode decoupling for the rest of the session. The pool is a queue handed out oldest-first, so depth is latency for any consumer that falls behind: at 3 buffers and 60 Hz an unlucky frame was 33 ms old before the encoder saw it. OBS and Sunshine both use 2 for an inline consumer. | oldest-first, up to 33 ms of pool age | newest-first; `frames_dropped_stale` counts the difference | VERIFIED (counter moves under load on 26200) | yes | The counter is the point: the drain is only correct if what it drops is visible. |
+| 97 | capture-win (wgc) | A keyframe request now always produces an IDR within one frame period, including on a completely static desktop: the ring's keepalive reads `idr_request` and calls `encode_repeat_slot` with it, and the encode thread ticks at the frame period rather than at the 200 ms keepalive interval. | NVENC is configured with an infinite GOP and IDR period, so there is no periodic keyframe at all. `idr_request` was read only in `AsyncNvencRing::stage`, which runs only when WGC delivers a *new* frame; the 200 ms keepalive read `Encoder::idr_requested`, whose only writer had no callers. A client that joined, or lost its reference chain, while nothing moved on the extended display waited for the user to move something. | **2 IDRs in a 30 s static selftest**, both at session start | an IDR within one frame period of any request | VERIFIED (`idrs_sent` in the selftest telemetry) | yes | Corroborated by baseline note 5 in `docs/BASELINE.md`, which recorded the 2-IDR symptom before the cause was known. |
+| 98 | capture-win (wgc) | The WGC D3D device is created on the encoder's adapter: `IDXGIFactory6::EnumAdapterByGpuPreference` (probed by `QueryInterface`, Win 10 1803+) plus `VendorId`, with `GpuPreference::Vendor`/`HighPerformance`/`MinimumPower` chosen from the configured encoder. The registry write that only applied to the *next* launch was dropped. Which adapter captures, which encodes, and whether they match is logged once per session. | The encoder input is a `SHARED_NTHANDLE \| SHARED_KEYEDMUTEX` texture opened on the capture device, and that mechanism is same-adapter only; when the two adapters differ every frame takes a GPU→CPU→GPU round trip. WGC can capture any monitor from a device on any adapter, so the choice is free. x264 gets `MinimumPower` for the opposite reason: reading back from the iGPU that composes the desktop beats dragging the frame across PCIe. | inferable only from a "zero-copy path unavailable" line that named no adapter | `adapters: capture=… encode=… same_adapter=true\|false` once per session | VERIFIED (`same_adapter=true` on the dev box for NVENC and for x264) | yes | Also shouts when the capture adapter is a software rasteriser, which is what a WARP-composed indirect display looks like. |
+| 99 | tuning-win | Capture and encode threads are confined to the highest-`EfficiencyClass` CPU sets (`GetSystemCpuSetInformation` + `SetThreadSelectedCpuSetMasks`), probed by "does this machine report more than one distinct efficiency class". | Thread priority orders threads *within* a core's queue and says nothing about which core the scheduler picks, so an MMCSS-critical capture thread could still be parked on an efficiency core. The cost shows up as tail latency, not as a lower average. `SetThreadSelectedCpuSetMasks` is a soft restriction, unlike `SetThreadAffinityMask`, so the scheduler may still migrate rather than deadlock. | no core-class preference | `[cpu] hybrid CPU detected: confining capture/encode threads to the 12 logical processors of efficiency class 1` | VERIFIED (the dev box is a hybrid Intel part and takes the branch) | yes | Probed by capability, never by CPU model; a homogeneous CPU takes no action at all. |
+| 100 | capture-win (fork) | ~2,800 lines removed from the vendored `windows_capture` fork — the unused DXGI duplication API, `window.rs`, `graphics_capture_picker.rs` and the Media Foundation `VideoEncoder` — with the `Media_*`/`Storage*` `windows` features and the `clap` dependency they forced. The six genuine upstream bug fixes the fork carries are recorded in `windows_capture/FORK.md`. | The fork's provenance was undocumented, so every one of those fixes was one careless dependency refresh away from being lost, and the dead half made the diff against upstream unreadable. | 2,800 lines + 3 crate features + 1 dependency | gone; `FORK.md` names each surviving divergence | VERIFIED (builds, tests pass) | yes | Compile time and binary size, not frame latency. |
+| 101 | capture-win (dxgi) | The cursor is composited incrementally: only the rectangle it previously occupied is restored and only the rectangle it now occupies is drawn, instead of recopying the whole desktop texture whenever the pointer moved. | Moving the mouse over a static desktop cost a full-resolution `CopyResource` per pointer update — 8.29 MB at 1080p — for a change of at most 32×32 pixels. | full-frame copy per pointer update | two small blits | VERIFIED (dev box; cursor correctness by eye per `docs/manual-tests/windows-capture.md` §6) | yes | |
+| 102 | capture-win (wgc) | `DirtyRegionSettings::ReportOnly` (probed) plus a skip when `Frame::dirty_regions()` comes back empty, capped at 5 consecutive skips. | The DXGI path had skipped unchanged frames since `a56eedc`; WGC — the *fast* path — re-encoded every delivered frame, burning encoder time, GPU copy bandwidth and bitrate on frames byte-identical to the previous one. For a second monitor showing a document or a terminal that is most of the frames. The repeater already emits a keepalive every 200 ms, so a skipped frame is not a stalled client. | every delivered frame encoded | unchanged frames skipped; the 5-skip valve covers a driver that under-reports | VERIFIED on 26200 (the property exists there); no effect pre-24H2, where the property is absent | yes | The valve matters: a driver that reported no dirty regions when there were some would otherwise serve a stale picture forever. |
+| 103 | capture-win (dxgi) | `AcquireNextFrame`/`ReleaseFrame` paired by an RAII guard on every exit path, and `DXGI_ERROR_INVALID_CALL` recovered by re-duplicating (capped at 20) instead of killing the capture thread. | The two calls are a strict pair: miss one release and every subsequent acquire returns `DXGI_ERROR_INVALID_CALL` forever. `poll` had a `?` between them, so any early return leaked the frame and wedged the thread. Against a freshly created virtual display it reproduced every time — five `ACCESS_LOST` re-duplications while the IDD settled, then a permanent invalid call — and the client saw a negotiated session that stayed black. | `probe --whep-selftest --capture-backend dxgi` died at the first invalid acquire, 0 RTP packets | the capture survives the settling period | VERIFIED (the invalid-call death no longer reproduces) | yes | Half of the "AcquireNextFrame invalid call on a fresh virtual display" blocker; the other half is row 105. |
+| 104 | capture-win (dxgi) | `IDXGIOutput5::DuplicateOutput1` with an explicit format list is tried before `IDXGIOutput1::DuplicateOutput`, probed by `QueryInterface`; and **every** adapter that enumerates the display is tried, not just the first. The compatibility report's `dxgi` probe creates a duplication and drops it instead of asking whether a DXGI factory exists. | On a hybrid-graphics laptop the same display can be listed by several adapters and only the one that composes it can duplicate it; `DuplicateOutput1` is also the only entry point that can duplicate a display in HDR mode. And `CreateDXGIFactory1().is_ok()` is true on every Windows since 7, so the report was advertising a fallback that could not start. | `DuplicateOutput failed after 5 attempts: 0x887A0004` — one bare HRESULT — and a compatibility report claiming DXGI was available | every adapter tried and named; the report prints `dxgi: duplication fallback is NOT available on this machine (…)`, and a working host logs which entry point is live | VERIFIED — and the answer on this box is **negative**: `\\.\DISPLAY1` is enumerated only by the RTX 3080 Ti and both entry points return `DXGI_ERROR_UNSUPPORTED`. This machine is WGC-only, which it now states rather than implies. | yes | See the note below on what is left of the DXGI fallback. |
+| 105 | capture-win (dxgi) | Duplication that is re-established without ever producing a frame fails the capture after 40 attempts, and the "re-established" line is rate-limited to the first and every tenth. | `redup_failures` counted only *failed* re-duplications and a success reset it, so an output returning `DXGI_ERROR_ACCESS_LOST` on every acquire looped forever: acquire, lose access, re-duplicate, repeat. Against a fresh IDD virtual display it did exactly that for a whole 12 s probe run, delivered no frames, and emitted a log line — hence a UI IPC event — every time round. | unbounded silent spin, ~3 log lines/s, 0 frames | bounded and named: the capture stops with `duplication was re-established 41 times without ever delivering a frame` | VERIFIED (reproduced the spin, then the bound) | yes | "Degrade loudly" is the requirement; a negotiated session showing black is the failure this removes. |
+| 106 | capture-win (dxgi) | The DXGI capture thread stages the composed frame into one of three slot textures on the duplication device and hands the index to a `dxgi-encode` thread, instead of encoding inline. Overrun drops are counted in `frames_dropped_ring`; the per-60-frame latency line now prints the frame budget beside the measured average. | Capture of frame N+1 could not begin until the encode of frame N returned, so the achievable rate was `1 / (capture + composite + encode)` rather than `1 / capture` — and on every CPU-bridge backend the encode is the large term. This is the path every Windows 10 and pre-24H2 Windows 11 host falls back to, so it is the common case rather than the rare one. | capture and encode serialized on one thread | decoupled; the copy is GPU-to-GPU on a device that is already multithread-protected | COMPILE-CHECKED — this box cannot duplicate its own primary display (row 104) and its IDD displays do not settle into a duplication, so the throughput claim has no local number | yes | One caveat, stated because it bounds the win: the encode thread shares the duplication device with the capture thread, and D3D11 multithread protection holds the device lock for the whole of a blocking `Map`. So on a CPU-bridge backend the *readback* (1192 us BGRA / 740 us NV12 at 720p, row 108) still stalls the capture thread, while the encode itself — 2-8 ms for x264 — no longer does. The majority of the serialization is gone, not all of it. Measured verification needs a machine where DXGI duplication works: `docs/manual-tests/windows-capture.md` §5b. |
+| 107 | capture-win (dxgi) | No video processor on the adapter composing the display means the encoder is configured at native resolution and the client does the scale, with a log line, instead of the session failing. | `Scaler::new` casts the duplication device to `ID3D11VideoDevice` and its context to `ID3D11VideoContext`; both fail on a device created without `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` — which `create_device_on` silently retries without — or on an adapter with no video engine, and an indirect-display adapter is not obliged to have one. The failure was `?`-propagated, so on a host that had already fallen back from WGC, a client with video-scale under 100% could not start a session at all. | error "building GPU downscaler for --scale", no session | native-resolution stream plus one explanatory line | VERIFIED that this box's duplication devices *do* expose a video processor, so the fallback branch is COMPILE-CHECKED | yes | A worse picture is not a dead session. |
+| 108 | scaler-win | `Scaler::with_format` can make its destination and staging surfaces `DXGI_FORMAT_NV12`, so the one `VideoProcessorBlt` that already scales also does the colour conversion, and `read_back` returns `height + height/2` rows at one pitch. NV12 is probed with `CheckVideoProcessorFormat`; an odd dimension or a refusal falls back to BGRA with a log line. `Backend::cpu_bridge_format()` is where a backend opts in. | BGRA is 4 bytes per pixel and NV12 is 1.5, so the `CopyResource` into staging, the blocking `Map` and the memcpy into the retained buffer all shrink by 62.5% — and every CPU-bridge encoder converts BGRA to 4:2:0 on the CPU anyway (x264 on a rayon pool, oneVPL through a second VPP pass, AMF through an internal converter), so that conversion moves onto silicon that was already running. | 1920x1080 → 1280x720, 60 iterations, median us/frame: **blt 5, readback 1192, total 1196**; 3,686,400 bytes | **blt 4, readback 740, total 743**; 1,382,400 bytes — **38% off the readback** | VERIFIED (`cargo test --lib scaler -- --nocapture`; two tests also assert the picture survives the conversion) | yes | The encoder half is not landed: no backend has an `encode_nv12_padded` yet, so `cpu_bridge_format` still answers BGRA for all of them. `findings/major-encoders-win-need-an-nv12-cpu-bridge-entry-point.md` carries the exact signature and plane layout for W3b and W4. |
+| 109 | tuning-win | The idle repeater thread drops from `THREAD_PRIORITY_TIME_CRITICAL` to `THREAD_PRIORITY_HIGHEST`, keeping MMCSS and the P-core confinement. | The process is `HIGH_PRIORITY_CLASS` and every capture and encode thread is time-critical, so N clients meant roughly 2N time-critical threads competing with the tokio transport workers — which sit at `ABOVE_NORMAL` and are what actually push RTP. The repeater emits a keepalive every 200 ms; being a millisecond late costs nothing. | 2-3 time-critical threads per session | one fewer per DXGI and per classic session | VERIFIED (builds and runs; the contention claim itself needs a 4-client host to measure) | yes | The x264 case is the worst one, because a time-critical CPU encoder can saturate cores. |
+| 110 | audio (macOS) | Legacy-tier playthrough setpoint: fixed 4096 frames -> three of the output device's own IO periods, floored at 128 and ceilinged at 4096, raised 64 frames at a time only by a *measured* underrun; `DRIFT_GAIN` 2.0e-9 -> 5.0e-8 | The setpoint **is** the steady-state monitoring latency -- the drift loop's fixed point is that many frames of backlog. On this tier the virtual device is the system default output, so every sound the Mac makes passes through it before reaching the speakers. | 4096 frames = **85.3 ms** at 48 kHz, plus the device's own IOProc latency | 3 x 512 = 1536 frames = **32 ms** on a typical cycle; 3 x 128 = **8 ms** on a short one | COMPILE-CHECKED (setpoint arithmetic asserted by two new tests; click-to-sound needs a second machine to record with) | yes | The old gain needed ~30 s to move an 85 ms backlog, so the setpoint was the shock absorber for a loop too slow to reach it. 25x the gain against errors an order of magnitude smaller reaches the 0.3% trim limit (about five cents of pitch) in ~2 s. `IoCtx::underruns` was incremented and never loaded; the control thread now reports it and the bump every 10 s. |
+| 111 | audio (macOS) | `capture_ns` end to end on the legacy tier: the driver stamps `mach_absolute_time()` in `OnProcessMixedOutput`, publishes it through the layout-2 shm anchor, and the encoder worker extrapolates by sample counter | W8's Windows note asked for the signed skew against `host_now_ns()` to be measured before trusting any hardware stamp -- on Windows loopback the endpoint timestamp turned out to be a *play cursor* about 15 ms in the future and had to be clamped. | drain-time stamp: the moment the worker woke up, plus a synthetic forward ladder that could regress between passes | capture -> Opus packet **p50 -0.57 / p90 3.59 / p99 4.54 ms** (median of three 10 s runs, 3277 packets); **0 of 3277** `capture_ns` deltas anything but exactly 5.000 ms; **0** regressions, **0** sequence gaps; encode p50 0.09-0.12 ms | **VERIFIED** on macOS 10.15.8 | yes | p50 is negative on purpose: the driver stamps the mix when it exists, before it would have been heard, so a packet reaches the encoder ahead of its own audio's playout -- under one IO cycle and in the right direction, unlike the Windows case. **No clamp applied**, and that is the decision: clamping would flatten the within-block ladder that produces the exact 5 ms spacing above. A fourth run across a 3 s silent gap gave exactly 1 non-5 ms delta (the re-seat), 0 regressions, 0 sequence gaps. |
+| 112 | audio (macOS) | Tap aggregate `kAudioDevicePropertyBufferFrameSize` set to `clamp(128, range)`; the legacy tier does the same on the virtual device | The IO cycle is added to every sample before the ring sees it, and neither we nor the AudioCap reference the aggregate is modelled on ever set it -- the CoreAudio default for a built-in output is commonly 512 frames. | 512 frames = **10.67 ms**, assumed; never measured on a *tap* aggregate by anyone | legacy tier: requested 128, **granted 128 = 2.67 ms**, with `overruns` 0 and `dropped_backpressure` 0 | **VERIFIED** (legacy tier, 10.15.8); COMPILE-CHECKED (tap aggregate, needs 14.2+) | yes | `period_frames` was only ever written by the Windows path, so the 2 s summary reported the macOS IO cycle as `period=0fr`; both tiers now store the granted value, which is how the 128 above is known. SCK has no equivalent knob -- it owns no device. |
+| 113 | audio (macOS) | `Producer::push`/`Consumer::pop` split-at-wrap `copy_nonoverlapping`; `convert_interleaved` fast path for 48 kHz stereo f32 interleaved (one memcpy plus one clamp pass) | Five to six scalar passes over every sample where two vectorisable ones would do, on the real-time capture thread where cost is IOProc deadline-miss risk rather than throughput. The ring stores `UnsafeCell<f32>`, which the compiler cannot see as contiguous through the per-element `get()`. | per-sample masked store and load; per-sample four-byte reassembly, a two-into-two "downmix", two clamps | two `copy_nonoverlapping`s per ring crossing; one memcpy plus one clamp pass on the format fast path | COMPILE-CHECKED (no per-callback timing harness on this tier; end-to-end encode p50 0.09-0.12 ms) | yes | `AudioFormatDesc::is_fast_path` existed to name exactly this case and had **no callers at all**, so the fast path it named did not exist. The clamp is kept deliberately -- the system mix is not bounded to +-1 and a bare memcpy would drop it. Two tests assert the fast path agrees with the general one on identical input, clamps, and stops at whichever buffer runs out first. |
+| 114 | audio (macOS) | shm reader thread: `THREAD_TIME_CONSTRAINT_POLICY(5 ms)` + `park_timeout(500 us)` -> `user_interactive` QoS + `sleep(250 us)` | A Mach time-constraint policy declares a periodic deadline the scheduler holds the thread to; this one then slept for an unrelated interval, waiting for a wakeup that can never come -- the producer is `coreaudiod` in another process writing to shared memory, so nothing unparks it and `park_timeout` only wrapped a plain sleep in a mutex and a condvar. | 0-500 us of added delay per drain, on a thread the scheduler may demote out of the real-time band for missing its declared deadline | 0-250 us, a quarter of the driver's own 2.67 ms IO cycle, on the QoS class the work actually wants | **VERIFIED** as part of the end-to-end p99 of 4.54 ms in row 97 | yes | The finding offered `mach_wait_until` as the lower-latency, higher-risk alternative. Rejected: the policy was never honoured in the first place, and the poll is already a fraction of the block period it drains. |
+| 115 | audio (macOS) | Crash-recovery LaunchAgent: installed per start and never removed, `StartInterval` 30, each run forking `pgrep -x ScreenExtend` -> installed once, removed on every path that ends its job, `StartInterval` 60, lock-file check | A permanent background job the user never consented to, surviving app deletion, relaunching a stale absolute path, and doing a process spawn plus HAL IPC 2880 times a day for a case that only matters after a crash. | 2880 launches/day, **forever**, each forking `pgrep` and parsing PIDs | 1440/day and **only while the legacy tier is streaming**; the agent removes itself the first run that finds no host holding the lock | **VERIFIED** (install and removal observed on 10.15.8; `launchctl list \| grep screenextend` is empty after a clean stop) | yes | `single_instance` already keeps an exclusive `fs4` lock for exactly this question -- one `open` plus one `flock` replaces the spawn -- and on macOS its directory is the parent of the routing state file, which the watchdog can resolve without a Tauri app. |
+| 116 | audio (macOS) | Volume-key `CGEventTap` callback: synchronous `AudioObject{Get,Set}PropertyData` -> classify and `try_send` on a 16-slot bounded channel to a worker thread | An *active* session-level tap with `kCGEventTapOptionDefault` blocks **every** keyboard and mouse event in the login session for its duration, including the remote-control input path this product exists to provide. Two `coreaudiod` round trips inside it overrun the tap deadline when the daemon is busy, and macOS then silently disables the tap -- which is why the `kCGEventTapDisabledByTimeout` re-enable branch already existed. | two synchronous HAL round trips per volume key, in the session input path | classify plus one `try_send`; no IPC, no allocation | COMPILE-CHECKED (the tap is opt-in via `set_legacy_volume_key_proxy` and needs Accessibility; the structural claim is by construction) | yes | `try_send`, never `send`: a full queue means the worker is behind on key repeats, and dropping one of those is invisible where stalling the session's input path is not. Also fixed the mutex held across `VolumeKeyTap::start`'s blocking handshake, and the `unwrap()` that let one panic poison every later call. |
+| 117 | audio (macOS) | SCK's two async-to-sync bridges 5 s -> 1.5 s; `start_capture`'s `ready_rx.recv()` given a 15 s ceiling where it had none | Both SCK waits are taken serially under the `AudioHub` mutex, which holds every other session's audio subscribe and unsubscribe, and both are hit in the denied-Screen-Recording case a user is most likely to meet. | up to **10 s** of frozen audio subscribe for every other device, more once the candidate loop moved on to the next backend; `start_capture` could wait forever | 3 s worst case for the SCK pair, 15 s hard ceiling overall | COMPILE-CHECKED (13.0+ path) | yes | SCK offers no non-blocking variant, so bounding the waits is the whole fix. A display list or a stream start that has not arrived in 1.5 s is not going to. |
+| 118 | audio (macOS) | Driver shm ring layout 1 -> 2: capture-time seqlock anchor, reader-published `readPos`, `overruns` actually written, scalar write loop -> two `memcpy`s, umask cleared across `shm_open`, `os_log` throughout | The ring carried no time, so a reader could only date samples from its own drain. `overruns` was declared in the ABI and never incremented, so the one signal that says this tier is dropping samples read a constant 0. And `shm_open` applied `coreaudiod`'s umask, so under 077 the host got a bare `EACCES` and silently took the slower HAL-input path with nothing anywhere saying so. | no anchor, no `readPos`, `overruns` always 0, 1024 scalar stores per callback, mode at the mercy of a umask this code does not control, and zero logging in the entire driver | anchor published per block; `readPos` tracking `writePos` at a backlog of **0** with `overruns` **0** over 2,083,840 samples; `O_RDWR` **granted**; geometry and errno visible in `log stream` | **VERIFIED** on macOS 10.15.8 | yes | ABI bumped on both sides in one change (`shm_ring.hpp` <-> `shm_reader.rs`); a layout-1 segment is unlinked and recreated at load. `legacy/test/ring.rs` now **scrapes the C++ header** and fails if the two drift, instead of comparing Rust constants to literals typed in the same repo. |
+| 119 | audio (macOS) | `dropped_backpressure`: the worker's unconditional `store(consumer.overruns())` per drain pass removed; the capture callbacks and the shm reader own the counter | Three producers `fetch_add` into it -- ring overruns from each callback, and the samples the legacy reader loses to a lapped shared-memory ring, which is a different loss with a different cause and the interesting number for that tier. The worker then overwrote all of it within milliseconds. | legacy-tier loss reported as a flat **0** in `AudioDiagnostics::summary()` | both loss sources accumulate; measured 0 on a healthy run, which now means something | **VERIFIED** on macOS 10.15.8 | yes | Picked the producers as the single owner rather than adding a second field, because both numbers are genuinely "samples lost to backpressure" and the shared `AudioDiagnostics` struct is W8's to grow. |
+| 138 | macos capture | CGDisplayStream: `IOSurfaceIncrementUseCount`/`DecrementUseCount` around every surface held past the callback (RAII `HeldSurface`), `kCGDisplayStreamQueueDepth` 2 -> 5, `kCGDisplayStreamMinimumFrameTime` deleted | `CGDisplayStream.h` requires *both* a `CFRetain` and a use-count increment of a client that keeps a delivered surface; we did the retain only, so WindowServer was free to composite the next frame into the buffer VideoToolbox was reading. Marking surfaces in use makes the queue depth real for the first time, so the depth had to move in the same change: 2 was below CoreGraphics' own documented default of 3 while the pipeline pinned two surfaces. `MinimumFrameTime` defaults to zero, so setting it to 0.95/fps added a hold-off nothing asked for. | PRE | POST | VERIFIED (10.15.8) | yes | The three had to land together: the increment alone converts a corruption bug into a starvation bug, and the hold-off is invisible while the queue is the binding constraint. |
+| 139 | macos capture | the first frame of a session is exempt from the empty-dirty-rect skip; both wrap paths take ownership of the `CVPixelBuffer` before checking the `CVReturn` | A freshly created virtual display is completely still until a window is dragged onto it, so every frame reports zero dirty rects, nothing is ever published, and the 200 ms keepalive has no previous frame to repeat. CoreVideo can also return non-zero *and* hand back a +1 buffer. | client saw black until something moved | first frame always published | VERIFIED (10.15.8) | yes | The other half of "connected but black" is row 94. |
+| 140 | macos capture | CGDisplayStream de-linked: five functions and five CFString constants resolved by one cached `dlsym` | The API is *obsoleted*, not merely deprecated, in the macOS 15 SDK, and it is the fallback tier. A link-time reference to a symbol Apple has announced the end of makes the entire binary unloadable the day it goes — the rule the codebase already applies to ScreenCaptureKit, in the other direction. | `nm -u \| grep -i displaystream` listed 10 symbols | listed none; capture and the TCC probe both run through the resolved pointers | VERIFIED (10.15.8) | yes | A machine without the API now fails its capture start with a line, instead of failing to launch. |
+| 141 | macos encode | `VTCopyVideoEncoderList` logged once per process; `VTCopySupportedPropertyDictionaryForEncoder` queried per session; every `macos_at_least` gate on this path deleted | The encoder was configured from OS version numbers. The property set actually depends on the encoder VideoToolbox picks, which depends on the frame size and the machine. The version gate on `EnableLowLatencyRateControl` named 11.0; the key is 11.3, and the spec ladder already answers the question by trying. | no inventory, no property report, one `sw_vers` fork per query | one `[vt] encoder:` line per H.264 encoder (id, hardware, GPU, instance-limited) and one `[vt] properties:` line per session | VERIFIED (10.15.8) | yes | `InstanceLimit` is the documented mechanism behind "it only works when I quit everything else", and nothing had ever printed it. |
+| 142 | macos encode | `UsingHardwareAcceleratedVideoEncoder` read back and stored; a software session logs at error level; `CompatibilityReport.encoder_backend` reports the probed tier | The `hardware` flag recorded on success was the flag that had been *requested*. A session created on the `Require` rung can still be software, and then nothing was logged at all. | `encoder_backend` was the constant `"videotoolbox"` | `videotoolbox-hardware` / `videotoolbox-software`, from the encoder list at report time and from the session read-back at stream time | VERIFIED (10.15.8) | yes | `UsingGPURegistryID` is NULL for a built-in-GPU hardware encoder *and* for software, so it can never stand in for the hardware flag. |
+| 143 | macos encode | `PreferredEncoderGPURegistryID` from `CGDirectDisplayCopyCurrentMetalDevice` of the captured display | On a multi-GPU Mac, WindowServer vends the display's IOSurface from the GPU driving that display while VideoToolbox picks an encoder by its own criteria; when they differ, every frame migrates across the PCIe bridge. `Preferred`, never `Required`, which would defeat the fallback ladder. | not set | set when the display reports a Metal device | COMPILE-CHECKED — the 10.15.8 dev Mac is single-GPU, so it correctly reports `gpu_registry_id=none` | yes | Needs a 2016-2019 15-inch MacBook Pro or an eGPU to verify. Script: `docs/manual-tests/macos-capture-encode.md` §9. |
+| 144 | macos encode | `DataRateLimits` removed; `MaxFrameDelayCount` unset; `MaxKeyFrameIntervalDuration` 10 s -> 600 s | QA1958 defines `DataRateLimits` as a hard cap over a sliding window and `AverageBitRate` as a target; Chromium documents the cap as undocumented-incompatible with `EnableLowLatencyRateControl` and as making the encoder undershoot regardless. The loss-based controller already owns the bitrate. `MaxFrameDelayCount` is a contract on the *calling* thread, so `1` blocks the deadline-scheduled encode loop inside the encoder. A 10 s periodic IDR is a bitrate spike the removed cap then had to absorb. | two rate controllers with different time constants, plus a periodic IDR | one target, no cap, keyframes only on request | PRE_POST | yes | OBS reports `RealTime = true` *plus* bitrate limiting caused heavy frame drops on M1-era Macs; the pairing is gone, `RealTime` stays. |
+| 145 | macos encode | per-frame stamps travel through VideoToolbox as `sourceFrameRefCon` | A `std::sync::Mutex<VecDeque>` sat between the real-time encode thread and the drain thread, and assumed submit order equals emit order. VideoToolbox carries an opaque pointer per frame for exactly this. | a lock per submit and per emit | none; the stamps arrive with their own frame | VERIFIED (10.15.8) | yes | Also deletes the ordering assumption, which mattered the moment frames could be dropped. |
+| 146 | macos encode | encoder output channel bounded at 4, drop-oldest, counted, and the count forces an IDR | The channel was unbounded, so a drain thread that fell behind turned into latency rather than into a visible drop. A dropped access unit breaks the reference chain, which is why the count has to become a keyframe. | unbounded | 4, with `encoder_output_drops` in `status --json` | VERIFIED (10.15.8: 0 drops over three 6 s runs) | yes | Dropping the oldest keeps the freshest picture; either end of the queue needs the IDR. |
+| 147 | macos encode | frames in flight counted and capped at 2, with the cap standing aside to 16 after 100 ms of no output; the blocking `CompleteFrames` is gone from the encode loop | VideoToolbox accepts frames until memory runs out. A comparable product measured ~8 resident when overfed — 130 ms at 60 fps, invisible to every timer we have. But a hard cap against an encoder that structurally holds frames is a deadlock, which is what the old blocking flush on the keepalive path was really working around; that flush was synchronous and unbounded on a deadline thread, five times a second on a still screen. | unbounded, plus a blocking flush per keepalive | 2, or 16 against a frame-holding encoder, and no flush | PRE_POST | yes | The max depth reached is logged next to VideoToolbox's own `NumberOfPendingFrames`; a disagreement between the two says which problem you have. |
+| 148 | macos encode | a submit failure no longer ends the stream: three consecutive failures rebuild the encoder, old session released first | One `VTCompressionSessionEncodeFrame` error broke out of the encode loop forever. The session stayed up, the transport stayed connected, and the picture simply stopped, with one line in the log. | first error = permanent freeze | up to three rebuilds, then a deliberate end so clients are told | COMPILE-CHECKED — the failure is not reproducible on demand | yes | The old session is released *before* the replacement is asked for; the hardware encoder is instance-limited, so the other order turns a transient error into a permanent software fallback. |
+| 149 | macos encode | a first-frame deadline: 750 ms with no capture yields a synthesized black IDR, counted as `capture_no_first_frame` | A capture backend that delivers nothing produced a session that negotiated, connected, reported healthy and showed nothing, forever — this is why every macOS cell in `docs/BASELINE.md` was empty. | `probe --whep-selftest` sent 0 frames; `probe --live` wrote 2 in 5 s | the client gets a decodable picture within a second, and the silence is visible in `status --json` | VERIFIED (10.15.8) | yes | Pairs with row 84: one fixes the still-display capture, the other covers a backend that fails outright. |
+| 150 | macos sched | one scheduling scheme per thread; every `thread_policy_set` / `pthread_set_qos_class_self_np` return checked and logged once; `THREAD_TIME_CONSTRAINT` computation `period/8` -> `0.75 x period`, read back with `thread_policy_get`; `os_workgroup` deleted; `setpriority(-10)` deleted | The encode thread was given a QoS class *and* a deadline policy *and* a precedence policy *and* an affinity tag, with every return value discarded — a QoS class is how the kernel manages priority and a deadline reservation is how that management is removed, so the last writer won and nothing said which. 2.08 ms of a 16.67 ms frame is under a third of what the work costs, and a reservation smaller than the work is worse than none. The workgroup was created and joined but never given an interval. `setpriority(-10)` needs root and printed EACCES on every normal launch. | budget 2.08 ms, no readback, one inert workgroup, one error line per launch | budget 12.5 ms, effective policy printed, no workgroup, no error line | VERIFIED (10.15.8) | yes | Research is explicit that a `DEFAULT`-type workgroup is a no-op and interval workgroups are audio-only. |
+| 151 | macos capture | the 60 fps floor in `live_encoder_config` is gone | `refresh.clamp(60.min(max_fps), max_fps)` could only ever raise the rate, so a 30 Hz display or a client that asked for 30 was captured and encoded at 60: twice the frames, none of them new, competing with the ones that were. The `refresh_hz == 0 -> 60` line one statement earlier already covers a display that reports nothing sensible. | 30 Hz display encoded at 60 | encoded at 30 | VERIFIED (unit-tested; the dev display is 60 Hz so the behaviour change is asserted, not measured) | yes | |
+| 152 | macos capture | ScreenCaptureKit: `queueDepth` 3 -> 8, `minimumFrameInterval` 0.9/fps, `SCFrameStatusStarted` accepted, presentation timestamp read, colour matched to the CGDisplayStream path, `stop()` blanks the delegate ivar and drains the delivery queue before freeing its context | Apple raised its own documented default for the queue from 3 to 8 and describes depth as memory against stalling, not latency; the comment claiming "3 is lowest latency" had it backwards. OpenDisplay measured ~51 fps out of a request for exactly 1/60 and OBS ships a 10 % shortening for the same beat-frequency reason. `Started` is the first frame after `startCapture`, carrying the whole display, and it was discarded. The PTS is host-clock nanoseconds, so it needs its own conversion — the tick path would have scaled it twice. | depth 3, exact interval, first frame discarded, `os_time_ns` always 0, SCK colour defaults, ctx freed with a handler possibly in flight | as described | **COMPILE-CHECKED** — the dev Mac is 10.15.8, where ScreenCaptureKit does not exist | yes | Script: `docs/manual-tests/macos-capture-encode.md`. |
+| 153 | macos capture | capture tier chosen by `AnyClass::get`, and ScreenCaptureKit not committed to until it has delivered a frame (1500 ms); the CGDisplayStream TCC probe is not reached on a host that has SCK | The selector was a `sw_vers` fork whose parse failure returned *true*. Chromium reports full-display SCK capture is broken on 12.3 — it starts and delivers nothing, which from outside is indistinguishable from slow. Probing with the obsoleted API on a modern Mac is also what raises Sequoia's recurring privacy alert. | version string comparison, no frame-level check | class probe plus a first-frame gate, both logged | VERIFIED (10.15.8 selects CGDisplayStream by class absence); the frame gate is UNVERIFIED | yes | A mid-session fallback from SCK to CGDisplayStream was considered and **rejected**: swapping capture backends under a live session risks a worse failure than the stall it papers over, and CGDisplayStream would not fix a WindowServer stall anyway. The watchdog that matters is row 94, which covers both. |
+| 154 | macos | `pipeline::start` returns a `SessionCapture` instead of leaking; the drain thread reuses one Annex B buffer; the wake token is consumed when a frame is taken; the reachable CoreFoundation panics on the encode path return `None` | `start` called `mem::forget` on the capture backend and the latency activity and dropped the stop flag and the join handle, so one call permanently held a capture stream, a VideoToolbox session, a real-time thread, a process-wide App Nap suppression and two power assertions. The wake channel is a `bounded(1)` counter and a frame taken after a timeout left its token behind, so the next wait returned instantly with nothing to take. | leaks per call; a `Vec` grown from empty per frame; a spurious wake per timed-out take; `expect` on every `CFDictionaryCreate`, including the per-frame force-keyframe dictionary | none of the above | VERIFIED (10.15.8; `start` has no production caller, so the leak was latent) | yes | |
+| 155 | macos encode | `ConstantBitRate` and `BaseLayerFrameRate` probed and reported, deliberately not set | CBR spends bits on a static screen to hold the rate, which is the opposite of what a screen sharer wants and is why the removed `DataRateLimits` was not replaced with one. `BaseLayerFrameRate` is hierarchical-P temporal layering: it adds reference depth to buy scalability nothing here consumes. | both unmentioned | both named in the `[vt] properties:` line as `available` or `absent` | VERIFIED (10.15.8 reports both `absent`) | n/a — recorded rejection | The report exists so a future reader can see the decision was made rather than missed. |
+
+
+| 156 | ui (desktop) | Deleted `ui/form.tsx` and `ui/resizable.tsx` (no importers), `generateSlug`, `useInterval`, two never-assigned `Window` globals and a commented-out component; dropped nine now-unreferenced runtime dependencies | Rollup already tree-shook the two components out of the bundle, so the claim to test was whether removing them was pure hygiene or an actual size win. It is a CSS win: tailwind was still scanning their class names. | `main-*.js` **565.27 kB** (gzip 181.44), `main-*.css` **52.92 kB** (gzip 9.33) | JS **565.26 kB**, CSS **50.14 kB** (gzip 9.03) -- CSS -2.78 kB (-5.3%), JS unchanged | VERIFIED | yes | Deps removed: `react-hook-form`, `react-resizable-panels`, `@radix-ui/react-icons`, `zod`, `@hookform/resolvers`, `react-avatar`, `react-svg`, `@radix-ui/react-tooltip`, `@tauri-apps/plugin-dialog`. `motion` looks unused and is not -- it is `nextstepjs`'s peer and the walkthrough breaks without it. |
+| 157 | ui (desktop) | Four upstream shadcn defects: `TOAST_REMOVE_DELAY` 1,000,000 ms -> 5,000; a guard on `InputOTPSlot`'s `context.slots[index]`; `SheetContent`'s unused `trapFocus` prop deleted; `Button`'s `hover:opacity-75` merged before `className` instead of after | All four shipped verbatim from `npx shadcn add`. The toast one is the only ongoing cost: every dismissed toast held its object and a `setTimeout` handle for 16 min 40 s in a process that stays open for the whole streaming session. | one live `toastTimeouts` entry per toast for 16 min | freed 5 s after dismissal, which is after Radix has already unmounted the toast | VERIFIED (build + lint); the timer window is arithmetic | yes | `hover:opacity-75` stayed out of `buttonVariants`: alert-dialog.tsx and devices.tsx call that directly and must keep rendering without the fade, so moving it there would have been a visible change. `<Input>`'s `forwardRef` render function also took one argument, so every ref handed to it stayed null. |
+| 158 | ui (desktop) | `index.html` paints the two literal `--background` values on `html`, and `ThemeProvider` writes the user's theme choice to `localStorage` as a synchronous paint hint that the inline script and the provider's initial state both read | Nothing set a background before the render-blocking 50 KB stylesheet arrived, so both themes opened on the WebView's white canvas; and the inline script resolved the theme from `prefers-color-scheme` alone, so a user on a dark OS who had chosen light saw dark chrome until `config.json` round-tripped over IPC. | white frame every launch; wrong-theme frame on every launch where the choice differs from the OS | first painted frame matches the settled frame in both cases | VERIFIED (build); the frame-by-frame capture is `docs/manual-tests` work | yes | Deliberately no `<meta name="color-scheme">`: it also restyles the native form controls, which would be a visible change. Only `html` is painted -- `body` takes `bg-background` from the stylesheet and covers the viewport, so the literal never competes with the token. |
+| 159 | build | `vite.config.ts`: an `existsSync` guard with a real message in `monacoDeps()`, `handleHotUpdate` invalidating the `classicWorkers` bundle cache, header comments on `classicWorkers` and on the `esbuild.target` 13.0-vs-13.1 discrepancy; `index.html` added to tailwind's content globs; `scripts/**/*.mjs` brought under ESLint | Renaming `src/lib/monaco-setup.ts` or `json-editor.tsx` killed every vite command with a bare ENOENT thrown from inside the config, before any project code was reached; and the memoised worker bundle was never invalidated, so editing a worker entry served the stale build for the rest of the dev session. | ENOENT with no explanation; stale worker until restart; the compatibility gate itself unlinted | named error; cache dropped on change; `eslint .` covers `scripts/` | VERIFIED | yes | The tailwind glob is a trap-remover, not a size change: the emitted stylesheet is byte-identical with and without `./index.html`. `build.sourcemap: "hidden"` was considered and rejected -- see the note below. |
+| 160 | ui (desktop) | `DeviceDetails` split into a light trigger and a body that mounts with the sheet (held `SHEET_EXIT_MS` = 500 ms across Radix's close animation); table rows keyed on the device's trust token instead of the array index | Radix unmounts `SheetContent` while closed, but the component around it -- a formik instance with its validation and touched machinery, a config-store subscription, two effects and a 500-line render function -- ran once per row on every parent render. Since the context split (row 6) a toast no longer re-renders the app, but `deviceModify` still did. | 5 connected devices = 5 live formik instances, all re-rendering on any parent render | 0 while every sheet is closed | VERIFIED (build + lint); the DevTools commit count is `docs/manual-tests` work | yes | The index key was also a correctness bug: `deviceJoin` rebuilds the list as filter-then-push, so a rejoining device moves to the end and shifts every index after it; React then reuses a row instance across two devices and can carry an open sheet's form state onto the wrong one. |
+| 161 | ui (desktop, macOS) | Permission-gate poll: fixed 200 ms -> 200 ms for the first 2 s, then 1 s to 10 s, then 3 s | The gate is open for as long as the user is in System Settings, which is minutes. 200 ms was five IPC round-trips a second into TCC for all of it. The `focus` listener on the next line is what actually makes the dialog feel instant. | **~300** `check_permissions` calls in the first minute | **~35** worst case in the first minute (10 + 8 + 17) | VERIFIED by construction; not executed here -- Windows and Linux return an empty permission list, so this path never runs on this box | yes | User-visible behaviour is unchanged: flipping the permission in System Settings and returning to the app still advances immediately, via `focus`. |
+| 162 | ui (desktop) | `QrDisplay` memoized and its `<QRCode>` element keyed on `[url, blurred]`; `App.tsx` hands back the previous `qrValues` array when the newly built one is equal | An N-adapter host builds 2N QR codes -- the wide row and the carousel each render the full set -- plus two for the cloud URL, and none was memoized, so all of them re-ran Reed-Solomon and matrix generation whenever `qrValues` was reallocated. `networkChange` reallocates it on any adapter change: a VPN coming up, Wi-Fi roaming. | 2N+2 re-encodes per `networkChange`, on an adapter set that is usually identical | 0 when the adapter set is unchanged; only the changed card otherwise | VERIFIED (build + lint) | yes | `size={500}` was left alone deliberately: the prop is redundant against the `viewBox` but the encode cost does not depend on it, so changing it is risk without gain. |
+| 163 | ui (desktop) | Walkthrough highlight: unconditional `requestAnimationFrame` loop -> full rate only during a 700 ms burst after a scroll, a resize or any CSS transition in the document, with a 250 ms idle net and the target element cached between measurements | A `querySelector` plus a `getBoundingClientRect` -- a synchronous layout flush -- at the display's refresh rate for as long as a step was on screen, on a host that is simultaneously capturing, encoding and streaming a display. | 60-144 forced layouts/s for the whole tour | ~4/s when nothing is moving; unchanged while the 300 ms sidebar collapse or a resize is in flight | VERIFIED (build + lint) | yes | `transitionrun`/`transitionend` is what covers the sidebar collapse -- the case the rAF loop existed for and the one `onResized` alone missed. |
+| 164 | ui (desktop) | `get_avatar`/`set_avatar` carry base64 `String` instead of `Vec<u8>` (`number[]` over the bridge); `loadAvatar` assigns the result straight to `<img src>` | A 256x256 PNG crossed as a JSON array of decimal integers -- 3-4 bytes of JSON per image byte -- was parsed into an array of tens of thousands of boxed numbers, walked into a `Uint8Array`, wrapped in a `Blob` and run through a `FileReader` to produce the base64 data URL the `<img>` wanted in the first place. This runs on every launch, concurrently with `setup()`. | ~50 KB PNG -> **~180 KB** JSON payload plus three representations | **~67 KB** base64 payload, one representation, no conversion | VERIFIED (build, clippy, 186 tests, bindings regenerated from a debug build with no CLI args -- the diff is the two signatures and nothing else) | yes | `write_avatar`/`read_avatar` stay byte-level so the `account avatar set|show` CLI path does not round-trip through base64 for nothing. `base64` was already in the tree via the webrtc stack. |
+| 165 | ui (desktop) | Settings: `sortedKnownDevices` memoized over a `Set` of connected IPs; the Past Devices table extracted into a `React.memo` child | The comparator called `connectedDevices.some(...)` twice per comparison, so the sort was O(n log n * m) and ran on every render -- which on this page means every keystroke in any of eleven controlled inputs. | re-sorted per keystroke; N rows re-rendered per keystroke | sorted only when the device lists change; 0 rows re-rendered per keystroke | VERIFIED (build + lint) | yes | The finding's larger proposal -- extracting all seven `<Card>`s -- was not done: state crosses card boundaries in this 1616-line component (the session OTP feeds both the session card and the wifi-QR dialog), and both concrete sub-issues it named are fixed. |
+| 166 | ui (desktop) | Seven `catch {}` blocks that discarded the reason now report it; type-aware ESLint turned on with `@typescript-eslint/no-floating-promises` as a warning | `console.error` reaches the Rust log bus since the error-reporting wrapper landed, so a swallowed reason is now cheap to surface. The updater one mattered most: a network failure, a bad signature or a malformed `latest.json` was indistinguishable from "no update available". | 7 silent failure paths; every type-aware lint rule off | all 7 on the log bus; `no-floating-promises` finds 18 real sites | VERIFIED | yes | `pnpm lint` 3.2 s -> 6.7 s. The rule is a warning, not an error: most hits are formik's `setFieldValue`, which cannot reject. |
+| 167 | ui (desktop) | `<link rel=preload as=font>` for the webfont, injected from the emitted bundle by a `transformIndexHtml` plugin; the dashboard carousel's scrollbar rule moved out of a per-render inline `<style>` into `index.css`; `transition-all duration-500` on the inner sidebar narrowed to `transition-[border-right-width]` | The font is declared inside the 50 KB render-blocking stylesheet, so its fetch only started once all of that CSS had been parsed, and `font-display: swap` paints the fallback first. The sidebar's `transition-all` was inert during the collapse but made the style system keep a full transition snapshot on every recalc, on the same subtree as a 300 ms per-frame layout. | font discovered after 50 KB of CSS; a `<style>` element injected on every dashboard render | font fetch starts with the head; the rule is in the stylesheet | VERIFIED (the preload link is in `dist/index.html`) | yes | The font's `serif` fallback -- the visible half of that finding -- is still open under "UI-visible recommendations". |
+| 168 | ui (desktop) | Past Devices rows keyed on `${token}\|${ip}` instead of `ip`; the device-editor body mounts during render rather than from an effect | Device trust is keyed on the per-device token, so one IP legitimately owns several rows -- one per device that has used the address -- and keying on the IP alone collapsed them onto a single React identity, which is how a row can show another device's ban state. | React's duplicate-key warning on every Settings render, invisible in a release build | unique per row | VERIFIED -- found by running the app, not by reading it: `logbus::set_verbose(true)` forced on in a debug build made the frontend's `console.error` forwarding print to the terminal, and this was the only frontend line in the whole boot | yes | The same bug in the *connected* devices table was fixed in row 87. Worth noting as a method: the error-forwarding wrapper turned a class of React warning that nobody can see in a release build into something a terminal run reports. |
+| 169 | audio (macOS) | SCK audio teardown: blank the delegate ivar, stop the stream, post a synchronous barrier onto the serial delivery queue, then free the context box | `stop()` freed the box after releasing the stream, delegate and queue, on a comment that asserted no callback could still read it. Releasing a `DispatchQueue` handle neither drains nor cancels blocks already enqueued on it, and `stopCaptureWithCompletionHandler:` is not documented as a barrier against an in-flight `stream:didOutputSampleBuffer:ofType:` -- so the delegate surviving one extra retain handed a real-time callback a dangling pointer. | a use-after-free racing the `UserInteractive` delivery queue on every teardown, presenting as a rare crash on disconnecting the last audio-enabled device -- or as nothing | the ivar is null before the stop, and the serial queue is drained to a barrier before the free; three ordered steps with no window between them | COMPILE-CHECKED (13.0+ path, no machine on this project runs it) | yes | The Process Tap sibling needs none of this: `AudioDeviceDestroyIOProcID` is documented not to return while the IOProc runs. `macos_utils/streamer/sck.rs` (W5) still has the identical shape and the recipe transfers verbatim. |
+| 170 | audio (macOS) | SCK dummy video stream: added `showsCursor: false` and `queueDepth: 3` to the existing 2x2 at 1 fps | SCK has no audio-only mode before the 14.2 Process Tap, so this backend must run a real screen stream to get audio at all. The Screen Recording requirement and the menu-bar indicator are Apple's constraint; what the stream costs while it is up is not. | 2x2 at 1 fps with default cursor compositing and default queue depth | same geometry with cursor compositing off and the shallowest queue SCK accepts; no screen output is registered, so every frame produced is dropped at the delegate | COMPILE-CHECKED (13.0+ path) | yes | `powermetrics` on a 13.x machine is the measurement; `setExcludesCurrentProcessAudio: true` was already correct, so the host's own audio is not fed back. |
+
 ## Notes
+
+### Considered and rejected on the macOS capture/encode path (W5)
+
+**One VideoToolbox session shared between clients at the same resolution.** The hardware encoder
+is instance-limited and ScreenExtend creates a session per connected device, so two phones asking
+for the same geometry hold two scarce sessions to produce identical bitstreams. Sharing them is a
+real saving and it is *not* a small change: the pipeline, the bitrate controller, the IDR request
+and the telemetry are all per-session by construction, and a shared encoder would need a
+per-client keyframe policy — a joining device needs an IDR the others do not. What landed instead
+is the detection half: the instance-limit flag is read out of `VTCopyVideoEncoderList` and logged,
+and a session that falls to software says so loudly. That is what turns "it only works when I quit
+everything else" from folklore into a log line. The sharing belongs with whoever owns the session
+lifecycle, not with the encoder.
+
+**Falling back from ScreenCaptureKit to CGDisplayStream mid-session.** Rejected. The tier is
+decided at start and now requires a delivered frame before it is committed, which covers the
+documented 12.3 failure. Swapping capture backends under a live session risks a worse failure than
+the stall it would paper over, and a WindowServer stall — the usual cause of a mid-session dry
+spell — is not something the other API would fix. The watchdog that does help is the first-frame
+deadline: after 750 ms with nothing captured the encode loop synthesizes a black IDR and counts
+`capture_no_first_frame`, so the condition is visible instead of mute.
+
+**A Metal convert/scale stage in `gpu.rs`.** Rejected, and the placeholder now says why.
+WindowServer delivers the frame already scaled to the requested size and already in the pixel
+format the encoder wants (`420f`), and the delivered IOSurface is wrapped rather than copied all
+the way into VideoToolbox — so there is no CPU conversion to move onto the GPU. Whether
+WindowServer's own downscale costs anything is a separate question, and it now has an instrument:
+`cgds::tests::capture_rate` captures at native size and `cgds::tests::capture_rate_downscaled` at
+half, and both print the same `displayTime → callback` distribution.
+
+**`kVTCompressionPropertyKey_ConstantBitRate` as a replacement for the removed `DataRateLimits`.**
+Rejected. CBR spends bits to hold the rate on a screen that is not changing, which is the opposite
+of what a screen sharer wants; `AverageBitRate` plus the loss-based controller is the right shape.
+The property is probed and named in the per-session property line so the decision is visible
+rather than absent.
+
+**`CGVirtualDisplaySettings.refreshDeadline`.** Absent on the 10.15 floor, so there is nothing to
+measure here. It is probed with `respondsToSelector:` and reported, deliberately not set. It is
+the only latency-named knob on the WindowServer side of that boundary, which is where the largest
+single term in the host path lives, so the experiment is written up for a modern Mac in
+`docs/manual-tests/macos-capture-encode.md` §10.
+
+
+
+### UI-visible recommendation (W7): the screen-recording indicator on macOS 13.0-14.1
+
+Not applied — it changes user-facing copy, which is out of scope for this engagement.
+
+On macOS 13.0 through 14.1 there is no audio-only system-audio API: the Process Tap arrives in
+14.2, and below 13.0 the driver tier covers it. In that band ScreenCaptureKit is the only native
+backend, and SCK has no audio-only mode, so ScreenExtend must run a real (2x2, 1 fps) screen
+stream to receive audio at all. macOS therefore requires Screen Recording and lights the menu-bar
+screen-recording indicator for the whole session — including when a device has audio on and video
+off, where it appears for no reason the user can see.
+
+`CompatibilityReport.audio_backend` already carries `screencapturekit`, so the UI can say this
+exactly where it matters: in the per-device audio toggle, when that value is
+`screencapturekit`. Something to the effect of *"macOS will show the screen-recording indicator
+while system audio is on — this version of macOS has no audio-only capture."* Nothing needs to be
+plumbed; the value is already on the frontend.
+
+The third option the finding raised — reusing the video path's existing `SCStream` when the same
+device already has video capture running — is **rejected**. The two streams have different owners
+(`macos_utils/streamer/sck.rs` is W5's, per-display, started and stopped per pipeline;
+`audio/sck_audio.rs` is host-wide and lives as long as the `AudioHub` has a subscriber), different
+lifetimes and different content filters. Fusing them would couple the audio hub's lifetime to a
+particular device's video pipeline, which is exactly the coupling `AudioHub` exists to avoid — and
+it would buy nothing for the audio-on/video-off case that generates the complaint, since there is
+no video stream to share there.
+
+### macOS audio after the W8 merge: `ts_clamped=0`, and the number to quote (W7)
+
+`w7-macos-audio` merged `latency-overhaul` at `cf9d6fc9`, which brought W8's shared audio core
+(broadcast depth 80 ms, `FLAG_REDUNDANT`, `probe --audio`, the `AudioDiagnostics` histograms) onto
+the macOS side. All three gates pass on the merged tree — `cargo fmt --check`,
+`cargo clippy --all-targets -D warnings`, `cargo test` (286 passed, 16 ignored) — on macOS 10.15.8,
+which closes `major-build-w8-shared-audio-changes-never-gated-on-macos`. The one conflict was the
+legacy live tests: `AudioCapture` no longer carries an `rx`, so they subscribe to the broadcast
+*before* `start_capture` (a receiver made afterwards misses the head of the run), drain with
+`try_recv`, and assert `Lagged` never fires. It did not.
+
+Re-measured after the merge through the shipped path, driver loaded:
+
+    capture->packet = 2.10 / 4.19 / 4.72 / 5.22 ms  (p50/p90/p99/max)  <- W8's histogram
+    encode          = 0.10 / 0.12 / 0.16 / 0.62 ms
+    period=128fr  discontinuity=1  lagged=0  ts_clamped=0
+    capture_ns deltas: 1 of 1227 not exactly 5.000 ms, 0 regressions, 0 sequence gaps
+
+**Quote the histogram, not the subscriber-side number.** `capture_to_packet` is the shared
+instrument both platforms report, recorded inside the worker as each packet is created. Row 111's
+p50 of -0.57 ms is a *signed* subscriber-side measurement taken after the broadcast hop, and it
+exists for one purpose: to establish the **direction** of the skew, which a saturating histogram
+cannot show. Both agree the p99 is about 5 ms.
+
+**`ts_clamped=0` is the answer W8's note asked for.** On Windows loopback the endpoint timestamp is
+a play cursor roughly 15 ms in the future and the shipped anchor is
+`min(qpc_host_ns, now - read_duration)`, with `capture_ts_clamped` counting how often that bites —
+every drain on the endpoint tier. On macOS the driver stamps the mix with `mach_absolute_time()` in
+`OnProcessMixedOutput`, a genuinely past instant, so the same counter reads **zero** and no clamp
+is warranted. The Process Tap tier is still an open question: its aggregate carries its own latency
+and safety offset, and its skew must be measured on a 14.2+ machine before that tier is trusted.
+
+`discontinuity=1` where it read 0 before: the macOS worker now increments `discontinuity_count` on
+a timeline re-seat, so the shared summary and the worker's local `resyncs` counter finally agree.
+
+### macOS audio: what was rejected, and why (W7)
+
+Four W7 findings were resolved by a recorded decision rather than a change. Each was tried or
+reasoned to a number first.
+
+**No clamp on the macOS hardware capture timestamp.** W8's Windows fix ships
+`min(qpc_host_ns, now - read_duration)` because a loopback stream's endpoint timestamp is a *play
+cursor*, roughly 15 ms in the future, and left alone it made the client under-buffer. Its note
+asked macOS to measure the signed skew before trusting the equivalent. Measured: p50 **-0.57 ms**,
+min -6.23, over 3277 packets — under one 2.67 ms IO cycle, and it is the *right* direction, because
+the driver stamps the mix in `OnProcessMixedOutput` when the mix exists rather than when it is
+heard. Applying the Windows clamp here would flatten the within-block ladder that produces the
+exact 5.000 ms packet spacing (0 of 3277 deltas were anything else), which is the property the
+whole `capture_ns` fix exists to provide. The Process Tap tier is a different question — its
+aggregate has its own latency and safety offset — and the tap's own skew must be measured on a
+14.2+ machine before that tier is trusted. Recorded in `docs/manual-tests/macos-audio.md`.
+
+**`mach_wait_until` for the shm reader.** The finding offered it as the deadline-honouring
+alternative to a poll on a thread that had asked for a Mach time-constraint policy. Rejected: the
+policy was the thing that was wrong, not the sleep. A time-constraint thread that blocks for an
+interval unrelated to its declared period is not honouring the contract and the scheduler's usual
+answer is to demote it, so the policy bought nothing but the risk of being treated as a
+misbehaving RT thread. Dropping it for `user_interactive` and halving the poll to 250 us — a
+quarter of the driver's own IO cycle — is the whole of the available win, and it is measured
+inside row 111's p99 of 4.54 ms. `mach_wait_until` would add a hard-real-time contract to a thread
+whose producer is a *different process* that cannot signal it.
+
+**No sample-rate converter.** `speculative-audio-mac-no-sample-rate-conversion-anywhere` proposed
+either a cheap rate check or a polyphase resampler in `format.rs`. The cheap half is done on both
+paths that can be surprised (SCK, which only *requests* 48 kHz, and the legacy HAL-input fallback,
+which now refuses a non-48 kHz device rather than encoding at the wrong speed). The resampler is
+rejected for now: Opus encodes 8/12/16/24/48 kHz only and the config fixes 48 000, all three macOS
+tiers either negotiate or declare 48 kHz, and the legacy driver *is* 48 kHz by construction — so a
+resampler would be dead code on every path this project can currently run, carrying a quality
+question (polyphase taps, group delay) nobody can evaluate without hardware that reproduces the
+problem. The `teprintln!` that fires if SCK ever delivers another rate is the trigger to revisit;
+until someone sees that line, the finding has no evidence behind it.
+
+**`shm_open` mode is fixed with a umask window, not `fchmod`.** The finding proposed
+`fchmod(fd, 0666)` after `shm_open`. macOS returns `EINVAL` for `fchmod` on a POSIX shared-memory
+object and there is no filesystem path to `chmod`, so clearing the umask across the create is the
+only lever available. `shmcheck` reports the resolved mode and the driver logs it, so a host that
+still cannot map the segment says so instead of silently taking the slow transport.
+
+**What is left of `minor-audio-mac-swallowed-errors-and-panicking-unwraps`.** Every item that
+could leave the system in a wrong state with no trace is fixed: `RoutingState::save`'s two
+discarded `io::Error`s (a state file that cannot be written is exactly when crash recovery
+silently cannot run), the shm reader's `.spawn(...).ok()` (which reported `Transport::Shm` with no
+thread behind it, after printing the success line, and produced no audio forever), the
+post-aggregate tap format `unwrap_or`s, `install_watchdog_agent`'s discarded `launchctl` result,
+the volume proxy's and the volume tap's `let _ =` on HAL writes, SCK's discarded stop timeout, and
+`join.join()` swallowing a worker panic. Three classes were deliberately left:
+
+- `NonNull::new(&mut local as *mut _).unwrap()` in the property getters. The pointer is always a
+  stack address, so the `unwrap` is unreachable by construction. Churning ~15 call sites to remove
+  noise that cannot fire is not worth the diff.
+- `AnyClass::get(c"NSString"/`NSUUID`/`NSObject`).expect(...)`. These are Foundation classes on a
+  10.15 floor; if one is missing the process is already unrecoverable, and the tier probes that
+  *can* legitimately fail (`CATapDescription`, the SCK classes) already return
+  `AudioCaptureError::Unsupported` rather than panicking.
+- `let _ = self.monitor.push(samples)` in `CaptureTargets::publish`. The monitor ring drops by
+  design whenever playthrough is stopped, so a counter here would need to be conditional on the
+  playthrough being live; `IoCtx::underruns`, now reported, is the signal that actually matters.
+
+**The unbounded `AudioPacket` channel is resolved by W8's merge, not here.**
+`minor-audio-mac-unbounded-packet-channel-and-blocking-teardown` had two halves. The blocking
+halves are fixed (SCK's two 5 s bridges cut to 1.5 s, `start_capture`'s unbounded
+`ready_rx.recv()` given a 15 s ceiling). The channel itself disappears with W8's shared-core
+change, which removes `AudioCapture::rx` entirely and has backends publish into an `AudioSink`
+broadcast — so adding back-pressure to a channel that is about to be deleted would be work thrown
+away. The `major-build-w8-shared-audio-changes-never-gated-on-macos` finding stays open until that
+merge has been gated on the Mac.
+
+**Dead-code items 1, 2, 3 and 5 deleted; item 4 surfaced; item 6 wired.** From
+`minor-audio-mac-dead-code-inventory.md`: `ProcessTapCapture::try_create` and
+`SckAudioCapture::try_create` (probe constructors nothing called, each of which would have built
+and *started* a whole capture session to drop it), `nonsilent_probe` (an `Arc<AtomicU64>` allocated
+per start and connected to nothing), `Playthrough::gain()` and `ControlHandle::transport` are gone.
+`IoCtx::underruns` is now reported by the control thread every 10 s. `is_fast_path()` went from
+zero callers to being the fast path in row 113.
+
+### What is left of the DXGI fallback on this hardware, and what that costs (W3a)
+
+DXGI Desktop Duplication is the fallback every Windows 10 and pre-24H2 Windows 11 host used to
+land on by default, and after row 95 it is a genuine fallback again rather than the default. Rows
+103-107 are all repairs to it. What could not be repaired here is that **it does not run on this
+machine at all**:
+
+- `\\.\DISPLAY1` (the 1920x1080@360 primary) is enumerated by exactly one adapter, the RTX 3080 Ti
+  Laptop GPU, and `DuplicateOutput` and `DuplicateOutput1` both return `DXGI_ERROR_UNSUPPORTED`
+  (`0x887A0004`) on it. Trying every adapter that lists the display (row 104) does not help,
+  because there is only one. This is the documented hybrid-graphics behaviour: on an Optimus-class
+  machine duplication is refused for a process running against the discrete GPU.
+- Against a freshly created IDD virtual display, duplication *is* created — and then returns
+  `ACCESS_LOST` on every acquire, indefinitely. That is now bounded and named (row 105) rather
+  than an endless silent spin, but it still produces no frames.
+
+So every DXGI row above that claims a *latency* improvement — row 106 in particular, the
+capture/encode decoupling — is `COMPILE-CHECKED` and cannot be promoted from this machine. The
+functional rows (103, 104, 105, 107) are `VERIFIED` because their evidence is a failure mode that
+stopped reproducing, which this machine can show. `docs/manual-tests/windows-capture.md` §5b is
+the script for a host where duplication works.
+
+The consolation is that the population that needed DXGI most has largely moved: with row 95, a
+Windows 10 host stays on Windows.Graphics.Capture, which is the better path anyway.
+
+### Rejected: `Direct3D11CaptureFramePool::CreateFreeThreaded` (W3a)
+
+`WgcFeatures` probes `CreateFreeThreaded` and reports `+free-threaded-pool` on the dev box, and
+the pool is still created with `Create`, which binds `FrameArrived` to the calling thread's
+`DispatcherQueue`. Every captured frame therefore costs a DWM signal, a dispatcher-queue enqueue,
+a thread wake, a `GetMessageW` return and a `DispatchMessageW` before the handler runs. Sunshine
+uses `CreateFreeThreaded`; OBS uses `Create`.
+
+Not taken, on the measurement rather than on the difficulty. The stage this would shrink is
+`capture_delivery` — WGC's own `SystemRelativeTime` to the first instruction of
+`on_frame_arrived` — and `docs/BASELINE.md` measures it at **p50 0.98 / p90 4.19 / p99 6.82 ms**
+static and **p50 6.29 / p90 9.44 / p99 20.97 ms** on a live 1080p desktop. A thread wake on a hot
+thread is tens of microseconds. Even taking the whole pump hop as pure overhead it is low
+single-digit percent of the smallest of those numbers, and the stage is plainly dominated by the
+compositor's own cadence.
+
+Against that: with `CreateFreeThreaded` the handler runs on an arbitrary thread-pool thread, so
+the MMCSS "Pro Audio" registration, the `TIME_CRITICAL` priority and the P-core confinement
+applied in `LiveCapture::new` all land on the wrong thread and would have to be re-applied per
+callback behind a `thread_local`; `on_frame_arrived` loses its arrival *ordering* (the handler
+mutex still serializes, so this is not a data race, but frames could be encoded out of order); and
+the `WM_QUIT` shutdown handshake needs replacing with an event the free-threaded handler observes.
+Three real risks to buy a few percent of a stage that is not the bottleneck.
+
+Revisit if `capture_delivery` p50 ever falls to the same order as a thread wake — which would mean
+the compositor hop had been solved some other way, and then this would be what is left.
+
+This disposes of both `speculative-wgc-free-threaded-pool-probed-but-not-used` and
+`minor-wgc-frame-delivery-goes-through-a-win32-message-pump`, which describe the same change.
+
+### Rejected: double-buffering the CPU-bridge staging texture (W3a)
+
+`Scaler::read_back` and `TextureReader::read_back` both do `CopyResource` into a single staging
+texture and then `Map(..., D3D11_MAP_READ, 0, ...)` with no `DO_NOT_WAIT`, which blocks until the
+GPU has retired that copy. The proposal was to double-buffer and map frame N-1 while copying frame
+N, or to poll with `DO_NOT_WAIT` and skip the frame rather than block.
+
+Measured, so the arithmetic can be done: at 1920x1080 → 1280x720 the whole readback — copy, map
+stall and memcpy together — is **1192 us** median in BGRA and **740 us** in NV12 (row 108), while
+the `VideoProcessorBlt` submit beside it is 4-5 us. Pipelining the map costs a full frame period
+of latency, 16.7 ms at 60 Hz and 8.3 ms at 120 Hz, to remove at most 1.2 ms of stall. Polling with
+`DO_NOT_WAIT` costs a captured frame instead, which is worse on a path whose whole job is to
+deliver frames.
+
+Two things did land against this finding and they are the ones worth having: the stall moved off
+the capture thread onto a dedicated encode thread on the DXGI path (row 106), so it no longer
+delays the *next* capture; and NV12 output took 38% off it (row 108). What is left is where it
+belongs.
+
+### Rejected: removing the per-frame `Flush` in the NVENC ring stage (W3a)
+
+`AsyncNvencRing::stage` runs `AcquireSync(KEY_WRITER)`, a copy or scale into the shared texture,
+`Flush()`, `ReleaseSync(KEY_ENCODER)` on the WGC callback thread, once per frame. The question was
+whether the explicit `Flush` is redundant given that `ReleaseSync` is itself a GPU-visible
+synchronisation point.
+
+Kept, without a measurement, and deliberately: the destination is a **cross-device** shared
+resource (`SHARED_NTHANDLE | SHARED_KEYEDMUTEX`, opened on the other device with
+`OpenSharedResource1`). A keyed mutex orders access between devices but does not force the
+producer's command list to be submitted; the documented requirement for cross-device shared
+surfaces is to flush before releasing, and NVIDIA's own samples do. The failure mode of getting
+this wrong is a torn or stale frame that appears only under load on some drivers — the class of
+bug that a 30-second probe run will not show and a user will. A microsecond-scale saving is not
+worth buying that with an untestable hypothesis.
+
+The related cost was addressed instead: `stage` was already the whole of what the callback does on
+the ring path, and rows 96 and 102 removed the frames that reach it unnecessarily.
+
+### Rejected: high-resolution waitable timers and thread memory priority (W3a)
+
+Two scheduling levers from the W3a brief that turn out to have nothing to act on.
+
+**`CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)`** (Win 10 1803+) gives roughly
+0.5 ms wait granularity against the 1 ms that `timeBeginPeriod(1)` already buys. It would only
+matter on a thread whose deadline is timer-driven, and the frame path has none: the WGC path is
+event-driven end to end (DWM signals the frame pool, the callback runs, the ring hands the slot to
+an encode thread over a channel), and the DXGI path's wait is `AcquireNextFrame`'s own kernel wait,
+not a sleep. The three timed waits that do exist are the 200 ms keepalive, the ring encode
+thread's tick and the repeater's tick, and none of them is precision-sensitive — the keepalive is
+allowed to be a millisecond late by construction. Adding a waitable timer would add a handle per
+thread and change nothing measurable.
+
+**`SetThreadInformation(ThreadMemoryPriority)`** raises a thread out of a low memory priority.
+The default for a normal process is already `MEMORY_PRIORITY_NORMAL`; the call is a no-op unless
+something lowered it first, which nothing here does. The neighbouring `ThreadPowerThrottling`
+information class *is* worth setting and is now set (row 109's sibling commit) — but for a
+different reason: Windows 11 throttles threads of a minimised or occluded window, which is the
+ScreenExtend window's normal state while streaming.
+
+### The classic WGC path still encodes in the frame callback, and why that is different from DXGI
+
+Row 106 decoupled capture from encode on the DXGI path. The classic (non-ring) WGC path — which is
+what an Intel, AMD or software encoder gets — still runs the whole encode inside
+`on_frame_arrived`, i.e. on the WGC delivery thread, holding the handler mutex.
+
+Left alone deliberately, because the two situations are not the same shape. DXGI's
+`AcquireNextFrame`/`ReleaseFrame` is a strict pair with no buffering: while the encode ran, the
+duplication was simply not being read, so the compositor's next present had nowhere to go and the
+achievable rate really was `1 / (capture + encode)`. WGC has a frame pool in front of the callback,
+and with rows 96's per-path depth and drain-to-newest, a slow callback costs *stale frames*, which
+are counted in `frames_dropped_stale` — not compositor stalls. The consumer falls behind and then
+catches up on the newest frame, which for a screen-share is the correct thing to lose.
+
+Extending the ring to the non-NVENC backends would still be worth doing, and it is a bigger change
+than it looks: the ring is built around NVENC's shared keyed-mutex input textures, so a generic
+version needs the slot-texture ring that `DxgiRing` now is, plus a decision about which device owns
+the slots for each backend. `DxgiRing` is the shape to lift. Not attempted here because the
+measurable half of it — the DXGI path — is the one that could not be measured on this machine
+anyway (see the DXGI note above), so there would have been no number either way.
 
 ### The AirPlay tier now has a working end-to-end harness, and what it settled
 
@@ -224,10 +604,43 @@ at the `Store` boundary measures the thing that actually mattered instead.
 build -- and says nothing useful about a production launch. It is recorded so a later production
 measurement has something to be compared against methodologically, not numerically.
 
+### W12 close-out: per-chunk bundle sizes
+
+`pnpm build` output before and after the close-out pass (branch `w12-closeout`, base
+`latency-overhaul` at `0e50445`). Raw size, gzip in brackets. Only the chunks that moved are
+listed; `monaco-setup` (2,957.05 kB / 765.79 kB), the two monaco workers, the fonts and the icon
+chunks are unchanged.
+
+| chunk | before | after | delta |
+|---|---|---|---|
+| `main-*.js` (eager entry) | 565.27 kB (181.44) | 566.74 kB (181.96) | **+1.47 kB** (+0.52) |
+| `main-*.css` | 52.92 kB (9.33) | 50.43 kB (9.07) | **-2.49 kB** (-0.26) |
+| `devices-*.js` | 76.54 kB (24.37) | 76.90 kB (24.50) | +0.36 kB |
+| `settings-*.js` | 52.77 kB (15.36) | 53.17 kB (15.51) | +0.40 kB |
+| `dashboard-*.js` | 31.06 kB (12.02) | 30.89 kB (11.99) | -0.17 kB |
+| `config-json-editor-*.js` | 32.78 kB (11.63) | 32.94 kB (11.70) | +0.16 kB |
+| `index.html` | 2.75 kB (1.07) | 4.22 kB (1.70) | +1.47 kB |
+| **total moved** | **814.09 kB** | **815.29 kB** | **+1.20 kB** (+0.15%) |
+
+The pass was not a size pass and it did not become one: the shipped bytes are flat to within a
+fifth of a percent. What moved is where work happens rather than how much of it is downloaded --
+the eager chunk grew by the theme paint hint, the `qrValues` equality check, three `React.memo`
+wrappers and the walkthrough's event plumbing, and the stylesheet shrank because two components
+tailwind was still scanning are gone. `index.html` grew by the background paint, the theme hint
+script and the font preload link, all of which are on the critical path *before* any of those
+assets are fetched.
+
+The one large size win available was measured and not taken: stubbing out `NextStepProvider` and
+`NextStepReact` drops the eager chunk to **420.56 kB** (gzip 135.15), i.e. `nextstepjs` + `motion`
+are **146.01 kB / 46.75 kB gzipped, 25.8%** of it. See recommendation 2 below for why it is a
+visible change rather than a free one.
+
 ### W12 UI-visible recommendations (not applied)
 
 The engagement rule is that the desktop UI stays element-for-element and pixel-for-pixel identical.
-These four would pay off and were deliberately not made.
+These would pay off and were deliberately not made. Items 1-4 are from the first W12 pass; 5-9 came
+out of the close-out, which resolved every remaining `Workstream: W12` finding. The findings
+themselves are deleted -- this list is what survives them.
 
 1. **Drop the `!important` from the global `button, input` transition.** Component-level
    `transition-colors` utilities on nine kit components are currently unreachable, and
@@ -238,12 +651,22 @@ These four would pay off and were deliberately not made.
    of transitions; no measured latency difference, since row 12 already removed the expensive half.
    Filed as `findings/minor-ui-global-button-transition-still-overrides-the-kit.md`.
 
-2. **Lazy-load `nextstepjs` + `motion`.** They are the largest non-React item left in the 565 kB
-   eager chunk. `NextStepReact` renders the whole app as its `children`, so `React.lazy` around it
-   means the Suspense fallback is shown on first mount -- there is no previous screen for
-   `startTransition` to hold. The tour runs at most once per install. Upside: unmeasured; the
-   finding records how to measure it in one build before anyone commits to the work. Filed as
-   `findings/minor-ui-walkthrough-provider-holds-motion-in-the-entry-chunk.md`.
+2. **Lazy-load `nextstepjs` + `motion`.** They are the largest non-React item left in the eager
+   chunk, and the upside is now **measured**: replacing `NextStepProvider` and `NextStepReact`
+   with pass-through stubs and building takes `main-*.js` from **566.74 kB to 420.56 kB**
+   (**-146.01 kB, -25.8%**; gzip 181.96 -> 135.15 kB, **-46.75 kB, -25.7%**). That is the largest
+   single win left in the desktop UI.
+
+   It was not taken because `NextStepReact` is not merely an ancestor by convention -- it renders
+   two real DOM elements around the app (`div[data-name=nextstep-wrapper]{position:relative;
+   width:100%}` wrapping `div[data-name=nextstep-site]{display:block;width:100%}` wrapping
+   `children`). The `position: relative` wrapper is the containing block for every
+   `position: absolute` descendant that has no closer positioned ancestor, `#innerSidebar` among
+   them. So neither of the finding's two routes is free: hoisting `NextStepReact` out from around
+   the router deletes those elements, and `React.lazy` with a matching fallback unmounts and
+   remounts the whole app when the chunk resolves, losing every piece of React state with it.
+   The honest version is a swap that is signed off as a visible change, or a fork of the library
+   that portals its overlay instead of wrapping. The tour runs at most once per install.
 
 3. **Fix `tooltip.tsx`'s Tailwind-v4 class syntax.** Five arrow-positioning classes
    (`data-[side=left]:top-1/2!` and siblings, plus `z-60`) generate no CSS under Tailwind 3, so the
@@ -252,9 +675,132 @@ These four would pay off and were deliberately not made.
    existing finding `minor-ui-tooltip-tailwind-v4-syntax-dead-classes.md` is left open.
 
 4. **The webfont's `serif` fallback.** `src/index.css` sets
-   `font-family: "Geist Variable", serif`, so first paint is Times and then reflows. Fixing the
-   stack changes what the user sees during the first ~100 ms. Left open as
-   `minor-ui-font-fallback-is-serif-and-unpreloaded.md`.
+   `font-family: "Geist Variable", serif`, so the pre-swap frame is Times -- at Geist's metrics,
+   so the swap is a full-page reflow, not just a colour change, and it lands on the `text-4xl`
+   sidebar headline where it is most obvious. `pre`, `code`, `kbd` and `samp` are in the same
+   rule and want a monospace fallback rather than a serif one. Fixing the stack changes what the
+   user sees during the first frames, so it was not applied. The invisible half of that finding
+   *was*: the font now has a `<link rel=preload>` (row 94), which shortens the window without
+   changing what is in it. Suggested replacement, for whoever signs it off:
+
+   ```css
+   html, body, input, textarea, button, select, optgroup {
+     font-family: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+   }
+   pre, code, kbd, samp { font-family: ui-monospace, Menlo, Consolas, monospace; }
+   ```
+
+5. **`index.html`'s global chrome-suppression scripts.** The `click` listener calls
+   `preventDefault()` on *any* click anywhere in the document with Ctrl, Cmd, Shift or Alt held.
+   Alt+click is Monaco's multi-cursor gesture, Ctrl/Cmd+click is add-cursor / go-to-definition,
+   and Shift+click is the standard range-extend for text and list selection; the Settings JSON
+   editor is a full Monaco instance. `contextmenu` is suppressed globally, which also removes
+   cut/copy/paste and spellcheck from every text input, with no in-app replacement menu. And the
+   reload guard checks `event.ctrlKey && event.key === "r"` but never `metaKey`, so Cmd+R is not
+   blocked on the one platform whose WKWebView is most likely to honour it. Narrowing the click
+   guard to `event.target.closest("a[href]")`, exempting `.monaco-editor, input, textarea,
+   [contenteditable]` from the context-menu guard and adding `metaKey` to the reload guard all
+   change behaviour the user can observe, so none was applied. `Element.closest` is Safari 9+,
+   so the narrowed form is safe on the floor. Was
+   `minor-build-index-html-blocks-modifier-clicks-globally.md`.
+
+6. **An open hosted network is announced by a toast, not a consent prompt.** When macOS refuses
+   every secured `securityType`, `start_hosted_network` falls back to an unencrypted AP and the
+   only signal is a destructive toast. The toast is transient; the network is not -- it stays up
+   for the session, and the dashboard shows it exactly as it shows a secured one, while the join
+   URL, session id and OTP are readable by anyone in range who associates. The fix is a
+   confirmation before the fallback starts anything plus a persistent badge while it is up; the
+   backend half is one branch, since `start_via_host_ap` already knows it is about to drop to
+   `SECURITY_OPEN`. Both are new UI. Also W6's territory. Was
+   `minor-ui-an-open-hosted-network-is-announced-by-a-toast-that-disappears.md`.
+
+7. **`bootstrap.tsx` offers "Install drivers" on macOS, where the command is a `true`-returning
+   stub.** `runSetup(true)` reacts to a failed `setup()` by calling `installDrivers()`, sleeping
+   five seconds and retrying -- on macOS that is a guaranteed no-op followed by an identical
+   failure -- and the error dialog renders a button whose copy tells the user to press it.
+   Gating both on `type() === "macos"` removes a control and changes the timing of an error
+   screen. Upside: five seconds off every macOS setup failure and a dialog that says something
+   true. `setup` returning a reason rather than a bare `bool` is the other half, and that is a
+   command-surface change across all three `*_utils` modules. Also W6's territory. Was
+   `minor-ui-bootstrap-offers-install-drivers-on-macos-where-it-does-nothing.md`.
+
+8. **The sidebar collapse animates `width`.** `#sidebar` transitions 275px to 0 over 300 ms, and
+   `width` is a layout property: every frame reflows the sidebar *and* the sibling flex child,
+   which is the whole page content -- the QR carousel, the device table, the settings form. It
+   cannot be composited, and it runs on the main thread of a process that is simultaneously
+   capturing, scaling and encoding video. Animating `transform: translateX(-275px)` with a
+   matching `margin-left` on the content pane, or a `grid-template-columns` transition, keeps the
+   sidebar's own subtree off the layout path -- but the sidebar currently *clips* from the right
+   under `overflow-hidden` while a transform would *slide* it, which is a different animation.
+   The cheap half was applied (row 94): the second, nested `transition-all duration-500` on
+   `#innerSidebar` now names the one property that actually flips. Was
+   `minor-ui-sidebar-animates-layout-properties.md`.
+
+9. **Two error paths report the wrong thing.** `buildQrValues` returns `[]` when
+   `getNetworkAdapters()` throws, and the dashboard renders an empty list as "Join or Create a
+   Network (none were found)" -- the wrong message for an IPC failure. `ensurePermissions`
+   returning `false` means "nothing was missing", so a permission *check* that failed is treated
+   as all-granted and startup proceeds. Both now put the reason on the log bus (row 93), but
+   fixing what the user is told is a copy change in the first case and a new blocking state in
+   the second. Was part of `minor-ui-swallowed-errors-and-silent-fallbacks.md`.
+
+### W12 close-out: the boot verification, and what it caught
+
+`pnpm tauri dev` was run once at the end of the pass on the merged branch, with
+`logbus::set_verbose(true)` forced on in the debug build (a temporary patch, reverted before the
+commit) so the frontend's `console.error` forwarding printed to the terminal instead of only
+reaching the log ring. The app reached the dashboard with `setup()` succeeding, the streamer bound
+to the LAN adapter, HTTP :8080 / HTTPS :8443 listening and the cloud session registered.
+
+Exactly one frontend line appeared in the whole boot, repeated: React's
+`Encountered two children with the same key, 172.16.11.81` from the Past Devices table. That is
+row 95. It is worth recording as a method rather than just a fix -- the release build has no
+devtools, so every React warning of that class was previously unobservable, and routing
+`console.error` to the log bus (which landed earlier in W12) is what made a terminal run report it.
+Anyone touching `src/` should do the same run before declaring a pass finished.
+
+Two backend lines in the same boot are pre-existing and belong to other workstreams, noted here
+only so the next reader does not re-discover them: `SetProcessDpiAwarenessContext failed (likely
+already set): Access is denied` and `MMCSS registration failed for a transport thread; transport
+threads will run unprioritised`.
+
+### W12 close-out: what was tried and rejected, and what is deliberately unchanged
+
+**`build.sourcemap: "hidden"` -- rejected.** A production stack trace from the boot-failure panel
+in `index.html` is minified and close to useless, and that panel exists precisely for the macOS
+10.15 floor where debugging is hardest. But `hidden` emits maps for every chunk, and the monaco
+chunk alone is 2.96 MB minified; the maps would ship inside the bundle resources for a payoff that
+only materialises when someone can also retrieve them. The right shape is emitting maps in release
+CI and keeping them as a build artifact rather than in the app, which is `build-release.yml`'s
+business, not the vite config's.
+
+**`eslint-plugin-react` / `jsx-a11y` -- not added.** Both would need new devDependencies, and the
+engagement's frontend rule is no new dependencies unless unavoidable. The type-aware half of that
+finding, which needs no new package, *was* done (row 93). The a11y gap it names is real and
+unaddressed: `src/layout/layout.tsx`'s sidebar toggle is a `<div onClick>` with no `role`, no
+`tabIndex` and no `onKeyDown`, so it is not keyboard-reachable. Fixing that is a behaviour change
+on a control the user can see, so it belongs with the recommendations above.
+
+**Base UI: a decision is owed, not a change.** `src/components/ui/tooltip.tsx` is the only file in
+the kit that uses `@base-ui/react`; every other component is still Radix. Base UI 1.6.0's shared
+internals reach for `inert` (Safari 15.5), `Element.checkVisibility` (17.4), `CSS.registerProperty`
+(16.4), `Object.hasOwn` (15.4) and `Array.prototype.findLast` (15.4). The current bundle is clean --
+tree-shaking keeps all of it out -- so this is a future hazard, not a live break. `inert` is the one
+that matters: it is in `floating-ui-react/utils/markOthers`, which every focus-managing Base UI
+component pulls in (Dialog, AlertDialog, Menu, Select, Popover, Combobox -- exactly the components a
+continued migration would move next), and it degrades *silently*: focus simply is not trapped and
+nothing errors. `scripts/check-legacy-webkit.mjs` now has a check for it, anchored on the write
+(`setAttribute("inert"`, `.inert =`, `toggleAttribute("inert"`) so that react-remove-scroll's prop
+of the same name is not a false positive; the other four were already covered. The unused
+`@radix-ui/react-tooltip` is gone (row 83). What remains is a maintainer decision -- either Base UI
+is the direction, and that means raising the desktop-UI floor or shipping an `inert` polyfill
+deliberately, or the tooltip goes back to Radix. Discovering it one component at a time is the
+option to avoid. Was `speculative-ui-base-ui-migration-drags-post-floor-apis.md`.
+
+**The tooltip's Tailwind-v4 classes stay broken on purpose.** Recommendation 3 above covers it: the
+five arrow-positioning classes generate no CSS under Tailwind 3, so correcting the syntax *moves the
+arrow*. That is the change the appearance rule forbids without sign-off, and the brief named this
+case explicitly.
 
 ### The bundled indirect display driver: what a rebuild would buy
 
@@ -401,6 +947,18 @@ check-macos-dyld.sh` on a release binary, with the strong `.tbd`-stub verdict on
 the header-availability half — which is what actually catches a newly linked framework API — on
 CI against the runner's own SDK. See `docs/manual-tests/macos-build.md` for what each half is
 worth.
+
+**The perf gate's tolerance is 20%, not the 5% originally specified, and it takes the best of
+three runs.** The same release binary measured `p95_encode` anywhere from **4405 to 9067 us** on
+the dev box across runs, entirely according to how many other `rustc` processes were on the
+machine — a 2.06x spread with nothing changed in the code. A 5% gate on a hosted runner, which
+is a shared VM and no quieter, would be red on almost every pull request and would be turned off
+within a week, which is exactly the history this whole job is trying not to repeat.
+`scripts/perf-gate.mjs` therefore accepts several `--input` files and uses the **lowest** reading
+per metric — the one least polluted by contention; a mean or a median would fold the runner's
+mood into the number — and the tolerance is set from the residual spread of those minima. Both
+choices are documented in `ci/perf-baseline.json` so the next person tightening it knows what
+they are trading.
 
 **The perf gate is Windows-only.** Not a judgement about macOS: the only timing any test prints
 is `p95_encode=<n>us` from the x264 unit test, and libx264 is compiled into the Windows backend
