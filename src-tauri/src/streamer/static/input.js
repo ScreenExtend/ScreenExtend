@@ -257,14 +257,52 @@
     send(OP.PING, pingBuf);
   }
   let lastRttMs = 0;
+
+  // Host clock offset, estimated NTP-style over the PING/PONG pair this channel already
+  // exchanges once a second. The host's clock (`host_now_ns`) is monotonic from its own
+  // process start, so a host timestamp means nothing on this device until we know the
+  // distance between the two epochs. Everything downstream that compares a host capture time
+  // to a local instant — the video display lag, the audio pre-enqueue lag — needs this.
+  //
+  // `offsetMs` is expressed against absolute time (`performance.timeOrigin + now()`), not
+  // against `performance.now()`, because a dedicated worker's time origin is its own
+  // creation, not the page's: only the absolute form is comparable across the page, the
+  // video worker and the audio worker.
+  const clock = { offsetMs: null, rttMs: null, samples: 0, bestRttMs: Infinity, bestAt: 0 };
+  const clockSubs = [];
+  // A minimum-RTT sample is the least queued one, so its midpoint estimate is the tightest.
+  // Age the best sample out so a route change is not remembered for the whole session.
+  const CLOCK_SAMPLE_TTL_MS = 30000;
+
+  function notifyClock() {
+    for (let i = 0; i < clockSubs.length; i++) {
+      try { clockSubs[i](clock.offsetMs); } catch (_) {}
+    }
+  }
+
+  function onPong(dv) {
+    const echoedNs = Number(dv.getBigUint64(1, true));
+    const nowMs = performance.now();
+    const rttMs = nowMs - echoedNs / 1e6;
+    lastRttMs = rttMs;
+    if (dv.byteLength < 17 || !isFinite(rttMs) || rttMs < 0 || rttMs > 5000) return;
+    if (!(rttMs <= clock.bestRttMs || nowMs - clock.bestAt > CLOCK_SAMPLE_TTL_MS)) return;
+    const hostMs = Number(dv.getBigUint64(9, true)) / 1e6;
+    const midAbsMs = performance.timeOrigin + (echoedNs / 1e6 + nowMs) / 2;
+    clock.bestRttMs = rttMs;
+    clock.bestAt = nowMs;
+    clock.rttMs = rttMs;
+    clock.offsetMs = hostMs - midAbsMs;
+    clock.samples++;
+    notifyClock();
+  }
+
   function onReliableMessage(ev) {
     try {
       const dv = new DataView(ev.data);
       const op = dv.getUint8(0);
       if (op === OP.PONG && dv.byteLength >= 9) {
-        const echoed = dv.getBigUint64(1, true);
-        const now = BigInt(Math.round(performance.now() * 1e6));
-        lastRttMs = Number(now - echoed) / 1e6;
+        onPong(dv);
         if (window.SEHealth) SEHealth.alive();
       } else if (op === OP.BYE) {
         if (window.SEHealth) SEHealth.bye(dv.byteLength >= 2 ? dv.getUint8(1) : 0);
@@ -528,5 +566,23 @@
     teardown,
     onViewportSettled() { refreshSize(); sendResize(); },
     get rtt() { return lastRttMs; },
+  };
+
+  // `offsetMs` converts between the host clock and absolute local time:
+  //   hostMs = absMs + offsetMs        absMs = hostMs - offsetMs
+  // Null until the first PONG carrying a host stamp lands (about a second into a session,
+  // and never at all against a host too old to send one).
+  window.SEClock = {
+    get offsetMs() { return clock.offsetMs; },
+    get rttMs() { return clock.rttMs; },
+    get samples() { return clock.samples; },
+    hostNsToAbsMs(hostNs) {
+      return clock.offsetMs === null ? null : hostNs / 1e6 - clock.offsetMs;
+    },
+    subscribe(fn) {
+      if (typeof fn !== 'function') return;
+      clockSubs.push(fn);
+      if (clock.offsetMs !== null) { try { fn(clock.offsetMs); } catch (_) {} }
+    },
   };
 })();

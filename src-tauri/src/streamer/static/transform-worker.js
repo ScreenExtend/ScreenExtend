@@ -21,6 +21,14 @@ let rtpWraps = 0;
 let videoDelayEmaMs = null;
 let lastAvsyncPostMs = 0;
 
+// Host-to-local clock offset measured by the page over PING/PONG (see input.js). Until it
+// arrives this stays 0, which reproduces the old behaviour exactly: the reported delay is
+// then the distance between two unrelated epochs, so it is only meaningful as a *difference*
+// against the audio worker's identically-biased number, which is what A/V sync uses. Once the
+// offset lands the same figure becomes a real display lag in milliseconds.
+let hostOffsetMs = 0;
+let clockValid = false;
+
 const CODEC_CANDIDATES = [
   'avc1.640034', 'avc1.640028', 'avc1.64001F',
   'avc1.4D4034', 'avc1.4D401F',
@@ -44,6 +52,13 @@ self.onmessage = (e) => {
     if (e.data.profileLevelId && /^[0-9a-fA-F]{6}$/.test(e.data.profileLevelId)) {
       preferredCodec = 'avc1.' + e.data.profileLevelId.toUpperCase();
     }
+  } else if (e.data && e.data.type === 'clockoffset') {
+    if (typeof e.data.offsetMs === 'number' && isFinite(e.data.offsetMs)) {
+      const first = !clockValid;
+      hostOffsetMs = e.data.offsetMs;
+      clockValid = true;
+      if (first) videoDelayEmaMs = null;
+    }
   } else if (e.data && e.data.type === 'stats') {
     postStats();
   } else if (e.data && e.data.type === 'rendercount') {
@@ -64,7 +79,7 @@ function reportAvSync(tsTicks) {
   rtpUnwrapLast = ts;
   const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
   const drawAbsMs = performance.timeOrigin + performance.now();
-  const delta = drawAbsMs - videoHostMs;
+  const delta = drawAbsMs - (videoHostMs - hostOffsetMs);
   if (videoDelayEmaMs === null) {
     videoDelayEmaMs = delta;
   } else {
@@ -88,7 +103,7 @@ function reportAvSync(tsTicks) {
 
   if (nowMs - lastAvsyncPostMs > 200) {
     lastAvsyncPostMs = nowMs;
-    self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs });
+    self.postMessage({ type: 'avsync', videoDelayMs: videoDelayEmaMs, clockValid: clockValid });
   }
 }
 

@@ -434,7 +434,10 @@ pub async fn handle_whep_offer(
                         };
                         if let Some(dc_pong) = &dc_pong {
                             if let input::protocol::InputEvent::Ping { t_ns } = ev {
-                                let pong = input::protocol::build_pong(t_ns);
+                                let pong = input::protocol::build_pong(
+                                    t_ns,
+                                    crate::streamer::audio::host_now_ns(),
+                                );
                                 let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
                                 return;
                             }
