@@ -340,10 +340,12 @@ impl Injector {
         if !source.is_null() {
             unsafe { CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0) };
         }
-        if !crate::macos_utils::permissions::accessibility_trusted() {
+        let tier = probe();
+        if !tier.injects() {
             teprintln!(
-                "Accessibility (TCC) not granted — injected input is dropped until ScreenExtend \
-                 is enabled in System Settings > Privacy & Security > Accessibility, then relaunched"
+                "input: Accessibility (TCC) is not granted, so every injected event is dropped \
+                 by the OS — enable ScreenExtend in System Settings > Privacy & Security > \
+                 Accessibility; it takes effect immediately, no relaunch"
             );
         }
         let desktop = desktop_bounds();
