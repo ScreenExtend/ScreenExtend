@@ -118,8 +118,11 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
         </TableRow>
       </TableHeader>
       <TableBody className="border-t">
+        {/* Trust is keyed on the token, not the IP, so the same address legitimately
+            appears more than once -- one row per device that has used it. Keying on the
+            IP alone made React collapse those rows onto one identity. */}
         {devices.map(device => (
-          <TableRow key={device.ip} className={device.banned ? "opacity-60" : ""}>
+          <TableRow key={`${device.token ?? ""}|${device.ip}`} className={device.banned ? "opacity-60" : ""}>
             <TableCell className="font-medium">
               <div className="flex items-center space-x-2">
                 <span>{device.name || "Unknown device"}</span>
