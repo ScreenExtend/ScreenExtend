@@ -10,8 +10,8 @@ mod test;
 
 use anyhow::Result;
 
-use crate::streamer::audio::AudioCapture;
+use crate::streamer::audio::{AudioCapture, AudioSink};
 
-pub fn start_capture() -> Result<AudioCapture> {
-    loopback::start()
+pub fn start_capture(sink: AudioSink) -> Result<AudioCapture> {
+    loopback::start(sink)
 }

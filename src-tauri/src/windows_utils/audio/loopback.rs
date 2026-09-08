@@ -20,7 +20,7 @@ use super::guards::{ComGuard, EventHandle, MixFormatPtr, MmcssGuard};
 use super::silence::SilenceCompanion;
 use crate::streamer::audio::encoder::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES};
 use crate::streamer::audio::{
-    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioStopFn,
+    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioSink, AudioStopFn,
     FLAG_DISCONTINUITY, FLAG_SILENT,
 };
 
@@ -40,8 +40,7 @@ const EVENT_WAIT_MS: u32 = 100;
 /// 20 x 100 ms = 2 s of nothing at all, against a 10 ms nominal period.
 const STARVED_WAITS_BEFORE_REACQUIRE: u32 = 20;
 
-pub fn start() -> Result<AudioCapture> {
-    let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
+pub fn start(sink: AudioSink) -> Result<AudioCapture> {
     let diagnostics = Arc::new(AudioDiagnostics::default());
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -51,7 +50,7 @@ pub fn start() -> Result<AudioCapture> {
     let stop_thread = Arc::clone(&stop);
     let join = std::thread::Builder::new()
         .name("audio-loopback".to_string())
-        .spawn(move || run(pkt_tx, diag_thread, stop_thread, ready_tx))
+        .spawn(move || run(sink, diag_thread, stop_thread, ready_tx))
         .context("spawning audio loopback thread")?;
 
     let (format, lookahead_samples) = match ready_rx.recv() {
@@ -76,7 +75,6 @@ pub fn start() -> Result<AudioCapture> {
     });
 
     Ok(AudioCapture {
-        rx: pkt_rx,
         stop: stop_fn,
         format,
         diagnostics,
@@ -104,7 +102,7 @@ impl Drop for Session {
 }
 
 fn run(
-    pkt_tx: crossbeam_channel::Sender<AudioPacket>,
+    sink: AudioSink,
     diagnostics: Arc<AudioDiagnostics>,
     stop: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<(AudioFormat, i32)>>,
@@ -331,10 +329,7 @@ fn run(
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
-            if pkt_tx.send(pkt).is_err() {
-                // no bridge/subscribers; capture is being torn down
-                return;
-            }
+            sink.send(pkt);
             seq = seq.wrapping_add(1);
         }
         if full > 0 {
