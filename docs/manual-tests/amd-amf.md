@@ -140,9 +140,22 @@ Assert:
 - `pict_type` values are only `I` and `P` — **never `B`**.
 - The first frame is `I` and there is exactly **one** of them in a 300-frame probe (infinite GOP:
   keyframes are on demand only). More than one means `IDRPeriod` did not take.
-- `color_range=pc` (full range). If it says `tv` or is absent, note it — `FullRangeColor` is the
-  only colour property AMF actually writes, and AMD hosts diverging from NVENC hosts here is
-  `findings/minor-amd-amf-does-not-write-vui-colour-signalling.md`.
+- `color_range` follows the **input format**, which the `AMF input is ...` / `AMF re-initializing
+  for a ...` log lines name. Packed BGRA off the capture is full range, so `pc`; NV12 out of the
+  scaler comes from the D3D11 video processor in BT.709 **limited**, so `tv`. Signalling full
+  range over limited-range samples is a washed-out picture, so a mismatch between the log line
+  and this field is a real bug, not a cosmetic one.
+- `color_space`, `color_primaries` and `color_transfer` are very likely **absent**, and that is
+  the known AMF driver bug (GPUOpen AMF issues #398, #277, #540: `OutColorProfile`,
+  `OutColorPrimaries`, `OutColorTransferChar` and `OutMatrixCoeff` never reach the bitstream on
+  any codec; `FullRangeColor` is the only one that works). The encoder sets all five anyway, so
+  if a future driver starts honouring them these fields appear on their own. Record what this
+  driver does either way — that is the whole point of asking.
+- Then compare against an NVENC capture of the same content on an NVIDIA box:
+  `ffprobe -show_entries stream=color_range,color_space,color_primaries,color_transfer` on both,
+  and render both in the client page on the *same* device. If they look different, the fix is
+  ours and cheap (we hand-packetize H.264, so the SPS VUI can be patched on the way out); if they
+  look the same, the browser is inferring BT.709 for HD and nothing needs doing. **Record which.**
 - `ffplay` shows the moving cyan box on a scrolling gradient, not garbage.
 
 Then confirm the first access unit carries SPS and PPS in band:
@@ -244,6 +257,71 @@ which on that machine is the correct choice.
 
 ---
 
+## 10. What ULL's free intra refresh costs (10 min)
+
+The AMF encode doc's per-USAGE defaults give `IntraRefreshMBsNumberPerSlot` = **255** for both
+`ULTRA_LOW_LATENCY` and `LOW_LATENCY`, and 0 for everything else. At 1080p (8160 MBs) that is a
+~32-frame wave, about 0.53 s at 60 fps. The backend does not set the property, so on AMD we ship
+a permanent rolling refresh **on** by default while NVENC ships it **off** by default
+(`Config::intra_refresh`) — an inconsistency nobody chose, and nobody has published what it
+costs. A rolling refresh raises the per-frame bit cost against a fixed CBR budget, and ours is
+fixed (`VBVBufferSize = bitrate/fps`, peak == target), so any cost is paid in picture quality.
+
+Encode the same 300-frame synthetic clip twice at a fixed 10 Mbps, once with the ULL default and
+once with the refresh explicitly off, and compare size and quality:
+
+```powershell
+# ULL's default: the backend leaves IntraRefreshMBsNumberPerSlot alone, so the usage's 255 stands.
+ScreenExtend probe --probe-encode --encoder amd --intra-refresh on  out_amd_refresh.h264
+# Explicitly off: the backend writes IntraRefreshMBsNumberPerSlot = 0, which is the only way to
+# turn the usage's default off.
+ScreenExtend probe --probe-encode --encoder amd --intra-refresh off out_amd_norefresh.h264
+
+ffprobe -v error -show_entries format=size -of csv=p=0 out_amd_refresh.h264
+ffprobe -v error -show_entries format=size -of csv=p=0 out_amd_norefresh.h264
+```
+
+At a fixed CBR target the two files should be nearly the same size, so the cost shows up as
+quality, not bytes. Measure it:
+
+```powershell
+ffmpeg -i out_amd_norefresh.h264 -i out_amd_refresh.h264 -lavfi "[0][1]ssim;[0][1]psnr" -f null -
+```
+
+Report the SSIM/PSNR delta and the file sizes. Anything under ~2% SSIM is noise and the ULL
+default should stay; a 10-15% quality cost is resilience the transport may already be providing
+through NACK/RTX, and then the refresh should be tied to `Config::intra_refresh` the way NVENC's
+is. Also watch the picture for the banding the NVENC CLI help warns about — a refresh wave can be
+visible as bands repainting the image.
+
+---
+
+## 11. The NV12 input path (5 min)
+
+W3a's scaler can hand the CPU bridge NV12, and `Backend::AmfCpu` now asks for it. That is the
+whole point: AMD state that packed-RGB input silently invokes an internal GPU colour converter
+which competes with the foreground application, and OBS refuses BGRA on its texture path for the
+same reason. NV12 removes that converter.
+
+The switch happens on the first frame, through `retune_input_format` — the same path a GPU-side
+format change takes. Look for, in order:
+
+```
+AMF re-initializing for a DXGI_FORMAT_NV12 input (was DXGI_FORMAT_B8G8R8A8_UNORM)
+```
+
+and **no** subsequent `AMF input is BGRA rather than NV12` line. Then confirm:
+
+- 300 frames arrive clean after the retune, and `ffplay` shows the pattern, not garbage or
+  swapped chroma. Chroma read as luma looks like a green or magenta cast over the whole frame.
+- The IDR count is 2, not 1: `retune_input_format` sets `idr_requested`, because the component
+  was re-`Init`ed and the client needs a fresh sequence.
+- `color_range=tv` per section 4.
+- The encode-path latency after the retune, against the BGRA numbers from step 5. This is the
+  number the internal converter was costing.
+
+---
+
 ## What to report back
 
 1. The `AMF AVC caps:` line, verbatim.
@@ -253,3 +331,7 @@ which on that machine is the correct choice.
 5. Glass-to-glass median and worst, AMF vs x264 on the same box.
 6. Anything in the log you did not expect — especially `AMF optional property not applied:`
    lines, which tell us which knobs this driver and VCN generation actually have.
+7. Step 10's SSIM/PSNR delta and file sizes, and whether the refresh wave is visible.
+8. Step 11's retune line, the post-retune encode latency against step 5, and `color_range`.
+9. Whether the four `Out*` colour properties reached the bitstream on this driver, and whether an
+   AMD stream and an NVENC stream of the same content look different in the client page.
