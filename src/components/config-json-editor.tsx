@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Braces,
@@ -35,10 +35,10 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { getConfig, getConfigSnapshot, subscribeToConfig, type Config } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useZoom } from "@/components/global-provider";
 import { configJsonSchema, validateConfig } from "@/lib/config-schema";
 import { applyConfig } from "@/lib/apply-config";
 
@@ -98,9 +98,8 @@ export function ConfigJsonEditor({
   onDirtyChange,
   onSaved,
 }: ConfigJsonEditorProps) {
-  const { toast } = useToast();
   const { t } = useTranslation();
-  const { windowZoom: [zoom] } = useContext(GlobalProviderContext);
+  const zoom = useZoom();
 
   const editorRef = useRef<JsonEditorHandle>(null);
   const seed = useRef<string | null>(null);

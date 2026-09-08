@@ -16,13 +16,12 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 
 use crate::streamer::audio::{
-    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioStopFn,
+    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioSink, AudioStopFn,
     FLAG_DISCONTINUITY, FLAG_SILENT,
 };
 use opus_encoder::{OpusEncoder, OpusEncoderConfig, FRAME_INTERLEAVED};
 
 const RING_CAPACITY: usize = 48_000 * 2 * 80 / 1000; // 7680 → rounds to 8192
-const ENCODE_WINDOW: usize = 4096;
 const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// nanoseconds of audio in one interleaved stereo Opus frame (5 ms at 48 kHz)
@@ -193,7 +192,7 @@ fn report_worker_panic(result: std::thread::Result<()>) {
     }
 }
 
-pub fn start_capture() -> Result<AudioCapture> {
+pub fn start_capture(pkt_sink: AudioSink) -> Result<AudioCapture> {
     let candidates = capable_backends();
     if candidates.is_empty() {
         bail!(
@@ -212,7 +211,6 @@ pub fn start_capture() -> Result<AudioCapture> {
         control_tx: Some(ctrl_tx),
     };
 
-    let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<i32>>();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -226,7 +224,7 @@ pub fn start_capture() -> Result<AudioCapture> {
                 sink,
                 consumer,
                 ctrl_rx,
-                pkt_tx,
+                pkt_sink,
                 diag_thread,
                 stop_thread,
                 ready_tx,
@@ -260,7 +258,6 @@ pub fn start_capture() -> Result<AudioCapture> {
     });
 
     Ok(AudioCapture {
-        rx: pkt_rx,
         stop: stop_fn,
         format: AudioFormat {
             sample_rate: 48_000,
@@ -277,7 +274,7 @@ fn worker(
     sink: AudioFrameSink,
     consumer: ring::Consumer,
     ctrl_rx: crossbeam_channel::Receiver<ControlMsg>,
-    pkt_tx: crossbeam_channel::Sender<AudioPacket>,
+    pkt_sink: AudioSink,
     diagnostics: Arc<AudioDiagnostics>,
     stop: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<i32>>,
@@ -291,7 +288,7 @@ fn worker(
             return;
         }
     };
-    crate::tprintln!("audio: {} loaded", encoder.version());
+    crate::tprintln!("{}", encoder.describe_state());
     let lookahead = encoder.lookahead_samples();
 
     let mut backend: Box<dyn AudioSource> = 'pick: {
@@ -318,7 +315,6 @@ fn worker(
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame starts a fresh timeline
-    let mut encode_ns: Vec<u64> = Vec::with_capacity(ENCODE_WINDOW);
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
@@ -369,12 +365,7 @@ fn worker(
                     continue;
                 }
             };
-            let dt = t0.elapsed().as_nanos() as u64;
-            if encode_ns.len() < ENCODE_WINDOW {
-                encode_ns.push(dt);
-            } else {
-                encode_ns[(seq as usize) % ENCODE_WINDOW] = dt;
-            }
+            diagnostics.record_encode_ns(t0.elapsed().as_nanos() as u64);
 
             let mut flags = pending_flags;
             pending_flags = 0;
@@ -388,10 +379,10 @@ fn worker(
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
-            if pkt_tx.send(pkt).is_err() {
-                backend.stop();
-                return;
-            }
+            diagnostics
+                .capture_to_packet
+                .record_span(pkt.capture_ns, host_now_ns());
+            pkt_sink.send(pkt);
             seq = seq.wrapping_add(1);
             produced = true;
         }
@@ -403,7 +394,6 @@ fn worker(
         // the very next drain pass, reporting legacy-tier loss as zero.
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
-            update_encode_percentiles(&encode_ns, &diagnostics);
             crate::tprintln!(
                 "[{}] {}, clock_resyncs={resyncs}",
                 backend.backend_name(),
@@ -431,17 +421,6 @@ fn worker(
 
     backend.stop();
     crate::tprintln!("audio: macOS capture stopped");
-}
-
-fn update_encode_percentiles(samples: &[u64], diagnostics: &AudioDiagnostics) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut sorted: Vec<u64> = samples.to_vec();
-    sorted.sort_unstable();
-    let p = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
-    diagnostics.encode_p50_ns.store(p(0.50), Ordering::Relaxed);
-    diagnostics.encode_p99_ns.store(p(0.99), Ordering::Relaxed);
 }
 
 fn os_version() -> String {

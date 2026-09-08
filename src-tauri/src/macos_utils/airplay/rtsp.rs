@@ -145,10 +145,17 @@ pub async fn read_request(
     stream: &mut TcpStream,
     buf: &mut Vec<u8>,
 ) -> Result<ReadOutcome, String> {
+    // Where the CRLFCRLF scan has already looked. Restarting it from zero on
+    // every read makes a head that arrives in N chunks cost O(N^2) byte
+    // comparisons — at the 64 KiB ceiling, sixteen rescans of up to 64 KiB for
+    // one request. Only the last three bytes of what has been scanned can be
+    // part of a boundary that straddles a read.
+    let mut searched = 0usize;
     let head_len = loop {
-        if let Some(n) = find_head_end(buf) {
+        if let Some(n) = find_head_end(buf, searched) {
             break n;
         }
+        searched = buf.len().saturating_sub(3);
         if buf.len() > MAX_HEADER_BYTES {
             return Err("request headers exceeded 64 KiB".to_string());
         }
@@ -252,8 +259,14 @@ pub async fn write_response(
         .map_err(|e| format!("control socket flush failed: {e}"))
 }
 
-fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
+    if buf.len() < 4 || from + 4 > buf.len() {
+        return None;
+    }
+    buf[from..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| from + i + 4)
 }
 
 /// Rewrites an `RTSP/1.0` version token to `HTTP/1.1` in place so `httparse`
@@ -323,7 +336,19 @@ mod tests {
 
     #[test]
     fn head_end_is_found_across_a_split() {
-        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\n"), Some(18));
-        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\n", 0), Some(18));
+        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n", 0), None);
+    }
+
+    #[test]
+    fn resuming_the_scan_still_sees_a_straddling_boundary() {
+        // The boundary sits at 16..20, so a resume that started at 20 would
+        // miss it. `read_request` resumes three bytes back for exactly this.
+        let buf = b"GET / HTTP/1.1\r\nA\r\n\r\nbody";
+        let split = buf.len() - 8;
+        assert_eq!(find_head_end(buf, 0), Some(21));
+        assert_eq!(find_head_end(buf, split.saturating_sub(3)), Some(21));
+        // Past the boundary there is nothing left to find.
+        assert_eq!(find_head_end(buf, 21), None);
     }
 }

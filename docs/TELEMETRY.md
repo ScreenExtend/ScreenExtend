@@ -28,11 +28,13 @@ host's own clock alongside it:
 PONG   0x61
   +1   u64  echoed client stamp, ns (as sent in the PING)
   +9   u64  host_now_ns at the moment the PONG was built
-       17 bytes total
+  +17  u16  host capabilities — docs/INPUT-PROTOCOL.md, "Host capabilities"
+       19 bytes total
 ```
 
-A client older than this reads the first 9 bytes and ignores the rest; a host older than this
-sends 9 bytes and the client simply never gets an offset.
+Bytes 0..17 are frozen. A client older than a field reads the prefix it knows and ignores the
+rest; a host older than a field sends a shorter frame, and a client that sees fewer than 19 bytes
+reads no capability bits, which is the correct answer for that host.
 
 The client keeps the **minimum-RTT** sample, because the least-queued exchange gives the tightest
 midpoint estimate, and ages it out after 30 s so a route change is not remembered forever:
@@ -69,23 +71,125 @@ epochs, meaningless on their own but valid as a *difference*, which is all A/V s
 | `socket_write_done_ns` | After the last RTP packet of the frame is written. |
 
 Derived histograms: `capture_delivery`, `scale`, `encode_queue`, `encode`, `packetize`,
-`socket_write`, `capture_to_encode`, `capture_to_socket`. A stage with `count == 0` did not fire —
-that absence is a finding, not a zero.
+`socket_write`, `pace_wait`, `capture_to_encode`, `capture_to_socket`.
+
+`pace_wait` is the odd one out: it is not derived from a `FrameTiming` pair but recorded
+directly by the RTP writer, and it holds **only the time the send pacer slept** — not the
+writes that sleeping is interleaved with. That separation is the point. Pacing and sending
+both show up inside `socket_write`, and "the pacer is free on this path" has to be
+distinguishable from "the socket is slow". On a `SessionLocality::SameNetwork` session the
+pacer is off and this histogram is all zeroes, which is the correct reading.
+
+A stage with `count == 0` did not fire — that absence is a finding, not a zero.
 
 Histograms are fixed log-scale buckets, 8 per octave (any bucket is under 13% wide), 512 buckets
 of `AtomicU64`. `record` is three relaxed `fetch_add`s and a `fetch_max`: no allocation, no lock,
 no logging, which is what makes it safe on a real-time capture callback. Reported as
 p50/p90/p99/max — never a bare mean, which hides the tail that is actually felt.
 
-### Degradation counters
+### Input stages
 
-`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `nacks_received`,
-`keyframe_requests`, `idrs_sent`, `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`,
-`audio_broadcast_lag_drops`, plus the client-reported `client_jitter_underruns` /
-`client_jitter_overruns`.
+Three more stages ride the same histograms, but they are recorded per *event* by
+`streamer::input`, not per frame, so `record_frame` does not feed them. The wire layouts they
+depend on are in `docs/INPUT-PROTOCOL.md`.
+
+| Stage | Span |
+|---|---|
+| `input_recv` | client send → host receive, minus the best case (see below) |
+| `input_queue` | host receive → the injector thread picking the event up |
+| `input_inject` | host receive → injection returned: the whole host-side cost |
+
+`input_recv` needs a clock offset the host does not have — the client estimates one from
+PING/PONG and never sends the result back — so the host estimates its own. What it can see
+unaided is `host_recv − client_send` for every stamped frame: the true offset plus that frame's
+one-way delay. The *minimum* of that over a rolling 30 s window is therefore the tightest offset
+obtainable from one direction alone, and `input_recv` reports the difference — **excess one-way
+delay**, 0 on the best sample and growing with queueing. It is a relative number by construction,
+which is what a latency budget wants and is all one direction can honestly give. The window is
+the same 30 s the client uses to age out its own best RTT sample, so a route change is not
+remembered for the whole session.
+
+Only frames carrying the optional client stamp are measured; an unstamped frame from an older
+client contributes nothing rather than a wrong number.
+
+## Degradation counters
+
+`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `frames_dropped_broadcast`,
+`nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
+`keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
+`encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
+client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
+`input_queue_drops` / `input_stale_drops`.
+
+`keyframe_requests` counts RTCP PLI and FIR; `client_keyframe_requests` counts the out-of-band
+`KEYFRAME_REQUEST` (`0x64`) a client sends when it has no other way to ask, so the two sources
+stay distinguishable.
+
+Four of these describe the transport's own decisions rather than its failures, and are read as
+pairs:
+
+- `keyframe_requests_suppressed` is how many requests the per-session gate declined. A decoder
+  that has lost its reference chain emits a PLI for every frame in its backlog, and on an
+  infinite-GOP encoder answering each one produces the largest frame the session can send — which
+  is what turns a stumble into a keyframe storm. So a large suppressed/requested ratio is healthy;
+  `idrs_sent` is what the encoder was actually told to do.
+- `frames_dropped_broadcast` is frames the encoder-to-viewer broadcast dropped on a viewer that
+  fell behind. Distinct from `frames_dropped_ring`, which is the capture side.
+- `delay_overuse_events` is intervals where the delay-gradient estimator said a queue was filling.
+  It fires *before* loss, so a non-zero count against a flat loss count is the signal working, not
+  a fault.
+- `pacer_deadline_misses` is packets the pacer released early because holding them any longer
+  would have outlasted the frame interval it was smoothing. A pacer that grows unbounded is worse
+  than no pacer, so this must stay small.
+
+The process-level `live_transport_sessions` sits alongside the per-session objects in
+`snapshot_json`: peer connections, ICE agents and injector threads not yet given back. It should
+equal the number of live sessions, and a number that only climbs across joins is a leak. `input_queue_drops` is the fast input queue shedding its oldest entry under
+pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
+rather than injected late — never a key or a button, which are state transitions the host cannot
+recover from.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
+
+## Audio stages
+
+Audio does not travel with a `FrameTiming`; there is one host-wide capture fanned out to every
+session, so its numbers live in `AudioDiagnostics` (`streamer/audio/mod.rs`) and are shared. Same
+rules as the video histograms — fixed log-scale buckets of `AtomicU64`, no allocation and no lock
+on the capture thread, reported as p50/p90/p99/max.
+
+| Histogram | What it measures |
+|---|---|
+| `wake_interval` | Capture-thread wake to wake: the engine period **as delivered**, which is what says whether a low-latency period request actually took effect. |
+| `encode` | Opus encode duration per 5 ms frame. |
+| `capture_to_packet` | `host_now_ns()` when a packet is handed to the transport, minus that packet's own `capture_ns`. The host-side half of the audio budget. |
+
+Counters alongside them: `period_frames` and `buffer_frames` (the engine period and the whole
+engine buffer — different numbers, and they used to be reported as the same one),
+`discontinuity_count`, `silent_count`, `device_changes`, `companion_restarts`,
+`event_starvations`, `dropped_backpressure`, `lagged_packets`, `capture_ts_clamped`.
+
+`companion_restarts` and `event_starvations` are the two that say the endpoint stopped producing:
+before they existed, a dead silent-render companion looked exactly like a healthy idle host,
+because the 2 s diagnostic kept printing with frozen counters. `capture_ts_clamped` counts drains
+whose endpoint timestamp was in the future — on a Windows loopback stream that is the normal
+case, not an anomaly, because the endpoint is a render device and its "device position" is a play
+cursor.
+
+### `ScreenExtend probe --audio`
+
+The audio counterpart of `--whep-selftest`. It drives an `AudioHub` the way a session's forwarder
+does, so it exercises the shipping capture backend, encoder and fan-out rather than a parallel
+harness, and it needs no virtual display. `--duration <secs>` sets the sampling window (default
+10); `--process-loopback` selects the second Windows capture tier, which is otherwise reached only
+when the endpoint tier fails and so cannot be measured.
+
+It prints packet rate and payload size, subscriber inter-arrival, capture -> subscriber latency,
+the signed skew of `capture_ns` against the host clock (including how many packets were stamped
+*ahead* of it, which is how the clamp above was found), and then the full `AudioDiagnostics`
+summary. A tier that delivers nothing reports that as a failure with the two explanations for it,
+rather than hanging.
 
 ## Client → host stats frame (`OP::STATS`, `0x62`)
 
@@ -93,10 +197,14 @@ Sent on the **reliable** DataChannel once a second, alongside the `PING`. Fixed 
 endian. All durations are **microseconds**; a value of 0 means "not measured", which is what a
 path with no hook for that stage reports.
 
+Version 2 (96 bytes) appends the tier bytes and the degradation field below. Bytes 0..72 are
+byte-identical to v1, which is what lets a host built against v1 read the prefix and ignore the
+rest.
+
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | opcode `0x62` |
-| 1 | 1 | version (currently 1; 0 is rejected) |
+| 1 | 1 | version (currently 2; 0 is rejected) |
 | 2 | 1 | video path |
 | 3 | 1 | audio path |
 | 4 | 4 | flags (below) |
@@ -116,10 +224,26 @@ path with no hook for that stage reports.
 | 60 | 4 | audio worklet underruns |
 | 64 | 4 | audio worklet overruns |
 | 68 | 4 | RTT, µs |
-| | | **72 bytes** |
+| | | **72 bytes (v1)** |
+| 72 | 1 | video transport tier |
+| 73 | 1 | render tier |
+| 74 | 1 | keyframe-request tier |
+| 75 | 1 | audio-sink tier |
+| 76 | 4 | errors the page swallowed (the `catch (_) {}` count) |
+| 80 | 4 | degradation flags (below) |
+| 84 | 4 | commanded audio jitter depth, µs |
+| 88 | 4 | audio packets concealed |
+| 92 | 4 | audio output latency, µs (0 = unknown) |
+| | | **96 bytes (v2)** |
 
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
+
+The host reads the tail whenever all 96 bytes arrived and leaves the fields at 0 otherwise, which
+is also what "not measured" means for each of them — so a v1 client and a v2 client that measured
+nothing are correctly indistinguishable. A frame one byte short of 96 reads as tail-absent rather
+than half-parsed. `serve -v` names the four tiers in words and lists the set degradation bits by
+name; `status --json` carries the raw codes, the decoded names and the audio numbers.
 
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
@@ -147,12 +271,59 @@ offset has arrived; before that the client reports 0 there and clears `CLOCK_VAL
 | 7 | decoder reports hardware acceleration |
 | 8 | clock offset valid |
 
+### Tier bytes (v2)
+
+Each says which mechanism is actually live, so a device on a slow path is distinguishable from
+one on the fast path rather than looking identical to it.
+
+| Byte | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| transport (72) | none | `RTCRtpScriptTransform` | `createEncodedStreams` | | |
+| render (73) | none | OffscreenCanvas 2D in the worker | track generator → `<video>` | `<video>` element | |
+| keyframe (74) | **cannot ask** | `sendKeyFrameRequest()` | `KEYFRAME_REQUEST` (`0x64`) on the input channel | | |
+| audio sink (75) | none | `AudioContext.setSinkId` | `HTMLMediaElement.setSinkId` | `navigator.audioSession` | `selectAudioOutput()` |
+
+A keyframe tier of 0 with a transport tier of 2 is the Chrome 94–140 case: the legacy transform
+runs instead of libwebrtc's reference finder, so nothing downstream emits a PLI and the client
+has no way at all to ask for an IDR.
+
+### Degradation flags (v2, offset 80)
+
+Every one of these was previously a bare `catch (_) {}` or an untaken branch, invisible to the
+host. The field is a union of the page's own bits and the audio module's.
+
+| Bit | Meaning |
+|---:|---|
+| 0 | fullscreen was requested and refused |
+| 1 | pointer lock was requested and refused |
+| 2 | `unadjustedMovement` unavailable — the OS pointer curve is compounding with the host's |
+| 3 | Screen Wake Lock API absent; on the `nosleep.js` shim |
+| 4 | a wake lock request was refused |
+| 5 | `AudioContext`/worklet setup failed |
+| 6 | `AudioDecoder` cannot decode Opus (or failed after saying it could) |
+| 7 | `AudioContext` is suspended |
+| 8 | output latency is estimated from `getOutputTimestamp()`, not reported |
+| 9 | audio-output labels unavailable (no microphone grant) |
+| 10 | `RTCRtpScriptTransform` unavailable |
+| 11 | no way to request a keyframe |
+| 12 | `transferControlToOffscreen` unavailable |
+| 13 | demoted to the `<video>` element |
+| 14 | `getCoalescedEvents` unavailable |
+| 15 | ICE gathering ran to its deadline instead of settling |
+| 16 | no H.264 `fmtp` in the answer to pin the decoder to |
+| 17 | no hardware decoder for the negotiated configuration |
+| 18 | refresh rate was measured with rAF, not reported by the browser |
+| 19 | stepped down from `RTCRtpScriptTransform` to `createEncodedStreams` |
+| 20 | `requestVideoFrameCallback` unavailable |
+| 21 | Keyboard Lock unavailable |
+
 ### Opcode note
 
-`0x62` is used in both directions. Host → client it is the (currently unused) input-queue stats
-frame built by `protocol::build_stats`, 25 bytes; client → host it is this frame. Direction
-disambiguates: the host parser only ever sees the client's, and the client's `onReliableMessage`
-only handles `PONG` and `BYE`.
+`0x62` is client → host only. It used to be defined in both directions — the host → client twin
+was a 25-byte injector-queue frame built by `protocol::build_stats` that was never sent — and that
+builder is gone: the injector's counters live in `SessionTelemetry` instead, where `status --json`
+reads them beside every other counter. The full input opcode table, and the optional client
+timestamp several frames now carry, are in `docs/INPUT-PROTOCOL.md`.
 
 ## Reading it
 
@@ -166,6 +337,22 @@ only handles `PONG` and `BYE`.
   sending, plus the tier detail, in milliseconds. `SEAudio.getSyncInfo()` is its audio
   counterpart.
 
+## Testing it
+
+`node scripts/test-client-stats.mjs` runs `input.js` under Node with minimal browser stubs,
+drives one PING/PONG exchange and one stats frame, and asserts the bytes against the layout
+above (including the v2 tail and the 72-byte floor an older host reads) plus the clock-offset
+arithmetic. It is not a substitute for a browser — it stubs the
+DOM, and it cannot exercise the workers — but it catches the failure that would otherwise be
+invisible: a `TypeError` inside `sendStats()` silently kills the once-a-second timer, and the
+host would simply see a client that never reports.
+
+The host half is covered by unit tests in `streamer/telemetry.rs` (bucket boundaries,
+percentiles against a known distribution, missing and out-of-order stamps),
+`streamer/input/protocol.rs` (a stats round trip, a truncated frame, a frame from a newer
+client), and the clock conversions in `windows_utils/streamer/clock.rs` and
+`macos_utils/streamer/clock.rs`.
+
 ## Adding a stage
 
 1. Add the stamp to `FrameTiming` and a `mark_*` for it.
@@ -173,3 +360,6 @@ only handles `PONG` and `BYE`.
 3. Fold it in `SessionTelemetry::record_frame`.
 4. Set the stamp on every pipeline that has that stage; the ones that do not will report
    `count == 0`, which is the correct answer.
+
+An event-shaped stage skips steps 1 and 3 — `FrameTiming` and `record_frame` are frame-shaped —
+and calls `telemetry.stages.<name>.record(ns)` directly, the way the three input stages do.

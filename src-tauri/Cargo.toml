@@ -144,7 +144,6 @@ windows-future = "0.3.2"
 windows-core = "0.62"
 parking_lot = "0.12.5"
 rayon = "1.12.0"
-clap = { version = "4.6.1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -154,13 +153,11 @@ features = [
     "Win32_System_Console",
     "Win32_System_ProcessStatus",
     "Win32_Graphics_Direct3D11",
-    "Security_Cryptography",
     "Win32_Devices_Display",
     "Win32_System_WinRT_Graphics_Capture",
     "Networking",
     "Win32_System_LibraryLoader",
     "System",
-    "Media_MediaProperties",
     "Win32_Graphics_Dxgi",
     "Win32_System_Ole",
     "Security_Credentials",
@@ -168,6 +165,7 @@ features = [
     "Networking_Connectivity",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",
     "Storage",
     "Win32_Graphics_Gdi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -176,10 +174,10 @@ features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Graphics_Capture",
     "Win32_Graphics_Direct3D",
     "Graphics_DirectX_Direct3D11",
-    "Media_Transcoding",
     "Win32_UI_Shell",
     "Graphics_Imaging",
     "Win32_System_WinRT_Direct3D11",
@@ -195,11 +193,9 @@ features = [
     "Devices_Enumeration",
     "Win32_Graphics_Dwm",
     "Foundation_Metadata",
-    "System_Threading",
     "Foundation",
     "Win32_Security",
     "Win32_Networking_WinSock",
-    "Media_Core",
     "Win32_System_Power",
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",

@@ -428,7 +428,18 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
         if std::time::Instant::now() >= deadline {
             return match last_err {
                 Some(e) if !ever_set && stable == 0 => Err(e),
-                _ => Ok(()),
+                // Written but never read back as settled. Reporting this as success let the
+                // caller tell the client a DPR the host had not applied; the client then renders
+                // at a ratio that does not match the display's real scale.
+                _ => {
+                    if ever_set {
+                        teprintln!(
+                            "[display] {device_name} accepted a scale of {target}% but never \
+                             reported it back within 2s; the client's DPR may not match"
+                        );
+                    }
+                    Ok(())
+                }
             };
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
