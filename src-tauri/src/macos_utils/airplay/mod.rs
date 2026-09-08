@@ -107,9 +107,17 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// `CGVirtualDisplay`, because an AirPlay session is a real network handshake
 /// plus a WindowServer reconfiguration, not a synchronous API call.
 const SESSION_BUDGET: Duration = Duration::from_secs(40);
-/// How long to wait after a *cold* publish before the picker can plausibly list
-/// us. Only paid when the receiver was not already warm — see [`prewarm`].
-const DISCOVERY_SETTLE: Duration = Duration::from_millis(6000);
+/// How long to let mDNSResponder settle after a *cold* publish. Only paid when
+/// the receiver was not already warm — see [`prewarm`].
+///
+/// This used to be a flat six seconds, on the theory that the picker needs that
+/// long to list a freshly published device. It does not need it *here*:
+/// `ax::connect_to` holds the menu open and re-reads it for its whole
+/// `DEVICE_ROW_TIMEOUT` precisely because the picker fills device rows in as
+/// discovery answers, so the wait already exists one step later and is
+/// interruptible the moment our row appears. All this needs to cover is the
+/// registration itself.
+const DISCOVERY_SETTLE: Duration = Duration::from_millis(500);
 /// How long the display gets to disappear after we drop the session.
 const REMOVAL_TIMEOUT: Duration = Duration::from_secs(8);
 /// A second, much shorter window after handing the configuration back.
@@ -353,16 +361,20 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
             }
         }
 
-        // Put every *other* display back the way it was. Without this the Mac's
-        // own screen is left at the client's resolution — showing as "Scaled"
-        // in Displays preferences — for the rest of the session.
-        modes_before.restore_except(attached.id);
-
-        // macOS picks the initial size itself, from a single bit — whether the
-        // advertised height reached 1080. The ladder it publishes afterwards is
-        // where the client's actual geometry comes back.
+        // One reconfiguration, not two. Every *other* display goes back the way
+        // it was — without this the Mac's own screen is left at the client's
+        // resolution, showing as "Scaled" in Displays preferences, for the rest
+        // of the session — and in the same commit ours moves onto the mode the
+        // client asked for. macOS picks the initial size itself from a single
+        // bit (whether the advertised height reached 1080); the ladder it
+        // publishes afterwards is where the real geometry comes back.
         let granted = topology::geometry(attached.id);
-        let (w, h) = topology::best_effort_mode(attached.id, (width, height));
+        let target = topology::closest_mode(attached.id, (width, height));
+        modes_before.restore_and_set(attached.id, target);
+        let (w, h) = match target {
+            Some(t) => topology::settle_geometry(attached.id, t, topology::MODE_SETTLE),
+            None => granted,
+        };
         if (w, h) != (width, height) {
             tprintln!(
                 "[airplay] macOS granted {w}x{h} for a requested {width}x{height} — AirPlay \
@@ -508,7 +520,6 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
                 e.into_inner().take();
             }
         }
-        sender_prefs::restore();
         ax::restore_menu_bar_option();
     }
 }
