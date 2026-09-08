@@ -578,13 +578,34 @@ fn pixel_dims(device_name: &str) -> Result<(u32, u32, u32)> {
     Ok((w, h, refresh))
 }
 
+/// Geometry in **backing pixels**, plus refresh and the HiDPI flag. `pixel_dims` reads
+/// `CGDisplayPixelsWide`, which reports points, so on a HiDPI display it is half the size that was
+/// applied — feeding it back into `reconfigure_display` halves the display again. Displays we
+/// created remember what was applied to them; anything else falls back to the point size at 1x.
+fn backing_dims(device_name: &str) -> Result<(u32, u32, u32, u32)> {
+    if let Some(dims) = crate::macos_utils::virtual_display::applied_backing(device_name) {
+        return Ok(dims);
+    }
+    let (w, h, refresh) = pixel_dims(device_name)?;
+    Ok((w, h, refresh, 0))
+}
+
+/// Geometry changes must not silently reset the display's HiDPI flag: the join path sets it from
+/// the client's DPR, and dropping it here forced a second full reconfiguration to put it back.
+fn current_hidpi(device_name: &str) -> u32 {
+    crate::macos_utils::virtual_display::applied_backing(device_name)
+        .map(|(_, _, _, hidpi)| hidpi)
+        .unwrap_or(0)
+}
+
 pub fn set_display_resolution(
     device_name: &str,
     width: u32,
     height: u32,
     refresh: u32,
 ) -> Result<()> {
-    reconfigure_display(device_name, width, height, refresh, 0).map_err(|e| anyhow::anyhow!(e))
+    let hidpi = current_hidpi(device_name);
+    reconfigure_display(device_name, width, height, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn set_display_mode(
@@ -599,26 +620,27 @@ pub fn set_display_mode(
     } else {
         (width, height)
     };
-    reconfigure_display(device_name, w, h, refresh, 0).map_err(|e| anyhow::anyhow!(e))
+    let hidpi = current_hidpi(device_name);
+    reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> {
-    let (w, h, refresh) = pixel_dims(device_name)?;
+    let (w, h, refresh, hidpi) = backing_dims(device_name)?;
     let is_portrait_now = h > w;
     if is_portrait_now == portrait {
         return Ok(());
     }
-    reconfigure_display(device_name, h, w, refresh, 0).map_err(|e| anyhow::anyhow!(e))
+    reconfigure_display(device_name, h, w, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
-    let (w, h, refresh) = pixel_dims(device_name)?;
     let hidpi = if percent >= HIDPI_THRESHOLD_PERCENT {
         1
     } else {
         0
     };
-    reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
+    crate::macos_utils::virtual_display::set_display_hidpi(device_name, hidpi)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn set_display_topology_extend() -> bool {
