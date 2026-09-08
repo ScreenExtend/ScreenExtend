@@ -228,11 +228,15 @@ MODES:
     --encode [path]       300 synthetic frames -> Annex-B     (default out.h264)
     --live [path]         150 live frames -> Annex-B          (default live.h264)
     --bitrate             exercise the adaptive-bitrate reconfigure path
+    --audio               subscribe to the real system-audio hub and report the capture
+                          period as delivered, packet age at the subscriber, and the
+                          capture thread's own histograms (see --duration)
     --whep-selftest       in-process WHEP client against a real virtual display;
                           asserts the answer SDP and that RTP actually flows
                           (requires a build with --features probe)
     --duration <secs>     with --whep-selftest, keep streaming this long after RTP is
-                          proven so the stage histograms describe a steady session
+                          proven so the stage histograms describe a steady session;
+                          with --audio, how long to sample (default 10)
 
 TUNING FLAGS are the streamer's own and are parsed straight off the command line:
     --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
@@ -266,6 +270,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         live: Option<String>,
         bitrate: bool,
         selftest: bool,
+        audio: bool,
     }
 
     fn parse_mode(args: &[String]) -> Mode {
@@ -276,6 +281,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             live: None,
             bitrate: false,
             selftest: false,
+            audio: false,
         };
         let path_after = |i: usize, default: &str| -> String {
             match args.get(i + 1) {
@@ -293,6 +299,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
                 "--live" | "--probe-live" => m.live = Some(path_after(i, "live.h264")),
                 "--bitrate" | "--probe-bitrate" => m.bitrate = true,
                 "--whep-selftest" | "--selftest" => m.selftest = true,
+                "--audio" => m.audio = true,
                 _ => {}
             }
         }
@@ -326,6 +333,135 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             audio_hub: Some(state.audio_hub.clone()),
             ..base
         }
+    }
+
+    /// Measure the host-side audio path end to end, the way a joined device sees it.
+    ///
+    /// It drives an `AudioHub` — the same type `AppState` holds, subscribed the same way a
+    /// session's forwarder subscribes — so it exercises the shipping capture backend, the
+    /// shipping Opus encoder and the shipping fan-out rather than a parallel harness that
+    /// could drift from them. Its own hub rather than `AppState`'s, because audio needs no
+    /// virtual display and this must stay runnable on a host with no display driver installed.
+    ///
+    /// It answers the two questions the audio budget is made of: how often the endpoint
+    /// actually delivers (the engine period as realised, not as requested), and how old a
+    /// packet is by the time a session could put it on the wire.
+    fn audio_probe(secs: u64) -> anyhow::Result<()> {
+        use std::time::{Duration, Instant};
+
+        use crate::streamer::audio::host_now_ns;
+        use crate::streamer::telemetry::Histogram;
+
+        let secs = if secs == 0 { 10 } else { secs };
+        let hub = crate::streamer::audio::AudioHub::new();
+        let mut sub = hub.subscribe()?;
+        println!(
+            "audio probe: {}Hz x{}ch, encoder lookahead {} samples ({:.2} ms); \
+             sampling for {secs}s",
+            sub.format.sample_rate,
+            sub.format.channels,
+            sub.lookahead_samples,
+            sub.lookahead_samples as f64 * 1000.0 / sub.format.sample_rate.max(1) as f64,
+        );
+
+        // Consumer-side view: the gap between packets arriving here, and the age of each packet
+        // measured against its own `capture_ns`. The capture thread records its own halves into
+        // `AudioDiagnostics`; printing both is how a scheduling hop shows up as a difference.
+        let arrival = Histogram::new();
+        let age = Histogram::new();
+        let mut packets = 0u64;
+        let mut bytes = 0u64;
+        let mut silent = 0u64;
+        let mut discontinuities = 0u64;
+        let mut seq_gaps = 0u64;
+        let mut last_seq: Option<u32> = None;
+        let mut last_arrival: Option<u64> = None;
+        let mut size_max = 0usize;
+        let mut skew_min_ns = i64::MAX;
+        let mut skew_max_ns = i64::MIN;
+        let mut skew_sum_ns: i128 = 0;
+        let mut ahead_of_clock = 0u64;
+
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            match sub.rx.blocking_recv() {
+                Ok(pkt) => {
+                    let now = host_now_ns();
+                    if let Some(prev) = last_arrival {
+                        arrival.record_span(prev, now);
+                    }
+                    last_arrival = Some(now);
+                    age.record_span(pkt.capture_ns, now);
+                    let skew = now as i64 - pkt.capture_ns as i64;
+                    skew_min_ns = skew_min_ns.min(skew);
+                    skew_max_ns = skew_max_ns.max(skew);
+                    skew_sum_ns += skew as i128;
+                    if skew < 0 {
+                        ahead_of_clock += 1;
+                    }
+                    if let Some(prev) = last_seq {
+                        if pkt.seq != prev.wrapping_add(1) {
+                            seq_gaps += 1;
+                        }
+                    }
+                    last_seq = Some(pkt.seq);
+                    packets += 1;
+                    bytes += pkt.data.len() as u64;
+                    size_max = size_max.max(pkt.data.len());
+                    if pkt.flags & crate::streamer::audio::FLAG_SILENT != 0 {
+                        silent += 1;
+                    }
+                    if pkt.flags & crate::streamer::audio::FLAG_DISCONTINUITY != 0 {
+                        discontinuities += 1;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    seq_gaps += n;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        let diagnostics = hub.diagnostics();
+        hub.unsubscribe();
+
+        let a = arrival.snapshot();
+        let g = age.snapshot();
+        println!("\n---- audio probe ({secs}s) ----");
+        println!(
+            "packets={packets} ({:.1}/s), payload avg={:.1}B max={size_max}B, \
+             silent={silent}, discontinuity={discontinuities}, seq gaps={seq_gaps}",
+            packets as f64 / secs as f64,
+            if packets == 0 {
+                0.0
+            } else {
+                bytes as f64 / packets as f64
+            },
+        );
+        println!(
+            "subscriber inter-arrival p50/p90/p99/max = {} ms",
+            a.brief()
+        );
+        println!("capture -> subscriber   p50/p90/p99/max = {} ms", g.brief());
+        if packets > 0 {
+            println!(
+                "capture_ns vs host clock: min={:.2} mean={:.2} max={:.2} ms; \
+                 {ahead_of_clock}/{packets} packets stamped ahead of the clock",
+                skew_min_ns as f64 / 1.0e6,
+                (skew_sum_ns / packets as i128) as f64 / 1.0e6,
+                skew_max_ns as f64 / 1.0e6,
+            );
+        }
+        if let Some(d) = diagnostics {
+            println!("{}", d.summary());
+        }
+        if packets == 0 {
+            anyhow::bail!(
+                "no audio packets in {secs}s — the endpoint delivered nothing, which is the \
+                 silent-companion failure mode (AUDIO_NOTES.md §3.2)"
+            );
+        }
+        Ok(())
     }
 
     fn finish(result: anyhow::Result<()>) -> ! {
@@ -370,6 +506,10 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         }
         if mode.bitrate {
             finish(Streamer::new(base).probe_bitrate());
+        }
+        if mode.audio {
+            let secs = base.selftest_secs;
+            finish(audio_probe(secs));
         }
 
         if (mode.live.is_some() || mode.selftest)
