@@ -256,7 +256,6 @@ fn default_device_listener_address() -> AudioObjectPropertyAddress {
 pub struct ProcessTapCapture {
     resources: Option<TapResources>,
     listener_ctx: *mut ListenerCtx,
-    nonsilent_probe: Option<Arc<AtomicU64>>,
     sink: Option<AudioFrameSink>,
 }
 
@@ -267,27 +266,8 @@ impl ProcessTapCapture {
         Self {
             resources: None,
             listener_ctx: ptr::null_mut(),
-            nonsilent_probe: None,
             sink: None,
         }
-    }
-
-    pub fn try_create() -> Result<(), AudioCaptureError> {
-        if !runtime_available() {
-            return Err(AudioCaptureError::Unsupported(
-                "Core Audio Process Tap API not present (needs macOS 14.2+)".into(),
-            ));
-        }
-        // throwaway sink; dropped with its ring right after the probe
-        let (producer, _consumer) = super::ring::ring(4096);
-        let sink = AudioFrameSink {
-            producer: Arc::new(producer),
-            diagnostics: Arc::new(AudioDiagnostics::default()),
-            control_tx: None,
-        };
-        let mut probe = ProcessTapCapture::new();
-        probe.build_and_start(&sink)?;
-        Ok(())
     }
 
     fn build_and_start(&mut self, sink: &AudioFrameSink) -> Result<(), AudioCaptureError> {
@@ -380,7 +360,6 @@ impl ProcessTapCapture {
             )));
         }
 
-        let nonsilent = Arc::new(AtomicU64::new(0));
         let scratch = vec![0.0f32; 8192 * format::OUT_CHANNELS].into_boxed_slice();
         let ctx = Box::into_raw(Box::new(IoCtx {
             producer: Arc::clone(&sink.producer),
@@ -390,7 +369,6 @@ impl ProcessTapCapture {
             diag: Arc::clone(&sink.diagnostics),
         }));
         resources.ctx = ctx;
-        self.nonsilent_probe = Some(nonsilent);
 
         let proc_fn: objc2_core_audio::AudioDeviceIOProc = Some(tap_ioproc);
         let mut io_proc: AudioDeviceIOProcID = None;
