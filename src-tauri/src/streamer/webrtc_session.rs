@@ -122,6 +122,40 @@ impl KeyframeRequester {
     }
 }
 
+/// Whether an access unit carries a sequence parameter set.
+///
+/// Parameter sets lead a keyframe access unit, at most behind an AUD or an SEI, so a short prefix
+/// scan answers the question and costs nothing on the P-frames that dominate the stream.
+fn access_unit_has_sps(data: &[u8]) -> bool {
+    const SPS_NAL_TYPE: u8 = 7;
+    let end = data.len().min(256);
+    let mut i = 0usize;
+    while i + 3 < end {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if data[i + 3] & 0x1f == SPS_NAL_TYPE {
+                return true;
+            }
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Whether a payload list actually carries the parameter sets, as a STAP-A aggregate or as a
+/// bare SPS.
+fn payloads_carry_parameter_sets(payloads: &[Bytes]) -> bool {
+    const STAP_A_NAL_TYPE: u8 = 24;
+    const SPS_NAL_TYPE: u8 = 7;
+    payloads.iter().any(|p| {
+        matches!(
+            p.first().map(|b| b & 0x1f),
+            Some(STAP_A_NAL_TYPE) | Some(SPS_NAL_TYPE)
+        )
+    })
+}
+
 pub struct InputParams {
     pub device: Option<String>,
     pub control_enabled: bool,
@@ -753,6 +787,7 @@ pub async fn handle_whep_offer(
                 pipeline.frame_duration,
             );
             let mut warned_unbound = false;
+            let mut warned_dropped_params = false;
             // Two extensions when the client offered transport-wide-cc, one when it did not.
             // Stamping an extension the peer never negotiated costs a marshal and a `BytesMut`
             // per packet and reaches nobody, and the send history it feeds would only ever be
@@ -791,6 +826,23 @@ pub async fn handle_whep_offer(
                             // spin.
                             keyframes.request_quietly();
                             continue;
+                        }
+                        // `H264Payloader` stashes SPS and PPS and re-emits them as a STAP-A
+                        // aggregate prepended to the next VCL NAL — but only if the aggregate
+                        // fits the MTU. If it does not it is dropped with no error and the
+                        // stashed copies are cleared anyway, so they are never retried. With an
+                        // infinite GOP that is a permanent black screen with traffic flowing, and
+                        // it looks like a healthy session from every host-side signal. It cannot
+                        // be fixed from out here, but it can stop being silent.
+                        if access_unit_has_sps(&frame.data)
+                            && !payloads_carry_parameter_sets(&payloads)
+                            && !warned_dropped_params
+                        {
+                            warned_dropped_params = true;
+                            teprintln!(
+                                "H.264 parameter sets did not fit the {mtu}-byte MTU and were dropped; \
+                                 this client cannot initialise its decoder and will stay black"
+                            );
                         }
                         timing.mark_packetize_done();
                         pacer.set_target_bps(pacing_target.load(Ordering::Relaxed));
@@ -1466,4 +1518,56 @@ fn spawn_bitrate_driver(
         }
         tprintln!("bitrate driver stopped (peer connection closed)");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn annex_b(nal_types: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for t in nal_types {
+            out.extend_from_slice(&[0, 0, 0, 1, *t]);
+            out.extend_from_slice(&[0xAA; 8]);
+        }
+        out
+    }
+
+    #[test]
+    fn a_keyframe_access_unit_is_recognised_by_its_parameter_sets() {
+        // AUD, SPS, PPS, IDR — the shape NVENC and x264 both emit.
+        assert!(access_unit_has_sps(&annex_b(&[9, 7, 8, 5])));
+        assert!(access_unit_has_sps(&annex_b(&[7, 8, 5])));
+    }
+
+    #[test]
+    fn a_p_frame_is_not_mistaken_for_one() {
+        assert!(!access_unit_has_sps(&annex_b(&[1])));
+        assert!(!access_unit_has_sps(&annex_b(&[9, 6, 1])));
+        assert!(!access_unit_has_sps(&[]));
+        assert!(!access_unit_has_sps(&[0, 0, 1]));
+    }
+
+    #[test]
+    fn parameter_sets_are_detected_in_either_form_the_payloader_emits() {
+        // STAP-A aggregate (24), and a bare SPS (7) for the split case.
+        assert!(payloads_carry_parameter_sets(&[Bytes::from_static(&[
+            24, 0, 1
+        ])]));
+        assert!(payloads_carry_parameter_sets(&[
+            Bytes::from_static(&[28, 0]),
+            Bytes::from_static(&[7, 0]),
+        ]));
+    }
+
+    #[test]
+    fn an_idr_with_no_parameter_sets_is_flagged() {
+        // FU-A fragments only: exactly what the payloader emits when the STAP-A did not fit,
+        // and what used to leave a client permanently black with no host-side signal.
+        let fua = [
+            Bytes::from_static(&[28, 0x85]),
+            Bytes::from_static(&[28, 0x05]),
+        ];
+        assert!(!payloads_carry_parameter_sets(&fua));
+    }
 }
