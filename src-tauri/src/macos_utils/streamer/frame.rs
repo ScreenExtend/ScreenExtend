@@ -114,6 +114,16 @@ impl FrameSource {
         self.wake_rx.recv_timeout(timeout).is_ok()
     }
 
+    /// Consume a pending wake token.
+    ///
+    /// The channel is a `bounded(1)` counter, and a frame can be taken by `try_take_latest`
+    /// without its token ever being received — after a timed-out `wait`, say. The token then
+    /// makes the *next* `wait` return immediately with nothing to take, which spins the loop and,
+    /// when an IDR is pending, spends the wake on a duplicate encode of the previous frame.
+    pub fn drain_wake(&self) {
+        let _ = self.wake_rx.try_recv();
+    }
+
     pub fn wake_sender(&self) -> Sender<()> {
         self.sink.wake_tx.clone()
     }

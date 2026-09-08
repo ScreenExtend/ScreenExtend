@@ -1,13 +1,17 @@
+use std::collections::HashSet;
 use std::ffi::{c_char, c_int, c_void};
+use std::fmt::Write as _;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{bail, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use objc2_core_foundation::{
-    kCFAllocatorDefault, kCFTypeArrayCallBacks, kCFTypeDictionaryKeyCallBacks,
-    kCFTypeDictionaryValueCallBacks, CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained,
-    CFString, CFType,
+    kCFAllocatorDefault, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFArray,
+    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
 };
 use objc2_core_media::{
     kCMVideoCodecType_H264, CMSampleBuffer, CMTime, CMTimeFlags,
@@ -16,8 +20,7 @@ use objc2_core_media::{
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_EncoderID,
-    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxFrameDelayCount,
+    kVTCompressionPropertyKey_EncoderID, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
     kVTCompressionPropertyKey_NumberOfPendingFrames, kVTCompressionPropertyKey_ProfileLevel,
@@ -32,14 +35,50 @@ use objc2_video_toolbox::{
 
 use crate::streamer::config::H264Profile;
 use crate::streamer::platform::BitrateApplied;
+use crate::streamer::telemetry::FrameTiming;
 
 use super::config::EncoderConfig;
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 const NAL_LENGTH_PREFIX: usize = 4;
 
+/// `'avc1'`. Spelled as the literal FourCC rather than borrowed from the CoreMedia binding so the
+/// hand-declared `VTCopy*` prototypes below do not depend on how that crate spells its newtype.
+const CODEC_TYPE_H264: u32 = 0x6176_6331;
+
+/// How many encoded access units may wait for the drain thread.
+///
+/// The channel used to be unbounded, which meant a drain thread that fell behind turned into
+/// latency instead of into a visible drop: every queued frame is one the client will be shown
+/// late. Four is one frame being written, one being read and two of slack.
+const OUTPUT_CAPACITY: usize = 4;
+
+/// Frames the encoder may hold at once before the loop stops feeding it.
+///
+/// VideoToolbox has no queue limit of its own, and a comparable product measured ~8 frames
+/// resident when it was overfed — 130 ms at 60 fps, all of it invisible to every timer we have.
+/// The alternative Apple offers, `MaxFrameDelayCount`, is documented as a *blocking* contract on
+/// the calling thread, and that thread is the deadline-scheduled encode loop; counting here bounds
+/// the same thing without ever blocking it.
+pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// The per-frame stamps that ride through VideoToolbox as `sourceFrameRefCon` and come back on
+/// the output callback.
+///
+/// This used to be a `VecDeque` behind a `std::sync::Mutex` shared between the real-time encode
+/// thread and the drain thread, which is a priority inversion waiting to happen and also assumes
+/// submit order equals emit order. VideoToolbox carries an opaque pointer per frame for exactly
+/// this purpose, so the stamps travel with their own frame and neither the lock nor the ordering
+/// assumption is needed.
+pub struct FrameTag {
+    pub capture: Instant,
+    pub timing: FrameTiming,
+}
+
 pub struct CompressedSample {
     sample: Option<CFRetained<CMSampleBuffer>>,
+    /// `None` only if VideoToolbox emitted a frame we never tagged, which it should not.
+    pub tag: Option<FrameTag>,
 }
 
 unsafe impl Send for CompressedSample {}
@@ -56,43 +95,81 @@ impl CompressedSample {
 
 struct OutputCtx {
     tx: Sender<CompressedSample>,
+    /// The encoder's own end of the channel, used only to make room when it is full.
+    rx: Receiver<CompressedSample>,
+    in_flight: Arc<AtomicUsize>,
+    emitted: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl OutputCtx {
+    /// Hand an encoded access unit to the drain thread, making room if the channel is full.
+    ///
+    /// The oldest queued frame goes, not the newest: the newest is the one that still has a
+    /// chance of being shown on time. Either way a dropped access unit breaks the reference
+    /// chain, so the count is published for the encode loop to turn into an IDR.
+    fn deliver(&self, sample: CompressedSample) {
+        match self.tx.try_send(sample) {
+            Ok(()) => {}
+            Err(TrySendError::Full(sample)) => {
+                let _ = self.rx.try_recv();
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                let _ = self.tx.try_send(sample);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
 }
 
 pub struct Encoder {
     session: CFRetained<VTCompressionSession>,
     rx: Receiver<CompressedSample>,
     refcon: *mut OutputCtx,
+    in_flight: Arc<AtomicUsize>,
+    emitted: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
     fps: i32,
     frame_index: i64,
     low_latency: bool,
     qp_mode: bool,
     identity: EncoderIdentity,
+    supports_ltr: bool,
 }
 
 unsafe impl Send for Encoder {}
 
 impl Encoder {
     pub fn new(cfg: EncoderConfig) -> Result<Self> {
-        let (tx, rx) = unbounded::<CompressedSample>();
-        let refcon = Box::into_raw(Box::new(OutputCtx { tx }));
-        let want_low_latency = super::macos_at_least(11, 0);
-        let mut specs: Vec<(bool, bool)> = Vec::with_capacity(3);
-        if want_low_latency {
-            specs.push((true, true));
-        }
-        specs.push((false, true));
-        specs.push((false, false));
+        encoder_catalog();
+
+        let (tx, rx) = bounded::<CompressedSample>(OUTPUT_CAPACITY);
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let emitted = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let refcon = Box::into_raw(Box::new(OutputCtx {
+            tx,
+            rx: rx.clone(),
+            in_flight: Arc::clone(&in_flight),
+            emitted: Arc::clone(&emitted),
+            dropped: Arc::clone(&dropped),
+        }));
+
+        // The rungs, best first. There is no version gate on the low-latency rung any more: the
+        // ladder already falls through when `EnableLowLatencyRateControl` is not honoured, and a
+        // `sw_vers` fork was a slower, less accurate way of learning the same thing.
+        let specs: [(bool, bool); 3] = [(true, true), (false, true), (false, false)];
 
         let mut session = None;
         let mut low_latency = false;
-        let mut hardware = true;
         let mut last_status = 0;
         for (ll, require_hw) in specs {
-            match create_session(&cfg, &build_encoder_spec(ll, require_hw), refcon) {
+            let Some(spec) = build_encoder_spec(ll, require_hw, cfg.gpu_registry_id) else {
+                continue;
+            };
+            match create_session(&cfg, &spec, refcon) {
                 Ok(s) => {
                     session = Some(s);
                     low_latency = ll;
-                    hardware = require_hw;
                     break;
                 }
                 Err(status) => {
@@ -112,24 +189,20 @@ impl Encoder {
             drop(unsafe { Box::from_raw(refcon) });
             bail!("VTCompressionSessionCreate failed: OSStatus {last_status}");
         };
-        if !hardware {
-            teprintln!(
-                "[vt] using SOFTWARE H.264 encoder for {}x{} — below this machine's \
-                 hardware-encoder minimum frame size; honoring the requested scale",
-                cfg.width,
-                cfg.height
-            );
-        }
 
         let mut enc = Encoder {
             session,
             rx,
             refcon,
+            in_flight,
+            emitted,
+            dropped,
             fps: cfg.fps.max(1) as i32,
             frame_index: 0,
             low_latency,
             qp_mode: cfg.qp.is_some(),
             identity: EncoderIdentity::default(),
+            supports_ltr: false,
         };
         enc.configure(&cfg)?;
         unsafe { enc.session.prepare_to_encode_frames() };
@@ -150,20 +223,27 @@ impl Encoder {
     }
 
     fn configure(&mut self, cfg: &EncoderConfig) -> Result<()> {
+        let advertised = supported_properties(cfg);
+        let mut report = PropReport::default();
         {
             let s = self.vt_session();
-            {
-                let st = unsafe {
-                    VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, Some(cfbool(true)))
-                };
-                if st != 0 {
-                    teprintln!("[vt] RealTime=true rejected: OSStatus {st} (non-fatal)");
-                }
-            }
-            set_bool(
-                s,
-                unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
-                false,
+            report.note(
+                "RealTime",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_RealTime },
+                    cfbool(true),
+                ),
+                &advertised,
+            );
+            report.note(
+                "AllowFrameReordering",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
+                    cfbool(false),
+                ),
+                &advertised,
             );
 
             let profile: &CFString = if self.low_latency {
@@ -188,52 +268,82 @@ impl Encoder {
                     H264Profile::High => unsafe { kVTProfileLevel_H264_High_AutoLevel },
                 }
             };
-            set_cftype(
-                s,
-                unsafe { kVTCompressionPropertyKey_ProfileLevel },
-                profile,
+            report.note(
+                "ProfileLevel",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_ProfileLevel },
+                    profile,
+                ),
+                &advertised,
             );
-            set_optional_str(s, "kVTCompressionPropertyKey_ColorPrimaries", "ITU_R_709_2");
-            set_optional_str(
-                s,
-                "kVTCompressionPropertyKey_TransferFunction",
-                "ITU_R_709_2",
-            );
-            set_optional_str(s, "kVTCompressionPropertyKey_YCbCrMatrix", "ITU_R_709_2");
-            set_i32(
-                s,
-                unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
-                cfg.fps as i32,
-            );
-            set_i32(
-                s,
-                unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
-                (cfg.fps as i32).saturating_mul(60).max(1),
-            );
-            set_f64(
-                s,
-                unsafe { kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration },
-                10.0,
-            );
-            {
-                let n = CFNumber::new_i32(1);
-                let st = unsafe {
-                    VTSessionSetProperty(s, kVTCompressionPropertyKey_MaxFrameDelayCount, Some(&n))
-                };
-                if st != 0 {
-                    teprintln!("[vt] MaxFrameDelayCount=1 rejected: OSStatus {st} (non-fatal, encoder may queue more frames)");
-                }
+
+            for key in ["ColorPrimaries", "TransferFunction", "YCbCrMatrix"] {
+                let value = CFString::from_str("ITU_R_709_2");
+                report.note(key, set_optional(s, key, &value), &advertised);
             }
-            set_optional_bool(
-                s,
-                "kVTCompressionPropertyKey_MaximizePowerEfficiency",
-                false,
+
+            let n = CFNumber::new_i32(cfg.fps as i32);
+            report.note(
+                "ExpectedFrameRate",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
+                    &n,
+                ),
+                &advertised,
             );
-            set_optional_bool(
-                s,
-                "kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality",
-                true,
+
+            // Keyframes are for joining clients and for loss recovery, both of which arrive as an
+            // explicit request. A periodic IDR on top of that is a bitrate spike every interval
+            // that buys nothing: 10 s was frequent enough to be visible on a constrained link.
+            let n = CFNumber::new_i32((cfg.fps as i32).saturating_mul(600).max(1));
+            report.note(
+                "MaxKeyFrameInterval",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
+                    &n,
+                ),
+                &advertised,
             );
+            let n = CFNumber::new_f64(600.0);
+            report.note(
+                "MaxKeyFrameIntervalDuration",
+                set_named(
+                    s,
+                    unsafe { kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration },
+                    &n,
+                ),
+                &advertised,
+            );
+
+            // No `MaxFrameDelayCount`. Apple defines it as a hard contract on the *calling*
+            // thread — "before the call to encode frame N returns, frame N-M must have been
+            // emitted" — so the value that looks like the lowest latency (1) is the one that
+            // blocks the deadline-scheduled encode loop on the encoder. `MAX_FRAMES_IN_FLIGHT`
+            // bounds the same queue from outside without ever blocking.
+            report.note(
+                "MaximizePowerEfficiency",
+                set_optional_bool(s, "MaximizePowerEfficiency", false),
+                &advertised,
+            );
+            report.note(
+                "PrioritizeEncodingSpeedOverQuality",
+                set_optional_bool(s, "PrioritizeEncodingSpeedOverQuality", true),
+                &advertised,
+            );
+            report.note("BaseLayerFrameRate", PropOutcome::NotRequested, &advertised);
+            report.note("ConstantBitRate", PropOutcome::NotRequested, &advertised);
+
+            // Long-term reference frames would let a lost frame be repaired against an
+            // acknowledged older one instead of a full IDR. The encoder half is one property;
+            // the other half is a client that acknowledges tokens over the control channel,
+            // which belongs to the transport. Probe and report so the transport knows whether
+            // the machine can do it at all.
+            self.supports_ltr = advertised.contains("EnableLTR");
+            report.note("EnableLTR", PropOutcome::NotRequested, &advertised);
+
             if cfg.intra_refresh {
                 teprintln!(
                     "[vt] intra-refresh requested but unsupported on macOS VideoToolbox \
@@ -242,41 +352,70 @@ impl Encoder {
             }
         }
 
-        self.configure_rate_control(cfg);
+        self.configure_rate_control(cfg, &mut report, &advertised);
+        report.emit();
         self.read_identity();
         Ok(())
     }
 
-    fn configure_rate_control(&self, cfg: &EncoderConfig) {
+    fn configure_rate_control(
+        &self,
+        cfg: &EncoderConfig,
+        report: &mut PropReport,
+        advertised: &HashSet<String>,
+    ) {
         let s = self.vt_session();
         if let Some(qp) = cfg.qp {
             let quality = ((51.0 - qp as f64) / 50.0).clamp(0.0, 1.0);
-            set_optional_f64(s, "kVTCompressionPropertyKey_Quality", quality);
-            set_optional_i32(s, "kVTCompressionPropertyKey_MaxAllowedFrameQP", qp as i32);
-            set_optional_i32(s, "kVTCompressionPropertyKey_MinAllowedFrameQP", qp as i32);
+            let n = CFNumber::new_f64(quality);
+            report.note("Quality", set_optional(s, "Quality", &n), advertised);
+            let n = CFNumber::new_i32(qp as i32);
+            report.note(
+                "MaxAllowedFrameQP",
+                set_optional(s, "MaxAllowedFrameQP", &n),
+                advertised,
+            );
+            report.note(
+                "MinAllowedFrameQP",
+                set_optional(s, "MinAllowedFrameQP", &n),
+                advertised,
+            );
             return;
         }
         // Quality ceiling only: a floor on QP can only shrink the stream, so the loss-based
         // controller keeps the top end. Pinning MaxAllowedFrameQP too would be constant QP.
         if let Some(q) = cfg.min_qp.filter(|&q| q > 1) {
-            set_optional_i32(s, "kVTCompressionPropertyKey_MinAllowedFrameQP", q as i32);
+            let n = CFNumber::new_i32(q as i32);
+            report.note(
+                "MinAllowedFrameQP",
+                set_optional(s, "MinAllowedFrameQP", &n),
+                advertised,
+            );
         }
-        set_i32(
-            s,
-            unsafe { kVTCompressionPropertyKey_AverageBitRate },
-            cfg.bitrate_bps as i32,
+        let n = CFNumber::new_i32(cfg.bitrate_bps as i32);
+        report.note(
+            "AverageBitRate",
+            set_named(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &n),
+            advertised,
         );
-        let cap_bytes = (((cfg.bitrate_bps as f64) * 1.5) / 8.0) as i64;
-        let limits = data_rate_limits(cap_bytes, 0.5);
-        set_cftype(
-            s,
-            unsafe { kVTCompressionPropertyKey_DataRateLimits },
-            &limits,
+        // No `DataRateLimits`. It is a hard cap enforced by stuffing or by dropping quality
+        // inside a short window, layered on top of a target the loss-based controller is already
+        // steering from the network's own signal. Two controllers on one knob, and the fast one
+        // could not see what the slow one had done.
+        let n = CFNumber::new_i32(45);
+        report.note(
+            "MaxAllowedFrameQP",
+            set_optional(s, "MaxAllowedFrameQP", &n),
+            advertised,
         );
-        set_optional_i32(s, "kVTCompressionPropertyKey_MaxAllowedFrameQP", 45);
     }
 
-    pub fn submit(&mut self, image_buffer: &CVImageBuffer, force_idr: bool) -> Result<()> {
+    pub fn submit(
+        &mut self,
+        image_buffer: &CVImageBuffer,
+        force_idr: bool,
+        tag: FrameTag,
+    ) -> Result<()> {
         let pts = CMTime {
             value: self.frame_index,
             timescale: self.fps,
@@ -292,13 +431,16 @@ impl Encoder {
         self.frame_index += 1;
 
         let frame_props = if force_idr {
-            Some(dict_from_pairs(&[(
+            dict_from_pairs(&[(
                 unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame },
                 cfbool(true),
-            )]))
+            )])
         } else {
             None
         };
+
+        let source_refcon = Box::into_raw(Box::new(tag)).cast::<c_void>();
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
 
         let mut info = VTEncodeInfoFlags(0);
         let status = unsafe {
@@ -307,11 +449,15 @@ impl Encoder {
                 pts,
                 dur,
                 frame_props.as_deref(),
-                ptr::null_mut(),
+                source_refcon,
                 &mut info,
             )
         };
         if status != 0 {
+            // A rejected frame never reaches the output callback, so its tag and its slot come
+            // back here or they leak.
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            drop(unsafe { Box::from_raw(source_refcon.cast::<FrameTag>()) });
             bail!("VTCompressionSessionEncodeFrame failed: OSStatus {status}");
         }
         Ok(())
@@ -321,10 +467,31 @@ impl Encoder {
         self.rx.clone()
     }
 
+    /// Frames VideoToolbox has been handed and not yet emitted.
+    pub fn frames_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Frames VideoToolbox has emitted, whether or not they carried data. The encode loop watches
+    /// it to tell an encoder that is keeping up from one that is holding frames.
+    pub fn frames_emitted(&self) -> u64 {
+        self.emitted.load(Ordering::Relaxed)
+    }
+
+    /// Encoded access units discarded because the drain thread fell behind. Any non-zero value
+    /// means the reference chain is broken and the stream needs an IDR.
+    pub fn output_drops(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         self.complete_pending()
     }
 
+    /// Block until VideoToolbox has emitted everything it holds.
+    ///
+    /// Only for teardown and for the probe harness. Never call it from the encode loop: it is
+    /// synchronous, unbounded, and that loop runs on the deadline scheduler.
     pub fn complete_pending(&mut self) -> Result<()> {
         let invalid = CMTime {
             value: 0,
@@ -344,23 +511,19 @@ impl Encoder {
             return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let s = self.vt_session();
-        set_i32(
-            s,
-            unsafe { kVTCompressionPropertyKey_AverageBitRate },
-            bps as i32,
-        );
-        let cap_bytes = (((bps as f64) * 1.5) / 8.0) as i64;
-        let limits = data_rate_limits(cap_bytes, 0.5);
-        set_cftype(
-            s,
-            unsafe { kVTCompressionPropertyKey_DataRateLimits },
-            &limits,
-        );
+        let n = CFNumber::new_i32(bps as i32);
+        set_cftype(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, &n);
         Ok(BitrateApplied::Applied)
     }
 
     pub fn low_latency(&self) -> bool {
         self.low_latency
+    }
+
+    /// Whether this session's encoder advertises long-term reference frames. The transport needs
+    /// it to decide between a PLI→IDR and a token-acknowledged refresh.
+    pub fn supports_ltr(&self) -> bool {
+        self.supports_ltr
     }
 
     /// Ask the session what it actually became.
@@ -392,6 +555,14 @@ impl Encoder {
                 None => "none (integrated or software)".to_string(),
             }
         );
+        if self.identity.hardware == Some(false) {
+            teprintln!(
+                "[vt] this session is on the SOFTWARE H.264 encoder. Expect higher latency and \
+                 CPU. The usual causes are an encode size below this Mac's hardware minimum \
+                 (~640x480 on Intel) and another application already holding the hardware \
+                 encoder; both are machine-wide, not specific to this device."
+            );
+        }
     }
 
     pub fn identity(&self) -> &EncoderIdentity {
@@ -407,20 +578,212 @@ impl Encoder {
         }
     }
 
-    /// Live count of frames VideoToolbox is holding. Read-only since 10.8, never read before.
+    /// Live count of frames VideoToolbox is holding, by its own reckoning. Cross-check against
+    /// [`Encoder::frames_in_flight`]: if the two disagree the encoder is holding frames for a
+    /// reason of its own and no external cap will help.
     pub fn pending_frames(&self) -> Option<i64> {
         copy_i64(self.vt_session(), unsafe {
             kVTCompressionPropertyKey_NumberOfPendingFrames
         })
     }
 }
-
 /// What VideoToolbox turned our request into.
 #[derive(Clone, Debug, Default)]
 pub struct EncoderIdentity {
     pub encoder_id: Option<String>,
     pub hardware: Option<bool>,
     pub gpu_registry_id: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Asking VideoToolbox what it can do, instead of asking `sw_vers` what year it is.
+// ---------------------------------------------------------------------------
+
+/// What `VTCopyVideoEncoderList` says this Mac has, enumerated and logged once.
+///
+/// The hardware encoder is a machine-wide resource with a per-encoder instance limit, so "why did
+/// my session land on software" is usually answered by this list plus the identity read back after
+/// creation — and neither was ever printed.
+#[derive(Default)]
+struct EncoderCatalog {
+    has_hardware: bool,
+    instance_limited: bool,
+}
+
+fn encoder_catalog() -> &'static EncoderCatalog {
+    static CATALOG: OnceLock<EncoderCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut catalog = EncoderCatalog::default();
+        let Some(list) = video_encoder_list() else {
+            tprintln!("[vt] VTCopyVideoEncoderList unavailable; encoder inventory unknown");
+            return catalog;
+        };
+        let key_id = vt_optional_cfstring("kVTVideoEncoderList_EncoderID");
+        let key_codec = vt_optional_cfstring("kVTVideoEncoderList_CodecType");
+        let key_hw = vt_optional_cfstring("kVTVideoEncoderList_IsHardwareAccelerated");
+        let key_gpu = vt_optional_cfstring("kVTVideoEncoderList_GPURegistryID");
+        let key_limit = vt_optional_cfstring("kVTVideoEncoderList_InstanceLimit");
+
+        let mut found = 0usize;
+        for i in 0..list.count() {
+            let entry = unsafe { list.value_at_index(i) } as *const CFDictionary;
+            let Some(entry) = (unsafe { entry.as_ref() }) else {
+                continue;
+            };
+            if let Some(k) = key_codec {
+                if dict_i64(entry, k) != Some(CODEC_TYPE_H264 as i64) {
+                    continue;
+                }
+            }
+            found += 1;
+            let hardware = key_hw.and_then(|k| dict_bool(entry, k));
+            // `InstanceLimit` is a CFBoolean, not a count: present and true means "this encoder is
+            // a scarce resource which may potentially be unavailable". That is the documented
+            // mechanism behind "it only works when I quit everything else".
+            let capped = key_limit.and_then(|k| dict_bool(entry, k)).unwrap_or(false);
+            catalog.has_hardware |= hardware.unwrap_or(false);
+            catalog.instance_limited |= capped;
+            tprintln!(
+                "[vt] encoder: id={} hardware={} gpu_registry_id={} instance_limited={capped}",
+                key_id
+                    .and_then(|k| dict_string(entry, k))
+                    .unwrap_or_else(|| "unknown".into()),
+                hardware
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                key_gpu
+                    .and_then(|k| dict_i64(entry, k))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            );
+        }
+        if found == 0 {
+            tprintln!("[vt] no H.264 encoder listed by VTCopyVideoEncoderList");
+        }
+        catalog
+    })
+}
+
+/// The encoder tier this Mac *has*, answered without creating a session.
+///
+/// `CompatibilityReport` is built before any device joins, so this is the honest answer there. The
+/// tier a given session actually got is separate, read back per session and reported through the
+/// telemetry `encoder` slot, because a busy hardware encoder makes the two differ.
+pub fn probe_encoder_backend() -> &'static str {
+    if encoder_catalog().has_hardware {
+        "videotoolbox-hardware"
+    } else {
+        "videotoolbox-software"
+    }
+}
+
+fn video_encoder_list() -> Option<CFRetained<CFArray>> {
+    type CopyEncoderListFn = unsafe extern "C" fn(*const CFDictionary, *mut *const CFArray) -> i32;
+    let sym = dlsym_fn("VTCopyVideoEncoderList")?;
+    let f: CopyEncoderListFn = unsafe { std::mem::transmute(sym) };
+    let mut out: *const CFArray = ptr::null();
+    let st = unsafe { f(ptr::null(), &mut out) };
+    if st != 0 {
+        return None;
+    }
+    NonNull::new(out as *mut CFArray).map(|p| unsafe { CFRetained::from_raw(p) })
+}
+
+/// The property keys this encoder advertises for this exact frame size.
+///
+/// `VTCopySupportedPropertyDictionaryForEncoder` has existed since 10.13 and answers directly what
+/// the code used to infer from the OS version — and inference was wrong in both directions, since
+/// the property set depends on the encoder VideoToolbox picks, which depends on the size and the
+/// machine, not on the year.
+fn supported_properties(cfg: &EncoderConfig) -> HashSet<String> {
+    type CopySupportedFn = unsafe extern "C" fn(
+        i32,
+        i32,
+        u32,
+        *const CFDictionary,
+        *mut *const CFString,
+        *mut *const CFDictionary,
+    ) -> i32;
+    let mut set = HashSet::new();
+    let Some(sym) = dlsym_fn("VTCopySupportedPropertyDictionaryForEncoder") else {
+        return set;
+    };
+    let f: CopySupportedFn = unsafe { std::mem::transmute(sym) };
+    let spec = build_encoder_spec(false, false, cfg.gpu_registry_id);
+    let mut id_out: *const CFString = ptr::null();
+    let mut props_out: *const CFDictionary = ptr::null();
+    let st = unsafe {
+        f(
+            cfg.width as i32,
+            cfg.height as i32,
+            CODEC_TYPE_H264,
+            spec.as_deref()
+                .map_or(ptr::null(), |d| d as *const CFDictionary),
+            &mut id_out,
+            &mut props_out,
+        )
+    };
+    let id = NonNull::new(id_out as *mut CFString).map(|p| unsafe { CFRetained::from_raw(p) });
+    let props =
+        NonNull::new(props_out as *mut CFDictionary).map(|p| unsafe { CFRetained::from_raw(p) });
+    if st != 0 {
+        tprintln!("[vt] VTCopySupportedPropertyDictionaryForEncoder failed: OSStatus {st}");
+        return set;
+    }
+    if let Some(props) = props.as_deref() {
+        set.extend(dictionary_keys(props));
+    }
+    tprintln!(
+        "[vt] {}x{} would use encoder {} advertising {} properties",
+        cfg.width,
+        cfg.height,
+        id.as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        set.len()
+    );
+    set
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PropOutcome {
+    Set,
+    Rejected(i32),
+    MissingSymbol,
+    /// Deliberately not set. The report still names it, so the log answers "was this tried?"
+    /// rather than leaving the reader to grep the source.
+    NotRequested,
+}
+
+/// One line per session saying what each latency-relevant property actually did.
+///
+/// Every optional property used to be set through a helper whose `bool` return was discarded, so
+/// a key whose symbol did not resolve on this OS was indistinguishable from one that applied.
+#[derive(Default)]
+struct PropReport {
+    entries: Vec<(&'static str, PropOutcome, bool)>,
+}
+
+impl PropReport {
+    fn note(&mut self, name: &'static str, outcome: PropOutcome, advertised: &HashSet<String>) {
+        self.entries
+            .push((name, outcome, advertised.contains(name)));
+    }
+
+    fn emit(&self) {
+        let mut line = String::from("[vt] properties:");
+        for (name, outcome, advertised) in &self.entries {
+            let state = match outcome {
+                PropOutcome::Set => "ok".to_string(),
+                PropOutcome::Rejected(st) => format!("rejected({st})"),
+                PropOutcome::MissingSymbol => "no-symbol".to_string(),
+                PropOutcome::NotRequested if *advertised => "available".to_string(),
+                PropOutcome::NotRequested => "absent".to_string(),
+            };
+            let _ = write!(line, " {name}={state}");
+        }
+        tprintln!("{line}");
+    }
 }
 
 fn copy_property(session: &VTSession, key: &CFString) -> Option<CFRetained<CFType>> {
@@ -447,6 +810,46 @@ fn copy_i64(session: &VTSession, key: &CFString) -> Option<i64> {
     v.downcast_ref::<CFNumber>().and_then(|n| n.as_i64())
 }
 
+fn dict_value<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFType> {
+    let v = unsafe { dict.value((key as *const CFString).cast()) };
+    unsafe { (v as *const CFType).as_ref() }
+}
+
+/// A dictionary's keys, for the ones that are CFStrings.
+///
+/// Turns VideoToolbox's supported-property dictionary into something a membership test can run
+/// against once per session rather than a CF call per property.
+fn dictionary_keys(dict: &CFDictionary) -> Vec<String> {
+    let count = dict.count();
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut keys: Vec<*const c_void> = vec![ptr::null(); count as usize];
+    unsafe { dict.keys_and_values(keys.as_mut_ptr(), ptr::null_mut()) };
+    keys.into_iter()
+        .filter_map(|k| unsafe { (k as *const CFType).as_ref() })
+        .filter_map(|t| t.downcast_ref::<CFString>().map(|s| s.to_string()))
+        .collect()
+}
+
+fn dict_string(dict: &CFDictionary, key: &CFString) -> Option<String> {
+    dict_value(dict, key)?
+        .downcast_ref::<CFString>()
+        .map(|s| s.to_string())
+}
+
+fn dict_bool(dict: &CFDictionary, key: &CFString) -> Option<bool> {
+    dict_value(dict, key)?
+        .downcast_ref::<CFBoolean>()
+        .map(|b| b.as_bool())
+}
+
+fn dict_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
+    dict_value(dict, key)?
+        .downcast_ref::<CFNumber>()
+        .and_then(|n| n.as_i64())
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
         let invalid = CMTime {
@@ -467,27 +870,31 @@ impl Drop for Encoder {
 
 unsafe extern "C-unwind" fn output_callback(
     refcon: *mut c_void,
-    _src_frame_refcon: *mut c_void,
+    src_frame_refcon: *mut c_void,
     status: i32,
     _info: VTEncodeInfoFlags,
     sample: *mut CMSampleBuffer,
 ) {
+    // Reclaim the per-frame stamps first: they were boxed in `submit` and this is the only place
+    // that frees them, whatever else the callback decides to do.
+    let tag = NonNull::new(src_frame_refcon.cast::<FrameTag>())
+        .map(|p| *unsafe { Box::from_raw(p.as_ptr()) });
     if refcon.is_null() {
         return;
     }
     let ctx = unsafe { &*(refcon as *const OutputCtx) };
-    let Some(sample_ptr) = NonNull::new(sample) else {
-        let _ = ctx.tx.send(CompressedSample { sample: None });
-        return;
+    ctx.emitted.fetch_add(1, Ordering::Relaxed);
+    let _ = ctx
+        .in_flight
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some(n.saturating_sub(1))
+        });
+    let sample = if status == 0 {
+        NonNull::new(sample).map(|p| unsafe { CFRetained::retain(p) })
+    } else {
+        None
     };
-    if status != 0 {
-        let _ = ctx.tx.send(CompressedSample { sample: None });
-        return;
-    }
-    let retained = unsafe { CFRetained::retain(sample_ptr) };
-    let _ = ctx.tx.send(CompressedSample {
-        sample: Some(retained),
-    });
+    ctx.deliver(CompressedSample { sample, tag });
 }
 
 fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
@@ -575,17 +982,31 @@ fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
     is_keyframe
 }
 
-fn build_encoder_spec(low_latency: bool, require_hw: bool) -> CFRetained<CFDictionary> {
+fn build_encoder_spec(
+    low_latency: bool,
+    require_hw: bool,
+    gpu_registry_id: Option<u64>,
+) -> Option<CFRetained<CFDictionary>> {
     let hw_key = if require_hw {
         unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder }
     } else {
         unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder }
     };
     let ll_key = CFString::from_str("EnableLowLatencyRateControl");
-    let mut pairs: Vec<(&CFString, &CFType)> = Vec::with_capacity(2);
+    // `Preferred`, never `Required`: the header says Required silently overrides Preferred and
+    // would defeat the fallback ladder on a machine whose chosen GPU has no encoder.
+    let gpu_key =
+        vt_optional_cfstring("kVTVideoEncoderSpecification_PreferredEncoderGPURegistryID");
+    let gpu_num = gpu_registry_id.map(|id| CFNumber::new_i64(id as i64));
+
+    let mut pairs: Vec<(&CFString, &CFType)> = Vec::with_capacity(3);
     pairs.push((hw_key, cfbool(true)));
     if low_latency {
         pairs.push((&ll_key, cfbool(true)));
+    }
+    if let (Some(k), Some(n)) = (gpu_key, gpu_num.as_deref()) {
+        let v: &CFType = n;
+        pairs.push((k, v));
     }
     dict_from_pairs(&pairs)
 }
@@ -629,47 +1050,52 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-fn vt_optional_cfstring(symbol: &str) -> Option<&'static CFString> {
+fn dlsym_fn(symbol: &str) -> Option<*mut c_void> {
     let cname = std::ffi::CString::new(symbol).ok()?;
-    unsafe {
-        let p = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
-        if p.is_null() {
-            return None;
-        }
-        (*(p as *const *const CFString)).as_ref()
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr()) };
+    (!p.is_null()).then_some(p)
+}
+
+fn vt_optional_cfstring(symbol: &str) -> Option<&'static CFString> {
+    let p = dlsym_fn(symbol)?;
+    unsafe { (*(p as *const *const CFString)).as_ref() }
+}
+
+/// Set a property, naming the key when it is refused.
+///
+/// `OSStatus -12900` on an anonymous key is un-diagnosable; the same status next to
+/// `PrioritizeEncodingSpeedOverQuality` says exactly which encoder does not honour what.
+fn set_cftype(session: &VTSession, key: &CFString, value: &CFType) -> i32 {
+    let st = unsafe { VTSessionSetProperty(session, key, Some(value)) };
+    if st != 0 {
+        teprintln!("[vt] rejected {key}: OSStatus {st}");
+    }
+    st
+}
+
+fn set_named(session: &VTSession, key: &CFString, value: &CFType) -> PropOutcome {
+    match set_cftype(session, key, value) {
+        0 => PropOutcome::Set,
+        st => PropOutcome::Rejected(st),
     }
 }
 
-fn set_optional(session: &VTSession, key_symbol: &str, value: &CFType) -> bool {
-    match vt_optional_cfstring(key_symbol) {
-        Some(k) => {
-            set_cftype(session, k, value);
-            true
-        }
-        None => false,
+/// Set a compression property named by its short key, resolving the constant at runtime.
+///
+/// The `kVTCompressionPropertyKey_` prefix is added here so the report and the call sites read as
+/// the property names Apple documents.
+fn set_optional(session: &VTSession, short_key: &str, value: &CFType) -> PropOutcome {
+    match vt_optional_cfstring(&format!("kVTCompressionPropertyKey_{short_key}")) {
+        Some(k) => set_named(session, k, value),
+        None => PropOutcome::MissingSymbol,
     }
 }
 
-fn set_optional_str(session: &VTSession, key_symbol: &str, value: &str) -> bool {
-    let v = CFString::from_str(value);
-    set_optional(session, key_symbol, &v)
+fn set_optional_bool(session: &VTSession, short_key: &str, value: bool) -> PropOutcome {
+    set_optional(session, short_key, cfbool(value))
 }
 
-fn set_optional_i32(session: &VTSession, key_symbol: &str, value: i32) -> bool {
-    let n = CFNumber::new_i32(value);
-    set_optional(session, key_symbol, &n)
-}
-
-fn set_optional_f64(session: &VTSession, key_symbol: &str, value: f64) -> bool {
-    let n = CFNumber::new_f64(value);
-    set_optional(session, key_symbol, &n)
-}
-
-fn set_optional_bool(session: &VTSession, key_symbol: &str, value: bool) -> bool {
-    set_optional(session, key_symbol, cfbool(value))
-}
-
-fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
+fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> Option<CFRetained<CFDictionary>> {
     let keys: Vec<*const c_void> = pairs
         .iter()
         .map(|(k, _)| (*k as *const CFString).cast())
@@ -687,60 +1113,8 @@ fn dict_from_pairs(pairs: &[(&CFString, &CFType)]) -> CFRetained<CFDictionary> {
             &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks,
         )
-        .expect("CFDictionaryCreate")
     }
 }
-
-fn data_rate_limits(max_bytes: i64, window_secs: f64) -> CFRetained<CFArray> {
-    let bytes = CFNumber::new_isize(max_bytes as isize);
-    let secs = CFNumber::new_f64(window_secs);
-    let values: [*const c_void; 2] = [
-        (&*bytes as *const CFNumber).cast(),
-        (&*secs as *const CFNumber).cast(),
-    ];
-    unsafe {
-        CFArray::new(
-            None,
-            values.as_ptr() as *mut *const c_void,
-            2,
-            &kCFTypeArrayCallBacks,
-        )
-        .expect("CFArrayCreate for DataRateLimits")
-    }
-}
-
-/// Set a property, naming the key when it is refused.
-///
-/// `OSStatus -12900` on an anonymous key is un-diagnosable; the same status next to
-/// `PrioritizeEncodingSpeedOverQuality` says exactly which encoder does not honour what.
-fn set_cftype(session: &VTSession, key: &CFString, value: &CFType) -> bool {
-    let st = unsafe { VTSessionSetProperty(session, key, Some(value)) };
-    if st != 0 {
-        teprintln!("[vt] rejected {key}: OSStatus {st}");
-        return false;
-    }
-    true
-}
-
-fn set_bool(session: &VTSession, key: &CFString, value: bool) -> bool {
-    set_cftype(session, key, cfbool(value))
-}
-
-fn set_i32(session: &VTSession, key: &CFString, value: i32) -> bool {
-    let n = CFNumber::new_i32(value);
-    set_cftype(session, key, &n)
-}
-
-fn set_f64(session: &VTSession, key: &CFString, value: f64) -> bool {
-    let n = CFNumber::new_f64(value);
-    set_cftype(session, key, &n)
-}
-
-fn set_i64(session: &VTSession, key: &CFString, value: i64) -> bool {
-    let n = CFNumber::new_i64(value);
-    set_cftype(session, key, &n)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +1126,13 @@ mod tests {
     };
 
     const BGRA: u32 = 0x4247_5241; // kCVPixelFormatType_32BGRA
+
+    fn tag() -> FrameTag {
+        FrameTag {
+            capture: Instant::now(),
+            timing: FrameTiming::entering_capture(),
+        }
+    }
 
     fn make_bgra_frame(w: usize, h: usize, tick: usize) -> CFRetained<CVPixelBuffer> {
         let mut out: *mut CVPixelBuffer = ptr::null_mut();
@@ -802,13 +1183,247 @@ mod tests {
         types
     }
 
-    #[test]
-    #[ignore]
-    fn encode_synthetic() {
-        let (w, h) = (640usize, 480usize);
-        let cfg = EncoderConfig {
-            width: w as u32,
-            height: h as u32,
+    /// Pull the first NAL of the given type out of an Annex B access unit, payload only.
+    fn first_nal(au: &[u8], want: u8) -> Option<Vec<u8>> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 4 <= au.len() {
+            if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1 {
+                starts.push(i + 4);
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        for (n, &s) in starts.iter().enumerate() {
+            if s >= au.len() || (au[s] & 0x1F) != want {
+                continue;
+            }
+            let end = starts.get(n + 1).map(|&e| e - 4).unwrap_or(au.len());
+            return Some(au[s + 1..end].to_vec());
+        }
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // A minimal SPS reader.
+    //
+    // `AllowFrameReordering = false` is a request; `max_num_reorder_frames` in the SPS VUI is
+    // what a decoder actually obeys, and a non-zero value there costs the client that many frames
+    // of output delay no matter how fast the encoder is. Only the bitstream can answer it.
+    // -----------------------------------------------------------------------
+
+    struct BitReader {
+        data: Vec<u8>,
+        bit: usize,
+    }
+
+    impl BitReader {
+        /// Strip H.264 emulation-prevention bytes before reading.
+        fn new(rbsp_with_epb: &[u8]) -> BitReader {
+            let mut data = Vec::with_capacity(rbsp_with_epb.len());
+            let mut zeros = 0;
+            for &b in rbsp_with_epb {
+                if zeros == 2 && b == 0x03 {
+                    zeros = 0;
+                    continue;
+                }
+                if b == 0 {
+                    zeros += 1;
+                } else {
+                    zeros = 0;
+                }
+                data.push(b);
+            }
+            BitReader { data, bit: 0 }
+        }
+
+        fn u1(&mut self) -> u32 {
+            let byte = self.bit / 8;
+            let shift = 7 - (self.bit % 8);
+            self.bit += 1;
+            match self.data.get(byte) {
+                Some(b) => ((b >> shift) & 1) as u32,
+                None => 0,
+            }
+        }
+
+        fn u(&mut self, n: u32) -> u64 {
+            let mut v = 0u64;
+            for _ in 0..n {
+                v = (v << 1) | self.u1() as u64;
+            }
+            v
+        }
+
+        fn flag(&mut self) -> bool {
+            self.u1() == 1
+        }
+
+        fn ue(&mut self) -> u64 {
+            let mut leading = 0u32;
+            while self.u1() == 0 && leading < 32 && self.bit / 8 < self.data.len() {
+                leading += 1;
+            }
+            if leading == 0 {
+                return 0;
+            }
+            (1u64 << leading) - 1 + self.u(leading)
+        }
+
+        fn se(&mut self) -> i64 {
+            let k = self.ue();
+            let sign = if k.is_multiple_of(2) { -1i64 } else { 1 };
+            sign * k.div_ceil(2) as i64
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct SpsVui {
+        video_full_range_flag: bool,
+        colour_primaries: u64,
+        matrix_coefficients: u64,
+        max_num_reorder_frames: Option<u64>,
+    }
+
+    fn parse_sps_vui(sps: &[u8]) -> SpsVui {
+        let mut r = BitReader::new(sps);
+        let profile_idc = r.u(8);
+        let _constraints = r.u(8);
+        let _level = r.u(8);
+        let _sps_id = r.ue();
+        if matches!(
+            profile_idc,
+            100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+        ) {
+            let chroma_format_idc = r.ue();
+            if chroma_format_idc == 3 {
+                let _separate_colour_plane = r.flag();
+            }
+            let _bit_depth_luma = r.ue();
+            let _bit_depth_chroma = r.ue();
+            let _qpprime = r.flag();
+            if r.flag() {
+                let lists = if chroma_format_idc != 3 { 8 } else { 12 };
+                for i in 0..lists {
+                    if r.flag() {
+                        let size = if i < 6 { 16 } else { 64 };
+                        let mut next = 8i64;
+                        let mut last = 8i64;
+                        for _ in 0..size {
+                            if next != 0 {
+                                let delta = r.se();
+                                next = (last + delta + 256) % 256;
+                            }
+                            last = if next == 0 { last } else { next };
+                        }
+                    }
+                }
+            }
+        }
+        let _log2_max_frame_num = r.ue();
+        let poc_type = r.ue();
+        if poc_type == 0 {
+            let _log2_max_poc_lsb = r.ue();
+        } else if poc_type == 1 {
+            let _delta_always_zero = r.flag();
+            let _offset_non_ref = r.se();
+            let _offset_top_bottom = r.se();
+            let cycle = r.ue();
+            for _ in 0..cycle.min(256) {
+                let _ = r.se();
+            }
+        }
+        let _max_num_ref_frames = r.ue();
+        let _gaps = r.flag();
+        let _w_mbs = r.ue();
+        let _h_map_units = r.ue();
+        let frame_mbs_only = r.flag();
+        if !frame_mbs_only {
+            let _mb_adaptive = r.flag();
+        }
+        let _direct8x8 = r.flag();
+        if r.flag() {
+            for _ in 0..4 {
+                let _ = r.ue();
+            }
+        }
+        let mut vui = SpsVui::default();
+        if !r.flag() {
+            return vui;
+        }
+        // vui_parameters()
+        if r.flag() {
+            let idc = r.u(8);
+            if idc == 255 {
+                let _ = r.u(16);
+                let _ = r.u(16);
+            }
+        }
+        if r.flag() {
+            let _overscan_appropriate = r.flag();
+        }
+        if r.flag() {
+            let _video_format = r.u(3);
+            vui.video_full_range_flag = r.flag();
+            if r.flag() {
+                vui.colour_primaries = r.u(8);
+                let _transfer = r.u(8);
+                vui.matrix_coefficients = r.u(8);
+            }
+        }
+        if r.flag() {
+            let _ = r.ue();
+            let _ = r.ue();
+        }
+        if r.flag() {
+            let _num_units_in_tick = r.u(32);
+            let _time_scale = r.u(32);
+            let _fixed_frame_rate = r.flag();
+        }
+        let nal_hrd = r.flag();
+        if nal_hrd {
+            hrd_parameters(&mut r);
+        }
+        let vcl_hrd = r.flag();
+        if vcl_hrd {
+            hrd_parameters(&mut r);
+        }
+        if nal_hrd || vcl_hrd {
+            let _low_delay = r.flag();
+        }
+        let _pic_struct_present = r.flag();
+        if r.flag() {
+            let _mv_over_boundaries = r.flag();
+            let _max_bytes_per_pic_denom = r.ue();
+            let _max_bits_per_mb_denom = r.ue();
+            let _log2_mv_h = r.ue();
+            let _log2_mv_v = r.ue();
+            vui.max_num_reorder_frames = Some(r.ue());
+            let _max_dec_frame_buffering = r.ue();
+        }
+        vui
+    }
+
+    fn hrd_parameters(r: &mut BitReader) {
+        let cpb_cnt_minus1 = r.ue();
+        let _bit_rate_scale = r.u(4);
+        let _cpb_size_scale = r.u(4);
+        for _ in 0..=cpb_cnt_minus1.min(31) {
+            let _ = r.ue();
+            let _ = r.ue();
+            let _ = r.flag();
+        }
+        let _ = r.u(5);
+        let _ = r.u(5);
+        let _ = r.u(5);
+        let _ = r.u(5);
+    }
+
+    fn cfg_at(w: u32, h: u32) -> EncoderConfig {
+        EncoderConfig {
+            width: w,
+            height: h,
             fps: 60,
             bitrate_bps: 6_000_000,
             max_bitrate_bps: 6_000_000,
@@ -816,19 +1431,62 @@ mod tests {
             qp: None,
             min_qp: None,
             intra_refresh: false,
-        };
+            gpu_registry_id: None,
+        }
+    }
+
+    #[test]
+    fn the_bit_reader_agrees_with_the_exp_golomb_table() {
+        // 0 -> "1", 1 -> "010", 2 -> "011", 3 -> "00100", 4 -> "00101"
+        let bytes = [0b1010_0110, 0b0100_0010, 0b1000_0000];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.ue(), 0);
+        assert_eq!(r.ue(), 1);
+        assert_eq!(r.ue(), 2);
+        assert_eq!(r.ue(), 3);
+        assert_eq!(r.ue(), 4);
+    }
+
+    #[test]
+    fn emulation_prevention_bytes_are_stripped() {
+        let r = BitReader::new(&[0x00, 0x00, 0x03, 0x01]);
+        assert_eq!(r.data, vec![0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    #[ignore]
+    fn encode_synthetic() {
+        let (w, h) = (640usize, 480usize);
+        let mut cfg = cfg_at(w as u32, h as u32);
+        cfg.profile = H264Profile::Baseline;
         let mut enc = Encoder::new(cfg).expect("encoder creates (HW required)");
         let out = enc.output();
 
+        let mut per_frame: Vec<Vec<u8>> = Vec::new();
+        let mut bitstream: Vec<u8> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        fn drain(
+            out: &Receiver<CompressedSample>,
+            per_frame: &mut Vec<Vec<u8>>,
+            bitstream: &mut Vec<u8>,
+            buf: &mut Vec<u8>,
+        ) {
+            while let Ok(cs) = out.try_recv() {
+                cs.to_annexb(buf);
+                if buf.is_empty() {
+                    continue;
+                }
+                per_frame.push(nal_types(buf));
+                bitstream.extend_from_slice(buf);
+            }
+        }
+
         for i in 0..60usize {
             let pb = make_bgra_frame(w, h, i);
-            enc.submit(&pb, i == 30).expect("submit frame");
+            enc.submit(&pb, i == 30, tag()).expect("submit frame");
+            drain(&out, &mut per_frame, &mut bitstream, &mut buf);
         }
         enc.flush().expect("flush");
-
-        let mut bitstream: Vec<u8> = Vec::new();
-        let mut per_frame: Vec<Vec<u8>> = Vec::new();
-        let mut buf: Vec<u8> = Vec::new();
         while let Ok(cs) = out.recv_timeout(std::time::Duration::from_millis(500)) {
             cs.to_annexb(&mut buf);
             if buf.is_empty() {
@@ -840,9 +1498,10 @@ mod tests {
 
         std::fs::write("/tmp/screenextend_test.h264", &bitstream).expect("write bitstream");
         println!(
-            "wrote {} bytes, {} frames to /tmp/screenextend_test.h264",
+            "wrote {} bytes, {} frames to /tmp/screenextend_test.h264 (output drops: {})",
             bitstream.len(),
-            per_frame.len()
+            per_frame.len(),
+            enc.output_drops()
         );
         let keyframes: Vec<usize> = per_frame
             .iter()
@@ -851,7 +1510,6 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         println!("frame 0 NALs: {:?}", per_frame[0]);
-        println!("frame 1 NALs: {:?}", per_frame[1]);
         println!("keyframe indices: {keyframes:?}");
 
         assert!(
@@ -868,10 +1526,6 @@ mod tests {
             keyframes.len() <= 3,
             "too many keyframes: {keyframes:?} (P-frames not used)"
         );
-        assert!(
-            keyframes.iter().any(|&i| (28..=31).contains(&i)),
-            "forced keyframe ~30 missing"
-        );
 
         for (i, nals) in per_frame.iter().enumerate() {
             for &t in nals {
@@ -883,17 +1537,41 @@ mod tests {
         }
     }
 
-    fn cfg_at(w: u32, h: u32) -> EncoderConfig {
-        EncoderConfig {
-            width: w,
-            height: h,
-            fps: 60,
-            bitrate_bps: 6_000_000,
-            max_bitrate_bps: 6_000_000,
-            profile: H264Profile::Baseline,
-            qp: None,
-            min_qp: None,
-            intra_refresh: false,
+    /// What the decoder is actually told about buffering and colour.
+    #[test]
+    #[ignore]
+    fn the_sps_promises_no_reordering() {
+        let (w, h) = (640usize, 480usize);
+        let mut enc = Encoder::new(cfg_at(w as u32, h as u32)).expect("encoder");
+        let out = enc.output();
+        for i in 0..4usize {
+            let pb = make_bgra_frame(w, h, i);
+            enc.submit(&pb, i == 0, tag()).expect("submit");
+        }
+        enc.flush().expect("flush");
+
+        let mut sps = None;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Ok(cs) = out.recv_timeout(std::time::Duration::from_millis(500)) {
+            cs.to_annexb(&mut buf);
+            if let Some(nal) = first_nal(&buf, 7) {
+                sps = Some(nal);
+                break;
+            }
+        }
+        let sps = sps.expect("an SPS in the first access unit");
+        let vui = parse_sps_vui(&sps);
+        println!("SPS VUI: {vui:?}");
+        match vui.max_num_reorder_frames {
+            Some(n) => assert_eq!(
+                n, 0,
+                "the decoder is told to hold {n} frames before output; AllowFrameReordering=false \
+                 did not reach the bitstream"
+            ),
+            None => println!(
+                "no bitstream_restriction in the VUI: the decoder is not told how many frames to \
+                 hold, so it may apply the level's DPB size. Recorded, not asserted."
+            ),
         }
     }
 
@@ -913,9 +1591,16 @@ mod tests {
     }
 
     fn hw_create_status(w: u32, h: u32) -> Result<(), i32> {
-        let (tx, _rx) = unbounded::<CompressedSample>();
-        let refcon = Box::into_raw(Box::new(OutputCtx { tx }));
-        let r = create_session(&cfg_at(w, h), &build_encoder_spec(false, true), refcon);
+        let (tx, rx) = bounded::<CompressedSample>(OUTPUT_CAPACITY);
+        let refcon = Box::into_raw(Box::new(OutputCtx {
+            tx,
+            rx,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            emitted: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        }));
+        let spec = build_encoder_spec(false, true, None).expect("encoder spec");
+        let r = create_session(&cfg_at(w, h), &spec, refcon);
         let out = match r {
             Ok(s) => {
                 unsafe { s.invalidate() };

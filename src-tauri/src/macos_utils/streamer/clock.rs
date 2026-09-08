@@ -31,8 +31,21 @@ pub fn mach_ticks_to_host_ns(ticks: u64) -> u64 {
     if ticks == 0 {
         return 0;
     }
-    let mach_ns = mach_delta_ns(0, ticks) as i128;
-    let host = mach_ns - mach_to_host_delta_ns();
+    host_ns_to_shared_ns(mach_delta_ns(0, ticks))
+}
+
+/// Convert a mach-clock timestamp that is **already in nanoseconds** to the shared host clock.
+///
+/// ScreenCaptureKit stamps its samples from `CMClockGetHostTimeClock`, which is the same clock
+/// CGDisplayStream's `displayTime` comes from but expressed as a `CMTime` in seconds rather than
+/// as a raw tick count. Running such a value through the tick conversion would scale it by the
+/// timebase a second time and produce a plausible-looking, systematically wrong number — which is
+/// worse than the honest zero it replaces.
+pub fn host_ns_to_shared_ns(mach_ns: u64) -> u64 {
+    if mach_ns == 0 {
+        return 0;
+    }
+    let host = mach_ns as i128 - mach_to_host_delta_ns();
     if host <= 0 {
         0
     } else {

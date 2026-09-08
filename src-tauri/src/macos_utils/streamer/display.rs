@@ -1,3 +1,8 @@
+use std::ptr::NonNull;
+
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, Bool};
+use objc2::{msg_send, sel};
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError,
     CGGetActiveDisplayList, CGMainDisplayID,
@@ -11,6 +16,31 @@ unsafe extern "C" {
 }
 
 const MAX_DISPLAYS: usize = 16;
+
+/// The registry ID of the GPU currently driving this display.
+///
+/// It is what `kVTVideoEncoderSpecification_PreferredEncoderGPURegistryID` takes. Without it
+/// VideoToolbox picks an encoder by its own criteria, and on a Mac with more than one GPU that can
+/// be a different one from the GPU WindowServer composites this display on — in which case every
+/// frame's IOSurface migrates across the PCIe bridge before it can be encoded.
+///
+/// `CGDirectDisplayCopyCurrentMetalDevice` is CoreGraphics 10.11, below the floor. The returned
+/// Metal object is only ever messaged, never linked against, so this adds no framework dependency.
+pub fn metal_registry_id(display: DisplayId) -> Option<u64> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDirectDisplayCopyCurrentMetalDevice(display: DisplayId) -> *mut AnyObject;
+    }
+    // SAFETY: a `Copy` function, so the result is +1 and `Retained::from_raw` takes that ownership.
+    let device = unsafe { CGDirectDisplayCopyCurrentMetalDevice(display) };
+    let device = unsafe { Retained::from_raw(NonNull::new(device)?.as_ptr()) }?;
+    let responds: Bool = unsafe { msg_send![&*device, respondsToSelector: sel!(registryID)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let id: u64 = unsafe { msg_send![&*device, registryID] };
+    (id != 0).then_some(id)
+}
 
 pub fn active_displays() -> Vec<DisplayId> {
     let mut ids = [0u32; MAX_DISPLAYS];

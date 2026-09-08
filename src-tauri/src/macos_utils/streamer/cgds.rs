@@ -220,6 +220,10 @@ impl CaptureBackend for CgDisplayStreamBackend {
         "cgdisplaystream"
     }
 
+    fn frames_captured(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
+    }
+
     fn start(&mut self) -> Result<(), CaptureError> {
         let props = make_cg_properties();
 

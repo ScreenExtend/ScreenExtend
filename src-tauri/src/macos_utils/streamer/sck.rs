@@ -39,10 +39,11 @@
 //!   §5.2 `-[SCContentFilter initWithDisplay:excludingWindows:]` (whole display,
 //!        empty exclusion array).
 //!   §5.3 `SCStreamConfiguration`: native `width`/`height`, `420f`,
-//!        `minimumFrameInterval = 1/fps`, `queueDepth = 3` (SCK rejects < 3; 3 is
-//!        lowest latency), `showsCursor = true` (window-server composites the
-//!        cursor into the frame — same low-latency cursor path as the
-//!        CGDisplayStream backend), `capturesAudio = false`.
+//!        `minimumFrameInterval` slightly *shorter* than a frame period,
+//!        `queueDepth = 8` (Apple's own documented default), `showsCursor = true`
+//!        (window-server composites the cursor into the frame — same low-latency
+//!        cursor path as the CGDisplayStream backend), `capturesAudio = false`,
+//!        and the same 709 colour handling the CGDisplayStream backend forces.
 //!   §5.4 an `SCStreamOutput` delegate built with [`ClassBuilder`]; its
 //!        `stream:didOutputSampleBuffer:ofType:` is the hot path.
 //!   §5.5 frame-status filter — forward only `SCFrameStatusComplete` (read from
@@ -60,7 +61,7 @@
 
 use std::ffi::{c_void, CStr};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,6 +90,10 @@ use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId};
 /// `objc2-screen-capture-kit`'s `SCFrameStatus::Complete = 0`), so we inline it
 /// rather than referencing the 12.3+ enum symbol.
 const SC_FRAME_STATUS_COMPLETE: i64 = 0;
+
+/// `SCFrameStatusStarted` — the first frame after `startCapture`, carrying the whole display.
+/// Discarding it is what made a client joining a still screen wait for the first thing to move.
+const SC_FRAME_STATUS_STARTED: i64 = 4;
 
 /// `SCStreamOutputType.screen` (= 0). Inlined for the same reason as above.
 const SC_OUTPUT_TYPE_SCREEN: isize = 0;
@@ -144,6 +149,9 @@ struct OutputCtx {
     /// only on an OS without SCK, where this code never runs.
     status_key: Option<&'static CFString>,
     dirty_rects_key: Option<&'static CFString>,
+    /// Cleared until one frame has actually been published. The dirty-rect skip is right for a
+    /// screen nobody is looking at and wrong for a client that has never seen a pixel.
+    published_one: AtomicBool,
 }
 
 pub struct SckBackend {
@@ -191,11 +199,6 @@ impl SckBackend {
             _queue: None,
             ctx: ptr::null_mut(),
         })
-    }
-
-    /// Number of complete frames delivered so far (probe instrumentation).
-    pub fn frames_captured(&self) -> u64 {
-        self.frames.load(Ordering::Relaxed)
     }
 }
 
@@ -281,6 +284,10 @@ impl CaptureBackend for SckBackend {
         "screencapturekit"
     }
 
+    fn frames_captured(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
+    }
+
     fn start(&mut self) -> Result<(), CaptureError> {
         // Belt-and-suspenders: confirm SCK is actually present. On 10.15 these
         // return None and we bail without ever touching a missing framework.
@@ -333,6 +340,7 @@ impl CaptureBackend for SckBackend {
             height: self.cfg.height,
             status_key,
             dirty_rects_key,
+            published_one: AtomicBool::new(false),
         }));
 
         let delegate = unsafe {
@@ -409,7 +417,8 @@ impl CaptureBackend for SckBackend {
         }
 
         tprintln!(
-            "[sck] capture started: display={} {}x{} @ {}fps (queueDepth=3)",
+            "[sck] capture started: display={} {}x{} @ {}fps \
+             (queueDepth={QUEUE_DEPTH}, minimumFrameInterval=0.9/fps)",
             self.display_id,
             self.cfg.width,
             self.cfg.height,
@@ -425,6 +434,15 @@ impl CaptureBackend for SckBackend {
     }
 
     fn stop(&mut self) {
+        // Order matters. Blank the delegate's context pointer first, so a sample handler already
+        // enqueued on the delivery queue finds null and returns instead of dereferencing a box we
+        // are about to free. Releasing a dispatch queue handle does not drain what is already on
+        // it, and `stopCaptureWithCompletionHandler:` is not documented as a barrier against an
+        // in-flight `stream:didOutputSampleBuffer:ofType:`.
+        if let Some(delegate) = &self.delegate {
+            // SAFETY: `delegate` is an instance of our own class, which declares the ivar.
+            unsafe { set_ctx_ivar(delegate, ptr::null_mut()) };
+        }
         if let Some(stream) = &self.stream {
             // Bridge the async stop to sync so the delegate is guaranteed not to
             // be called again before we free its context.
@@ -440,6 +458,12 @@ impl CaptureBackend for SckBackend {
                 ];
             }
             let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+        // Then drain the serial delivery queue: anything enqueued before this block has run
+        // by the time the synchronous dispatch returns, so nothing can still be inside the
+        // handler when the context is freed below.
+        if let Some(queue) = &self._queue {
+            queue.exec_sync(|| {});
         }
         // Drop the retained objc2/dispatch objects first (detaches the output),
         // then reclaim the boxed context the delegate referenced.
@@ -561,14 +585,29 @@ unsafe fn find_display(content: &AnyObject, display_id: DisplayId) -> Option<Ret
     None
 }
 
+/// Surfaces ScreenCaptureKit keeps in flight.
+///
+/// `SCStreamConfiguration.h` describes the key as the maximum number of frames the queue stores,
+/// and says a larger queue "may allow you to process frame data without stalling the display
+/// stream". Apple raised its own documented default from 3 to 8 between the 12.3 and 26.5 SDKs.
+/// Ours was 3, carrying a comment claiming that was the lowest-latency value: depth is memory
+/// against stalling, not latency, and this pipeline holds surfaces that came out of this queue —
+/// the latest-wins slot plus the encode loop's keepalive frame.
+const QUEUE_DEPTH: isize = 8;
+
 /// §5.3 — apply the low-latency SCStreamConfiguration knobs via objc2 setters.
 fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
     let fps = cfg.fps.max(1);
-    // CMTime { value: 1, timescale: fps, flags: Valid(=1), epoch: 0 } passed by
-    // value to `-setMinimumFrameInterval:`.
+    // Nine tenths of a frame period, not one.
+    //
+    // Asking for exactly 1/fps beats against the compositor's own cadence. OpenDisplay measured
+    // ~51 fps out of a 60 fps request; OBS found that "setting this property to the exact inverse
+    // of our frame rate seems to provide a capture that drops many frames" and ships a 10 %
+    // shortening. The property is a floor on delivery spacing, so asking for slightly less than a
+    // frame period costs nothing and stops the beat.
     let interval = objc2_core_media::CMTime {
-        value: 1,
-        timescale: fps,
+        value: 9,
+        timescale: fps.saturating_mul(10),
         flags: objc2_core_media::CMTimeFlags::Valid,
         epoch: 0,
     };
@@ -580,10 +619,38 @@ fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
         let _: () = msg_send![config, setHeight: cfg.height as isize];
         let _: () = msg_send![config, setMinimumFrameInterval: interval];
         let _: () = msg_send![config, setPixelFormat: cfg.pixel_format];
-        // SCK requires queueDepth in 3..=8; 3 = lowest latency.
-        let _: () = msg_send![config, setQueueDepth: 3isize];
+        let _: () = msg_send![config, setQueueDepth: QUEUE_DEPTH];
         let _: () = msg_send![config, setShowsCursor: true];
         let _: () = msg_send![config, setCapturesAudio: false];
+    }
+    // Match the CGDisplayStream backend's colour handling instead of leaving SCK on its defaults.
+    // Both tiers feed the same encoder, and a stream whose primaries depend on which capture tier
+    // happened to start is a colour shift nobody would think to look for.
+    set_optional_constant(
+        config,
+        sel!(setColorMatrix:),
+        c"kCVImageBufferYCbCrMatrix_ITU_R_709_2",
+    );
+    set_optional_constant(config, sel!(setColorSpaceName:), c"kCGColorSpaceSRGB");
+}
+
+/// Set a property whose value is a framework CFString constant, when both halves exist.
+///
+/// Both are probed: `respondsToSelector:` for the setter, because these arrived after 12.3, and
+/// `dlsym` for the value, because referencing the constant would be a link-time dependency.
+fn set_optional_constant(config: &AnyObject, selector: Sel, symbol: &CStr) {
+    let responds: Bool = unsafe { msg_send![config, respondsToSelector: selector] };
+    if !responds.as_bool() {
+        return;
+    }
+    let Some(value) = sck_optional_cfstring(symbol) else {
+        return;
+    };
+    let raw = (value as *const CFString).cast::<AnyObject>();
+    // SAFETY: both setters take a CFStringRef, which is toll-free bridged to the object pointer
+    // `performSelector:withObject:` passes.
+    unsafe {
+        let _: *mut AnyObject = msg_send![config, performSelector: selector, withObject: raw];
     }
 }
 
@@ -625,7 +692,7 @@ extern "C-unwind" fn did_output_sample_buffer(
     let sample_ref = unsafe { sample.as_ref() };
 
     // ---- §5.5 frame-status gate + §1.5 dirty-rect skip ----
-    if !frame_is_complete_and_dirty(sample_ref, ctx) {
+    if !frame_should_publish(sample_ref, ctx) {
         return;
     }
 
@@ -636,7 +703,7 @@ extern "C-unwind" fn did_output_sample_buffer(
 /// Read the `SCStreamFrameInfo` attachment and decide whether to forward the
 /// frame: forward only `SCFrameStatusComplete`, and skip when the dirty-rects
 /// attachment is present but empty (nothing changed — §1.5).
-fn frame_is_complete_and_dirty(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool {
+fn frame_should_publish(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool {
     // CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false).
     let attachments: CFRetained<CFArray> = match unsafe { sample.sample_attachments_array(false) } {
         Some(a) if a.count() > 0 => a,
@@ -665,8 +732,15 @@ fn frame_is_complete_and_dirty(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool
             (&mut status as *mut i64).cast::<c_void>(),
         )
     };
-    if ok == 0 || status != SC_FRAME_STATUS_COMPLETE {
+    if ok == 0 || (status != SC_FRAME_STATUS_COMPLETE && status != SC_FRAME_STATUS_STARTED) {
         return false;
+    }
+
+    // The very first frame is published whatever its dirty rects say, and so is a `Started`
+    // frame: a client that has seen nothing needs this one, and on a freshly created virtual
+    // display nothing will move until someone drags a window onto it.
+    if status == SC_FRAME_STATUS_STARTED || !ctx.published_one.load(Ordering::Relaxed) {
+        return true;
     }
 
     // §1.5: dirty-rect skip. If the attachment exists and is an *empty* array,
@@ -729,16 +803,30 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
             height: ctx.height,
             arrived_mach: mach_now(),
             captured_at: Instant::now(),
-            // ScreenCaptureKit's presentation timestamp lives on the CMSampleBuffer and is not
-            // read here; see findings/major-sck-presentation-timestamp-is-discarded.md. The dev
-            // Mac is 10.15, where SCK does not exist, so wiring it blind is not worth the risk.
-            os_time_ns: 0,
+            os_time_ns: sample_host_ns(sample),
             backing: Backing::PixelBuffer {
                 pixbuf,
                 _surface: HeldSurface::hold(surface),
             },
         });
+        ctx.published_one.store(true, Ordering::Relaxed);
     }
+}
+
+/// The frame's own presentation time, on the clock the rest of the streamer measures against.
+///
+/// ScreenCaptureKit stamps every sample from `CMClockGetHostTimeClock`, i.e. mach time expressed
+/// as a `CMTime` in seconds — so it is already the same clock as CGDisplayStream's `displayTime`,
+/// just in different units. Without it the SCK path can only measure from the moment its callback
+/// ran, which hides everything the frame spent between the compositor and us.
+fn sample_host_ns(sample: &CMSampleBuffer) -> u64 {
+    // SAFETY: CoreMedia, present on the 10.15 floor; valid sample for the callback's duration.
+    let pts = unsafe { sample.presentation_time_stamp() };
+    if pts.timescale <= 0 || (pts.flags.0 & objc2_core_media::CMTimeFlags::Valid.0) == 0 {
+        return 0;
+    }
+    let ns = (pts.value as i128 * 1_000_000_000 / pts.timescale as i128).max(0) as u64;
+    super::clock::host_ns_to_shared_ns(ns)
 }
 
 /// `-[NSError localizedDescription]` as a Rust string (for diagnostics).

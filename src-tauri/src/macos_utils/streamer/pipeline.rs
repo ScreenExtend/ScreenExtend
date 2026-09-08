@@ -1,6 +1,5 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -15,7 +14,7 @@ use crate::streamer::telemetry::{FrameTiming, SessionTelemetry, SharedTelemetry}
 
 use super::config::{live_encoder_config, EncoderConfig};
 use super::display;
-use super::encoder::Encoder;
+use super::encoder::{Encoder, FrameTag, MAX_FRAMES_IN_FLIGHT};
 use super::frame::{frame_channel, FrameSource};
 use super::gpu::Gpu;
 use super::{start_capture, CaptureBackend, CaptureConfig, DisplayId, PIXEL_FORMAT_420F};
@@ -30,6 +29,40 @@ pub struct EncodedFrame {
 }
 
 const BROADCAST_CAPACITY: usize = 4;
+
+/// How long a session may run without a single captured frame before the client is handed a
+/// picture anyway.
+///
+/// A capture backend that starts and never delivers produces a session that negotiates, connects,
+/// reports healthy and then shows nothing forever: the keepalive can only repeat a frame, and
+/// there is no frame to repeat. A freshly created virtual display with nothing on it is exactly
+/// that case — no window has moved on it yet, so nothing is dirty and nothing is delivered.
+const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(750);
+
+/// How long the encode loop waits for a frame before looking at its other work.
+const IDLE_POLL: Duration = Duration::from_millis(4);
+
+/// How often an unchanged screen is re-encoded so the client's decoder keeps ticking.
+const KEEPALIVE: Duration = Duration::from_millis(200);
+
+/// Consecutive submit failures before this encoder is written off and replaced.
+const SUBMIT_ERRORS_BEFORE_RESET: u32 = 3;
+
+/// How many times a session may rebuild its encoder before it ends instead.
+const MAX_ENCODER_RESETS: u32 = 3;
+
+/// How long the in-flight cap waits for the encoder to emit anything before it stands aside.
+///
+/// The cap assumes an encoder that returns roughly one frame for each one it is given. Not every
+/// VideoToolbox implementation does: without low-latency rate control some hold several frames
+/// before emitting the first, and against such an encoder a hard cap of two is a deadlock, not
+/// back-pressure — which is what the old code's blocking `CompleteFrames` on the keepalive path
+/// was really working around. So the cap yields to evidence: if nothing has come out for this
+/// long, keep feeding (up to a much larger bound) and say so once.
+const STALL_BYPASS: Duration = Duration::from_millis(100);
+
+/// The bound that still applies while the cap is stood aside.
+const HARD_MAX_FRAMES_IN_FLIGHT: usize = 16;
 
 #[derive(Clone)]
 pub struct Pipeline {
@@ -109,30 +142,34 @@ fn spawn_pipeline(
     };
 
     let encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
+    // The tier that actually started, not the one that was asked for: a session that fell back to
+    // the software encoder reports "videotoolbox-software" here and in the compatibility report.
+    telemetry.encoder.set(encoder.backend_name().into());
 
     let stop_thread = Arc::clone(&stop);
     let encode_thread = std::thread::Builder::new()
         .name("videotoolbox-encode".to_string())
         .spawn(move || {
-            run_encode_loop(
+            run_encode_loop(EncodeLoop {
                 encoder,
+                cfg: enc,
                 source,
                 tx,
                 idr_request,
                 target_bitrate,
-                stop_thread,
+                stop: stop_thread,
                 frame_duration,
                 telemetry,
-            )
+            })
         })
         .context("spawn encode thread")?;
 
     Ok((pipeline, stop, encode_thread))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_encode_loop(
-    mut encoder: Encoder,
+struct EncodeLoop {
+    encoder: Encoder,
+    cfg: EncoderConfig,
     source: FrameSource,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
@@ -140,75 +177,158 @@ fn run_encode_loop(
     stop: Arc<AtomicBool>,
     frame_duration: Duration,
     telemetry: SharedTelemetry,
-) {
-    super::qos::pin_current_thread_user_interactive();
-    super::qos::pin_current_thread_time_constraint(frame_duration.as_nanos() as u64);
-    super::qos::raise_current_thread_precedence();
-    super::qos::pin_current_thread_encode_affinity();
-    let _workgroup = super::qos::FrameWorkgroup::join(frame_duration.as_nanos() as u64);
-    let _keep_awake = super::power::KeepAwake::begin();
+}
 
-    // VideoToolbox is asynchronous — submit and completion are different threads — so each
-    // frame's stamps ride the queue with its capture instant rather than being taken at drain
-    // time, which would have measured the drain thread's wake-up latency instead of the encode.
-    let pending_ts: Arc<Mutex<VecDeque<(Instant, FrameTiming)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
-
-    let drain_ts = Arc::clone(&pending_ts);
-    let drain_telemetry = Arc::clone(&telemetry);
-    let output = encoder.output();
-    let drain = std::thread::Builder::new()
+/// Turn compressed samples into broadcast frames.
+///
+/// Its own thread because `to_annexb` walks the whole access unit and the encode loop is on the
+/// deadline scheduler; the two share nothing but the encoder's output channel, which is the point
+/// — the shared `Mutex<VecDeque>` that used to carry per-frame timestamps between them is gone,
+/// the stamps now ride with their own frame through VideoToolbox.
+fn spawn_drain(
+    output: crossbeam_channel::Receiver<super::encoder::CompressedSample>,
+    tx: broadcast::Sender<EncodedFrame>,
+    telemetry: SharedTelemetry,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
         .name("videotoolbox-drain".to_string())
         .spawn(move || {
             super::qos::pin_current_thread_user_interactive();
             super::qos::raise_current_thread_precedence();
             super::qos::pin_current_thread_encode_affinity();
-            while let Ok(sample) = output.recv() {
-                let (capture, mut timing) = drain_ts
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or_else(|| (Instant::now(), FrameTiming::entering_capture()));
+            // One buffer for the life of the thread. `to_annexb` clears it first, so the only
+            // per-frame allocation left is the `Bytes` the transport takes ownership of.
+            let mut au: Vec<u8> = Vec::with_capacity(256 * 1024);
+            while let Ok(mut sample) = output.recv() {
+                let (capture, mut timing) = match sample.tag.take() {
+                    Some(t) => (t.capture, t.timing),
+                    None => (Instant::now(), FrameTiming::entering_capture()),
+                };
                 timing.mark_encode_done();
-                let mut au: Vec<u8> = Vec::new();
                 sample.to_annexb(&mut au);
                 if au.is_empty() {
                     continue;
                 }
-                drain_telemetry
-                    .frames_encoded
-                    .fetch_add(1, Ordering::Relaxed);
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(EncodedFrame {
-                    data: Bytes::from(au),
+                    data: Bytes::copy_from_slice(&au),
                     capture,
                     timing,
                 });
             }
         })
-        .expect("spawn encode-drain thread");
+        .expect("spawn encode-drain thread")
+}
 
-    let idle = Duration::from_millis(4);
-    let keepalive = Duration::from_millis(200);
+/// Tear the encoder down and stand a new one up.
+///
+/// The old session is released *before* the replacement is asked for. The hardware encoder is a
+/// machine-wide, instance-limited resource, so creating the new one first is exactly how a
+/// recoverable error turns into a permanent software fallback.
+fn reset_encoder(
+    encoder: &mut Option<Encoder>,
+    drain: &mut Option<std::thread::JoinHandle<()>>,
+    cfg: EncoderConfig,
+    tx: &broadcast::Sender<EncodedFrame>,
+    telemetry: &SharedTelemetry,
+) -> bool {
+    *encoder = None;
+    if let Some(handle) = drain.take() {
+        let _ = handle.join();
+    }
+    match Encoder::new(cfg) {
+        Ok(e) => {
+            telemetry.encoder.set(e.backend_name().into());
+            *drain = Some(spawn_drain(e.output(), tx.clone(), Arc::clone(telemetry)));
+            *encoder = Some(e);
+            true
+        }
+        Err(e) => {
+            teprintln!("[vt] the encoder could not be recreated: {e:?}");
+            false
+        }
+    }
+}
+
+fn run_encode_loop(l: EncodeLoop) {
+    let EncodeLoop {
+        encoder,
+        cfg,
+        source,
+        tx,
+        idr_request,
+        target_bitrate,
+        stop,
+        frame_duration,
+        telemetry,
+    } = l;
+
+    // One scheduling scheme per thread. This one is a deadline thread and deliberately takes no
+    // QoS class: a QoS class is how the kernel *manages* a thread's priority and a time-constraint
+    // reservation is how that management is taken away, so setting both only means the last
+    // writer wins and nothing in the log says which.
+    super::qos::pin_current_thread_time_constraint(frame_duration.as_nanos() as u64);
+    super::qos::pin_current_thread_encode_affinity();
+    let _keep_awake = super::power::KeepAwake::begin();
+
+    let mut drain = Some(spawn_drain(
+        encoder.output(),
+        tx.clone(),
+        Arc::clone(&telemetry),
+    ));
+    let mut encoder = Some(encoder);
+
     let mut last_frame: Option<Arc<super::frame::Frame>> = None;
     let mut bitrate_warned = false;
     let mut last_emit = Instant::now();
+    let started = Instant::now();
+    let mut seen_capture = false;
+    let mut submit_errors = 0u32;
+    let mut resets = 0u32;
+    let mut last_output_drops = 0u64;
+    let mut backpressure_skips = 0u64;
+    let mut last_emitted = 0u64;
+    let mut last_output_at = Instant::now();
+    let mut max_in_flight_seen = 0usize;
+    let mut stall_reported = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        let Some(enc) = encoder.as_mut() else {
+            break;
+        };
 
-        source.wait(idle);
-        let force_idr = idr_request.swap(false, Ordering::Relaxed);
+        source.wait(IDLE_POLL);
+        let mut force_idr = idr_request.swap(false, Ordering::Relaxed);
+
+        // A discarded access unit breaks the reference chain for everything after it. The only
+        // repair is a fresh IDR, and the drop count is the only place the condition is visible.
+        let drops = enc.output_drops();
+        if drops != last_output_drops {
+            teprintln!(
+                "[vt] the drain thread fell behind; {} encoded frame(s) discarded, forcing an IDR",
+                drops - last_output_drops
+            );
+            last_output_drops = drops;
+            force_idr = true;
+            telemetry
+                .degradation
+                .encoder_output_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 {
-            match encoder.set_bitrate(pending) {
+            match enc.set_bitrate(pending) {
                 Ok(BitrateApplied::Applied) => {}
                 Ok(BitrateApplied::IgnoredConstantQp) => {
                     if !bitrate_warned {
                         bitrate_warned = true;
                         teprintln!(
-                            "bitrate adaptation is inert: the encoder is in explicit constant-QP                              mode (--qp), so congestion control cannot shrink the stream"
+                            "bitrate adaptation is inert: the encoder is in explicit constant-QP \
+                             mode (--qp), so congestion control cannot shrink the stream"
                         );
                     }
                 }
@@ -222,65 +342,192 @@ fn run_encode_loop(
             }
         }
 
-        if let Some(frame) = source.try_take_latest() {
+        // Back-pressure the capture side rather than the encoder's own queue. VideoToolbox will
+        // accept frames until memory runs out, and the only Apple-provided limit,
+        // MaxFrameDelayCount, is documented as blocking the *calling* thread — which is this one.
+        let emitted = enc.frames_emitted();
+        if emitted != last_emitted {
+            last_emitted = emitted;
+            last_output_at = Instant::now();
+        }
+        let in_flight = enc.frames_in_flight();
+        if in_flight > max_in_flight_seen {
+            max_in_flight_seen = in_flight;
+            // The single most informative number on this path, and it used to be invisible: how
+            // deep the encoder's own hidden queue gets. Cross-check it against VideoToolbox's own
+            // count — a disagreement means the encoder is holding frames for a reason of its own.
+            tprintln!(
+                "[vt] frames in flight reached {in_flight} (VideoToolbox reports {:?} pending)",
+                enc.pending_frames()
+            );
+        }
+        let stalled = last_output_at.elapsed() >= STALL_BYPASS;
+        if stalled && !stall_reported {
+            stall_reported = true;
+            tprintln!(
+                "[vt] no output for {} ms with {in_flight} frame(s) in flight; this encoder holds \
+                 frames, so the in-flight cap stands aside up to {HARD_MAX_FRAMES_IN_FLIGHT}",
+                STALL_BYPASS.as_millis()
+            );
+        }
+        let cap = if stalled {
+            HARD_MAX_FRAMES_IN_FLIGHT
+        } else {
+            MAX_FRAMES_IN_FLIGHT
+        };
+        let at_capacity = in_flight >= cap;
+        if at_capacity {
+            backpressure_skips += 1;
+        }
+        let fresh = if at_capacity {
+            None
+        } else {
+            source.try_take_latest()
+        };
+
+        let mut submitted = None;
+        if let Some(frame) = fresh {
+            // The wake channel counts tokens; a token left behind by a frame that has already
+            // been taken makes the next wait return instantly and the loop spin.
+            source.drain_wake();
             if let Some(pixbuf) = frame.pixel_buffer() {
                 let mut timing = FrameTiming::entering_capture();
                 timing.capture_available_ns = frame.os_time_ns;
-                if !submit_one(
-                    &mut encoder,
-                    &pending_ts,
+                submitted = Some(submit_one(
+                    enc,
                     frame.captured_at,
                     timing,
                     pixbuf,
                     force_idr,
-                ) {
-                    teprintln!("encode submit failed; stopping encode loop");
-                    break;
+                ));
+            }
+            seen_capture = true;
+            last_frame = Some(frame);
+        } else if force_idr || last_emit.elapsed() >= KEEPALIVE {
+            if let Some(frame) = last_frame.as_ref() {
+                if let Some(pixbuf) = frame.pixel_buffer() {
+                    // Re-encoding the frame we already have: the picture did not change, so it
+                    // is counted and kept out of the capture-relative histograms.
+                    telemetry
+                        .degradation
+                        .frames_repeated
+                        .fetch_add(1, Ordering::Relaxed);
+                    submitted = Some(submit_one(
+                        enc,
+                        frame.captured_at,
+                        FrameTiming::repeating(),
+                        pixbuf,
+                        force_idr,
+                    ));
                 }
+            } else if !seen_capture && started.elapsed() >= FIRST_FRAME_DEADLINE {
+                // Nothing has ever been captured. Give the client a decodable picture so its
+                // video element starts and the session's silence is visible rather than mute.
+                if let Some(pb) = placeholder_frame(cfg.width as usize, cfg.height as usize) {
+                    telemetry
+                        .degradation
+                        .capture_no_first_frame
+                        .fetch_add(1, Ordering::Relaxed);
+                    submitted = Some(submit_one(
+                        enc,
+                        Instant::now(),
+                        FrameTiming::repeating(),
+                        &pb,
+                        true,
+                    ));
+                }
+            }
+        }
+
+        match submitted {
+            Some(true) => {
+                submit_errors = 0;
+                last_emit = Instant::now();
                 if force_idr {
                     telemetry
                         .degradation
                         .idrs_sent
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                last_emit = Instant::now();
             }
-            last_frame = Some(frame);
-        } else if force_idr || last_emit.elapsed() >= keepalive {
-            if let Some(frame) = last_frame.as_ref() {
-                if let Some(pixbuf) = frame.pixel_buffer() {
-                    let captured = frame.captured_at;
-                    // Re-encoding the frame we already have: the picture did not change, so
-                    // it is counted and kept out of the capture-relative histograms.
-                    let timing = FrameTiming::repeating();
+            Some(false) => {
+                telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                submit_errors += 1;
+                // One rejected frame is not a reason to stop streaming forever, which is what
+                // breaking out of this loop used to mean: the session stayed up, the transport
+                // stayed connected, and the picture simply stopped.
+                if submit_errors >= SUBMIT_ERRORS_BEFORE_RESET {
+                    resets += 1;
                     telemetry
                         .degradation
-                        .frames_repeated
+                        .encoder_resets
                         .fetch_add(1, Ordering::Relaxed);
-                    if !submit_one(
-                        &mut encoder,
-                        &pending_ts,
-                        captured,
-                        timing,
-                        pixbuf,
-                        force_idr,
-                    ) {
+                    if resets > MAX_ENCODER_RESETS
+                        || !reset_encoder(&mut encoder, &mut drain, cfg, &tx, &telemetry)
+                    {
+                        teprintln!(
+                            "[vt] giving up after {resets} encoder reset(s); ending the stream so \
+                             clients are told rather than left on a frozen picture"
+                        );
                         break;
                     }
-                    if !encoder.low_latency() {
-                        if let Err(e) = encoder.complete_pending() {
-                            teprintln!("complete_pending failed: {e:?}");
-                        }
-                    }
-                    last_emit = Instant::now();
+                    submit_errors = 0;
+                    idr_request.store(true, Ordering::Relaxed);
                 }
             }
+            None => {}
         }
     }
 
-    let _ = encoder.flush();
-    drop(encoder);
-    let _ = drain.join();
+    if let Some(mut enc) = encoder.take() {
+        let _ = enc.flush();
+    }
+    // Dropping the encoder closes its output channel, which is what lets the drain thread finish.
+    if let Some(handle) = drain.take() {
+        let _ = handle.join();
+    }
+    tprintln!(
+        "[vt] encode loop finished: max {max_in_flight_seen} frame(s) in flight, \
+         {backpressure_skips} capture(s) skipped for back-pressure"
+    );
+}
+
+/// A solid black frame, for a session whose capture backend has produced nothing.
+fn placeholder_frame(w: usize, h: usize) -> Option<CFRetained<CVPixelBuffer>> {
+    use objc2_core_video::{
+        CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    };
+    const BGRA: u32 = 0x4247_5241;
+    let mut out: *mut CVPixelBuffer = std::ptr::null_mut();
+    let r = unsafe {
+        CVPixelBufferCreate(
+            objc2_core_foundation::kCFAllocatorDefault,
+            w.max(2),
+            h.max(2),
+            BGRA,
+            None,
+            std::ptr::NonNull::from(&mut out),
+        )
+    };
+    let out = std::ptr::NonNull::new(out)?;
+    let pb = unsafe { CFRetained::from_raw(out) };
+    if r != 0 {
+        return None;
+    }
+    unsafe {
+        CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags(0));
+        let base = CVPixelBufferGetBaseAddress(&pb) as *mut u8;
+        if !base.is_null() {
+            let bpr = CVPixelBufferGetBytesPerRow(&pb);
+            std::ptr::write_bytes(base, 0, bpr * h.max(2));
+        }
+        CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags(0));
+    }
+    Some(pb)
 }
 
 /// The session's telemetry has to exist before capture starts, not after: the capture backend
@@ -307,27 +554,41 @@ fn note_capture_backend(pipeline: &Pipeline, backend: &dyn CaptureBackend) {
 
 fn submit_one(
     encoder: &mut Encoder,
-    pending_ts: &Mutex<VecDeque<(Instant, FrameTiming)>>,
     captured_at: Instant,
     mut timing: FrameTiming,
     pixbuf: &objc2_core_video::CVImageBuffer,
     force_idr: bool,
 ) -> bool {
     timing.mark_encode_submit();
-    pending_ts.lock().unwrap().push_back((captured_at, timing));
-    if let Err(e) = encoder.submit(pixbuf, force_idr) {
-        teprintln!("encode submit failed: {e:?}");
-        pending_ts.lock().unwrap().pop_back();
-        return false;
+    match encoder.submit(
+        pixbuf,
+        force_idr,
+        FrameTag {
+            capture: captured_at,
+            timing,
+        },
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            teprintln!("[vt] encode submit failed: {e:?}");
+            false
+        }
     }
-    true
 }
 
-pub fn start(cfg: &Config) -> Result<Pipeline> {
+/// Start a pipeline on the primary display. Only the probe harness uses it; the session path
+/// is `start_on_monitor`. It returns the same `SessionCapture` its sibling does, because the
+/// version that returned a bare `Pipeline` had to `mem::forget` the capture backend and the
+/// latency activity to keep them alive — leaking a capture stream, a VideoToolbox session, a
+/// real-time thread, a process-wide App Nap suppression and two power assertions per call.
+pub fn start(cfg: &Config) -> Result<SessionCapture> {
     super::ensure_screen_recording_access();
     let display = select_display(cfg.monitor)?;
     let (native_w, native_h, refresh) = display_geometry(display);
-    let enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
+    // IOSurface does not have to migrate to another one before it can be read.
+    enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
     let (sink, source) = frame_channel();
@@ -344,11 +605,15 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
     let backend = start_capture(display, gpu, sink, cap_cfg, Arc::clone(&telemetry))
         .context("starting capture backend")?;
 
-    let (pipeline, _stop, _encode_thread) = spawn_pipeline(enc, source, telemetry)?;
+    let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source, telemetry)?;
     note_capture_backend(&pipeline, backend.as_ref());
-    std::mem::forget(backend);
-    std::mem::forget(activity);
-    Ok(pipeline)
+    Ok(SessionCapture {
+        pipeline,
+        control: Some(backend),
+        stop,
+        encode_thread: Some(encode_thread),
+        _activity: activity,
+    })
 }
 
 pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCapture> {
@@ -356,7 +621,10 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     let display =
         display_by_name(device_name).with_context(|| format!("resolving display {device_name}"))?;
     let (native_w, native_h, refresh) = display_geometry(display);
-    let enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
+    // IOSurface does not have to migrate to another one before it can be read.
+    enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
     let (sink, source) = frame_channel();
@@ -398,6 +666,7 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
         qp: cfg.qp,
         min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
+        gpu_registry_id: None,
     };
     let mut encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
     let out = encoder.output();
@@ -410,9 +679,9 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
         let mut bytes = 0usize;
         for i in 0..120usize {
             if let Some(pb) = make_synthetic_bgra(w as usize, h as usize, tick0 + i) {
-                let _ = encoder.submit(&pb, i == 0);
+                let _ = encoder.submit(&pb, i == 0, probe_tag());
                 if !encoder.low_latency() {
-                    let _ = encoder.submit(&pb, false);
+                    let _ = encoder.submit(&pb, false, probe_tag());
                 }
             }
             while let Ok(cs) = out.try_recv() {
@@ -449,7 +718,10 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
 
     let display = select_display(cfg.monitor)?;
     let (native_w, native_h, refresh) = display_geometry(display);
-    let enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    let mut enc = live_encoder_config(native_w, native_h, refresh, cfg);
+    // Ask VideoToolbox for an encoder on the GPU that drives this display, so the captured
+    // IOSurface does not have to migrate to another one before it can be read.
+    enc.gpu_registry_id = display::metal_registry_id(display);
 
     let gpu = Gpu::new().context("initializing Metal GPU core")?;
     let (sink, source) = frame_channel();
@@ -475,10 +747,12 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
         source.wait(Duration::from_millis(8));
         if let Some(frame) = source.try_take_latest() {
             if let Some(pixbuf) = frame.pixel_buffer() {
-                encoder.submit(pixbuf, first).context("submit")?;
+                encoder
+                    .submit(pixbuf, first, probe_tag())
+                    .context("submit")?;
                 first = false;
                 if !encoder.low_latency() {
-                    let _ = encoder.submit(pixbuf, false);
+                    let _ = encoder.submit(pixbuf, false, probe_tag());
                 }
             }
         }
@@ -504,6 +778,14 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
 
     tprintln!("[probe-live] wrote {frames} frames, {bytes} bytes to {path}");
     Ok(())
+}
+
+/// The probe harness drives the encoder directly, so it still has to hand each frame a tag.
+fn probe_tag() -> FrameTag {
+    FrameTag {
+        capture: Instant::now(),
+        timing: FrameTiming::entering_capture(),
+    }
 }
 
 fn make_synthetic_bgra(w: usize, h: usize, tick: usize) -> Option<CFRetained<CVPixelBuffer>> {
@@ -640,15 +922,27 @@ pub fn set_display_topology_extend() -> bool {
 mod tests {
     use super::*;
     use crate::streamer::config::H264Profile;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::super::cgds::CgDisplayStreamBackend;
     use super::super::config::EncoderConfig;
     use super::super::encoder::Encoder;
-    use super::super::mach::mach_age_ms;
     use super::super::{CaptureBackend, CaptureConfig, PIXEL_FORMAT_420F};
+
+    fn enc_cfg(w: u32, h: u32, fps: u32, display: DisplayId) -> EncoderConfig {
+        EncoderConfig {
+            width: w & !1,
+            height: h & !1,
+            fps,
+            bitrate_bps: 12_000_000,
+            max_bitrate_bps: 12_000_000,
+            profile: H264Profile::Baseline,
+            qp: None,
+            min_qp: None,
+            intra_refresh: false,
+            gpu_registry_id: display::metal_registry_id(display),
+        }
+    }
 
     #[test]
     #[ignore]
@@ -672,22 +966,11 @@ mod tests {
                 .unwrap();
         backend.start().expect("capture starts");
 
-        let enc_cfg = EncoderConfig {
-            width: (w & !1),
-            height: (h & !1),
-            fps,
-            bitrate_bps: 12_000_000,
-            max_bitrate_bps: 12_000_000,
-            profile: H264Profile::Baseline,
-            qp: None,
-            min_qp: None,
-            intra_refresh: false,
-        };
-        let mut encoder = Encoder::new(enc_cfg).expect("encoder");
+        let mut encoder = Encoder::new(enc_cfg(w, h, fps, display)).expect("encoder");
         let out = encoder.output();
 
-        let ts: Arc<Mutex<VecDeque<(u64, bool)>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let drain_ts = Arc::clone(&ts);
+        // No side queue of timestamps: each frame's stamps ride with it through VideoToolbox as
+        // its `sourceFrameRefCon`, which is also what the production drain thread reads.
         let drain = std::thread::spawn(move || {
             let mut lat: Vec<f64> = Vec::new();
             let mut bytes = 0usize;
@@ -695,14 +978,14 @@ mod tests {
             let mut new_frames = 0usize;
             let mut buf: Vec<u8> = Vec::new();
             while let Ok(cs) = out.recv() {
-                let tag = drain_ts.lock().unwrap().pop_front();
+                let tag = cs.tag.as_ref().map(|t| (t.capture, t.timing.repeated));
                 let is_keyframe = cs.to_annexb(&mut buf);
                 if buf.is_empty() {
                     continue;
                 }
-                if let Some((a, is_new)) = tag {
-                    if is_new {
-                        lat.push(mach_age_ms(a));
+                if let Some((captured, repeated)) = tag {
+                    if !repeated {
+                        lat.push(captured.elapsed().as_secs_f64() * 1000.0);
                         new_frames += 1;
                     }
                 }
@@ -714,20 +997,30 @@ mod tests {
             (lat, bytes, keyframes, new_frames)
         });
 
-        super::super::qos::pin_current_thread_user_interactive();
         let idle = Duration::from_millis(1);
         let keepalive_budget = 4u32;
-        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let deadline = Instant::now() + Duration::from_secs(6);
         let mut first = true;
         let mut submitted = 0usize;
-        let mut last_frame: Option<std::sync::Arc<super::super::frame::Frame>> = None;
+        let mut last_frame: Option<Arc<super::super::frame::Frame>> = None;
         let mut budget = 0u32;
-        while std::time::Instant::now() < deadline {
+        while Instant::now() < deadline {
             source.wait(idle);
             if let Some(frame) = source.try_take_latest() {
+                source.drain_wake();
                 if let Some(pixbuf) = frame.pixel_buffer() {
-                    ts.lock().unwrap().push_back((frame.arrived_mach, true));
-                    encoder.submit(pixbuf, first).expect("submit");
+                    let mut timing = FrameTiming::entering_capture();
+                    timing.capture_available_ns = frame.os_time_ns;
+                    encoder
+                        .submit(
+                            pixbuf,
+                            first,
+                            FrameTag {
+                                capture: frame.captured_at,
+                                timing,
+                            },
+                        )
+                        .expect("submit");
                     first = false;
                     submitted += 1;
                     last_frame = Some(frame);
@@ -736,8 +1029,16 @@ mod tests {
             } else if budget > 0 {
                 if let Some(lf) = last_frame.as_ref() {
                     if let Some(pixbuf) = lf.pixel_buffer() {
-                        ts.lock().unwrap().push_back((lf.arrived_mach, false));
-                        encoder.submit(pixbuf, false).ok();
+                        encoder
+                            .submit(
+                                pixbuf,
+                                false,
+                                FrameTag {
+                                    capture: lf.captured_at,
+                                    timing: FrameTiming::repeating(),
+                                },
+                            )
+                            .ok();
                     }
                     budget -= 1;
                 }
@@ -746,13 +1047,16 @@ mod tests {
         encoder.flush().ok();
         let captured = backend.frames_captured();
         let cap_drops = backend.frames_dropped();
+        let output_drops = encoder.output_drops();
+        let pending_at_flush = encoder.pending_frames();
         backend.stop();
         drop(encoder);
         let (mut lat, bytes, keyframes, new_frames) = drain.join().unwrap();
 
         println!(
             "captured={captured} windowserver_drops={cap_drops} submitted={submitted} \
-             new_frames={new_frames} keyframes={keyframes} bytes={bytes}"
+             new_frames={new_frames} keyframes={keyframes} bytes={bytes} \
+             output_drops={output_drops} vt_pending_at_flush={pending_at_flush:?}"
         );
         assert!(
             submitted > 0,
@@ -764,7 +1068,7 @@ mod tests {
         let p50 = lat[lat.len() / 2];
         let p99 = lat[((lat.len() as f64 * 0.99) as usize).min(lat.len() - 1)];
         println!(
-            "capture→encoded latency ms (new frames): mean={mean:.3} p50={p50:.3} p99={p99:.3} max={:.3}",
+            "capture-to-encoded latency ms (new frames): mean={mean:.3} p50={p50:.3} p99={p99:.3} max={:.3}",
             lat.last().unwrap()
         );
     }
@@ -790,27 +1094,18 @@ mod tests {
                 .unwrap();
         backend.start().expect("capture starts");
 
-        let enc = EncoderConfig {
-            width: w & !1,
-            height: h & !1,
-            fps,
-            bitrate_bps: 12_000_000,
-            max_bitrate_bps: 12_000_000,
-            profile: H264Profile::Baseline,
-            qp: None,
-            min_qp: None,
-            intra_refresh: false,
-        };
-        let (pipeline, stop, _encode_thread) =
-            spawn_pipeline(enc, source, new_session_telemetry()).expect("pipeline");
+        let telemetry = new_session_telemetry();
+        let (pipeline, stop, encode_thread) =
+            spawn_pipeline(enc_cfg(w, h, fps, display), source, Arc::clone(&telemetry))
+                .expect("pipeline");
         let mut rx = pipeline.tx.subscribe();
         pipeline.request_idr();
 
         let mut count = 0usize;
         let mut bytes = 0usize;
         let mut lat: Vec<f64> = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             match rx.try_recv() {
                 Ok(ef) => {
                     count += 1;
@@ -821,19 +1116,34 @@ mod tests {
             }
         }
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         backend.stop();
+        let _ = encode_thread.join();
 
         println!("production pipeline: broadcast {count} EncodedFrames, {bytes} bytes");
+        for (label, value) in telemetry.degradation.each() {
+            if value != 0 {
+                println!("  degradation {label} = {value}");
+            }
+        }
         if !lat.is_empty() {
             lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mean = lat.iter().sum::<f64>() / lat.len() as f64;
             println!(
-                "submit→broadcast latency ms: mean={mean:.3} p50={:.3} max={:.3}",
+                "submit-to-broadcast latency ms: mean={mean:.3} p50={:.3} max={:.3}",
                 lat[lat.len() / 2],
                 lat.last().unwrap()
             );
         }
         assert!(count > 0, "production pipeline produced no encoded frames");
+    }
+
+    /// A session whose capture backend never delivers still has to paint something.
+    #[test]
+    fn the_placeholder_frame_has_the_geometry_it_was_asked_for() {
+        use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
+        let pb = placeholder_frame(64, 32).expect("a placeholder buffer");
+        assert_eq!(unsafe { CVPixelBufferGetWidth(&pb) }, 64);
+        assert_eq!(unsafe { CVPixelBufferGetHeight(&pb) }, 32);
     }
 }
