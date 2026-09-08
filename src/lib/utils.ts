@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React from "react";
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { commands, type NetworkInfo } from "./bindings";
@@ -27,8 +27,6 @@ if (import.meta.env.DEV) window.commands = commands;
 
 declare global {
     interface Window {
-        sidebarSize: number;
-        otp: string;
         commands: any;
     }
 }
@@ -94,34 +92,4 @@ export function generateOtp(length = 6): string {
         }
     }
     return result;
-}
-
-export function generateSlug() {
-    let result = "";
-    const characters = "abcdefghijklmnopqrstuvwxyz";
-    const charactersLength = characters.length;
-    let counter = 0;
-    while (counter < 8) {
-        result += characters.charAt(Math.floor(Math.random() * charactersLength));
-        counter += 1;
-    }
-    return result;
-}
-
-export function useInterval(callback: () => void, delay: number | null): void {
-    const savedCallback = useRef<() => void>(() => {});
-    useEffect(() => {
-        savedCallback.current = callback;
-    }, [callback]);
-    useEffect(() => {
-        function func() {
-            if (savedCallback.current) {
-                savedCallback.current();
-            }
-        }
-        if (delay !== null) {
-            const id = setInterval(func, delay);
-            return () => clearInterval(id);
-        }
-    }, [delay]);
 }

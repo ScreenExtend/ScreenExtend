@@ -276,7 +276,6 @@ export function DeviceDetails({ device }: { device: Device }) {
         className="min-w-[350px] overflow-y-auto"
         onInteractOutside={considerClosing}
         onEscapeKeyDown={considerClosing}
-        trapFocus={true}
       >
         <SheetClose asChild />
         <SheetHeader>
@@ -763,24 +762,6 @@ export function DeviceDetails({ device }: { device: Device }) {
     </Sheet>
   );
 }
-
-//const CheckSelect = ({ name, checked, onCheckedChange }: { name: string, checked: boolean, onCheckedChange: (checked: boolean) => void }) => {
-//  return (
-//    <div className="flex items-center space-x-2 flex-1">
-//      <Checkbox
-//        id={name}
-//        checked={checked}
-//        onCheckedChange={onCheckedChange}
-//      />
-//      <Label
-//        htmlFor={name}
-//        className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:select-none peer-disabled:opacity-70 capitalize"
-//      >
-//        {name}
-//      </Label>
-//    </div>
-//  );
-//};
 
 export function DeleteDevice(props: React.ComponentPropsWithoutRef<typeof Button>) {
   const { t } = useTranslation();
