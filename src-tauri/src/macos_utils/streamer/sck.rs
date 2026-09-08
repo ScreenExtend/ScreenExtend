@@ -79,7 +79,7 @@ use objc2_foundation::NSString;
 
 use crate::streamer::telemetry::SharedTelemetry;
 
-use super::frame::{Backing, Frame, FrameSink};
+use super::frame::{Backing, Frame, FrameSink, HeldSurface};
 use super::gpu::Gpu;
 use super::mach::mach_now;
 use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId};
@@ -717,10 +717,12 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
         let Some(out) = NonNull::new(out) else {
             return;
         };
+        // Take ownership before checking the status: CoreVideo can return non-zero and still
+        // hand back a +1 buffer, and dropping it here is what stops that leaking.
+        let pixbuf = CFRetained::from_raw(out);
         if r != 0 {
             return;
         }
-        let pixbuf = CFRetained::from_raw(out);
         ctx.frames.fetch_add(1, Ordering::Relaxed);
         ctx.sink.publish(Frame {
             width: ctx.width,
@@ -733,7 +735,7 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
             os_time_ns: 0,
             backing: Backing::PixelBuffer {
                 pixbuf,
-                _surface: surface,
+                _surface: HeldSurface::hold(surface),
             },
         });
     }
