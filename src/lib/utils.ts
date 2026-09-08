@@ -51,7 +51,11 @@ export async function buildQrValues(sessionId: string, httpPort: number = DEFAUL
   let adapters: NetworkInfo[] = [];
   try {
     adapters = await commands.getNetworkAdapters();
-  } catch {
+  } catch (e) {
+    // The dashboard renders an empty list as "no networks were found", which is the wrong
+    // message for a failed IPC call -- but the correct one is a copy change, so for now
+    // the reason at least reaches the log bus.
+    console.error("reading the network adapters failed", e);
     return [];
   }
   const isIpv4 = (ip: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);

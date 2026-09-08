@@ -339,7 +339,12 @@ export default function Bootstrap() {
   };
 
   const start = async () => {
-    updateCheck.current = check().catch(() => null);
+    updateCheck.current = check().catch(e => {
+      // An updater failure -- network, signature, malformed latest.json -- used to be
+      // indistinguishable from "no update available".
+      console.error("the update check failed", e);
+      return null;
+    });
     // The dashboard is the next screen either way; fetching its chunk alongside the Rust
     // setup keeps it off the entry chunk without making the navigation wait for it.
     void loadDashboard();

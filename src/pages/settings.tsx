@@ -84,6 +84,90 @@ function formatLastSeen(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
+// Split out and memoized: the markup is unchanged, but Settings holds 34 `useState`
+// hooks -- eleven of them behind controlled text inputs -- and re-rendered this table on
+// every keystroke in any of them. Its props only change when the known-device list or
+// the connected set does.
+const PastDevicesTable = React.memo(function PastDevicesTable({
+  devices,
+  connectedIps,
+  onBan,
+  onForget,
+}: {
+  devices: KnownDevice[];
+  connectedIps: Set<string>;
+  onBan: (device: { token?: string; ip: string }, banned: boolean) => Promise<boolean>;
+  onForget: (device: { token?: string; ip: string }) => Promise<void>;
+}) {
+  if (devices.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground py-2">
+        No devices have connected yet.
+      </p>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-[160px]">Device Name</TableHead>
+          <TableHead>OS</TableHead>
+          <TableHead>IP</TableHead>
+          <TableHead>Last Seen</TableHead>
+          <TableHead></TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody className="border-t">
+        {devices.map(device => (
+          <TableRow key={device.ip} className={device.banned ? "opacity-60" : ""}>
+            <TableCell className="font-medium">
+              <div className="flex items-center space-x-2">
+                <span>{device.name || "Unknown device"}</span>
+                {connectedIps.has(device.ip) && (
+                  <span className="inline-flex items-center space-x-1 text-xs text-green-600">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
+                    Connected
+                  </span>
+                )}
+                {!device.banned && !connectedIps.has(device.ip) && (
+                  <span className="text-xs text-muted-foreground">Auto-join</span>
+                )}
+                {device.banned && (
+                  <span className="text-xs font-medium text-red-500">Banned</span>
+                )}
+              </div>
+            </TableCell>
+            <TableCell>{device.os || "—"}</TableCell>
+            <TableCell>{device.ip}</TableCell>
+            <TableCell className="text-muted-foreground">{formatLastSeen(device.lastSeen)}</TableCell>
+            <TableCell className="text-right">
+              <div className="flex items-center justify-end space-x-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={device.banned ? "" : "text-red-600 hover:text-red-700"}
+                  onClick={() => void onBan(device, !device.banned)}
+                >
+                  {device.banned ? "Unban" : "Ban"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Forget device"
+                  title="Forget device"
+                  onClick={() => void onForget(device)}
+                >
+                  <Trash2 className="h-4 w-4 text-muted-foreground" />
+                </Button>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+});
+
 export default function Settings() {
   const { otp, sessionId, publicSessionsEnabled, hostedNetworkOn } = useSession();
   const avatar = useAvatar();
@@ -284,10 +368,10 @@ export default function Settings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectedDevices]);
 
-  // A `Set` rather than a linear scan, because the comparator below calls this twice per
-  // comparison: the sort was O(n log n * m) in the number of known and connected devices.
+  // A `Set` rather than the linear `connectedDevices.some(...)` this replaced: the sort
+  // comparator below calls it twice per comparison, so the sort was O(n log n * m) in the
+  // number of known and connected devices.
   const connectedIps = useMemo(() => new Set(connectedDevices.map(d => d.ip)), [connectedDevices]);
-  const isConnected = (ip: string) => connectedIps.has(ip);
 
   const applyBan = async (device: { token?: string; ip: string }, banned: boolean): Promise<boolean> => {
     const token = device.token ?? "";
@@ -608,7 +692,10 @@ export default function Settings() {
     try {
       await commands.stopHostedNetwork();
       wifiOn = await commands.isWifiOn();
-    } catch {
+    } catch (e) {
+      // Assume Wi-Fi is on: the alternative is offering to turn on a radio we could not
+      // read, and the generic failure toast below still fires.
+      console.error("reading the Wi-Fi state after a failed hosted network failed", e);
       wifiOn = true;
     }
     if (!opts?.fromWifiModal && !wifiOn) {
@@ -993,70 +1080,12 @@ export default function Settings() {
                   Ban IP
                 </Button>
               </div>
-              {sortedKnownDevices.length > 0 ? (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="w-[160px]">Device Name</TableHead>
-                      <TableHead>OS</TableHead>
-                      <TableHead>IP</TableHead>
-                      <TableHead>Last Seen</TableHead>
-                      <TableHead></TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody className="border-t">
-                    {sortedKnownDevices.map(device => (
-                      <TableRow key={device.ip} className={device.banned ? "opacity-60" : ""}>
-                        <TableCell className="font-medium">
-                          <div className="flex items-center space-x-2">
-                            <span>{device.name || "Unknown device"}</span>
-                            {isConnected(device.ip) && (
-                              <span className="inline-flex items-center space-x-1 text-xs text-green-600">
-                                <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
-                                Connected
-                              </span>
-                            )}
-                            {!device.banned && !isConnected(device.ip) && (
-                              <span className="text-xs text-muted-foreground">Auto-join</span>
-                            )}
-                            {device.banned && (
-                              <span className="text-xs font-medium text-red-500">Banned</span>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell>{device.os || "—"}</TableCell>
-                        <TableCell>{device.ip}</TableCell>
-                        <TableCell className="text-muted-foreground">{formatLastSeen(device.lastSeen)}</TableCell>
-                        <TableCell className="text-right">
-                          <div className="flex items-center justify-end space-x-2">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className={device.banned ? "" : "text-red-600 hover:text-red-700"}
-                              onClick={() => void applyBan(device, !device.banned)}
-                            >
-                              {device.banned ? "Unban" : "Ban"}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              aria-label="Forget device"
-                              title="Forget device"
-                              onClick={() => void forgetDevice(device)}
-                            >
-                              <Trash2 className="h-4 w-4 text-muted-foreground" />
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              ) : (
-                <p className="text-sm text-muted-foreground py-2">
-                  No devices have connected yet.
-                </p>
-              )}
+              <PastDevicesTable
+                devices={sortedKnownDevices}
+                connectedIps={connectedIps}
+                onBan={applyBan}
+                onForget={forgetDevice}
+              />
             </CardContent>
           </Card>
         </div>

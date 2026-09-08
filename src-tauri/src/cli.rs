@@ -1640,7 +1640,7 @@ mod desktop {
                         exit(1);
                     }
                 };
-                if crate::set_avatar(app.clone(), bytes) {
+                if crate::write_avatar(&app.clone(), &bytes) {
                     println!("Avatar updated.");
                     exit(0);
                 }
@@ -1656,7 +1656,7 @@ mod desktop {
                 exit(1);
             }
             "show" => {
-                match crate::get_avatar(app.clone()) {
+                match crate::read_avatar(&app.clone()) {
                     Some(bytes) => println!("Avatar set ({} bytes).", bytes.len()),
                     None => println!("No avatar set (the default logo is used)."),
                 }
