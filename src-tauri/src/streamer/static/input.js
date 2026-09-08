@@ -639,16 +639,23 @@
     // Keep the newest samples: they are the ones the user is still looking at.
     return c.slice(c.length - MAX_COALESCED_PER_FLUSH);
   }
+  // The full 40-byte pointer frame, coalesced or not: it is the only form that carries contact
+  // width, height and per-event buttons. This is the whole of what touch takes.
+  function queueSingleMove(e) {
+    if (absGateOpen && pendingMoves.size === 0) {
+      absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush(); return;
+    }
+    pendingMoves.set(e.pointerId, e); armFlush();
+  }
+
   function pushStroke(e, src) {
     let st = pendingStrokes.get(e.pointerId);
     const c = coalescedOf(e);
     if (!st && c.length === 1) {
       // A single sample goes as a full pointer message: it carries contact width, height
       // and per-event buttons, none of which the 24-byte batch sample has room for.
-      if (absGateOpen && pendingMoves.size === 0) {
-        absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush(); return;
-      }
-      pendingMoves.set(e.pointerId, e); armFlush(); return;
+      queueSingleMove(e);
+      return;
     }
     if (!st) { st = { source: src, buttons: e.buttons || 0, samples: [] }; pendingStrokes.set(e.pointerId, st); }
     // Any single move already queued for this pointer is older than these samples, and the
@@ -687,7 +694,13 @@
       }
     } else if (src === SRC.touch) {
       updatePinch(e);
-      pushStroke(e, src);
+      // Touch does not batch. A batch sample is 24 bytes — x, y, pressure, tilt, twist — with
+      // no room for the contact width and height that the full pointer frame carries at 30 and
+      // 34, and the host's batched touch path injects them as literal zeros. A zero-area
+      // contact is wrong for anything that reads rcContact, which is exactly the inking and
+      // gesture surfaces a touch drag is aimed at. Pen keeps batching: it is the high-rate
+      // source batching was for, and its samples carry everything the injector uses.
+      queueSingleMove(e);
     } else {
       pushStroke(e, src);
     }
@@ -844,9 +857,19 @@
     on(window, 'orientationchange', refreshSize, { passive: true });
   }
 
+  // Focusing `#imeSink` — a real off-screen text input — is what raises the software keyboard on
+  // a touch device, so it may only happen where there is a hardware one. `maxTouchPoints === 0`
+  // was too narrow: it excluded touchscreen laptops, which have a real keyboard and need
+  // composition input. `(any-pointer: fine)` alone is too wide the other way, because it matches
+  // a *pen* — an iPad with a Pencil, a Surface with its stylus — and those pop the keyboard over
+  // the live stage with nothing on screen to explain it. Hover is what separates the two: a mouse
+  // or trackpad reports it, a digitiser does not.
   function hasFinePointer() {
     try {
-      if (window.matchMedia) return window.matchMedia('(any-pointer: fine)').matches;
+      if (window.matchMedia) {
+        return window.matchMedia('(any-pointer: fine)').matches &&
+          window.matchMedia('(any-hover: hover)').matches;
+      }
     } catch (_) { noteSuppressed(); }
     return navigator.maxTouchPoints === 0;
   }

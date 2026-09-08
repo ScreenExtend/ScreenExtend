@@ -817,15 +817,32 @@
                 try { noSleepImpl.disable(); } catch (_) { noteSuppressed(); }
             }
 
-            // Tiered: the real Wake Lock API first, the looping-video shim only where it is
-            // missing or refuses. On iOS below 18.4 (and in a standalone home-screen app
-            // even at 18.4) that is still the only thing that works.
+            // Safari added `navigator.wakeLock` in 16.4 but a standalone home-screen app is the
+            // documented case where the request fulfils and the screen sleeps anyway. Probing
+            // for the constructor and stopping at "it resolved" therefore made the shim
+            // unreachable on exactly the devices the comment below names. There is nothing to
+            // feature-detect — the API reports success — so the shim runs *beneath* the wake
+            // lock there rather than only on refusal. It costs one muted looping clip.
+            function standaloneApp() {
+                try {
+                    if (navigator.standalone === true) return true;
+                    if (window.matchMedia) return window.matchMedia('(display-mode: standalone)').matches;
+                } catch (_) { noteSuppressed(); }
+                return false;
+            }
+
+            // Tiered: the real Wake Lock API first, the looping-video shim where it is missing,
+            // refuses, or is known not to hold the screen. On iOS below 18.4 (and in a
+            // standalone home-screen app even at 18.4) the shim is still the only thing that
+            // works.
             function enableNoSleep() {
                 if (hasWakeLockApi) {
+                    const alsoShim = standaloneApp();
+                    if (alsoShim) enableNoSleepShim();
                     acquireWakeLock().then(function (ok) {
                         if (ok) { if (!locked) releaseWakeLock(); return; }
-                        enableNoSleepShim();
-                    }, enableNoSleepShim);
+                        if (!alsoShim) enableNoSleepShim();
+                    }, function () { if (!alsoShim) enableNoSleepShim(); });
                     return;
                 }
                 enableNoSleepShim();

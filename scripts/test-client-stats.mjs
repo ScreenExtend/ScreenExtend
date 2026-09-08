@@ -323,7 +323,9 @@ ctx.document.pointerLockElement = null;
 // POINTER_MOVE_BATCH's tail is all three fields or none: the host reads it only when the
 // stamp, the flags byte and the predicted count are all present. The count is 0 because this
 // client sends measured samples only.
-const touch = (x, y) => pointerEvent({ pointerType: 'touch', pointerId: 11, clientX: x, clientY: y });
+// Pen, not touch: touch deliberately does not batch, because a 24-byte batch sample has no room
+// for the contact width and height the host injects for a touch contact.
+const touch = (x, y) => pointerEvent({ pointerType: 'pen', pointerId: 11, clientX: x, clientY: y });
 const withCoalesced = (e, pts) => Object.assign({}, e, { getCoalescedEvents: () => pts.map((p) => touch(p[0], p[1])) });
 sent.length = 0;
 now = 6200;
