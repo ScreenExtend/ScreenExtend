@@ -513,11 +513,13 @@
   };
   let hostCaps = 0;
   const capSubs = [];
-  function noteHostCaps(dv) {
-    const caps = dv.byteLength >= 19 ? dv.getUint16(17, true) : 0;
+  function setHostCaps(caps) {
     if (caps === hostCaps) return;
     hostCaps = caps;
     for (let i = 0; i < capSubs.length; i++) { try { capSubs[i](caps); } catch (_) {} }
+  }
+  function noteHostCaps(dv) {
+    setHostCaps(dv.byteLength >= 19 ? dv.getUint16(17, true) : 0);
   }
 
   // The legacy `createEncodedStreams` transform gives the client no way to ask for an IDR,
@@ -830,7 +832,12 @@
       if (!visible) clearHeld();
     });
     on(document, 'pointerlockchange', () => {
-      sendState(OP.POINTERLOCK_STATE, document.pointerLockElement === surface || !!document.pointerLockElement);
+      const locked = document.pointerLockElement === surface || !!document.pointerLockElement;
+      // The page sets this when a lock request grants unadjustedMovement. Losing the lock
+      // withdraws the claim, so a re-entry that took a different route cannot inherit it and
+      // tell the host the deltas are raw when they have been through the OS curve.
+      if (!locked) lockIsUnadjusted = false;
+      sendState(OP.POINTERLOCK_STATE, locked);
     });
 
     on(window, 'resize', refreshSize, { passive: true });
@@ -893,6 +900,12 @@
     clearHeld();
     [fast, reliable, bulk].forEach((ch) => { try { if (ch) ch.close(); } catch (_) {} });
     fast = reliable = bulk = null;
+    dropPc = null;
+    // The next connection's host is answered for by its own PONG, not by the last one's — a
+    // reconfigure can land on a different adapter, and the tiers gated on these bits have to be
+    // withdrawn until it does.
+    setHostCaps(0);
+    lockIsUnadjusted = false;
     if (imeSink) {
       imeSink.value = '';
       try { imeSink.blur(); } catch (_) {}
