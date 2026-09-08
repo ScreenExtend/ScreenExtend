@@ -1,35 +1,65 @@
 use windows::core::HSTRING;
 use windows::Foundation::Metadata::ApiInformation;
 use windows::Graphics::Capture::GraphicsCaptureSession;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
+    DXGI_ERROR_NOT_FOUND,
+};
 use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
 use wmi::{COMLibrary, WMIConnection};
 
+use super::hosted_network::{probe_backend, HostedNetworkBackend};
+use super::streamer::{select_vendor, Vendor};
+use super::virtual_display::{probe_display_backend, DisplayBackend};
 use crate::{CompatibilityReport, UnsupportedApi};
 
+/// Windows 10 20H1. Kept for the "minimum required" line the compatibility panel shows; the
+/// decision of whether this host is supported is made by probing the capture backends.
 const MIN_BUILD: u32 = 19041;
+
+/// The first Windows 11 build. `ProductName` in the registry still reads "Windows 10" on
+/// Windows 11, so the build number is the only honest source for the name.
+const WIN11_BUILD: u32 = 22000;
 
 struct Probes {
     wgc: bool,
     dxgi: bool,
     wifi_radios: bool,
-    wifi_direct: bool,
-    tethering: bool,
     wmi: bool,
+    audio_backend: &'static str,
+    capture_backend: &'static str,
+    encoder: EncoderProbe,
+    display_backend: DisplayBackend,
+    hosted_network: HostedNetworkBackend,
 }
 
 impl Probes {
+    /// Used only when the probe thread itself could not run, so that a machine is never told it
+    /// is unsupported because we failed to ask.
     fn optimistic() -> Self {
         Self {
             wgc: true,
             dxgi: true,
             wifi_radios: true,
-            wifi_direct: true,
-            tethering: true,
             wmi: true,
+            audio_backend: "unknown",
+            capture_backend: "unknown",
+            encoder: EncoderProbe {
+                backend: "unknown",
+                software_adapter_only: false,
+            },
+            display_backend: DisplayBackend::IddDriver,
+            hosted_network: HostedNetworkBackend::Unsupported,
         }
     }
+}
+
+struct EncoderProbe {
+    /// The encoder the pipeline would reach for first on this hardware.
+    backend: &'static str,
+    /// Every DXGI adapter on this machine is a software rasteriser (WARP / Basic Render Driver).
+    software_adapter_only: bool,
 }
 
 fn read_os_info() -> (String, u32) {
@@ -41,8 +71,11 @@ fn read_os_info() -> (String, u32) {
     let product_name: String = nt.get_value("ProductName").unwrap_or_default();
     let display_version: String = nt.get_value("DisplayVersion").unwrap_or_default();
     let build: String = nt.get_value("CurrentBuild").unwrap_or_default();
+    let build_num = build.parse::<u32>().unwrap_or(0);
 
-    let product = if product_name.is_empty() {
+    let product = if build_num >= WIN11_BUILD {
+        "Windows 11".to_string()
+    } else if product_name.is_empty() {
         "Windows".to_string()
     } else {
         product_name
@@ -57,7 +90,6 @@ fn read_os_info() -> (String, u32) {
     } else {
         format!("{product}{display} (build {build})")
     };
-    let build_num = build.parse::<u32>().unwrap_or(0);
     (os_version, build_num)
 }
 
@@ -73,30 +105,35 @@ fn run_probes() -> Probes {
         })
         .is_ok();
 
+        let wgc = wgc_supported();
+        let dxgi = dxgi_supported();
+
         Probes {
-            wgc: wgc_supported(),
-            dxgi: dxgi_supported(),
+            wgc,
+            dxgi,
             wifi_radios: type_present("Windows.Devices.Radios.Radio"),
-            wifi_direct: type_present(
-                "Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher",
-            ),
-            tethering: type_present(
-                "Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager",
-            ),
             wmi,
+            audio_backend: probe_audio_backend(),
+            capture_backend: if wgc {
+                "WindowsGraphicsCapture"
+            } else if dxgi {
+                "DxgiDesktopDuplication"
+            } else {
+                "none"
+            },
+            encoder: probe_encoder(),
+            display_backend: probe_display_backend(),
+            hosted_network: probe_backend(None),
         }
     })
     .join()
     .unwrap_or_else(|_| Probes::optimistic())
 }
 
+/// `GraphicsCaptureSession::IsSupported()` is the capability test. The
+/// `UniversalApiContract 8` check that used to sit next to it could only add false negatives.
 fn wgc_supported() -> bool {
-    ApiInformation::IsApiContractPresentByMajor(
-        &HSTRING::from("Windows.Foundation.UniversalApiContract"),
-        8,
-    )
-    .unwrap_or(false)
-        && GraphicsCaptureSession::IsSupported().unwrap_or(false)
+    GraphicsCaptureSession::IsSupported().unwrap_or(false)
 }
 
 fn dxgi_supported() -> bool {
@@ -107,13 +144,105 @@ fn type_present(type_name: &str) -> bool {
     ApiInformation::IsTypePresent(&HSTRING::from(type_name)).unwrap_or(false)
 }
 
+/// System audio is WASAPI loopback on a render endpoint. With no default output device there
+/// is nothing to loop back, and the audio toggle can never work.
+fn probe_audio_backend() -> &'static str {
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+    let probe = || -> windows::core::Result<()> {
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
+        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?;
+        Ok(())
+    };
+    match probe() {
+        Ok(()) => "wasapi",
+        Err(e) => {
+            tprintln!("[compatibility] no default audio output endpoint: {e}");
+            "none"
+        }
+    }
+}
+
+/// Which encoder the pipeline would reach for. `EncoderVendor::Auto` tries NVENC, then Quick
+/// Sync, then x264, choosing by DXGI adapter description — the same classification used here.
+fn probe_encoder() -> EncoderProbe {
+    let mut has_nvidia = false;
+    let mut has_intel = false;
+    let mut has_amd = false;
+    let mut hardware_adapters = 0usize;
+    let mut software_adapters = 0usize;
+
+    let factory = match unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+        Ok(factory) => factory,
+        Err(_) => {
+            return EncoderProbe {
+                backend: "x264",
+                software_adapter_only: false,
+            }
+        }
+    };
+
+    for index in 0.. {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(_) => break,
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+
+        if DXGI_ADAPTER_FLAG(desc.Flags as i32) & DXGI_ADAPTER_FLAG_SOFTWARE != DXGI_ADAPTER_FLAG(0)
+            || name.contains("Basic Render Driver")
+        {
+            software_adapters += 1;
+            continue;
+        }
+        hardware_adapters += 1;
+        match select_vendor(&name) {
+            Vendor::Nvidia => has_nvidia = true,
+            Vendor::Intel => has_intel = true,
+            Vendor::Amd => has_amd = true,
+            Vendor::Unknown => {}
+        }
+    }
+
+    let backend = if has_nvidia {
+        "nvenc"
+    } else if has_intel {
+        "quicksync"
+    } else if has_amd {
+        // AMD encode is a stub; those hosts run the CPU encoder.
+        "x264 (no AMD hardware encoder)"
+    } else {
+        "x264"
+    };
+
+    EncoderProbe {
+        backend,
+        software_adapter_only: hardware_adapters == 0 && software_adapters > 0,
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn check_system_requirements() -> CompatibilityReport {
     let (os_version, build_num) = read_os_info();
-    let os_supported = build_num >= MIN_BUILD;
 
     let probes = run_probes();
+    // Supported means "a capture backend actually works here", not "the build number is high
+    // enough". The build number stays as the text we show.
+    let os_supported = probes.wgc || probes.dxgi;
     let mut unsupported: Vec<UnsupportedApi> = Vec::new();
 
     if !probes.wgc && !probes.dxgi {
@@ -135,6 +264,47 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
+    match probes.display_backend {
+        DisplayBackend::IddDriver => {}
+        DisplayBackend::DriverNotInstalled => unsupported.push(UnsupportedApi {
+            name: "Virtual Display Driver".to_string(),
+            description:
+                "Not installed. Each connected device needs one; install the driver to continue."
+                    .to_string(),
+            required_version: "Windows 10 20H1 (build 19041)".to_string(),
+            severity: "blocking".to_string(),
+        }),
+        DisplayBackend::DriverNotResponding => unsupported.push(UnsupportedApi {
+            name: "Virtual Display Driver".to_string(),
+            description:
+                "Installed but not answering. Reinstall the driver, or restart this machine."
+                    .to_string(),
+            required_version: "Windows 10 20H1 (build 19041)".to_string(),
+            severity: "blocking".to_string(),
+        }),
+    }
+
+    if probes.encoder.software_adapter_only {
+        unsupported.push(UnsupportedApi {
+            name: "Hardware graphics adapter".to_string(),
+            description: "Only a software rasteriser (WARP) was found; expect high latency and \
+                          high CPU use."
+                .to_string(),
+            required_version: "any GPU".to_string(),
+            severity: "optional".to_string(),
+        });
+    }
+
+    if probes.audio_backend == "none" {
+        unsupported.push(UnsupportedApi {
+            name: "System Audio Capture".to_string(),
+            description: "No default audio output device, so there is nothing to capture."
+                .to_string(),
+            required_version: "Windows 10".to_string(),
+            severity: "optional".to_string(),
+        });
+    }
+
     if !probes.wifi_radios {
         unsupported.push(UnsupportedApi {
             name: "WinRT Wi-Fi Radios".to_string(),
@@ -144,7 +314,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
-    if !probes.wifi_direct || !probes.tethering {
+    if probes.hosted_network == HostedNetworkBackend::Unsupported {
         unsupported.push(UnsupportedApi {
             name: "Wi-Fi Direct / Mobile Hotspot".to_string(),
             description: "Hosting a Wi-Fi hotspot for devices to join.".to_string(),
@@ -162,13 +332,45 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
+    if build_num != 0 && build_num < MIN_BUILD {
+        tprintln!(
+            "[compatibility] build {build_num} is below the stated minimum {MIN_BUILD}, but the \
+             capture backends probed available"
+        );
+    }
+
     CompatibilityReport {
         os_name: "Windows".to_string(),
         os_version,
         min_os_version: "Windows 10 20H1 (build 19041) / Server 20H2 (build 19042)".to_string(),
         os_supported,
         unsupported_apis: unsupported,
-        audio_backend: "wasapi".to_string(),
-        display_backend: "IddDriver".to_string(),
+        audio_backend: probes.audio_backend.to_string(),
+        display_backend: probes.display_backend.as_str().to_string(),
+        capture_backend: probes.capture_backend.to_string(),
+        encoder_backend: probes.encoder.backend.to_string(),
+        hosted_network_backend: probes.hosted_network.as_str().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Prints every probed backend on this machine. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn report_backends() {
+        let report = check_system_requirements();
+        println!("os:             {}", report.os_version);
+        println!("supported:      {}", report.os_supported);
+        println!("capture:        {}", report.capture_backend);
+        println!("encoder:        {}", report.encoder_backend);
+        println!("display:        {}", report.display_backend);
+        println!("audio:          {}", report.audio_backend);
+        println!("hosted network: {}", report.hosted_network_backend);
+        for api in &report.unsupported_apis {
+            println!("  [{}] {} - {}", api.severity, api.name, api.description);
+        }
     }
 }
