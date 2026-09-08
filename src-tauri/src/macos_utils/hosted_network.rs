@@ -44,6 +44,9 @@ const MODE_SETTLE_TIMEOUT: Duration = Duration::from_millis(2500);
 const DHCP_SETTLE_TIMEOUT: Duration = Duration::from_millis(6000);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+/// How long an AP may stay up with nothing associated before saying so. Long enough for a person
+/// to pick the network on a phone, type the passphrase and be handed a lease.
+const ASSOCIATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HostedNetworkBackend {
@@ -77,6 +80,9 @@ pub struct HostedNetworkStatus {
     pub advertised: bool,
     /// The host holds a routable IPv4 on the AP interface, i.e. `bootpd` is serving.
     pub host_ipv4: Option<Ipv4Addr>,
+    /// A client that actually associated, took a DHCP lease from us and reached the streamer.
+    /// This is the only field that distinguishes an AP that works from one that merely exists.
+    pub associated_peer: Option<Ipv4Addr>,
 }
 
 fn status() -> &'static Mutex<HostedNetworkStatus> {
@@ -415,11 +421,43 @@ fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<S
             }
         }
 
+        let since = Instant::now();
+        let mut announced_association = false;
+        let mut announced_silence = false;
+
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
                 return;
             }
+
+            // "Started" has never meant "a client can join". Look for one.
+            if let (Some(host), false) = (host_ipv4, announced_association) {
+                if let Some(peer) = associated_peer(&app, host) {
+                    status().lock().unwrap().associated_peer = Some(peer);
+                    tprintln!(
+                        "[hosted-network] '{ssid}' carried a client: {peer} associated, took a                          lease and joined"
+                    );
+                    announced_association = true;
+                }
+            }
+            if !announced_association
+                && !announced_silence
+                && since.elapsed() >= ASSOCIATION_TIMEOUT
+            {
+                announced_silence = true;
+                match host_ipv4 {
+                    Some(host) => teprintln!(
+                        "[hosted-network] '{ssid}' has been up for {}s on {host} with nothing                          associated. The usual causes, in order: the client refused the security                          type this Mac accepted; the client's radio does not support the band or                          channel in use; or the passphrase was mistyped. Check what the network                          looks like from the client before assuming the host is at fault",
+                        ASSOCIATION_TIMEOUT.as_secs()
+                    ),
+                    None => teprintln!(
+                        "[hosted-network] '{ssid}' has been up for {}s with no address on the                          interface and nothing associated; nothing is serving DHCP, so a client                          that does associate still cannot join",
+                        ASSOCIATION_TIMEOUT.as_secs()
+                    ),
+                }
+            }
+
             let still_up = wifi_interface()
                 .map(|i| interface_mode_is_host_ap(&i))
                 .unwrap_or(false);
@@ -440,6 +478,21 @@ fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<S
             return;
         }
     });
+}
+
+/// A client of *our* AP, as opposed to one that reached us over the wired LAN.
+///
+/// The hosted network hands out a /24 around the host's own address, so a session whose client IP
+/// shares that /24 came in over the AP. This is the promotion from "advertised" to "verified":
+/// nothing before it observes a client at all.
+fn associated_peer(app: &AppHandle, host: Ipv4Addr) -> Option<Ipv4Addr> {
+    use tauri::Manager;
+    let state = app.try_state::<AppState>()?;
+    let sessions = state.sessions.clone();
+    crate::streamer::session::client_ips(&sessions)
+        .into_iter()
+        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .find(|peer| peer.octets()[..3] == host.octets()[..3] && *peer != host)
 }
 
 struct Attempt {
@@ -692,6 +745,7 @@ pub fn start_hosted_network(
         security: Some(outcome.security),
         advertised: true,
         host_ipv4: None,
+        associated_peer: None,
     };
 
     *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
