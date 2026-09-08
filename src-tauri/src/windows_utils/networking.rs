@@ -421,3 +421,45 @@ fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
         teprintln!("[network-watcher] failed to emit NetworkChange: {e:?}");
     }
 }
+
+/// Physical medium of the adapter holding a local address, from `MSFT_NetAdapter`'s
+/// `NdisPhysicalMedium`.
+///
+/// The values that matter here are `NdisPhysicalMedium802_3` (14) and `NdisPhysicalMediumNative802_11`
+/// (9) — the same pair `ADAPTER_QUERY` already filters on. **USB tethering and RNDIS both present
+/// as 802.3**, which is the whole point: a phone on a cable is an ordinary IP interface and joins
+/// with no code change at all, and until now nothing on the host could tell that apart from Wi-Fi.
+#[derive(Deserialize, Debug)]
+struct NetAdapterMedium {
+    #[serde(rename = "InterfaceIndex")]
+    interface_index: Option<u32>,
+    #[serde(rename = "NdisPhysicalMedium")]
+    ndis_physical_medium: Option<u32>,
+}
+
+const MEDIUM_QUERY: &str =
+    "SELECT InterfaceIndex, NdisPhysicalMedium FROM MSFT_NetAdapter WHERE EndPointInterface = False";
+
+/// Which physical medium a local IP is reached over, or `None` when nothing matched.
+pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::LinkMedium> {
+    use crate::streamer::platform::LinkMedium;
+
+    let com_con = com_for_this_thread();
+    let wmi_con = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con).ok()?;
+    let ips: Vec<NetIPAddress> = wmi_con.raw_query(IP_QUERY).ok()?;
+    let index = ips.iter().find_map(|entry| {
+        (entry.ip_address.as_deref() == Some(ip))
+            .then_some(entry.interface_index)
+            .flatten()
+    })?;
+    let media: Vec<NetAdapterMedium> = wmi_con.raw_query(MEDIUM_QUERY).ok()?;
+    let medium = media
+        .iter()
+        .find(|m| m.interface_index == Some(index))
+        .and_then(|m| m.ndis_physical_medium)?;
+    Some(match medium {
+        14 => LinkMedium::Wired,
+        1 | 9 => LinkMedium::Wireless,
+        _ => LinkMedium::Other,
+    })
+}

@@ -466,6 +466,31 @@ async fn detect_session_locality(
         return (SessionLocality::Unknown, None);
     };
     let remote_addr = cand_addr.get(&rid).copied();
+
+    // What the local end of the nominated pair is physically riding. A USB-tethered phone is an
+    // ordinary Ethernet interface, so this is the only way the host can tell the wired path from
+    // Wi-Fi — and the wired path is what every competitor in the category treats as its
+    // low-latency tier. Reported through the log bus, because the desktop UI's appearance is
+    // fixed.
+    if let Some(lip) = cand_ip.get(&lid).cloned() {
+        // `spawn_blocking`, not an inline call: on Windows this is two WMI round trips, and on
+        // macOS a `getifaddrs` walk plus an ioctl. Once per session, never on a hot path — but
+        // never on a tokio worker either.
+        let probe = lip.clone();
+        let medium = tokio::task::spawn_blocking(move || {
+            crate::streamer::platform::link_medium_for_local_ip(&probe)
+        })
+        .await
+        .ok()
+        .flatten();
+        match medium {
+            Some(m) => tprintln!(
+                "session link: local candidate {lip} is on a {} adapter",
+                m.as_str()
+            ),
+            None => tprintln!("session link: could not determine the medium behind {lip}"),
+        }
+    }
     let lt = cand_type
         .get(&lid)
         .cloned()
@@ -613,11 +638,15 @@ pub struct SessionHandle {
     mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
     /// The qWAVE flow, released with the session.
     _qos: Arc<Mutex<Option<sockets::QosFlow>>>,
+    /// The WHEP resource id, so the trickle registry entry goes away with the session rather than
+    /// waiting for the `Weak` to be swept on the next join.
+    resource_id: String,
 }
 
 impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
+        unregister_trickle(&self.resource_id);
         if let Err(e) = self.pc.close().await {
             teprintln!("closing peer connection: {e}");
         }
@@ -648,6 +677,8 @@ impl SessionHandle {
 /// concurrent futures instead of one serial chain.
 pub struct PendingWhep {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    /// The WHEP resource id this session is addressable by, for trickled ICE.
+    resource_id: String,
     media_socket: Option<MediaSocket>,
     track: Arc<TrackLocalStaticRTP>,
     rtp_sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
@@ -667,7 +698,13 @@ impl PendingWhep {
     /// Without this a display or pipeline failure would leak exactly what the peer connection used
     /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
     /// read worker.
+    /// The WHEP resource id, which the `Location` header points at.
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
     pub async fn abandon(mut self) {
+        unregister_trickle(&self.resource_id);
         if let Err(e) = self.pc.close().await {
             teprintln!("closing peer connection after a failed join: {e}");
         }
@@ -823,8 +860,12 @@ pub async fn prepare_whep(
         local.sdp
     };
 
+    let resource_id = mint_resource_id();
+    register_trickle(&resource_id, &pc);
+
     Ok(PendingWhep {
         pc,
+        resource_id,
         media_socket,
         track,
         rtp_sender,
@@ -852,6 +893,7 @@ pub async fn activate_whep(
 ) -> Result<(String, SessionHandle)> {
     let PendingWhep {
         pc,
+        resource_id,
         media_socket,
         track,
         rtp_sender,
@@ -1404,6 +1446,7 @@ pub async fn activate_whep(
             input_join: Some(input_join),
             mux: media_socket.map(|m| m.mux),
             _qos: qos_flow,
+            resource_id,
         },
     ))
 }
@@ -1999,6 +2042,73 @@ mod tests {
         assert_eq!(h264_codecs(H264Profile::Baseline).len(), 1);
     }
 
+    /// SDP lines are joined with a real CRLF, built here rather than escaped inline, so the
+    /// fixtures read as the wire format they are.
+    fn frag(lines: &[&str]) -> String {
+        let mut out = String::new();
+        for l in lines {
+            out.push_str(l);
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    #[test]
+    fn a_trickle_fragment_carries_its_mid_and_m_line_index() {
+        let f = parse_trickle_fragment(&frag(&[
+            "a=ice-ufrag:AbCd",
+            "m=video 9 UDP/TLS/RTP/SAVPF 102",
+            "a=mid:0",
+            "a=candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host",
+            "a=candidate:2 1 udp 1694498815 203.0.113.7 40000 typ srflx",
+        ]));
+        assert_eq!(f.ufrag.as_deref(), Some("AbCd"));
+        assert_eq!(f.candidates.len(), 2);
+        assert_eq!(f.candidates[0].1.as_deref(), Some("0"));
+        assert_eq!(f.candidates[0].2, Some(0));
+        assert!(f.candidates[0].0.starts_with("1 1 udp"));
+        assert!(!f.end_of_candidates);
+    }
+
+    #[test]
+    fn a_second_m_section_advances_the_m_line_index() {
+        let f = parse_trickle_fragment(&frag(&[
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "a=mid:0",
+            "a=candidate:1 1 udp 1 10.0.0.1 1 typ host",
+            "m=video 9 UDP/TLS/RTP/SAVPF 102",
+            "a=mid:1",
+            "a=candidate:2 1 udp 1 10.0.0.1 2 typ host",
+        ]));
+        assert_eq!(f.candidates[0].2, Some(0));
+        assert_eq!(f.candidates[1].2, Some(1));
+        assert_eq!(f.candidates[1].1.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn end_of_candidates_is_noticed_and_a_bare_candidate_line_is_accepted() {
+        let f = parse_trickle_fragment(&frag(&[
+            "candidate:1 1 udp 1 10.0.0.1 1 typ host",
+            "a=end-of-candidates",
+        ]));
+        assert_eq!(f.candidates.len(), 1);
+        assert!(f.end_of_candidates);
+    }
+
+    #[test]
+    fn an_empty_or_junk_fragment_yields_nothing_rather_than_failing() {
+        assert_eq!(parse_trickle_fragment(""), TrickleFragment::default());
+        assert_eq!(
+            parse_trickle_fragment(&frag(&["v=0", "o=- 0 0 IN IP4 0.0.0.0"])),
+            TrickleFragment::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn trickling_to_a_session_that_does_not_exist_is_reported_not_ignored() {
+        assert!(!add_trickled_candidates("deadbeef", "a=end-of-candidates").await);
+    }
+
     #[test]
     fn every_registered_payload_type_is_distinct() {
         for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
@@ -2012,4 +2122,119 @@ mod tests {
             assert_eq!(pts.len(), before, "duplicate payload type for {profile:?}");
         }
     }
+}
+
+/// Live sessions addressable by their WHEP resource id, for trickle ICE.
+///
+/// `Weak`, so a session that ends drops out of here without anything having to remember to remove
+/// it — and so this map can never be the thing that keeps a peer connection alive.
+static TRICKLE_SESSIONS: Mutex<
+    Option<
+        std::collections::HashMap<
+            String,
+            std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
+        >,
+    >,
+> = Mutex::new(None);
+
+fn mint_resource_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn register_trickle(id: &str, pc: &Arc<webrtc::peer_connection::RTCPeerConnection>) {
+    let mut guard = TRICKLE_SESSIONS.lock_recover();
+    let map = guard.get_or_insert_with(Default::default);
+    map.retain(|_, weak| weak.strong_count() > 0);
+    map.insert(id.to_string(), Arc::downgrade(pc));
+}
+
+fn unregister_trickle(id: &str) {
+    if let Some(map) = TRICKLE_SESSIONS.lock_recover().as_mut() {
+        map.remove(id);
+    }
+}
+
+/// One `a=candidate:` line's worth of trickled ICE, as RFC 9725 sends it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TrickleFragment {
+    pub candidates: Vec<(String, Option<String>, Option<u16>)>,
+    pub ufrag: Option<String>,
+    /// The fragment said the client has finished gathering (`a=end-of-candidates`).
+    pub end_of_candidates: bool,
+}
+
+/// Parse an `application/trickle-ice-sdpfrag` body.
+///
+/// A fragment is a partial SDP: zero or more `m=` sections, each with an optional `a=mid:` and
+/// some `a=candidate:` lines, plus `a=ice-ufrag:` for the generation the candidates belong to. The
+/// mid and the m-line index are what tell the agent which media section a candidate is for; with
+/// BUNDLE there is only one, but carrying them through is what makes this work with a client that
+/// does not bundle.
+pub fn parse_trickle_fragment(body: &str) -> TrickleFragment {
+    let mut out = TrickleFragment::default();
+    let mut mid: Option<String> = None;
+    let mut mline: i32 = -1;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with("m=") {
+            mline += 1;
+            mid = None;
+        } else if let Some(v) = line.strip_prefix("a=mid:") {
+            mid = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("a=ice-ufrag:") {
+            out.ufrag = Some(v.trim().to_string());
+        } else if line == "a=end-of-candidates" {
+            out.end_of_candidates = true;
+        } else if let Some(v) = line
+            .strip_prefix("a=candidate:")
+            .or_else(|| line.strip_prefix("candidate:"))
+        {
+            let index = if mline >= 0 { Some(mline as u16) } else { None };
+            out.candidates
+                .push((v.trim().to_string(), mid.clone(), index));
+        }
+    }
+    out
+}
+
+/// Feed trickled candidates to a live session. Returns whether the session was found.
+pub async fn add_trickled_candidates(id: &str, body: &str) -> bool {
+    use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+
+    let pc = {
+        let guard = TRICKLE_SESSIONS.lock_recover();
+        guard
+            .as_ref()
+            .and_then(|m| m.get(id).and_then(|w| w.upgrade()))
+    };
+    let Some(pc) = pc else {
+        return false;
+    };
+
+    let frag = parse_trickle_fragment(body);
+    let mut added = 0usize;
+    for (candidate, sdp_mid, sdp_mline_index) in frag.candidates {
+        let init = RTCIceCandidateInit {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+            username_fragment: frag.ufrag.clone(),
+        };
+        match pc.add_ice_candidate(init).await {
+            Ok(()) => added += 1,
+            Err(e) => teprintln!("trickle: rejected a candidate ({e})"),
+        }
+    }
+    if added > 0 || frag.end_of_candidates {
+        tprintln!(
+            "trickle: added {added} remote candidate(s){}",
+            if frag.end_of_candidates {
+                ", client finished gathering"
+            } else {
+                ""
+            }
+        );
+    }
+    true
 }
