@@ -112,6 +112,46 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 89 | client / audio | `detectHasEarpiece` reuses `detectIOS()` and separates phone from tablet by the screen's short edge instead of testing the User-Agent for `iPhone` (`static/audio.js`) | It was the one capability gate in the file that was a raw User-Agent sniff, and an iPhone with "Request Desktop Website" enabled sends a Macintosh UA -- losing the Speaker/Earpiece pair, which is the only output control iOS has below 18.4 where `HTMLMediaElement.setSinkId` arrives. | a desktop-UA iPhone shows an empty output list and reports `supported: false` | it keeps the category pair | UNVERIFIED | yes | No capability says "this device has an earpiece" -- `navigator.audioSession` exists on iPad too -- so some device-shape inference is unavoidable. What was avoidable was using the weakest one available. |
 ## Notes
 
+### W11 decisions made without consultation
+
+Two pieces of user-visible copy on the client page changed inside a branch whose brief is latency
+and compatibility. Both are kept, and both are recorded here with their exact before and after,
+because copy is appearance and nobody asked for either.
+
+**1. The HTTPS-upsell modal's body paragraph.** The trigger was a typo — "sucre" — but the
+sentence around it was also wrong about *why* the switch matters: the browser withholds WebCodecs
+and `SharedArrayBuffer` from an insecure context, so this is the difference between the fast paths
+and the slow ones, not a vague "quicker and privately".
+
+Before:
+
+> This page is on an insecure (HTTP) connection. Switching to the sucre version ensures data is
+> exchanged quicker and privately. Your browser may warn about the self-signed certificate once,
+> which is expected; choose to More Info/Advanced --> Proceed to site.
+
+After:
+
+> This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video
+> and audio paths on a secure one, so switching makes the screen faster as well as private. You
+> will see a one-time warning about the self-signed certificate; that is expected — choose
+> Advanced (or More Info), then continue to the site.
+
+The raw `-->` in the original renders literally in HTML and reads as a broken tag; that is why the
+arrow is gone rather than reworded.
+
+**2. The limited-browser-support modal.** The `httpsFixable` flag on each row became conditional
+(`httpsCouldHelp`) instead of a hard-coded `true`. That is a correctness fix, not a copy change:
+it drove a "Switch to HTTPS" affordance on iPhones whose Safari has never shipped an
+`AudioDecoder` for HTTPS to restore, and on pages that were already secure. The rows themselves
+were briefly split from one to three and have been **restored to the original single row with its
+original wording** — see the finding
+`minor-client-limited-browser-modal-lists-three-audio-rows.md`, now resolved.
+
+Nothing else in `<body>` moved on this branch: no element added, removed, reordered or
+re-classed, all four modals keep their ids, roles and inline `z-index`, and the only stylesheet
+changes are `inset: 0` expanded to its four long-hands (identical rendering, Safari below 14.1)
+and one `-webkit-backdrop-filter` prefix.
+
 ### W11 rejections (recorded, not applied)
 
 Each of these was considered against a finding and deliberately not done. They are here so the

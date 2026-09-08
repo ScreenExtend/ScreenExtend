@@ -227,9 +227,13 @@
       // the predicted count are all present, so the flags byte cannot ride without the stamp.
       // The count is 0 because this client sends measured samples only — getPredictedEvents()
       // is deliberately not used; see docs/OPTIMIZATIONS.md.
+      // The flags byte is structurally 0 here and the host does not read it. `UNADJUSTED` is
+      // the only bit defined, it means the client holds pointer lock with raw movement, and a
+      // locked pointer sends MOUSE_DELTA — never a batch. It is written as a reserved zero so
+      // the tail keeps its documented shape rather than pretending to carry something.
       if (wantStamp()) {
         setU64(batchView, o, nowNs()); o += STAMP_LEN;
-        batchView.setUint8(o++, wantEvFlags() ? evFlags() : 0);
+        batchView.setUint8(o++, 0);
         batchView.setUint8(o++, 0);
       }
       send(OP.POINTER_MOVE_BATCH, batchBuf, o);
