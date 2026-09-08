@@ -117,40 +117,46 @@ pub trait AudioSource: Send {
 }
 
 pub fn probe_audio_backend() -> AudioBackend {
-    static NATIVE: OnceLock<Option<AudioBackend>> = OnceLock::new();
-    let native = *NATIVE.get_or_init(|| capable_native_backends().first().copied());
-    if let Some(b) = native {
+    if let Some(b) = native_backends().first().copied() {
         return b;
     }
-
-    if legacy::probe::eligible_os() {
-        match legacy::probe::legacy_state() {
-            legacy::probe::LegacyState::Ready => AudioBackend::VirtualDevice,
-            _ => AudioBackend::NeedsDriverInstall,
-        }
-    } else {
-        AudioBackend::Unsupported
+    match legacy::probe::legacy_state() {
+        legacy::probe::LegacyState::Ready => AudioBackend::VirtualDevice,
+        // Below 12.3 there is no native system-audio API at all and the driver is the answer, so
+        // there is nothing to report as unsupported: the app's own floor is 10.15 and the driver
+        // covers it.
+        _ => AudioBackend::NeedsDriverInstall,
     }
 }
 
-fn capable_native_backends() -> Vec<AudioBackend> {
-    use crate::macos_utils::streamer::{macos_at_least, screencapturekit_available};
-    let mut v = Vec::new();
-    if macos_at_least(14, 2) && process_tap::runtime_available() {
-        v.push(AudioBackend::ProcessTap);
-    }
-    if macos_at_least(13, 0)
-        && screencapturekit_available()
-        && sck_audio::SckAudioCapture::runtime_available()
-    {
-        v.push(AudioBackend::ScreenCaptureKitAudio);
-    }
-    v
+/// The native tiers this Mac can run, best first.
+///
+/// Probed by capability alone — `runtime_available()` dlsyms the Process Tap entry points and
+/// looks up `CATapDescription`, and the SCK one looks up `SCStream` and friends. There is
+/// deliberately no OS-version conjunct: a version gate adds a `sw_vers` subprocess and a
+/// fail-open path (`macos_at_least` returns true when it cannot read the version) to a question
+/// the class lookup already answers exactly. Cached, because neither answer can change while the
+/// process runs.
+fn native_backends() -> &'static [AudioBackend] {
+    static NATIVE: OnceLock<Vec<AudioBackend>> = OnceLock::new();
+    NATIVE.get_or_init(|| {
+        let mut v = Vec::new();
+        if process_tap::runtime_available() {
+            v.push(AudioBackend::ProcessTap);
+        }
+        if sck_audio::SckAudioCapture::runtime_available() {
+            v.push(AudioBackend::ScreenCaptureKitAudio);
+        }
+        v
+    })
 }
 
 fn capable_backends() -> Vec<AudioBackend> {
-    let mut v = capable_native_backends();
-    if v.is_empty() && legacy::probe::eligible_os() && legacy::probe::driver_healthy() {
+    let mut v = native_backends().to_vec();
+    // The driver is a real fallback, not a below-13.0-only tier. On 13.x with Screen Recording
+    // denied, SCK is selected, fails to start, and there is nothing after it — even when the
+    // driver is installed and would have worked.
+    if legacy::probe::driver_healthy() {
         v.push(AudioBackend::VirtualDevice);
     }
     v
@@ -170,17 +176,10 @@ fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {
 pub fn start_capture() -> Result<AudioCapture> {
     let candidates = capable_backends();
     if candidates.is_empty() {
-        let ver = os_version();
-        if legacy::probe::eligible_os() {
-            bail!(
-                "system audio on macOS {ver} needs the ScreenExtend Audio driver installed; \
-                 enable it from the device's audio toggle to run the one-time install"
-            );
-        }
         bail!(
-            "system audio capture is not supported on this macOS version ({ver}); \
-             it requires macOS 13 (ScreenCaptureKit) or 14.2+ (Process Tap), or 10.15–12.x with \
-             the ScreenExtend Audio driver"
+            "system audio on macOS {} needs the ScreenExtend Audio driver installed; \
+             enable it from the device's audio toggle to run the one-time install",
+            os_version()
         );
     }
 

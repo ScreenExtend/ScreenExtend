@@ -242,7 +242,10 @@ impl ControlRuntime {
                     self.format_listener = None;
                 }
             },
-            RoutingEvent::DeviceList => self.repoint_playthrough(),
+            RoutingEvent::DeviceList => {
+                probe::invalidate(); // the driver device may have just appeared or gone
+                self.repoint_playthrough();
+            }
             RoutingEvent::PlaythroughFormat => {
                 if self.router.is_active() && self.playthrough_target != 0 {
                     crate::tprintln!(
