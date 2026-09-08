@@ -17,19 +17,31 @@ use crate::macos_utils::audio::ControlMsg;
 use crate::streamer::audio::AudioDiagnostics;
 
 use super::branding::SHM_NAME;
+
+// Hard ABI contract with `src-tauri/macos/ScreenExtendAudio/src/shm_ring.hpp` — change both
+// together. `legacy/test/ring.rs` scrapes that header and fails if the two drift.
 const SHM_MAGIC: u32 = 0x3141_4553; // 'SEA1' little-endian
-const LAYOUT_VERSION: u32 = 1;
+const LAYOUT_VERSION: u32 = 2;
 const RING_CAPACITY: usize = 131_072; // 2^17 f32 samples
-const HEADER_BYTES: usize = 64;
+const HEADER_BYTES: usize = 128;
+const FORMAT_F32_INTERLEAVED: u32 = 1;
 const OFF_MAGIC: usize = 0;
 const OFF_VERSION: usize = 4;
 const OFF_SAMPLE_RATE: usize = 8;
 const OFF_CHANNELS: usize = 12;
+const OFF_SAMPLE_FORMAT: usize = 16;
 const OFF_CAPACITY: usize = 20;
+const OFF_HEADER_BYTES: usize = 24;
 const OFF_WRITE_POS: usize = 32;
 const OFF_GENERATION: usize = 40;
+const OFF_READ_POS: usize = 56;
+const OFF_ANCHOR_SEQ: usize = 64;
+const OFF_ANCHOR_POS: usize = 72;
+const OFF_ANCHOR_HOST_TIME: usize = 80;
 const SHM_TOTAL_BYTES: usize = HEADER_BYTES + RING_CAPACITY * 4;
 const DRAIN_CHUNK: usize = 4096;
+/// interleaved stereo samples per second — the ring's unit
+const RING_SAMPLES_PER_SEC: i128 = 96_000;
 
 pub(crate) fn clamp_read(read_pos: u64, write_pos: u64, capacity: u64) -> (u64, u64, bool) {
     let avail = write_pos.wrapping_sub(read_pos);
@@ -92,6 +104,9 @@ impl CaptureTargets {
 
 struct ShmMap {
     base: *mut c_void,
+    /// false when the segment could only be opened read-only, so `readPos` cannot be published and
+    /// the driver's overrun accounting stays off
+    writable: bool,
 }
 
 unsafe impl Send for ShmMap {}
@@ -99,15 +114,27 @@ unsafe impl Send for ShmMap {}
 impl ShmMap {
     fn open() -> Option<ShmMap> {
         let cname = CString::new(SHM_NAME).ok()?;
-        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
+        // Read-write first, so the driver can be told how far behind we are; a segment created
+        // under a restrictive coreaudiod umask may still grant read-only, which works for capture.
+        let (fd, writable) = unsafe {
+            match libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0) {
+                d if d >= 0 => (d, true),
+                _ => (libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0), false),
+            }
+        };
         if fd < 0 {
             return None;
         }
+        let prot = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
         let base = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 SHM_TOTAL_BYTES,
-                libc::PROT_READ,
+                prot,
                 libc::MAP_SHARED,
                 fd,
                 0,
@@ -117,7 +144,7 @@ impl ShmMap {
         if base == libc::MAP_FAILED {
             return None;
         }
-        let map = ShmMap { base };
+        let map = ShmMap { base, writable };
         if !map.header_valid() {
             return None;
         }
@@ -134,19 +161,102 @@ impl ShmMap {
         unsafe { &*((self.base as *const u8).add(off) as *const AtomicU64) }
     }
 
+    /// Copy `out.len()` samples starting at ring index `start`, in at most two spans.
     #[inline]
-    fn ring_sample(&self, index: usize) -> f32 {
+    fn copy_ring(&self, start: usize, out: &mut [f32]) {
+        let n = out.len();
+        let first = (RING_CAPACITY - start).min(n);
+        // SAFETY: the mapping is page-aligned and the ring begins at a 16-byte offset, so every
+        // f32 is aligned; `start` and `start + first` are both within [0, RING_CAPACITY]
         unsafe {
-            ptr::read_unaligned((self.base as *const u8).add(HEADER_BYTES + index * 4) as *const f32)
+            let ring = (self.base as *const u8).add(HEADER_BYTES) as *const f32;
+            ptr::copy_nonoverlapping(ring.add(start), out.as_mut_ptr(), first);
+            if first < n {
+                ptr::copy_nonoverlapping(ring, out.as_mut_ptr().add(first), n - first);
+            }
+        }
+    }
+
+    /// The driver's latest (sample index, `mach_absolute_time` ticks) pair, read through its
+    /// seqlock. `None` if the driver has published none or the lock was caught mid-write.
+    fn anchor(&self) -> Option<(u64, u64)> {
+        let seq = self.atomic_u64_at(OFF_ANCHOR_SEQ);
+        for _ in 0..4 {
+            let before = seq.load(Ordering::Acquire);
+            if before == 0 {
+                return None;
+            }
+            if before & 1 != 0 {
+                continue;
+            }
+            let pos = self.atomic_u64_at(OFF_ANCHOR_POS).load(Ordering::Relaxed);
+            let ticks = self
+                .atomic_u64_at(OFF_ANCHOR_HOST_TIME)
+                .load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == before {
+                return Some((pos, ticks));
+            }
+        }
+        None
+    }
+
+    /// Host-clock time of the sample at absolute index `pos`, or 0 if the driver has not stamped
+    /// anything yet.
+    fn host_ns_at(&self, pos: u64) -> u64 {
+        let Some((anchor_pos, ticks)) = self.anchor() else {
+            return 0;
+        };
+        let base = crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(ticks);
+        if base == 0 {
+            return 0;
+        }
+        let delta = pos as i128 - anchor_pos as i128;
+        let ns = base as i128 + (delta * 1_000_000_000i128) / RING_SAMPLES_PER_SEC;
+        if ns <= 0 {
+            0
+        } else {
+            ns as u64
+        }
+    }
+
+    /// Tell the driver how far we have consumed, so it can count what it overwrites unread.
+    #[inline]
+    fn publish_read_pos(&self, pos: u64) {
+        if self.writable {
+            self.atomic_u64_at(OFF_READ_POS)
+                .store(pos, Ordering::Release);
         }
     }
 
     fn header_valid(&self) -> bool {
-        self.u32_at(OFF_MAGIC) == SHM_MAGIC
-            && self.u32_at(OFF_VERSION) == LAYOUT_VERSION
-            && self.u32_at(OFF_CAPACITY) as usize == RING_CAPACITY
-            && self.u32_at(OFF_CHANNELS) == 2
-            && self.u32_at(OFF_SAMPLE_RATE) == 48_000
+        let checks = [
+            ("magic", self.u32_at(OFF_MAGIC), SHM_MAGIC),
+            ("version", self.u32_at(OFF_VERSION), LAYOUT_VERSION),
+            (
+                "header_bytes",
+                self.u32_at(OFF_HEADER_BYTES),
+                HEADER_BYTES as u32,
+            ),
+            ("capacity", self.u32_at(OFF_CAPACITY), RING_CAPACITY as u32),
+            ("channels", self.u32_at(OFF_CHANNELS), 2),
+            ("sample_rate", self.u32_at(OFF_SAMPLE_RATE), 48_000),
+            (
+                "sample_format",
+                self.u32_at(OFF_SAMPLE_FORMAT),
+                FORMAT_F32_INTERLEAVED,
+            ),
+        ];
+        for (name, got, want) in checks {
+            if got != want {
+                crate::teprintln!(
+                    "audio(legacy): shared segment header rejected: {name} is {got}, expected \
+                     {want} (driver and host layouts differ — reinstall the audio driver)"
+                );
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -220,12 +330,14 @@ fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) 
     let mut read_pos = write_pos.load(Ordering::Acquire);
     let mut last_gen = generation.load(Ordering::Acquire);
     let mut scratch = vec![0.0f32; DRAIN_CHUNK];
+    map.publish_read_pos(read_pos);
 
     while !stop.load(Ordering::Relaxed) {
         let gen = generation.load(Ordering::Acquire);
         if gen != last_gen {
             last_gen = gen;
             read_pos = write_pos.load(Ordering::Acquire);
+            map.publish_read_pos(read_pos);
             if let Some(tx) = &targets.control_tx {
                 let _ = tx.try_send(ControlMsg::Reacquire);
             }
@@ -247,17 +359,19 @@ fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) 
         }
 
         let n = (avail as usize).min(DRAIN_CHUNK);
-        for (i, slot) in scratch.iter_mut().take(n).enumerate() {
-            *slot = map.ring_sample((read_pos.wrapping_add(i as u64) as usize) & mask);
-        }
+        // when the driver wrote this block, not when this thread got to it
+        let block_ns = map.host_ns_at(read_pos);
+        map.copy_ring((read_pos as usize) & mask, &mut scratch[..n]);
 
         let w1 = write_pos.load(Ordering::Acquire);
         if w1.wrapping_sub(read_pos) > RING_CAPACITY as u64 {
             read_pos = w1;
+            map.publish_read_pos(read_pos);
             continue;
         }
         read_pos = read_pos.wrapping_add(n as u64);
-        targets.publish(&scratch[..n], 0);
+        map.publish_read_pos(read_pos);
+        targets.publish(&scratch[..n], block_ns);
     }
 }
 
@@ -377,7 +491,22 @@ pub(crate) mod layout {
     pub const VERSION: u32 = super::LAYOUT_VERSION;
     pub const CAPACITY: usize = super::RING_CAPACITY;
     pub const HEADER_BYTES: usize = super::HEADER_BYTES;
-    pub const OFF_WRITE_POS: usize = super::OFF_WRITE_POS;
-    pub const OFF_GENERATION: usize = super::OFF_GENERATION;
+    pub const SAMPLE_FORMAT: u32 = super::FORMAT_F32_INTERLEAVED;
     pub const TOTAL_BYTES: usize = super::SHM_TOTAL_BYTES;
+    /// every named field offset, as `(name in shm_ring.hpp, byte offset)`
+    pub const OFFSETS: &[(&str, usize)] = &[
+        ("magic", super::OFF_MAGIC),
+        ("version", super::OFF_VERSION),
+        ("sampleRate", super::OFF_SAMPLE_RATE),
+        ("channels", super::OFF_CHANNELS),
+        ("sampleFormat", super::OFF_SAMPLE_FORMAT),
+        ("capacity", super::OFF_CAPACITY),
+        ("headerBytes", super::OFF_HEADER_BYTES),
+        ("writePos", super::OFF_WRITE_POS),
+        ("generation", super::OFF_GENERATION),
+        ("readPos", super::OFF_READ_POS),
+        ("anchorSeq", super::OFF_ANCHOR_SEQ),
+        ("anchorPos", super::OFF_ANCHOR_POS),
+        ("anchorHostTime", super::OFF_ANCHOR_HOST_TIME),
+    ];
 }
