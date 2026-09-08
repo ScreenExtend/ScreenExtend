@@ -231,6 +231,9 @@ MODES:
     --audio               subscribe to the real system-audio hub and report the capture
                           period as delivered, packet age at the subscriber, and the
                           capture thread's own histograms (see --duration)
+    --process-loopback    with --audio, take the Windows process-loopback tier instead of
+                          endpoint loopback, which is otherwise only reached when the
+                          endpoint tier fails and so cannot be measured
     --whep-selftest       in-process WHEP client against a real virtual display;
                           asserts the answer SDP and that RTP actually flows
                           (requires a build with --features probe)
@@ -271,6 +274,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         bitrate: bool,
         selftest: bool,
         audio: bool,
+        process_loopback: bool,
     }
 
     fn parse_mode(args: &[String]) -> Mode {
@@ -282,6 +286,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             bitrate: false,
             selftest: false,
             audio: false,
+            process_loopback: false,
         };
         let path_after = |i: usize, default: &str| -> String {
             match args.get(i + 1) {
@@ -300,6 +305,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
                 "--bitrate" | "--probe-bitrate" => m.bitrate = true,
                 "--whep-selftest" | "--selftest" => m.selftest = true,
                 "--audio" => m.audio = true,
+                "--process-loopback" => m.process_loopback = true,
                 _ => {}
             }
         }
@@ -382,9 +388,22 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         let mut skew_sum_ns: i128 = 0;
         let mut ahead_of_clock = 0u64;
 
+        // Bounded, because a tier that delivers nothing is a result the probe has to be able
+        // to report — `blocking_recv` on a silent capture would simply never return, and
+        // "the probe printed nothing" is the least useful possible answer.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| anyhow::anyhow!("probe runtime: {e}"))?;
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
-            match sub.rx.blocking_recv() {
+            let next = rt.block_on(async {
+                tokio::time::timeout(Duration::from_millis(500), sub.rx.recv()).await
+            });
+            let Ok(next) = next else {
+                continue; // 500 ms with no audio; keep waiting until the deadline
+            };
+            match next {
                 Ok(pkt) => {
                     let now = host_now_ns();
                     if let Some(prev) = last_arrival {
@@ -465,6 +484,13 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
     }
 
     fn finish(result: anyhow::Result<()>) -> ! {
+        // `exit()` skips destructors, and a piped stdout is block-buffered, so without this
+        // the whole report can be lost — which reads as "the probe printed nothing".
+        let flush = || {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+        };
         for (key, t) in crate::streamer::telemetry::all() {
             if t.frames_encoded.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 continue;
@@ -472,9 +498,13 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             println!("[{key}] {}", t.summary_line());
         }
         match result {
-            Ok(()) => exit(0),
+            Ok(()) => {
+                flush();
+                exit(0)
+            }
             Err(e) => {
                 eprintln!("probe failed: {e:?}");
+                flush();
                 exit(1)
             }
         }
@@ -509,6 +539,11 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         }
         if mode.audio {
             let secs = base.selftest_secs;
+            #[cfg(target_os = "windows")]
+            if mode.process_loopback {
+                crate::windows_utils::audio::loopback::PREFER_PROCESS_LOOPBACK
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             finish(audio_probe(secs));
         }
 

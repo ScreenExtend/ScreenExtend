@@ -3,6 +3,7 @@ pub mod engine;
 pub mod format;
 pub mod guards;
 pub mod loopback;
+pub mod process_loopback;
 pub mod silence;
 
 #[cfg(test)]

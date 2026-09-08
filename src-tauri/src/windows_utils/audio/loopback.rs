@@ -17,6 +17,7 @@ use super::device::{
 use super::engine;
 use super::format::{convert_to_stereo_f32, parse_mix_format, MixFormat, SampleKind};
 use super::guards::{ComGuard, EventHandle, MixFormatPtr, MmcssGuard};
+use super::process_loopback;
 use super::silence::SilenceCompanion;
 use crate::streamer::audio::encoder::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES};
 use crate::streamer::audio::{
@@ -48,6 +49,13 @@ const EVENT_WAIT_MS: u32 = 100;
 /// Consecutive unsignalled waits before the endpoint is treated as clockless and re-acquired.
 /// 20 x 100 ms = 2 s of nothing at all, against a 10 ms nominal period.
 const STARVED_WAITS_BEFORE_REACQUIRE: u32 = 20;
+
+/// Try the process-loopback tier first instead of using it only as a fallback.
+///
+/// Set by `ScreenExtend probe --audio --process-loopback` and by nothing else. Tier ordering
+/// is supposed to be decided by measurement, and on a machine where tier 1 works there is
+/// otherwise no way to take tier 2's numbers at all.
+pub static PREFER_PROCESS_LOOPBACK: AtomicBool = AtomicBool::new(false);
 
 pub fn start(sink: AudioSink) -> Result<AudioCapture> {
     let diagnostics = Arc::new(AudioDiagnostics::default());
@@ -96,7 +104,8 @@ struct Session {
     capture: IAudioCaptureClient,
     event: EventHandle,
     mix: MixFormat,
-    companion: SilenceCompanion,
+    /// Tier 1 only: the endpoint's clock source. Process loopback has no endpoint to park.
+    companion: Option<SilenceCompanion>,
     period_frames: u32,
     buffer_frames: u32,
 }
@@ -241,7 +250,8 @@ fn run(
         } else {
             starved_waits += 1;
         }
-        let companion_dead = !session.companion.is_alive();
+        // Tier 2 has no companion, so it cannot be the reason capture stalled.
+        let companion_dead = session.companion.as_ref().is_some_and(|c| !c.is_alive());
         if companion_dead || starved_waits >= STARVED_WAITS_BEFORE_REACQUIRE {
             if companion_dead {
                 crate::teprintln!(
@@ -495,8 +505,120 @@ unsafe fn drain(
     }
 }
 
-/// Acquire the default render endpoint for loopback, starting a fresh silent companion first.
+/// Acquire a capture session, newest workable tier first.
+///
+/// Endpoint loopback is tried first because it is what every supported Windows has and what
+/// this code has always used. Process loopback is the fallback rather than the default because
+/// it is *not* measurably faster — both ride the same shared engine — and the invariant here is
+/// that the working path is never replaced by an unmeasured one. It takes over exactly when the
+/// endpoint tier cannot work at all: the endpoint held in exclusive mode by another app (where
+/// loopback is impossible by documentation), or an endpoint that will not activate.
 unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
+    if PREFER_PROCESS_LOOPBACK.load(Ordering::Relaxed) {
+        match acquire_process_loopback() {
+            Ok(s) => return Ok(s),
+            Err(e) => crate::teprintln!(
+                "audio: process loopback was requested but failed ({e:#}); using the endpoint"
+            ),
+        }
+    }
+    match acquire_endpoint(enumerator) {
+        Ok(s) => Ok(s),
+        Err(endpoint_err) => {
+            if !process_loopback::available() {
+                return Err(endpoint_err);
+            }
+            crate::teprintln!(
+                "audio: endpoint loopback failed ({endpoint_err:#}); falling back to process \
+                 loopback"
+            );
+            acquire_process_loopback().map_err(|e| {
+                endpoint_err.context(format!("process loopback fallback also failed: {e:#}"))
+            })
+        }
+    }
+}
+
+/// Tier 2: capture every process except this one, off the synthetic loopback device.
+///
+/// No silent render companion: there is no endpoint to park, so the argument that makes the
+/// companion mandatory for tier 1 (measured 0/20 event signals without it) does not apply to a
+/// device with no hardware clock. Whether it applies *worse* is unmeasured — this box has no
+/// way to force tier 2 — so the starvation detector in the capture loop is what covers it, and
+/// the `starvations` counter is what would say so.
+unsafe fn acquire_process_loopback() -> Result<Session> {
+    let client = process_loopback::activate()?;
+    let want = process_loopback::target_format();
+    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    client
+        .Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            flags,
+            0,
+            0,
+            &want as *const WAVEFORMATEX,
+            None,
+        )
+        .context("Initialize process loopback (48k stereo float)")?;
+
+    let started = (|| -> Result<(EventHandle, IAudioCaptureClient)> {
+        let event = EventHandle::new_auto_reset()?;
+        client
+            .SetEventHandle(event.raw())
+            .context("SetEventHandle (process loopback)")?;
+        let capture: IAudioCaptureClient = client
+            .GetService()
+            .context("GetService(IAudioCaptureClient, process loopback)")?;
+        Ok((event, capture))
+    })();
+    let (event, capture) = match started {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = client.Stop();
+            let _ = client.Reset();
+            return Err(e);
+        }
+    };
+
+    let buffer_frames = client.GetBufferSize().unwrap_or(0);
+    // `GetDevicePeriod` has nothing to report on a synthetic device with no hardware clock —
+    // it returns 0 here — and the measured delivery cadence matches the buffer exactly
+    // (480 frames = 10 ms, one period per buffer), so that is the honest number to report.
+    let period_frames = engine::device_period_frames(&client, OUT_SAMPLE_RATE)
+        .map(|(default, _min)| default)
+        .filter(|&p| p > 0)
+        .unwrap_or(buffer_frames);
+
+    if let Err(e) = client.Start() {
+        let _ = client.Reset();
+        return Err(anyhow::Error::from(e).context("Start process loopback capture"));
+    }
+
+    crate::tprintln!(
+        "audio: process loopback acquired (48000Hz x2ch F32, every process except this one, \
+         period {period_frames} frames, buffer {buffer_frames} frames)"
+    );
+
+    Ok(Session {
+        client,
+        capture,
+        event,
+        mix: MixFormat {
+            sample_rate: OUT_SAMPLE_RATE,
+            channels: OUT_CHANNELS,
+            kind: SampleKind::F32,
+            block_align: 8,
+            channel_mask: 0,
+        },
+        // No endpoint, so no companion.
+        companion: None,
+        period_frames,
+        buffer_frames,
+    })
+}
+
+/// Tier 1: the default render endpoint in loopback mode, with a silent companion for a clock.
+unsafe fn acquire_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
     // Start the companion *before* opening loopback so the endpoint is already running.
     let companion = SilenceCompanion::start().context("starting silent render companion")?;
 
@@ -630,7 +752,7 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
         capture,
         event,
         mix: effective_mix,
-        companion,
+        companion: Some(companion),
         period_frames,
         buffer_frames,
     })
