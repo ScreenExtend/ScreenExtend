@@ -209,3 +209,15 @@ tauri-plugin-autostart = "2"
 
 [profile.dev.package.objc2]
 debug-assertions = false
+
+# Shipping builds ran on cargo's stock release profile until now: LTO off, 16 codegen units.
+# The hot path crosses crate boundaries on every frame (encoder FFI -> `streamer`
+# packetizer -> `webrtc`/`bytes` -> SRTP), which is exactly where cross-crate inlining is
+# worth paying for. `debug = "line-tables-only"` with `strip = false` keeps release profiles
+# and crash reports readable; it costs file size, not speed.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+strip = false
