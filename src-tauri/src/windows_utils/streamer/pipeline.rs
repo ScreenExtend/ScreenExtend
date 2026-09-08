@@ -26,7 +26,7 @@ use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{
     Encoder, EncoderConfig, SlotEncodeError, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER,
 };
-use super::scaler::{Scaler, TextureReader};
+use super::scaler::{ReadbackFormat, Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
@@ -639,17 +639,20 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             dup.context(),
         )?;
 
+        // No scaler at all when the display is already the size the client asked for: the blt
+        // would be an identity pass and the extra surface a wasted allocation.
         let needs_scaler =
             backend.wants_prescale() && (config.width != native_w || config.height != native_h);
         let scaler = if needs_scaler {
             Some(
-                Scaler::new(
+                Scaler::with_format(
                     dup.device(),
                     dup.context(),
                     native_w,
                     native_h,
                     config.width,
                     config.height,
+                    scaler_output_format(&backend),
                 )
                 .context("building GPU downscaler for --scale")?,
             )
@@ -997,6 +1000,30 @@ impl Backend {
 
     fn wants_prescale(&self) -> bool {
         !matches!(self, Backend::Intel { .. })
+    }
+
+    /// What this backend wants a CPU-bridge readback to be in.
+    ///
+    /// The scale and the colour conversion are one `VideoProcessorBlt`, so NV12 costs the video
+    /// engine nothing extra and takes 62% off the readback, the memcpy and the upload. Every
+    /// CPU-bridge encoder here converts BGRA to 4:2:0 on the CPU anyway — x264 on a rayon pool,
+    /// oneVPL through a second VPP pass, AMF through an internal converter — so the conversion is
+    /// not saved so much as moved onto silicon that was already running.
+    ///
+    /// It stays BGRA until each encoder has an `encode_nv12_padded` to receive it
+    /// (`findings/major-scaler-win-emits-bgra-where-three-encoders-want-nv12.md`, W3b); the
+    /// scaler side is in place, so flipping a backend over is a one-line change here plus that
+    /// entry point. NVENC is deliberately not a candidate: `NV_ENC_BUFFER_FORMAT_ARGB` is
+    /// byte-identical to the captured texture and its internal conversion beats a pre-pass.
+    fn cpu_bridge_format(&self) -> ReadbackFormat {
+        match self {
+            Backend::Nvenc { .. }
+            | Backend::Intel { .. }
+            | Backend::IntelCpu { .. }
+            | Backend::Amf { .. }
+            | Backend::AmfCpu { .. }
+            | Backend::X264 { .. } => ReadbackFormat::Bgra8,
+        }
     }
 
     fn is_cpu_bridge(&self) -> bool {
@@ -1791,6 +1818,19 @@ fn apply_pending_bitrate_atomic(
     }
 }
 
+/// The scaler's destination format for a given backend.
+///
+/// Only a CPU-bridge backend reads the scaled surface back, so only it has an opinion. A GPU-path
+/// backend receives the blt straight into its own input texture (`scale_into`), and that
+/// texture's format is the encoder's business.
+fn scaler_output_format(backend: &Backend) -> ReadbackFormat {
+    if backend.is_cpu_bridge() {
+        backend.cpu_bridge_format()
+    } else {
+        ReadbackFormat::Bgra8
+    }
+}
+
 fn build_backend(
     config: EncoderConfig,
     vendor: crate::streamer::config::EncoderVendor,
@@ -2136,16 +2176,18 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             &ctx.device_context,
         )?;
 
+        // Same as the DXGI path: an equal-size display needs no blt.
         let needs_scaler =
             backend.wants_prescale() && (config.width != native_w || config.height != native_h);
         let scaler = if needs_scaler {
-            match Scaler::new(
+            match Scaler::with_format(
                 &ctx.device,
                 &ctx.device_context,
                 native_w,
                 native_h,
                 config.width,
                 config.height,
+                scaler_output_format(&backend),
             ) {
                 Ok(s) => Some(s),
                 Err(e) => {
