@@ -29,12 +29,21 @@ unsafe extern "C" {
         keycode: u16,
         key_down: bool,
     ) -> CGEventRef;
-    // (source, units, wheelCount, wheel1[, wheel2[, wheel3]]).
-    fn CGEventCreateScrollWheelEvent(
+    // The fixed-arity twin of CGEventCreateScrollWheelEvent (10.13+, below our 10.15 floor).
+    //
+    // The variadic original takes `wheel1` as a *named* parameter and only `wheel2`/`wheel3`
+    // through the ellipsis. Declaring `wheel1` past the `...` compiles and works on x86_64,
+    // where named and variadic integers share one register sequence, but breaks on Apple
+    // arm64: named arguments go in registers and variadic ones on the stack, so the callee
+    // reads `wheel1` out of `w3` while the caller wrote it to the stack. Using the non-
+    // variadic entry point removes the class of bug rather than restating the prototype.
+    fn CGEventCreateScrollWheelEvent2(
         source: CGEventSourceRef,
         units: u32,
         wheel_count: u32,
-        ...
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
@@ -509,7 +518,7 @@ impl Injector {
             return;
         }
         unsafe {
-            let ev = CGEventCreateScrollWheelEvent(self.source, unit, 2, v, h);
+            let ev = CGEventCreateScrollWheelEvent2(self.source, unit, 2, v, h, 0);
             if ev.is_null() {
                 return;
             }
@@ -530,7 +539,7 @@ impl Injector {
             return;
         }
         unsafe {
-            let ev = CGEventCreateScrollWheelEvent(self.source, SCROLL_UNIT_LINE, 1, lines);
+            let ev = CGEventCreateScrollWheelEvent2(self.source, SCROLL_UNIT_LINE, 1, lines, 0, 0);
             if ev.is_null() {
                 return;
             }
@@ -781,6 +790,55 @@ fn set_pasteboard(mime: &str, data: &[u8]) -> bool {
             }
             let ok: bool = msg_send![pb, setData: nsdata, forType: &*ty];
             ok
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    }
+
+    const FIELD_SCROLL_DELTA_AXIS_1: u32 = 11;
+    const FIELD_SCROLL_DELTA_AXIS_2: u32 = 12;
+
+    /// Pins the arity. Binding the symbol to a fully spelled-out fixed-arity pointer type is
+    /// what fails the build if anyone reintroduces a `...` or drops a wheel argument — the
+    /// variadic form of this call is an arm64 ABI mismatch that x86_64 cannot detect.
+    #[test]
+    fn the_scroll_constructor_stays_fixed_arity() {
+        let f: unsafe extern "C" fn(CGEventSourceRef, u32, u32, i32, i32, i32) -> CGEventRef =
+            CGEventCreateScrollWheelEvent2;
+        assert_eq!(f as *const (), CGEventCreateScrollWheelEvent2 as *const ());
+    }
+
+    /// The behavioural half: `wheel1`/`wheel2` have to arrive as themselves. Under the old
+    /// variadic declaration this reads back junk on Apple Silicon and the right answer on
+    /// Intel, which is exactly why the defect survived a dev box.
+    #[test]
+    fn scroll_wheel_arguments_land_on_their_own_axes() {
+        unsafe {
+            let src = CGEventSourceCreate(SOURCE_STATE_HID);
+            let ev = CGEventCreateScrollWheelEvent2(src, SCROLL_UNIT_LINE, 2, 3, -1, 0);
+            assert!(
+                !ev.is_null(),
+                "CGEventCreateScrollWheelEvent2 returned null"
+            );
+            assert_eq!(
+                CGEventGetIntegerValueField(ev, FIELD_SCROLL_DELTA_AXIS_1),
+                3
+            );
+            assert_eq!(
+                CGEventGetIntegerValueField(ev, FIELD_SCROLL_DELTA_AXIS_2),
+                -1
+            );
+            CFRelease(ev);
+            if !src.is_null() {
+                CFRelease(src);
+            }
         }
     }
 }
