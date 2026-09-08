@@ -1,5 +1,9 @@
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    THREAD_PRIORITY, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+};
 
 pub fn apply_process_tuning() {
     #[cfg(windows)]
@@ -81,7 +85,25 @@ pub fn tune_current_thread() -> ThreadTuning {
     #[cfg(windows)]
     {
         let mmcss = register_mmcss();
-        raise_current_thread_priority();
+        raise_current_thread_priority(THREAD_PRIORITY_TIME_CRITICAL);
+        confine_to_performance_cores();
+        ThreadTuning { mmcss }
+    }
+}
+
+/// Tuning for a thread that runs on a timer rather than on the frame.
+///
+/// The process is already `HIGH_PRIORITY_CLASS` and every capture and encode thread is
+/// `THREAD_PRIORITY_TIME_CRITICAL`, so N clients meant ~2N time-critical threads competing with
+/// the tokio transport workers, which sit at `ABOVE_NORMAL` and are what actually push RTP. The
+/// idle repeater is not one of the threads that needs to win those contests: it emits a keepalive
+/// every 200 ms and being a millisecond late costs nothing. It keeps MMCSS and the P-core
+/// confinement — it should still not be parked on an efficiency core — and drops to `HIGHEST`.
+pub fn tune_timer_thread() -> ThreadTuning {
+    #[cfg(windows)]
+    {
+        let mmcss = register_mmcss();
+        raise_current_thread_priority(THREAD_PRIORITY_HIGHEST);
         confine_to_performance_cores();
         ThreadTuning { mmcss }
     }
@@ -409,14 +431,14 @@ fn register_mmcss() -> isize {
 }
 
 #[cfg(windows)]
-fn raise_current_thread_priority() {
+fn raise_current_thread_priority(level: THREAD_PRIORITY) {
     use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost, THREAD_PRIORITY_TIME_CRITICAL,
+        GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost,
     };
     unsafe {
         let t = GetCurrentThread();
-        if let Err(e) = SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL) {
-            teprintln!("SetThreadPriority failed: {e}");
+        if let Err(e) = SetThreadPriority(t, level) {
+            teprintln!("SetThreadPriority({}) failed: {e}", level.0);
         }
         let _ = SetThreadPriorityBoost(t, true);
     }

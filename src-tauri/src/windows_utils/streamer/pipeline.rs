@@ -2285,7 +2285,7 @@ fn spawn_repeater(
     std::thread::Builder::new()
         .name("nvenc-repeat".to_string())
         .spawn(move || {
-            let _thread_tuning = tuning::tune_current_thread();
+            let _thread_tuning = tuning::tune_timer_thread();
             let mut last_emit = Instant::now();
             loop {
                 if stop.load(Ordering::Relaxed) {
