@@ -662,22 +662,58 @@ unsafe fn acquire_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<Session> 
         // (§4.4 option 1: AUTOCONVERTPCM). No userspace resampler needed.
         let want = target_wave_format();
         let flags = base_flags | STREAMFLAGS_AUTOCONVERTPCM | STREAMFLAGS_SRC_DEFAULT_QUALITY;
-        client
-            .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                flags,
-                0,
-                0,
-                &want as *const WAVEFORMATEX,
-                None,
-            )
-            .with_context(|| {
-                format!(
-                    "Initialize loopback with AUTOCONVERTPCM to 48k stereo float \
-                     (source was {}Hz x{}ch {:?})",
-                    mix.sample_rate, mix.channels, mix.kind
+        let converted = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            flags,
+            0,
+            0,
+            &want as *const WAVEFORMATEX,
+            None,
+        );
+        if let Err(e) = converted {
+            // The engine refused to convert. Take the endpoint's own format and do the work in
+            // userspace instead of failing the whole feature.
+            //
+            // This is what makes `convert_to_stereo_f32`'s non-fast branch, `downmix_frame`
+            // (BS.775 for 3/4/5.1/7.1) and `read_sample`'s integer arms reachable at all.
+            // Until now AUTOCONVERTPCM was the only non-fast path, so both possible values of
+            // `effective_mix` satisfied `is_fast_path()` and roughly 90 lines of tested
+            // conversion code could not execute in production — while `CLAUDE.md` described
+            // AUTOCONVERTPCM, the downmix and the integer conversion as if they were
+            // alternatives. Now they are.
+            crate::teprintln!(
+                "audio: engine refused AUTOCONVERTPCM ({e}); capturing the endpoint's own \
+                 {}Hz x{}ch {:?} and converting in userspace",
+                mix.sample_rate,
+                mix.channels,
+                mix.kind
+            );
+            // A refused `Initialize` leaves this client in an unclear state; the retry gets a
+            // fresh one.
+            let retry: IAudioClient = device
+                .Activate(CLSCTX_ALL, None)
+                .context("re-Activate IAudioClient after a refused AUTOCONVERTPCM")?;
+            let retry_pwfx =
+                MixFormatPtr::from_raw(retry.GetMixFormat().context("GetMixFormat (retry)")?);
+            retry
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    base_flags,
+                    0,
+                    0,
+                    retry_pwfx.as_ptr(),
+                    None,
                 )
-            })?;
+                .context("Initialize loopback with the endpoint's own format")?;
+            return finish_endpoint_session(retry, mix, companion);
+        }
+        converted.with_context(|| {
+            format!(
+                "Initialize loopback with AUTOCONVERTPCM to 48k stereo float \
+                     (source was {}Hz x{}ch {:?})",
+                mix.sample_rate, mix.channels, mix.kind
+            )
+        })?;
         crate::tprintln!(
             "audio: source mix format {}Hz x{}ch {:?}; using engine AUTOCONVERTPCM to 48k stereo float",
             mix.sample_rate,
@@ -693,9 +729,21 @@ unsafe fn acquire_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<Session> 
         }
     };
 
-    // Everything between `Initialize` and `Start` is fallible, and dropping an initialized
-    // client without stopping it leaves the engine holding a stream we no longer own —
-    // `Session::drop` cannot help because no `Session` exists yet.
+    finish_endpoint_session(client, effective_mix, companion)
+}
+
+/// Everything after a successful `Initialize` on the endpoint tier: event, service, sizes,
+/// `Start`.
+///
+/// Split out because the AUTOCONVERTPCM fallback has to run all of it against a different
+/// client and a different mix format. Every call between `Initialize` and `Start` is fallible,
+/// and dropping an initialized client without stopping it leaves the engine holding a stream
+/// we no longer own — `Session::drop` cannot help, because no `Session` exists yet.
+unsafe fn finish_endpoint_session(
+    client: IAudioClient,
+    effective_mix: MixFormat,
+    companion: SilenceCompanion,
+) -> Result<Session> {
     let started = (|| -> Result<(EventHandle, IAudioCaptureClient)> {
         let event = EventHandle::new_auto_reset()?;
         client
