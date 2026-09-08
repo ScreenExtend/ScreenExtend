@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
@@ -184,16 +184,10 @@ export default function Dashboard() {
             </div>
           ) : null}
         </div>
+        {/* The `#mainCarousel::-webkit-scrollbar` rule that used to be injected inside
+            the carousel as an inline <style>, on every render, now lives in index.css. */}
         {cloudUrl || qrValues.length ? (
           <Carousel className="w-full max-w-xs lg:hidden mx-auto" style={{ msOverflowStyle: "none", scrollbarWidth: "none", overflow: "-moz-scrollbars-none", overflowX: "scroll" }} id={"mainCarousel"}>
-            <style>{`
-              #mainCarousel::-webkit-scrollbar {
-                display: none;
-                background: transparent;
-                width: 0;
-                height: 0;
-              }
-            `}</style>
             <CarouselContent>
               {cloudUrl && (
                 <CarouselItem>
@@ -222,9 +216,32 @@ export default function Dashboard() {
     );
 }
 
-const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; url: string; badge?: ReactNode; blurred?: boolean; blurredLabel?: string }) => {
+// An N-adapter host builds 2N of these -- the wide row and the carousel both render the
+// full set -- and every one re-encodes the QR (Reed-Solomon plus matrix generation) on
+// any render where the element identity changes. `networkChange` fires on a VPN coming
+// up or Wi-Fi roaming, so this is not rare. The value only changes when the session id,
+// the port or the adapter set does.
+const QrDisplay = memo(({ name, url, badge, blurred, blurredLabel }: { name: string; url: string; badge?: ReactNode; blurred?: boolean; blurredLabel?: string }) => {
   const [copied, setCopied] = useState(false);
   const { t } = useTranslation();
+
+  const code = useMemo(() => (
+    <QRCode
+      size={500}
+      style={{
+        display: "block",
+        width: "100%",
+        maxWidth: "100%",
+        height: "auto",
+        aspectRatio: "1 / 1",
+        borderRadius: "0.275rem",
+        transition: "filter 0.2s",
+        filter: blurred ? "blur(10px)" : undefined
+      }}
+      value={url}
+      viewBox="0 0 256 256"
+    />
+  ), [url, blurred]);
 
   const handleCopy = async () => {
     try {
@@ -248,21 +265,7 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
         {badge}
       </h2>
       <Card className="max-w-96 min-w-72 mx-auto w-full p-1 relative overflow-hidden">
-        <QRCode
-          size={500}
-          style={{
-            display: "block",
-            width: "100%",
-            maxWidth: "100%",
-            height: "auto",
-            aspectRatio: "1 / 1",
-            borderRadius: "0.275rem",
-            transition: "filter 0.2s",
-            filter: blurred ? "blur(10px)" : undefined
-          }}
-          value={url}
-          viewBox="0 0 256 256"
-        />
+        {code}
         {blurred && (
           <div className="absolute top-0 right-0 bottom-0 left-0 flex items-center justify-center z-10">
             <span className="rounded-md bg-black/60 px-3 py-1.5 text-sm font-medium text-white">
@@ -300,7 +303,8 @@ const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; 
       </Card>
     </div>
   );
-};
+});
+QrDisplay.displayName = "QrDisplay";
 
 function QrModalComponent({ value }: { value: string }) {
   const [openModal, setOpenModal] = useState(false);

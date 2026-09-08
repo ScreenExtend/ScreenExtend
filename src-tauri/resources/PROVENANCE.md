@@ -1,7 +1,8 @@
 # Vendored resources — provenance
 
 Third-party binaries bundled as Tauri `resources`. Checksums are pinned in
-`SHA256SUMS` (verified in CI). **When updating any blob, update both its SHA-256
+`SHA256SUMS` and verified by the `blob-checksums` job in
+`.github/workflows/ci.yml`. **When updating any blob, update both its SHA-256
 here and in `SHA256SUMS`.** Versions/tags marked "confirm" should be verified
 against the upstream release the next time these are refreshed.
 

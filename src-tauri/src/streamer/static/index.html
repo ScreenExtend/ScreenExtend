@@ -11,7 +11,10 @@
         <style>
             #permModal {
                 position: fixed;
-                inset: 0;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
                 z-index: 20;
                 display: none;
                 align-items: center;
@@ -102,7 +105,7 @@
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
             <div class="card">
                 <h2>Switch to HTTPS: faster and more secure</h2>
-                <p>This page is on an insecure (HTTP) connection. Switching to the sucre version ensures data is exchanged quicker and privately. Your browser may warn about the self-signed certificate once, which is expected; choose to More Info/Advanced --> Proceed to site.</p>
+                <p>This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video and audio paths on a secure one, so switching makes the screen faster as well as private. You will see a one-time warning about the self-signed certificate; that is expected — choose Advanced (or More Info), then continue to the site.</p>
                 <div class="row">
                     <button id="goHttps">Switch to HTTPS</button>
                     <button id="dismiss">Stay on HTTP</button>
@@ -166,11 +169,67 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
-            const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
-            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
-            const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+            // RTCRtpScriptTransform is preferred wherever it exists, and Chrome 141+ has both
+            // it and the legacy createEncodedStreams. Only the standard one carries
+            // sendKeyFrameRequest(), and the transform runs *instead of* libwebrtc's
+            // reference finder, so a receiver without it can never ask for an IDR: a single
+            // lost keyframe froze the picture until a watchdog demoted the whole session to
+            // <video>. `forceLegacyTransform` is the escape hatch if the standard path turns
+            // out not to start on some build.
+            let forceLegacyTransform = false;
+            function useScriptTransformNow() {
+                return hasScriptTransform && !forceLegacyTransform;
+            }
+            let audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
+            let audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
+            // Presentation tier override for the manual A/B in docs/manual-tests/client-page.md.
+            // `canvas` is the default and the floor; `track` routes decoded frames through a
+            // VideoTrackGenerator into the <video> element, which may or may not win a
+            // hardware overlay depending on the platform.
+            const PRESENT_PREF = (/(?:[?&#])present=(\w+)/.exec(location.search + location.hash) || [])[1] || 'canvas';
+
+            // Everything the page used to swallow in a bare `catch (_) { noteSuppressed(); }` — 63 of them —
+            // now lands here and rides the once-a-second stats frame to the host. A silent
+            // degradation is one nobody ever fixes.
+            const DEG = {
+                FULLSCREEN_DENIED: 1 << 0,
+                POINTER_LOCK_DENIED: 1 << 1,
+                UNADJUSTED_MOVEMENT_UNAVAILABLE: 1 << 2,
+                WAKE_LOCK_API_ABSENT: 1 << 3,
+                WAKE_LOCK_REFUSED: 1 << 4,
+                AUDIO_PREPARE_FAILED: 1 << 5,
+                AUDIO_OPUS_UNSUPPORTED: 1 << 6,
+                AUDIO_CONTEXT_SUSPENDED: 1 << 7,
+                AUDIO_OUTPUT_LATENCY_ESTIMATED: 1 << 8,
+                AUDIO_OUTPUT_LABELS_UNAVAILABLE: 1 << 9,
+                SCRIPT_TRANSFORM_UNAVAILABLE: 1 << 10,
+                KEYFRAME_REQUEST_IMPOSSIBLE: 1 << 11,
+                OFFSCREEN_CANVAS_UNAVAILABLE: 1 << 12,
+                DEMOTED_TO_VIDEO: 1 << 13,
+                COALESCED_EVENTS_UNAVAILABLE: 1 << 14,
+                ICE_GATHERING_DEADLINE: 1 << 15,
+                NO_H264_FMTP: 1 << 16,
+                DECODER_HW_UNAVAILABLE: 1 << 17,
+                REFRESH_RATE_MEASURED: 1 << 18,
+                TRANSFORM_FELL_BACK_TO_LEGACY: 1 << 19,
+                RVFC_UNAVAILABLE: 1 << 20,
+                KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
+            };
+            let degradeFlags = 0;
+            let suppressedErrors = 0;
+            function degrade(bit) { degradeFlags |= bit; }
+            function undegrade(bit) { degradeFlags &= ~bit; }
+            function noteSuppressed() { suppressedErrors++; }
+
+            if (!hasScriptTransform) degrade(DEG.SCRIPT_TRANSFORM_UNAVAILABLE);
+            if (typeof canvas.transferControlToOffscreen !== 'function') degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+            if (!(navigator.keyboard && navigator.keyboard.lock)) degrade(DEG.KEYBOARD_LOCK_UNAVAILABLE);
+            if (typeof video.requestVideoFrameCallback !== 'function') degrade(DEG.RVFC_UNAVAILABLE);
+            if (!(window.PointerEvent && ('getCoalescedEvents' in PointerEvent.prototype))) {
+                degrade(DEG.COALESCED_EVENTS_UNAVAILABLE);
+            }
 
             let pc = null;
             let worker = null;
@@ -264,6 +323,13 @@
                 },
             };
 
+            // A DOMException with an empty message — an AbortError from a cancelled
+            // setRemoteDescription, some InvalidStateErrors — used to reach showError as ''
+            // and leave the spinner up over a disabled Connect button with no text, forever.
+            function errorText(err) {
+                if (!err) return 'Connection failed.';
+                return (err.message && String(err.message)) || String(err) || 'Connection failed.';
+            }
             function showError(msg) {
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
@@ -280,6 +346,15 @@
             function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
             function showVideo() { video.style.display = 'block'; canvas.style.display = 'none'; }
 
+            // The letterboxed picture rect that input coordinates are normalised against
+            // needs the intrinsic size, and on the <video> paths this is where it arrives.
+            function relayVideoSize() {
+                if (!(video.videoWidth > 0)) return;
+                try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+            }
+            video.addEventListener('loadedmetadata', relayVideoSize);
+            video.addEventListener('resize', relayVideoSize);
+
             function freshCanvas() {
                 const replacement = document.createElement('canvas');
                 replacement.id = 'canvas';
@@ -294,6 +369,7 @@
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 reconfiguring = false;
+                clearReconfigWatchdog();
                 loadingEl.classList.remove('show');
                 if (isLive) { startReconfigPoll(); return; }
                 isLive = true;
@@ -302,7 +378,16 @@
                 setTimeout(() => { joinEl.style.display = 'none'; }, 450);
                 startLock();
                 startReconfigPoll();
-                refineRefreshRate();
+                // Keep refining in the background; it is applied by the next reconfigure
+                // rather than by forcing one.
+                // A *second* measurement, not the promise the join already consumed — that
+                // one has resolved and re-reading it can only ever hand back the number
+                // already in joinData, which made the refinement structurally inert.
+                // Sixty samples this time, and only now that the page is foregrounded and
+                // painting, so it is a better measurement than the one the join could
+                // wait for rather than the same one again.
+                getRefreshRate(REFRESH_REFINE_SAMPLES).then(
+                    (r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
             }
 
             async function startReconfigPoll() {
@@ -312,7 +397,7 @@
                     try {
                         const r = await fetch('/reconfig');
                         if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; markAlive(); }
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
                 }
                 armProbe();
             }
@@ -349,7 +434,17 @@
 
             function applyReconfig(j) {
                 if (typeof j.audioSink === 'string') {
-                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) {}
+                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) { noteSuppressed(); }
+                    // The host asking to change this device's output is the moment the
+                    // microphone grant is worth something: without it the picker on the host is
+                    // a list of unlabelled ids. Offered only where the card was deferred rather
+                    // than declined, and it does nothing at all once the labels are known.
+                    try {
+                        if (window.SEAudio && SEAudio.offerOutputLabels) {
+                            Promise.resolve(SEAudio.offerOutputLabels(offerPermModalNow))
+                                .then(() => SEAudio.postOutputs(), noteSuppressed);
+                        }
+                    } catch (_) { noteSuppressed(); }
                 }
                 if (kickEpoch !== null && j.kick !== kickEpoch) {
                     kickEpoch = j.kick;
@@ -375,11 +470,27 @@
                 showError(msg || 'You have been removed from this session.');
             }
 
+            // While `reconfiguring` is set, every recovery path on the page returns early —
+            // the probe tick, the link evaluation, the connection-state handler and the leave
+            // beacon. A rebuild that never completes therefore leaves the last decoded frame
+            // frozen with no spinner, no status and no reconnect, so it gets its own deadline.
+            const RECONFIG_DEADLINE_MS = 15000;
+            let reconfigWatchdog = null;
+            function clearReconfigWatchdog() {
+                if (reconfigWatchdog) { clearTimeout(reconfigWatchdog); reconfigWatchdog = null; }
+            }
             function reconfigure() {
                 if (reconfiguring) return;
                 reconfiguring = true;
                 teardownSession();
                 usingFallback = false;
+                clearReconfigWatchdog();
+                reconfigWatchdog = setTimeout(() => {
+                    reconfigWatchdog = null;
+                    if (!reconfiguring) return;
+                    reconfiguring = false;
+                    linkLost('Disconnected, reconnect to continue.');
+                }, RECONFIG_DEADLINE_MS);
                 start(true);
             }
 
@@ -389,8 +500,8 @@
             const viewportSettledSubs = [];
             function onViewportSettled(cb) { viewportSettledSubs.push(cb); }
             function emitViewportSettled() {
-                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) {} }
-                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) {}
+                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) { noteSuppressed(); } }
+                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) { noteSuppressed(); }
             }
 
             function readOrientationPortrait() {
@@ -489,9 +600,34 @@
 
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
 
-            const LOCK_KEYS = ['Escape', 'MetaLeft', 'MetaRight', 'AltLeft', 'AltRight', 'F11'];
             const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'keydown', 'wheel'];
-            const noSleep = new NoSleep();
+
+            // Screen Wake Lock (Chrome 84, Firefox 126, Safari 16.4 partial / 18.4 full) is
+            // the real API; nosleep.js — which keeps the screen alive by looping a tiny
+            // video — is the floor beneath it. NoSleep is constructed lazily so a failed
+            // /nosleep.js fetch cannot take the rest of this script down with it, which a
+            // top-level `new NoSleep()` did.
+            let noSleepImpl = null;
+            let noSleepTried = false;
+            function getNoSleep() {
+                if (noSleepTried) return noSleepImpl;
+                noSleepTried = true;
+                try {
+                    if (typeof NoSleep === 'function') {
+                        noSleepImpl = new NoSleep();
+                        // The bundled build plays an *unmuted* looping clip; muting it also
+                        // relaxes the autoplay rules that would otherwise refuse it.
+                        if (noSleepImpl.noSleepVideo) noSleepImpl.noSleepVideo.muted = true;
+                    }
+                } catch (_) { noteSuppressed(); noSleepImpl = null; }
+                return noSleepImpl;
+            }
+
+            const hasWakeLockApi = !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+            if (!hasWakeLockApi) degrade(DEG.WAKE_LOCK_API_ABSENT);
+            let wakeLockSentinel = null;
+            let wakeLockPending = false;
+
             let visibilityHandler = null;
             let beforeUnloadHandler = null;
             let fullscreenHandler = null;
@@ -499,12 +635,27 @@
             let pageshowHandler = null;
             let locked = false;
 
+            // Only the unprefixed form is specified to return a Promise. Safari below 16.4
+            // returns undefined from webkitRequestFullscreen, so the `.catch()` at every
+            // call site threw a TypeError — and because startLock() is called un-awaited
+            // from onStreamLive(), that rejection silently skipped pointer lock, keyboard
+            // lock and the wake lock for the whole session.
             function enterFullscreen(el) {
-                if (el.requestFullscreen) return el.requestFullscreen();
-                if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
-                if (el.mozRequestFullScreen) return el.mozRequestFullScreen();
-                if (el.msRequestFullscreen) return el.msRequestFullscreen();
-                if (el === video && el.webkitEnterFullscreen) { try { el.webkitEnterFullscreen(); } catch (_) {} }
+                let r;
+                try {
+                    if (el.requestFullscreen) r = el.requestFullscreen();
+                    else if (el.webkitRequestFullscreen) r = el.webkitRequestFullscreen();
+                    else if (el.mozRequestFullScreen) r = el.mozRequestFullScreen();
+                    else if (el.msRequestFullscreen) r = el.msRequestFullscreen();
+                    else if (el === video && el.webkitEnterFullscreen) el.webkitEnterFullscreen();
+                } catch (err) {
+                    degrade(DEG.FULLSCREEN_DENIED);
+                    return Promise.reject(err);
+                }
+                if (r && typeof r.then === 'function') {
+                    return r.then(function () { undegrade(DEG.FULLSCREEN_DENIED); },
+                        function (err) { degrade(DEG.FULLSCREEN_DENIED); throw err; });
+                }
                 return Promise.resolve();
             }
             function currentFullscreenEl() {
@@ -529,18 +680,109 @@
             }
             async function acquireKeyboardLock() {
                 if (navigator.keyboard && navigator.keyboard.lock) {
-                    try { await navigator.keyboard.lock(); } catch (_) {}
+                    try { await navigator.keyboard.lock(); } catch (_) { noteSuppressed(); }
                 }
+            }
+            // Raw, un-accelerated deltas where the platform has them (Chrome 88+ on
+            // Windows/macOS/ChromeOS, Safari 18.4, Firefox 152 — not Linux). Without it the
+            // client's OS applies its own pointer curve and the host applies another, so
+            // the two compound. The option form rejects where unsupported, and the whole
+            // call returns undefined instead of a Promise below Chrome 92 / Safari 18.4.
+            let pointerLockUnadjusted = false;
+            // input.js puts this on the wire as the MOUSE_DELTA flags byte, so the host
+            // knows whether the deltas have already been through an OS pointer curve.
+            // Every assignment goes through here rather than the variable.
+            function setPointerLockUnadjusted(on) {
+                pointerLockUnadjusted = !!on;
+                try {
+                    if (window.RemoteInput && RemoteInput.setPointerLockUnadjusted) {
+                        RemoteInput.setPointerLockUnadjusted(pointerLockUnadjusted);
+                    }
+                } catch (_) { noteSuppressed(); }
             }
             function acquirePointerLock(el) {
                 try {
+                    if (!el.requestPointerLock) {
+                        if (el.mozRequestPointerLock) el.mozRequestPointerLock();
+                        else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
+                        else {
+                            el.style.cursor = 'none'; el.style.userSelect = 'none';
+                            el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none';
+                            el.style.msUserSelect = 'none';
+                            degrade(DEG.POINTER_LOCK_DENIED);
+                        }
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        return;
+                    }
+                    function lockPlain() {
+                        try {
+                            const q = el.requestPointerLock();
+                            if (q && q.catch) q.catch(function () { degrade(DEG.POINTER_LOCK_DENIED); });
+                        } catch (_) { degrade(DEG.POINTER_LOCK_DENIED); }
+                    }
                     let p = null;
-                    if (el.requestPointerLock) p = el.requestPointerLock();
-                    else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
-                    else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
-                    else { el.style.cursor = 'none'; el.style.userSelect = 'none'; el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none'; el.style.msUserSelect = 'none'; }
-                    if (p && p.catch) p.catch(() => {});
-                } catch (_) {}
+                    let threw = false;
+                    try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { threw = true; }
+                    if (threw) {
+                        // The options bag was rejected outright, so *no lock was requested at
+                        // all*. Without the plain retry, relative movement was dead for the
+                        // whole session and every mouse move went down the absolute path.
+                        noteSuppressed();
+                        setPointerLockUnadjusted(false);
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        lockPlain();
+                        return;
+                    }
+                    if (p && typeof p.then === 'function') {
+                        // Set on fulfilment, not on the mere fact that a Promise came back: an
+                        // engine that returns one and ignores unknown dictionary members
+                        // resolves normally, and reporting raw deltas we are not getting is
+                        // worse than reporting none.
+                        p.then(function () {
+                            setPointerLockUnadjusted(true);
+                            undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        }, function () {
+                            setPointerLockUnadjusted(false);
+                            degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                            lockPlain();
+                        });
+                        return;
+                    }
+                    // No Promise came back. Chrome 88-110 honours unadjustedMovement and still
+                    // returns undefined, so this is genuinely unknown rather than unavailable —
+                    // but the bit is the only channel there is, and over-reporting raw deltas
+                    // is the more misleading of the two.
+                    degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                    setPointerLockUnadjusted(false);
+                } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
+            }
+
+            async function acquireWakeLock() {
+                if (!hasWakeLockApi || wakeLockPending) return false;
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                wakeLockPending = true;
+                try {
+                    wakeLockSentinel = await navigator.wakeLock.request('screen');
+                    undegrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel.addEventListener('release', function () { wakeLockSentinel = null; });
+                    return true;
+                } catch (_) {
+                    degrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel = null;
+                    return false;
+                } finally {
+                    wakeLockPending = false;
+                }
+            }
+            function releaseWakeLock() {
+                const s = wakeLockSentinel;
+                wakeLockSentinel = null;
+                if (!s) return;
+                try { const p = s.release(); if (p && p.catch) p.catch(noteSuppressed); } catch (_) { noteSuppressed(); }
+            }
+            function wakeLockHeld() {
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                return !!(noSleepImpl && noSleepImpl.isEnabled);
             }
 
             function installGestureHandler() {
@@ -577,15 +819,50 @@
             }
 
             function disableNoSleep() {
-                try { noSleep.disable(); } catch (_) {}
+                releaseWakeLock();
+                if (!noSleepImpl) return;
+                try { noSleepImpl.disable(); } catch (_) { noteSuppressed(); }
             }
 
-            function enableNoSleep() {
+            // Safari added `navigator.wakeLock` in 16.4 but a standalone home-screen app is the
+            // documented case where the request fulfils and the screen sleeps anyway. Probing
+            // for the constructor and stopping at "it resolved" therefore made the shim
+            // unreachable on exactly the devices the comment below names. There is nothing to
+            // feature-detect — the API reports success — so the shim runs *beneath* the wake
+            // lock there rather than only on refusal. It costs one muted looping clip.
+            function standaloneApp() {
                 try {
-                    if (noSleep.isEnabled) return;
-                    const p = noSleep.enable();
-                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => {});
-                } catch (_) {}
+                    if (navigator.standalone === true) return true;
+                    if (window.matchMedia) return window.matchMedia('(display-mode: standalone)').matches;
+                } catch (_) { noteSuppressed(); }
+                return false;
+            }
+
+            // Tiered: the real Wake Lock API first, the looping-video shim where it is missing,
+            // refuses, or is known not to hold the screen. On iOS below 18.4 (and in a
+            // standalone home-screen app even at 18.4) the shim is still the only thing that
+            // works.
+            function enableNoSleep() {
+                if (hasWakeLockApi) {
+                    const alsoShim = standaloneApp();
+                    if (alsoShim) enableNoSleepShim();
+                    acquireWakeLock().then(function (ok) {
+                        if (ok) { if (!locked) releaseWakeLock(); return; }
+                        if (!alsoShim) enableNoSleepShim();
+                    }, function () { if (!alsoShim) enableNoSleepShim(); });
+                    return;
+                }
+                enableNoSleepShim();
+            }
+
+            function enableNoSleepShim() {
+                const ns = getNoSleep();
+                if (!ns) return;
+                try {
+                    if (ns.isEnabled) return;
+                    const p = ns.enable();
+                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => { degrade(DEG.WAKE_LOCK_REFUSED); });
+                } catch (_) { noteSuppressed(); degrade(DEG.WAKE_LOCK_REFUSED); }
             }
 
             async function startLock() {
@@ -599,9 +876,15 @@
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
+                    // iOS suspends the context when the page is backgrounded and nothing
+                    // resumed it: the picture came back and the audio did not.
+                    try { if (window.SEAudio) SEAudio.resume(); } catch (_) { noteSuppressed(); }
                     if (!fullscreenMode) return;
-                    await acquireKeyboardLock();
-                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
+                    // Fullscreen first: navigator.keyboard.lock() is specified to reject
+                    // outside it, so asking on the way back from the background asked at the
+                    // one moment it could not succeed and the rejection was swallowed.
+                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); } }
+                    if (currentFullscreenEl()) await acquireKeyboardLock();
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
 
@@ -629,7 +912,7 @@
                         enableNoSleep();
                     } else {
                         enterViewportMode();
-                        try { await enterFullscreen(fullscreenTarget()); } catch (_) {}
+                        try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); }
                     }
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
@@ -673,7 +956,7 @@
                         else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
                         else if (document.mozCancelFullScreen) await document.mozCancelFullScreen();
                         else if (document.msExitFullscreen) await document.msExitFullscreen();
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
                 }
             }
 
@@ -681,17 +964,41 @@
             function sendLeave() {
                 if (leaveSent || !isLive || reconfiguring) return;
                 leaveSent = true;
-                try { navigator.sendBeacon('/leave'); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                try { navigator.sendBeacon('/leave'); } catch (_) { noteSuppressed(); }
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
             }
             window.addEventListener('pagehide', sendLeave);
 
-            async function getIceServers() {
+            // `/ice-config` answers with the servers *and* the host's own view of where this
+            // client is, which is the only reliable source for whether the session will be
+            // relayed. An older host sends no `locality` field; `unknown` is then the honest
+            // answer and the wait falls back to reading the server list, which is what this
+            // page did before the field existed.
+            async function getIceConfig() {
                 try {
                     const r = await fetch('/ice-config');
-                    if (r.ok) return (await r.json()).iceServers || [];
-                } catch (_) {}
-                return [];
+                    if (r.ok) {
+                        const j = await r.json();
+                        return {
+                            iceServers: (j && j.iceServers) || [],
+                            locality: (j && typeof j.locality === 'string') ? j.locality : 'unknown',
+                        };
+                    }
+                } catch (_) { noteSuppressed(); }
+                return { iceServers: [], locality: 'unknown' };
+            }
+
+            // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
+            // waiting for one is only right when nothing else can carry the session. The host
+            // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
+            // the list" is not the question. On a LAN the host candidate is what gets nominated,
+            // it arrives in milliseconds, and refusing to end the wait on it cost every join on a
+            // TURN-configured host the difference; a TURN server that is merely unreachable cost
+            // the whole 6 s deadline before the WHEP POST was even sent.
+            function relayNeeded(cfg) {
+                if (cfg.locality === 'same-network') return false;
+                if (cfg.locality === 'cross-network') return hasTurnServer(cfg.iceServers);
+                return hasTurnServer(cfg.iceServers);
             }
 
             function hasTurnServer(iceServers) {
@@ -701,17 +1008,61 @@
                     return arr.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
                 });
             }
-            function waitForIceGathering(pc, timeoutMs) {
+            // WHEP is a single POST, so the offer has to carry every candidate we intend to
+            // use — there is no PATCH to trickle them in later. That does not mean waiting
+            // for gathering to *finish*: on a LAN the host candidates are the ones that will
+            // be nominated, they arrive in the first few milliseconds, and everything after
+            // them is a STUN round trip whose result the connection will never use. So the
+            // wait ends a short grace period after the last useful candidate rather than at
+            // the full deadline, and the deadline is only reached when nothing arrived.
+            const ICE_HOST_GRACE_MS = 200;
+            const ICE_RELAY_GRACE_MS = 400;
+            // Split out so it can be asserted without a browser — scripts/test-client-ice.mjs
+            // extracts these three from this file and drives them directly. The gating is the
+            // whole correctness of a TURN join: on a relayed session a host candidate must not
+            // end the wait, because the relay allocation is a full round trip behind it and
+            // WHEP has no PATCH to trickle it in afterwards.
+            function iceCandidateType(c) {
+                if (!c) return '';
+                if (c.type) return c.type;
+                const m = / typ (\w+)/.exec(c.candidate || '');
+                return (m && m[1]) || '';
+            }
+            function iceGraceFor(type, needRelay) {
+                if (needRelay) return type === 'relay' ? ICE_RELAY_GRACE_MS : 0;
+                return (type === 'host' || type === 'srflx') ? ICE_HOST_GRACE_MS : 0;
+            }
+            function waitForIceGathering(pc, timeoutMs, needRelay) {
                 if (pc.iceGatheringState === 'complete') return Promise.resolve();
                 return new Promise((resolve) => {
-                    const check = () => {
-                        if (pc.iceGatheringState === 'complete') {
-                            pc.removeEventListener('icegatheringstatechange', check);
-                            resolve();
-                        }
-                    };
-                    pc.addEventListener('icegatheringstatechange', check);
-                    setTimeout(resolve, timeoutMs || 3000);
+                    let settled = false;
+                    let graceTimer = 0;
+                    const deadline = setTimeout(() => {
+                        if (pc.iceGatheringState !== 'complete') degrade(DEG.ICE_GATHERING_DEADLINE);
+                        finish();
+                    }, timeoutMs || 3000);
+                    function finish() {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(deadline);
+                        if (graceTimer) clearTimeout(graceTimer);
+                        pc.removeEventListener('icegatheringstatechange', onState);
+                        pc.removeEventListener('icecandidate', onCandidate);
+                        resolve();
+                    }
+                    function arm(ms) {
+                        if (graceTimer) clearTimeout(graceTimer);
+                        graceTimer = setTimeout(finish, ms);
+                    }
+                    function onState() { if (pc.iceGatheringState === 'complete') finish(); }
+                    function onCandidate(ev) {
+                        const c = ev.candidate;
+                        if (!c || !c.candidate) { finish(); return; }
+                        const ms = iceGraceFor(iceCandidateType(c), needRelay);
+                        if (ms) arm(ms);
+                    }
+                    pc.addEventListener('icegatheringstatechange', onState);
+                    pc.addEventListener('icecandidate', onCandidate);
                 });
             }
 
@@ -725,8 +1076,17 @@
                 }
             }
 
+            // Bumped by every teardown, checked by start() after each of its awaits. start()
+            // reads and writes pc, worker and usingFallback across seven suspension points and
+            // both watchdogs can tear the session down inside one of them; without a token the
+            // resumed call would POST a second /whep for the same device and hand the fresh
+            // connection the previous one's answer.
+            let startGen = 0;
+
             function teardownSession() {
-                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) {}
+                startGen++;
+                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
+                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
@@ -735,20 +1095,85 @@
                 if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
                 videoWorkerStats = null;
                 stopFallbackFrameStats();
-                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
+            }
+
+            let transformStarted = false;
+            let transformWatchdog = null;
+
+            // One step down, not all the way: losing RTCRtpScriptTransform costs the
+            // keyframe request, losing WebCodecs entirely costs the whole jitter buffer
+            // (~90 ms) as well.
+            function retryWithLegacyTransform(reason) {
+                if (forceLegacyTransform || !hasLegacyEncodedStreams) {
+                    fallbackToVideo(reason);
+                    return;
+                }
+                forceLegacyTransform = true;
+                degrade(DEG.TRANSFORM_FELL_BACK_TO_LEGACY);
+                console.warn('falling back to createEncodedStreams:', reason);
+                teardownSession();
+                start(true);
             }
 
             function fallbackToVideo(reason) {
                 if (usingFallback) return;
                 usingFallback = true;
+                degrade(DEG.DEMOTED_TO_VIDEO);
                 console.warn('falling back to <video>:', reason);
                 teardownSession();
                 start(false);
             }
 
+            // Presentation tier 2: decoded frames written into a track generator and played
+            // by the <video> element, which on some platforms lets the compositor take a
+            // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
+            // public measurement says the overlay actually happens, and the constructor
+            // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
+            // Runs from inside the worker's onmessage, where a throw is swallowed by the
+            // event loop and leaves the page with no video sink at all: no canvas, no
+            // generator, and a <video> nothing writes to. transferControlToOffscreen can
+            // throw — every other call of it is inside a try for exactly that reason.
+            function useCanvasInstead() {
+                try {
+                    if (worker) {
+                        const off = freshCanvas().transferControlToOffscreen();
+                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                    }
+                    showCanvas();
+                } catch (err) {
+                    noteSuppressed();
+                    degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+                    fallbackToVideo('canvas transfer failed: ' + err);
+                }
+            }
+            function attachTrackGenerator(track) {
+                if (!track) {
+                    console.warn('[webcodecs] track generator unavailable; using the canvas');
+                    useCanvasInstead();
+                    return;
+                }
+                try {
+                    video.srcObject = new MediaStream([track]);
+                    showVideo();
+                    startFallbackFrameStats();
+                    tryPlay();
+                } catch (err) {
+                    noteSuppressed();
+                    console.warn('[webcodecs] track generator attach failed:', err);
+                    // Without the canvas transfer the worker has no sink at all: it kept
+                    // writing into a generator attached to nothing and the page showed black.
+                    useCanvasInstead();
+                }
+            }
+
             async function handleRenderCount(n) {
+                // pc.getStats() is a suspension point, and both watchdogs tear the session down
+                // and rebuild it from inside one. Without this the resumed call demotes the
+                // *new* session on the old one's stall count.
+                const gen = startGen;
                 let bytes = -1;
                 try {
                     if (pc) {
@@ -759,7 +1184,8 @@
                             }
                         });
                     }
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
+                if (gen !== startGen) { noteSuppressed(); return; }
                 const rendersAdvanced = n !== lastRendered;
                 const knowBytes = bytes >= 0;
                 const bytesAdvanced = knowBytes && bytes !== lastBytes;
@@ -768,7 +1194,22 @@
                 if (rendersAdvanced || bytesAdvanced) markAlive();
                 if (rendersAdvanced) { renderStalls = 0; return; }
                 if (bytesAdvanced) {
-                    if (++renderStalls >= 2) fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    renderStalls++;
+                    // Ask for a keyframe first — that is what a stall usually needs, and
+                    // until this page could ask, the only remedy was to throw the whole
+                    // fast path away and take the jitter buffer back.
+                    // Nothing below reads the reply — the keyTier two lines down comes
+                    // from the once-a-second `videostats` message — so this only ever
+                    // fed a console.log, once every two seconds, for the whole of a
+                    // stall, on a page whose other diagnostics are behind ?debug.
+                    if (DEBUG && worker) worker.postMessage({ type: 'stats' });
+                    let asked = false;
+                    try { asked = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                    const keyTier = (videoWorkerStats && videoWorkerStats.keyTier) || 0;
+                    const canAsk = asked || keyTier === 1;
+                    if (renderStalls >= (canAsk ? 4 : 2)) {
+                        fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    }
                 } else {
                     renderStalls = 0;
                 }
@@ -802,7 +1243,10 @@
             // silent degradation the host would otherwise never learn about. `SEVideo.getStats`
             // is the read side; input.js ships the same numbers to the host once a second.
             const VIDEO_PATH = { none: 0, webcodecsCanvas: 1, webcodecsVideo: 2, videoElement: 3 };
-            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3 };
+            // 4 is appended rather than folded into 2: 2 has always meant "the page relays
+            // every packet", and a host reading it must go on meaning that. The
+            // MessagePort transport is a different, faster thing and gets its own code.
+            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3, workletPort: 4 };
 
             let videoWorkerStats = null;
             const fallbackStats = {
@@ -833,9 +1277,12 @@
                 fallbackStats.rvfcSupported = true;
                 const step = function (_now, meta) {
                     fallbackStats.painted++;
+                    if (video.videoWidth > 0) {
+                        try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+                    }
                     if (hostClockOffsetMs !== null && meta && typeof meta.rtpTimestamp === 'number') {
                         const hostMs = (meta.rtpTimestamp >>> 0) * 1000 / 90000;
-                        const paintMs = performance.timeOrigin +
+                        const paintMs = TIME_ORIGIN_MS +
                             (typeof meta.expectedDisplayTime === 'number' ? meta.expectedDisplayTime : performance.now());
                         const lag = paintMs - (hostMs - hostClockOffsetMs);
                         // The RTP timestamp is 32 bits and wraps every ~13 h; a sample that
@@ -853,7 +1300,7 @@
 
             function stopFallbackFrameStats() {
                 if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
-                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) {}
+                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) { noteSuppressed(); }
                 }
                 rvfcHandle = 0;
                 fallbackStats.samples.length = 0;
@@ -862,6 +1309,8 @@
 
             function activeVideoPath() {
                 if (usingFallback || !worker) return video.srcObject ? VIDEO_PATH.videoElement : VIDEO_PATH.none;
+                const w = videoWorkerStats;
+                if (w && w.renderTier === 2) return VIDEO_PATH.webcodecsVideo;
                 return VIDEO_PATH.webcodecsCanvas;
             }
 
@@ -871,25 +1320,66 @@
                 try { info = SEAudio.getSyncInfo(); } catch (_) { return AUDIO_PATH.none; }
                 if (!info || !info.path) return AUDIO_PATH.none;
                 if (info.path !== 'webcodecs') return AUDIO_PATH.opusTrack;
-                return info.transport === 'shared' ? AUDIO_PATH.workletSab : AUDIO_PATH.workletPost;
+                if (info.transport === 'shared') return AUDIO_PATH.workletSab;
+                if (info.transport === 'port') return AUDIO_PATH.workletPort;
+                return AUDIO_PATH.workletPost;
             }
 
+            // One definition, so the flag the host is told cannot disagree with the branch the
+            // page took: the other one omitted mozFullScreenElement.
             function isFullscreen() {
-                return !!(document.fullscreenElement || document.webkitFullscreenElement);
+                return !!currentFullscreenEl();
             }
 
+            // Tier codes, mirrored in docs/TELEMETRY.md and in transform-worker.js.
+            const TRANSPORT_TIER = { none: 0, scriptTransform: 1, encodedStreams: 2 };
+            const RENDER_TIER = { none: 0, canvas2d: 1, trackGenerator: 2, videoElement: 3 };
+
+            function renderTierNow() {
+                if (usingFallback || !worker) return video.srcObject ? RENDER_TIER.videoElement : RENDER_TIER.none;
+                const w = videoWorkerStats;
+                return w ? (w.renderTier || RENDER_TIER.canvas2d) : RENDER_TIER.canvas2d;
+            }
+
+            let audioFastRetired = false;
             window.SEVideo = {
+                noteSuppressed,
+                // The client claimed the WebCodecs audio path, so the host answered with no
+                // audio track at all — there is nothing on the wire to fall back to when the
+                // decoder or the worklet then gives up. Drop the claim and rebuild the
+                // session, and the next answer carries a real Opus track. Once only: if the
+                // rebuilt session fails too, it is failing on the browser's own decoder and
+                // another round would be a loop.
+                onAudioFastLost() {
+                    if (audioFastRetired || !audioFast) return;
+                    audioFastRetired = true;
+                    audioFast = false;
+                    // No DataChannel on the track path, so no redundancy to advertise either,
+                    // and no spare track to ask for: the next answer's audio track is the one
+                    // that gets fed. `verified` survives — the decoder really was probed, and
+                    // what it says about this device is what the host should log.
+                    audioCaps = {
+                        webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false,
+                        verified: !!audioCaps.verified, wantsFallbackTrack: false,
+                    };
+                    degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    if (!isLive || kicked) return;
+                    console.warn('[audio] fast path lost; renegotiating for a standard track');
+                    reconfigure();
+                },
                 getStats() {
                     const w = videoWorkerStats;
                     const fb = fallbackPercentiles();
                     const audio = (window.SEAudio && SEAudio.getSyncInfo()) || {};
+                    const workerSuppressed = (w && w.suppressed) || 0;
                     return {
                         videoPath: activeVideoPath(),
                         audioPath: activeAudioPath(),
                         sab: typeof SharedArrayBuffer === 'function',
                         crossOriginIsolated: !!self.crossOriginIsolated,
-                        wakeLock: !!(noSleep && noSleep.isEnabled),
+                        wakeLock: wakeLockHeld(),
                         pointerLock: !!document.pointerLockElement,
+                        pointerLockUnadjusted: pointerLockUnadjusted,
                         keyboardLock: !!(navigator.keyboard && navigator.keyboard.lock),
                         fullscreen: isFullscreen(),
                         setSinkId: typeof HTMLMediaElement !== 'undefined' &&
@@ -907,6 +1397,20 @@
                         audioUnderruns: audio.underruns || 0,
                         audioOverruns: audio.overruns || 0,
                         rvfcSupported: fallbackStats.rvfcSupported,
+                        // Which mechanism is live on each axis, so a device on a slow path
+                        // is distinguishable from a device on the fast one.
+                        transportTier: usingFallback ? TRANSPORT_TIER.none : ((w && w.transportTier) || TRANSPORT_TIER.none),
+                        renderTier: renderTierNow(),
+                        keyTier: (w && w.keyTier) || 0,
+                        sinkTier: (window.SEAudio && SEAudio.sinkTier && SEAudio.sinkTier()) || 0,
+                        suppressed: suppressedErrors + workerSuppressed +
+                            ((window.SEAudio && SEAudio.suppressedCount && SEAudio.suppressedCount()) || 0),
+                        degraded: degradeFlags | ((window.SEAudio && SEAudio.degradeFlags && SEAudio.degradeFlags(DEG)) || 0),
+                        audioTargetMs: audio.targetMs || 0,
+                        audioConcealed: audio.concealed || 0,
+                        audioOutputLatencyMs: audio.outputLatencyMs || 0,
+                        audioRedundantUsed: audio.redundantUsed || 0,
+                        audioRedundantDiscarded: audio.redundantDiscarded || 0,
                     };
                 },
             };
@@ -914,17 +1418,40 @@
             let videoStatsPoll = null;
             function startVideoStatsPoll() {
                 if (videoStatsPoll) clearInterval(videoStatsPoll);
-                videoStatsPoll = setInterval(function () {
-                    if (worker) worker.postMessage({ type: 'videostats' });
-                }, 1000);
+                const tick = function () { if (worker) worker.postMessage({ type: 'videostats' }); };
+                // A plain setInterval's first tick is a full second out, and until it lands
+                // videoWorkerStats is null — which is also the whole first second after every
+                // reconfigure, because teardownSession clears it.
+                tick();
+                videoStatsPoll = setInterval(tick, 1000);
             }
 
             if (window.SEClock) {
                 SEClock.subscribe(function (offsetMs) {
+                    // Every other consumer screens this with isFinite; this one assigned it
+                    // straight through and then reported clockValid for a NaN offset.
+                    if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) { noteSuppressed(); return; }
                     hostClockOffsetMs = offsetMs;
-                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) {}
-                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) {}
+                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) { noteSuppressed(); }
+                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) { noteSuppressed(); }
                 });
+            }
+
+            // The out-of-band keyframe request is a tier only if the host parses the opcode.
+            // It says so in the PONG capability bits, which land about a second into the
+            // session, so the worker starts at "no way to ask" — which keeps its own give-up
+            // signal and the page's stall demotion armed — and is told if that changes.
+            function relayOutOfBandKey() {
+                if (!worker) return;
+                let available = false;
+                try {
+                    available = !!(window.RemoteInput && RemoteInput.hostCapability &&
+                        RemoteInput.hostCapability('KEYFRAME_REQUEST'));
+                } catch (_) { noteSuppressed(); }
+                try { worker.postMessage({ type: 'outofbandkey', available: available }); } catch (_) { noteSuppressed(); }
+            }
+            if (window.RemoteInput && RemoteInput.onHostCapabilities) {
+                RemoteInput.onHostCapabilities(relayOutOfBandKey);
             }
 
             let __workerBlobUrl = null;
@@ -944,12 +1471,28 @@
                 }
             }
 
+            const TRANSFORM_START_TIMEOUT_MS = 2500;
+            const FRAME_WATCHDOG_MS = 5000;
+            const WHEP_TIMEOUT_MS = 10000;
+
             async function start(preferWebCodecs) {
                 teardownSession();
+                // After teardownSession, so this call owns the newest generation.
+                const gen = ++startGen;
+                const stale = () => gen !== startGen;
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
-                    const iceServers = await getIceServers();
+                    const useScriptTransform = useScriptTransformNow();
+                    const iceConfig = await getIceConfig();
+                    if (stale()) return;
+                    const iceServers = iceConfig.iceServers;
+                    // Computed once and carried into the gathering wait: without it the wait took
+                    // the LAN branch on every session and cut gathering ~200 ms in, before any
+                    // TURN allocation could return. It comes from the host's locality rather than
+                    // from the server list, because a LAN host hands out TURN as a backup.
+                    const needRelay = relayNeeded(iceConfig);
+                    if (DEBUG) console.log('[ice] locality=' + iceConfig.locality + ' needRelay=' + needRelay);
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
@@ -957,55 +1500,141 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
-                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
+                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
                         if (audioFast) {
-                            SEAudio.prepare();
                             pc.ondatachannel = (ev) => {
                                 if (ev.channel && ev.channel.label === 'audio') {
                                     SEAudio.attachDataChannel(ev.channel);
                                 }
                             };
-                        } else {
-                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+                        }
+                        // The recvonly audio section goes in on both paths now. Off the fast
+                        // path it carries the track the host feeds. On the fast path it is the
+                        // spare `wantsFallbackTrack` asks for — and an SDP answer may not add an
+                        // m-line the offer did not contain (RFC 3264 §6), so without a section
+                        // here the host's spare track has nowhere to land and is simply dropped
+                        // from the answer. WHEP has no renegotiation verb, so this is the only
+                        // moment it can exist at all: without it a decoder that says "supported"
+                        // and then fails on real packets is silence for the rest of the session.
+                        if (!audioFast || audioCaps.wantsFallbackTrack) {
+                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
+                    // Both of these — and the host's PlayoutDelayExtension(0, 0) — only affect
+                    // a client that ends up on the <video> element. An encoded transform takes
+                    // the frame from RtpVideoStreamReceiver2::OnAssembledFrame *instead of*
+                    // entering the reference finder and the frame buffer, and the frame buffer
+                    // is what these are inputs to. Set them anyway: they cost nothing and they
+                    // are correct for the fallback, which is the one path that has a jitter
+                    // buffer at all. See findings and docs/OPTIMIZATIONS.md — the same branch
+                    // is why every receive-side timing field in getStats() reads zero here.
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
-                        worker = await makeTransformWorker();
+                        const w = await makeTransformWorker();
+                        if (stale()) { try { w.terminate(); } catch (_) { noteSuppressed(); } return; }
+                        worker = w;
+                        // A worker whose script fails to load or parse is constructed
+                        // successfully and then simply never posts anything, so without this
+                        // the only net is a timeout — 2.5 s where there is a legacy transform
+                        // to fall back to, and five seconds of black screen on Safari, where
+                        // there is not.
+                        worker.onerror = (ev) => {
+                            noteSuppressed();
+                            fallbackToVideo('transform worker failed: ' + ((ev && ev.message) || 'unknown'));
+                        };
+                        worker.onmessageerror = noteSuppressed;
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
                                 onStreamLive();
                             } else if (m.data.type === 'decodeerror') {
                                 console.warn('[webcodecs] decode error:', m.data.message);
+                            } else if (m.data.type === 'painterror') {
+                                noteSuppressed();
+                                console.warn('[webcodecs] paint error:', m.data.message);
                             } else if (m.data.type === 'configerror') {
                                 console.error('[webcodecs] configure() failed for codec', m.data.codec, ':', m.data.message);
                                 fallbackToVideo('VideoDecoder.configure failed: ' + m.data.message);
+                            } else if (m.data.type === 'decoderdead') {
+                                fallbackToVideo('decoder failed ' + m.data.resets + ' times in a row');
                             } else if (m.data.type === 'backlog') {
-                                console.warn('[webcodecs] decoder backlog (' + m.data.size + '); dropping to freshest frame');
+                                console.warn('[webcodecs] ' + m.data.inFlight + ' decodes still outstanding; skipping to the next keyframe');
+                            } else if (m.data.type === 'requestkey') {
+                                // The legacy transform cannot ask for an IDR itself; relay it
+                                // over the reliable input channel instead of freezing.
+                                let sent = false;
+                                try { sent = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                                if (!sent) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                            } else if (m.data.type === 'nokeyframe') {
+                                // Only now is a demotion the right answer: we asked by every
+                                // means available and the host still sent no keyframe.
+                                console.warn('[webcodecs] no keyframe after ' + Math.round(m.data.waitedMs) + ' ms (keyTier=' + m.data.keyTier + ')');
+                                if (!m.data.keyTier) fallbackToVideo('no keyframe and no way to ask for one');
                             } else if (m.data.type === 'transformstart') {
-                                console.log('[webcodecs] onrtctransform FIRED — readable=' + m.data.hasReadable + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                                transformStarted = true;
+                                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
+                                console.log('[webcodecs] transform started — transport=' + m.data.transport + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                            } else if (m.data.type === 'trackgen') {
+                                attachTrackGenerator(m.data.track);
                             } else if (m.data.type === 'firstframe') {
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                            } else if (m.data.type === 'size') {
+                                try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.width, m.data.height); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
                             } else if (m.data.type === 'avsync') {
-                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
+                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'videostats') {
                                 videoWorkerStats = m.data.stats;
+                                // Latched here rather than in SEVideo.getStats(), which is the
+                                // documented console read-side: typing it must not change what
+                                // the host is told.
+                                // The poll fires its first tick immediately, before the
+                                // transform is installed, and the worker answers from its
+                                // initial state: keyTier 0 because no transform has fired and
+                                // no PONG has landed, decoderHardware false because
+                                // doConfigure has not run. Latching either from that reply set
+                                // both bits on every session for the rest of its life. Both
+                                // conditions are re-evaluated instead, and only once the thing
+                                // that determines them has actually happened.
+                                if (m.data.stats) {
+                                    const w = m.data.stats;
+                                    if (w.configured) {
+                                        if (w.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
+                                        else undegrade(DEG.DECODER_HW_UNAVAILABLE);
+                                    }
+                                    if (w.transportTier) {
+                                        if (w.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                        else undegrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                    }
+                                }
+                                if (m.data.stats && m.data.stats.displayWidth) {
+                                    try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.stats.displayWidth, m.data.stats.displayHeight); } catch (_) { noteSuppressed(); }
+                                }
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
                         };
-                        const off = freshCanvas().transferControlToOffscreen();
-                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        relayOutOfBandKey();
+                        if (PRESENT_PREF === 'track') {
+                            worker.postMessage({ type: 'trackgen' });
+                        } else {
+                            const off = freshCanvas().transferControlToOffscreen();
+                            worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        }
                         if (hostClockOffsetMs !== null) worker.postMessage({ type: 'clockoffset', offsetMs: hostClockOffsetMs });
                         startVideoStatsPoll();
                         if (useScriptTransform) {
-                            videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            try {
+                                videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            } catch (err) {
+                                retryWithLegacyTransform('RTCRtpScriptTransform threw: ' + err.message);
+                                return;
+                            }
+                            transformStarted = false;
                         } else {
                             let readable;
                             try {
@@ -1016,21 +1645,78 @@
                             }
                             worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
+                        // Both of these are inert on this path and deliberately kept: the
+                        // transform runs in place of libwebrtc's reference finder, so the
+                        // frame buffer they configure is never reached. They are set anyway
+                        // so a future engine that moves the transform downstream does not
+                        // silently reintroduce a jitter buffer.
                         try {
                             if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
-                        } catch (_) {}
-                        showCanvas();
+                        } catch (_) { noteSuppressed(); }
+                        if (PRESENT_PREF !== 'track') showCanvas();
+                    }
+
+                    // `onrtctransform` cannot fire until ICE has connected and the first
+                    // encoded frame has arrived, so 2500 ms measured from installing the
+                    // transform is well inside the setup budget this same function allots to
+                    // ICE alone — a slow or cross-network join was demoted off
+                    // RTCRtpScriptTransform for being slow, permanently losing
+                    // sendKeyFrameRequest(). Measure from the first sign that packets should
+                    // be flowing instead.
+                    let transformWatchdogArmed = false;
+                    // Both watchdogs are armed from the same event, and it is this one: the
+                    // moment packets should be flowing. They used to start from different
+                    // origins — this one at ICE-connected, the 5 s demotion at `ontrack`, which
+                    // is during setRemoteDescription and therefore *earlier* — so any join whose
+                    // ICE took more than about 2.5 s after the answer had the 5 s timer fire
+                    // first and skip the ladder entirely. A cross-network or relayed join
+                    // reaching 3 s of ICE is ordinary, and the cost was landing on <video> for
+                    // the whole session instead of stepping one rung to createEncodedStreams.
+                    function armTransformWatchdog() {
+                        armFrameWatchdog();
+                        if (transformWatchdogArmed || transformStarted) return;
+                        if (!(webcodecs && useScriptTransform && hasLegacyEncodedStreams)) return;
+                        transformWatchdogArmed = true;
+                        transformWatchdog = setTimeout(() => {
+                            transformWatchdog = null;
+                            if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
+                        }, TRANSFORM_START_TIMEOUT_MS);
+                    }
+
+                    // The bottom of the ladder, but it steps rather than jumps: a script
+                    // transform that never fired still has a rung below it that keeps WebCodecs
+                    // and the ~90 ms the <video> element costs. retryWithLegacyTransform falls
+                    // through to fallbackToVideo where there is no legacy transform, so this
+                    // stays bounded either way.
+                    function armFrameWatchdog() {
+                        // Only the WebCodecs path has anything to demote to; the <video> path
+                        // is already the floor and its liveness is the reconfig poll's job.
+                        if (watchdog || !webcodecs) return;
+                        watchdog = setTimeout(() => {
+                            watchdog = null;
+                            if (webcodecs && useScriptTransform && hasLegacyEncodedStreams && !transformStarted) {
+                                retryWithLegacyTransform('no WebCodecs frame within 5s');
+                            } else {
+                                fallbackToVideo('no WebCodecs frame within 5s');
+                            }
+                        }, FRAME_WATCHDOG_MS);
                     }
 
                     pc.ontrack = (e) => {
                         if (e.track.kind === 'audio') {
-                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) {}
+                            // Remembered, not attached: on the fast path this track is the
+                            // spare `wantsFallbackTrack` asked for, and playing it now would
+                            // report the slow path while the worklet is still running.
+                            try { if (window.SEAudio) SEAudio.noteFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
                             return;
                         }
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
-                            showCanvas();
+                            // ontrack lands after a network round trip, well after the worker
+                            // answered `trackgen`, so an unguarded showCanvas() here hid the
+                            // <video> the generator had just been attached to.
+                            if (PRESENT_PREF !== 'track') showCanvas();
                             if (DEBUG) statsPoll = setInterval(() => {
                                 if (worker) worker.postMessage({ type: 'stats' });
                                 if (pc) pc.getStats().then((rep) => {
@@ -1055,7 +1741,6 @@
                                     if (!foundInbound) console.log('[webcodecs] NO inbound-rtp stat yet; candidate-pair=' + pair);
                                 }).catch((err) => console.log('[webcodecs] getStats failed', err));
                             }, 1000);
-                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 5s'), 5000);
                             lastRendered = -1; lastBytes = -1; renderStalls = 0;
                             if (liveWatch) clearInterval(liveWatch);
                             liveWatch = setInterval(() => {
@@ -1064,10 +1749,13 @@
                             }, 2000);
                         } else {
                             video.srcObject = e.streams[0];
+                            // These are real on this path, unlike on the WebCodecs one: the
+                            // <video> element goes through libwebrtc's frame buffer, so the
+                            // target it is given is the target it keeps.
                             try {
                                 if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
-                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
-                            } catch (_) {}
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) { noteSuppressed(); }
+                            } catch (_) { noteSuppressed(); }
                             showVideo();
                             startFallbackFrameStats();
                             tryPlay();
@@ -1078,27 +1766,33 @@
                     pc.oniceconnectionstatechange = () => {
                         if (pc !== localPc) return;
                         const s = pc.iceConnectionState;
-                        if ((s === 'connected' || s === 'completed') && (usingFallback || !canWebCodecs)) {
-                            onStreamLive();
+                        if (s === 'connected' || s === 'completed') {
+                            armTransformWatchdog();
+                            if (usingFallback || !canWebCodecs) onStreamLive();
                         } else if (s === 'failed') {
                             linkLost('Connection failed.');
                         }
                     };
                     pc.onconnectionstatechange = () => {
-                        if (pc !== localPc || reconfiguring) return;
+                        if (pc !== localPc) return;
                         const s = pc.connectionState;
+                        if (s === 'connected') armTransformWatchdog();
+                        if (reconfiguring) return;
                         if (s === 'connected') markAlive();
                         else if (s === 'disconnected') enterDegraded();
                         else if (s === 'failed') linkLost('Disconnected, reconnect to continue.');
                     };
 
                     const offer = await pc.createOffer();
+                    if (stale()) return;
                     await pc.setLocalDescription(offer);
-                    await waitForIceGathering(pc, hasTurnServer(iceServers) ? 6000 : 3000);
+                    if (stale()) return;
+                    await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
+                    if (stale()) return;
 
                     let storedToken = '';
-                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) {}
-                    const resp = await fetch('/whep', {
+                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
+                    const whepOpts = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -1114,35 +1808,73 @@
                             sdp: pc.localDescription.sdp,
                             audioCapabilities: audioCaps,
                         }),
-                    });
+                    };
+                    // A host that accepts the connection and never answers — a wedged
+                    // display-correlation lock, a suspended VM, a black-holed route — parked
+                    // this await forever, and on the reconfigure path that is a frozen picture
+                    // with every recovery mechanism switched off.
+                    let whepAbort = null;
+                    let whepTimer = 0;
+                    if (typeof AbortController === 'function') {
+                        whepAbort = new AbortController();
+                        whepOpts.signal = whepAbort.signal;
+                        whepTimer = setTimeout(function () {
+                            try { whepAbort.abort(); } catch (_) { noteSuppressed(); }
+                        }, WHEP_TIMEOUT_MS);
+                    }
+                    let resp;
+                    try {
+                        resp = await fetch('/whep', whepOpts);
+                    } catch (err) {
+                        if (whepAbort && whepAbort.signal.aborted) throw new Error('The host did not answer in time.');
+                        throw err;
+                    } finally {
+                        if (whepTimer) clearTimeout(whepTimer);
+                    }
+                    if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
                     const issuedToken = resp.headers.get('X-Device-Token');
-                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) {} }
+                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     const answerSdp = await resp.text();
+                    if (stale()) return;
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                    if (stale()) return;
 
                     try {
                         if (window.SEAudio) {
                             SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken);
                             Promise.resolve(SEAudio._enumPromise).then(() => SEAudio.postOutputs()).catch(() => {});
                         }
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs && worker) {
                         const plid = negotiatedProfileLevelId(answerSdp);
-                        if (plid) worker.postMessage({ type: 'codechint', profileLevelId: plid });
+                        if (!plid) degrade(DEG.NO_H264_FMTP);
+                        // The coded size goes with it: isConfigSupported can only answer
+                        // honestly about a configuration it has been given in full, and the
+                        // host was asked for exactly this size.
+                        const dpr = getDpr();
+                        worker.postMessage({
+                            type: 'codechint',
+                            profileLevelId: plid || '',
+                            width: Math.round(joinData.width * dpr),
+                            height: Math.round(joinData.height * dpr),
+                        });
                     }
                 } catch (err) {
                     console.error(err);
-                    const isAuthError = /Invalid session ID or OTP/.test(err.message);
+                    // A newer start() already owns pc and worker; this one's failure is about a
+                    // connection nobody is using any more.
+                    if (stale()) { noteSuppressed(); return; }
+                    const isAuthError = /Invalid session ID or OTP/.test(err && err.message);
                     if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
-                        fallbackToVideo('setup error: ' + err.message);
+                        fallbackToVideo('setup error: ' + errorText(err));
                     } else if (reconfiguring && isLive) {
                         reconfiguring = false;
                         startReconfigPoll();
                     } else {
-                        showError(err.message);
+                        showError(errorText(err));
                     }
                 }
             }
@@ -1152,7 +1884,7 @@
                 try {
                     const r = await fetch('/net-config');
                     if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
                 const u = new URL(location.href);
                 u.protocol = 'https:';
                 u.port = httpsPort;
@@ -1205,9 +1937,9 @@
             const DEVICE_TOKEN_KEY = 'se.deviceToken';
             try {
                 if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
-            } catch (_) {}
+            } catch (_) { noteSuppressed(); }
             fullscreenModeInput.addEventListener('change', () => {
-                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) {}
+                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) { noteSuppressed(); }
             });
 
             document.getElementById('brand').addEventListener('click', () => {
@@ -1255,18 +1987,52 @@
                 const r = window.screen && window.screen.refreshRate;
                 return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
-            function relayRefreshRate(rate) {
-                if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
+            // The measured rate is folded into joinData *before* the offer goes out, so the
+            // host builds the display at the right rate the first time. It used to be
+            // measured after the stream went live and then applied by tearing the session
+            // down and rebuilding it — every 90, 120 or 144 Hz client renegotiated about a
+            // second after connecting, retaking the host's display-correlation lock on the
+            // way. If the rate is still unknown at submit time it stays unknown: a later
+            // refinement only updates joinData, so the next reconfigure that happens for
+            // some other reason (an orientation change, a host setting) carries it.
+            // Long enough for REFRESH_SAMPLES rAF callbacks at 60 Hz (~383 ms) with room to
+            // spare. It used to be 400 ms against a 60-sample measurement, i.e. ~1 s at 60 Hz —
+            // so resolveRefreshRate returned 0 on essentially every join and the true rate was
+            // applied only if some unrelated reconfigure happened later, which for most
+            // sessions is never. A 120 Hz client ran the host display at the default rate.
+            const REFRESH_DEADLINE_MS = 500;
+            const AUDIO_PREPARE_DEADLINE_MS = 2000;
+            async function resolveRefreshRate() {
+                const reported = screenRefreshRate();
+                if (reported) return reported;
+                degrade(DEG.REFRESH_RATE_MEASURED);
+                const measured = await Promise.race([
+                    refreshRatePromise,
+                    new Promise((r) => setTimeout(() => r(0), REFRESH_DEADLINE_MS)),
+                ]);
+                return clampRefresh(measured) || 0;
+            }
+            // The refinement is the safety net for a join-time measurement that was wrong, not
+            // the normal path: with REFRESH_SAMPLES at 24 the measurement lands inside the
+            // deadline and the first offer already carries the right rate. It is wrong when
+            // the page spent its first half-second in a background tab or behind a layout
+            // storm, where rAF is throttled and the measured rate is far too low — and a rate
+            // that only ever updated `joinData` was never corrected on a stationary tablet,
+            // because nothing else there ever reconfigures. So apply it, once, and only when
+            // the two disagree by more than the clamp step.
+            let refreshRefinementApplied = false;
+            function noteRefinedRefreshRate(rate) {
+                if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
                 if (Math.abs(rate - cur) < 5) return;
                 joinData.refreshRate = rate;
-                console.log('[refresh] refined to ' + rate + ' Hz; reconfiguring host display');
+                if (refreshRefinementApplied || !isLive || reconfiguring || kicked) {
+                    console.log('[refresh] refined to ' + rate + ' Hz; will apply at the next reconfigure');
+                    return;
+                }
+                refreshRefinementApplied = true;
+                console.log('[refresh] refined to ' + rate + ' Hz from ' + cur + '; rebuilding the host display');
                 reconfigure();
-            }
-            async function refineRefreshRate() {
-                let rate = screenRefreshRate();
-                if (!rate) rate = clampRefresh(await refreshRatePromise);
-                relayRefreshRate(rate);
             }
 
             function validate() {
@@ -1292,7 +2058,7 @@
                 const fs = params.get('fs');
                 if (fs === '0' || fs === '1') {
                     fullscreenModeInput.checked = fs === '1';
-                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) {}
+                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) { noteSuppressed(); }
                 }
 
                 const consumed = ['otp', 'name', 'fs'];
@@ -1340,7 +2106,17 @@
             sessionInput.addEventListener('input', validate);
             nameInput.addEventListener('input', validate);
 
-            const refreshRatePromise = getRefreshRate().catch(() => 0);
+            // performance.timeOrigin is Safari 15; input.js already computes it the long
+            // way for the clock offset and this is the other consumer. Without it every
+            // <video>-path lag sample was NaN, failed `lag >= 0`, and was discarded — so
+            // host-to-paint read 0 on precisely the old browsers that take that path.
+            const TIME_ORIGIN_MS = (typeof performance.timeOrigin === 'number' && isFinite(performance.timeOrigin))
+                ? performance.timeOrigin
+                : (Date.now() - performance.now());
+
+            const REFRESH_SAMPLES = 24;
+            const REFRESH_REFINE_SAMPLES = 60;
+            const refreshRatePromise = getRefreshRate(REFRESH_SAMPLES).catch(() => 0);
 
             const COMPAT_HIDE_KEY = 'se.compat.hideLimited';
 
@@ -1351,7 +2127,7 @@
                 try {
                     if (hidden) localStorage.setItem(COMPAT_HIDE_KEY, '1');
                     else localStorage.removeItem(COMPAT_HIDE_KEY);
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
             }
 
             function checkBrowserRequirements() {
@@ -1370,20 +2146,37 @@
                         severity: 'blocking',
                     });
                 }
+                // HTTPS can only restore what the browser withholds for lack of a secure
+                // context. On a page that is already secure it fixes nothing, and telling an
+                // iPhone that HTTPS will bring back an AudioDecoder its Safari has never
+                // shipped is simply wrong.
+                // Absent below Safari 11.1, where `!undefined` is true even on an https page —
+                // which is exactly the misleading copy the comment above exists to avoid.
+                const httpsCouldHelp = (typeof window.isSecureContext === 'boolean')
+                    ? !window.isSecureContext
+                    : (location.protocol === 'http:');
                 if (!canWebCodecs) {
                     unsupported.push({
                         name: 'WebCodecs video',
                         description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsCouldHelp,
                     });
                 }
+                // One row, gated on the pair, and the original wording: this modal's rendered
+                // content is not this branch's to change. Splitting it into a row per capability
+                // showed two rows where one used to appear on Safari 16.4-17 and Firefox 130+,
+                // and added a third for cross-origin isolation that is close to unreachable —
+                // WebCodecs needs a secure context, and on one the host's own COOP/COEP headers
+                // make `crossOriginIsolated` true. `httpsFixable` keeps the correction, because
+                // that one is not cosmetic: it drove a "Switch to HTTPS" button on iPhones whose
+                // Safari has never shipped an AudioDecoder for HTTPS to restore.
                 if (!audioFast) {
                     unsupported.push({
                         name: 'WebCodecs audio and AudioWorklet',
                         description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsCouldHelp,
                     });
                 }
                 const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
@@ -1491,15 +2284,97 @@
                 const m = document.getElementById('permModal');
                 const cont = document.getElementById('permContinue');
                 const skip = document.getElementById('permSkip');
-                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) {} };
+                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) { noteSuppressed(); } };
                 cont.onclick = () => done(onContinue);
                 skip.onclick = () => done(onSkip);
                 m.style.display = 'flex';
             }
 
+            // Only a modal the user can actually see is worth showing. A fullscreen element
+            // renders only its own subtree, so a prompt raised while the stage is fullscreen
+            // would be invisible and its promise would never settle; the host is told the
+            // labels are unavailable instead, which is the truth either way.
+            const FULLSCREEN_EVENTS = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
+            // `onSkip` is called with `true` when the card could not be shown rather than
+            // answered. That distinction is what stops a session that entered fullscreen — the
+            // default — from being unable to ever ask again: a deferral is retried by
+            // `offerOutputLabels()` when something actually needs the answer, a decline is not.
+            function permModalIfVisible(onContinue, onSkip) {
+                if (currentFullscreenEl()) {
+                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
+                    return;
+                }
+                // The check above is a single sample, and startLock() enters fullscreen
+                // asynchronously off onStreamLive — a modal raised a few hundred milliseconds
+                // earlier survived into the transition, became invisible inside the fullscreen
+                // subtree with its promise never settling, and then reappeared over the live
+                // picture the moment the user left fullscreen. Keep watching for the life of
+                // the modal and resolve it as skipped if that happens.
+                let watching = true;
+                const stopWatching = () => {
+                    if (!watching) return;
+                    watching = false;
+                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onFsChange));
+                };
+                const onFsChange = () => {
+                    if (!watching || !currentFullscreenEl()) return;
+                    stopWatching();
+                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
+                    document.getElementById('permModal').style.display = 'none';
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
+                };
+                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onFsChange));
+                showPermModal(
+                    () => { stopWatching(); if (onContinue) onContinue(); },
+                    () => { stopWatching(); if (onSkip) onSkip(false); },
+                );
+            }
+
+            // The retry. The card is only worth raising now because something asked for it — the
+            // host changing this device's output, or the user opening the picker — so leave
+            // fullscreen first rather than raising it into a subtree that does not render it.
+            // The gesture handler re-enters fullscreen on the next tap, which is the same path
+            // Esc already takes, so the visible state ends where it started.
+            function offerPermModalNow(onContinue, onSkip) {
+                if (!currentFullscreenEl()) { permModalIfVisible(onContinue, onSkip); return; }
+                let settled = false;
+                const stop = () => {
+                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onLeft));
+                };
+                const onLeft = () => {
+                    if (settled || currentFullscreenEl()) return;
+                    settled = true;
+                    stop();
+                    permModalIfVisible(onContinue, onSkip);
+                };
+                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onLeft));
+                try {
+                    let p = null;
+                    if (document.exitFullscreen) p = document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) p = document.webkitExitFullscreen();
+                    else if (document.mozCancelFullScreen) p = document.mozCancelFullScreen();
+                    else if (document.msExitFullscreen) p = document.msExitFullscreen();
+                    if (p && p.catch) p.catch(noteSuppressed);
+                } catch (_) { noteSuppressed(); }
+                // An exit that never lands must not strand the caller's promise.
+                setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    stop();
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
+                }, 1500);
+            }
+
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 if (connectBtn.disabled) return;
+
+                // Before any await: iOS only resumes an AudioContext from inside the gesture
+                // that created it, and everything after the first `await` in this handler is
+                // outside that window.
+                let audioReady = null;
+                try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
 
                 const g0 = screenGeom();
                 joinData = {
@@ -1507,7 +2382,7 @@
                     deviceName: nameInput.value.trim(),
                     otp: otpValue(),
                     os: detectOs(),
-                    refreshRate: screenRefreshRate() || 0,
+                    refreshRate: 0,
                     width: g0.width,
                     height: g0.height,
                 };
@@ -1529,24 +2404,54 @@
 
                 console.log('[join] connecting with', joinData);
 
-                try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
+                // The fast audio path is decided here rather than from constructor
+                // existence, because the host reads `audioCapabilities` once and, if we
+                // claim the fast path, sends Opus on a DataChannel and puts no audio track
+                // in the answer at all. A prepare() that fails after that point is total
+                // silence with no way back. Safari 26 and Firefox 130 both newly pass the
+                // old constructor sniff, which is what made this urgent.
+                // All three overlap: the worklet module is a fetch, the decoder probe is
+                // async on some engines, and the refresh-rate measurement has its own
+                // deadline. Serialising them would put the sum in front of the picture.
+                const capsPromise = (window.SEAudio ? SEAudio.verifyCapabilities() : Promise.resolve(null))
+                    .catch(() => { noteSuppressed(); return { webcodecsOpus: false, worklet: false }; });
+                // A worklet module that never loads must not hold the join open: past the
+                // deadline the client simply does not claim the fast path.
+                const readyPromise = audioReady
+                    ? Promise.race([
+                        Promise.resolve(audioReady).catch(() => { noteSuppressed(); return false; }),
+                        new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
+                    ])
+                    : Promise.resolve(true);
+                const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
 
-                const startAudioAndStream = async () => {
-                    try {
-                        if (window.SEAudio) {
-                            SEAudio._enumPromise = SEAudio.unlockAndEnumerate();
-                            await SEAudio.micReady();
-                        }
-                    } catch (_) {}
-                    beginStreaming();
-                };
-                let needMic = false;
-                try { if (window.SEAudio) { SEAudio.initSpeakers(); needMic = await SEAudio.needsMicPermission(); } } catch (_) {}
-                if (needMic) {
-                    showPermModal(startAudioAndStream, () => beginStreaming());
-                } else {
-                    startAudioAndStream();
+                if (results[0]) {
+                    audioCaps = results[0];
+                    if (!results[1]) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
+                    audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+                    if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    // verifyCapabilities() derived this from a worklet that was still expected
+                    // to load. It did not, so the host is about to send a fed track and a
+                    // second spare one would be the same audio twice.
+                    audioCaps.wantsFallbackTrack = audioFast;
+                    // No DataChannel off the fast path, so there is nothing for a
+                    // redundant body to ride and nothing true to claim.
+                    audioCaps.redundancy = audioFast;
                 }
+                joinData.refreshRate = results[2];
+
+                // Audio-output enumeration is for the host's device panel, not for playback:
+                // it must never stand between the user and the picture. It runs after the
+                // stream is under way and, where the browser needs a microphone grant to
+                // reveal output labels, asks then — the prompt used to gate the join for up
+                // to twelve seconds.
+                beginStreaming();
+                try {
+                    if (window.SEAudio) {
+                        SEAudio.initSpeakers();
+                        SEAudio._enumPromise = SEAudio.enumerateLazily(permModalIfVisible);
+                    }
+                } catch (_) { noteSuppressed(); }
             });
         </script>
     </body>

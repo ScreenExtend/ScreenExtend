@@ -77,6 +77,12 @@ const router = createMemoryRouter(
   )
 );
 
+// `networkChange` fires on any adapter change -- a VPN coming up, Wi-Fi roaming -- and
+// usually reports the same set. Handing back the previous array keeps the QR components
+// and every other consumer of the context out of the commit.
+const sameQrValues = (a: QrValue[], b: QrValue[]): boolean =>
+  a.length === b.length && a.every((v, i) => v.title === b[i].title && v.value === b[i].value);
+
 const deviceEquals = (a: Device, b: Device): boolean => {
   const keys = Object.keys(b) as (keyof Device)[];
   if (keys.length !== Object.keys(a).length) return false;
@@ -118,6 +124,10 @@ function GlobalState({ children }: { children: ReactNode }) {
   const [otp, setOtp] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [qrValues, setQrValues] = useState<QrValue[]>([]);
+  const applyQrValues = useMemo(
+    () => (next: QrValue[]) => setQrValues(prev => (sameQrValues(prev, next) ? prev : next)),
+    []
+  );
   const [loaded, setLoaded] = useState(false);
   const [devices, setDevices] = useState<Device[]>([]);
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
@@ -379,9 +389,9 @@ function GlobalState({ children }: { children: ReactNode }) {
         setSessionId(newId);
         try {
           const cfg = await getConfig();
-          setQrValues(await buildQrValues(newId, cfg?.serverPorts?.http));
+          applyQrValues(await buildQrValues(newId, cfg?.serverPorts?.http));
         } catch {
-          setQrValues(await buildQrValues(newId, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
+          applyQrValues(await buildQrValues(newId, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
           toast({
             variant: "destructive",
             title: t("toasts.qrRefresh.failureTitle"),
@@ -394,9 +404,9 @@ function GlobalState({ children }: { children: ReactNode }) {
         if (!id) return;
         try {
           const cfg = await getConfig();
-          setQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
+          applyQrValues(await buildQrValues(id, cfg?.serverPorts?.http));
         } catch {
-          setQrValues(await buildQrValues(id, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
+          applyQrValues(await buildQrValues(id, getConfigSnapshot()?.serverPorts?.http).catch(() => []));
           toast({
             variant: "destructive",
             title: t("toasts.qrRefresh.failureTitle"),
