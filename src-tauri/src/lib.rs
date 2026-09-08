@@ -387,7 +387,8 @@ pub fn run() {
             get_server_ports,
             set_disable_gpu_encode,
             get_disable_gpu_encode,
-            logbus::get_log_backlog
+            logbus::get_log_backlog,
+            logbus::log_frontend_error
         ])
         .events(collect_events![
             DeviceJoin,
