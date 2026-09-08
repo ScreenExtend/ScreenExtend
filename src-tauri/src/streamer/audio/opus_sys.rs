@@ -43,6 +43,22 @@ pub const OPUS_GET_LOOKAHEAD_REQUEST: c_int = 4027;
 pub const OPUS_RESET_STATE: c_int = 4028;
 pub const OPUS_GET_SAMPLE_RATE_REQUEST: c_int = 4029;
 pub const OPUS_SET_LSB_DEPTH_REQUEST: c_int = 4036;
+/// "If set to 1, disables almost all use of prediction, making frames almost completely
+/// independent" — the right dial for a zero-retransmit, unordered transport where any frame
+/// may have to stand alone. Costs bitrate at fixed quality.
+pub const OPUS_SET_PREDICTION_DISABLED_REQUEST: c_int = 4042;
+
+// The GET side. None of these existed, so the encoder's configuration was applied and never
+// confirmed: `ctl_set` does check its return, but nothing asked the encoder what state it was
+// actually in — and Windows and macOS load different libopus builds.
+pub const OPUS_GET_APPLICATION_REQUEST: c_int = 4001;
+pub const OPUS_GET_BITRATE_REQUEST: c_int = 4003;
+pub const OPUS_GET_VBR_REQUEST: c_int = 4007;
+pub const OPUS_GET_COMPLEXITY_REQUEST: c_int = 4011;
+pub const OPUS_GET_VBR_CONSTRAINT_REQUEST: c_int = 4021;
+pub const OPUS_GET_SIGNAL_REQUEST: c_int = 4025;
+pub const OPUS_GET_LSB_DEPTH_REQUEST: c_int = 4037;
+pub const OPUS_GET_PREDICTION_DISABLED_REQUEST: c_int = 4043;
 
 #[repr(C)]
 pub struct OpusEncoder {

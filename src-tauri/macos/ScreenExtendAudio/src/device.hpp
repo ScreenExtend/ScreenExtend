@@ -45,8 +45,11 @@ private:
     // loopback ring indexed by absolute sample-time, power-of-two, allocated once at construction
     static constexpr uint32_t kLoopbackFrames = 65536; // 2^16 frames ≈ 1.37 s @ 48 kHz
     static constexpr uint32_t kChannels = 2;
+    // ceiling on one IO cycle; the downmix scratch is sized for it once, never in the callback
+    static constexpr uint32_t kMaxFramesPerCallback = 8192; // 170 ms @ 48 kHz
     std::vector<float> loopback_;
     uint32_t loopbackMask_; // kLoopbackFrames - 1
+    std::vector<float> downmix_;
 };
 
 std::shared_ptr<aspl::Device> BuildDevice(const std::shared_ptr<aspl::Context>& context,

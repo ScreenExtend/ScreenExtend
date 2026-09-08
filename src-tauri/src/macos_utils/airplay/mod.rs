@@ -1,13 +1,22 @@
-//! Virtual displays on macOS 10.13–10.14, where `CGVirtualDisplay` does not exist.
+//! Virtual displays where `CGVirtualDisplay` does not exist.
 //!
-//! The private `CGVirtualDisplay*` classes that
-//! [`super::virtual_display`] uses arrived with 10.15. Below that there is no
-//! supported way for a userspace process to add a display — so this module
-//! borrows one from AirPlay: it stands up a minimal fake AirPlay receiver on the
-//! loopback-visible Bonjour namespace, drives the Mac's own AirPlay picker at
-//! it, and lets **macOS** create the extended-desktop display. Once the display
-//! exists it is an ordinary `CGDirectDisplayID` and the existing
-//! CGDisplayStream + WebRTC pipeline captures it exactly as before.
+//! The private `CGVirtualDisplay*` classes that [`super::virtual_display`] uses
+//! arrived in **10.14.4** — they predate Sidecar by a release, which is why the
+//! tier is selected by looking the classes up rather than by comparing a
+//! version number. Below that there is no supported way for a userspace process
+//! to add a display, so this module borrows one from AirPlay: it stands up a
+//! minimal fake AirPlay receiver, drives the Mac's own AirPlay picker at it, and
+//! lets **macOS** create the extended-desktop display. Once the display exists
+//! it is an ordinary `CGDirectDisplayID` and the existing CGDisplayStream +
+//! WebRTC pipeline captures it exactly as before.
+//!
+//! **This tier is below the app's own floor.** `minimumSystemVersion` is 10.15,
+//! so on every release where `probe_display_backend` would actually choose this
+//! backend the binary refuses to launch. It is kept as a safety net — if the
+//! classes ever go away, or a release turns out not to have them where we
+//! assumed — and it is developed and tested on 10.15, where both AirPlay and
+//! `CGVirtualDisplay` exist. Nothing here is a reason to do further work toward
+//! supporting 10.13.
 //!
 //! What this deliberately does not do: decode H.264, derive FairPlay keys,
 //! decrypt anything, or touch VideoToolbox. The mirroring stream macOS sends us
@@ -30,6 +39,7 @@
 //! | [`topology`] | finding the new display and taking it out of the mirror set |
 
 pub mod ax;
+pub mod cf_sys;
 pub mod dnssd;
 pub mod fairplay;
 pub mod info;
@@ -107,11 +117,32 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// `CGVirtualDisplay`, because an AirPlay session is a real network handshake
 /// plus a WindowServer reconfiguration, not a synchronous API call.
 const SESSION_BUDGET: Duration = Duration::from_secs(40);
-/// How long to wait after a *cold* publish before the picker can plausibly list
-/// us. Only paid when the receiver was not already warm — see [`prewarm`].
-const DISCOVERY_SETTLE: Duration = Duration::from_millis(6000);
+/// How long to let mDNSResponder settle after a *cold* publish. Only paid when
+/// the receiver was not already warm — see [`prewarm`].
+///
+/// This used to be a flat six seconds, on the theory that the picker needs that
+/// long to list a freshly published device. It does not need it *here*:
+/// `ax::connect_to` holds the menu open and re-reads it for its whole
+/// `DEVICE_ROW_TIMEOUT` precisely because the picker fills device rows in as
+/// discovery answers, so the wait already exists one step later and is
+/// interruptible the moment our row appears. All this needs to cover is the
+/// registration itself.
+const DISCOVERY_SETTLE: Duration = Duration::from_millis(500);
 /// How long the display gets to disappear after we drop the session.
 const REMOVAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// A second, much shorter window after handing the configuration back.
+///
+/// A display that outlives its session is inert — the session is over and the
+/// next `create_display` adopts the same id — so this is worth a moment, not
+/// another eight seconds of a quitting app.
+const REMOVAL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wall-clock budget for tearing a session down.
+///
+/// Teardown drives the same menu bar a join does, on a thread with no runtime,
+/// while the app is trying to quit. Each sub-step used to carry its own
+/// multi-attempt budget, which multiplied out to the better part of a minute
+/// with no progress reported anywhere. One budget bounds the whole thing.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(10);
 
 struct Session {
     name: String,
@@ -178,7 +209,8 @@ fn prewarm() {
         .name("se-airplay-warm".into())
         .spawn(|| match ensure_receiver() {
             Ok(true) => tprintln!(
-                "[airplay] receiver advertising ahead of the first client, so joining does not                  have to wait for discovery"
+                "[airplay] receiver advertising ahead of the first client, so joining does not \
+                 have to wait for discovery"
             ),
             Ok(false) => {}
             Err(e) => teprintln!("[airplay] could not pre-start the receiver: {e}"),
@@ -202,10 +234,16 @@ pub fn owns_display(id: u32) -> bool {
 /// Whether this backend can be used at all on the running system.
 ///
 /// Two hard requirements: an Accessibility grant (we drive the picker), and a
-/// logged-in GUI session (there is no menu bar otherwise).
+/// logged-in GUI session (there is no menu bar otherwise). Both are checked —
+/// the GUI one used to be named here and tested nowhere, so `ScreenExtend serve`
+/// over ssh failed fifteen seconds into a join, from inside the AX retry loop,
+/// instead of at setup.
 pub fn availability() -> Result<(), String> {
     if !ax::accessibility_trusted() {
         return Err(ax::ACCESSIBILITY_DENIED.to_string());
+    }
+    if !ax::gui_session_present() {
+        return Err(ax::NO_GUI_SESSION.to_string());
     }
     Ok(())
 }
@@ -284,12 +322,24 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         let modes_before = topology::snapshot_modes();
 
         let started = Instant::now();
+        // One budget for the whole join. `ax::connect_to` used to sit outside
+        // it with three attempts of its own, which multiplied out past the
+        // budget it was supposed to live inside.
+        let budget = started + SESSION_BUDGET;
 
-        ax::connect_to(&receiver_name)?;
+        // Clear the previous session's latched phase and mirror flags, so
+        // `diagnose` describes *this* attempt.
+        if let Ok(slot) = warm_receiver().lock() {
+            if let Some(receiver) = slot.as_ref() {
+                receiver.begin_session();
+            }
+        }
+
+        ax::connect_to(&receiver_name, budget)?;
 
         let attached = match topology::wait_for_airplay_display(
             &baseline,
-            SESSION_BUDGET.saturating_sub(started.elapsed()),
+            budget.saturating_duration_since(Instant::now()),
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -298,7 +348,7 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
                     .ok()
                     .and_then(|slot| slot.as_ref().map(diagnose))
                     .unwrap_or_default();
-                let _ = ax::disconnect();
+                let _ = ax::disconnect(Instant::now() + TEARDOWN_BUDGET);
                 return Err(format!("{e} {diagnosis}"));
             }
         };
@@ -311,8 +361,8 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         if topology::is_mirroring(attached.id) {
             if let Err(e) = topology::stop_mirroring(attached.id) {
                 teprintln!("[airplay] CoreGraphics un-mirror failed ({e}); trying the menu");
-                if let Err(e2) = ax::use_as_separate_display() {
-                    let _ = ax::disconnect();
+                if let Err(e2) = ax::use_as_separate_display(budget) {
+                    let _ = ax::disconnect(Instant::now() + TEARDOWN_BUDGET);
                     return Err(format!(
                         "the display attached as a mirror and could not be extended: {e}; \
                          the menu fallback also failed: {e2}"
@@ -321,16 +371,20 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
             }
         }
 
-        // Put every *other* display back the way it was. Without this the Mac's
-        // own screen is left at the client's resolution — showing as "Scaled"
-        // in Displays preferences — for the rest of the session.
-        modes_before.restore_except(attached.id);
-
-        // macOS picks the initial size itself, from a single bit — whether the
-        // advertised height reached 1080. The ladder it publishes afterwards is
-        // where the client's actual geometry comes back.
+        // One reconfiguration, not two. Every *other* display goes back the way
+        // it was — without this the Mac's own screen is left at the client's
+        // resolution, showing as "Scaled" in Displays preferences, for the rest
+        // of the session — and in the same commit ours moves onto the mode the
+        // client asked for. macOS picks the initial size itself from a single
+        // bit (whether the advertised height reached 1080); the ladder it
+        // publishes afterwards is where the real geometry comes back.
         let granted = topology::geometry(attached.id);
-        let (w, h) = topology::best_effort_mode(attached.id, (width, height));
+        let target = topology::closest_mode(attached.id, (width, height));
+        modes_before.restore_and_set(attached.id, target);
+        let (w, h) = match target {
+            Some(t) => topology::settle_geometry(attached.id, t, topology::MODE_SETTLE),
+            None => granted,
+        };
         if (w, h) != (width, height) {
             tprintln!(
                 "[airplay] macOS granted {w}x{h} for a requested {width}x{height} — AirPlay \
@@ -371,7 +425,8 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         if let Some(current) = topology::find_airplay_display() {
             if current != id {
                 tprintln!(
-                    "[airplay] display renumbered {id} -> {current} during reconfiguration;                      capturing {current}"
+                    "[airplay] display renumbered {id} -> {current} during reconfiguration; \
+                     capturing {current}"
                 );
                 if let Ok(mut reg) = registry().lock() {
                     if let Some(session) = reg.sessions.remove(&id) {
@@ -397,6 +452,8 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
             teprintln!("[airplay] remove_display({id}) — not an AirPlay display");
             return;
         };
+        let started = Instant::now();
+        let budget = started + TEARDOWN_BUDGET;
 
         // Undo everything we changed about the display, then hand the whole
         // configuration back to the system. Any `CGCompleteDisplayConfiguration`
@@ -415,7 +472,7 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         // is still advertised and therefore still in the picker: once the
         // Bonjour records are withdrawn there is no row left to press, and
         // macOS holds the display open on a receiver it can no longer see.
-        if let Err(e) = ax::disconnect() {
+        if let Err(e) = ax::disconnect(budget) {
             teprintln!("[airplay] could not stop the AirPlay session from the menu: {e}");
         }
 
@@ -428,20 +485,27 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         // attaching it did, so put them back once more now that it is gone.
         modes_before.restore_except(id);
 
-        if !topology::wait_for_removal(id, REMOVAL_TIMEOUT) {
+        let first_window = REMOVAL_TIMEOUT.min(budget.saturating_duration_since(Instant::now()));
+        if !topology::wait_for_removal(id, first_window) {
             // macOS is not always prompt about dropping the display object once
             // its session is over. Hand the configuration back once more and give
-            // it a second window; if it still lingers it is inert — the session
-            // is gone, and the next `create_display` will adopt the same id
-            // rather than waiting for a new one (see
+            // it a second, short window; if it still lingers it is inert — the
+            // session is gone, and the next `create_display` will adopt the same
+            // id rather than waiting for a new one (see
             // `topology::wait_for_airplay_display`).
             topology::release_display_configuration();
-            if !topology::wait_for_removal(id, REMOVAL_TIMEOUT) {
+            if !topology::wait_for_removal(id, REMOVAL_SETTLE_TIMEOUT) {
                 teprintln!(
-                    "[airplay] display {id}'s session has ended but macOS has not dropped the                      display yet; it will go when ScreenExtend exits, and it does not block a                      new session"
+                    "[airplay] display {id}'s session has ended but macOS has not dropped the \
+                     display yet; it will go when ScreenExtend exits, and it does not block a \
+                     new session"
                 );
             }
         }
+        tprintln!(
+            "[airplay] display {id} torn down in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     fn remove_all_displays(&self) {
@@ -453,10 +517,20 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
             self.remove_display(id);
         }
         // Now stop advertising too — this is app shutdown, not a client leaving.
-        if let Ok(mut slot) = warm_receiver().lock() {
-            slot.take();
+        match warm_receiver().lock() {
+            Ok(mut slot) => {
+                slot.take();
+            }
+            // A poisoned lock here used to mean the receiver was never dropped
+            // and the Bonjour records were never withdrawn, silently.
+            Err(e) => {
+                teprintln!(
+                    "[airplay] the receiver slot is poisoned; withdrawing the advertisement anyway"
+                );
+                e.into_inner().take();
+            }
         }
-        sender_prefs::restore();
+        ax::restore_menu_bar_option();
     }
 }
 
@@ -490,7 +564,7 @@ fn diagnose(receiver: &Receiver) -> String {
 
 /// Reports what the picker currently lists, for `ScreenExtend doctor`.
 pub fn probe() -> Result<Vec<String>, String> {
-    let snap = ax::snapshot()?;
+    let snap = ax::snapshot(Instant::now() + SESSION_BUDGET)?;
     Ok(snap
         .device_names()
         .into_iter()

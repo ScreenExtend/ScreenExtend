@@ -38,10 +38,26 @@ impl RoutingState {
 
     pub fn save(&self, path: &Path) {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                crate::teprintln!("audio(legacy): cannot create {}: {e}", dir.display());
+                return;
+            }
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(path, bytes);
+        let bytes = match serde_json::to_vec_pretty(self) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::teprintln!("audio(legacy): routing state would not serialise: {e}");
+                return;
+            }
+        };
+        // A state file that cannot be written means crash recovery cannot run, and the user's
+        // default output device stays on the virtual device after a crash with nothing to say why.
+        if let Err(e) = std::fs::write(path, bytes) {
+            crate::teprintln!(
+                "audio(legacy): cannot write {} ({e}); crash recovery will not be able to restore \
+                 the previous default output device",
+                path.display()
+            );
         }
     }
 
@@ -205,26 +221,38 @@ pub fn recover_on_launch() {
     }
 }
 
+/// Is a ScreenExtend host holding the single-instance lock?
+///
+/// The lock, not a `pgrep` fork: `single_instance` already keeps an exclusive `fs4` lock on
+/// `screenextend.lock` in the app's local data directory for exactly this question, and acquiring
+/// it is one `open` plus one `flock` against a process spawn plus a PID-list parse. The directory
+/// is the one Tauri's `app_local_data_dir` resolves to on macOS, which is the parent of the
+/// routing state file — the watchdog runs before any Tauri app exists, so it cannot ask Tauri.
 fn another_instance_running() -> bool {
-    let self_pid = std::process::id();
-    std::process::Command::new("pgrep")
-        .args(["-x", "ScreenExtend"])
-        .output()
-        .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse::<u32>().ok())
-                .any(|pid| pid != self_pid)
-        })
-        .unwrap_or(false)
+    let Some(dir) = default_state_path().parent().map(PathBuf::from) else {
+        return false;
+    };
+    let lock_path = dir.join(crate::single_instance::LOCK_FILE);
+    match crate::single_instance::acquire_lock(&lock_path) {
+        Some(file) => {
+            drop(file); // we only wanted to know; the running host must be able to take it back
+            false
+        }
+        None => true,
+    }
 }
 
+/// The `audio-recover` subcommand: restore the default output device a crashed host left hijacked.
+///
+/// Also the agent's own exit condition. Once the host is gone and the device has been put back
+/// there is nothing left for a periodic job to do, so it removes itself rather than polling on
+/// forever against a path that may not even exist any more.
 pub fn watchdog_recover() {
     if another_instance_running() {
-        return;
+        return; // the host is alive and owns the routing; nothing to recover
     }
     recover_on_launch();
+    uninstall_watchdog_agent();
 }
 
 const WATCHDOG_LABEL: &str = "app.screenextend.desktop.audiowatchdog";
@@ -238,12 +266,8 @@ fn watchdog_plist_path() -> PathBuf {
         .join(format!("{WATCHDOG_LABEL}.plist"))
 }
 
-pub fn install_watchdog_agent() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let plist = format!(
+fn watchdog_plist(exe: &Path) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -253,23 +277,96 @@ pub fn install_watchdog_agent() {
     <string>audio-recover</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>30</integer>
+  <key>StartInterval</key><integer>60</integer>
   <key>ProcessType</key><string>Background</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
 </dict></plist>
 "#,
         exe.display()
-    );
+    )
+}
+
+/// Install the post-crash recovery agent, if it is not already installed with these contents.
+///
+/// The agent exists only for the window in which the virtual device is the system default output.
+/// It is removed again by [`uninstall_watchdog_agent`] on a clean stop and on driver uninstall, and
+/// by [`watchdog_recover`] itself the first time it finds no host running — so it is a job with a
+/// bounded life rather than a permanent background poll against a path the app may have moved away
+/// from.
+pub fn install_watchdog_agent() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            crate::teprintln!("audio(legacy): cannot resolve own path for the recovery agent: {e}");
+            return;
+        }
+    };
+    let plist = watchdog_plist(&exe);
     let path = watchdog_plist_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if std::fs::write(&path, plist).is_err() {
+
+    // Re-bootstrapping an already-loaded job is an error every start would log; only touch launchd
+    // when the plist is actually new or its embedded path changed.
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == plist);
+    if unchanged && watchdog_agent_loaded() {
         return;
     }
-    let uid = format!("gui/{}", unsafe { libc::getuid() });
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootstrap", &uid, &path.to_string_lossy()])
-        .output();
+
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            crate::teprintln!("audio(legacy): cannot create {}: {e}", dir.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, plist) {
+        crate::teprintln!("audio(legacy): cannot write {}: {e}", path.display());
+        return;
+    }
+    let domain = gui_domain();
+    // bootout first so a changed path replaces the loaded job rather than colliding with it
+    let _ = launchctl(&["bootout", &format!("{domain}/{WATCHDOG_LABEL}")]);
+    match launchctl(&["bootstrap", &domain, &path.to_string_lossy()]) {
+        Some(true) => crate::tprintln!("audio(legacy): crash-recovery agent loaded"),
+        _ => crate::teprintln!(
+            "audio(legacy): launchctl bootstrap of the crash-recovery agent failed; a crash will \
+             leave the default output on the virtual device until the app is next opened"
+        ),
+    }
+}
+
+/// Unload the recovery agent and delete its plist.
+///
+/// Idempotent, and safe to call when it was never installed.
+pub fn uninstall_watchdog_agent() {
+    let domain = gui_domain();
+    let _ = launchctl(&["bootout", &format!("{domain}/{WATCHDOG_LABEL}")]);
+    let path = watchdog_plist_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => crate::tprintln!("audio(legacy): crash-recovery agent removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => crate::teprintln!("audio(legacy): cannot remove {}: {e}", path.display()),
+    }
+}
+
+fn gui_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+fn watchdog_agent_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("{}/{WATCHDOG_LABEL}", gui_domain())])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `Some(true)` when launchctl reported success, `Some(false)` when it ran and failed,
+/// `None` when it could not be run at all.
+fn launchctl(args: &[&str]) -> Option<bool> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .ok()
+        .map(|o| o.status.success())
 }
 
 #[derive(Debug, Clone, Copy)]
