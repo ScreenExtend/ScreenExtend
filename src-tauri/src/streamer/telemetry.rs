@@ -336,6 +336,18 @@ pub struct ClientStats {
     pub audio_overruns: u32,
     pub clock_offset_valid: bool,
     pub rtt_us: u32,
+    // v2 tail. All zero when the client only sent the 72-byte v1 prefix, which is also the
+    // "not measured" value for every one of them, so a v1 client is indistinguishable from a
+    // v2 client that could not measure anything — as it should be.
+    pub transport_tier: u8,
+    pub render_tier: u8,
+    pub key_tier: u8,
+    pub sink_tier: u8,
+    pub suppressed_errors: u32,
+    pub degraded_flags: u32,
+    pub audio_target_us: u32,
+    pub audio_concealed: u32,
+    pub audio_output_latency_us: u32,
 }
 
 pub mod client_flags {
@@ -348,6 +360,83 @@ pub mod client_flags {
     pub const SET_SINK_ID: u32 = 1 << 6;
     pub const DECODER_HARDWARE: u32 = 1 << 7;
     pub const CLOCK_VALID: u32 = 1 << 8;
+}
+
+pub fn transport_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "script-transform",
+        2 => "encoded-streams",
+        _ => "unknown",
+    }
+}
+
+pub fn render_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "offscreen-canvas",
+        2 => "track-generator",
+        3 => "video-element",
+        _ => "unknown",
+    }
+}
+
+/// Tier 0 is the one that matters: the client cannot ask for a keyframe at all.
+pub fn key_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "sendKeyFrameRequest",
+        2 => "out-of-band",
+        _ => "unknown",
+    }
+}
+
+pub fn sink_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "audiocontext-setsinkid",
+        2 => "media-element-setsinkid",
+        3 => "audio-session",
+        4 => "select-audio-output",
+        _ => "unknown",
+    }
+}
+
+/// Names for the v2 degradation bits, in bit order. Every one was a bare `catch (_) {}` or an
+/// untaken branch on the client before it became a bit here.
+pub const CLIENT_DEGRADED_NAMES: [&str; 22] = [
+    "fullscreen_refused",
+    "pointer_lock_refused",
+    "no_unadjusted_movement",
+    "no_wake_lock_api",
+    "wake_lock_refused",
+    "audio_worklet_failed",
+    "no_opus_decoder",
+    "audio_context_suspended",
+    "output_latency_estimated",
+    "no_audio_output_labels",
+    "no_script_transform",
+    "no_keyframe_request",
+    "no_offscreen_canvas",
+    "demoted_to_video_element",
+    "no_coalesced_events",
+    "ice_gathering_timed_out",
+    "no_h264_fmtp",
+    "no_hardware_decoder",
+    "refresh_rate_estimated",
+    "stepped_down_to_encoded_streams",
+    "no_request_video_frame_callback",
+    "no_keyboard_lock",
+];
+
+/// The degradation bits that are set, by name.
+pub fn client_degraded_list(flags: u32) -> Vec<&'static str> {
+    CLIENT_DEGRADED_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| flags & (1 << i) != 0)
+        .map(|(_, n)| *n)
+        .collect()
 }
 
 pub fn video_path_name(code: u8) -> &'static str {
@@ -478,6 +567,21 @@ impl SessionTelemetry {
                     "unsynced"
                 },
             ));
+            if c.version >= 2 {
+                s.push_str(&format!(
+                    " transport={} render={} key={} sink={}",
+                    transport_tier_name(c.transport_tier),
+                    render_tier_name(c.render_tier),
+                    key_tier_name(c.key_tier),
+                    sink_tier_name(c.sink_tier),
+                ));
+                // A non-zero degradation field is the most useful line a support conversation
+                // can start from, so it is named rather than printed as a hex mask.
+                let degraded = client_degraded_list(c.degraded_flags);
+                if !degraded.is_empty() {
+                    s.push_str(&format!(" degraded={}", degraded.join(",")));
+                }
+            }
         }
         s
     }
@@ -547,6 +651,17 @@ impl SessionTelemetry {
                 "keyframe_requests": c.keyframe_requests,
                 "audio_underruns": c.audio_underruns,
                 "audio_overruns": c.audio_overruns,
+                "transport_tier": transport_tier_name(c.transport_tier),
+                "render_tier": render_tier_name(c.render_tier),
+                "key_tier": key_tier_name(c.key_tier),
+                "sink_tier": sink_tier_name(c.sink_tier),
+                "tier_codes": [c.transport_tier, c.render_tier, c.key_tier, c.sink_tier],
+                "suppressed_errors": c.suppressed_errors,
+                "degraded_flags": c.degraded_flags,
+                "degraded": client_degraded_list(c.degraded_flags),
+                "audio_target_ms": c.audio_target_us as f64 / 1000.0,
+                "audio_concealed": c.audio_concealed,
+                "audio_output_latency_ms": c.audio_output_latency_us as f64 / 1000.0,
             })
         });
         serde_json::json!({

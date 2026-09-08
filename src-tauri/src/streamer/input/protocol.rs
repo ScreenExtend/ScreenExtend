@@ -581,7 +581,10 @@ fn parse_resize(b: &[u8]) -> Option<InputEvent> {
 /// Wire size of a v1 client stats frame. Anything shorter is rejected; anything longer is a
 /// later version whose extra fields this build ignores.
 pub const CLIENT_STATS_LEN: usize = 72;
-pub const CLIENT_STATS_VERSION: u8 = 1;
+/// Wire size of a v2 frame: the v1 prefix plus the tier bytes, the degradation field and the
+/// three audio numbers. Bytes 0..72 are byte-identical to v1.
+pub const CLIENT_STATS_V2_LEN: usize = 96;
+pub const CLIENT_STATS_VERSION: u8 = 2;
 
 fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if b.len() < CLIENT_STATS_LEN {
@@ -591,6 +594,13 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if version == 0 {
         return None;
     }
+    // The declared length is a floor: a v1 client sends 72 bytes and a client newer than this
+    // build may send more than 96. Take the tail only if all of it arrived.
+    let tail: &[u8] = if b.len() >= CLIENT_STATS_V2_LEN {
+        &b[CLIENT_STATS_LEN..CLIENT_STATS_V2_LEN]
+    } else {
+        &[]
+    };
     Some(InputEvent::ClientStats(Box::new(
         crate::streamer::telemetry::ClientStats {
             received_host_ns: crate::streamer::audio::host_now_ns(),
@@ -617,8 +627,24 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
                 & crate::streamer::telemetry::client_flags::CLOCK_VALID
                 != 0,
             rtt_us: rd_u32(b, 68)?,
+            // The tail is read only when the whole of it is present. A v1 client leaves these
+            // at 0, which is also what "not measured" means for every one of them.
+            transport_tier: tail.first().copied().unwrap_or(0),
+            render_tier: tail.get(1).copied().unwrap_or(0),
+            key_tier: tail.get(2).copied().unwrap_or(0),
+            sink_tier: tail.get(3).copied().unwrap_or(0),
+            suppressed_errors: tail_u32(tail, 4),
+            degraded_flags: tail_u32(tail, 8),
+            audio_target_us: tail_u32(tail, 12),
+            audio_concealed: tail_u32(tail, 16),
+            audio_output_latency_us: tail_u32(tail, 20),
         },
     )))
+}
+
+#[inline]
+fn tail_u32(tail: &[u8], at: usize) -> u32 {
+    rd_u32(tail, at).unwrap_or(0)
 }
 
 pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 17] {
@@ -826,6 +852,69 @@ mod tests {
         let mut v0 = vec![0u8; CLIENT_STATS_LEN];
         v0[0] = op::STATS;
         assert!(parse(&v0).is_none());
+    }
+
+    #[test]
+    fn a_v2_stats_frame_carries_the_tier_bytes_and_the_degradation_field() {
+        use crate::streamer::telemetry::client_degraded_list;
+        let mut b = vec![0u8; CLIENT_STATS_V2_LEN];
+        b[0] = op::STATS;
+        b[1] = CLIENT_STATS_VERSION;
+        b[72] = 2; // encoded-streams transport
+        b[73] = 1; // offscreen canvas
+        b[74] = 0; // cannot ask for a keyframe: the Chrome 94-140 case
+        b[75] = 4; // selectAudioOutput
+        b[76..80].copy_from_slice(&9u32.to_le_bytes());
+        b[80..84].copy_from_slice(&((1u32 << 11) | (1u32 << 19)).to_le_bytes());
+        b[84..88].copy_from_slice(&40_000u32.to_le_bytes());
+        b[92..96].copy_from_slice(&12_000u32.to_le_bytes());
+
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(
+                    (c.transport_tier, c.render_tier, c.key_tier, c.sink_tier),
+                    (2, 1, 0, 4)
+                );
+                assert_eq!(c.suppressed_errors, 9);
+                assert_eq!(c.audio_target_us, 40_000);
+                assert_eq!(c.audio_output_latency_us, 12_000);
+                assert_eq!(
+                    client_degraded_list(c.degraded_flags),
+                    ["no_keyframe_request", "stepped_down_to_encoded_streams"]
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_v1_stats_frame_still_parses_and_leaves_the_tail_zero() {
+        let mut b = vec![0u8; CLIENT_STATS_LEN];
+        b[0] = op::STATS;
+        b[1] = 1;
+        b[2] = 3;
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.version, 1);
+                assert_eq!(c.video_path, 3);
+                assert_eq!(c.transport_tier, 0);
+                assert_eq!(c.degraded_flags, 0);
+                assert_eq!(c.audio_output_latency_us, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_v2_tail_is_treated_as_absent_rather_than_half_read() {
+        let mut b = vec![0u8; CLIENT_STATS_V2_LEN - 1];
+        b[0] = op::STATS;
+        b[1] = CLIENT_STATS_VERSION;
+        b[72] = 2;
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => assert_eq!(c.transport_tier, 0),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
