@@ -15,7 +15,6 @@ use super::protocol::InputEvent;
 pub const NAME: &str = "linux-stub";
 
 pub fn boost_thread() {}
-pub fn tune_process() {}
 
 pub struct Injector {
     warned: bool,
