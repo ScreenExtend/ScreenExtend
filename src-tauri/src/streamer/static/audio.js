@@ -40,6 +40,7 @@
         stats: null,
         // A/V sync running state
         videoDelayMs: null,     // from the video worker (EMA of display lag)
+        hostOffsetMs: null,     // host<->local clock offset, from SEClock via PING/PONG
         preEnqueueEmaMs: null,  // audio capture→enqueue latency, smoothed
         lastTargetMs: null,     // last depth commanded to the worklet
         lastTargetAt: 0,
@@ -450,6 +451,14 @@
         state.node.port.postMessage({ type: 'target', targetMs: target });
     }
 
+    // Both the audio and the video worker must apply the same clock offset, or their
+    // difference — which is what the sync target is built from — moves for no reason.
+    function setHostClockOffset(offsetMs) {
+        if (typeof offsetMs !== 'number' || !isFinite(offsetMs)) return;
+        state.hostOffsetMs = offsetMs;
+        if (state.worker) state.worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs });
+    }
+
     function setVideoDelay(ms) {
         if (typeof ms !== 'number' || !isFinite(ms)) return;
         state.videoDelayMs = ms;
@@ -528,6 +537,7 @@
         w.onerror = (e) => console.warn('[audio] decoder worker error:', e);
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
+        if (state.hostOffsetMs !== null) w.postMessage({ type: 'clockoffset', offsetMs: state.hostOffsetMs });
         return true;
     }
 
@@ -597,6 +607,7 @@
             path: state.path,
             transport: state.sab ? 'shared' : 'postMessage',
             videoDelayMs: state.videoDelayMs,
+            hostOffsetMs: state.hostOffsetMs,
             preEnqueueMs: state.preEnqueueEmaMs,
             targetMs: state.lastTargetMs,
             residualOffsetMs: state.residualOffsetMs,
@@ -616,6 +627,7 @@
         setMuted,
         isMuted: () => state.muted,
         setVideoDelay,
+        setHostClockOffset,
         getSyncInfo,
         activePath,
         teardown,

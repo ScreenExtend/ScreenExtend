@@ -20,6 +20,10 @@ let shared = false;
 let decoder = null;
 let lastSeq = null;
 let preEnqueueEmaMs = null;
+// Host-to-local clock offset from the page (see input.js). 0 until the first PONG carrying a
+// host stamp lands, which reproduces the old epoch-biased number; the video worker carries
+// the identical bias, so the A/V sync difference is unaffected either way.
+let hostOffsetMs = 0;
 let lastSyncPostAt = 0;
 let scratchL = null;
 let scratchR = null;
@@ -88,7 +92,7 @@ function onDecoded(ad) {
     ad.close();
 
     const enqueueAbsMs = performance.timeOrigin + performance.now();
-    const pre = enqueueAbsMs - captureHostMs;
+    const pre = enqueueAbsMs - (captureHostMs - hostOffsetMs);
     preEnqueueEmaMs = (preEnqueueEmaMs === null) ? pre : preEnqueueEmaMs * 0.9 + pre * 0.1;
     if (enqueueAbsMs - lastSyncPostAt > SYNC_POST_INTERVAL_MS) {
         lastSyncPostAt = enqueueAbsMs;
@@ -154,5 +158,10 @@ self.onmessage = (ev) => {
         preEnqueueEmaMs = null;
         if (d.sab) setupShared(d.sab, d.capFrames);
         makeDecoder();
+    } else if (d.type === 'clockoffset') {
+        if (typeof d.offsetMs === 'number' && isFinite(d.offsetMs)) {
+            if (hostOffsetMs === 0) preEnqueueEmaMs = null;
+            hostOffsetMs = d.offsetMs;
+        }
     }
 };

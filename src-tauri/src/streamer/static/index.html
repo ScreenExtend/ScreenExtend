@@ -174,6 +174,10 @@
 
             let pc = null;
             let worker = null;
+            // The host clock offset is measured on the input channel and has to reach both
+            // workers; neither can measure it itself, and a worker's `performance` origin is
+            // its own creation, so only the absolute form crosses the boundary meaningfully.
+            let hostClockOffsetMs = null;
             let watchdog = null;
             let statsPoll = null;
             let liveWatch = null;
@@ -785,6 +789,14 @@
                 return null;
             }
 
+            if (window.SEClock) {
+                SEClock.subscribe(function (offsetMs) {
+                    hostClockOffsetMs = offsetMs;
+                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) {}
+                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) {}
+                });
+            }
+
             let __workerBlobUrl = null;
             async function makeTransformWorker() {
                 try {
@@ -858,6 +870,7 @@
                         };
                         const off = freshCanvas().transferControlToOffscreen();
                         worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        if (hostClockOffsetMs !== null) worker.postMessage({ type: 'clockoffset', offsetMs: hostClockOffsetMs });
                         if (useScriptTransform) {
                             videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
                         } else {

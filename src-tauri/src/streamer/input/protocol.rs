@@ -448,10 +448,17 @@ fn parse_resize(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
-pub fn build_pong(t_ns: u64) -> [u8; 9] {
-    let mut out = [0u8; 9];
+/// `[PONG][echoed client stamp u64][host_now_ns u64]`.
+///
+/// The echoed half gives the client its RTT; the host half is what lets it place a host
+/// timestamp on its own timeline at all. The host clock's epoch is this process's start, so
+/// without a measured offset the client has nothing to compare an RTP-recovered capture time
+/// against. Clients older than this field read only the first 9 bytes and ignore the rest.
+pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 17] {
+    let mut out = [0u8; 17];
     out[0] = op::PONG;
     out[1..9].copy_from_slice(&t_ns.to_le_bytes());
+    out[9..17].copy_from_slice(&host_ns.to_le_bytes());
     out
 }
 
@@ -603,11 +610,15 @@ mod tests {
             InputEvent::Ping { t_ns } => assert_eq!(t_ns, 123456789),
             _ => panic!(),
         }
-        let pong = build_pong(123456789);
+        let pong = build_pong(123456789, 987654321);
         assert_eq!(pong[0], op::PONG);
         assert_eq!(
             u64::from_le_bytes(pong[1..9].try_into().unwrap()),
             123456789
+        );
+        assert_eq!(
+            u64::from_le_bytes(pong[9..17].try_into().unwrap()),
+            987654321
         );
     }
 
