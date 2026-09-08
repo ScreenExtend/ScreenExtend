@@ -1,4 +1,4 @@
-import { useState, useContext } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 
 import Layout from "@/layout/layout";
@@ -20,18 +20,17 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { Command } from "@tauri-apps/plugin-shell";
 import { type } from "@tauri-apps/plugin-os";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useConnectedDevices } from "@/components/global-provider";
 import { type Device } from "@/components/config-provider";
 import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
 function RefreshStream({ device }: { device: Device }) {
   const [busy, setBusy] = useState(false);
-  const { toast } = useToast();
   const { t } = useTranslation();
   const name = device.name || device.ip;
 
@@ -86,8 +85,7 @@ function RefreshStream({ device }: { device: Device }) {
 
 export default function Devices() {
   const [devicesTooltipOpen, setDevicesTooltipOpen] = useState(false);
-  const { windowDevices: [devices] } = useContext(GlobalProviderContext);
-  const { toast } = useToast();
+  const devices = useConnectedDevices();
   const { t } = useTranslation();
 
   return (

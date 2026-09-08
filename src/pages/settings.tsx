@@ -1,4 +1,4 @@
-import React, { useState, useContext, useEffect, useRef, useCallback, lazy, Suspense } from "react";
+import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from "react";
 import QRCode from "react-qr-code";
 import { useBlocker } from "react-router-dom";
 
@@ -43,13 +43,13 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { updateConfig, getConfig, flushConfig, getKnownDevices, setKnownDeviceBanned, removeKnownDevice, DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, type Config, type KnownDevice } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useAvatar, useConnectedDevices, useGlobalSetters, useSession, useZoom } from "@/components/global-provider";
 import { LogTerminal } from "@/components/log-terminal";
 const ConfigJsonEditor = lazy(() =>
   import("@/components/config-json-editor").then(m => ({ default: m.ConfigJsonEditor }))
 );
 import { useTheme, type Theme } from "@/components/theme-provider";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, type ServerPorts } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
@@ -62,6 +62,7 @@ const MIN_HOSTED_NETWORK_PASSWORD_LENGTH = getOsType() === "macos" ? 10 : 8;
 const IS_WINDOWS = getOsType() === "windows";
 const IS_MACOS = getOsType() === "macos";
 const SUPPORTS_WIFI_QR = IS_WINDOWS || IS_MACOS;
+const CREDENTIALS_PERSIST_DEBOUNCE_MS = 400;
 
 function isLikelyIp(value: string): boolean {
   if (!value) return false;
@@ -84,8 +85,11 @@ function formatLastSeen(ts: number): string {
 }
 
 export default function Settings() {
-  const { windowOtp: [otp, setOtp], windowHostedNetworkOn: [hostedNetworkOn, setHostedNetworkOn], windowSessionId: [sessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [publicSessionsEnabled, setPublicSessionsEnabled], windowAvatar: [avatar, setAvatar], windowZoom: [zoom, setZoom], windowDevices: [connectedDevices] } = useContext(GlobalProviderContext);
-  const { toast } = useToast();
+  const { otp, sessionId, publicSessionsEnabled, hostedNetworkOn } = useSession();
+  const avatar = useAvatar();
+  const zoom = useZoom();
+  const connectedDevices = useConnectedDevices();
+  const { setOtp, setHostedNetworkOn, setQrValues, setPublicSessionsEnabled, setAvatar, setZoom } = useGlobalSetters();
   const { t } = useTranslation();
   const { setTheme } = useTheme();
 
@@ -130,6 +134,7 @@ export default function Settings() {
   const configProceeding = useRef(false);
   const configLoadOk = useRef(false);
   const credentialsSaveToastShown = useRef(false);
+  const persistedCredentials = useRef<string | null>(null);
   const knownDevicesLoaded = useRef(false);
 
   const blocker = useBlocker(
@@ -532,22 +537,33 @@ export default function Settings() {
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [spin]);
+  }, [spin, setOtp]);
 
+  // Both fields back controlled inputs, so this used to fire an IPC write and a global
+  // config notification per keystroke. Nothing reads the credentials back from the store
+  // while the page is open -- the Save button works off React state -- so the write can
+  // wait until typing settles. The inputs and the button's disabled state are unaffected.
   useEffect(() => {
     if (!configLoaded || !configLoadOk.current) return;
-    updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}})
-      .then(() => { credentialsSaveToastShown.current = false; })
-      .catch(e => {
-        console.error("failed to persist hosted network credentials", e);
-        if (credentialsSaveToastShown.current) return;
-        credentialsSaveToastShown.current = true;
-        toast({
-          variant: "destructive",
-          title: t("toasts.settings.saveFailedTitle"),
-          description: t("toasts.settings.saveFailedDescription"),
+    const pair = JSON.stringify([hostedNetworkName, hostedNetworkPassword]);
+    if (persistedCredentials.current === pair) return;
+    const timer = window.setTimeout(() => {
+      persistedCredentials.current = pair;
+      updateConfig({hostedNetworkCredentials: {name: hostedNetworkName, password: hostedNetworkPassword}})
+        .then(() => { credentialsSaveToastShown.current = false; })
+        .catch(e => {
+          persistedCredentials.current = null;
+          console.error("failed to persist hosted network credentials", e);
+          if (credentialsSaveToastShown.current) return;
+          credentialsSaveToastShown.current = true;
+          toast({
+            variant: "destructive",
+            title: t("toasts.settings.saveFailedTitle"),
+            description: t("toasts.settings.saveFailedDescription"),
+          });
         });
-      });
+    }, CREDENTIALS_PERSIST_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostedNetworkName, hostedNetworkPassword, configLoaded]);
 

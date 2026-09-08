@@ -76,6 +76,10 @@ async startHostedNetwork(name: string, password: string) : Promise<boolean> {
 async stopHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("stop_hosted_network");
 },
+/**
+ * Whether the hosted network is up. Reads the platform object we already hold — it must not
+ * spawn a process, because the UI and the adapter list ask often.
+ */
 async isHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("is_hosted_network");
 },
@@ -153,6 +157,18 @@ async getDisableGpuEncode() : Promise<boolean> {
 },
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
+},
+/**
+ * The webview's `console.error` has nowhere to go in a release build -- there are no
+ * devtools attached and nothing captures it -- so failures in the desktop UI simply
+ * vanished. This puts them on the same bus as everything else, which means they reach
+ * the Settings log terminal, `get_log_backlog` and `ScreenExtend logs`.
+ * 
+ * Defined below the macros because a `macro_rules!` is only in scope after its definition
+ * within its own file.
+ */
+async logFrontendError(message: string) : Promise<void> {
+    await TAURI_INVOKE("log_frontend_error", { message });
 }
 }
 
@@ -196,7 +212,7 @@ sessionIdChange: "session-id-change"
 export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device

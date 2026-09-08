@@ -105,9 +105,16 @@ const ConfigDB = Store.load("config.json");
 ConfigDB.catch((e: unknown) => { console.error("failed to open config store", e); });
 
 let snapshot: Config | undefined;
+let snapshotJson = "";
 const listeners = new Set<() => void>();
 
+// A read is not a change. Publishing an identical config still hands
+// useSyncExternalStore a new object, which re-renders every subscriber, so gate
+// the fan-out on the serialized value.
 const publish = (config: Config | undefined) => {
+  const next = config === undefined ? "" : JSON.stringify(config);
+  if (next === snapshotJson && (config === undefined) === (snapshot === undefined)) return;
+  snapshotJson = next;
   snapshot = config;
   listeners.forEach(listener => listener());
 };
@@ -119,30 +126,48 @@ export const subscribeToConfig = (listener: () => void): (() => void) => {
 
 export const getConfigSnapshot = (): Config | undefined => snapshot;
 
-export const getConfig = async (): Promise<Config | undefined> => {
+let reading: Promise<Config | undefined> | null = null;
+
+const readStore = async (): Promise<Config | undefined> => {
   const db = await ConfigDB;
-  if ((await db.length()) === 0) return undefined;
+  // One `plugin:store|entries` invoke. Reading key by key was one IPC round-trip
+  // per key of `defaultConfig`, awaited in a loop.
+  const entries = await db.entries<unknown>();
+  if (entries.length === 0) {
+    publish(undefined);
+    return undefined;
+  }
   const config = { ...defaultConfig };
-  for (const key of Object.keys(defaultConfig) as (keyof Config)[]) {
-    const value = await db.get(key);
-    if (value !== undefined) (config as Record<string, unknown>)[key] = value;
+  for (const [key, value] of entries) {
+    if (value !== undefined && key in defaultConfig) {
+      (config as Record<string, unknown>)[key] = value;
+    }
   }
   publish(config);
   return config;
 };
 
+// Forces a store read even when a snapshot is already held. Only needed after a
+// write fails, where the in-memory copy may no longer match the file.
+export const reloadConfig = async (): Promise<Config | undefined> => {
+  if (!reading) reading = readStore().finally(() => { reading = null; });
+  return reading;
+};
+
+export const getConfig = async (): Promise<Config | undefined> =>
+  snapshot !== undefined ? snapshot : reloadConfig();
+
 export const updateConfig = async (information: Partial<Config>) => {
   try {
     const db = await ConfigDB;
-    for (const key of Object.keys(information) as (keyof Config)[]) {
-      await db.set(key, information[key]);
-    }
+    const keys = Object.keys(information) as (keyof Config)[];
+    await Promise.all(keys.map(key => db.set(key, information[key])));
   } catch (e) {
-    await getConfig().catch(() => undefined);
+    await reloadConfig().catch(() => undefined);
     throw e;
   }
   if (snapshot) publish({ ...snapshot, ...information });
-  else await getConfig();
+  else await reloadConfig();
 };
 
 let loading: Promise<Config | undefined> | null = null;
