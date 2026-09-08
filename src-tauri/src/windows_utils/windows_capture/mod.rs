@@ -1,5 +1,10 @@
 //! # Windows Capture Rust Library
 //!
+//! Vendored fork. The examples below are the upstream crate's own README prose and say
+//! `use windows_capture::…`, a path that does not resolve now that this is a module of
+//! `screenextend_lib`. They are fenced as `text` so `cargo test` compiles none of them; do not
+//! re-fence them as Rust without rewriting the paths.
+//!
 //! **Windows Capture** is a highly efficient Rust and Python library that
 //! enables you to effortlessly capture the screen using the Graphics Capture
 //! API. This library allows you to easily capture the screen of your
@@ -34,7 +39,7 @@
 //!
 //! ## Usage
 //!
-//! ```no_run
+//! ```text
 //! use std::io::{self, Write};
 //! use std::time::Instant;
 //!

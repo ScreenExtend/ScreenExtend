@@ -98,7 +98,7 @@ pub enum ImageEncoderPixelFormat {
 /// color format is compatible.
 ///
 /// # Example
-/// ```no_run
+/// ```text
 /// use windows_capture::encoder::{ImageEncoder, ImageEncoderPixelFormat, ImageFormat};
 ///
 /// let width = 320u32;
@@ -669,7 +669,7 @@ impl ContainerSettingsSubType {
 /// - Call [`VideoEncoder::finish`] to finalize the container.
 ///
 /// # Example
-/// ```no_run
+/// ```text
 /// use windows_capture::encoder::{
 ///     AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
 /// };
@@ -1031,7 +1031,7 @@ impl VideoEncoder {
     /// keep the encoded video in memory (e.g., for network streaming or further processing).
     ///
     /// # Example
-    /// ```no_run
+    /// ```text
     /// use windows::Storage::Streams::InMemoryRandomAccessStream;
     /// use windows::core::Interface;
     /// use windows_capture::encoder::{

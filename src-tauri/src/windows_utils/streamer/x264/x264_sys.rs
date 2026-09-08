@@ -411,7 +411,15 @@ fn open_library() -> Result<Library> {
     };
 
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+        // `dir` is the app directory for a shipped build. For a test binary it is
+        // `target/<profile>/deps/`, one level below where cargo stages `resources/`, hence
+        // the grandparent probe — without it the software-encode tests found no libx264 and
+        // "passed" having encoded nothing.
+        let dirs = exe
+            .parent()
+            .into_iter()
+            .chain(exe.parent().and_then(|d| d.parent()));
+        for dir in dirs {
             for name in LIB_NAMES {
                 if let Some(lib) = attempt(dir.join("resources").join(name), &mut last_err) {
                     return Ok(lib);
@@ -420,6 +428,16 @@ fn open_library() -> Result<Library> {
                     return Ok(lib);
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    for name in LIB_NAMES {
+        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(name);
+        if let Some(lib) = attempt(staged, &mut last_err) {
+            return Ok(lib);
         }
     }
 

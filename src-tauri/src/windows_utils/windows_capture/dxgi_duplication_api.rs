@@ -5,7 +5,7 @@
 //! to select the target output and exposes CPU-readable frames via [`super::frame::FrameBuffer`].
 //!
 //! # Example
-//! ```no_run
+//! ```text
 //! use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
 //! use windows_capture::encoder::ImageFormat;
 //! use windows_capture::monitor::Monitor;
