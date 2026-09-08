@@ -14,7 +14,10 @@ readme = "../README.md"
 
 [lib]
 name = "screenextend_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# `rlib` alone: `staticlib` and `cdylib` are the mobile-target defaults from the Tauri
+# template, and producing them linked the whole crate three times on every build for
+# artifacts nothing consumes. Restore them if a mobile target is ever added.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "ScreenExtend"
@@ -27,6 +30,10 @@ default = []
 probe = []
 
 [lints.rust]
+# Measured 2026-09: flipping this to `warn` lights 62 sites across 28 files, most of them in
+# modules under active work (streamer/{congestion,pacer,telemetry,audio}) and in the vendored
+# driver_ipc fork. With `clippy -D warnings` as the gate that is a crate-wide build break for
+# code this change does not own, so it stays `allow` until the tree settles.
 dead_code = "allow"
 
 [build-dependencies]
@@ -46,7 +53,6 @@ base64 = "0.22"
 tauri-plugin-cli = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-http = "2"
 tauri-plugin-os = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-store = "2"
@@ -86,7 +92,6 @@ libloading = "0.9"
 log = "0.4.22"
 rand = "0.9.1"
 thiserror = "2.0.3"
-wmi = "0.17.2"
 whoami = "2.1.2"
 qr2term = "0.3"
 ctrlc = "3.5.2"
@@ -95,7 +100,6 @@ tauri-plugin-notification = "2.3.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS capture/encode backend
 arc-swap = "1"
-crossbeam-channel = "0.5"
 
 # Apple framework bindings
 objc2 = "0.6"
@@ -142,6 +146,9 @@ plist = "1"
 httparse = "1"
 
 [target.'cfg(windows)'.dependencies]
+# Only `windows_utils::{compatibility, networking}` use this, and it drags in chrono and
+# futures; it was resolved for every target while it sat in the shared block.
+wmi = "0.17.2"
 winreg = "0.52.0"
 windows-future = "0.3.2"
 windows-core = "0.62"
