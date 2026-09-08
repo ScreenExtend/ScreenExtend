@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::streamer::bitrate::{estimate_from_loss, BitrateController};
+use crate::streamer::bitrate::{estimate_from_loss, BitrateController, RttCongestionMonitor};
 
 const MIN: u32 = 1_000_000;
 const MAX: u32 = 40_000_000;
@@ -111,7 +111,7 @@ fn cut_emits_when_symmetric_threshold_would_stall() {
     let now = t0();
     let start = c.update(10_000_000, now).expect("first sample emits");
     assert_eq!(start, 10_000_000);
-    let cut = c.update(8_500_000, now + Duration::from_millis(50));
+    let cut = c.update(8_500_000, now + Duration::from_millis(300));
     assert!(
         cut.is_some(),
         "cut must emit under the asymmetric threshold"
@@ -166,5 +166,87 @@ fn end_to_end_degrade_then_recover() {
     assert!(
         target > low,
         "target recovered after loss cleared: {low} -> {target}"
+    );
+}
+
+/// Replays `spawn_bitrate_driver`'s arithmetic without a peer connection: one RTT sample and
+/// one loss sample per 120 ms poll, returning the final target.
+fn drive(rtt_ms_series: &[f64], fraction_lost: f64, polls: usize) -> u32 {
+    let mut controller = BitrateController::new(MIN, MAX);
+    let mut monitor = RttCongestionMonitor::new();
+    let mut target = MAX;
+    let start = t0();
+    for i in 0..polls {
+        let rtt = rtt_ms_series[i % rtt_ms_series.len()];
+        let mut estimate = estimate_from_loss(target, target, fraction_lost);
+        if monitor.observe(rtt) {
+            let clamped = (target as f64 * 0.85) as u32;
+            if clamped < estimate {
+                estimate = clamped;
+            }
+        }
+        let now = start + Duration::from_millis(i as u64 * 120);
+        if let Some(v) = controller.update(estimate, now) {
+            target = v;
+        }
+    }
+    target
+}
+
+#[test]
+fn lan_rtt_never_cuts_the_target() {
+    // 5 ms is a normal Wi-Fi LAN RTT. Before the unit fix this was multiplied by 1000,
+    // crossed the 80 ms clamp on every poll, and walked the target to the 1 Mbps floor
+    // within a couple of seconds.
+    let target = drive(&[5.0], 0.0, 200);
+    assert_eq!(
+        target, MAX,
+        "a 5 ms RTT must never clamp the bitrate; got {target}"
+    );
+}
+
+#[test]
+fn steady_wan_rtt_never_cuts_the_target() {
+    // 150 ms steady is an ordinary cross-continent RTT and carries no congestion signal:
+    // the old absolute 80 ms threshold pinned every such session at the floor.
+    let target = drive(&[150.0, 152.0, 148.0, 151.0], 0.0, 200);
+    assert_eq!(target, MAX, "steady high RTT is not congestion");
+}
+
+#[test]
+fn queueing_above_baseline_still_clamps() {
+    let mut m = RttCongestionMonitor::new();
+    for _ in 0..20 {
+        assert!(!m.observe(20.0), "baseline samples are not congestion");
+    }
+    assert!(!m.observe(120.0), "one excursion is not yet sustained");
+    assert!(m.observe(130.0), "a sustained excursion must clamp");
+}
+
+#[test]
+fn rtt_monitor_ignores_absent_samples() {
+    let mut m = RttCongestionMonitor::new();
+    assert!(
+        !m.observe(0.0),
+        "no RTCP report yet must not read as congestion"
+    );
+    assert!(!m.observe(f64::NAN));
+    assert_eq!(m.baseline_ms(), None);
+}
+
+#[test]
+fn cuts_are_rate_limited() {
+    let mut c = BitrateController::new(MIN, MAX);
+    let now = t0();
+    assert_eq!(c.update(10_000_000, now), Some(10_000_000));
+    assert_eq!(
+        c.update(5_000_000, now + Duration::from_millis(120)),
+        None,
+        "a cut one poll after the last change must be held off"
+    );
+    assert!(
+        c.update(5_000_000, now + Duration::from_millis(300))
+            .is_some(),
+        "the cut lands once the interval has elapsed"
     );
 }

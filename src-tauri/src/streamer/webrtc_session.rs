@@ -31,7 +31,10 @@ use webrtc::track::track_local::TrackLocal;
 pub use webrtc::ice_transport::ice_server::RTCIceServer;
 
 use super::audio::{self, protocol, SharedAudioHub};
-use super::bitrate::{estimate_from_loss, BitrateController, DEFAULT_MIN_BITRATE_BPS};
+use super::bitrate::{
+    estimate_from_loss, BitrateController, RttCongestionMonitor, DEFAULT_MIN_BITRATE_BPS,
+    RTT_DELAY_THRESHOLD_MS,
+};
 use super::config::H264Profile;
 use super::input;
 use super::pipeline::Pipeline;
@@ -862,12 +865,11 @@ async fn forward_track(
 fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pipeline: Pipeline) {
     use webrtc::stats::StatsReportType;
 
-    const RTT_CONGESTION_THRESHOLD_MS: f64 = 80.0;
-
     let max_bps = pipeline.max_bitrate_bps;
     let mut controller = BitrateController::new(DEFAULT_MIN_BITRATE_BPS.min(max_bps), max_bps);
     let mut current_target = max_bps;
     let mut last_bytes_sent: Option<(u64, Instant)> = None;
+    let mut rtt_monitor = RttCongestionMonitor::new();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(BWE_POLL_INTERVAL);
@@ -894,8 +896,13 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
                     }
                     StatsReportType::RemoteInboundRTP(s) => {
                         fraction_lost = fraction_lost.max(s.fraction_lost);
-                        if let Some(rtt_s) = s.round_trip_time {
-                            max_rtt_ms = max_rtt_ms.max(rtt_s * 1000.0);
+                        // webrtc-rs does NOT use the W3C unit here. `round_trip_time` is
+                        // already milliseconds: interceptor-0.17.1/src/stats/interceptor.rs
+                        // `calculate_rtt_ms` returns `rtt_seconds * 1000.0 + …` and it is
+                        // copied verbatim into this field. Scaling it again pinned every
+                        // session at the bitrate floor.
+                        if let Some(rtt_ms) = s.round_trip_time {
+                            max_rtt_ms = max_rtt_ms.max(rtt_ms);
                         }
                     }
                     _ => {}
@@ -926,12 +933,13 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
 
             let mut estimate = estimate_from_loss(current_target, measured_send_bps, fraction_lost);
 
-            if max_rtt_ms > RTT_CONGESTION_THRESHOLD_MS {
+            if rtt_monitor.observe(max_rtt_ms) {
                 let rtt_estimate = (current_target as f64 * 0.85) as u32;
                 if rtt_estimate < estimate {
+                    let baseline = rtt_monitor.baseline_ms().unwrap_or(0.0);
                     tprintln!(
-                        "BWE: RTT congestion signal (rtt_ms={max_rtt_ms:.1} > {RTT_CONGESTION_THRESHOLD_MS}ms); \
-                         clamping estimate {estimate} -> {rtt_estimate}"
+                        "BWE: RTT congestion signal (rtt_ms={max_rtt_ms:.1} is >{RTT_DELAY_THRESHOLD_MS}ms \
+                         above baseline {baseline:.1}ms); clamping estimate {estimate} -> {rtt_estimate}"
                     );
                     estimate = rtt_estimate;
                 }

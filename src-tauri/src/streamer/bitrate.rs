@@ -10,6 +10,7 @@ pub struct BitrateController {
     change_threshold: f64,
     cut_threshold: f64,
     min_interval: Duration,
+    cut_min_interval: Duration,
     ewma: Option<f64>,
     last_emitted: Option<u32>,
     last_change_at: Option<Instant>,
@@ -19,6 +20,7 @@ impl BitrateController {
     pub fn new(min_bps: u32, max_bps: u32) -> Self {
         Self::with_params(min_bps, max_bps, 0.4, 0.10, Duration::from_millis(500))
             .with_cut_threshold(0.04)
+            .with_cut_min_interval(Duration::from_millis(250))
     }
 
     pub fn with_params(
@@ -37,6 +39,7 @@ impl BitrateController {
             change_threshold,
             cut_threshold: change_threshold,
             min_interval,
+            cut_min_interval: Duration::ZERO,
             ewma: None,
             last_emitted: None,
             last_change_at: None,
@@ -49,6 +52,14 @@ impl BitrateController {
             "cut_threshold must be in (0, 1]"
         );
         self.cut_threshold = cut_threshold;
+        self
+    }
+
+    /// Floor on how often a downward move may be emitted. Without one a sustained signal
+    /// ratchets the target down once per BWE poll (120 ms) and walks to the floor in a
+    /// couple of seconds.
+    pub fn with_cut_min_interval(mut self, interval: Duration) -> Self {
+        self.cut_min_interval = interval;
         self
     }
 
@@ -84,11 +95,14 @@ impl BitrateController {
             return None;
         }
 
-        if !is_cut {
-            if let Some(t) = self.last_change_at {
-                if now.duration_since(t) < self.min_interval {
-                    return None;
-                }
+        let interval = if is_cut {
+            self.cut_min_interval
+        } else {
+            self.min_interval
+        };
+        if let Some(t) = self.last_change_at {
+            if now.duration_since(t) < interval {
+                return None;
             }
         }
 
@@ -99,6 +113,58 @@ impl BitrateController {
     fn emit(&mut self, target: u32, now: Instant) {
         self.last_emitted = Some(target);
         self.last_change_at = Some(now);
+    }
+}
+
+/// How far above the observed baseline RTT counts as queuing delay.
+pub const RTT_DELAY_THRESHOLD_MS: f64 = 40.0;
+
+/// Consecutive polls that must exceed the delay threshold before a clamp fires. At the
+/// 120 ms BWE poll rate this is ~240 ms of sustained queueing, which one late RTCP report
+/// cannot fake.
+const RTT_CONGESTION_POLLS: u32 = 2;
+
+/// Delay-based congestion detector.
+///
+/// Absolute RTT is not a congestion signal: 80 ms is an ordinary uncongested RTT for a
+/// cross-continent link, and clamping on it pins every WAN session at the floor forever.
+/// What indicates a full queue is RTT *above the path's own baseline*, so this tracks a
+/// rolling minimum and reports only sustained excursions above it.
+#[derive(Debug, Clone, Default)]
+pub struct RttCongestionMonitor {
+    baseline_ms: Option<f64>,
+    over: u32,
+}
+
+impl RttCongestionMonitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn baseline_ms(&self) -> Option<f64> {
+        self.baseline_ms
+    }
+
+    /// Feed one RTT sample in **milliseconds**. Returns true while the path looks congested.
+    pub fn observe(&mut self, rtt_ms: f64) -> bool {
+        if !rtt_ms.is_finite() || rtt_ms <= 0.0 {
+            return false;
+        }
+        let baseline = match self.baseline_ms {
+            Some(b) if rtt_ms < b => rtt_ms,
+            // Creep upward slowly so a genuinely re-routed path re-baselines instead of
+            // staying pinned to a minimum it will never see again.
+            Some(b) => b + (rtt_ms - b) * 0.002,
+            None => rtt_ms,
+        };
+        self.baseline_ms = Some(baseline);
+
+        if rtt_ms - baseline > RTT_DELAY_THRESHOLD_MS {
+            self.over = self.over.saturating_add(1);
+        } else {
+            self.over = 0;
+        }
+        self.over >= RTT_CONGESTION_POLLS
     }
 }
 
