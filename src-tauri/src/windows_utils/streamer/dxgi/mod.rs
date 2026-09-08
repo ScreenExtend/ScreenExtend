@@ -594,7 +594,8 @@ impl Duplicator {
                 self.redup_without_frame += 1;
                 if self.redup_without_frame > REDUP_WITHOUT_FRAME_MAX {
                     bail!(
-                        "duplication was re-established {} times without ever delivering a frame;                          this output cannot be captured with DXGI Desktop Duplication",
+                        "duplication was re-established {} times without ever delivering a \
+                         frame; this output cannot be captured with DXGI Desktop Duplication",
                         self.redup_without_frame
                     );
                 }

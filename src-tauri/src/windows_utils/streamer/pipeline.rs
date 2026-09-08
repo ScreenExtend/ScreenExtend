@@ -82,7 +82,8 @@ fn warn_constant_qp_once(warned: &mut bool) {
     if !*warned {
         *warned = true;
         teprintln!(
-            "bitrate adaptation is inert: the encoder is in explicit constant-QP mode (--qp),              so congestion control cannot shrink the stream"
+            "bitrate adaptation is inert: the encoder is in explicit constant-QP mode (--qp), \
+             so congestion control cannot shrink the stream"
         );
     }
 }
@@ -907,7 +908,9 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         let wants_downscale = config.width != native_w || config.height != native_h;
         if wants_downscale && !video_processor_available(dup.device(), dup.context()) {
             teprintln!(
-                "dxgi: the adapter composing {device_name} exposes no D3D11 video processor, so                  the requested {}x{} downscale cannot be done on the GPU; encoding at the native                  {native_w}x{native_h} and leaving the scale to the client",
+                "dxgi: the adapter composing {device_name} exposes no D3D11 video processor, \
+                 so the requested {}x{} downscale cannot be done on the GPU; encoding at the \
+                 native {native_w}x{native_h} and leaving the scale to the client",
                 config.width,
                 config.height
             );
