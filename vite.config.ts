@@ -1,7 +1,7 @@
 import { build, defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path, { resolve } from "path";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -9,7 +9,17 @@ function monacoDeps(): string[] {
   const found = new Set<string>(["@monaco-editor/react"]);
   const pattern = /["'](monaco-editor\/esm\/[^"']+)["']/g;
   for (const file of ["src/lib/monaco-setup.ts", "src/components/json-editor.tsx"]) {
-    const text = readFileSync(resolve(__dirname, file), "utf8");
+    const full = resolve(__dirname, file);
+    // Without this, renaming either file kills every vite command -- dev, build, tauri
+    // dev, tauri build -- with a bare ENOENT thrown from inside the config, before any
+    // project code is reached. The path is in the message but the reason is not.
+    if (!existsSync(full)) {
+      throw new Error(
+        `vite.config: monacoDeps() lists ${file}, which does not exist. ` +
+          "Update the list if the file was renamed or moved."
+      );
+    }
+    const text = readFileSync(full, "utf8");
     let hit: RegExpExecArray | null;
     while ((hit = pattern.exec(text))) found.add(hit[1]);
   }
@@ -22,6 +32,10 @@ const WORKER_ENTRIES: Record<string, string> = {
   "monaco-json.worker": "src/lib/monaco-json.worker.ts",
 };
 
+// Vite's dev server serves `?worker` as a module worker and safari 13.1 cannot construct
+// one, so the two monaco language services are bundled here as classic IIFE scripts and
+// served from `/@classic-worker/`. Production does not go through this at all -- there the
+// same guarantee comes from `worker.format: "iife"` below.
 function classicWorkers(): Plugin {
   const bundled = new Map<string, string>();
   return {
@@ -77,6 +91,13 @@ function classicWorkers(): Plugin {
         })();
       });
     },
+    // The bundle is memoised for the life of the dev server, so without this an edit to a
+    // worker entry keeps serving the stale build until the server is restarted.
+    handleHotUpdate({ file }) {
+      for (const [name, entry] of Object.entries(WORKER_ENTRIES)) {
+        if (file === path.resolve(__dirname, entry)) bundled.delete(name);
+      }
+    },
   };
 }
 
@@ -101,6 +122,9 @@ export default defineConfig(async () => ({
   // production correctness rested entirely on vite's default happening to be "iife".
   worker: { format: "iife" },
 
+  // esbuild's "safari13" means 13.0, while browserslist in package.json says 13.1. The
+  // difference is `?.` and `??`, which landed in 13.1: esbuild therefore lowers slightly
+  // more than strictly necessary, which errs in the safe direction and should stay.
   esbuild: { target: "safari13" },
   optimizeDeps: {
     include: monacoDeps(),

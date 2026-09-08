@@ -15,6 +15,17 @@ export default [
       "*.config.ts",
     ],
   },
+  // The compatibility gate itself was outside every lint the repo has, which is a poor
+  // place for a script whose whole job is to fail the build correctly. Node globals only;
+  // no TypeScript rules, because these are plain ES modules.
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: { console: "readonly", process: "readonly", URL: "readonly" },
+    },
+  },
   {
     files: ["src/**/*.{ts,tsx}"],
     languageOptions: {
