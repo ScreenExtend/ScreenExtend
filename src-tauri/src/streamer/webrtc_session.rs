@@ -527,6 +527,10 @@ pub async fn handle_whep_offer(
         playout_delay_max * 10
     );
 
+    // Whether this client can carry a transport-wide sequence number at all. Read from the
+    // offer, because an extension the peer did not offer cannot be negotiated into the answer.
+    let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01");
+
     let keyframe_gate = Arc::new(KeyframeGate::new());
     let keyframes = KeyframeRequester {
         pipeline: pipeline.clone(),
@@ -749,17 +753,24 @@ pub async fn handle_whep_offer(
                 pipeline.frame_duration,
             );
             let mut warned_unbound = false;
-            let mut extensions = vec![
-                webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
-                    webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(
-                        0,
-                        playout_delay_max,
-                    ),
+            // Two extensions when the client offered transport-wide-cc, one when it did not.
+            // Stamping an extension the peer never negotiated costs a marshal and a `BytesMut`
+            // per packet and reaches nobody, and the send history it feeds would only ever be
+            // written and never read.
+            let mut extensions = Vec::with_capacity(2);
+            extensions.push(webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
+                webrtc::rtp::extension::playout_delay_extension::PlayoutDelayExtension::new(
+                    0,
+                    playout_delay_max,
                 ),
-                webrtc::rtp::extension::HeaderExtension::TransportCc(
+            ));
+            if twcc_offered {
+                extensions.push(webrtc::rtp::extension::HeaderExtension::TransportCc(
                     webrtc::rtp::extension::transport_cc_extension::TransportCcExtension::default(),
-                ),
-            ];
+                ));
+            } else {
+                *feedback.history.lock().unwrap() = None;
+            }
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
@@ -792,26 +803,33 @@ pub async fn handle_whep_offer(
                         let missed_before = pacer.deadline_misses();
                         for (i, payload) in payloads.into_iter().enumerate() {
                             let wire_len = payload.len() + 12;
-                            let wait = pacer.schedule(wire_len, Instant::now());
-                            if !wait.is_zero() {
-                                tokio::time::sleep(wait).await;
+                            // `PacingMode::Off` is the same code path the writer had before the
+                            // pacer existed: no clock read, no bucket, no sleep.
+                            if pacer.mode() != PacingMode::Off {
+                                let wait = pacer.schedule(wire_len, Instant::now());
+                                if !wait.is_zero() {
+                                    tokio::time::sleep(wait).await;
+                                }
                             }
-                            let now = Instant::now();
-                            // Stamp the transport-wide sequence number ourselves. The stock
-                            // `twcc::sender::Sender` interceptor would do the stamping but keeps
-                            // its counter private, and without the packet-to-sequence mapping the
-                            // feedback that comes back cannot be turned into a delay gradient.
-                            let transport_seq = {
-                                let mut guard = feedback.history.lock().unwrap();
-                                guard.as_mut().map(|h| h.record(wire_len as u32, now))
-                            };
-                            if let Some(seq) = transport_seq {
-                                extensions[1] =
-                                    webrtc::rtp::extension::HeaderExtension::TransportCc(
-                                        webrtc::rtp::extension::transport_cc_extension::TransportCcExtension {
-                                            transport_sequence: seq,
-                                        },
-                                    );
+                            if twcc_offered {
+                                // Stamp the transport-wide sequence number ourselves. The stock
+                                // `twcc::sender::Sender` interceptor would do the stamping but
+                                // keeps its counter private, and without the packet-to-sequence
+                                // mapping the feedback that comes back cannot be turned into a
+                                // delay gradient.
+                                let now = Instant::now();
+                                let transport_seq = {
+                                    let mut guard = feedback.history.lock().unwrap();
+                                    guard.as_mut().map(|h| h.record(wire_len as u32, now))
+                                };
+                                if let Some(seq) = transport_seq {
+                                    extensions[1] =
+                                        webrtc::rtp::extension::HeaderExtension::TransportCc(
+                                            webrtc::rtp::extension::transport_cc_extension::TransportCcExtension {
+                                                transport_sequence: seq,
+                                            },
+                                        );
+                                }
                             }
                             let pkt = webrtc::rtp::packet::Packet {
                                 header: webrtc::rtp::header::Header {
