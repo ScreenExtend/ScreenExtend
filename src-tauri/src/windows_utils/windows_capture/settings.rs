@@ -2,25 +2,17 @@ use std::time::Duration;
 
 use windows::Graphics::Capture::GraphicsCaptureItem;
 
-use super::graphics_capture_picker::HwndGuard;
+use super::d3d11::GpuPreference;
 use super::monitor::Monitor;
-use super::window::Window;
 
-/// An enumeration of item types that can be captured.
+/// What can be captured.
 ///
-/// Wraps the WinRT [`GraphicsCaptureItem`] together with additional details about the source:
-/// - [`Monitor`] for display monitors,
-/// - [`Window`] for top-level windows,
-/// - [`super::graphics_capture_picker::HwndGuard`] for unknown HWND-based sources.
+/// Upstream also had `Window` and `Unknown` (an HWND from the system picker) variants; ScreenExtend
+/// only ever captures the virtual display it created, so both were removed along with the modules
+/// behind them. See `FORK.md`.
 pub enum GraphicsCaptureItemType {
     /// A display monitor. Contains the [`GraphicsCaptureItem`] and its [`Monitor`] details.
     Monitor((GraphicsCaptureItem, Monitor)),
-    /// An application window. Contains the [`GraphicsCaptureItem`] and its [`Window`] details.
-    Window((GraphicsCaptureItem, Window)),
-    /// An unknown capture item type (typically created from an HWND). Contains the
-    /// [`GraphicsCaptureItem`] and the associated
-    /// [`super::graphics_capture_picker::HwndGuard`].
-    Unknown((GraphicsCaptureItem, HwndGuard)),
 }
 
 /// Specifies the pixel format for the captured frame.
@@ -113,6 +105,8 @@ pub struct Settings<Flags, T: TryInto<GraphicsCaptureItemType>> {
     pub(crate) dirty_region_settings: DirtyRegionSettings,
     /// The pixel format for the captured frames.
     pub(crate) color_format: ColorFormat,
+    /// Which adapter the capture device should be created on.
+    pub(crate) gpu_preference: GpuPreference,
     /// User-defined flags that can be passed to the capture implementation.
     pub(crate) flags: Flags,
 }
@@ -140,8 +134,21 @@ impl<Flags, T: TryInto<GraphicsCaptureItemType>> Settings<Flags, T> {
             minimum_update_interval_settings,
             dirty_region_settings,
             color_format,
+            gpu_preference: GpuPreference::Default,
             flags,
         }
+    }
+
+    /// Chooses the adapter the capture device is created on.
+    ///
+    /// The default is whatever DXGI resolves for the process, which on a hybrid laptop is decided
+    /// by a registry value and by how the process was launched. Naming the encoder's adapter here
+    /// is what keeps the shared encoder-input texture a same-adapter resource.
+    #[inline]
+    #[must_use]
+    pub const fn with_gpu_preference(mut self, gpu_preference: GpuPreference) -> Self {
+        self.gpu_preference = gpu_preference;
+        self
     }
 
     /// Returns a reference to the capture item.

@@ -26,6 +26,9 @@ pub enum Error {
     /// The current [`ColorFormat`] cannot be saved as an image.
     #[error("This color format is not supported for saving as an image")]
     UnsupportedFormat,
+    /// A caller-supplied staging texture does not match the frame it was asked to receive.
+    #[error("Invalid staging texture: {0}")]
+    InvalidStagingTexture(&'static str),
     /// Direct3D staging/mapping failed.
     #[error("DirectX error: {0}")]
     DirectXError(#[from] super::d3d11::Error),
@@ -204,6 +207,43 @@ impl<'a> Frame<'a> {
             mapped_texture,
             self.width(),
             self.height(),
+            self.color_format,
+        ))
+    }
+
+    /// Reads the frame back through a staging texture the caller owns and keeps.
+    ///
+    /// [`Frame::buffer`] creates and destroys a full-resolution staging texture on every call —
+    /// a kernel-mode allocation per frame, on the capture thread, for every CPU-bridge encode.
+    /// The sibling DXGI wrapper has had this form since the fork was taken; `Frame` had not.
+    /// The texture must match the frame's geometry and format, which is the caller's cue to
+    /// recreate it when the captured content size changes.
+    #[inline]
+    pub fn buffer_with<'s>(
+        &'s mut self,
+        staging: &'s mut StagingTexture,
+    ) -> Result<FrameBuffer<'s>, Error> {
+        let desc = staging.desc();
+        if desc.Width != self.desc.Width || desc.Height != self.desc.Height {
+            return Err(Error::InvalidStagingTexture(
+                "geometry must match the frame",
+            ));
+        }
+        if desc.Format != self.desc.Format {
+            return Err(Error::InvalidStagingTexture("format must match the frame"));
+        }
+
+        unsafe {
+            self.context
+                .CopyResource(staging.texture(), &self.frame_texture);
+        }
+
+        let mapped_texture = MappedStagingTexture::map_borrowed(self.context, staging)?;
+
+        Ok(FrameBuffer::from_mapped(
+            mapped_texture,
+            self.desc.Width,
+            self.desc.Height,
             self.color_format,
         ))
     }
