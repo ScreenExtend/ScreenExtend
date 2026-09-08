@@ -4,6 +4,7 @@ pub mod dxgi;
 pub mod pipeline;
 pub mod scaler;
 pub mod tuning;
+pub mod workload_window;
 
 pub mod amd;
 pub mod amd_sys;
@@ -104,12 +105,26 @@ pub fn report_adapter_pairing(
         );
     }
     match encoder_device.and_then(device_adapter_info) {
-        Some(enc) => tprintln!(
-            "adapters: capture={} encode={} same_adapter={}",
-            capture.label(),
-            enc.label(),
-            enc.luid == capture.luid
-        ),
+        Some(enc) => {
+            tprintln!(
+                "adapters: capture={} encode={} same_adapter={}",
+                capture.label(),
+                enc.label(),
+                enc.luid == capture.luid
+            );
+            if enc.luid != capture.luid {
+                // Desktop Duplication and WGC are both adapter-local, so the capture adapter is
+                // whichever one the OS chose to compose that display on — and for an indirect
+                // display that choice is not ours. Before IddCx 1.4 the OS composes on the POST
+                // adapter (the iGPU, on a hybrid laptop) and `IddCxAdapterSetRenderAdapter`, the
+                // only way for a driver to ask for a different one, is IddCx 1.4; the bundled
+                // driver declares IddCx 1.2. The cost is a full-frame PCIe copy per frame that a
+                // dGPU-attached physical monitor would not pay. See `docs/OPTIMIZATIONS.md`.
+                tprintln!(
+                    "adapters: every frame crosses adapters. If this is a ScreenExtend virtual                      display, the bundled indirect display driver declares IddCx 1.2 and has no                      way to ask the OS to compose on the encoder's GPU"
+                );
+            }
+        }
         None => tprintln!(
             "adapters: capture={} encode=cpu (software encoder)",
             capture.label()
