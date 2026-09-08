@@ -672,6 +672,17 @@
             // the two compound. The option form rejects where unsupported, and the whole
             // call returns undefined instead of a Promise below Chrome 92 / Safari 18.4.
             let pointerLockUnadjusted = false;
+            // input.js puts this on the wire as the MOUSE_DELTA flags byte, so the host
+            // knows whether the deltas have already been through an OS pointer curve.
+            // Every assignment goes through here rather than the variable.
+            function setPointerLockUnadjusted(on) {
+                pointerLockUnadjusted = !!on;
+                try {
+                    if (window.RemoteInput && RemoteInput.setPointerLockUnadjusted) {
+                        RemoteInput.setPointerLockUnadjusted(pointerLockUnadjusted);
+                    }
+                } catch (_) { noteSuppressed(); }
+            }
             function acquirePointerLock(el) {
                 try {
                     if (!el.requestPointerLock) {
@@ -700,7 +711,7 @@
                         // all*. Without the plain retry, relative movement was dead for the
                         // whole session and every mouse move went down the absolute path.
                         noteSuppressed();
-                        pointerLockUnadjusted = false;
+                        setPointerLockUnadjusted(false);
                         degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                         lockPlain();
                         return;
@@ -711,10 +722,10 @@
                         // resolves normally, and reporting raw deltas we are not getting is
                         // worse than reporting none.
                         p.then(function () {
-                            pointerLockUnadjusted = true;
+                            setPointerLockUnadjusted(true);
                             undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                         }, function () {
-                            pointerLockUnadjusted = false;
+                            setPointerLockUnadjusted(false);
                             degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
                             lockPlain();
                         });
@@ -725,7 +736,7 @@
                     // but the bit is the only channel there is, and over-reporting raw deltas
                     // is the more misleading of the two.
                     degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
-                    pointerLockUnadjusted = false;
+                    setPointerLockUnadjusted(false);
                 } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
             }
 
@@ -1258,8 +1269,14 @@
                     if (audioFastRetired || !audioFast) return;
                     audioFastRetired = true;
                     audioFast = false;
-                    // No DataChannel on the track path, so no redundancy to advertise either.
-                    audioCaps = { webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false };
+                    // No DataChannel on the track path, so no redundancy to advertise either,
+                    // and no spare track to ask for: the next answer's audio track is the one
+                    // that gets fed. `verified` survives — the decoder really was probed, and
+                    // what it says about this device is what the host should log.
+                    audioCaps = {
+                        webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false,
+                        verified: !!audioCaps.verified, wantsFallbackTrack: false,
+                    };
                     degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
                     if (!isLive || kicked) return;
                     console.warn('[audio] fast path lost; renegotiating for a standard track');
@@ -1538,7 +1555,10 @@
 
                     pc.ontrack = (e) => {
                         if (e.track.kind === 'audio') {
-                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
+                            // Remembered, not attached: on the fast path this track is the
+                            // spare `wantsFallbackTrack` asked for, and playing it now would
+                            // report the slow path while the worklet is still running.
+                            try { if (window.SEAudio) SEAudio.noteFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
                             return;
                         }
                         if (e.track.kind !== 'video') return;
@@ -2209,6 +2229,10 @@
                     if (!results[1]) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
                     audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
                     if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    // verifyCapabilities() derived this from a worklet that was still expected
+                    // to load. It did not, so the host is about to send a fed track and a
+                    // second spare one would be the same audio twice.
+                    audioCaps.wantsFallbackTrack = audioFast;
                 }
                 joinData.refreshRate = results[2];
 

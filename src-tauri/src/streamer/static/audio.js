@@ -116,6 +116,18 @@
                 note();
             }
         }
+        // Says the answer above came from probing a decoder rather than from reading three
+        // constructor names off `window`. The host logs it per join, which is what makes a
+        // Safari with no AudioDecoder distinguishable from a device that merely failed to
+        // build a worklet.
+        caps.verified = true;
+        // WHEP has no renegotiation verb, so a track absent from the first answer can never
+        // be added later — this is the only moment a spare one can exist. Ask for it exactly
+        // when it would be a safety net: on the fast path, where the decoder can still fail
+        // after saying it would work and where the host otherwise puts no audio in the SDP
+        // at all. Off the fast path the host already sends a track it feeds, and asking for a
+        // second one would be asking for the same audio twice.
+        caps.wantsFallbackTrack = !!(caps.webcodecsOpus && caps.worklet);
         verified = caps;
         return caps;
     }
@@ -917,6 +929,18 @@
             (state.sab ? 'shared-memory ring' : 'postMessage ring'));
     }
 
+    // What `ontrack` calls. A host that honours `wantsFallbackTrack` puts a recvonly Opus
+    // track in the answer as a spare; attaching it while the WebCodecs path is live would
+    // report `netEQ` in the stats frame and play a second, silent element beside the worklet.
+    // So remember it and attach only when there is nothing else. This is what makes the spare
+    // track a safety net rather than a regression.
+    function noteFallbackStream(stream) {
+        state.fallbackStream = stream;
+        const claimingFastPath = !!(verified && verified.webcodecsOpus && verified.worklet);
+        if (claimingFastPath && !state.decoderFailed) return;
+        attachFallbackStream(stream);
+    }
+
     function attachFallbackStream(stream) {
         state.fallbackStream = stream;
         if (!state.audioEl) {
@@ -1003,6 +1027,7 @@
         resume,
         attachDataChannel,
         attachFallbackStream,
+        noteFallbackStream,
         setMuted,
         isMuted: () => state.muted,
         setVideoDelay,
