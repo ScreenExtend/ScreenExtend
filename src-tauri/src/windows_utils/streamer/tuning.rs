@@ -1,5 +1,9 @@
 #[cfg(windows)]
 use windows::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    THREAD_PRIORITY, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+};
 
 pub fn apply_process_tuning() {
     #[cfg(windows)]
@@ -81,7 +85,27 @@ pub fn tune_current_thread() -> ThreadTuning {
     #[cfg(windows)]
     {
         let mmcss = register_mmcss();
-        raise_current_thread_priority();
+        raise_current_thread_priority(THREAD_PRIORITY_TIME_CRITICAL);
+        exempt_thread_from_power_throttling();
+        confine_to_performance_cores();
+        ThreadTuning { mmcss }
+    }
+}
+
+/// Tuning for a thread that runs on a timer rather than on the frame.
+///
+/// The process is already `HIGH_PRIORITY_CLASS` and every capture and encode thread is
+/// `THREAD_PRIORITY_TIME_CRITICAL`, so N clients meant ~2N time-critical threads competing with
+/// the tokio transport workers, which sit at `ABOVE_NORMAL` and are what actually push RTP. The
+/// idle repeater is not one of the threads that needs to win those contests: it emits a keepalive
+/// every 200 ms and being a millisecond late costs nothing. It keeps MMCSS and the P-core
+/// confinement — it should still not be parked on an efficiency core — and drops to `HIGHEST`.
+pub fn tune_timer_thread() -> ThreadTuning {
+    #[cfg(windows)]
+    {
+        let mmcss = register_mmcss();
+        raise_current_thread_priority(THREAD_PRIORITY_HIGHEST);
+        exempt_thread_from_power_throttling();
         confine_to_performance_cores();
         ThreadTuning { mmcss }
     }
@@ -193,6 +217,49 @@ fn performance_core_masks(
             None
         })
         .as_ref()
+}
+
+/// Opts one thread out of EcoQoS, on top of the process-wide exemption.
+///
+/// The process-level `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` opt-out covers the default, but
+/// Windows 11 also throttles threads belonging to a window that is minimised or fully occluded —
+/// which is the normal state of the ScreenExtend window while it is streaming to a second device.
+/// A per-thread opt-out is the documented override for exactly that, and it is a few microseconds
+/// once per thread. `SetThreadInformation` with `ThreadPowerThrottling` is Windows 10 1809+; an
+/// older build simply refuses, which is why the failure is logged once rather than propagated.
+#[cfg(windows)]
+fn exempt_thread_from_power_throttling() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::Win32::Foundation::HANDLE as WinHandle;
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, ThreadPowerThrottling,
+        THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE,
+    };
+
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let rc = unsafe {
+        SetThreadInformation(
+            WinHandle(GetCurrentThread().0),
+            ThreadPowerThrottling,
+            &state as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if rc.is_err() && !WARNED.swap(true, Ordering::Relaxed) {
+        teprintln!(
+            "[cpu] per-thread power-throttling exemption unavailable (pre-1809?): {:?}; \
+             the process-wide exemption still applies",
+            rc.err()
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -409,14 +476,14 @@ fn register_mmcss() -> isize {
 }
 
 #[cfg(windows)]
-fn raise_current_thread_priority() {
+fn raise_current_thread_priority(level: THREAD_PRIORITY) {
     use windows::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost, THREAD_PRIORITY_TIME_CRITICAL,
+        GetCurrentThread, SetThreadPriority, SetThreadPriorityBoost,
     };
     unsafe {
         let t = GetCurrentThread();
-        if let Err(e) = SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL) {
-            teprintln!("SetThreadPriority failed: {e}");
+        if let Err(e) = SetThreadPriority(t, level) {
+            teprintln!("SetThreadPriority({}) failed: {e}", level.0);
         }
         let _ = SetThreadPriorityBoost(t, true);
     }
