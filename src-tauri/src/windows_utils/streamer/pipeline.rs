@@ -1241,6 +1241,11 @@ impl AsyncNvencRing {
         telemetry: SharedTelemetry,
     ) -> Self {
         let k = pairs.len();
+        // The keepalive path re-encodes the held slot without going through `stage()`, which is
+        // where `idr_request` is otherwise consumed. Hand the encoder the same atomic so a PLI
+        // on a static desktop produces an IDR rather than another P frame.
+        let mut encoder = encoder;
+        encoder.attach_idr_flag(Arc::clone(&idr_request));
         let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
         let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
