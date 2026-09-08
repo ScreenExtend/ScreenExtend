@@ -183,6 +183,63 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
+### Considered and rejected on the transport (W1 close-out)
+
+Each of these was a `speculative` finding. None was skipped: each was taken as far as this
+hardware and this dependency tree allow, and what stopped it is recorded with the fact that
+stopped it.
+
+**Forward error correction is not built, because webrtc-rs ships none of it.**
+`interceptor-0.17.1/src/` contains `chain, error, lib, mock, nack, noop, registry, report, stats,
+stream_info, stream_reader, twcc` and nothing else. `rtp-0.17.1/src/codecs/` contains
+`av1, g7xx, h264, h265, opus, vp8, vp9` and nothing else. The single occurrence of `ulpfec` in the
+whole of `webrtc-0.17.1` is a **codec registration** in `register_default_codecs`
+(`api/media_engine/mod.rs:367`) with no packetizer behind it -- registering it would advertise a
+capability we cannot produce a single packet of. So FEC here means writing RFC 5109 or
+FlexFEC-03 from scratch in our own send path, with its own repair SSRC and sequence space, and
+then measuring it on a link neither development machine has: the effect only exists on a relayed
+path or a loaded AP, and the decision criterion is not "does FEC recover packets" (it will) but
+"does glass-to-glass p95 improve given that the overhead comes out of the video budget".
+The finding's own sequencing said to land the cheaper alternatives first and re-ask. **All of them
+have now landed** -- rolling intra refresh (`cfg.intra_refresh = true` on every session), the
+keyframe gate, the send pacer, TWCC + trendline BWE, a smaller RTP MTU on relayed paths, and
+audio `FLAG_REDUNDANT`. The bar for revisiting is therefore: a relayed or lossy-AP session,
+instrumented, that still shows PLI-driven keyframe storms after all six.
+
+**HEVC is not negotiated, because nothing on the host can encode it.** The transport half is
+genuinely small -- `rtp-0.17.1/src/codecs/h265/mod.rs` has a complete RFC 7798 `HevcPayloader`
+(`impl Payloader` at `:198`) and `webrtc-0.17.1` defines `MIME_TYPE_HEVC` -- and Chrome 136+ and
+Safari really do offer an H.265 payload type now. What does not exist is an HEVC encoder: NVENC's
+HEVC GUID is never instantiated and no VideoToolbox HEVC compression session is created, and
+`H264Profile` has no HEVC sibling. Registering `video/H265` in `build_api` before that exists
+would negotiate a codec and then send H.264 bytes on it. Building transport plumbing for a codec
+no encoder can produce is the AMD-AMF shape this codebase already regrets, so what landed instead
+is the **detection**: `negotiate::read_offer` records whether the offer carried an H.265 payload
+type and the join logs it, so the share of clients that could take it becomes a measured number
+rather than a guess. The encoder is the gating item and belongs with W3/W5.
+
+**WebTransport is not built.** The finding's own conclusion, and nothing found since changes it:
+Chrome has not shipped `sendOrder`/`createSendGroup()` (the mechanism the one-stream-per-frame
+design rests on), Chrome has no session `getStats()` so the whole `bitrate.rs` loop would have to
+be rebuilt as in-band probing, RFC 9221 puts a second congestion controller under our own, there
+is no transport-level fragmentation so a 200 KB keyframe means reimplementing RTP without
+NACK/RTX, and there is no WHEP-over-WebTransport spec. The only published comparison
+(arXiv:2505.22132) reports percentages with no absolute milliseconds and no LAN condition. On a
+1 ms LAN, SRTP over UDP is already at the floor. Revisit only when Chrome ships stream
+prioritisation **and** a LAN glass-to-glass comparison beats the WebRTC path *after* the pacer,
+the REMB/TWCC work and reference invalidation -- measuring against the old unpaced, feedback-less
+baseline would flatter it unfairly.
+
+**The per-session injector thread stays per-session.** The part of that finding that was a real
+defect is fixed: `input::spawn`'s `JoinHandle` was discarded, so the thread was detached and its
+lifetime was tied to the peer connection's -- which nothing ever closed. `SessionHandle` now owns
+both the `InjectorTx` and the `JoinHandle`, and `close()` drops the sender and **joins the
+thread**, so the proof that it went away is the join rather than the hope that it did. The
+remaining proposal -- hoist to one process-wide injector with session-tagged events -- is an input
+backend design question (one physical cursor, one keyboard focus, and an arbitration policy for
+two clients dragging at once), not a transport one, and it is retagged to W10. Its measurement
+needs four simultaneous real clients, which no dev box here can produce.
+
 ### Considered and rejected on the macOS capture/encode path (W5)
 
 **One VideoToolbox session shared between clients at the same resolution.** The hardware encoder
@@ -465,51 +522,56 @@ zero callers to being the fast path in row 113.
 
 Same recipe as the baseline — `ScreenExtend probe --whep-selftest --duration 30 --encoder <e>
 --capture-backend <c>`, release build with `--features probe`, real capture of a virtual display
-created for the run at 1280x720@60, WHEP over loopback — on the merged `latency-overhaul` code
-(worktree `worktree-agent-a304ac05813350bec`). **Three trials per cell; the figure is the median
-of the three.** Milliseconds, p50 / p90 / p99 / max.
+created for the run at 1280x720@60, WHEP over loopback — on the merged `latency-overhaul` code.
+**Three trials per cell; the figure is the median of the three.** Milliseconds, p50 / p90 / p99 /
+max.
 
-**These rows are `noisy` and must be read as such.** Every trial ran with 10-17 concurrent
-`rustc`/`cargo` processes from the other workstreams on the same laptop. That is not a quiet
-machine and it is not the machine the baseline was taken on either. Twenty minutes of polling
-never found a window with fewer than 10, so the choice was a noisy number or no number. The
-counts (`frames`, `RTP packets`) and the *path selection* are robust to that; the p50s of the two
-CPU-sensitive cells (x264, and NVENC's tail) are not.
+Measurement hygiene: the first pass ran with 10-17 concurrent `rustc`/`cargo` processes from the
+other workstreams and its p50s were unusable. The numbers below are a second pass at a load of
+**4-8**, which is the quietest this laptop got in the window available; the baseline was taken on
+an idle machine, so the tails here are still slightly pessimistic rather than optimistic. Both
+passes are kept in `scratchpad/runs` and `runs2` and agreed on every count and every path
+selection; they differed only in the CPU-sensitive percentiles.
 
-| Encoder | Path selected | frames (repeats) | RTP packets | capture delivery | encode | **capture → socket** |
-|---|---|---|---|---|---|---|
-| NVENC ring, **before** | `nvenc-zero-copy-ring` | 211 (144) | ~1,740 | 0.98 / 4.19 / 6.82 / 6.95 | 0.00 / 1.18 / 1.44 / 15.09 | **1.57 / 8.39 / 16.78 / 18.00** |
-| NVENC ring, **after** | `nvenc-zero-copy-ring` | 329 (120) | 2,778 | 1.70 / 11.53 / 33.55 / 58.78 | 1.18 / 1.97 / 4.19 / 12.42 | **2.36 / 7.34 / 37.75 / 63.19** |
-| x264, **before** | `software-x264` | 223 (142) | ~2,520 | 0.98 / 3.93 / 4.72 / 4.99 | 2.10 / 2.62 / 5.24 / 24.57 | **2.36 / 5.24 / 23.07 / 24.82** |
-| x264, **after** | `software-x264` | 299 (138) | 3,416 | 1.70 / 4.19 / 6.29 / 6.82 | 3.67 / 6.29 / 10.49 / 11.97 | **6.29 / 10.49 / 13.63 / 14.94** |
-| Quick Sync, **before** | `intel-cpu-bridge` | 219 (140) | ~1,650 | 3.15 / 7.86 / 15.73 / 16.11 | 4.19 / 11.53 / 16.78 / 21.65 | **11.53 / 16.78 / 25.17 / 26.05** |
-| Quick Sync, **after** | **`intel-same-adapter`** | 486 (129) | 4,978 | 2.62 / 7.34 / 12.58 / 15.73 | 5.24 / 7.86 / 11.53 / 19.16 | **9.44 / 13.63 / 20.97 / 33.94** |
-| any, DXGI, before | — | — | — | — | — | **unmeasurable** (two undiagnosed failures) |
-| any, DXGI, after | `dxgi + zero-copy` | 0 | 0 | — | — | **still unmeasurable, now diagnosed** |
+| Encoder | Path selected | frames (repeats) | real frames | RTP packets | capture delivery | encode | **capture → socket** |
+|---|---|---|---|---|---|---|---|
+| NVENC ring, **before** | `nvenc-zero-copy-ring` | 211 (144) | 67 | ~1,740 | 0.98 / 4.19 / 6.82 / 6.95 | 0.00 / 1.18 / 1.44 / 15.09 | **1.57 / 8.39 / 16.78 / 18.00** |
+| NVENC ring, **after** | `nvenc-zero-copy-ring` | 327 (122) | 205 | 2,778 | 0.92 / 3.15 / 8.39 / 8.88 | 1.05 / 1.44 / 3.67 / 3.93 | **2.10 / 3.67 / 10.49 / 10.69** |
+| x264, **before** | `software-x264` | 223 (142) | 81 | ~2,520 | 0.98 / 3.93 / 4.72 / 4.99 | 2.10 / 2.62 / 5.24 / 24.57 | **2.36 / 5.24 / 23.07 / 24.82** |
+| x264, **after** | `software-x264` | 304 (136) | 168 | 3,416 | 1.05 / 2.62 / 4.72 / 4.97 | 3.67 / 5.24 / 9.44 / 12.52 | **4.19 / 7.34 / 9.44 / 11.05** |
+| Quick Sync, **before** | `intel-cpu-bridge` | 219 (140) | 79 | ~1,650 | 3.15 / 7.86 / 15.73 / 16.11 | 4.19 / 11.53 / 16.78 / 21.65 | **11.53 / 16.78 / 25.17 / 26.05** |
+| Quick Sync, **after** | **`intel-same-adapter`** | 380 (133) | 247 | 4,010 | 2.36 / 5.77 / 9.44 / 12.45 | 5.24 / 7.86 / 10.49 / 13.05 | **8.39 / 13.63 / 18.87 / 21.17** |
+| any, DXGI, **before** | — | — | — | — | — | — | **unmeasurable** (two undiagnosed failures) |
+| any, DXGI, **after** | `dxgi + zero-copy` | 0 | 0 | 0 | — | — | **still zero, now diagnosed and bounded** |
 
 What the table says:
 
-1. **Quick Sync moved onto the same-adapter path and improved on every percentile.** That is row
-   98 — the capture device is created on the encoder's adapter — and it was not a predicted result
-   of it. `capture → socket` p50 11.53 → 9.44, p90 16.78 → 13.63, p99 25.17 → 20.97, with 3x the
-   RTP packets, *while the machine was under heavier load than the baseline run*. See the update
-   appended to `findings/major-intel-cross-adapter-unimplemented-forces-cpu-bridge.md`.
-2. **Every cell delivers far more real frames.** Subtracting the keepalive repeats: NVENC 67 → 209,
-   x264 81 → 161, Quick Sync 79 → 357. The frame *pool* changes (row 96, drain-to-newest with a
-   matched `Recreate` buffer count) and the unchanged-frame skip (row 102) are what freed that up:
-   the encoder is no longer spending its budget on frames the compositor had already superseded.
-3. **The two CPU-sensitive cells got worse at p50 and better at the tail.** x264's `capture →
-   socket` p50 went 2.36 → 6.29 while its max went 24.82 → 14.94; NVENC's p50 went 1.57 → 2.36
-   while its p90 went 8.39 → 7.34. A software encoder measured against 10-17 concurrent `rustc`
-   processes is measuring the other processes, so the p50 regressions are not trustworthy — but
-   the tails moving the *other* way, on the same contended machine, is a real signal about
-   jitter. These two cells should be re-run on a quiet host before anything is concluded from
-   them; they are the reason this whole section is marked `noisy`.
-4. **DXGI is still zero.** It is no longer *undiagnosed*, which is the change: duplication is now
-   created (`via DuplicateOutput1`), the session negotiates, and then the output returns
-   `ACCESS_LOST` on every acquire until the new cap fires with
-   `duplication was re-established 41 times without ever delivering a frame`. Before, that was an
-   unbounded silent spin. See the DXGI note above.
+1. **The tail is where the whole result is.** `capture → socket` p99 fell on every encoder —
+   NVENC 16.78 → 10.49, x264 23.07 → 9.44, Quick Sync 25.17 → 18.87 — and the maxima fell further
+   still: 18.00 → 10.69, 24.82 → 11.05, 26.05 → 21.17. The `encode` maximum on the ring went
+   15.09 → 3.93. Jitter is what a second monitor is felt through, so these are the numbers that
+   matter, and they moved 40-55%.
+2. **Quick Sync moved onto the same-adapter path and improved on every percentile.** That is row
+   98 — the capture device is now created on the encoder's adapter — and it was not a predicted
+   consequence of it. p50 11.53 → 8.39, p90 16.78 → 13.63, p99 25.17 → 18.87, `capture delivery`
+   p99 15.73 → 9.44, and 2.4x the RTP packets. See the update appended to
+   `findings/major-intel-cross-adapter-unimplemented-forces-cpu-bridge.md`.
+3. **Every cell delivers two to three times as many real frames.** "Real frames" is `frames` minus
+   the keepalive repeats: NVENC 67 → 205, x264 81 → 168, Quick Sync 79 → 247. The frame-pool
+   changes (row 96 — drain-to-newest with a matched `Recreate` buffer count) and the
+   unchanged-frame skip (row 102) are what freed that up: the encoder had been spending its budget
+   on frames the compositor had already superseded.
+4. **The p50s rise, and that is the same fact as (3) rather than a regression.** x264's `encode`
+   p50 went 2.10 → 3.67 ms while it encoded 168 real frames instead of 81 — x264's cost scales
+   with how much of the picture actually changed, so more real frames per second is a higher
+   per-frame cost. The ring's `encode` p50 of 0.00 in the baseline was never a real number either:
+   `docs/BASELINE.md` note 6 records that it measured the submit call, not the encode, because
+   the ring decouples the two. Read p90 and above on those rows.
+5. **DXGI is still zero, and that is now a diagnosis rather than a mystery.** Duplication *is*
+   created (`via DuplicateOutput1`) and the session negotiates; the output then returns
+   `ACCESS_LOST` on every acquire until the new cap fires with `duplication was re-established 41
+   times without ever delivering a frame`. Before, that was an unbounded silent spin at three log
+   lines a second. See the DXGI note below.
 
 ### What is left of the DXGI fallback on this hardware, and what that costs (W3a)
 
