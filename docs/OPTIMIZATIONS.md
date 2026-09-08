@@ -57,6 +57,12 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 36 | client / session | Screen Wake Lock as a tier above `nosleep.js`; `nosleep.js` constructed lazily and muted; `enterFullscreen()` always returns a Promise; `inset: 0` replaced by long-hands (`static/index.html`, `static/styles.css`) | Only the unprefixed `requestFullscreen` returns a Promise. Safari below 16.4 returns `undefined`, so every `.catch()` on it threw a `TypeError` — and because `startLock()` is called un-awaited from `onStreamLive()`, that rejection silently skipped pointer lock, keyboard lock and the wake lock for the whole session. `const noSleep = new NoSleep()` sat at the top level of the one shared inline script, so a failed `/nosleep.js` fetch took the join form and the submit handler with it. | Safari < 16.4: no pointer lock, no keyboard lock, no wake lock, no diagnostic. Mobile WebKit < 14.1: six full-bleed layers collapsed, because `inset` is ignored whole. | each degradation is a bit in the stats frame; the wake lock is the real API where it exists; the layers have long-hands | **UNVERIFIED** | yes | `nosleep.js`'s video is muted, which also relaxes the autoplay rules that could refuse it. The `inset` change removes both `KNOWN_DEBT` entries from `scripts/check-legacy-webkit.mjs`; the client-page pass now reports zero. |
 | 37 | client / observability | Stats frame v2 (96 bytes, first 72 byte-identical to v1): four tier bytes, a 22-bit degradation field, the swallowed-error count and three audio numbers; 49 bare `catch (_) {}` across `index.html` and `audio.js` now count what they drop (`static/input.js`, `static/index.html`, `static/audio.js`, `static/transform-worker.js`) | The client audit found 63 `catch (_) {}` and 22 distinct silent degradations, none of them visible to the host. A device on the `<video>` fallback with an estimated output latency and no wake lock looked, from the host, exactly like one on every fast path. | 0 of 22 degradations reportable | 22 bits plus four tier bytes, once a second on the reliable channel; `SEVideo.getStats()` returns the same values for a person holding the phone | **UNVERIFIED** (the frame is asserted byte-for-byte by `node scripts/test-client-stats.mjs`, which is COMPILE-CHECKED) | yes | The host does not yet parse past byte 72 — `parse_client_stats` reads the v1 prefix and stops — so the tail currently reaches the host and is discarded: `findings/major-telemetry-client-stats-v2-tail-is-discarded.md`. Until that lands the fields are read on the device. Appending was still right: the wire format had to change once, and doing it before the host side means no second migration. |
 
+| 38 | macOS / hosted network | `startHostAPModeWithSSID:securityType:channel:password:error:` and `stopHostAPMode` guarded by `respondsToSelector:`; a probed tier (HostAP SPI -> IBSS -> Unsupported); a most-secure-first `securityType` ladder replacing WEP-or-open; the open fallback moved behind every secured attempt on every channel; start verified against `interfaceMode()` and a routable IPv4 on the interface; a liveness watcher; AWDL social channels 6/44/149 dropped from the channel preferences. | A bare `msg_send!` to a selector `CWInterface` may not implement raises an Obj-C exception through a non-unwinding Rust frame, which aborts the process — so on any Mac without the SPI, "start hosted network" made the app vanish. Separately, "started" meant the SPI returned YES, which says nothing about whether a client can associate or get a DHCP lease. | selector sent unguarded; WEP or a silent open AP; success = the SPI's return value; channel 44 preferred | all seven selectors probed on 10.15.8 and **all present**; secured ladder walked once per process and remembered; success = AP mode + a routable IPv4, logged separately when only the first holds | VERIFIED (probe, on 10.15.8); UNVERIFIED (association, DHCP, throughput) | yes | Association could not be tested: the dev box's only Wi-Fi interface (`en3`) carries the SSH session this work runs over, and starting an AP drops it. Script: `docs/manual-tests/macos-hosted-network.md`. The security-type sweep ships as `macos_utils::hosted_network::tests::sweep_security_types` (`--ignored`). |
+| 39 | macOS / virtual display | `create_display_with_modes` implemented (the trait default discarded the ladder); HiDPI derived from the ladder so the display is born at the client's DPR; the mode list carries the primary mode, its transpose and the ladder's other resolutions plus transposes; `reconfigure_display` skips `applySettings:` when the geometry is already registered at the same HiDPI, and no longer holds the registry mutex across WindowServer IPC; `set_display_scale` works from the remembered backing geometry rather than `CGDisplayPixelsWide` (points); `setTerminationHandler:` installed behind `respondsToSelector:`; `activate_mode` polls at 5 ms for 250 ms then 25 ms. | Every Retina join created the display at 1x with one mode and then paid a second `applySettings:` plus a full `activate_mode` — a mode-find loop of up to 1.5 s and a settle loop of up to 1.5 s — inside `DISPLAY_CORRELATION_LOCK`, where every other joining client waits. | 2 x `applySettings:` + 2 x `activate_mode` per Retina join, the second searching for a mode that did not exist yet (up to 3 s); orientation flips and in-ladder geometry changes were full mode-list rewrites | 1 x `applySettings:` + 1 x `activate_mode` that finds its mode on the first `CGDisplayCopyAllDisplayModes`; the post-join scale call is an early return; orientation flips are a plain `CGDisplaySetDisplayMode` | COMPILE-CHECKED | yes | **Not measured.** `time_a_retina_join` is checked in as an `--ignored` A/B of both sequences, but it must run in the console session: over SSH the process has no WindowServer connection and `initWithDescriptor:` / `applySettings:` **block indefinitely** rather than failing (measured — the test had to be killed twice). |
+| 40 | macOS / compatibility | `NSProcessInfo.operatingSystemVersion` (cached) replaces three `sw_vers` forks per report; `capture_backend()` is an `AnyClass::get` on `SCStream`/`SCShareableContent`; `hosted_network_backend()` exposes the HostAP tier; `UnsupportedApi` entries added for the AirPlay single-display cap and for a Mac that can host no network. | The report forked three processes on the main thread from a command the bootstrap screen calls twice, and gated the capture tier on a version string in a code path whose correct probe was one line away. The capture tier — the one with the largest latency and quality consequence — was never reported at all. | 3 x `posix_spawn` per `check_system_requirements`; no capture tier; the AirPlay one-display cap surfaced only when a second device failed to connect | 0 subprocesses; capture and hosted-network tiers probed by class lookup; both caps reported as `UnsupportedApi` entries | VERIFIED (0 forks, 10.15.8) | yes | Exposed as `pub fn` accessors rather than new `CompatibilityReport` fields: W9 is adding `capture_backend` / `encoder_backend` / `hosted_network_backend` to that struct on the Windows branch. Wiring recorded in `findings/minor-compat-mac-capture-and-hostap-tiers-not-in-the-report-struct.md`. |
+| 41 | macOS / network watcher | One `AF_INET` socket for the whole enumeration (was two per interface); functional type cached per interface name; `is_hosted_network` asked once per poll rather than once per Wi-Fi interface; the last readable SSID remembered; the watcher compares `(interface_index, ip_addresses)` instead of the whole struct; `cli_adapters` and `get_network_adapters` collapsed into one walk. | At 1 Hz forever, the watcher opened and closed a dozen sockets, ran a dozen ioctls and made two to four `airportd` XPC round trips per second at idle — and a nil SSID read (which needs Location authorization on 10.15+) counted as an adapter change and re-ran `sync_streamers`. | ~12 socket+ioctl pairs/s and 2-4 CoreWLAN XPC calls/s at idle; a name-only flip re-ran the reconciler | 1 socket + N ioctls per poll, 1 CoreWLAN call, and no resync for a name-only change | COMPILE-CHECKED | yes | The `SCDynamicStore` subscription that would remove the poll entirely is left as a finding; this change removes the per-interface cost, not the 1 Hz cadence. |
+| 42 | macOS / session | `set_server_ports` sends each client a `Bye` and shuts down gracefully instead of dropping connections, and finishes the restart on its own thread; `remove_all_displays` no longer spawns a thread it immediately joins; `TauriDeviceReporter` skips its per-join and per-leave resync on any backend that does not cap concurrent displays. | Three small main-thread and per-event costs on the join, leave and settings paths, none of which did anything the caller needed. | 300 ms main-thread sleep per port change plus an abrupt transport close; one OS thread per join and per leave doing nothing on the `CGVirtualDisplay` tier | port change returns immediately and the client is told why; no thread per join/leave outside the AirPlay tier | COMPILE-CHECKED | yes | The `AppHandle` parameter Tauri injects is invisible to specta, so `bindings.ts` is unchanged. |
+
 ## Notes
 
 ### The AirPlay tier now has a working end-to-end harness, and what it settled
@@ -230,3 +236,55 @@ So the compose-cadence work (`major-vdisplay-win-decouple-idd-refresh-from-strea
 directly implementable: `virtual_display::set_refresh_rate(device_name, 120)` after the existing
 `set_display_mode`, with `current_display_mode` as the read-back. A rate outside
 `[requested, 60, 120]` is *not* serviceable on a live display and needs the display recreating.
+
+### What the HostAP SPI actually does on the 10.15.8 box
+
+`cargo test --lib macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture`
+on the Intel MacBook, macOS 10.15.8, interface `en3`:
+
+```
+interfaceMode    : CWInterfaceMode(1)          (Station)
+powerOn          : true
+responds : startHostAPModeWithSSID:securityType:channel:password:error:   true
+responds : stopHostAPMode                                                 true
+responds : startHostAPMode:                                               true
+responds : enableHostAPMode                                               true
+responds : disableHostAPMode                                              true
+responds : startIBSSModeWithSSID:security:channel:password:error:         true
+responds : stopIBSSMode                                                   true
+backend          : HostAP
+5 GHz channels   : 36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 149 153 157 161 165
+2.4 GHz channels : 1 … 11
+would pick       : 36
+```
+
+So on the supported floor the private SPI is not merely present but accompanied by four more
+HostAP selectors nothing in the tree has ever called — `startHostAPMode:` (no SSID, no security
+type, which plausibly reads both from the Internet Sharing preferences and would get WPA2 for
+free) and the `enableHostAPMode` / `disableHostAPMode` pair. Both are worth trying on a modern Mac
+before concluding that WEP is the ceiling.
+
+**What could not be established here.** The box has exactly one Wi-Fi interface, `en3`, and it
+carries the SSH session this work runs over; starting an AP on it drops the connection. So no
+`startHostAPMode…` call was ever made: association, the security type the AP advertises, DHCP and
+throughput are all untested, and the security-type ladder in `secured_attempts` is still a set of
+guesses. The one thing the 2012 sweep this code inherited *does* tell us is where not to look
+again: it covered `[-127, 127]`, so every value at or above 128 is unexplored, which is why the
+ladder starts at 1024 and works down.
+
+### `refreshDeadline` was probed and deliberately not set
+
+`CGVirtualDisplaySettings` gained `refreshDeadline`, `rotation` and `isReference` somewhere
+between 10.14.6 and the present. `report_settings_surface()` now asks `respondsToSelector:` for
+all three and logs the answer once, so a field report says which levers existed on that machine.
+
+None is set. `refreshDeadline` is the only latency-named knob anywhere on the WindowServer side of
+this boundary and is the most interesting thing in the private surface, but its units and
+semantics are unpublished, the class family is known to have crashed WindowServer on Sequoia
+betas, and the property does not exist on the 10.15 floor — so there is no machine here on which
+setting it could be measured. Shipping a value chosen by guesswork into WindowServer is not a
+trade worth making; the probe and the finding are what carry it forward.
+
+`rotation` is more immediately useful and equally unverifiable here: where it exists it should
+replace the transposed-width/height modes this commit registers for orientation flips. Both are
+tracked in `findings/speculative-vdisplay-mac-refresh-deadline-never-set.md`.

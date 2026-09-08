@@ -1044,7 +1044,7 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn fill_synthetic_bgra(buf: &mut [u8], width: u32, height: u32, frame: u32) {
+pub(crate) fn fill_synthetic_bgra(buf: &mut [u8], width: u32, height: u32, frame: u32) {
     let w = width as usize;
     let h = height as usize;
     let f = frame as usize;

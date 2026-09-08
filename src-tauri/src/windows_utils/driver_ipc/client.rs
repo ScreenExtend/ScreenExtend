@@ -14,6 +14,14 @@ use crate::driver_ipc::*;
 // EOF byte used to separate messages
 pub(crate) const EOF: u8 = 0x4;
 
+/// A local named-pipe write should complete in microseconds. Bound it anyway: without this the
+/// write loop retries forever, and its caller holds the virtual-display mutex while it does.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Driver events (monitor arrivals, mode changes) burst. At 10 a single burst could drop
+/// updates and leave the cached monitor state silently disagreeing with the driver.
+const EVENT_CAPACITY: usize = 64;
+
 /// Client for interacting with the Virtual Display Driver.
 ///
 /// Connects via a named pipe to the driver.
@@ -66,7 +74,7 @@ impl Client {
         });
 
         let (command_tx, command_rx) =
-            broadcast::channel::<Result<ClientCommand, error::ReceiveError>>(10);
+            broadcast::channel::<Result<ClientCommand, error::ReceiveError>>(EVENT_CAPACITY);
 
         {
             let shared = shared.clone();
@@ -163,7 +171,14 @@ impl Client {
         stream.filter_map(|cmd| match cmd {
             Ok(Ok(ClientCommand::Event(event))) => Some(Ok(event)),
             Ok(Err(e)) => Some(Err(e)),
-            Err(errors::BroadcastStreamRecvError::Lagged(_n)) => None, // TODO: Indicate lagged? (Maybe changing Item to Result<EventCommand, ...> is better?)
+            Err(errors::BroadcastStreamRecvError::Lagged(n)) => {
+                // Dropped events leave DriverClient's cached monitor list stale, and
+                // refresh_state reads this same channel, so it cannot repair itself.
+                teprintln!(
+                    "[driver-ipc] dropped {n} driver events; cached monitor state may be stale"
+                );
+                None
+            }
             _ => None,
         })
     }
@@ -222,45 +237,55 @@ async fn send_command(
     client: &named_pipe::NamedPipeClient,
     command: &impl Serialize,
 ) -> Result<(), error::SendCommandError> {
-    // Create a vector with the full message, then send it as a single
-    // write. This is required because the pipe is in message mode.
+    // One message per write: the driver splits on the EOF byte, so a message must not be
+    // interleaved with another.
     let mut message = serde_json::to_vec(command)?;
     message.push(EOF);
 
-    // write to pipe without needing to block or split it
+    let write_all = async {
+        let mut written = 0;
+        loop {
+            // wait for pipe to be writable
+            client.writable().await?;
 
-    let mut written = 0;
-    loop {
-        // wait for pipe to be writable
-        client.writable().await?;
+            match client.try_write(&message[written..]) {
+                // we wrote less than the entire size
+                Ok(n) if written + n < message.len() => {
+                    written += n;
+                    continue;
+                }
 
-        match client.try_write(&message[written..]) {
-            // we wrote less than the entire size
-            Ok(n) if written + n < message.len() => {
-                written += n;
-                continue;
+                // write succeeded
+                Ok(n) if written + n >= message.len() => {
+                    break;
+                }
+
+                // nothing wrote, retry again
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+
+                // actual error
+                Err(e) => {
+                    return Err(e);
+                }
+
+                _ => unreachable!(),
             }
-
-            // write succeeded
-            Ok(n) if written + n >= message.len() => {
-                break;
-            }
-
-            // nothing wrote, retry again
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                continue;
-            }
-
-            // actual error
-            Err(e) => {
-                return Err(e.into());
-            }
-
-            _ => unreachable!(),
         }
-    }
+        Ok(())
+    };
 
-    Ok(())
+    match timeout(WRITE_TIMEOUT, write_all).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(error::SendCommandError::PipeBroken(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the display driver did not accept a write within {:?}",
+                WRITE_TIMEOUT
+            ),
+        ))),
+    }
 }
 
 // receive all commands and send them back to the receiver
@@ -280,7 +305,14 @@ async fn receive_command(
         }
 
         match client.try_read(&mut buf) {
-            Ok(0) => return Err(io::Error::last_os_error()),
+            // A zero-length read means the driver closed the pipe. Say so: GetLastError at this
+            // point is whatever happened last and can read "The operation completed successfully".
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the display driver closed the pipe",
+                ))
+            }
             Ok(n) => recv_buf.extend(&buf[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
@@ -302,8 +334,19 @@ async fn receive_command(
             let data = &recv_buf[offset..pos];
             offset = pos + 1;
 
-            let Ok(command) = serde_json::from_slice::<ClientCommand>(data) else {
-                continue;
+            let command = match serde_json::from_slice::<ClientCommand>(data) {
+                Ok(command) => command,
+                Err(e) => {
+                    // ClientCommand is #[serde(untagged)] and carries no version, so an
+                    // undecodable message is indistinguishable from one a newer driver added.
+                    // Either way, dropping it silently is how the virtual display ends up not
+                    // appearing with nothing to read afterwards.
+                    let preview = String::from_utf8_lossy(&data[..data.len().min(160)]);
+                    teprintln!(
+                        "[driver-ipc] dropped an undecodable driver message ({e}): {preview}"
+                    );
+                    continue;
+                }
             };
 
             if tx.send(Ok(command)).is_err() {

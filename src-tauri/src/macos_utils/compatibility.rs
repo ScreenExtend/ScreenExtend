@@ -81,5 +81,12 @@ pub fn check_system_requirements() -> CompatibilityReport {
         unsupported_apis: unsupported,
         audio_backend: audio_backend.as_str().to_string(),
         display_backend: display_backend.as_str().to_string(),
+        capture_backend: if sck_available {
+            "ScreenCaptureKit".to_string()
+        } else {
+            "CGDisplayStream".to_string()
+        },
+        encoder_backend: "videotoolbox".to_string(),
+        hosted_network_backend: "CoreWLAN HostAP".to_string(),
     }
 }

@@ -86,12 +86,20 @@ export default defineConfig(async () => ({
 
   build: {
     target: ["es2020", "chrome87", "safari13"],
+    // Left at rollup's default on purpose: the monaco chunk is expected to trip it, and
+    // the warning is how a new oversized chunk becomes visible in the build output.
+    chunkSizeWarningLimit: 500,
     rollupOptions: {
       input: {
         main: resolve(__dirname, "index.html"),
       },
     },
   },
+
+  // Safari 13.1 cannot construct `new Worker(url, { type: "module" })`, and the monaco
+  // language services are workers. `classicWorkers` below only covers the dev server;
+  // production correctness rested entirely on vite's default happening to be "iife".
+  worker: { format: "iife" },
 
   esbuild: { target: "safari13" },
   optimizeDeps: {

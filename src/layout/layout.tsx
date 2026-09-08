@@ -1,17 +1,17 @@
-import React, { useState, useContext } from "react";
+import React, { useState } from "react";
 
 import { Sidebar } from "@/layout/sidebar";
 import { ModeToggle } from "@/components/mode-toggle";
 import { ProfileMenu } from "@/components/profile-menu";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useSession } from "@/components/global-provider";
 
 const SIDEBAR_WIDTH = 275;
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const { windowOtp: [otp], windowSessionId: [sessionId] } = useContext(GlobalProviderContext);
+  const { otp, sessionId } = useSession();
 
   return (
     <div className="flex h-screen w-full">
