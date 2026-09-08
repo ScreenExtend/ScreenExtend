@@ -656,30 +656,53 @@ macro_rules! resolve {
     }};
 }
 
-/// Candidate dispatcher names, newest first. `libvpl.dll` is the oneVPL dispatcher; the legacy
-/// names are Media SDK's, kept as a last resort for an older driver stack.
-const VPL_NAMES: &[&str] = &["libvpl.dll", "libmfx.dll", "libmfxhw64.dll"];
+/// The oneVPL dispatcher's file name. Only this one: the Media SDK dispatchers (`libmfx.dll`,
+/// `libmfxhw64.dll`) export no `MFXLoad` at all, and the runtime behind them is API 1.x, which
+/// `create_session`'s version gate refuses because this encoder needs 2.x internal surface
+/// allocation. Loading one could only turn a clean "no dispatcher" into a confusing
+/// "resolving MFXLoad failed".
+const VPL_NAME: &str = "libvpl.dll";
 
 /// Find the oneVPL dispatcher.
 ///
-/// The old code was `Library::new("libvpl.dll")` with no search and no alternatives, under a
-/// comment claiming the DLL "ships with the Intel GPU driver". It does not: what Intel drivers
-/// install is the *runtime* (`libmfx-gen.dll` for oneVPL, `libmfxhw64.dll` for MSDK); the
-/// dispatcher is an application-redistributed component. On a host without it, Quick Sync was
-/// simply never available and the machine silently ran the CPU x264 path. So this searches the
-/// way `x264_sys::open_library` does — bundled `resources/` first, then the exe directory, then
-/// the OS search path — and reports which file answered.
+/// The old code was `Library::new("libvpl.dll")` with no path search, so the error on a host
+/// without one was a bare load failure that `build_backend` turned into "Quick Sync unavailable,
+/// falling back to software x264" — a `teprintln!` nobody reads. This searches, and reports
+/// which file answered.
+///
+/// **Order matters, and it is the OS search path first.** Intel's guidance is that Xe (Gen12)
+/// and later drivers install the dispatcher themselves — measured on the dev box as
+/// `C:\Windows\System32\libvpl.dll`, oneVPL Dispatcher 2.7.0, Intel, WHQL-signed — and that copy
+/// is the one matched to the runtime the same driver package installed. An app-side copy found
+/// first would shadow it. So `resources/` and the exe directory are a *fallback* slot for a host
+/// that has a 2.x runtime but no dispatcher, not the preferred source. See
+/// `resources/PROVENANCE.md` for why nothing is shipped in that slot today.
 fn open_dispatcher() -> Result<(Library, std::path::PathBuf)> {
-    let mut last_err: Option<String> = None;
-    let attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
+    let mut tried: Vec<String> = Vec::new();
+
+    // A dispatcher that cannot answer `MFXLoad` is not a dispatcher. Checking here lets the
+    // search move on to the next candidate instead of failing the whole load on the first file
+    // that happens to have the right name.
+    let attempt = |candidate: std::path::PathBuf, tried: &mut Vec<String>| match unsafe {
         Library::new(&candidate)
     } {
-        Ok(lib) => Some((lib, candidate)),
+        Ok(lib) => {
+            if unsafe { lib.get::<FnMFXLoad>(b"MFXLoad\0") }.is_ok() {
+                Some((lib, candidate))
+            } else {
+                tried.push(format!("{}: no MFXLoad export", candidate.display()));
+                None
+            }
+        }
         Err(e) => {
-            *last_err = Some(format!("{}: {e}", candidate.display()));
+            tried.push(format!("{}: {e}", candidate.display()));
             None
         }
     };
+
+    if let Some(v) = attempt(std::path::PathBuf::from(VPL_NAME), &mut tried) {
+        return Ok(v);
+    }
 
     if let Ok(exe) = std::env::current_exe() {
         // The grandparent probe is for test binaries, which live in `target/<profile>/deps/`,
@@ -689,37 +712,19 @@ fn open_dispatcher() -> Result<(Library, std::path::PathBuf)> {
             .into_iter()
             .chain(exe.parent().and_then(|d| d.parent()));
         for dir in dirs {
-            for name in VPL_NAMES {
-                if let Some(v) = attempt(dir.join("resources").join(name), &mut last_err) {
-                    return Ok(v);
-                }
-                if let Some(v) = attempt(dir.join(name), &mut last_err) {
-                    return Ok(v);
-                }
+            if let Some(v) = attempt(dir.join(VPL_NAME), &mut tried) {
+                return Ok(v);
+            }
+            if let Some(v) = attempt(dir.join("resources").join(VPL_NAME), &mut tried) {
+                return Ok(v);
             }
         }
     }
 
-    #[cfg(test)]
-    for name in VPL_NAMES {
-        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(name);
-        if let Some(v) = attempt(staged, &mut last_err) {
-            return Ok(v);
-        }
-    }
-
-    for name in VPL_NAMES {
-        if let Some(v) = attempt(std::path::PathBuf::from(name), &mut last_err) {
-            return Ok(v);
-        }
-    }
-
     anyhow::bail!(
-        "could not load the oneVPL dispatcher (tried bundled resources, the exe directory and \
-         the OS search path for {VPL_NAMES:?}): {}",
-        last_err.unwrap_or_default()
+        "could not load the oneVPL dispatcher ({VPL_NAME}); Quick Sync is unavailable on this \
+         host. Tried, in order: {}",
+        tried.join("; ")
     )
 }
 
