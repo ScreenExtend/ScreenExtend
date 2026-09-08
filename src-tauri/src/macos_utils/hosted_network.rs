@@ -882,6 +882,71 @@ mod tests {
         );
     }
 
+    /// One bounded run of exactly what shipping code does, with every number the ledger wants:
+    /// which securityType the SPI accepts, on which channel and band, how long the radio takes to
+    /// reach AP mode, and whether anything then serves DHCP.
+    ///
+    /// **This takes the Wi-Fi interface.** On a Mac whose only network is that interface — which
+    /// is this project's dev box — it drops every remote session, so it has to be run detached
+    /// with a watchdog that restores the radio. `docs/manual-tests/macos-hosted-network.md` has
+    /// the script.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::hosted_network::tests::measure_hostap_start -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
+    fn measure_hostap_start() {
+        let Some(interface) = wifi_interface() else {
+            println!("no Wi-Fi interface");
+            return;
+        };
+        println!("backend: {:?}", probe_hosted_network_backend());
+        let Some(channel) = pick_channel(&interface) else {
+            println!("no usable channel");
+            return;
+        };
+        let number = unsafe { channel.channelNumber() };
+        println!("channel {number} ({})", channel_band(&channel));
+        let name = interface_bsd_name(&interface);
+        println!("interface {name:?}");
+
+        let ssid = "ScreenExtend-Measure";
+        let password = "screenextend";
+        for attempt in secured_attempts(password).into_iter().chain([Attempt {
+            security: SECURITY_OPEN,
+            label: "securityType 2 (open)".to_string(),
+            password: None,
+        }]) {
+            let t0 = Instant::now();
+            let accepted = send_start_host_ap(
+                &interface,
+                &channel,
+                ssid,
+                attempt.security,
+                attempt.password.as_deref(),
+            );
+            let accepted_at = t0.elapsed();
+            let mode_ok = accepted && wait_for_ap_mode(&interface);
+            let mode_at = t0.elapsed();
+            let ip = mode_ok
+                .then(|| name.clone())
+                .flatten()
+                .and_then(|n| wait_for_ipv4(&n, DHCP_SETTLE_TIMEOUT));
+            let ip_at = t0.elapsed();
+            println!(
+                "{}: accepted={accepted} in {accepted_at:?}, ap_mode={mode_ok} at {mode_at:?},                  ip={ip:?} at {ip_at:?}",
+                attempt.label
+            );
+            stop_host_ap_mode();
+            std::thread::sleep(Duration::from_millis(400));
+            if mode_ok {
+                break;
+            }
+        }
+        println!("stopped; the radio should rejoin its known network on its own");
+    }
+
     /// The security-type sweep the tree has been carrying as a 2012 comment. Run it on a real Mac
     /// with a phone nearby:
     ///
@@ -893,7 +958,7 @@ mod tests {
     /// actually entered AP mode. Scan from a second device to see what each accepted value
     /// advertises.
     #[test]
-    #[ignore]
+    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
     fn sweep_security_types() {
         let Some(interface) = wifi_interface() else {
             println!("no Wi-Fi interface");
