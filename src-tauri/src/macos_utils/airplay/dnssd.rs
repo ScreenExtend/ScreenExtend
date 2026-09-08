@@ -737,4 +737,57 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(2));
         drop(ad);
     }
+
+    /// Does mDNSResponder accept a peer-to-peer registration on this Mac at all?
+    ///
+    /// The open question behind an AWDL transport is whether a service can be published somewhere
+    /// a nearby Apple device sees it with Wi-Fi off. Everything past that is unknowable from here,
+    /// but this first observation costs nothing: three registrations of a throwaway service type,
+    /// each reporting its own return code.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::airplay::dnssd::tests::probe_awdl_registration -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "registers real Bonjour services; run manually"]
+    fn probe_awdl_registration() {
+        let attempts: [(&str, u32, DNSServiceFlags); 3] = [
+            (
+                "primary LAN interface, no AWDL",
+                primary_interface_index().map(|(i, _)| i).unwrap_or(0),
+                KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
+            ),
+            (
+                "any interface, IncludeAWDL",
+                0,
+                KDNS_SERVICE_FLAGS_NO_AUTO_RENAME | KDNS_SERVICE_FLAGS_INCLUDE_AWDL,
+            ),
+            (
+                "InterfaceIndexP2P, IncludeAWDL",
+                KDNS_SERVICE_INTERFACE_INDEX_P2P,
+                KDNS_SERVICE_FLAGS_NO_AUTO_RENAME | KDNS_SERVICE_FLAGS_INCLUDE_AWDL,
+            ),
+        ];
+
+        for (label, interface_index, flags) in attempts {
+            let outcome = Service::register(
+                "ScreenExtend AWDL Probe",
+                "_screenextend._tcp",
+                7010,
+                interface_index,
+                flags,
+                &[("txtvers", "1".to_string())],
+            );
+            match outcome {
+                Ok(service) => {
+                    println!("{label}: accepted (index {interface_index}, flags 0x{flags:x})");
+                    drop(service);
+                }
+                Err(e) => {
+                    println!("{label}: rejected (index {interface_index}, flags 0x{flags:x}) — {e}")
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
 }
