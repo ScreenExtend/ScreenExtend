@@ -159,6 +159,14 @@ async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
 },
 /**
+ * Arm or disarm the `LogLine` event stream. Called by the Settings log panel on mount and,
+ * crucially, on unmount: without the second call the panel being opened once kept the writer
+ * thread emitting batched IPC events for the rest of the process's life.
+ */
+async setLogStreaming(on: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_log_streaming", { on });
+},
+/**
  * The webview's `console.error` has nowhere to go in a release build -- there are no
  * devtools attached and nothing captures it -- so failures in the desktop UI simply
  * vanished. This puts them on the same bus as everything else, which means they reach
@@ -180,9 +188,7 @@ cloudStatusChange: CloudStatusChange,
 deviceAudioOutputs: DeviceAudioOutputs,
 deviceJoin: DeviceJoin,
 deviceModify: DeviceModify,
-deviceModifyAction: DeviceModifyAction,
 deviceRemove: DeviceRemove,
-deviceRemoveAction: DeviceRemoveAction,
 hostedNetworkNoPassword: HostedNetworkNoPassword,
 joinAttemptsPaused: JoinAttemptsPaused,
 logLine: LogLine,
@@ -193,9 +199,7 @@ cloudStatusChange: "cloud-status-change",
 deviceAudioOutputs: "device-audio-outputs",
 deviceJoin: "device-join",
 deviceModify: "device-modify",
-deviceModifyAction: "device-modify-action",
 deviceRemove: "device-remove",
-deviceRemoveAction: "device-remove-action",
 hostedNetworkNoPassword: "hosted-network-no-password",
 joinAttemptsPaused: "join-attempts-paused",
 logLine: "log-line",
@@ -217,9 +221,7 @@ export type Device = { ip: string; token: string; name: string; scale: number; o
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
-export type DeviceModifyAction = Device
 export type DeviceRemove = Device
-export type DeviceRemoveAction = Device
 export type DisplayCapacity = { max: number | null; in_use: number; full: boolean; backend: string }
 export type HostedNetworkNoPassword = null
 export type JoinAttemptsPaused = { retryAfterSecs: number }

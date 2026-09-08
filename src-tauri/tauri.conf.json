@@ -41,7 +41,9 @@
       "binaries/nefconc"
     ],
     "macOS": {
-      "entitlements": "./Entitlements.plist"
+      "entitlements": "./Entitlements.plist",
+      "infoPlist": "./Info.plist",
+      "minimumSystemVersion": "10.15"
     },
     "windows": {
       "nsis": {
@@ -67,8 +69,9 @@
           "args": [
             { "name": "http-port", "takesValue": true, "description": "Override the HTTP port." },
             { "name": "https-port", "takesValue": true, "description": "Override the HTTPS port." },
-            { "name": "session-id", "takesValue": true, "description": "Use a specific session id (default: random)." },
-            { "name": "otp", "takesValue": true, "description": "Use a specific OTP (default: random)." },
+            { "name": "session-id", "takesValue": true, "description": "Use a specific session id; `-` reads it from stdin, SCREENEXTEND_SESSION_ID also works (default: random)." },
+            { "name": "otp", "takesValue": true, "description": "Use a specific OTP; `-` reads it from stdin (default: random). Prefer SCREENEXTEND_OTP or --otp-file: argv is readable by every process." },
+            { "name": "otp-file", "takesValue": true, "description": "Read the OTP from this file instead of the command line." },
             { "name": "no-cloud", "description": "Do not register a public 'Anywhere (Internet)' session." },
             { "name": "no-qr", "description": "Do not render QR codes in the terminal." },
             { "name": "software-encode", "description": "Force CPU (software) video encoding." },
