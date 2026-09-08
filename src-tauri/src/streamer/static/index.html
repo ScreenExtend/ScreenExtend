@@ -1903,6 +1903,19 @@
                 m.style.display = 'flex';
             }
 
+            // Only a modal the user can actually see is worth showing. A fullscreen element
+            // renders only its own subtree, so a prompt raised while the stage is fullscreen
+            // would be invisible and its promise would never settle; the host is told the
+            // labels are unavailable instead, which is the truth either way.
+            function permModalIfVisible(onContinue, onSkip) {
+                if (currentFullscreenEl()) {
+                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
+                    try { if (onSkip) onSkip(); } catch (_) { noteSuppressed(); }
+                    return;
+                }
+                showPermModal(onContinue, onSkip);
+            }
+
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 if (connectBtn.disabled) return;
@@ -1979,7 +1992,7 @@
                 try {
                     if (window.SEAudio) {
                         SEAudio.initSpeakers();
-                        SEAudio._enumPromise = SEAudio.enumerateLazily(showPermModal);
+                        SEAudio._enumPromise = SEAudio.enumerateLazily(permModalIfVisible);
                     }
                 } catch (_) { noteSuppressed(); }
             });
