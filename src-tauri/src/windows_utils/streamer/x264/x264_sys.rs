@@ -380,6 +380,8 @@ type FnEncoderClose = unsafe extern "C" fn(*mut x264_t);
 type FnPictureInit = unsafe extern "C" fn(*mut x264_picture_t);
 
 pub struct X264Api {
+    path: std::path::PathBuf,
+    pub build: i32,
     pub param_default_preset: FnParamDefaultPreset,
     pub param_apply_profile: FnParamApplyProfile,
     pub encoder_open: FnEncoderOpen,
@@ -398,12 +400,12 @@ unsafe impl Sync for X264Api {}
 
 const LIB_NAMES: &[&str] = &["libx264-164.dll", "libx264.dll", "x264.dll"];
 
-fn open_library() -> Result<Library> {
+fn open_library() -> Result<(Library, std::path::PathBuf)> {
     let mut last_err: Option<String> = None;
     let attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
         Library::new(&candidate)
     } {
-        Ok(lib) => Some(lib),
+        Ok(lib) => Some((lib, candidate)),
         Err(e) => {
             *last_err = Some(format!("{}: {e}", candidate.display()));
             None
@@ -464,26 +466,45 @@ fn open_library() -> Result<Library> {
     ))
 }
 
+/// `x264_param_t` is hand-translated for exactly one ABI (build 164) and libx264 is not
+/// ABI-stable across builds — `i_bitdepth`, `i_avcintra_flavor`, `mastering_display`,
+/// `content_light_level` and `i_alternative_transfer` were each inserted at different builds.
+/// A mismatched library reading a build-164 struct is not a clean failure; it is libx264
+/// reading and writing the wrong offsets.
+///
+/// libx264 versions `x264_encoder_open` by mangling the build number into the symbol name for
+/// exactly this reason, so the exported name is the ABI stamp. Resolving only
+/// `x264_encoder_open_164` is therefore the check — accepting a neighbouring build, as the
+/// loader used to, meant proceeding with an ABI we know is wrong. `x264_build` is read too
+/// where it exists, but the shipped MinGW DLL exports functions only, so it cannot be required.
+unsafe fn read_build(lib: &Library) -> Option<i32> {
+    let sym: Symbol<*const c_int> = unsafe { lib.get(b"x264_build\0") }.ok()?;
+    Some(unsafe { **sym })
+}
+
 unsafe fn resolve_encoder_open(lib: &Library) -> Result<FnEncoderOpen> {
-    let primary = format!("x264_encoder_open_{X264_BUILD}");
-    let names = std::iter::once(primary.clone())
-        .chain((150..=175).rev().map(|b| format!("x264_encoder_open_{b}")))
-        .chain(std::iter::once("x264_encoder_open".to_string()));
-    for name in names {
-        let cname = format!("{name}\0");
-        if let Ok(sym) = lib.get::<FnEncoderOpen>(cname.as_bytes()) {
-            return Ok(*sym);
-        }
-    }
-    Err(anyhow!(
-        "libx264 exports no x264_encoder_open_<build> symbol (looked for {primary} and neighbours); \
-         library build likely incompatible with the vendored bindings (X264_BUILD {X264_BUILD})"
-    ))
+    let name = format!("x264_encoder_open_{X264_BUILD}\0");
+    let sym = unsafe { lib.get::<FnEncoderOpen>(name.as_bytes()) }?;
+    Ok(*sym)
 }
 
 impl X264Api {
+    /// Path of the libx264 that was actually loaded. Logged at encoder init so a report from a
+    /// machine says which DLL answered, not merely that one did.
+    pub fn library_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn load() -> Result<Self> {
-        let lib = open_library()?;
+        let (lib, path) = open_library()?;
+        let build = unsafe { read_build(&lib) };
+        if let Some(b) = build.filter(|&b| b != X264_BUILD) {
+            return Err(anyhow!(
+                "libx264 at {} reports x264_build {b}, but the vendored x264_param_t is pinned \
+                 to build {X264_BUILD}",
+                path.display()
+            ));
+        }
         unsafe {
             let param_default_preset: Symbol<FnParamDefaultPreset> = lib
                 .get(b"x264_param_default_preset\0")
@@ -513,9 +534,19 @@ impl X264Api {
                 .get(b"x264_picture_init\0")
                 .context("resolving x264_picture_init")?;
 
-            let encoder_open = resolve_encoder_open(&lib)?;
+            let encoder_open = resolve_encoder_open(&lib).with_context(|| {
+                format!(
+                    "libx264 at {} does not export x264_encoder_open_{X264_BUILD}, so it is not \
+                     build {X264_BUILD} and its x264_param_t layout will not match the vendored \
+                     one. Refusing it rather than reading it at the wrong offsets — install the \
+                     bundled libx264-{X264_BUILD}.dll or take the mismatched libx264 off PATH.",
+                    path.display()
+                )
+            })?;
 
             Ok(Self {
+                path,
+                build: build.unwrap_or(X264_BUILD),
                 param_default_preset: *param_default_preset,
                 param_apply_profile: *param_apply_profile,
                 encoder_open,

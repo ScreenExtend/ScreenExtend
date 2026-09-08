@@ -28,8 +28,6 @@ pub struct X264Encoder {
     c_size: usize,
     have_frame: bool,
     pts: i64,
-    use_bgra_csp: bool,
-    repeat_bgra: Vec<u8>,
 }
 
 unsafe impl Send for X264Encoder {}
@@ -93,8 +91,15 @@ impl X264Encoder {
             }
         }
 
-        // GOP / recovery
-        p.i_keyint_max = X264_KEYINT_MAX_INFINITE;
+        // GOP / recovery. libx264 advances the intra-refresh column by `mb_width / i_keyint_max`
+        // macroblocks per frame, so keyint *is* the refresh period — leave it infinite and the
+        // wave moves ~1e-9 MB/frame and never sweeps. One sweep per second matches the Intel
+        // backend's `IntRefCycleSize = fps`.
+        p.i_keyint_max = if config.intra_refresh {
+            fps.clamp(2, i32::MAX as u32) as c_int
+        } else {
+            X264_KEYINT_MAX_INFINITE
+        };
         p.i_scenecut_threshold = 0;
         p.b_intra_refresh = if config.intra_refresh { 1 } else { 0 };
 
@@ -122,30 +127,27 @@ impl X264Encoder {
             );
         }
 
-        let mut p_bgra = p; // x264_param_t is Copy
-        p_bgra.i_csp = X264_CSP_BGRA;
-        let bgra_handle = unsafe { (api.encoder_open)(&mut p_bgra) };
-
-        let (handle, use_bgra_csp) = if !bgra_handle.is_null() {
-            (bgra_handle, true)
-        } else {
-            let h = unsafe { (api.encoder_open)(&mut p) };
-            if h.is_null() {
-                bail!("x264_encoder_open returned null (invalid params or libx264 build mismatch)");
-            }
-            (h, false)
-        };
+        // Input must be planar 4:2:0. libx264 does NOT convert RGB internally: any csp at or
+        // above X264_CSP_I444 maps to I444 in frame_internal_csp(), and x264_sps_init then
+        // forces PROFILE_HIGH444_PREDICTIVE regardless of what apply_profile asked for. A
+        // packed-BGRA fast path therefore emits profile_idc 244 / chroma_format_idc 3, which
+        // no browser WebRTC decoder accepts. `x264_profile_asserts_420` covers this.
+        let handle = unsafe { (api.encoder_open)(&mut p) };
+        if handle.is_null() {
+            bail!("x264_encoder_open returned null (invalid params or libx264 build mismatch)");
+        }
 
         let y_size = width * height;
         let c_size = (width / 2) * (height / 2);
         let i420 = vec![0u8; y_size + 2 * c_size];
 
-        let csp_label = if use_bgra_csp { "BGRA" } else { "I420" };
         tprintln!(
             "pipeline: software x264 encoder ready ({width}x{height}@{fps}, {kbps} kbps, \
-             threads={}, profile={:?}, csp={csp_label})",
+             threads={}, profile={:?}, csp=I420, intra_refresh={}, lib={})",
             p.i_threads,
             config.profile,
+            config.intra_refresh,
+            api.library_path().display(),
         );
 
         Ok(Self {
@@ -160,8 +162,6 @@ impl X264Encoder {
             c_size,
             have_frame: false,
             pts: 0,
-            use_bgra_csp,
-            repeat_bgra: Vec::new(),
         })
     }
 
@@ -175,28 +175,25 @@ impl X264Encoder {
         row_pitch: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>> {
-        if self.use_bgra_csp {
-            self.repeat_bgra.clear();
-            self.repeat_bgra.extend_from_slice(data);
-            let out = self.encode_with_bgra_direct(data, row_pitch, force_idr)?;
-            self.have_frame = true;
-            Ok(out)
-        } else {
-            self.convert_bgra_to_i420(data, row_pitch as usize)?;
-            self.encode_converted(force_idr)
-        }
+        self.convert_bgra_to_i420(data, row_pitch as usize)?;
+        self.encode_converted(force_idr)
     }
 
+    /// Re-encode the already-converted I420 planes. No BGRA copy is retained, so a repeat can
+    /// never disagree with the source frame's stride.
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         if !self.have_frame {
             return Ok(Vec::new());
         }
-        if self.use_bgra_csp && !self.repeat_bgra.is_empty() {
-            let data = self.repeat_bgra.clone();
-            let row_pitch = (self.width * 4) as u32;
-            return self.encode_with_bgra_direct(&data, row_pitch, force_idr);
-        }
         self.encode_converted(force_idr)
+    }
+
+    /// Advance the periodic intra-refresh wave immediately (loss repair without an IDR).
+    /// A no-op unless the encoder was opened with `intra_refresh`.
+    pub fn intra_refresh(&mut self) {
+        if self.config.intra_refresh {
+            unsafe { (self.api.encoder_intra_refresh)(self.handle) };
+        }
     }
 
     pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
@@ -214,54 +211,6 @@ impl X264Encoder {
             bail!("x264_encoder_reconfig failed ({rv})");
         }
         Ok(BitrateApplied::Applied)
-    }
-
-    fn encode_with_bgra_direct(
-        &mut self,
-        data: &[u8],
-        row_pitch: u32,
-        force_idr: bool,
-    ) -> Result<Vec<u8>> {
-        let mut pic_in: x264_picture_t = unsafe { std::mem::zeroed() };
-        unsafe { (self.api.picture_init)(&mut pic_in) };
-        pic_in.img.i_csp = X264_CSP_BGRA;
-        pic_in.img.i_plane = 1;
-        pic_in.img.plane[0] = data.as_ptr() as *mut u8;
-        pic_in.img.i_stride[0] = row_pitch as c_int;
-        pic_in.i_pts = self.pts;
-        pic_in.i_type = if force_idr {
-            X264_TYPE_IDR
-        } else {
-            X264_TYPE_AUTO
-        };
-
-        let mut nals: *mut x264_nal_t = ptr::null_mut();
-        let mut n_nal: c_int = 0;
-        let mut pic_out: x264_picture_t = unsafe { std::mem::zeroed() };
-        let size = unsafe {
-            (self.api.encoder_encode)(
-                self.handle,
-                &mut nals,
-                &mut n_nal,
-                &mut pic_in,
-                &mut pic_out,
-            )
-        };
-        if size < 0 {
-            bail!("x264_encoder_encode (BGRA direct) failed ({size})");
-        }
-        self.pts += 1;
-
-        if size == 0 || n_nal == 0 || nals.is_null() {
-            return Ok(Vec::new());
-        }
-        debug_assert_eq!(
-            pic_out.i_dts, pic_out.i_pts,
-            "0 B-frames must keep dts == pts (no reordering)"
-        );
-
-        let out = unsafe { std::slice::from_raw_parts((*nals).p_payload, size as usize).to_vec() };
-        Ok(out)
     }
 
     fn encode_converted(&mut self, force_idr: bool) -> Result<Vec<u8>> {
@@ -379,8 +328,13 @@ impl Drop for X264Encoder {
     }
 }
 
+/// A dedicated bounded pool, not rayon's global one: the x264 encode thread is TIME_CRITICAL +
+/// MMCSS and x264 runs its own slice threads, so letting the convert fan out across every core
+/// oversubscribes those hot threads and adds latency under CPU contention.
 static CONVERT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
+/// Workers are nonetheless raised to ABOVE_NORMAL so the TIME_CRITICAL encode thread, which is
+/// blocked inside `install()` while they run, is not stalled by lower-priority system work.
 fn build_convert_pool() -> rayon::ThreadPool {
     let n = std::thread::available_parallelism()
         .map(|c| (c.get() / 2).clamp(1, 4))
