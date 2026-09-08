@@ -221,3 +221,22 @@ On a dual-GPU Intel Mac (2016–2019 15-inch MacBook Pro, Mac Pro, eGPU):
 
 **Record**: both registry IDs, `powermetrics` package power idle vs streaming, and
 whether the integrated GPU stays in use.
+
+## 10. `CGVirtualDisplaySettings.refreshDeadline`
+
+The private virtual-display class gained a property with a latency-shaped name at
+some version after 10.14.6; it is absent on the 10.15 dev box, so nothing here can
+try it, and it is deliberately not set. The virtual-display code probes for it with
+`respondsToSelector:` and logs the result once.
+
+On each modern Mac, record whether the probe reports it present. If it is, the
+experiment worth running is: set it to one frame period, then to half a frame
+period, and compare `displayTime → callback` p50/p99 from
+
+```sh
+cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate -- --ignored --nocapture
+```
+
+against the unset control. It sits on the WindowServer side of the boundary, which
+is where the largest single term in the host path lives, so it is the one
+speculative knob on this path worth the trouble. Keep it only if the numbers move.
