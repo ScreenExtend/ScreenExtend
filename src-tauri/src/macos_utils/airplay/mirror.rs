@@ -148,6 +148,7 @@ async fn drain(mut stream: TcpStream, stats: &MirrorStats) -> Result<(), String>
     let mut scratch = vec![0u8; 64 * 1024];
     let mut probe = HeaderProbe::new();
     let mut rate = RateReport::new();
+    let mut reports = StreamReports::new();
 
     loop {
         match stream.read_exact(&mut header).await {
@@ -200,6 +201,9 @@ async fn drain(mut stream: TcpStream, stats: &MirrorStats) -> Result<(), String>
             }
             if first {
                 probe.observe_payload(kind, &scratch[..take]);
+                if kind == TYPE_STREAM_REPORT && take == payload_len {
+                    reports.observe(&scratch[..take]);
+                }
                 first = false;
             }
             left -= take;
@@ -210,6 +214,155 @@ async fn drain(mut stream: TcpStream, stats: &MirrorStats) -> Result<(), String>
             .bytes
             .fetch_add((HEADER_LEN + payload_len) as u64, Ordering::Relaxed);
         rate.observe(HEADER_LEN + payload_len);
+    }
+}
+
+/// The sender's own statistics, which arrive in the clear and used to be counted and dropped.
+///
+/// Type-`0x05` packets are not video: their payload is a `bplist00` binary property list carrying
+/// the AirPlay sender's view of the link — round-trip time, bandwidth, queue depth — measured by
+/// macOS itself, about macOS itself, once a second. No FairPlay, no AES, nothing to decrypt; only
+/// the type-`0x00` payloads are ciphertext.
+///
+/// The first report is logged with every scalar it carries, because the key set is undocumented
+/// and a field report is the only way to learn it. After that only the numeric keys are logged,
+/// throttled, so a long session does not fill the backlog with one line a second.
+struct StreamReports {
+    since: Instant,
+    seen: u64,
+}
+
+/// How often the numeric summary is logged after the first full report.
+const STREAM_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+
+impl StreamReports {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            seen: 0,
+        }
+    }
+
+    fn observe(&mut self, payload: &[u8]) {
+        let first = self.seen == 0;
+        self.seen += 1;
+        if !first && self.since.elapsed() < STREAM_REPORT_INTERVAL {
+            return;
+        }
+        self.since = Instant::now();
+
+        // A stream report is a small property list followed by a ~25 KiB trailer of something
+        // else, so the whole payload does not parse. `binary_plist_len` finds where the plist
+        // ends.
+        let Some(len) = binary_plist_len(payload) else {
+            if first {
+                tprintln!(
+                    "[airplay] stream report ({} bytes) does not start with a binary property \
+                     list; leaving it alone",
+                    payload.len()
+                );
+            }
+            return;
+        };
+        let Ok(value) = plist::from_bytes::<plist::Value>(&payload[..len]) else {
+            if first {
+                tprintln!(
+                    "[airplay] stream report: {len} of {} bytes look like a property list but it \
+                     did not parse",
+                    payload.len()
+                );
+            }
+            return;
+        };
+        if first {
+            tprintln!(
+                "[airplay] stream reports carry a {len}-byte property list and a {}-byte trailer",
+                payload.len() - len
+            );
+        }
+
+        let mut fields = Vec::new();
+        collect_scalars(&value, "", &mut fields, first);
+        if fields.is_empty() {
+            return;
+        }
+        fields.sort();
+        tprintln!(
+            "[airplay] sender stream report #{}: {}",
+            self.seen,
+            fields.join(" ")
+        );
+    }
+}
+
+/// Where the binary property list at the start of `buf` ends.
+///
+/// A stream report is a small `bplist00` followed by a much larger trailer, so handing the whole
+/// payload to the parser fails. A binary plist ends with a 32-byte trailer whose last three fields
+/// are `numObjects`, `topObject` and `offsetTableOffset`, and the offset table sits immediately
+/// before that trailer — which makes the end position self-describing: the only `end` whose
+/// trailer is internally consistent is the real one.
+fn binary_plist_len(buf: &[u8]) -> Option<usize> {
+    const HEADER: &[u8] = b"bplist00";
+    const TRAILER: usize = 32;
+    if buf.len() < HEADER.len() + TRAILER || !buf.starts_with(HEADER) {
+        return None;
+    }
+    for end in HEADER.len() + TRAILER..=buf.len() {
+        let t = &buf[end - TRAILER..end];
+        let offset_int_size = t[6] as usize;
+        let object_ref_size = t[7] as usize;
+        if !(1..=8).contains(&offset_int_size) || !(1..=8).contains(&object_ref_size) {
+            continue;
+        }
+        let num_objects = u64::from_be_bytes(t[8..16].try_into().ok()?) as usize;
+        let top_object = u64::from_be_bytes(t[16..24].try_into().ok()?) as usize;
+        let table_offset = u64::from_be_bytes(t[24..32].try_into().ok()?) as usize;
+        if num_objects == 0 || num_objects > 1 << 20 || top_object >= num_objects {
+            continue;
+        }
+        if table_offset < HEADER.len() {
+            continue;
+        }
+        if table_offset.checked_add(num_objects * offset_int_size) == Some(end - TRAILER) {
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// Flatten a property list into `key=value` pairs.
+///
+/// `numbers_only` drops strings and booleans, which is what the throttled summaries want; the
+/// first report keeps everything so the schema is recorded once.
+fn collect_scalars(value: &plist::Value, prefix: &str, out: &mut Vec<String>, everything: bool) {
+    const MAX_FIELDS: usize = 64;
+    if out.len() >= MAX_FIELDS {
+        return;
+    }
+    match value {
+        plist::Value::Dictionary(dict) => {
+            for (key, child) in dict {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_scalars(child, &path, out, everything);
+            }
+        }
+        plist::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate().take(4) {
+                collect_scalars(child, &format!("{prefix}[{index}]"), out, everything);
+            }
+        }
+        plist::Value::Integer(n) => out.push(format!("{prefix}={n}")),
+        plist::Value::Real(n) => out.push(format!("{prefix}={n:.3}")),
+        plist::Value::Boolean(b) if everything => out.push(format!("{prefix}={b}")),
+        plist::Value::String(s) if everything => {
+            out.push(format!("{prefix}={:?}", &s[..s.len().min(32)]))
+        }
+        _ => {}
     }
 }
 
@@ -248,48 +401,48 @@ impl RateReport {
     }
 }
 
-/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch.
-const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
-
-/// The current time in NTP short-format fixed point, from the same wall clock
-/// the sender timestamps its frames off.
-fn ntp_now() -> u64 {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs() + NTP_UNIX_EPOCH_OFFSET_SECS;
-    let frac = ((d.subsec_nanos() as u64) << 32) / 1_000_000_000;
-    (secs << 32) | frac
+/// A 64-bit NTP fixed-point value in nanoseconds: seconds in the high 32 bits, a binary fraction
+/// in the low 32.
+fn ntp_fixed_to_ns(v: u64) -> i128 {
+    ((v as i128) * 1_000_000_000) >> 32
 }
 
-fn ntp_delta_ns(now: u64, then: u64) -> i64 {
-    let diff = now as i128 - then as i128;
-    ((diff * 1_000_000_000) >> 32) as i64
-}
-
-/// A plausible capture-to-delivery latency: never more than a second in the
-/// future, never more than ten seconds in the past.
-fn plausible(ns: i64) -> bool {
-    (-1_000_000_000..10_000_000_000).contains(&ns)
+/// Whether an NTP fixed-point reading is a plausible *sender-epoch* stamp.
+///
+/// Measured on 10.15.8: the mirror header's timestamp is not a wall clock. Read little-endian its
+/// seconds field was 41457 and then 41459 two seconds later — a monotonic clock whose epoch is
+/// somewhere inside this boot, not 1900 and not 1970. Read big-endian the same bytes are 11.5
+/// years, which is what makes the byte order decidable at all.
+fn plausible_sender_seconds(v: u64) -> bool {
+    const MAX_UPTIME_SECS: u64 = 400 * 24 * 3600;
+    let secs = v >> 32;
+    secs > 0 && secs < MAX_UPTIME_SECS
 }
 
 /// Reads the plaintext part of the mirror header.
 ///
-/// Every published AirPlay receiver frames a mirror packet as a 128-byte header
-/// whose first five bytes are the payload length and the packet type, with a
-/// flag field at offset 6 and the sender's capture time — NTP fixed point — at
-/// offset 8. This module reads five of those bytes and discards the rest, which
-/// throws away the one thing on this connection that nothing else in the tree
-/// can measure: the sender is *this same Mac*, so the difference between that
-/// timestamp and the instant the bytes reach our socket is macOS's own
-/// compositor-to-consumer latency — the floor under every capture path on this
-/// OS, CGDisplayStream and ScreenCaptureKit alike.
+/// Every published AirPlay receiver frames a mirror packet as a 128-byte header whose first five
+/// bytes are the payload length and the packet type, with a flag field at offset 6 and the
+/// sender's capture time — NTP fixed point — at offset 8. This module read five of those bytes and
+/// discarded the rest, which threw away the one thing on this connection nothing else in the tree
+/// can see: the sender is *this same Mac*, so the distance between that timestamp and the instant
+/// the bytes reach our socket is macOS's own compose-to-consumer path.
 ///
-/// It is off unless `SE_AIRPLAY_TIMING=1`, because the measurement is only
-/// interesting with `SE_AIRPLAY_MAX_FPS` raised, and that makes the host encode
-/// its whole desktop for us to throw away. Purely a read of bytes that already
-/// arrive — no decryption, and none is possible: only the payload is FairPlay
-/// ciphertext.
+/// **What the stamp turned out to be, measured on 10.15.8:** not a wall clock. Read
+/// little-endian, its seconds field read 41457 while the machine had been up fourteen hours — a
+/// monotonic clock whose epoch is somewhere inside this boot and is published nowhere. So the
+/// *absolute* figure is unobtainable without implementing AirPlay's own NTP time sync, which this
+/// receiver deliberately does not.
+///
+/// What survives is the half that does not need the epoch. Both clocks are the same machine's
+/// monotonic time, so the offset between them is a constant: subtracting the smallest difference
+/// seen in a session leaves how much later than its own best case each frame arrived. That is the
+/// variability of macOS's compose-to-consumer path, which is the half that matters to a stream.
+///
+/// Off unless `SE_AIRPLAY_TIMING=1`, because the measurement is only interesting with
+/// `SE_AIRPLAY_MAX_FPS` raised, and that makes the host encode its whole desktop for us to throw
+/// away. Purely a read of bytes that already arrive — no decryption, and none is possible: only
+/// the payload is FairPlay ciphertext.
 struct HeaderProbe {
     enabled: bool,
     /// Header hexdumps still owed, per packet type.
@@ -298,8 +451,11 @@ struct HeaderProbe {
     /// type-`0x00` payload is really ciphertext or whether a NAL start code is
     /// visible in the clear.
     payload_dumps: [u8; 256],
+    /// `receiver monotonic ns - sender stamp ns`, one per stamped packet. Only the differences
+    /// between these are meaningful; the constant epoch offset is folded out at report time.
     deltas: Vec<i64>,
     big_endian: Option<bool>,
+    started: Instant,
 }
 
 /// How many packets of each type get dumped when the probe is on.
@@ -322,6 +478,7 @@ impl HeaderProbe {
             payload_dumps: [DUMPS_PER_TYPE; 256],
             deltas: Vec::new(),
             big_endian: None,
+            started: Instant::now(),
         }
     }
 
@@ -329,7 +486,7 @@ impl HeaderProbe {
         if !self.enabled {
             return;
         }
-        let now = ntp_now();
+        let now = self.started.elapsed().as_nanos() as i128;
         let kind = header[4] as usize;
 
         if self.header_dumps[kind] > 0 {
@@ -350,15 +507,19 @@ impl HeaderProbe {
             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
         ]);
 
-        // The byte order of the timestamp is not something we can look up with
-        // confidence, so it is decided empirically once: whichever reading puts
-        // the capture instant in the recent past is the right one.
+        // Stream reports carry zeros here; only video and codec data are stamped.
+        if le == 0 {
+            return;
+        }
+
+        // The byte order is not something to look up with confidence, so it is decided once, on
+        // the evidence: one reading is a sane number of seconds of uptime, the other is a decade.
         let big_endian = match self.big_endian {
             Some(v) => v,
             None => {
-                let pick = if plausible(ntp_delta_ns(now, be)) {
+                let pick = if plausible_sender_seconds(be) {
                     Some(true)
-                } else if plausible(ntp_delta_ns(now, le)) {
+                } else if plausible_sender_seconds(le) {
                     Some(false)
                 } else {
                     None
@@ -366,20 +527,20 @@ impl HeaderProbe {
                 let Some(pick) = pick else {
                     return;
                 };
+                let chosen = if pick { be } else { le };
                 tprintln!(
-                    "[airplay] mirror capture timestamps read as {}-endian NTP",
-                    if pick { "big" } else { "little" }
+                    "[airplay] mirror capture stamps read as {}-endian NTP fixed point, {} s into \
+                     the sender's own epoch",
+                    if pick { "big" } else { "little" },
+                    chosen >> 32
                 );
                 self.big_endian = Some(pick);
                 pick
             }
         };
 
-        let delta = ntp_delta_ns(now, if big_endian { be } else { le });
-        if !plausible(delta) {
-            return;
-        }
-        self.deltas.push(delta);
+        let sender = ntp_fixed_to_ns(if big_endian { be } else { le });
+        self.deltas.push((now - sender) as i64);
         if self.deltas.len() >= SAMPLE_BATCH {
             self.report();
         }
@@ -406,14 +567,20 @@ impl HeaderProbe {
     fn report(&mut self) {
         self.deltas.sort_unstable();
         let n = self.deltas.len();
-        let at = |q: f64| self.deltas[((n as f64 * q) as usize).min(n - 1)];
+        // The epoch offset between the sender's clock and ours is constant and unknown, so the
+        // fastest frame in the batch is the zero. Everything reported is *excess over best case*,
+        // not an absolute latency, and saying so in the line matters: an absolute number here
+        // would be a fabrication.
+        let floor = self.deltas[0];
+        let at = |q: f64| self.deltas[((n as f64 * q) as usize).min(n - 1)] - floor;
         tprintln!(
-            "[airplay] macOS compositor-to-consumer latency over {n} frames: \
-             p50 {:.2}ms p90 {:.2}ms p99 {:.2}ms max {:.2}ms",
+            "[airplay] macOS compose-to-consumer spread over {n} frames (excess over the fastest \
+             frame in the batch; the absolute floor needs AirPlay's NTP sync, which we do not \
+             implement): p50 {:.2}ms p90 {:.2}ms p99 {:.2}ms max {:.2}ms",
             at(0.50) as f64 / 1e6,
             at(0.90) as f64 / 1e6,
             at(0.99) as f64 / 1e6,
-            self.deltas[n - 1] as f64 / 1e6,
+            (self.deltas[n - 1] - floor) as f64 / 1e6,
         );
         self.deltas.clear();
     }
@@ -646,15 +813,59 @@ mod tests {
         assert_eq!(s.packets.load(Ordering::Relaxed), 9);
     }
 
+    /// The bytes are from a real header on 10.15.8, little-endian, 41457 seconds into the
+    /// sender's own epoch while the machine had been up fourteen hours. Read the other way round
+    /// the same eight bytes are eleven and a half years, which is what makes the byte order
+    /// decidable without a specification.
     #[test]
-    fn ntp_round_trips_through_the_delta() {
-        let now = ntp_now();
-        assert!(plausible(ntp_delta_ns(now, now)));
-        // 20 ms earlier in NTP fixed point.
-        let then = now - ((20u64 << 32) / 1000);
-        let d = ntp_delta_ns(now, then);
-        assert!((19_000_000..21_000_000).contains(&d), "{d}");
-        // A timestamp read with the wrong byte order lands nowhere near now.
-        assert!(!plausible(ntp_delta_ns(now, now.swap_bytes())));
+    fn the_capture_stamp_byte_order_is_decidable_from_one_sample() {
+        let raw = [0x15u8, 0xb0, 0x57, 0x32, 0xf1, 0xa1, 0x00, 0x00];
+        let le = u64::from_le_bytes(raw);
+        let be = u64::from_be_bytes(raw);
+        assert_eq!(le >> 32, 41457);
+        assert!(plausible_sender_seconds(le));
+        assert!(!plausible_sender_seconds(be));
+        assert_eq!(ntp_fixed_to_ns(1u64 << 32), 1_000_000_000);
+    }
+
+    #[test]
+    fn a_property_list_is_found_inside_a_larger_payload() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("rttAvg".to_string(), plist::Value::Real(0.0031));
+        dict.insert("bytes".to_string(), plist::Value::Integer(4096.into()));
+        let mut encoded = Vec::new();
+        plist::to_writer_binary(&mut encoded, &plist::Value::Dictionary(dict)).unwrap();
+        let exact = encoded.len();
+
+        // The real payload is the plist plus a trailer several hundred times its size.
+        let mut payload = encoded.clone();
+        payload.extend(std::iter::repeat_n(0xABu8, 25_000));
+
+        assert_eq!(binary_plist_len(&payload), Some(exact));
+        assert!(plist::from_bytes::<plist::Value>(&payload).is_err());
+        assert!(plist::from_bytes::<plist::Value>(&payload[..exact]).is_ok());
+        assert_eq!(binary_plist_len(b"not a plist at all, really"), None);
+    }
+
+    #[test]
+    fn scalars_are_flattened_with_their_paths() {
+        let mut inner = plist::Dictionary::new();
+        inner.insert("VrttAvg".to_string(), plist::Value::Real(1.5));
+        let mut outer = plist::Dictionary::new();
+        outer.insert("stats".to_string(), plist::Value::Dictionary(inner));
+        outer.insert("name".to_string(), plist::Value::String("mirror".into()));
+
+        let mut numbers = Vec::new();
+        collect_scalars(
+            &plist::Value::Dictionary(outer.clone()),
+            "",
+            &mut numbers,
+            false,
+        );
+        assert_eq!(numbers, vec!["stats.VrttAvg=1.500".to_string()]);
+
+        let mut everything = Vec::new();
+        collect_scalars(&plist::Value::Dictionary(outer), "", &mut everything, true);
+        assert_eq!(everything.len(), 2);
     }
 }
