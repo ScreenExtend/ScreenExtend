@@ -17,7 +17,7 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 
 use crate::streamer::audio::{
-    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioStopFn,
+    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioSink, AudioStopFn,
     FLAG_DISCONTINUITY, FLAG_SILENT,
 };
 use opus_encoder::{OpusEncoder, OpusEncoderConfig, FRAME_INTERLEAVED};
@@ -130,7 +130,7 @@ fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {
     }
 }
 
-pub fn start_capture() -> Result<AudioCapture> {
+pub fn start_capture(pkt_sink: AudioSink) -> Result<AudioCapture> {
     let candidates = capable_backends();
     if candidates.is_empty() {
         let ver = os_version();
@@ -157,7 +157,6 @@ pub fn start_capture() -> Result<AudioCapture> {
         consumer_thread: consumer_thread_lock,
     };
 
-    let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<i32>>();
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -171,7 +170,7 @@ pub fn start_capture() -> Result<AudioCapture> {
                 sink,
                 consumer,
                 ctrl_rx,
-                pkt_tx,
+                pkt_sink,
                 diag_thread,
                 stop_thread,
                 ready_tx,
@@ -200,7 +199,6 @@ pub fn start_capture() -> Result<AudioCapture> {
     });
 
     Ok(AudioCapture {
-        rx: pkt_rx,
         stop: stop_fn,
         format: AudioFormat {
             sample_rate: 48_000,
@@ -217,7 +215,7 @@ fn worker(
     sink: AudioFrameSink,
     consumer: ring::Consumer,
     ctrl_rx: crossbeam_channel::Receiver<ControlMsg>,
-    pkt_tx: crossbeam_channel::Sender<AudioPacket>,
+    pkt_sink: AudioSink,
     diagnostics: Arc<AudioDiagnostics>,
     stop: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::Sender<Result<i32>>,
@@ -311,10 +309,7 @@ fn worker(
             diagnostics
                 .capture_to_packet
                 .record_span(pkt.capture_ns, host_now_ns());
-            if pkt_tx.send(pkt).is_err() {
-                backend.stop();
-                return;
-            }
+            pkt_sink.send(pkt);
             seq = seq.wrapping_add(1);
             produced = true;
         }
