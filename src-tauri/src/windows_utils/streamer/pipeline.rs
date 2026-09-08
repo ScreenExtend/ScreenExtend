@@ -457,7 +457,8 @@ fn start_live_capture(
             wake_rx,
             telemetry,
         },
-    );
+    )
+    .with_gpu_preference(super::capture_gpu_preference(effective_vendor(cfg)));
 
     tprintln!(
         "pipeline: starting live monitor capture (WGC): \
@@ -2039,6 +2040,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         None
                     };
 
+                    super::report_adapter_pairing(&ctx.adapter, Some(encoder.device()));
                     telemetry.encoder.set("nvenc-zero-copy-ring".into());
                     let ring = AsyncNvencRing::new(
                         encoder,
@@ -2124,6 +2126,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             tuning::raise_d3d11_gpu_priority(dev);
         }
 
+        super::report_adapter_pairing(&ctx.adapter, backend.device());
         let path_name = backend.name();
         telemetry.encoder.set(path_name.into());
         let core = Arc::new(Mutex::new(EncodeCore {

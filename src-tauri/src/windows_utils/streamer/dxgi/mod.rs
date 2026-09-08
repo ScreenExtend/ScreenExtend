@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 
+use crate::windows_capture::d3d11::AdapterInfo;
 use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
 
 const REDUP_MAX_RETRIES: u32 = 40;
@@ -93,14 +94,28 @@ fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_O
             };
             let name = wide_to_string(&desc.DeviceName);
             if name == device_name {
-                let adapter_desc = unsafe { adapter.GetDesc1() }.ok();
-                tprintln!(
-                    "dxgi: output {} found on adapter '{}'",
-                    name,
-                    adapter_desc
-                        .map(|d| wide_to_string(&d.Description))
-                        .unwrap_or_else(|| "<unknown>".into()),
-                );
+                // Duplication is adapter-local, so this is not a choice — but it is worth
+                // saying which GPU it landed on, and shouting when that GPU is a software
+                // rasteriser. Before IddCx 1.4 the OS composed an indirect display on the POST
+                // adapter, or on WARP when the POST adapter was PnpStopped, and the bundled
+                // driver declares IddCx 1.2. A WARP-composed virtual display means every frame
+                // of it is rendered on the CPU that is also running the encoder.
+                match unsafe { adapter.GetDesc1() } {
+                    Ok(d) => {
+                        let info = AdapterInfo::from_dxgi_desc1(&d);
+                        if info.software {
+                            teprintln!(
+                                "dxgi: output {name} is composed by a SOFTWARE rasteriser -- {}. \
+                                 Expect very high latency and CPU use; the POST adapter is \
+                                 probably stopped",
+                                info.label()
+                            );
+                        } else {
+                            tprintln!("dxgi: output {name} found on adapter {}", info.label());
+                        }
+                    }
+                    Err(_) => tprintln!("dxgi: output {name} found on an undescribed adapter"),
+                }
                 let output1: IDXGIOutput1 = output
                     .cast()
                     .context("IDXGIOutput as IDXGIOutput1 (needs DXGI 1.2+)")?;

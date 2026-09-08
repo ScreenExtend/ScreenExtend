@@ -4,7 +4,7 @@ use windows::Win32::Foundation::HANDLE;
 pub fn apply_process_tuning() {
     #[cfg(windows)]
     {
-        prefer_high_performance_gpu();
+        raise_gpu_scheduling_priority_class();
         raise_timer_resolution();
         honor_timer_resolution_in_background();
         exempt_from_power_throttling();
@@ -12,38 +12,46 @@ pub fn apply_process_tuning() {
     }
 }
 
+/// Asks the GPU scheduler to treat this process as real-time.
+///
+/// `IDXGIDevice::SetGPUThreadPriority` — which we also call, per device — turned out not to be
+/// enough on its own: OBS added exactly this call (commit `ec769ef`, "libobs-d3d11: Set maximum
+/// GPU priority") because capture was still being deprioritised underneath a full-screen game.
+/// It is per-process, so one call at startup covers every device created later, which matters
+/// because we create a capture device and an encoder device per client.
+///
+/// Resolved by `GetProcAddress`: it lives in gdi32 but is not in any import library, and a
+/// non-zero NTSTATUS is a reason to carry on, not to fail.
 #[cfg(windows)]
-fn prefer_high_performance_gpu() {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+fn raise_gpu_scheduling_priority_class() {
+    use windows::core::s;
+    use windows::Win32::Foundation::HANDLE as WinHandle;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows::Win32::System::Threading::GetCurrentProcess;
 
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            teprintln!("[gpu] could not resolve current exe for GPU preference: {e}");
-            return;
-        }
+    /// `D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME`, the top of the Idle..Realtime scale.
+    const REALTIME: u32 = 5;
+
+    type SetPriorityClassFn = unsafe extern "system" fn(WinHandle, u32) -> i32;
+
+    let Ok(gdi32) = (unsafe { GetModuleHandleA(s!("gdi32.dll")) }) else {
+        teprintln!("[gpu] gdi32 not loaded; skipping GPU scheduling priority");
+        return;
     };
-    let exe_path = exe.to_string_lossy().into_owned();
-
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = match hkcu.create_subkey(r"Software\Microsoft\DirectX\UserGpuPreferences") {
-        Ok((k, _)) => k,
-        Err(e) => {
-            teprintln!("[gpu] opening UserGpuPreferences failed: {e}");
-            return;
-        }
+    let Some(proc) =
+        (unsafe { GetProcAddress(gdi32, s!("D3DKMTSetProcessSchedulingPriorityClass")) })
+    else {
+        tprintln!("[gpu] D3DKMTSetProcessSchedulingPriorityClass unavailable; skipping");
+        return;
     };
-
-    const HIGH_PERFORMANCE: &str = "GpuPreference=2;";
-    if let Ok(existing) = key.get_value::<String, _>(&exe_path) {
-        if existing == HIGH_PERFORMANCE {
-            tprintln!("[gpu] high-performance GPU preference already set for {exe_path}");
-            return;
-        }
-    }
-    match key.set_value(&exe_path, &HIGH_PERFORMANCE) {
-        Ok(()) => tprintln!("[gpu] set high-performance GPU preference for {exe_path}"),
-        Err(e) => teprintln!("[gpu] setting high-performance GPU preference failed: {e}"),
+    let set: SetPriorityClassFn = unsafe { std::mem::transmute(proc) };
+    let status = unsafe { set(GetCurrentProcess(), REALTIME) };
+    if status == 0 {
+        tprintln!("[gpu] GPU scheduling priority class raised to REALTIME");
+    } else {
+        teprintln!(
+            "[gpu] D3DKMTSetProcessSchedulingPriorityClass(REALTIME) -> NTSTATUS 0x{status:08X}"
+        );
     }
 }
 
