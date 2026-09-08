@@ -48,7 +48,7 @@ its reason:
 
 ```
 [capture] ScreenCaptureKit failed to start for display 1: <reason>; falling back to CGDisplayStream
-[sck] no frame within 1500ms of startCapture; treating ScreenCaptureKit as unusable on this display
+[sck] no frame within 1500 ms of startCapture; treating ScreenCaptureKit as unusable on display 1
 ```
 
 The second line is the frame-level probe. ScreenCaptureKit on 12.3 is reported by
@@ -171,13 +171,35 @@ and harmless.
 Under load (drag a video around the extended display for a minute), watch for:
 
 ```
-[vt] holding frames back: 2 in flight, 1 skipped so far
+[vt] frames in flight reached 2 (VideoToolbox reports Some(2) pending)
+[vt] no output for 100 ms with 2 frame(s) in flight; this encoder holds frames, so the in-flight cap stands aside up to 16
 [vt] the drain thread fell behind; 1 encoded frame(s) discarded, forcing an IDR
+[vt] encode loop finished: max 2 frame(s) in flight, 0 capture(s) skipped for back-pressure
 ```
 
-The first is normal and self-correcting — it is the cap that stops VideoToolbox
-accumulating a queue nothing can see. The second should be rare; if it is frequent,
-the drain thread is losing to something and that is a finding.
+The first is the depth gauge; it prints only when a new maximum is reached, next to
+VideoToolbox's own count of what it holds. **The two should agree.** If they do not,
+the encoder is holding frames for a reason of its own and no external cap will help
+— write that down, it is the single most diagnostic disagreement on this path.
+
+The second line is the one that tells you which kind of encoder this Mac gave you.
+On a low-latency (`…rtvc`) session it should never appear. On the 10.15 dev box it
+appears immediately, because that encoder structurally holds frames — which is why
+the cap yields rather than deadlocking.
+
+The third should be rare; if it is frequent, the drain thread is losing to something
+and that is a finding.
+
+**Record**: whether the stall-bypass line appears, and the final `max N frame(s) in
+flight` from the summary. Capture-side, the matching number is on the stop line:
+
+```
+[cgds] capture stopped: 366 frames published, 0 dropped by WindowServer, 41000 ns mean in the delivery callback
+```
+
+`dropped by WindowServer` above zero on a quiet screen means the surfaces we hold
+are starving the stream — check the queue depth. The callback mean is the whole
+per-frame cost this backend pays inside CoreGraphics' delivery queue.
 
 ## 8. What latency to expect
 
