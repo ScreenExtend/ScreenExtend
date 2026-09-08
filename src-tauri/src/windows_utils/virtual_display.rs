@@ -82,28 +82,42 @@ struct Inner {
     owned: Vec<Monitor>,
 }
 
-impl Inner {
-    fn commit(&mut self, monitors: Vec<Monitor>) -> Result<(), String> {
+#[derive(Debug)]
+pub struct WindowsVirtualDisplay {
+    inner: Mutex<Inner>,
+    /// Serialises driver round trips, so `inner` is never held across one.
+    ///
+    /// There is one named pipe, so commits are serial whatever we do; what this buys is that a
+    /// slow or wedged driver no longer stalls *readers* of the monitor list — the display-name
+    /// correlation on the join path, and `registered_refresh_rates` — behind a blocking mutex
+    /// held across a `RUNTIME.block_on`. The round trip is bounded (5 s connect, 2 s write) but
+    /// bounded is not short: `DISPLAY_ATTACH_TIMEOUT` is 5 s for the whole attach.
+    commit: Mutex<()>,
+}
+
+impl WindowsVirtualDisplay {
+    /// Send a monitor list to the driver without holding `inner` across the round trip.
+    ///
+    /// The caller must already hold `commit`, which is what makes reading `owned`, computing a
+    /// new list and storing it back atomic enough: no other commit can interleave.
+    fn commit_unlocked(&self, monitors: Vec<Monitor>) -> Result<(), String> {
+        // An independent client over the same connection, so `set_monitors` mutates a state of
+        // its own rather than the shared one — which is what lets the guard go before the wait.
+        let mut client = self.inner.lock().unwrap().client.duplicate();
         let started = Instant::now();
-        self.client
+        let result = client
             .set_monitors(&monitors)
-            .map_err(|e| format!("set monitors: {e}"))?;
-        self.owned = monitors;
-        let result = self
-            .client
-            .notify()
-            .map_err(|e| format!("notify driver: {e}"));
+            .map_err(|e| format!("set monitors: {e}"))
+            .and_then(|()| client.notify().map_err(|e| format!("notify driver: {e}")));
         let elapsed = started.elapsed();
         if elapsed >= SLOW_COMMIT {
             tprintln!("[virtual-display] driver commit took {elapsed:?}");
         }
+        if result.is_ok() {
+            self.inner.lock().unwrap().owned = monitors;
+        }
         result
     }
-}
-
-#[derive(Debug)]
-pub struct WindowsVirtualDisplay {
-    inner: Mutex<Inner>,
 }
 
 impl WindowsVirtualDisplay {
@@ -136,6 +150,7 @@ impl WindowsVirtualDisplay {
                 client,
                 owned: Vec::new(),
             }),
+            commit: Mutex::new(()),
         }))
     }
 
@@ -380,8 +395,10 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         refresh_rate: u32,
         extra_modes: &[(u32, u32)],
     ) -> Result<u32, String> {
-        let mut inner = self.inner.lock().unwrap();
-        let mut monitors = inner.owned.clone();
+        // Held for the whole allocate-commit-record sequence, so no other commit can hand out
+        // the same id; `inner` itself is taken only for the moments that touch its fields.
+        let _commit = self.commit.lock().unwrap();
+        let mut monitors = self.inner.lock().unwrap().owned.clone();
         let id = (0u32..)
             .find(|candidate| !monitors.iter().any(|m| m.id == *candidate))
             .ok_or_else(|| "no free display id".to_string())?;
@@ -442,7 +459,7 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
             name: Some(name),
             modes,
         });
-        inner.commit(monitors)?;
+        self.commit_unlocked(monitors)?;
         Ok(id)
     }
 
@@ -470,19 +487,21 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
     }
 
     fn remove_display(&self, id: u32) {
-        let mut inner = self.inner.lock().unwrap();
-        let mut monitors = inner.owned.clone();
+        let _commit = self.commit.lock().unwrap();
+        let mut monitors = self.inner.lock().unwrap().owned.clone();
         monitors.retain(|m| m.id != id);
-        if let Err(e) = inner.commit(monitors) {
+        if let Err(e) = self.commit_unlocked(monitors) {
             teprintln!("virtual_display: remove({id}) failed: {e}");
         }
     }
 
     fn remove_all_displays(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.client.remove_all();
-        inner.owned.clear();
-        if let Err(e) = inner.client.notify() {
+        let _commit = self.commit.lock().unwrap();
+        let mut client = self.inner.lock().unwrap().client.duplicate();
+        client.remove_all();
+        let result = client.notify();
+        self.inner.lock().unwrap().owned.clear();
+        if let Err(e) = result {
             teprintln!("virtual_display: notify after remove_all failed: {e:?}");
         }
     }

@@ -65,6 +65,13 @@ const TOUCH_MASK_CONTACTAREA: u32 = 0x0000_0001;
 const TOUCH_MASK_ORIENTATION: u32 = 0x0000_0002;
 const TOUCH_MASK_PRESSURE: u32 = 0x0000_0004;
 
+/// Windows needs no permission to synthesize input into its own session, so the tier is
+/// constant. The pen/touch degradation to mouse is reported by `Injector::new` instead: it is a
+/// property of the session, not of the host.
+pub fn probe() -> super::InputBackend {
+    super::InputBackend::SendInput
+}
+
 pub fn boost_thread() {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -141,12 +148,12 @@ impl Injector {
         // The scancode table is layout-neutral, so nothing here depends on the client platform.
         let ClientProfile { device_name, .. } = client;
         let pen_dev = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }
-            .map_err(|e| log::warn!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
+            .map_err(|e| teprintln!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
             .ok();
         let touch_dev = unsafe {
             CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_COUNT, POINTER_FEEDBACK_DEFAULT)
         }
-        .map_err(|e| log::warn!("synthetic touch device unavailable, degrading touch→mouse: {e}"))
+        .map_err(|e| teprintln!("synthetic touch device unavailable, degrading touch→mouse: {e}"))
         .ok();
         Injector {
             virt: VirtualScreen::query(),
@@ -190,7 +197,7 @@ impl Injector {
             );
             if resolved != self.target {
                 if let Some(r) = resolved {
-                    log::info!(
+                    tprintln!(
                         "remote-input geometry: display {name} at ({},{}) {}x{}; desktop origin ({},{})",
                         r.left, r.top, r.width, r.height, self.virt.left, self.virt.top
                     );
@@ -719,7 +726,7 @@ impl Injector {
 
     fn clipboard(&mut self, op: u8, mime: &str, data: &[u8]) {
         if set_clipboard(mime, data) {
-            log::info!("clipboard set ({mime}, {} bytes, op={op})", data.len());
+            tprintln!("clipboard set ({mime}, {} bytes, op={op})", data.len());
             if op == 2 {
                 self.paste_hotkey();
             }
@@ -744,7 +751,7 @@ impl Injector {
         }
         let dir = std::env::temp_dir().join("input-bridge-drop");
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            log::warn!("drop: cannot create temp dir {dir:?}: {e}");
+            teprintln!("drop: cannot create temp dir {dir:?}: {e}");
             return;
         }
         let mut wide: Vec<u16> = Vec::new();
@@ -756,7 +763,7 @@ impl Injector {
                 .unwrap_or_else(|| std::ffi::OsString::from(format!("drop-{i}.bin")));
             let path = dir.join(&fname);
             if let Err(e) = std::fs::write(&path, &it.data) {
-                log::warn!("drop: write {path:?} failed: {e}");
+                teprintln!("drop: write {path:?} failed: {e}");
                 continue;
             }
             wide.extend(path.as_os_str().encode_wide());
@@ -774,7 +781,7 @@ impl Injector {
             let h = match GlobalAlloc(GHND, bytes) {
                 Ok(h) => h,
                 Err(e) => {
-                    log::warn!("drop: GlobalAlloc failed: {e}");
+                    teprintln!("drop: GlobalAlloc failed: {e}");
                     return;
                 }
             };
@@ -797,9 +804,9 @@ impl Injector {
             let _ = GlobalUnlock(h);
 
             match PostMessageW(Some(hwnd), WM_DROPFILES, WPARAM(h.0 as usize), LPARAM(0)) {
-                Ok(_) => log::info!("posted WM_DROPFILES ({count} file(s)) to target window"),
+                Ok(_) => tprintln!("posted WM_DROPFILES ({count} file(s)) to target window"),
                 Err(e) => {
-                    log::warn!("drop: PostMessage WM_DROPFILES failed: {e}");
+                    teprintln!("drop: PostMessage WM_DROPFILES failed: {e}");
                     let _ = GlobalFree(Some(h));
                 }
             }
@@ -1001,7 +1008,7 @@ fn send_inputs(inputs: &[INPUT]) {
     }
     let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
-        log::warn!("SendInput inserted {sent}/{} events", inputs.len());
+        teprintln!("SendInput inserted {sent}/{} events", inputs.len());
     }
 }
 
@@ -1011,7 +1018,7 @@ fn inject_pointer(dev: HSYNTHETICPOINTERDEVICE, frame: &[POINTER_TYPE_INFO]) {
         return;
     }
     if let Err(e) = unsafe { InjectSyntheticPointerInput(dev, frame) } {
-        log::warn!("InjectSyntheticPointerInput failed: {e}");
+        teprintln!("InjectSyntheticPointerInput failed: {e}");
     }
 }
 
