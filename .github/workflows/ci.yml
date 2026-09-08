@@ -1,0 +1,364 @@
+name: ci
+
+# The previous ci.yml was added and deleted 4m13s apart in 2026-08 and never ran once, so
+# treat everything here as new configuration rather than a restoration. Two things it did
+# not have and needs: the macOS runners are the only machines in the project where
+# ScreenCaptureKit (12.3+), the Core Audio process tap (14.2+) and VideoToolbox low-latency
+# (11.0+) can execute at all — the dev Mac is 10.15 — and nothing anywhere checked the
+# shipped binary against the 10.15 dyld floor, which is a load failure, not a lost feature.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Cargo does not need the interactive incremental cache in CI and it is a large part of
+  # what the rust-cache action has to store.
+  CARGO_INCREMENTAL: 0
+  PNPM_VERSION: 10.26.1
+
+jobs:
+  # ---------------------------------------------------------------- frontend
+  # The desktop UI has to keep parsing in the WKWebView that ships with the 10.15 floor
+  # (Safari 13.1), which is what check-legacy-webkit.mjs re-derives from dist/ after the
+  # build. It is cheap and OS-independent, so it runs once on ubuntu rather than three
+  # times in the matrix.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: eslint
+        run: pnpm lint
+
+      - name: tsc + vite build
+        run: pnpm build
+
+      - name: Safari 13.1 floor (dist/)
+        run: node scripts/check-legacy-webkit.mjs
+
+      - name: client stats harness
+        run: node scripts/test-client-stats.mjs
+
+  # ---------------------------------------------------------------- rust gates
+  # `pnpm build` first because tauri_build embeds ../dist at compile time, so even
+  # `cargo check` fails without it.
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-13, macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: build the frontend (tauri_build embeds it)
+        run: pnpm build
+
+      - name: cargo fmt
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Includes the hand-written FFI layout tests (nvenc_layout, amd_layout, intel), which
+      # are the only thing asserting those ABIs — the AMD backend has never encoded a frame.
+      - name: cargo test
+        working-directory: src-tauri
+        # `a_display_name_resolves_only_to_a_live_display` calls CGMainDisplayID and needs a
+        # real console session; it is skipped rather than deleted so the gating decision
+        # stays visible. W15 owns turning this into a proper ignore/feature gate.
+        run: cargo test -- --skip a_display_name_resolves_only_to_a_live_display
+
+  # ------------------------------------------------- macOS runtime smoke (modern tiers)
+  # The dev box is 10.15 Catalina, so these runners are the only place the 12.3+/13+/14.2+
+  # paths can actually run. macos-13 is Intel, macos-14 and macos-15 are Apple Silicon.
+  macos-smoke:
+    name: macos smoke (${{ matrix.os }})
+    needs: rust
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - name: build the host binary
+        working-directory: src-tauri
+        run: cargo build --bin ScreenExtend
+
+      # `doctor` reports the probed tiers. A hosted runner has no Screen Recording grant, so
+      # a required permission is legitimately missing and doctor exits 3 (DOCTOR_EXIT_PERMISSION)
+      # — the assertion is on the report, not the exit code. Exit 1 (unsupported OS) is a
+      # real failure and is caught below.
+      - name: doctor --json reports the probed backends
+        working-directory: src-tauri
+        run: |
+          set -o pipefail
+          code=0
+          ./target/debug/ScreenExtend doctor --json > doctor.json || code=$?
+          echo "doctor exit code: $code"
+          cat doctor.json
+          if [ "$code" = "1" ]; then
+            echo "::error::doctor reports this macOS is unsupported"
+            exit 1
+          fi
+          for field in '.os.name' '.os.version' '.os.supported' '.audioBackend' '.displayBackend'; do
+            value=$(jq -r "$field" doctor.json)
+            if [ -z "$value" ] || [ "$value" = "null" ]; then
+              echo "::error::doctor --json is missing $field"
+              exit 1
+            fi
+            echo "  $field = $value"
+          done
+          jq -e '.os.supported == true' doctor.json > /dev/null
+          # Runner OS -> the tier that must be picked. Anything lower means the probe is
+          # broken on that release, which is exactly what this job exists to catch.
+          jq -r '"probes: \(.macos.probes | tojson)"' doctor.json
+
+      - name: the probed audio tier matches the runner's macOS
+        working-directory: src-tauri
+        run: |
+          backend=$(jq -r '.audioBackend' doctor.json)
+          version=$(jq -r '.os.version' doctor.json)
+          echo "macOS $version selected audio backend: $backend"
+          # AudioBackend::as_str: process_tap (14.2+) > screencapturekit (13.0+) >
+          # virtual_device (10.15-12.x, driver installed) > needs_driver_install > unsupported.
+          case "${{ matrix.os }}" in
+            macos-13) want=screencapturekit ;;
+            macos-14|macos-15) want=process_tap ;;
+          esac
+          if [ "$backend" != "$want" ]; then
+            echo "::error::expected the $want tier on ${{ matrix.os }}, probe returned '$backend'"
+            exit 1
+          fi
+          echo "ok: $backend"
+
+      # VideoToolbox compression of synthetic frames — no display and no screen-recording
+      # grant needed, unlike the capture tests, which is why only the encoder module is run.
+      # These are #[ignore]d because they need real hardware; a runner has it.
+      - name: VideoToolbox encode (ignored tests)
+        working-directory: src-tauri
+        run: cargo test --lib macos_utils::streamer::encoder -- --ignored --nocapture
+
+  # ---------------------------------------------------------------- dyld floor
+  # One link-time reference to an API newer than 10.15 is bound by dyld before main(), so
+  # the app does not launch on Catalina at all — and it launches fine on every machine that
+  # could debug it. This is the gate for that.
+  dyld-floor:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # Release, because that is what ships and what dead-code elimination changes.
+      - name: cargo build --release
+        working-directory: src-tauri
+        run: cargo build --release --bin ScreenExtend
+
+      # ScreenCaptureKit.framework does not exist on 10.15, so an LC_LOAD_DYLIB for it is an
+      # unconditional launch failure. This costs nothing and needs no SDK, so it runs first
+      # and on its own.
+      - name: no framework newer than the floor is linked
+        working-directory: src-tauri
+        run: |
+          otool -L target/release/ScreenExtend | tee /tmp/otool-L.txt
+          if grep -qE 'ScreenCaptureKit|Symbols\.framework|MediaExtension' /tmp/otool-L.txt; then
+            echo "::error::the binary links a framework that is absent on macOS 10.15"
+            exit 1
+          fi
+
+      - name: deployment target is the declared floor
+        working-directory: src-tauri
+        run: |
+          otool -l target/release/ScreenExtend | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | tee /tmp/lc.txt
+          want=$(jq -r '.bundle.macOS.minimumSystemVersion' tauri.macos.conf.json)
+          # On an arm64 runner the slice legitimately records 11.0 — Apple Silicon postdates
+          # 10.15 — so accept the declared floor or 11.0, and nothing else.
+          if ! grep -qE "(minos|version) (${want}|11\.0)" /tmp/lc.txt; then
+            echo "::error::deployment target does not match minimumSystemVersion ${want}"
+            exit 1
+          fi
+
+      # The 10.15 SDK is not on any hosted runner. Read scripts/check-macos-dyld.sh: the .tbd
+      # stub index is the authoritative test and a newer SDK's stubs are a superset, so that
+      # half weakens; the header INTRO column still fails anything annotated as introduced
+      # after --floor, and that is the half that catches a newly linked framework API. Run
+      # the real 10.15 SDK check on the dev box (docs/dev-workflow.md) for the strong verdict.
+      - name: dyld floor (runner SDK, --floor 10.15)
+        run: |
+          sdk=$(xcrun --sdk macosx --show-sdk-path)
+          echo "checking against $sdk (SDK version $(xcrun --sdk macosx --show-sdk-version))"
+          bash scripts/check-macos-dyld.sh \
+            src-tauri/target/release/ScreenExtend "$sdk" --floor 10.15
+
+      - name: upload the symbol report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dyld-floor-report
+          path: |
+            /tmp/otool-L.txt
+            /tmp/lc.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- vendored blobs
+  # Both SHA256SUMS files and the blobs they cover are pinned checkout-independently by
+  # .gitattributes; this is the job that keeps them honest, and it is what both
+  # PROVENANCE.md files mean when they say "verified in CI".
+  blob-checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: src-tauri/resources
+        working-directory: src-tauri/resources
+        run: sha256sum -c SHA256SUMS
+
+      - name: src-tauri/binaries
+        working-directory: src-tauri/binaries
+        run: sha256sum -c SHA256SUMS
+
+  # ---------------------------------------------------------------- perf gate
+  # Compares the encoder's printed timings against ci/perf-baseline.json. A runner key with
+  # no committed baseline is reported, uploaded as an artifact and passed — see the readme
+  # block in that file for how to seed one. Hosted runners are shared VMs, so seed a key
+  # only from several runs, and expect to keep the tolerance loose.
+  #
+  # Windows only, and not because macOS does not matter: x264 is compiled into the Windows
+  # backend alone, and no macOS test prints a timing at all — the VideoToolbox tests assert
+  # bitstream structure and nothing else. Giving the VideoToolbox encoder the same
+  # `p95_encode=...us` line the x264 one already prints is what would extend this job to
+  # macos-15; until then a macOS entry here would be a green step measuring nothing.
+  perf-gate:
+    name: perf gate (${{ matrix.os }})
+    needs: rust
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # Release, because a debug encoder measures the debug profile and nothing else.
+      # x264 is the software fallback and the only encoder present on every machine, which
+      # is what makes it comparable run to run; the GPU encoders are measured on the dev
+      # boxes (docs/BASELINE.md), not here.
+      - name: measure
+        working-directory: src-tauri
+        shell: bash
+        run: cargo test --release --lib x264_encoder -- --nocapture | tee ../perf-run.txt
+
+      - name: compare against ci/perf-baseline.json
+        shell: bash
+        run: |
+          node scripts/perf-gate.mjs \
+            --key "ci-${{ matrix.os }}" \
+            --input perf-run.txt \
+            --out perf-observed-${{ matrix.os }}.json
+
+      - name: upload the observed numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-observed-${{ matrix.os }}
+          path: |
+            perf-run.txt
+            perf-observed-${{ matrix.os }}.json
+          if-no-files-found: ignore
