@@ -1008,6 +1008,7 @@ async fn start_session(
                 fallback_track: caps.wants_fallback_track,
                 redundancy: caps.redundancy,
                 link_loss: None, // wired in by `start_session`, which owns the BWE
+                locality,
                 hub: std::sync::Arc::clone(hub),
                 overrides: std::sync::Arc::clone(overrides),
                 device_key: client_ip.to_string(),

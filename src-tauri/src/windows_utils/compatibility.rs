@@ -371,6 +371,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         capture_backend: probes.capture_backend.to_string(),
         encoder_backend: probes.encoder.backend.to_string(),
         hosted_network_backend: probes.hosted_network.as_str().to_string(),
+        input_backend: crate::streamer::input::probe_backend().as_str().to_string(),
     }
 }
 
@@ -390,6 +391,7 @@ mod test {
         println!("display:        {}", report.display_backend);
         println!("audio:          {}", report.audio_backend);
         println!("hosted network: {}", report.hosted_network_backend);
+        println!("input:          {}", report.input_backend);
         for api in &report.unsupported_apis {
             println!("  [{}] {} - {}", api.severity, api.name, api.description);
         }

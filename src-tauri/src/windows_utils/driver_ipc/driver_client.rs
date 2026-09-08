@@ -18,6 +18,9 @@ pub struct DriverClient {
     client: Client,
     state_rx: watch::Receiver<Vec<Monitor>>,
     state: Vec<Monitor>,
+    /// The wire protocol this connection negotiated: 1 for the shipped driver, higher for one
+    /// that serves the versioned pipe. Read by callers deciding whether a newer command exists.
+    protocol: u32,
 }
 
 impl DriverClient {
@@ -32,21 +35,35 @@ impl DriverClient {
     ///
     /// `name` is ONLY the {name} portion of \\.\pipe\{name}.
     pub async fn new_with(name: &str) -> Result<Self, error::InitError> {
-        let client = Client::connect_to(name).await?;
+        let (client, protocol) = Client::connect_negotiated(name).await?;
 
         let current_state = client.request_state().await?;
 
         let (state_tx, state_rx) = watch::channel(current_state.clone());
 
-        let mut stream = client.receive_events();
+        let mut stream = client.receive_events_or_lag();
 
+        // The cache reader needs its own handle: a dropped `Changed` is exactly the moment the
+        // cache goes wrong, and asking the driver again is the only way back. Logging the gap
+        // and carrying on, as this used to, left `monitors()` disagreeing with the driver with
+        // no path to recovery — `refresh_state` reads this same cache.
+        let resync = client.clone();
         task::spawn(async move {
             while let Some(event) = stream.next().await {
-                if let Ok(EventCommand::Changed(value)) = event {
-                    if state_tx.send(value).is_err() {
-                        // Client was dropped, stop listening
-                        break;
-                    }
+                let value = match event {
+                    Ok(EventOrLag::Event(EventCommand::Changed(value))) => value,
+                    Ok(EventOrLag::Lagged(_)) => match resync.request_state().await {
+                        Ok(state) => state,
+                        Err(e) => {
+                            teprintln!("[driver-ipc] resync after dropped events failed: {e}");
+                            continue;
+                        }
+                    },
+                    Err(_) => continue,
+                };
+                if state_tx.send(value).is_err() {
+                    // Client was dropped, stop listening
+                    break;
                 }
             }
         });
@@ -55,6 +72,7 @@ impl DriverClient {
             client,
             state_rx,
             state: current_state,
+            protocol,
         })
     }
 
@@ -97,6 +115,11 @@ impl DriverClient {
         }
 
         None
+    }
+
+    /// The wire protocol this connection negotiated.
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol
     }
 
     /// Manually synchronize with the driver.
@@ -552,6 +575,7 @@ impl DriverClient {
             client: self.client.clone(),
             state_rx: self.state_rx.clone(),
             state: self.state.clone(),
+            protocol: self.protocol,
         }
     }
 }

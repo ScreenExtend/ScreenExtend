@@ -94,6 +94,8 @@ pub const MOUSE_DELTA_LEN: usize = 8;
 /// count. Both tails are optional; see `docs/INPUT-PROTOCOL.md`.
 pub const STAMP_LEN: usize = 8;
 pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
+/// A `u16` sequence number, appended past the stamp tail on the fast-channel frames.
+pub const SEQ_LEN: usize = 2;
 
 /// Read the trailing client stamp a v2 frame may carry at `at`, or 0 when it carries none.
 ///
@@ -103,6 +105,25 @@ pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
 #[inline]
 fn rd_stamp(b: &[u8], at: usize) -> u64 {
     rd_u64(b, at).unwrap_or(0)
+}
+
+/// Read the fast-channel sequence number a frame may carry at `at`.
+///
+/// Optional for the same reason the stamp is: a client that does not send it reads as `None`
+/// and the injector simply does not reorder-gate that session.
+#[inline]
+fn rd_seq(b: &[u8], at: usize) -> Option<u16> {
+    rd_u16(b, at)
+}
+
+/// Whether `seq` is newer than `last` in a wrapping `u16` space.
+///
+/// The comparison is the signed difference, so it stays correct across the wrap at 65535 as
+/// long as the two are less than half a space apart — which at one event per pointer sample is
+/// several minutes of continuous motion.
+#[inline]
+pub fn seq_is_newer(seq: u16, last: u16) -> bool {
+    (seq.wrapping_sub(last) as i16) > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,9 +139,13 @@ pub enum Phase {
 }
 
 impl Phase {
+    /// `None` for anything that is not one of the eight pointer opcodes.
+    ///
+    /// This used to fall through to `Phase::Move`, which turned a future protocol mistake into a
+    /// silently injected cursor move rather than a rejected frame.
     #[inline]
-    pub fn from_opcode(op: u8) -> Phase {
-        match op {
+    pub fn from_opcode(op: u8) -> Option<Phase> {
+        Some(match op {
             op::POINTER_DOWN => Phase::Down,
             op::POINTER_UP => Phase::Up,
             op::POINTER_MOVE => Phase::Move,
@@ -129,7 +154,55 @@ impl Phase {
             op::POINTER_LEAVE => Phase::Leave,
             op::POINTER_OVER => Phase::Over,
             op::POINTER_OUT => Phase::Out,
-            _ => Phase::Move,
+            _ => return None,
+        })
+    }
+}
+
+/// Why a frame did not decode.
+///
+/// Every one of these used to be `None`, so a client whose protocol had drifted from the host's
+/// produced a session where input silently did nothing. The opcode is carried on every variant
+/// because that is what the log line has to name to be actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParseError {
+    /// A zero-length message.
+    Empty,
+    /// A first byte no version of this protocol has ever defined.
+    UnknownOpcode(u8),
+    /// The frame is shorter than its own opcode requires.
+    Truncated { op: u8, need: usize, got: usize },
+    /// A length prefix pointed past the end of the frame, or a count was implausible.
+    BadLength(u8),
+    /// A string field was not valid UTF-8.
+    BadUtf8(u8),
+}
+
+impl ParseError {
+    pub fn opcode(self) -> Option<u8> {
+        match self {
+            Self::Empty => None,
+            Self::UnknownOpcode(op)
+            | Self::Truncated { op, .. }
+            | Self::BadLength(op)
+            | Self::BadUtf8(op) => Some(op),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "empty frame"),
+            Self::UnknownOpcode(op) => write!(f, "unknown opcode 0x{op:02x}"),
+            Self::Truncated { op, need, got } => {
+                write!(
+                    f,
+                    "opcode 0x{op:02x} truncated: need {need} bytes, got {got}"
+                )
+            }
+            Self::BadLength(op) => write!(f, "opcode 0x{op:02x} has a length prefix past the end"),
+            Self::BadUtf8(op) => write!(f, "opcode 0x{op:02x} carries invalid UTF-8"),
         }
     }
 }
@@ -311,11 +384,56 @@ pub struct Parsed {
     /// none. It rides the same client timebase as the `PING` stamp, so the host can measure how
     /// long the event spent in flight without the client having to report anything back.
     pub client_ns: u64,
+    /// The fast channel's per-session sequence number, when the frame carried one.
+    ///
+    /// The fast channel is unordered and zero-retransmit, so two moves can be delivered out of
+    /// order and the older one would walk the cursor backwards for a frame. `None` means the
+    /// client is older than the field and this session simply is not reorder-gated.
+    pub seq: Option<u16>,
 }
 
-pub fn parse(b: &[u8]) -> Option<Parsed> {
-    let opcode = *b.first()?;
+/// Length a frame of `op` must reach before its fixed part can be read at all.
+fn fixed_len(op: u8) -> Option<usize> {
+    Some(match op {
+        op::POINTER_DOWN
+        | op::POINTER_UP
+        | op::POINTER_MOVE
+        | op::POINTER_CANCEL
+        | op::POINTER_ENTER
+        | op::POINTER_LEAVE
+        | op::POINTER_OVER
+        | op::POINTER_OUT => POINTER_LEN,
+        op::POINTER_MOVE_BATCH => BATCH_HEADER,
+        op::WHEEL => WHEEL_LEN,
+        op::ZOOM => 5,
+        op::MOUSE_DELTA => MOUSE_DELTA_LEN,
+        op::KEY => 5,
+        op::TEXT_INPUT | op::COMPOSITION_UPDATE => 5,
+        op::CLIPBOARD => 6,
+        op::DRAG => 10,
+        op::DROP => 12,
+        op::RESIZE => 9,
+        op::FOCUS_STATE | op::VISIBILITY | op::POINTERLOCK_STATE => 2,
+        op::PING | op::PONG => 9,
+        op::STATS => CLIENT_STATS_LEN,
+        op::KEYFRAME_REQUEST => 1,
+        _ => return None,
+    })
+}
+
+pub fn parse(b: &[u8]) -> Result<Parsed, ParseError> {
+    let opcode = *b.first().ok_or(ParseError::Empty)?;
+    let need = fixed_len(opcode).ok_or(ParseError::UnknownOpcode(opcode))?;
+    if b.len() < need {
+        return Err(ParseError::Truncated {
+            op: opcode,
+            need,
+            got: b.len(),
+        });
+    }
+    let short = || ParseError::BadLength(opcode);
     let mut client_ns = 0u64;
+    let mut seq = None;
     let ev = match opcode {
         op::POINTER_DOWN
         | op::POINTER_UP
@@ -325,43 +443,50 @@ pub fn parse(b: &[u8]) -> Option<Parsed> {
         | op::POINTER_LEAVE
         | op::POINTER_OVER
         | op::POINTER_OUT => {
-            let ev = parse_pointer(b)?;
+            let ev = parse_pointer(b).ok_or_else(short)?;
             client_ns = rd_stamp(b, POINTER_LEN);
+            seq = rd_seq(b, POINTER_LEN + STAMP_LEN);
             ev
         }
-        op::POINTER_MOVE_BATCH => parse_pointer_batch(b, &mut client_ns)?,
+        op::POINTER_MOVE_BATCH => parse_pointer_batch(b, &mut client_ns, &mut seq)?,
         op::WHEEL => {
-            let ev = parse_wheel(b)?;
+            let ev = parse_wheel(b).ok_or_else(short)?;
             client_ns = rd_stamp(b, WHEEL_LEN);
+            seq = rd_seq(b, WHEEL_LEN + STAMP_LEN);
             ev
         }
-        op::ZOOM => parse_zoom(b)?,
-        op::MOUSE_DELTA => parse_mouse_delta(b, &mut client_ns)?,
+        op::ZOOM => parse_zoom(b).ok_or_else(short)?,
+        op::MOUSE_DELTA => {
+            let ev = parse_mouse_delta(b, &mut client_ns).ok_or_else(short)?;
+            seq = rd_seq(b, MOUSE_DELTA_LEN + 1 + STAMP_LEN);
+            ev
+        }
         op::KEY => parse_key(b, &mut client_ns)?,
         op::TEXT_INPUT | op::COMPOSITION_UPDATE => parse_text(b, opcode)?,
         op::CLIPBOARD => parse_clipboard(b)?,
-        op::DRAG => parse_drag(b)?,
+        op::DRAG => parse_drag(b).ok_or_else(short)?,
         op::DROP => parse_drop(b)?,
-        op::RESIZE => parse_resize(b)?,
-        op::FOCUS_STATE => InputEvent::Lifecycle(Lifecycle::Focus(*b.get(1)? != 0)),
-        op::VISIBILITY => InputEvent::Lifecycle(Lifecycle::Visibility(*b.get(1)? != 0)),
-        op::POINTERLOCK_STATE => InputEvent::Lifecycle(Lifecycle::PointerLock(*b.get(1)? != 0)),
+        op::RESIZE => parse_resize(b).ok_or_else(short)?,
+        op::FOCUS_STATE => InputEvent::Lifecycle(Lifecycle::Focus(b[1] != 0)),
+        op::VISIBILITY => InputEvent::Lifecycle(Lifecycle::Visibility(b[1] != 0)),
+        op::POINTERLOCK_STATE => InputEvent::Lifecycle(Lifecycle::PointerLock(b[1] != 0)),
         op::PING => InputEvent::Ping {
-            t_ns: rd_u64(b, 1)?,
+            t_ns: rd_u64(b, 1).ok_or_else(short)?,
         },
         op::PONG => InputEvent::Pong {
-            t_ns: rd_u64(b, 1)?,
+            t_ns: rd_u64(b, 1).ok_or_else(short)?,
         },
-        op::STATS => parse_client_stats(b)?,
+        op::STATS => parse_client_stats(b).ok_or_else(short)?,
         op::KEYFRAME_REQUEST => InputEvent::KeyframeRequest {
             reason: b.get(1).copied().unwrap_or(keyframe_reason::UNSPECIFIED),
         },
-        _ => return None,
+        _ => return Err(ParseError::UnknownOpcode(opcode)),
     };
-    Some(Parsed {
+    Ok(Parsed {
         ev,
         fast: is_fast(opcode),
         client_ns,
+        seq,
     })
 }
 
@@ -381,43 +506,56 @@ fn parse_pointer(b: &[u8]) -> Option<InputEvent> {
         w: rd_f32(b, 30)?,
         h: rd_f32(b, 34)?,
         buttons: rd_u16(b, 38)?,
-        phase: Phase::from_opcode(b[0]),
+        phase: Phase::from_opcode(b[0])?,
     })
 }
 
 const BATCH_HEADER: usize = 10;
 const SAMPLE_SIZE: usize = 24;
-fn parse_pointer_batch(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
-    let source = *b.get(1)?;
-    let id = rd_u32(b, 2)?;
-    let buttons = rd_u16(b, 6)?;
-    let count = rd_u16(b, 8)? as usize;
+fn parse_pointer_batch(
+    b: &[u8],
+    client_ns: &mut u64,
+    seq: &mut Option<u16>,
+) -> Result<InputEvent, ParseError> {
+    let bad = || ParseError::BadLength(op::POINTER_MOVE_BATCH);
+    let source = b[1];
+    let id = rd_u32(b, 2).ok_or_else(bad)?;
+    let buttons = rd_u16(b, 6).ok_or_else(bad)?;
+    let count = rd_u16(b, 8).ok_or_else(bad)? as usize;
     let need = BATCH_HEADER + count * SAMPLE_SIZE;
-    if count == 0 || b.len() < need {
-        return None;
+    if count == 0 {
+        return Err(bad());
+    }
+    if b.len() < need {
+        return Err(ParseError::Truncated {
+            op: op::POINTER_MOVE_BATCH,
+            need,
+            got: b.len(),
+        });
     }
     let mut samples = Vec::with_capacity(count);
     let mut o = BATCH_HEADER;
     for _ in 0..count {
         samples.push(MoveSample {
-            x: rd_f32(b, o)?,
-            y: rd_f32(b, o + 4)?,
-            pressure: rd_f32(b, o + 8)?,
-            tilt_x: rd_f32(b, o + 12)?,
-            tilt_y: rd_f32(b, o + 16)?,
-            twist: rd_f32(b, o + 20)?,
+            x: rd_f32(b, o).ok_or_else(bad)?,
+            y: rd_f32(b, o + 4).ok_or_else(bad)?,
+            pressure: rd_f32(b, o + 8).ok_or_else(bad)?,
+            tilt_x: rd_f32(b, o + 12).ok_or_else(bad)?,
+            tilt_y: rd_f32(b, o + 16).ok_or_else(bad)?,
+            twist: rd_f32(b, o + 20).ok_or_else(bad)?,
         });
         o += SAMPLE_SIZE;
     }
     let predicted = if b.len() >= need + BATCH_TAIL_LEN {
         *client_ns = rd_stamp(b, need);
+        *seq = rd_seq(b, need + BATCH_TAIL_LEN);
         // A client that claims more predictions than it sent samples is malformed; clamping
         // rather than rejecting keeps the real samples, which are still good.
         b[need + STAMP_LEN + 1].min(count as u8)
     } else {
         0
     };
-    Some(InputEvent::PointerBatch {
+    Ok(InputEvent::PointerBatch {
         source,
         id,
         buttons,
@@ -461,19 +599,23 @@ fn parse_mouse_delta(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     })
 }
 
-fn parse_key(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
-    let flags = *b.get(1)?;
-    let mods = rd_u16(b, 2)?;
-    let code_len = *b.get(4)? as usize;
+fn parse_key(b: &[u8], client_ns: &mut u64) -> Result<InputEvent, ParseError> {
+    let bad = || ParseError::BadLength(op::KEY);
+    let utf8 = || ParseError::BadUtf8(op::KEY);
+    let flags = b[1];
+    let mods = rd_u16(b, 2).ok_or_else(bad)?;
+    let code_len = b[4] as usize;
     let code_start = 5;
     let code_end = code_start + code_len;
-    let code = std::str::from_utf8(b.get(code_start..code_end)?).ok()?;
-    let key_len = *b.get(code_end)? as usize;
+    let code =
+        std::str::from_utf8(b.get(code_start..code_end).ok_or_else(bad)?).map_err(|_| utf8())?;
+    let key_len = *b.get(code_end).ok_or_else(bad)? as usize;
     let key_start = code_end + 1;
     let key_end = key_start + key_len;
-    let key = std::str::from_utf8(b.get(key_start..key_end)?).ok()?;
+    let key =
+        std::str::from_utf8(b.get(key_start..key_end).ok_or_else(bad)?).map_err(|_| utf8())?;
     *client_ns = rd_stamp(b, key_end);
-    Some(InputEvent::Key {
+    Ok(InputEvent::Key {
         down: flags & 0b01 != 0,
         repeat: flags & 0b10 != 0,
         mods,
@@ -482,27 +624,35 @@ fn parse_key(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     })
 }
 
-fn parse_text(b: &[u8], opcode: u8) -> Option<InputEvent> {
-    let len = rd_u32(b, 1)? as usize;
-    let text = b.get(5..5 + len)?;
-    Some(InputEvent::Text {
+fn parse_text(b: &[u8], opcode: u8) -> Result<InputEvent, ParseError> {
+    let len = rd_u32(b, 1).ok_or(ParseError::BadLength(opcode))? as usize;
+    let text = b
+        .get(5..5 + len)
+        .ok_or(ParseError::BadLength(opcode))?
+        .to_vec();
+    Ok(InputEvent::Text {
         composing: opcode == op::COMPOSITION_UPDATE,
-        s: String::from_utf8(text.to_vec()).ok()?,
+        s: String::from_utf8(text).map_err(|_| ParseError::BadUtf8(opcode))?,
     })
 }
 
-fn parse_clipboard(b: &[u8]) -> Option<InputEvent> {
-    let op = *b.get(1)?;
-    let mime_len = rd_u32(b, 2)? as usize;
+fn parse_clipboard(b: &[u8]) -> Result<InputEvent, ParseError> {
+    let bad = || ParseError::BadLength(op::CLIPBOARD);
+    let utf8 = || ParseError::BadUtf8(op::CLIPBOARD);
+    let op = b[1];
+    let mime_len = rd_u32(b, 2).ok_or_else(bad)? as usize;
     let mime_start = 6;
     let mime_end = mime_start + mime_len;
-    let mime = std::str::from_utf8(b.get(mime_start..mime_end)?)
-        .ok()?
+    let mime = std::str::from_utf8(b.get(mime_start..mime_end).ok_or_else(bad)?)
+        .map_err(|_| utf8())?
         .to_string();
-    let data_len = rd_u32(b, mime_end)? as usize;
+    let data_len = rd_u32(b, mime_end).ok_or_else(bad)? as usize;
     let data_start = mime_end + 4;
-    let data = b.get(data_start..data_start + data_len)?.to_vec();
-    Some(InputEvent::Clipboard { op, mime, data })
+    let data = b
+        .get(data_start..data_start + data_len)
+        .ok_or_else(bad)?
+        .to_vec();
+    Ok(InputEvent::Clipboard { op, mime, data })
 }
 
 fn parse_drag(b: &[u8]) -> Option<InputEvent> {
@@ -521,35 +671,45 @@ const DROP_ITEM_MIN: usize = 2 + 4 + 8 + 8;
 /// No real drag-and-drop carries more than this, and the count sizes a heap allocation.
 const MAX_DROP_ITEMS: usize = 256;
 
-fn parse_drop(b: &[u8]) -> Option<InputEvent> {
-    let x = rd_f32(b, 2)?;
-    let y = rd_f32(b, 6)?;
-    let count = rd_u16(b, 10)? as usize;
+fn parse_drop(b: &[u8]) -> Result<InputEvent, ParseError> {
+    let bad = || ParseError::BadLength(op::DROP);
+    let utf8 = || ParseError::BadUtf8(op::DROP);
+    let x = rd_f32(b, 2).ok_or_else(bad)?;
+    let y = rd_f32(b, 6).ok_or_else(bad)?;
+    let count = rd_u16(b, 10).ok_or_else(bad)? as usize;
     // The count sizes a `Vec<DropItem>` (~72 B each), so it has to be bounded by what the
     // message could actually contain before it is believed: a bare 12-byte header claiming
     // 65535 items would otherwise allocate ~4.7 MB and then fail on the first read.
-    if count > MAX_DROP_ITEMS || b.len() < 12usize.checked_add(count.checked_mul(DROP_ITEM_MIN)?)? {
-        return None;
+    let floor = count
+        .checked_mul(DROP_ITEM_MIN)
+        .and_then(|n| n.checked_add(12))
+        .ok_or_else(bad)?;
+    if count > MAX_DROP_ITEMS || b.len() < floor {
+        return Err(bad());
     }
     let mut items = Vec::with_capacity(count);
     let mut pos = 12usize;
     for _ in 0..count {
-        let name_len = rd_u16(b, pos)? as usize;
+        let name_len = rd_u16(b, pos).ok_or_else(bad)? as usize;
         pos += 2;
-        let name_end = pos.checked_add(name_len)?;
-        let name = std::str::from_utf8(b.get(pos..name_end)?).ok()?.to_string();
+        let name_end = pos.checked_add(name_len).ok_or_else(bad)?;
+        let name = std::str::from_utf8(b.get(pos..name_end).ok_or_else(bad)?)
+            .map_err(|_| utf8())?
+            .to_string();
         pos = name_end;
-        let mime_len = rd_u32(b, pos)? as usize;
+        let mime_len = rd_u32(b, pos).ok_or_else(bad)? as usize;
         pos += 4;
-        let mime_end = pos.checked_add(mime_len)?;
-        let mime = std::str::from_utf8(b.get(pos..mime_end)?).ok()?.to_string();
+        let mime_end = pos.checked_add(mime_len).ok_or_else(bad)?;
+        let mime = std::str::from_utf8(b.get(pos..mime_end).ok_or_else(bad)?)
+            .map_err(|_| utf8())?
+            .to_string();
         pos = mime_end;
-        let size = rd_u64(b, pos)?;
+        let size = rd_u64(b, pos).ok_or_else(bad)?;
         pos += 8;
-        let data_len = rd_u64(b, pos)? as usize;
+        let data_len = rd_u64(b, pos).ok_or_else(bad)? as usize;
         pos += 8;
-        let data_end = pos.checked_add(data_len)?;
-        let data = b.get(pos..data_end)?.to_vec();
+        let data_end = pos.checked_add(data_len).ok_or_else(bad)?;
+        let data = b.get(pos..data_end).ok_or_else(bad)?.to_vec();
         pos = data_end;
         items.push(DropItem {
             name,
@@ -558,7 +718,7 @@ fn parse_drop(b: &[u8]) -> Option<InputEvent> {
             data,
         });
     }
-    Some(InputEvent::Drop { x, y, items })
+    Ok(InputEvent::Drop { x, y, items })
 }
 
 fn parse_resize(b: &[u8]) -> Option<InputEvent> {
@@ -679,13 +839,18 @@ pub mod hostcap {
     pub const INPUT_TIMESTAMP: u16 = 1 << 3;
     /// Reads the `MOUSE_DELTA` flags byte, so reporting `unadjustedMovement` is worth doing.
     pub const INPUT_EVENT_FLAGS: u16 = 1 << 4;
+    /// Reads the optional fast-channel `u16` sequence and rejects a positional event whose
+    /// sequence is behind one already injected. A client that does not see this bit can skip
+    /// the two bytes; sending them to a host that ignores them costs nothing either way.
+    pub const INPUT_SEQUENCE: u16 = 1 << 5;
 }
 
 /// The bits this build sets. See `docs/INPUT-PROTOCOL.md`, "Host capabilities".
 pub const HOST_CAPABILITIES: u16 = hostcap::KEYFRAME_REQUEST
     | hostcap::STATS_V2
     | hostcap::INPUT_TIMESTAMP
-    | hostcap::INPUT_EVENT_FLAGS;
+    | hostcap::INPUT_EVENT_FLAGS
+    | hostcap::INPUT_SEQUENCE;
 
 /// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16]`.
 ///
@@ -829,8 +994,80 @@ mod tests {
 
     #[test]
     fn truncated_is_none() {
-        assert!(parse(&[op::POINTER_MOVE, 0, 0]).is_none());
-        assert!(parse(&[]).is_none());
+        assert!(parse(&[op::POINTER_MOVE, 0, 0]).is_err());
+        assert!(parse(&[]).is_err());
+    }
+
+    /// A rejection has to say *what* was wrong, or a client whose page has drifted from this
+    /// host build produces a session where input silently does nothing.
+    #[test]
+    fn every_rejection_names_its_reason() {
+        assert_eq!(parse(&[]).unwrap_err(), ParseError::Empty);
+        assert_eq!(parse(&[0xff]).unwrap_err(), ParseError::UnknownOpcode(0xff));
+        assert_eq!(
+            parse(&[op::POINTER_MOVE, 0, 0]).unwrap_err(),
+            ParseError::Truncated {
+                op: op::POINTER_MOVE,
+                need: POINTER_LEN,
+                got: 3,
+            }
+        );
+        // A text frame whose length prefix runs past the end, then one whose bytes are not
+        // UTF-8: the same opcode, two different answers.
+        let mut over = vec![op::TEXT_INPUT];
+        over.extend_from_slice(&99u32.to_le_bytes());
+        over.extend_from_slice(b"hi");
+        assert_eq!(
+            parse(&over).unwrap_err(),
+            ParseError::BadLength(op::TEXT_INPUT)
+        );
+
+        let mut bad = vec![op::TEXT_INPUT];
+        bad.extend_from_slice(&2u32.to_le_bytes());
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        assert_eq!(
+            parse(&bad).unwrap_err(),
+            ParseError::BadUtf8(op::TEXT_INPUT)
+        );
+    }
+
+    /// The eight pointer opcodes are the only ones that name a phase. Anything else used to
+    /// come back as `Move`, which would have turned a protocol mistake into an injected cursor
+    /// move rather than a rejection.
+    #[test]
+    fn only_pointer_opcodes_have_a_phase() {
+        assert_eq!(Phase::from_opcode(op::POINTER_DOWN), Some(Phase::Down));
+        assert_eq!(Phase::from_opcode(op::POINTER_OUT), Some(Phase::Out));
+        assert_eq!(Phase::from_opcode(op::WHEEL), None);
+        assert_eq!(Phase::from_opcode(op::KEY), None);
+        assert_eq!(Phase::from_opcode(0x00), None);
+    }
+
+    #[test]
+    fn the_fast_channel_sequence_number_is_optional_on_every_frame_that_carries_one() {
+        // Pointer: v1, then stamp, then stamp + seq.
+        let mut b = vec![0u8; POINTER_LEN];
+        b[0] = op::POINTER_MOVE;
+        assert_eq!(parse(&b).unwrap().seq, None);
+        b.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(parse(&b).unwrap().seq, None);
+        b.extend_from_slice(&4242u16.to_le_bytes());
+        assert_eq!(parse(&b).unwrap().seq, Some(4242));
+
+        // Mouse delta: v1 8 bytes, flags byte, stamp, seq.
+        let mut d = vec![0u8; MOUSE_DELTA_LEN];
+        d[0] = op::MOUSE_DELTA;
+        assert_eq!(parse(&d).unwrap().seq, None);
+        d.push(0);
+        d.extend_from_slice(&9u64.to_le_bytes());
+        d.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(parse(&d).unwrap().seq, Some(5));
+
+        // Batch: past the stamp + flags + predicted tail.
+        let mut f = batch_frame(2, Some((42, 0, 0)));
+        assert_eq!(parse(&f).unwrap().seq, None);
+        f.extend_from_slice(&1234u16.to_le_bytes());
+        assert_eq!(parse(&f).unwrap().seq, Some(1234));
     }
 
     #[test]
@@ -878,6 +1115,10 @@ mod tests {
             "the MOUSE_DELTA flags byte is read"
         );
         assert!(
+            caps & hostcap::INPUT_SEQUENCE != 0,
+            "the fast-channel sequence is read and reorder-gated"
+        );
+        assert!(
             caps & hostcap::UNRELIABLE_MOVE_CHANNEL == 0,
             "there is no second move channel; the fast one is already unordered"
         );
@@ -922,11 +1163,11 @@ mod tests {
         let mut short = vec![0u8; CLIENT_STATS_LEN - 1];
         short[0] = op::STATS;
         short[1] = CLIENT_STATS_VERSION;
-        assert!(parse(&short).is_none());
+        assert!(parse(&short).is_err());
 
         let mut v0 = vec![0u8; CLIENT_STATS_LEN];
         v0[0] = op::STATS;
-        assert!(parse(&v0).is_none());
+        assert!(parse(&v0).is_err());
     }
 
     #[test]
@@ -1161,10 +1402,10 @@ mod tests {
         let mut b = vec![0u8; 12];
         b[0] = op::DROP;
         b[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
-        assert!(parse(&b).is_none());
+        assert!(parse(&b).is_err());
 
         b[10..12].copy_from_slice(&((MAX_DROP_ITEMS + 1) as u16).to_le_bytes());
-        assert!(parse(&b).is_none());
+        assert!(parse(&b).is_err());
     }
 
     #[test]
@@ -1188,6 +1429,6 @@ mod tests {
     fn bye_carries_its_reason() {
         assert_eq!(build_bye(bye::KICKED), [op::BYE, bye::KICKED]);
         assert_eq!(build_bye(bye::HOST_EXIT), [op::BYE, bye::HOST_EXIT]);
-        assert!(parse(&build_bye(bye::HOST_EXIT)).is_none());
+        assert!(parse(&build_bye(bye::HOST_EXIT)).is_err());
     }
 }
