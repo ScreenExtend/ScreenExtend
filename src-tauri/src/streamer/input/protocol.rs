@@ -647,11 +647,44 @@ fn tail_u32(tail: &[u8], at: usize) -> u32 {
     rd_u32(tail, at).unwrap_or(0)
 }
 
-pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 17] {
-    let mut out = [0u8; 17];
+/// What this host understands, so a client can feature-detect instead of assuming.
+///
+/// Announced in the `PONG` tail, which every client already receives once a second. A host older
+/// than the tail sends 17 bytes and the client reads no bits, which is the correct answer for it.
+pub mod hostcap {
+    /// Parses `KEYFRAME_REQUEST` (`0x64`) and routes it to the encoder's IDR path.
+    pub const KEYFRAME_REQUEST: u16 = 1 << 0;
+    /// Reads the 96-byte v2 client stats frame, not only its v1 prefix.
+    pub const STATS_V2: u16 = 1 << 1;
+    /// Accepts a separate unordered/unreliable channel for pointer moves. Not implemented: the
+    /// existing `fast` channel is already unordered with `maxRetransmits: 0`, so there is
+    /// nothing for a second one to add. Reserved so the bit cannot be reused for anything else.
+    pub const UNRELIABLE_MOVE_CHANNEL: u16 = 1 << 2;
+    /// Reads the optional trailing client timestamp on the pointer, batch, wheel, key and
+    /// mouse-delta frames, and reports the resulting one-way delay as `input_recv`. A client
+    /// that does not see this bit can skip the eight bytes.
+    pub const INPUT_TIMESTAMP: u16 = 1 << 3;
+    /// Reads the `MOUSE_DELTA` flags byte, so reporting `unadjustedMovement` is worth doing.
+    pub const INPUT_EVENT_FLAGS: u16 = 1 << 4;
+}
+
+/// The bits this build sets. See `docs/INPUT-PROTOCOL.md`, "Host capabilities".
+pub const HOST_CAPABILITIES: u16 = hostcap::KEYFRAME_REQUEST
+    | hostcap::STATS_V2
+    | hostcap::INPUT_TIMESTAMP
+    | hostcap::INPUT_EVENT_FLAGS;
+
+/// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16]`.
+///
+/// The tail is appended, never inserted: bytes 0..17 are byte-identical to the previous form, so
+/// a client that reads only those keeps working, and one that reads past them learns what this
+/// host can do without a handshake.
+pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 19] {
+    let mut out = [0u8; 19];
     out[0] = op::PONG;
     out[1..9].copy_from_slice(&t_ns.to_le_bytes());
     out[9..17].copy_from_slice(&host_ns.to_le_bytes());
+    out[17..19].copy_from_slice(&HOST_CAPABILITIES.to_le_bytes());
     out
 }
 
@@ -805,6 +838,35 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(pong[9..17].try_into().unwrap()),
             987654321
+        );
+    }
+
+    #[test]
+    fn the_pong_tail_announces_what_this_host_understands() {
+        let pong = build_pong(1, 2);
+        // The v1 prefix has to stay byte-identical, or a client reading only it breaks.
+        assert_eq!(pong[0], op::PONG);
+        assert_eq!(u64::from_le_bytes(pong[1..9].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(pong[9..17].try_into().unwrap()), 2);
+
+        let caps = u16::from_le_bytes(pong[17..19].try_into().unwrap());
+        assert_eq!(caps, HOST_CAPABILITIES);
+        assert!(
+            caps & hostcap::KEYFRAME_REQUEST != 0,
+            "0x64 reaches request_idr"
+        );
+        assert!(caps & hostcap::STATS_V2 != 0, "the 96-byte tail is read");
+        assert!(
+            caps & hostcap::INPUT_TIMESTAMP != 0,
+            "client stamps become input_recv"
+        );
+        assert!(
+            caps & hostcap::INPUT_EVENT_FLAGS != 0,
+            "the MOUSE_DELTA flags byte is read"
+        );
+        assert!(
+            caps & hostcap::UNRELIABLE_MOVE_CHANNEL == 0,
+            "there is no second move channel; the fast one is already unordered"
         );
     }
 
