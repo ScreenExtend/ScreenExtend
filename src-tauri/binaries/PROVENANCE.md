@@ -26,6 +26,12 @@ release the next time these are refreshed.
 ### macOS placeholder stubs
 
 `nefconc-x86_64-apple-darwin` and `nefconc-aarch64-apple-darwin` are **not**
-nefcon — they are 19-byte no-op shell stubs (`#!/bin/sh\nexit 0`). Tauri's
-`externalBin` requires a file for every target triple; nefcon is Windows-only, so
-macOS builds ship these harmless placeholders (the driver flow is Windows-only).
+nefcon — they are 17-byte no-op shell stubs (`#!/bin/sh\nexit 0`). Tauri's
+`externalBin` requires a file for every target triple and nefcon is Windows-only,
+so they exist to satisfy that. `tauri.macos.conf.json` sets `"externalBin": []`,
+so the macOS bundle ships neither them nor nefcon.
+
+`.gitattributes` marks them `binary`. They contain no NUL byte, so without that
+rule git's text detection rewrites them to CRLF on a Windows checkout and the
+checksums below stop matching — which is exactly what the old CI checksum job
+tripped over.
