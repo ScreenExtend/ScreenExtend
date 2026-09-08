@@ -350,46 +350,71 @@ fn interface_mode_is_host_ap(interface: &CWInterface) -> bool {
     mode == CWInterfaceMode::HostAP || mode == CWInterfaceMode::IBSS
 }
 
-/// A start that returned YES has told us nothing about the radio. Wait for the interface to enter
-/// AP mode, then for the host to hold a routable IPv4 on it — which is what proves `bootpd` came
-/// up and a client will get a lease.
-fn verify_ap_up(interface: &CWInterface) -> (bool, Option<Ipv4Addr>) {
-    let mode_deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
-    let mut mode_ok = false;
+/// A start that returned YES has told us nothing about the radio: wait for the interface to
+/// actually enter AP mode. `start_hosted_network` is a synchronous Tauri command, so this is the
+/// only wait it is allowed to make the user sit through.
+fn wait_for_ap_mode(interface: &CWInterface) -> bool {
+    let deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
     loop {
         if interface_mode_is_host_ap(interface) {
-            mode_ok = true;
-            break;
+            return true;
         }
-        if Instant::now() >= mode_deadline {
-            break;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    if !mode_ok {
-        return (false, None);
-    }
-
-    let Some(name) = interface_bsd_name(interface) else {
-        return (true, None);
-    };
-    let ip_deadline = Instant::now() + DHCP_SETTLE_TIMEOUT;
-    loop {
-        if let Some(ip) = super::networking::interface_ipv4(&name) {
-            return (true, Some(ip));
-        }
-        if Instant::now() >= ip_deadline {
-            return (true, None);
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// Notice an AP that goes away on its own — a radio reset, a Wi-Fi mode change from the menu bar,
-/// or the OS reclaiming the interface. Without this the dashboard keeps a green light on a dead AP.
-fn watch_liveness(app: AppHandle, generation: u64) {
+/// AP mode with no address on the interface means nothing is serving DHCP: clients will see the
+/// network and fail to join. This is the difference between advertised and working, and it settles
+/// a second or two after the start, so it is watched rather than waited on.
+fn wait_for_ipv4(name: &str, timeout: Duration) -> Option<Ipv4Addr> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(ip) = super::networking::interface_ipv4(name) {
+            return Some(ip);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Finish the verification the command thread could not afford to wait for, then keep watching.
+///
+/// Phase one asks whether the host got a routable IPv4 on the AP interface and says plainly which
+/// of the two outcomes happened. Phase two notices an AP that goes away on its own — a radio reset,
+/// a Wi-Fi mode change from the menu bar, or the OS reclaiming the interface — which is what
+/// otherwise leaves the dashboard with a green light on a dead AP.
+fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<String>) {
     std::thread::spawn(move || {
         use tauri::Manager;
+
+        let host_ipv4 = iface
+            .as_deref()
+            .and_then(|name| wait_for_ipv4(name, DHCP_SETTLE_TIMEOUT));
+        if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
+            return;
+        }
+        {
+            let mut guard = status().lock().unwrap();
+            guard.host_ipv4 = host_ipv4;
+            match (host_ipv4, guard.channel, guard.band, guard.security.clone()) {
+                (Some(ip), Some(channel), Some(band), Some(security)) => tprintln!(
+                    "[hosted-network] '{ssid}' verified — channel {channel} ({band}), {security}, \
+                     host address {ip}"
+                ),
+                (None, ..) => teprintln!(
+                    "[hosted-network] '{ssid}' is advertised but the interface never got an IPv4 \
+                     address; clients will see the network and fail to join because nothing is \
+                     handing out DHCP leases"
+                ),
+                _ => {}
+            }
+        }
+
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
@@ -404,7 +429,6 @@ fn watch_liveness(app: AppHandle, generation: u64) {
             if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
                 return;
             }
-            let ssid = status().lock().unwrap().ssid.clone();
             teprintln!(
                 "[hosted-network] '{ssid}' is no longer in AP mode — the OS or the radio dropped it"
             );
@@ -457,7 +481,6 @@ struct StartOutcome {
     channel: isize,
     band: &'static str,
     security: String,
-    host_ipv4: Option<Ipv4Addr>,
 }
 
 /// Try one (channel, security) pair and only report success once the radio agrees.
@@ -466,7 +489,7 @@ fn try_attempt(
     channel: &CWChannel,
     ssid: &str,
     attempt: &Attempt,
-) -> Option<Option<Ipv4Addr>> {
+) -> bool {
     let number = unsafe { channel.channelNumber() };
     tprintln!(
         "[hosted-network] trying '{ssid}' on channel {number} ({}) with {}",
@@ -480,26 +503,21 @@ fn try_attempt(
         attempt.security,
         attempt.password.as_deref(),
     ) {
-        return None;
+        return false;
     }
-    let (mode_ok, ip) = verify_ap_up(interface);
-    if !mode_ok {
+    if !wait_for_ap_mode(interface) {
         teprintln!(
             "[hosted-network] {} returned YES but the interface never entered AP mode; \
              stopping and moving on",
             attempt.label
         );
         stop_host_ap_mode();
-        return None;
+        return false;
     }
-    Some(ip)
+    true
 }
 
-fn try_ibss(
-    interface: &CWInterface,
-    ssid: &str,
-    password: Option<&str>,
-) -> Option<(u64, Option<Ipv4Addr>)> {
+fn try_ibss(interface: &CWInterface, ssid: &str, password: Option<&str>) -> Option<u64> {
     let (security, pw) = match password {
         Some(pw) => (IBSS_SECURITY_WEP104, Some(pw)),
         None => (IBSS_SECURITY_NONE, None),
@@ -512,12 +530,11 @@ fn try_ibss(
     if !send_start_ibss(interface, PREFERRED_CHANNEL as u64, ssid, security, pw) {
         return None;
     }
-    let (mode_ok, ip) = verify_ap_up(interface);
-    if !mode_ok {
+    if !wait_for_ap_mode(interface) {
         stop_host_ap_mode();
         return None;
     }
-    Some((security, ip))
+    Some(security)
 }
 
 fn start_via_host_ap(
@@ -541,13 +558,12 @@ fn start_via_host_ap(
                 std::thread::sleep(Duration::from_millis(250));
             }
             for attempt in secured_attempts(password) {
-                if let Some(ip) = try_attempt(interface, channel, name, &attempt) {
+                if try_attempt(interface, channel, name, &attempt) {
                     let _ = KNOWN_SECURED_TYPE.set(attempt.security);
                     return Some(StartOutcome {
                         channel: unsafe { channel.channelNumber() },
                         band: channel_band(channel),
                         security: attempt.label,
-                        host_ipv4: ip,
                     });
                 }
             }
@@ -574,7 +590,7 @@ fn start_via_host_ap(
         if index > 0 {
             std::thread::sleep(Duration::from_millis(250));
         }
-        if let Some(ip) = try_attempt(interface, channel, name, &open) {
+        if try_attempt(interface, channel, name, &open) {
             if had_password {
                 let _ = crate::HostedNetworkNoPassword.emit(app);
             }
@@ -582,7 +598,6 @@ fn start_via_host_ap(
                 channel: unsafe { channel.channelNumber() },
                 band: channel_band(channel),
                 security: open.label,
-                host_ipv4: ip,
             });
         }
     }
@@ -642,11 +657,10 @@ pub fn start_hosted_network(
                     None
                 }
             })
-            .map(|(security, ip)| StartOutcome {
+            .map(|security| StartOutcome {
                 channel: PREFERRED_CHANNEL,
                 band: "2.4 GHz",
                 security: format!("IBSS security {security}"),
-                host_ipv4: ip,
             })
     };
 
@@ -657,24 +671,13 @@ pub fn start_hosted_network(
         return false;
     };
 
-    match outcome.host_ipv4 {
-        Some(ip) => tprintln!(
-            "[hosted-network] '{name}' verified on {} — channel {} ({}), {}, host address {ip}",
-            backend.as_str(),
-            outcome.channel,
-            outcome.band,
-            outcome.security
-        ),
-        None => teprintln!(
-            "[hosted-network] '{name}' is advertised on {} (channel {}, {}, {}) but the interface \
-             never got an IPv4 address; clients will see the network and fail to join because \
-             nothing is handing out DHCP leases",
-            backend.as_str(),
-            outcome.channel,
-            outcome.band,
-            outcome.security
-        ),
-    }
+    tprintln!(
+        "[hosted-network] '{name}' is up on {} — channel {} ({}), {}; checking for a DHCP address",
+        backend.as_str(),
+        outcome.channel,
+        outcome.band,
+        outcome.security
+    );
 
     *status().lock().unwrap() = HostedNetworkStatus {
         backend: Some(backend.as_str()),
@@ -683,12 +686,17 @@ pub fn start_hosted_network(
         band: Some(outcome.band),
         security: Some(outcome.security),
         advertised: true,
-        host_ipv4: outcome.host_ipv4,
+        host_ipv4: None,
     };
 
     *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
     *state.hosted_network_running.lock().unwrap() = true;
-    watch_liveness(app, WATCH_GENERATION.load(Ordering::Relaxed));
+    watch_liveness(
+        app,
+        WATCH_GENERATION.load(Ordering::Relaxed),
+        name.to_string(),
+        interface_bsd_name(&interface),
+    );
     true
 }
 
@@ -836,11 +844,11 @@ mod tests {
         candidates.extend([96, 128, 160, 192, 256, 384, 512, 768, 1024, 2048]);
         for security in candidates {
             let accepted = send_start_host_ap(&interface, &channel, ssid, security, Some(password));
-            let (mode_ok, ip) = if accepted {
-                verify_ap_up(&interface)
-            } else {
-                (false, None)
-            };
+            let mode_ok = accepted && wait_for_ap_mode(&interface);
+            let ip = mode_ok
+                .then(|| interface_bsd_name(&interface))
+                .flatten()
+                .and_then(|name| wait_for_ipv4(&name, DHCP_SETTLE_TIMEOUT));
             println!("securityType {security:5}: accepted={accepted} ap_mode={mode_ok} ip={ip:?}");
             stop_host_ap_mode();
             std::thread::sleep(Duration::from_millis(400));
