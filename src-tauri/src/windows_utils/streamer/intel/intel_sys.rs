@@ -8,6 +8,7 @@
 use std::ffi::c_void;
 
 use anyhow::{Context as _, Result};
+use libloading::Library;
 
 // ===========================================================================================
 // Primitive typedefs (mfxdefs.h)
@@ -115,9 +116,20 @@ pub const MFX_PROFILE_AVC_HIGH: u16 = 100;
 /// MFX_PROFILE_AVC_CONSTRAINT_SET1 = (0x100 << 1) = 0x200
 pub const MFX_PROFILE_AVC_CONSTRAINED_BASELINE: u16 = MFX_PROFILE_AVC_BASELINE + 0x200;
 
+// The rate-control enum is *not* densely packed and the gaps are reserved values, so these
+// have to be transcribed exactly. `MFX_RATECONTROL_LA` at 8 is lookahead, which buffers frames
+// and is the opposite of what this encoder wants; `intel_rate_control_values` pins them.
 pub const MFX_RATECONTROL_CBR: u16 = 1;
 pub const MFX_RATECONTROL_VBR: u16 = 2;
 pub const MFX_RATECONTROL_CQP: u16 = 3;
+pub const MFX_RATECONTROL_AVBR: u16 = 4;
+pub const MFX_RATECONTROL_LA: u16 = 8;
+pub const MFX_RATECONTROL_ICQ: u16 = 9;
+/// Video Conferencing Mode. The only low-delay rate control in oneVPL's list for which
+/// `LowDelayBRC` and `MaxFrameSizeI`/`MaxFrameSizeP` are defined at all — under CBR the spec
+/// says they do not apply, which is why they were no-ops here.
+pub const MFX_RATECONTROL_VCM: u16 = 10;
+pub const MFX_RATECONTROL_QVBR: u16 = 14;
 
 pub const MFX_TARGETUSAGE_BEST_QUALITY: u16 = 1;
 pub const MFX_TARGETUSAGE_BALANCED: u16 = 4;
@@ -628,6 +640,7 @@ pub struct Vpl {
     pub MFXMemory_GetSurfaceForVPP: FnGetSurface,
     pub MFXMemory_GetSurfaceForVPPOut: FnGetSurface,
     pub MFXMemory_GetSurfaceForEncode: FnGetSurface,
+    path: std::path::PathBuf,
 }
 
 unsafe impl Send for Vpl {}
@@ -643,12 +656,83 @@ macro_rules! resolve {
     }};
 }
 
+/// Candidate dispatcher names, newest first. `libvpl.dll` is the oneVPL dispatcher; the legacy
+/// names are Media SDK's, kept as a last resort for an older driver stack.
+const VPL_NAMES: &[&str] = &["libvpl.dll", "libmfx.dll", "libmfxhw64.dll"];
+
+/// Find the oneVPL dispatcher.
+///
+/// The old code was `Library::new("libvpl.dll")` with no search and no alternatives, under a
+/// comment claiming the DLL "ships with the Intel GPU driver". It does not: what Intel drivers
+/// install is the *runtime* (`libmfx-gen.dll` for oneVPL, `libmfxhw64.dll` for MSDK); the
+/// dispatcher is an application-redistributed component. On a host without it, Quick Sync was
+/// simply never available and the machine silently ran the CPU x264 path. So this searches the
+/// way `x264_sys::open_library` does — bundled `resources/` first, then the exe directory, then
+/// the OS search path — and reports which file answered.
+fn open_dispatcher() -> Result<(Library, std::path::PathBuf)> {
+    let mut last_err: Option<String> = None;
+    let attempt = |candidate: std::path::PathBuf, last_err: &mut Option<String>| match unsafe {
+        Library::new(&candidate)
+    } {
+        Ok(lib) => Some((lib, candidate)),
+        Err(e) => {
+            *last_err = Some(format!("{}: {e}", candidate.display()));
+            None
+        }
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        // The grandparent probe is for test binaries, which live in `target/<profile>/deps/`,
+        // one level below where cargo stages `resources/`.
+        let dirs = exe
+            .parent()
+            .into_iter()
+            .chain(exe.parent().and_then(|d| d.parent()));
+        for dir in dirs {
+            for name in VPL_NAMES {
+                if let Some(v) = attempt(dir.join("resources").join(name), &mut last_err) {
+                    return Ok(v);
+                }
+                if let Some(v) = attempt(dir.join(name), &mut last_err) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    for name in VPL_NAMES {
+        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(name);
+        if let Some(v) = attempt(staged, &mut last_err) {
+            return Ok(v);
+        }
+    }
+
+    for name in VPL_NAMES {
+        if let Some(v) = attempt(std::path::PathBuf::from(name), &mut last_err) {
+            return Ok(v);
+        }
+    }
+
+    anyhow::bail!(
+        "could not load the oneVPL dispatcher (tried bundled resources, the exe directory and \
+         the OS search path for {VPL_NAMES:?}): {}",
+        last_err.unwrap_or_default()
+    )
+}
+
 impl Vpl {
+    /// Which dispatcher answered. Logged at session creation so a report from a user's machine
+    /// says whether they got the bundled one, the driver's, or something else on PATH.
+    pub fn library_path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Dynamically load the oneVPL dispatcher and resolve all entry points used by the encoder.
     pub fn load() -> Result<Self> {
-        let lib = unsafe { libloading::Library::new("libvpl.dll") }.context(
-            "loading libvpl.dll (Intel oneVPL dispatcher; ships with the Intel GPU driver)",
-        )?;
+        let (lib, path) = open_dispatcher()?;
 
         // Resolve the symbols while the library is borrowed, then move the library into the struct.
         // `Symbol::into_raw` keeps the pointer valid as long as the library is alive.
@@ -677,19 +761,63 @@ impl Vpl {
             MFXMemory_GetSurfaceForVPP: resolve!(lib, "MFXMemory_GetSurfaceForVPP"),
             MFXMemory_GetSurfaceForVPPOut: resolve!(lib, "MFXMemory_GetSurfaceForVPPOut"),
             MFXMemory_GetSurfaceForEncode: resolve!(lib, "MFXMemory_GetSurfaceForEncode"),
+            path,
             _lib: lib,
         };
         Ok(v)
     }
 }
 
-/// Map an `mfxStatus` to a `Result`, treating positive warnings as success.
+/// The name oneVPL gives a positive status, for the log line. A warning is not a failure, but
+/// it is always the runtime telling us it did something other than what was asked.
+pub fn warning_name(status: mfxStatus) -> &'static str {
+    match status {
+        MFX_WRN_IN_EXECUTION => "MFX_WRN_IN_EXECUTION",
+        MFX_WRN_DEVICE_BUSY => "MFX_WRN_DEVICE_BUSY",
+        MFX_WRN_VIDEO_PARAM_CHANGED => "MFX_WRN_VIDEO_PARAM_CHANGED",
+        MFX_WRN_PARTIAL_ACCELERATION => "MFX_WRN_PARTIAL_ACCELERATION",
+        MFX_WRN_INCOMPATIBLE_VIDEO_PARAM => "MFX_WRN_INCOMPATIBLE_VIDEO_PARAM",
+        MFX_WRN_VALUE_NOT_CHANGED => "MFX_WRN_VALUE_NOT_CHANGED",
+        MFX_WRN_OUT_OF_RANGE => "MFX_WRN_OUT_OF_RANGE",
+        _ => "MFX_WRN_?",
+    }
+}
+
+/// Map an `mfxStatus` to a `Result`, treating positive warnings as success — but saying so.
+///
+/// The warnings this accepts are the ones that matter: `MFX_WRN_PARTIAL_ACCELERATION` means the
+/// runtime fell back to encoding on the CPU inside oneVPL, and
+/// `MFX_WRN_INCOMPATIBLE_VIDEO_PARAM` means it silently changed the parameters. Both used to be
+/// discarded, under an init log that then asserted the requested configuration as achieved fact.
 pub fn check(status: mfxStatus, what: &str) -> Result<()> {
-    if status >= MFX_ERR_NONE {
+    if status > MFX_ERR_NONE {
+        teprintln!(
+            "oneVPL: {what} returned {} ({status}) — the runtime did not do exactly what was asked",
+            warning_name(status)
+        );
+        Ok(())
+    } else if status == MFX_ERR_NONE {
         Ok(())
     } else {
         anyhow::bail!("{what} failed: mfxStatus={status}");
     }
+}
+
+/// `check`, plus: a software fallback inside the runtime is treated as a hard failure.
+///
+/// `MFX_WRN_PARTIAL_ACCELERATION` at `ENCODE_Init` means H.264 is being encoded on the CPU
+/// while the log says "Intel Quick Sync (oneVPL) H.264 encoder initialized" — the worst
+/// latency outcome, under the most reassuring label. Failing here lets `build_backend` move on
+/// to a backend that will say what it is.
+pub fn check_no_software_fallback(status: mfxStatus, what: &str) -> Result<()> {
+    if status == MFX_WRN_PARTIAL_ACCELERATION {
+        anyhow::bail!(
+            "{what} returned MFX_WRN_PARTIAL_ACCELERATION: the oneVPL runtime fell back to \
+             software encoding, which is slower than the x264 path it would be labelled \
+             'Quick Sync' instead of"
+        );
+    }
+    check(status, what)
 }
 
 /// Strict variant: any non-zero status is an error.

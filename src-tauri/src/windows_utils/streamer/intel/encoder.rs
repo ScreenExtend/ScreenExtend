@@ -166,8 +166,26 @@ pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     bridge: Option<InputBridge>,
+    /// The dispatcher loader owns the enumerated implementations and must outlive the session;
+    /// it is released with `MFXUnload` after `MFXClose`. It used to be dropped on the floor on
+    /// the success path, leaking one loader plus its implementation descriptions per encoder
+    /// construction — and an encoder is built per streaming session.
+    loader: mfxLoader,
     enc_param: mfxVideoParam,
     enc_frame_info: mfxFrameInfo,
+
+    /// The three ext buffers, owned so they can be re-attached to `Reset`.
+    ///
+    /// oneVPL applies whatever ext buffers are present at `Reset`; ones omitted revert to the
+    /// runtime's defaults. `set_bitrate` used to `Reset` with `NumExtParam = 0`, so the first
+    /// bitrate change — seconds into a session, from the loss-based driver — restored HRD
+    /// conformance, PicTiming SEI, the default `MaxDecFrameBuffering`, B-pyramid, and dropped
+    /// `RepeatPPS`, the per-frame size caps and intra refresh. The low-latency configuration
+    /// lasted until the first congestion event and never came back.
+    ext_co: Box<mfxExtCodingOption>,
+    ext_co2: Box<mfxExtCodingOption2>,
+    ext_co3: Box<mfxExtCodingOption3>,
+    ext_ptrs: Vec<*mut mfxExtBuffer>,
 
     bitstream_buf: Vec<u8>,
     config: EncoderConfig,
@@ -231,7 +249,7 @@ impl Encoder {
             let _ = unsafe { mt.SetMultithreadProtected(true) };
         }
 
-        let session = create_session(&vpl)?;
+        let (session, loader) = create_session(&vpl)?;
 
         check_strict(
             unsafe {
@@ -245,6 +263,7 @@ impl Encoder {
         )
         .inspect_err(|_| unsafe {
             (vpl.MFXClose)(session);
+            (vpl.MFXUnload)(loader);
         })?;
 
         let requested_fps = config.fps.max(1);
@@ -271,8 +290,13 @@ impl Encoder {
             device: enc_device,
             context: enc_context,
             bridge,
+            loader,
             enc_param: unsafe { std::mem::zeroed() },
             enc_frame_info: unsafe { std::mem::zeroed() },
+            ext_co: Box::new(unsafe { std::mem::zeroed() }),
+            ext_co2: Box::new(unsafe { std::mem::zeroed() }),
+            ext_co3: Box::new(unsafe { std::mem::zeroed() }),
+            ext_ptrs: Vec::new(),
             bitstream_buf: Vec::new(),
             config,
             coded_w,
@@ -285,28 +309,26 @@ impl Encoder {
             idr_requested: false,
         };
 
-        if let Err(e) = this.init_vpp() {
-            unsafe { (this.vpl.MFXClose)(this.session) };
-            return Err(e);
-        }
-        if let Err(e) = this.init_encode() {
-            unsafe {
-                (this.vpl.MFXVideoVPP_Close)(this.session);
-                (this.vpl.MFXClose)(this.session);
-            }
-            return Err(e);
-        }
+        // Dropping `this` runs `Drop for Encoder`, which closes the encode and VPP components,
+        // the session and the loader. Closing them here as well double-closed the session
+        // (harmless-looking, since every return value was discarded, but a second `MFXClose` on
+        // a freed handle is the runtime's problem to survive, and the loader would now be
+        // unloaded twice).
+        this.init_vpp()?;
+        this.init_encode()?;
 
+        // Requested geometry only. What the runtime actually agreed to is the "oneVPL effective"
+        // line `init_encode` prints from `GetVideoParam`; this one used to assert `low_power=on,
+        // async_depth=1, gop_ref_dist=1` and an `rc=cbr` that was never read back.
         tprintln!(
-            "Intel Quick Sync (oneVPL) H.264 encoder initialized (D3D11 / ULL): {}x{} (coded {}x{})@{}, \
-             bitrate_bps={}, rc={}, qp={:?}, profile={:?}, intra_refresh={}, low_power=on, async_depth=1, gop_ref_dist=1",
+            "Intel Quick Sync (oneVPL) H.264 encoder initialized (D3D11 / ULL): {}x{} \
+             (coded {}x{})@{}, requested bitrate_bps={}, qp={:?}, profile={:?}, intra_refresh={}",
             this.config.width,
             this.config.height,
             this.coded_w,
             this.coded_h,
             fps,
             this.config.bitrate_bps,
-            if this.config.qp.is_some() { "cqp" } else { "cbr" },
             this.config.qp,
             this.config.profile,
             this.config.intra_refresh,
@@ -395,8 +417,7 @@ impl Encoder {
 
         let target_kbps = (self.config.bitrate_bps / 1000).clamp(1, 65000) as u16;
         let max_kbps = (self.config.max_bitrate_bps / 1000).clamp(target_kbps as u32, 65000) as u16;
-        let buffer_size_kb =
-            ((self.coded_w as u32 * self.coded_h as u32 * 4) / 1024).clamp(512, 65000) as u16;
+        let buffer_size_kb = vbv_kb(self.config.bitrate_bps, fps);
 
         let mut mfx: mfxInfoMFX = unsafe { std::mem::zeroed() };
         mfx.FrameInfo = self.enc_frame_info;
@@ -422,7 +443,13 @@ impl Encoder {
             mfx.TargetKbps = q;
             mfx.MaxKbps = q;
         } else {
-            mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+            // VCM, not CBR. oneVPL documents `LowDelayBRC`, `MaxFrameSizeI` and `MaxFrameSizeP`
+            // as applying to VBR/QVBR/VCM only — under CBR, which is what this branch used to
+            // select, all three are no-ops, so the Quick Sync path has had no working per-frame
+            // size cap at all. The `ENCODE_Query` below asks the runtime before committing, and
+            // falls back to CBR (dropping the three dead fields) if VCM is refused, which it is
+            // on some generations under `LowPower = ON`.
+            mfx.RateControlMethod = MFX_RATECONTROL_VCM;
             mfx.TargetKbps = target_kbps;
             mfx.MaxKbps = max_kbps;
             mfx.InitialDelayInKB = 0;
@@ -477,31 +504,136 @@ impl Encoder {
             co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
         }
 
-        let mut ext: [*mut mfxExtBuffer; 3] = [
-            &mut co as *mut _ as *mut mfxExtBuffer,
-            &mut co2 as *mut _ as *mut mfxExtBuffer,
-            &mut co3 as *mut _ as *mut mfxExtBuffer,
-        ];
-        par.ExtParam = ext.as_mut_ptr();
-        par.NumExtParam = ext.len() as u16;
+        // Boxed so the pointers stay valid across every later move of `Encoder`, and owned so
+        // `set_bitrate` can hand the same array to `Reset`.
+        *self.ext_co = co;
+        *self.ext_co2 = co2;
+        *self.ext_co3 = co3;
+        self.rebuild_ext_ptrs();
+        self.attach_ext(&mut par);
 
-        check(
+        // Ask before committing. `Query` is the API whose job is to report which requested
+        // parameters the runtime altered or dropped, and it was not called anywhere in this
+        // file — so VCM, LowDelayBRC, the frame-size caps and LowPower were all asserted.
+        //
+        // In and out must be distinct allocations: the runtime writes the corrected parameters
+        // into `out` while reading `in`, and aliasing them (which `query_fps_supported` gets
+        // away with because it attaches no ext buffers) faults once ext buffers are involved.
+        // `out`'s ext buffers carry headers only, per the API contract.
+        let mut out_co: mfxExtCodingOption = unsafe { std::mem::zeroed() };
+        out_co.Header = self.ext_co.Header;
+        let mut out_co2: mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+        out_co2.Header = self.ext_co2.Header;
+        let mut out_co3: mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+        out_co3.Header = self.ext_co3.Header;
+        let mut out_ptrs: [*mut mfxExtBuffer; 3] = [
+            &mut out_co as *mut _ as *mut mfxExtBuffer,
+            &mut out_co2 as *mut _ as *mut mfxExtBuffer,
+            &mut out_co3 as *mut _ as *mut mfxExtBuffer,
+        ];
+        let mut out = par;
+        out.ExtParam = out_ptrs.as_mut_ptr();
+        out.NumExtParam = out_ptrs.len() as u16;
+
+        let query_status =
+            unsafe { (self.vpl.MFXVideoENCODE_Query)(self.session, &mut par, &mut out) };
+        if query_status < MFX_ERR_NONE {
+            bail!("MFXVideoENCODE_Query rejected the encode parameters: mfxStatus={query_status}");
+        }
+        if query_status > MFX_ERR_NONE {
+            tprintln!(
+                "oneVPL: ENCODE_Query returned {} ({query_status}); the runtime changed something",
+                warning_name(query_status)
+            );
+        }
+
+        // `Query` writes the values it will honour into `out`, so a rate control it refused
+        // comes back as something else. Drop the fields that only exist for the mode we asked
+        // for, rather than leaving them set and claiming a cap that is not applied.
+        let effective_rc = unsafe { out.info.mfx.RateControlMethod };
+        if self.config.qp.is_none() && effective_rc != MFX_RATECONTROL_VCM {
+            teprintln!(
+                "oneVPL: VCM refused (runtime chose rc={effective_rc}); falling back to CBR \
+                 without LowDelayBRC or the per-frame size caps, which do not apply under CBR"
+            );
+            par.info.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+            par.info.mfx.TargetKbps = target_kbps;
+            par.info.mfx.MaxKbps = max_kbps;
+            par.info.mfx.BufferSizeInKB = buffer_size_kb;
+            self.ext_co3.LowDelayBRC = MFX_CODINGOPTION_UNKNOWN;
+            self.ext_co3.MaxFrameSizeI = 0;
+            self.ext_co3.MaxFrameSizeP = 0;
+            self.attach_ext(&mut par);
+        }
+
+        check_no_software_fallback(
             unsafe { (self.vpl.MFXVideoENCODE_Init)(self.session, &mut par) },
             "MFXVideoENCODE_Init",
         )?;
 
-        par.ExtParam = ptr::null_mut();
-        par.NumExtParam = 0;
+        // Read back *with* the ext buffers attached, so CO2/CO3 report their effective values.
+        // Reading back with `NumExtParam = 0`, as this used to, returns only the base
+        // `mfxInfoMFX` — which is why nobody could tell whether the ULL configuration took.
+        self.attach_ext(&mut par);
         check(
             unsafe { (self.vpl.MFXVideoENCODE_GetVideoParam)(self.session, &mut par) },
             "MFXVideoENCODE_GetVideoParam",
         )?;
 
-        let eff_buf_kb = unsafe { par.info.mfx.BufferSizeInKB }.max(buffer_size_kb);
-        self.bitstream_buf = vec![0u8; (eff_buf_kb as usize) * 1024];
+        let eff = unsafe { par.info.mfx };
+        // Two different needs that were conflated into one number: the CPB the rate controller
+        // may bank into, which must be about one frame, and the output allocation, which must
+        // hold the largest access unit. `BufferSizeInKB` is the former; the latter gets its own
+        // floor so a large IDR still fits.
+        let out_kb = eff.BufferSizeInKB.max(buffer_size_kb).max(512);
+        self.bitstream_buf = vec![0u8; (out_kb as usize) * 1024];
         self.enc_param = par;
-        self.enc_frame_info = unsafe { par.info.mfx.FrameInfo };
+        self.enc_frame_info = eff.FrameInfo;
+
+        // Effective, not requested. The old line printed `self.config` and asserted
+        // "low_power=on, async_depth=1, gop_ref_dist=1" without ever reading any of them back.
+        tprintln!(
+            "oneVPL effective: rc={}, target_kbps={}, max_kbps={}, buffer_kb={} (requested {}), \
+             initial_delay_kb={}, low_power={}, target_usage={}, gop_ref_dist={}, num_ref={}, \
+             num_slice={}, async_depth={}, low_delay_brc={}, max_frame_i={}, max_frame_p={}, \
+             max_dec_frame_buffering={}, repeat_pps={}, nal_hrd={}, int_ref_type={}, \
+             int_ref_cycle={}, out_buf_kb={}",
+            eff.RateControlMethod,
+            eff.TargetKbps,
+            eff.MaxKbps,
+            eff.BufferSizeInKB,
+            buffer_size_kb,
+            eff.InitialDelayInKB,
+            eff.LowPower,
+            eff.TargetUsage,
+            eff.GopRefDist,
+            eff.NumRefFrame,
+            eff.NumSlice,
+            par.AsyncDepth,
+            self.ext_co3.LowDelayBRC,
+            self.ext_co3.MaxFrameSizeI,
+            self.ext_co3.MaxFrameSizeP,
+            self.ext_co.MaxDecFrameBuffering,
+            self.ext_co2.RepeatPPS,
+            self.ext_co.NalHrdConformance,
+            self.ext_co2.IntRefType,
+            self.ext_co2.IntRefCycleSize,
+            out_kb,
+        );
         Ok(())
+    }
+
+    fn rebuild_ext_ptrs(&mut self) {
+        self.ext_ptrs = vec![
+            &mut *self.ext_co as *mut _ as *mut mfxExtBuffer,
+            &mut *self.ext_co2 as *mut _ as *mut mfxExtBuffer,
+            &mut *self.ext_co3 as *mut _ as *mut mfxExtBuffer,
+        ];
+    }
+
+    fn attach_ext(&mut self, par: &mut mfxVideoParam) {
+        par.ExtParam = self.ext_ptrs.as_mut_ptr();
+        par.NumExtParam = self.ext_ptrs.len() as u16;
     }
 
     #[allow(dead_code)]
@@ -514,21 +646,37 @@ impl Encoder {
             return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let kbps = (bps / 1000).clamp(1, 65000) as u16;
+        let fps = self.config.fps.max(1);
         self.config.bitrate_bps = bps;
         self.config.max_bitrate_bps = bps;
 
+        // The rate-control fields are the *only* thing that may differ between Init and Reset.
+        // Everything else, ext buffers included, is re-sent exactly as Init received it —
+        // omitting them at Reset is what silently reverted the whole low-latency posture on the
+        // first congestion event.
         let mut par = self.enc_param;
         par.info.mfx.TargetKbps = kbps;
         par.info.mfx.MaxKbps = kbps;
-        par.ExtParam = ptr::null_mut();
-        par.NumExtParam = 0;
+        par.info.mfx.BufferSizeInKB = vbv_kb(bps, fps);
+        if self.ext_co3.LowDelayBRC == MFX_CODINGOPTION_ON {
+            let avg_frame_bytes = (bps / 8 / fps).max(1);
+            self.ext_co3.WinBRCMaxAvgKbps = kbps;
+            self.ext_co3.MaxFrameSizeP = avg_frame_bytes.saturating_mul(2);
+            self.ext_co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
+        }
+        self.attach_ext(&mut par);
 
         check(
             unsafe { (self.vpl.MFXVideoENCODE_Reset)(self.session, &mut par) },
             "MFXVideoENCODE_Reset",
         )?;
         self.enc_param = par;
-        tprintln!("Intel Quick Sync bitrate reconfigured (bitrate_bps={bps})");
+        tprintln!(
+            "Intel Quick Sync bitrate reconfigured (bitrate_bps={bps}, buffer_kb={}, \
+             ext_buffers={} retained)",
+            unsafe { par.info.mfx.BufferSizeInKB },
+            par.NumExtParam,
+        );
         Ok(BitrateApplied::Applied)
     }
 
@@ -866,11 +1014,14 @@ impl Drop for Encoder {
             (self.vpl.MFXVideoENCODE_Close)(self.session);
             (self.vpl.MFXVideoVPP_Close)(self.session);
             (self.vpl.MFXClose)(self.session);
+            if !self.loader.is_null() {
+                (self.vpl.MFXUnload)(self.loader);
+            }
         }
     }
 }
 
-fn create_session(vpl: &Vpl) -> Result<mfxSession> {
+fn create_session(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
     let loader = unsafe { (vpl.MFXLoad)() };
     if loader.is_null() {
         bail!("MFXLoad returned null (oneVPL dispatcher unavailable)");
@@ -907,13 +1058,32 @@ fn create_session(vpl: &Vpl) -> Result<mfxSession> {
     match build() {
         Ok(session) => {
             let mut ver: u32 = 0;
-            let _ = unsafe { (vpl.MFXQueryVersion)(session, &mut ver) };
+            let st = unsafe { (vpl.MFXQueryVersion)(session, &mut ver) };
+            let (major, minor) = (ver >> 16, ver & 0xFFFF);
             tprintln!(
-                "oneVPL session created: HW impl via D3D11, api_version={}.{}",
-                ver >> 16,
-                ver & 0xFFFF
+                "oneVPL session created: HW impl via D3D11, api_version={major}.{minor}, \
+                 dispatcher={}",
+                vpl.library_path().display(),
             );
-            Ok(session)
+            // The encoder depends on 2.x-only internal allocation
+            // (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`).
+            // A 1.x runtime returns MFX_ERR_UNSUPPORTED from those on the *first frame*, long
+            // after `build_backend` committed to this vendor and logged "live capture ready" —
+            // so the check has to happen here, where failing over is still possible.
+            if st < MFX_ERR_NONE {
+                unsafe { (vpl.MFXClose)(session) };
+                unsafe { (vpl.MFXUnload)(loader) };
+                bail!("MFXQueryVersion failed (mfxStatus={st}); cannot confirm a 2.x runtime");
+            }
+            if major < 2 {
+                unsafe { (vpl.MFXClose)(session) };
+                unsafe { (vpl.MFXUnload)(loader) };
+                bail!(
+                    "oneVPL runtime reports API {major}.{minor}; this encoder needs 2.0+ for \
+                     internal surface allocation, and a 1.x runtime would fail at the first frame"
+                );
+            }
+            Ok((session, loader))
         }
         Err(e) => {
             unsafe { (vpl.MFXUnload)(loader) };
@@ -1024,11 +1194,23 @@ fn luid_eq(a: LUID, b: LUID) -> bool {
     a.LowPart == b.LowPart && a.HighPart == b.HighPart
 }
 
+/// The coded-picture buffer the rate controller may bank into: about one frame of bits.
+///
+/// This used to be `(coded_w * coded_h * 4) / 1024` — the size of one *uncompressed* BGRA
+/// frame, 8160 KB at 1920x1088, which is ~65 Mbit, i.e. about 6.5 seconds of buffer at a
+/// 10 Mbps target. The encoder was free to bank several seconds of bits and smooth excursions
+/// over a long window instead of clipping them per frame, which on a fixed-rate link becomes
+/// queueing delay and then loss. The output *allocation* still needs to be large; that is a
+/// separate number now.
+fn vbv_kb(bitrate_bps: u32, fps: u32) -> u16 {
+    ((bitrate_bps / 8 / fps.max(1)) / 1024).clamp(1, 65000) as u16
+}
+
 fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, fps: u32) -> bool {
     let fps = fps.max(1);
     let coded_w = align_up_u16(config.width, 16);
     let coded_h = align_up_u16(config.height, 16);
-    let buffer_size_kb = ((coded_w as u32 * coded_h as u32 * 4) / 1024).clamp(512, 65000) as u16;
+    let buffer_size_kb = vbv_kb(config.bitrate_bps, fps);
     let target_kbps = (config.bitrate_bps / 1000).clamp(1, 65000) as u16;
     let max_kbps = (config.max_bitrate_bps / 1000).clamp(target_kbps as u32, 65000) as u16;
 
@@ -1067,10 +1249,11 @@ fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, f
         mfx.TargetKbps = q;
         mfx.MaxKbps = q;
     } else {
-        mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+        mfx.RateControlMethod = MFX_RATECONTROL_VCM;
         mfx.TargetKbps = target_kbps;
         mfx.MaxKbps = max_kbps;
     }
+    mfx.IdrInterval = 0;
 
     let mut par: mfxVideoParam = unsafe { std::mem::zeroed() };
     par.AsyncDepth = 1;
@@ -1095,6 +1278,13 @@ fn query_max_supported_fps(
     }
     const PROBE_LOW: u32 = 30;
     if !query_fps_supported(vpl, session, config, PROBE_LOW) {
+        // Not "this device tops out at 60" — the probe itself failed, for a reason we have not
+        // established, and the cap is a guess. It used to be applied silently, so a host whose
+        // Query fails for an unrelated reason quietly lost every rate above 60.
+        teprintln!(
+            "Intel Quick Sync: the {PROBE_LOW} fps probe failed, so the supported frame-rate \
+             range is unknown; capping at {INTEL_FPS_QUERY_FALLBACK} fps as a guess"
+        );
         return requested.min(INTEL_FPS_QUERY_FALLBACK);
     }
     let (mut lo, mut hi, mut best) = (PROBE_LOW, requested, PROBE_LOW);
