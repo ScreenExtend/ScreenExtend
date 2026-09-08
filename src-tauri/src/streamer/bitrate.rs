@@ -168,6 +168,29 @@ impl RttCongestionMonitor {
     }
 }
 
+/// Loss below this is the ordinary background of a wireless link and carries no information.
+pub const LOSS_FLOOR: f64 = 0.01;
+
+/// Loss at or above this is severe: match GCC's `A_r * (1 - 0.5 * loss)` so the response is
+/// comparable with every other implementation at the point where they all agree.
+pub const LOSS_SEVERE: f64 = 0.10;
+
+/// Slope of the gentle response between [`LOSS_FLOOR`] and [`LOSS_SEVERE`], chosen so the two
+/// branches meet: at 10 % loss both give a factor of 0.95.
+const LOSS_SLOPE: f64 = (0.5 * LOSS_SEVERE) / (LOSS_SEVERE - LOSS_FLOOR);
+
+/// Loss-driven rate estimate.
+///
+/// The previous version had a **dead band from 2 % to 10 % loss** where it returned its input
+/// unchanged — 5 % packet loss is a visibly broken picture and the controller held the rate flat
+/// through it. That band came from GCC, where it is defensible because a delay-based estimator is
+/// carrying the session in the meantime; here there was nothing else. The response is now
+/// continuous from 1 % upward and meets GCC's own curve at 10 %, so severe loss behaves exactly
+/// as the reference implementation does and moderate loss stops being ignored.
+///
+/// `current_target_bps` is the estimator's own running value, not the emitted target: a cut
+/// smaller than the controller's deadband must still compound across intervals rather than being
+/// recomputed from an unchanged number forever.
 pub fn estimate_from_loss(
     current_target_bps: u32,
     measured_send_bps: u32,
@@ -176,13 +199,13 @@ pub fn estimate_from_loss(
     let cur = current_target_bps as f64;
     let loss = fraction_lost.clamp(0.0, 1.0);
 
-    if loss > 0.10 {
+    if loss >= LOSS_SEVERE {
         (cur * (1.0 - 0.5 * loss)).max(1.0) as u32
-    } else if loss < 0.02 {
+    } else if loss > LOSS_FLOOR {
+        (cur * (1.0 - LOSS_SLOPE * (loss - LOSS_FLOOR))).max(1.0) as u32
+    } else {
         let probe = cur * 1.08;
         let ceil = (measured_send_bps as f64) * 1.5;
         probe.min(ceil.max(cur)) as u32
-    } else {
-        current_target_bps
     }
 }

@@ -107,10 +107,11 @@ pub struct Config {
     /// Paint a large frame number and elapsed-millisecond clock over it, for the
     /// camera-based glass-to-glass method in `docs/BASELINE.md`.
     pub counter: bool,
-    /// Seconds the WHEP self-test keeps streaming after it has proved RTP flows. 0 stops
-    /// as soon as the packet threshold is met, which is a liveness check, not a
-    /// measurement; a baseline run wants 30 or more.
-    pub selftest_secs: u64,
+    /// How long a probe runs, in seconds. The self-test keeps streaming this long after it
+    /// has proved RTP flows; `--live` captures for this long instead of stopping at a fixed
+    /// frame count. 0 means "just prove it works", which is a liveness check and not a
+    /// measurement — a baseline run wants 30 or more.
+    pub probe_secs: u64,
     /// Force the DXGI Desktop Duplication capture path instead of letting WGC try first.
     /// DXGI is otherwise only ever reached as a fallback, which means it can only be
     /// measured by first breaking WGC.
@@ -173,7 +174,7 @@ impl Default for Config {
             probe_bitrate: false,
             workload: crate::streamer::synthetic::Workload::default(),
             counter: false,
-            selftest_secs: 0,
+            probe_secs: 0,
             force_dxgi: false,
             scale: ScalePercent::default(),
             stun_urls: vec![DEFAULT_STUN_URL.to_string()],
@@ -442,7 +443,7 @@ impl Config {
                 }
                 "--duration" => {
                     if let Some(v) = val(&args, i).and_then(|s| s.parse().ok()) {
-                        c.selftest_secs = v;
+                        c.probe_secs = v;
                     }
                     i += 2;
                 }
@@ -513,8 +514,9 @@ PROBES / SELF-TEST (no browser)\n\
   --probe-live [path]     150 live frames -> Annex-B (default live.h264)\n\
   --probe-bitrate         exercise adaptive-bitrate reconfigure\n\
   --whep-selftest         in-process WHEP client, assert RTP flows\n\
-  --duration <secs>       keep the self-test streaming this long after RTP is proven,\n\
-                          so the stage histograms have something to describe (default 0)\n\
+  --duration <secs>       how long a probe runs: the self-test holds the session open this\n\
+                          long after RTP is proven, and --probe-live captures for this long\n\
+                          instead of stopping at 150 frames (default 0 = liveness only)\n\
 \n\
   -h, --help              print this help and exit"
     );

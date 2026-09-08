@@ -4,11 +4,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::{
-    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, FLAG_DISCONTINUITY,
+    host_now_ns, AudioCapture, AudioDiagnostics, AudioFormat, AudioPacket, AudioSink,
+    BROADCAST_CAPACITY, FLAG_DISCONTINUITY,
 };
 
-fn mock_capture(n: u32) -> AudioCapture {
-    let (tx, rx) = crossbeam_channel::unbounded::<AudioPacket>();
+/// A capture backend that publishes `n` packets into `sink` and then stops, shaped exactly
+/// like the real ones: it owns a thread, it writes through the sink, and its `stop` joins.
+fn mock_capture(sink: AudioSink, n: u32) -> AudioCapture {
     let diagnostics = Arc::new(AudioDiagnostics::default());
     diagnostics.sample_rate.store(48000, Ordering::Relaxed);
     diagnostics.channels.store(2, Ordering::Relaxed);
@@ -16,21 +18,17 @@ fn mock_capture(n: u32) -> AudioCapture {
     let join = std::thread::spawn(move || {
         for seq in 0..n {
             let flags = if seq == 0 { FLAG_DISCONTINUITY } else { 0 };
-            let pkt = AudioPacket {
+            sink.send(AudioPacket {
                 seq,
                 capture_ns: host_now_ns(),
                 flags,
                 data: Bytes::from(vec![0xA5u8; 80]),
-            };
-            if tx.send(pkt).is_err() {
-                break;
-            }
+            });
         }
     });
 
     let mut join = Some(join);
     AudioCapture {
-        rx,
         stop: Box::new(move || {
             if let Some(j) = join.take() {
                 let _ = j.join();
@@ -47,10 +45,12 @@ fn mock_capture(n: u32) -> AudioCapture {
 
 #[test]
 fn mock_capture_emits_expected_packets() {
-    let cap = mock_capture(5);
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<AudioPacket>(BROADCAST_CAPACITY);
+    let cap = mock_capture(AudioSink::new(tx), 5);
     let mut seqs = Vec::new();
     let mut first_flags = None;
-    while let Ok(pkt) = cap.rx.recv() {
+    for _ in 0..5 {
+        let pkt = rx.blocking_recv().expect("packet");
         if first_flags.is_none() {
             first_flags = Some(pkt.flags);
         }
@@ -64,11 +64,27 @@ fn mock_capture_emits_expected_packets() {
 }
 
 #[test]
-fn mock_capture_stop_is_idempotent_after_drain() {
-    let cap = mock_capture(3);
-    let got: Vec<u32> = cap.rx.iter().map(|p| p.seq).collect();
-    assert_eq!(got.len(), 3);
-    (cap.stop)(); // joins the producer thread; must not panic
+fn capture_survives_having_no_subscribers() {
+    // A session toggling audio off drops the last receiver. That is normal, and it must not
+    // stop the host-wide capture: `AudioSink::send` swallows the "no receivers" error and the
+    // stop flag remains the only teardown path.
+    let (tx, rx) = tokio::sync::broadcast::channel::<AudioPacket>(BROADCAST_CAPACITY);
+    drop(rx);
+    let cap = mock_capture(AudioSink::new(tx), 64);
+    (cap.stop)(); // joins the producer thread; must not panic or hang
+}
+
+#[test]
+fn a_slow_subscriber_is_lagged_not_backpressured() {
+    // The producer must never block on a reader that has stopped reading. Publish more than
+    // the ring holds and confirm the writer finished and the reader is told it lost packets.
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<AudioPacket>(BROADCAST_CAPACITY);
+    let cap = mock_capture(AudioSink::new(tx), BROADCAST_CAPACITY as u32 * 4);
+    (cap.stop)(); // returns only if the producer never blocked
+    assert!(matches!(
+        rx.blocking_recv(),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
+    ));
 }
 
 struct SeqGate {
