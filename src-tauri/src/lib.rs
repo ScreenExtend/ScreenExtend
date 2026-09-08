@@ -668,6 +668,7 @@ pub fn run() {
                         app.handle().clone(),
                         ctrl_path,
                         focus_main_window,
+                        single_instance::quit_main_window,
                     ) {
                         teprintln!("[single-instance] failed to start control server: {e}");
                     }
