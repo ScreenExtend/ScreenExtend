@@ -823,6 +823,7 @@ pub fn register_cloud_session(
         disable_gpu_encode: state
             .disable_gpu_encode
             .load(std::sync::atomic::Ordering::Relaxed),
+        gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -934,6 +935,7 @@ pub fn sync_streamers(state: &AppState) {
             disable_gpu_encode: state
                 .disable_gpu_encode
                 .load(std::sync::atomic::Ordering::Relaxed),
+            gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
             ..Config::default()
         };
 

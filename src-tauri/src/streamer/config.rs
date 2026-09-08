@@ -140,7 +140,16 @@ pub struct Config {
     pub quality_qp: Option<u8>,
     pub intra_refresh: bool,
     pub encoder_vendor: EncoderVendor,
+    /// The snapshot the standalone probe harness and `--software-encode` set. Prefer
+    /// [`Config::software_encode_now`] everywhere that has a live host behind it.
     pub disable_gpu_encode: bool,
+    /// The live "GPU video encoding" toggle, when there is an `AppState` behind this config.
+    ///
+    /// Every other shared field in this struct is a cloned `Arc` and this one was a `bool` read
+    /// once at streamer-construction time, so a Settings toggle could only take effect by draining
+    /// and rebuilding every streamer — which is a visible disconnection for every device on the
+    /// host. With a handle, the encoder selection can read it at the moment it picks a backend.
+    pub gpu_encode_toggle: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub virtual_display: Option<SharedVirtualDisplay>,
     pub session_auth: Option<SessionAuth>,
     pub device_reporter: Option<SharedDeviceReporter>,
@@ -195,6 +204,7 @@ impl Default for Config {
             intra_refresh: false,
             encoder_vendor: EncoderVendor::Auto,
             disable_gpu_encode: false,
+            gpu_encode_toggle: None,
             virtual_display: None,
             session_auth: None,
             device_reporter: None,
@@ -211,6 +221,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Whether this session must encode in software, read live where a live value exists.
+    ///
+    /// The probe harness has no `AppState`, so it falls back to the snapshot `--software-encode`
+    /// set. Read this at encoder-selection time, not at config-build time.
+    pub fn software_encode_now(&self) -> bool {
+        match self.gpu_encode_toggle.as_ref() {
+            Some(flag) => flag.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.disable_gpu_encode,
+        }
+    }
+
     pub fn from_args() -> Self {
         let mut c = Config::default();
         let args: Vec<String> = std::env::args().collect();
@@ -520,4 +541,37 @@ PROBES / SELF-TEST (no browser)\n\
 \n\
   -h, --help              print this help and exit"
     );
+}
+
+#[cfg(test)]
+mod gpu_toggle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn the_probe_harness_falls_back_to_its_snapshot() {
+        let mut c = Config::default();
+        assert!(!c.software_encode_now());
+        c.disable_gpu_encode = true;
+        assert!(c.software_encode_now(), "--software-encode must still work");
+    }
+
+    #[test]
+    fn a_live_host_reads_the_toggle_rather_than_the_snapshot() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let c = Config {
+            disable_gpu_encode: true, // the stale snapshot
+            gpu_encode_toggle: Some(Arc::clone(&flag)),
+            ..Config::default()
+        };
+        assert!(
+            !c.software_encode_now(),
+            "the handle wins: the snapshot is what went stale"
+        );
+        flag.store(true, Ordering::Relaxed);
+        assert!(c.software_encode_now());
+        flag.store(false, Ordering::Relaxed);
+        assert!(!c.software_encode_now(), "and it can be turned back on");
+    }
 }
