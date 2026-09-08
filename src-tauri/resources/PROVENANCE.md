@@ -8,15 +8,54 @@ against the upstream release the next time these are refreshed.
 
 ## Virtual Display Driver (`VirtualDisplayDriver.{dll,cat,inf}`)
 
-- **Upstream:** [MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs)
-  — a Windows indirect-display driver (IDD) creating virtual monitors. Credited
-  in the project README.
-- **Used for:** creating a real virtual display per connected client.
-- **Version/tag:** confirm against the upstream release; the driver package
-  (`.inf`/`.cat`/`.dll`) is published on the upstream GitHub Releases.
-- **License:** confirm against the upstream `LICENSE` (virtual-display-rs).
-- **Signing:** the `.cat` catalog is signed; `ScreenExtend.cer` (below) is the
-  certificate that must be trusted for Windows to load the driver.
+**This is not an upstream artifact.** It is a locally built, rebranded fork, and until this
+section was rewritten nothing in the tree said so — the only way to learn what the binary
+was, was to run `strings` on it. That is recorded here so the next person does not have to.
+
+- **Upstream base:** [MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs),
+  a Windows indirect-display driver (IDD) creating virtual monitors. Credited in the project
+  README.
+- **Upstream commit built:** `eae5120a676831ebb96a78125f7e84532bcaf152` (2024-07-08). The DLL
+  reports it itself: `Initialized Virtual Display Driver v1.0.0 @ eae5120`.
+- **Fork repository:** **not published.** The branding patch below exists only in a private
+  working tree, so nobody but the original author can reproduce this binary. Publishing that
+  fork is the outstanding action; two queued driver improvements
+  (choosing the render adapter, and mode changes that do not unplug the monitor) are blocked
+  on it in practice.
+- **Build machine:** the DLL embeds `C:\Users\sarve\.cargo\registry\...` paths, i.e. it was
+  compiled on this project's Windows dev box, not by CI. Dependency versions visible in the
+  binary include `tokio 1.38.0` and `serde_json 1.0.120`, which dates the build to mid-2024.
+  The exact Rust toolchain and WDK/EWDK version used were **not recorded** and cannot be
+  recovered from the artifact; capture them the next time it is rebuilt.
+- **Build command:** unrecorded. Upstream builds with `cargo make` against the WDK; confirm
+  and write the exact invocation here on the next rebuild.
+- **Branding delta from upstream** (read out of the shipped `.inf`, which is UTF-16LE):
+  - `ManufacturerName="ScreenExtend"`, `DeviceName="ScreenExtend Display Driver"`
+  - `DriverVer = 07/18/2024,1.0.0.0`
+  - the IPC pipe name is **unchanged** at `\\.\pipe\virtualdisplaydriver`, which is what
+    `windows_utils/driver_ipc` connects to and what `probe_display_backend()` tests for.
+- **Capability ceiling, from the same `.inf`** — this is the one fact that is otherwise only
+  discoverable by disassembly:
+  - `UmdfExtensions = IddCx0102` — IddCx **1.2**, i.e. Windows 10 1709. Anything the driver
+    could gain from a later IddCx level (adapter selection among them) needs a rebuild
+    against a newer WDK, not a configuration change.
+  - `UmdfLibraryVersion = 2.15.0`, `UmdfKernelModeClientPolicy = AllowKernelModeClients`,
+    `UmdfHostProcessSharing = ProcessSharingDisabled`
+  - `HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "VirtualDisplayDriverGroup"` — Microsoft advises
+    dropping `DeviceGroupId` for low-lock-contention IDDs. Advisory for a console IDD like
+    this one, but it belongs in the same review.
+  - `Class = Display`, `ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}`,
+    `%DeviceName%=VirtualDisplay_Install, Root\VirtualDisplayDriver` — the hardware id the
+    `nefconc` calls in `cli.rs`/`lib.rs` pass.
+- **License:** upstream `virtual-display-rs` terms apply to the fork; confirm against its
+  `LICENSE` at commit `eae5120`.
+- **Signing:** the `.cat` catalog is signed with the key behind `ScreenExtend.cer` (below),
+  **not** with any upstream key. The signing procedure was not recorded either; the
+  certificate has to be installed into `root` and `TrustedPublisher` for Windows to load the
+  driver, which is what `ScreenExtend drivers install` does through `certutil`.
+- **Reproducing it:** a second machine following this section will not produce a
+  byte-identical DLL — embedded paths and timestamps differ — so the check is behavioural,
+  plus a matching `Initialized Virtual Display Driver ... @ <commit>` string.
 
 | File | SHA-256 |
 | --- | --- |

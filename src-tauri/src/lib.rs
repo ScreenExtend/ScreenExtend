@@ -609,16 +609,28 @@ pub fn run() {
             logbus::LogLine
         ]);
 
+    // Debug build, no CLI arguments: that is `pnpm tauri dev`, and `cargo run -- serve` is
+    // deliberately excluded. The path is resolved from the crate directory rather than from
+    // `..`, so it lands on the right file whatever the working directory is -- a relative
+    // path here wrote somewhere else, or panicked, depending on where the binary started.
+    //
+    // "no arguments" is still only a proxy for "this is the current build", so a stale debug
+    // binary can revert the whole surface. `scripts/check-bindings.mjs` is what catches that:
+    // a static cross-check against the macro lists above, run in CI.
     #[cfg(debug_assertions)]
     if std::env::args_os().nth(1).is_none() {
+        let bindings_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings.ts");
         builder
-            .export(Typescript::default(), "../src/lib/bindings.ts")
+            .export(Typescript::default(), &bindings_path)
             .expect("error while exporting typescript bindings");
-        let bindings_path = "../src/lib/bindings.ts";
-        let contents = std::fs::read_to_string(bindings_path)
+        let contents = std::fs::read_to_string(&bindings_path)
             .expect("error while reading typescript bindings");
-        std::fs::write(bindings_path, format!("// @ts-nocheck\n{contents}"))
+        // The generated file declares a `TAURI_CHANNEL` helper it does not always use, which
+        // `noUnusedLocals` rejects; that one artifact is why the whole file is unchecked.
+        std::fs::write(&bindings_path, format!("// @ts-nocheck\n{contents}"))
             .expect("error while writing typescript bindings");
+        println!("exported bindings to {}", bindings_path.display());
     }
 
     tauri::Builder::default()
@@ -645,6 +657,7 @@ pub fn run() {
             builder.mount_events(app);
             let _ = crate::cli::dispatch(app.handle());
             crate::streamer::input::prime();
+            permissions::prime();
             match app.cli().matches().ok().and_then(|m| m.subcommand) {
                 Some(command) if command.name == "hostednetwork" => {
                     let mut ssid = String::new();
