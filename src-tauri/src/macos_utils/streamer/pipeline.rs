@@ -189,7 +189,7 @@ fn spawn_drain(
     output: crossbeam_channel::Receiver<super::encoder::CompressedSample>,
     tx: broadcast::Sender<EncodedFrame>,
     telemetry: SharedTelemetry,
-) -> std::thread::JoinHandle<()> {
+) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("videotoolbox-drain".to_string())
         .spawn(move || {
@@ -217,7 +217,8 @@ fn spawn_drain(
                 });
             }
         })
-        .expect("spawn encode-drain thread")
+        .inspect_err(|e| teprintln!("[vt] could not spawn the encode-drain thread: {e}"))
+        .ok()
 }
 
 /// Tear the encoder down and stand a new one up.
@@ -239,7 +240,10 @@ fn reset_encoder(
     match Encoder::new(cfg) {
         Ok(e) => {
             telemetry.encoder.set(e.backend_name().into());
-            *drain = Some(spawn_drain(e.output(), tx.clone(), Arc::clone(telemetry)));
+            let Some(handle) = spawn_drain(e.output(), tx.clone(), Arc::clone(telemetry)) else {
+                return false;
+            };
+            *drain = Some(handle);
             *encoder = Some(e);
             true
         }
@@ -271,11 +275,10 @@ fn run_encode_loop(l: EncodeLoop) {
     super::qos::pin_current_thread_encode_affinity();
     let _keep_awake = super::power::KeepAwake::begin();
 
-    let mut drain = Some(spawn_drain(
-        encoder.output(),
-        tx.clone(),
-        Arc::clone(&telemetry),
-    ));
+    let mut drain = spawn_drain(encoder.output(), tx.clone(), Arc::clone(&telemetry));
+    if drain.is_none() {
+        return;
+    }
     let mut encoder = Some(encoder);
 
     let mut last_frame: Option<Arc<super::frame::Frame>> = None;
@@ -455,6 +458,12 @@ fn run_encode_loop(l: EncodeLoop) {
                     .degradation
                     .encoder_transient_errors
                     .fetch_add(1, Ordering::Relaxed);
+                // The keyframe request was taken off the flag at the top of this iteration and
+                // the frame carrying it was refused, so put it back: a client waiting on a PLI
+                // would otherwise stay broken until it thought to ask again.
+                if force_idr {
+                    idr_request.store(true, Ordering::Relaxed);
+                }
                 submit_errors += 1;
                 // One rejected frame is not a reason to stop streaming forever, which is what
                 // breaking out of this loop used to mean: the session stayed up, the transport

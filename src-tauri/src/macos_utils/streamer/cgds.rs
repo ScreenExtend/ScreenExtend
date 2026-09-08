@@ -135,6 +135,7 @@ pub struct CgDisplayStreamBackend {
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
     drops: Arc<AtomicU64>,
+    wrap_ns: Arc<AtomicU64>,
     telemetry: SharedTelemetry,
     stream: Option<CFRetained<CGDisplayStream>>,
     _queue: Option<DispatchRetained<DispatchQueue>>,
@@ -157,6 +158,7 @@ impl CgDisplayStreamBackend {
             sink,
             frames: Arc::new(AtomicU64::new(0)),
             drops: Arc::new(AtomicU64::new(0)),
+            wrap_ns: Arc::new(AtomicU64::new(0)),
             telemetry,
             stream: None,
             _queue: None,
@@ -174,6 +176,14 @@ impl CgDisplayStreamBackend {
     /// WindowServer updates"* — it is the only capture-side back-pressure signal this API has.
     pub fn frames_dropped(&self) -> u64 {
         self.drops.load(Ordering::Relaxed)
+    }
+
+    /// Mean nanoseconds spent inside the delivery callback wrapping the surface and publishing
+    /// it — the whole per-frame allocation cost this backend pays, measured rather than argued
+    /// about. Two monotonic clock reads and one relaxed add per frame; no allocation.
+    fn mean_wrap_ns(&self) -> Option<u64> {
+        let frames = self.frames.load(Ordering::Relaxed);
+        (frames > 0).then(|| self.wrap_ns.load(Ordering::Relaxed) / frames)
     }
 }
 
@@ -224,6 +234,7 @@ struct HandlerCtx {
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
     drops: Arc<AtomicU64>,
+    wrap_ns: Arc<AtomicU64>,
     telemetry: SharedTelemetry,
     published_one: AtomicBool,
     width: usize,
@@ -275,6 +286,7 @@ fn handle_frame(
         return;
     };
 
+    let wrap_started = mach_now();
     unsafe {
         let surface_ret: CFRetained<IOSurfaceRef> = CFRetained::retain(surface_ptr);
         let mut out: *mut CVPixelBuffer = ptr::null_mut();
@@ -302,6 +314,10 @@ fn handle_frame(
         });
         // Only now is the gate armed, so a failed wrap does not consume the one free pass.
         ctx.published_one.store(true, Ordering::Relaxed);
+        ctx.wrap_ns.fetch_add(
+            super::mach::mach_delta_ns(wrap_started, mach_now()),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -334,6 +350,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
             sink: self.sink.clone(),
             frames: self.frames.clone(),
             drops: self.drops.clone(),
+            wrap_ns: self.wrap_ns.clone(),
             telemetry: Arc::clone(&self.telemetry),
             published_one: AtomicBool::new(false),
             width: self.cfg.width,
@@ -386,9 +403,11 @@ impl CaptureBackend for CgDisplayStreamBackend {
         if let (Some(api), Some(stream)) = (cg_api(), &self.stream) {
             let _ = unsafe { (api.stop)((&**stream as *const CGDisplayStream).cast_mut()) };
             tprintln!(
-                "[cgds] capture stopped: {} frames published, {} dropped by WindowServer",
+                "[cgds] capture stopped: {} frames published, {} dropped by WindowServer, \
+                 {} ns mean in the delivery callback",
                 self.frames_captured(),
-                self.frames_dropped()
+                self.frames_dropped(),
+                self.mean_wrap_ns().unwrap_or(0)
             );
         }
         self.stream = None;
@@ -477,19 +496,24 @@ mod tests {
     #[test]
     #[ignore]
     fn capture_rate() {
+        let id = display::select_display(0).expect("a main display");
+        let (gw, gh, _) = display::display_geometry(id);
+        run_capture_rate(id, gw, gh, "native");
+    }
+
+    fn run_capture_rate(id: u32, w: u32, h: u32, label: &str) {
         const SECONDS: u64 = 5;
 
-        let id = display::select_display(0).expect("a main display");
         let (gw, gh, refresh) = display::display_geometry(id);
-        println!("display {id}: {gw}x{gh} @ {refresh}fps");
+        println!("display {id}: {gw}x{gh} @ {refresh}fps, capturing {w}x{h} ({label})");
 
         let _cursor = display::CursorAnimation::start(id, gw, gh);
 
         let gpu = Gpu::new().unwrap();
         let (sink, source) = frame_channel();
         let cfg = CaptureConfig {
-            width: gw as usize,
-            height: gh as usize,
+            width: w as usize,
+            height: h as usize,
             fps: if refresh == 0 { 60 } else { refresh } as i32,
             pixel_format: PIXEL_FORMAT_420F,
         };
@@ -525,21 +549,23 @@ mod tests {
         drop(held);
         let delivered = backend.frames_captured();
         let dropped = backend.frames_dropped();
+        let wrap_ns = backend.mean_wrap_ns().unwrap_or(0);
         backend.stop();
 
         println!(
-            "delivered={delivered} ({:.1} fps) taken={taken} windowserver_drops={dropped}",
+            "[{label}] delivered={delivered} ({:.1} fps) taken={taken} \
+             windowserver_drops={dropped} callback_mean={wrap_ns}ns",
             delivered as f64 / SECONDS as f64
         );
         if delivery_ms.is_empty() {
-            println!("displayTime→callback: no OS timestamps");
+            println!("[{label}] displayTime->callback: no OS timestamps");
         } else {
             delivery_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let p = |q: f64| {
                 delivery_ms[((delivery_ms.len() as f64 * q) as usize).min(delivery_ms.len() - 1)]
             };
             println!(
-                "displayTime→callback ms: p50={:.2} p90={:.2} p99={:.2} max={:.2} (n={})",
+                "[{label}] displayTime->callback ms: p50={:.2} p90={:.2} p99={:.2} max={:.2} (n={})",
                 p(0.5),
                 p(0.9),
                 p(0.99),
@@ -548,6 +574,21 @@ mod tests {
             );
         }
         assert!(delivered > 0, "no frames delivered");
+    }
+
+    /// Does WindowServer's own downscale cost delivery latency?
+    ///
+    /// All scaling is delegated to it: the stream is created at the encode size and no
+    /// `SourceRect`, `DestinationRect` or scaling-quality key is set, so a client asking for half
+    /// resolution makes the compositor resample every frame before we see it. Run this next to
+    /// `capture_rate` (which captures at native size) and compare the two `displayTime→callback`
+    /// distributions. If they match, the scaler is free and `gpu.rs` has nothing to do.
+    #[test]
+    #[ignore]
+    fn capture_rate_downscaled() {
+        let id = display::select_display(0).expect("a main display");
+        let (gw, gh, _) = display::display_geometry(id);
+        run_capture_rate(id, (gw / 2) & !1, (gh / 2) & !1, "half scale");
     }
 
     #[test]

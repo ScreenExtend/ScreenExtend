@@ -129,8 +129,9 @@ pub fn ensure_screen_recording_access() -> bool {
     }
     type AccessFn = unsafe extern "C" fn() -> bool;
     unsafe {
-        let cname = std::ffi::CString::new("CGRequestScreenCaptureAccess").unwrap();
-        let p = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
+        // A `c"..."` literal rather than `CString::new(...).unwrap()`: the name is a compile-time
+        // constant, so there is nothing to allocate and nothing to fail.
+        let p = libc::dlsym(libc::RTLD_DEFAULT, c"CGRequestScreenCaptureAccess".as_ptr());
         if p.is_null() {
             true
         } else {
