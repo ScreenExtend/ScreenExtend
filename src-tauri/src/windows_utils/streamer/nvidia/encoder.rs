@@ -50,6 +50,69 @@ const OUTPUT_BUFFERS: usize = 4;
 /// in which the encoder may predict from something stale.
 const MAX_LTR_SLOTS: u32 = 2;
 
+/// Check every driver entry point the encode path will unwrap, once, before anything is opened.
+///
+/// `NV_ENCODE_API_FUNCTION_LIST` is a table of nullable C function pointers, and the code checked
+/// exactly one of them — `nvEncOpenEncodeSessionEx` — while every hot-path call site unwrapped
+/// with `.expect(...)`. On a driver that populates the table partially (a vGPU or virtualised
+/// NVENC is the realistic case) that is a panic on the detached `nvenc-ring-encode` thread, whose
+/// join result is discarded, so the visible symptom is a stream that silently stops. Failing here
+/// instead lets `build_backend` fall through to the next vendor with a reason.
+///
+/// The optional ones are deliberately absent from this list: `nvEncInvalidateRefFrames` and the
+/// async-event pair are feature-gated at their call sites, not required.
+fn require_functions(fns: &NV_ENCODE_API_FUNCTION_LIST) -> Result<()> {
+    let required: [(&str, bool); 13] = [
+        (
+            "nvEncOpenEncodeSessionEx",
+            fns.nvEncOpenEncodeSessionEx.is_some(),
+        ),
+        ("nvEncGetEncodeCaps", fns.nvEncGetEncodeCaps.is_some()),
+        (
+            "nvEncGetEncodePresetConfigEx",
+            fns.nvEncGetEncodePresetConfigEx.is_some(),
+        ),
+        (
+            "nvEncInitializeEncoder",
+            fns.nvEncInitializeEncoder.is_some(),
+        ),
+        ("nvEncRegisterResource", fns.nvEncRegisterResource.is_some()),
+        (
+            "nvEncUnregisterResource",
+            fns.nvEncUnregisterResource.is_some(),
+        ),
+        (
+            "nvEncCreateBitstreamBuffer",
+            fns.nvEncCreateBitstreamBuffer.is_some(),
+        ),
+        (
+            "nvEncDestroyBitstreamBuffer",
+            fns.nvEncDestroyBitstreamBuffer.is_some(),
+        ),
+        ("nvEncMapInputResource", fns.nvEncMapInputResource.is_some()),
+        (
+            "nvEncUnmapInputResource",
+            fns.nvEncUnmapInputResource.is_some(),
+        ),
+        ("nvEncEncodePicture", fns.nvEncEncodePicture.is_some()),
+        ("nvEncLockBitstream", fns.nvEncLockBitstream.is_some()),
+        ("nvEncUnlockBitstream", fns.nvEncUnlockBitstream.is_some()),
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "NVENC function list is missing {} required entry point(s): {} (driver too old, or a              virtualised NVENC that does not implement the full API)",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 pub enum SlotEncodeError {
     Poisoned(anyhow::Error),
     Encode(anyhow::Error),
@@ -245,8 +308,9 @@ pub struct Encoder {
     outputs: Vec<Output>,
     inflight: std::collections::VecDeque<InFlight>,
     next_output: usize,
-    /// Reused across frames so a steady-state encode allocates nothing. Sized to the largest
-    /// access unit seen so far, which after the first IDR is the whole range.
+    /// The staging buffer the locked bitstream is read into. Kept across frames and only ever
+    /// grown, so the copy out of the driver's write-combined mapping never allocates while the
+    /// bitstream lock is held. Sized to the largest access unit seen so far.
     au_scratch: Vec<u8>,
     async_mode: bool,
     caps: EncoderCaps,
@@ -317,9 +381,7 @@ impl Encoder {
                 ptr::null_mut(),
             )?;
         }
-        if fns.nvEncOpenEncodeSessionEx.is_none() {
-            bail!("NVENC function list did not populate (driver too old?)");
-        }
+        require_functions(&fns)?;
 
         let encoder = unsafe { open_session(&fns, device.as_raw())? };
         let caps = EncoderCaps::query(&fns, encoder);
@@ -429,9 +491,7 @@ impl Encoder {
                 ptr::null_mut(),
             )?;
         }
-        if fns.nvEncOpenEncodeSessionEx.is_none() {
-            bail!("NVENC function list did not populate (driver too old?)");
-        }
+        require_functions(&fns)?;
 
         let encoder = unsafe { open_session(&fns, device.as_raw())? };
         let caps = EncoderCaps::query(&fns, encoder);
@@ -697,7 +757,7 @@ impl Encoder {
 
         self.encode_config = new_config;
         self.init_params = reconfig.reInitEncodeParams;
-        self.init_params.encodeConfig = &mut self.encode_config;
+        self.init_params.encodeConfig = ptr::null_mut();
         tprintln!("NVENC bitrate reconfigured (bitrate_bps={bps})");
         Ok(BitrateApplied::Applied)
     }
@@ -1178,7 +1238,14 @@ impl Encoder {
 
         self.encode_config = config;
         self.init_params = init;
-        self.init_params.encodeConfig = &mut self.encode_config;
+        // Null, not `&mut self.encode_config`. `NV_ENC_INITIALIZE_PARAMS.encodeConfig` is a raw
+        // pointer, and storing one into our own field made `Encoder` self-referential while
+        // `unsafe impl Send` moves it across threads — into `AsyncNvencRing::new`, then into the
+        // encode thread's closure. After each move the pointer named the previous location.
+        // Nothing dereferenced it (the one consumer, `set_bitrate`, overwrites it with a live
+        // stack local first), so this was a landmine rather than live UB; the config lives in
+        // `self.encode_config` and every user points the field at something live before use.
+        self.init_params.encodeConfig = ptr::null_mut();
         Ok(())
     }
 
@@ -1399,16 +1466,22 @@ impl Encoder {
             return Err(e);
         }
 
+        // Inside the lock: one read out of the driver's write-combined mapping into a buffer
+        // that is already resident. Nothing else — no allocation, no growth. `au_scratch` is
+        // kept, not handed out, so it stays sized to the largest access unit seen and the
+        // `reserve` cannot fault on the critical path. Copying into a freshly taken (and
+        // therefore empty) `Vec` put exactly that allocation inside the lock, where it delays
+        // the next picture that lands on this output slot.
         let len = lock.bitstreamSizeInBytes as usize;
-        self.au_scratch.clear();
-        self.au_scratch.reserve(len);
+        if self.au_scratch.len() < len {
+            self.au_scratch.resize(len, 0);
+        }
         unsafe {
             ptr::copy_nonoverlapping(
                 lock.bitstreamBufferPtr as *const u8,
                 self.au_scratch.as_mut_ptr(),
                 len,
             );
-            self.au_scratch.set_len(len);
         }
 
         let unlock = unsafe {
@@ -1421,7 +1494,9 @@ impl Encoder {
         unsafe { self.unmap(pending.mapped) };
         self.check(unlock, "nvEncUnlockBitstream")?;
 
-        Ok(std::mem::take(&mut self.au_scratch))
+        // Outside the lock. Still one allocation per access unit — the callers want an owned
+        // `Vec` that becomes a `Bytes` — but the driver is no longer waiting on it.
+        Ok(self.au_scratch[..len].to_vec())
     }
 
     unsafe fn unmap(&self, mapped: NV_ENC_INPUT_PTR) {
@@ -1650,7 +1725,29 @@ unsafe fn open_session(
             if let Some(d) = fns.nvEncDestroyEncoder {
                 let _ = d(encoder);
             }
-            return Err(anyhow!("nvEncOpenEncodeSessionEx failed: {st:?}"));
+            // Name the session cap when that is what happened. Consumer drivers allow a fixed
+            // number of concurrent NVENC sessions per system, and ScreenExtend opens one per
+            // streaming session — so the Nth client is an ordinary condition, not a broken
+            // machine. `build_backend` degrades to Quick Sync or x264 either way; the point of
+            // saying so is that the log otherwise reads as "NVENC unavailable" on a host with a
+            // perfectly good NVENC.
+            //
+            // `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY` is the status the driver actually returns for
+            // this, which its name does not suggest. Measured on the dev box (RTX 3080 Ti
+            // Laptop, driver 580.97) by opening sessions until refusal: the 9th failed, so the
+            // cap here is 8. `OUT_OF_MEMORY` covers the branches that report it that way
+            // instead. Probed by attempting, never by counting — the limit varies by driver
+            // branch and by whatever else on the machine is encoding.
+            let detail = match st {
+                NVENCSTATUS::NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY
+                | NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => {
+                    " (the driver's concurrent-session limit: this system already holds as many \
+                     NVENC sessions as it allows, so this client encodes on Quick Sync or x264 \
+                     instead)"
+                }
+                _ => "",
+            };
+            return Err(anyhow!("nvEncOpenEncodeSessionEx failed: {st:?}{detail}"));
         }
     }
     Ok(encoder)

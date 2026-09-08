@@ -509,3 +509,134 @@ fn nvenc_ltr_repair_is_cheaper_than_an_idr() {
          ({idr_bytes} B) is not a repair"
     );
 }
+
+/// How many concurrent NVENC sessions this driver actually allows, and what the (N+1)th looks
+/// like from here.
+///
+/// Consumer drivers cap concurrent NVENC sessions per system — three historically, eight since
+/// r551 — and ScreenExtend opens one encoder per streaming session, so the cap is a number of
+/// simultaneous clients, not an exotic failure. What must hold is that the client past the cap
+/// *degrades*: `build_backend` catches the error and moves to Quick Sync or x264. A panic, or an
+/// error that reads as "no NVENC on this machine", would be the wrong outcome on a host with a
+/// perfectly good encoder.
+///
+/// The cap is probed by attempting, never asserted as a number: it varies by driver branch and by
+/// what else on the machine is encoding.
+#[test]
+fn nvenc_session_limit_degrades_instead_of_panicking() {
+    const W: u32 = 640;
+    const H: u32 = 360;
+    // Well past any documented cap, so the loop ends on the driver's refusal, not on this bound.
+    const CEILING: usize = 24;
+
+    let mut held: Vec<Encoder> = Vec::new();
+    let mut refusal = None;
+    for _ in 0..CEILING {
+        match Encoder::new(cfg(W, H, 30, 2_000_000)) {
+            Ok(e) => held.push(e),
+            Err(e) => {
+                refusal = Some(format!("{e:#}"));
+                break;
+            }
+        }
+    }
+
+    if held.is_empty() {
+        super::skip(
+            "NVENC session-limit test (no NVIDIA GPU / driver)",
+            refusal.unwrap_or_default(),
+        );
+        return;
+    }
+
+    // Whatever the cap is, the encoders that were opened must still work — an exhausted session
+    // pool must not disturb the sessions that already exist.
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    fill_synthetic_bgra(&mut frame, W, H, 0);
+    for (i, enc) in held.iter_mut().enumerate() {
+        let au = enc.encode_bgra(&frame, true).unwrap_or_else(|e| {
+            panic!("session {i} should still encode after the pool filled: {e:#}")
+        });
+        assert!(
+            is_idr_with_headers(&au),
+            "session {i} produced no IDR after the session pool filled"
+        );
+    }
+
+    match &refusal {
+        Some(msg) => {
+            assert!(
+                msg.contains("nvEncOpenEncodeSessionEx"),
+                "the refusal past the session cap must name the call that refused, got: {msg}"
+            );
+            assert!(
+                msg.contains("concurrent-session limit"),
+                "a refusal caused by the session cap must say so, or the log reads as                  'no NVENC on this machine'; got: {msg}"
+            );
+            eprintln!(
+                "NVENC session limit OK: {} concurrent sessions opened, the next refused with: {msg}",
+                held.len()
+            );
+        }
+        None => eprintln!(
+            "NVENC session limit OK: {CEILING} concurrent sessions opened without refusal \
+             (this driver's cap is above the probe ceiling)"
+        ),
+    }
+}
+
+/// What the per-frame `nvEncMapInputResource` / `nvEncUnmapInputResource` pair costs.
+///
+/// `minor-nvenc-map-unmap-input-resource-every-frame` asks for a measurement before deciding
+/// whether to hold the mapping across frames. Registration is already done once at construction;
+/// this times the whole encode against a fixed frame so the map/unmap pair is the only per-frame
+/// driver work that varies, and prints it next to the total.
+#[test]
+fn nvenc_map_unmap_cost_per_frame() {
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+    const FRAMES: u32 = 200;
+
+    let mut encoder = match Encoder::new(cfg(W, H, 60, 10_000_000)) {
+        Ok(e) => e,
+        Err(e) => {
+            super::skip("NVENC map/unmap cost test (no NVIDIA GPU / driver)", e);
+            return;
+        }
+    };
+
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    fill_synthetic_bgra(&mut frame, W, H, 0);
+    // Warm the encoder so the first-frame IDR and any lazy driver allocation are out of the way.
+    for _ in 0..10 {
+        encoder.encode_bgra(&frame, false).expect("warmup encode");
+    }
+
+    // The same picture every time: the encoder's own work is then near-constant and the spread
+    // is dominated by the fixed driver round trips.
+    let mut full: Vec<u128> = Vec::with_capacity(FRAMES as usize);
+    for _ in 0..FRAMES {
+        let t = std::time::Instant::now();
+        encoder.encode_bgra(&frame, false).expect("steady encode");
+        full.push(t.elapsed().as_micros());
+    }
+    // A repeat re-encodes the held input through the same map/unmap pair without a new upload,
+    // so the difference between the two is the `UpdateSubresource` and nothing else.
+    let mut repeat: Vec<u128> = Vec::with_capacity(FRAMES as usize);
+    for _ in 0..FRAMES {
+        let t = std::time::Instant::now();
+        encoder.encode_repeat(false).expect("repeat encode");
+        repeat.push(t.elapsed().as_micros());
+    }
+
+    full.sort_unstable();
+    repeat.sort_unstable();
+    eprintln!(
+        "NVENC per-frame cost at {W}x{H}: upload+map+encode p50={}us p95={}us | \
+         map+encode only p50={}us p95={}us",
+        percentile(&full, 50),
+        percentile(&full, 95),
+        percentile(&repeat, 50),
+        percentile(&repeat, 95),
+    );
+}
