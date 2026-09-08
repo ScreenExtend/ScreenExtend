@@ -77,12 +77,45 @@ of `AtomicU64`. `record` is three relaxed `fetch_add`s and a `fetch_max`: no all
 no logging, which is what makes it safe on a real-time capture callback. Reported as
 p50/p90/p99/max — never a bare mean, which hides the tail that is actually felt.
 
-### Degradation counters
+### Input stages
+
+Three more stages ride the same histograms, but they are recorded per *event* by
+`streamer::input`, not per frame, so `record_frame` does not feed them. The wire layouts they
+depend on are in `docs/INPUT-PROTOCOL.md`.
+
+| Stage | Span |
+|---|---|
+| `input_recv` | client send → host receive, minus the best case (see below) |
+| `input_queue` | host receive → the injector thread picking the event up |
+| `input_inject` | host receive → injection returned: the whole host-side cost |
+
+`input_recv` needs a clock offset the host does not have — the client estimates one from
+PING/PONG and never sends the result back — so the host estimates its own. What it can see
+unaided is `host_recv − client_send` for every stamped frame: the true offset plus that frame's
+one-way delay. The *minimum* of that over a rolling 30 s window is therefore the tightest offset
+obtainable from one direction alone, and `input_recv` reports the difference — **excess one-way
+delay**, 0 on the best sample and growing with queueing. It is a relative number by construction,
+which is what a latency budget wants and is all one direction can honestly give. The window is
+the same 30 s the client uses to age out its own best RTT sample, so a route change is not
+remembered for the whole session.
+
+Only frames carrying the optional client stamp are measured; an unstamped frame from an older
+client contributes nothing rather than a wrong number.
+
+## Degradation counters
 
 `capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `nacks_received`,
-`keyframe_requests`, `idrs_sent`, `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`,
-`audio_broadcast_lag_drops`, plus the client-reported `client_jitter_underruns` /
-`client_jitter_overruns`.
+`keyframe_requests`, `client_keyframe_requests`, `idrs_sent`, `encoder_resets`,
+`encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the client-reported
+`client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
+`input_queue_drops` / `input_stale_drops`.
+
+`keyframe_requests` counts RTCP PLI and FIR; `client_keyframe_requests` counts the out-of-band
+`KEYFRAME_REQUEST` (`0x64`) a client sends when it has no other way to ask, so the two sources
+stay distinguishable. `input_queue_drops` is the fast input queue shedding its oldest entry under
+pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
+rather than injected late — never a key or a button, which are state transitions the host cannot
+recover from.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
@@ -135,10 +168,11 @@ rest.
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
 
-**The v2 tail is not yet parsed by the host.** `input/protocol.rs::parse_client_stats` reads the
-first 72 bytes and stops, so the tier bytes and the degradation field reach the host and are
-discarded. Surfacing them is `findings/major-telemetry-client-stats-v2-tail-is-discarded.md`.
-Until it lands, read them with `SEVideo.getStats()` on the device.
+The host reads the tail whenever all 96 bytes arrived and leaves the fields at 0 otherwise, which
+is also what "not measured" means for each of them — so a v1 client and a v2 client that measured
+nothing are correctly indistinguishable. A frame one byte short of 96 reads as tail-absent rather
+than half-parsed. `serve -v` names the four tiers in words and lists the set degradation bits by
+name; `status --json` carries the raw codes, the decoded names and the audio numbers.
 
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
@@ -214,10 +248,11 @@ host. The field is a union of the page's own bits and the audio module's.
 
 ### Opcode note
 
-`0x62` is used in both directions. Host → client it is the (currently unused) input-queue stats
-frame built by `protocol::build_stats`, 25 bytes; client → host it is this frame. Direction
-disambiguates: the host parser only ever sees the client's, and the client's `onReliableMessage`
-only handles `PONG` and `BYE`.
+`0x62` is client → host only. It used to be defined in both directions — the host → client twin
+was a 25-byte injector-queue frame built by `protocol::build_stats` that was never sent — and that
+builder is gone: the injector's counters live in `SessionTelemetry` instead, where `status --json`
+reads them beside every other counter. The full input opcode table, and the optional client
+timestamp several frames now carry, are in `docs/INPUT-PROTOCOL.md`.
 
 ## Reading it
 
@@ -254,3 +289,6 @@ client), and the clock conversions in `windows_utils/streamer/clock.rs` and
 3. Fold it in `SessionTelemetry::record_frame`.
 4. Set the stamp on every pipeline that has that stage; the ones that do not will report
    `count == 0`, which is the correct answer.
+
+An event-shaped stage skips steps 1 and 3 — `FrameTiming` and `record_frame` are frame-shaped —
+and calls `telemetry.stages.<name>.record(ns)` directly, the way the three input stages do.
