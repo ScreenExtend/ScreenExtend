@@ -318,10 +318,21 @@
     // the picture is up. Where the browser hides output labels behind a microphone grant,
     // the prompt is offered here — it used to stand in front of the join for up to twelve
     // seconds, gating ICE, which gated WHEP, which gated the host creating the display.
+    // The prompt is lazy and optional: the picture never waits for it and a decline costs
+    // nothing but device *labels* in the host's picker. But "the page went fullscreen while the
+    // card was up" is not a decline, and treating it as one made it terminal — a session that
+    // entered fullscreen (the default) could never get labels again, however many times the
+    // host asked to change the sink. A deferral is remembered as a deferral, and
+    // `offerOutputLabels` is what asks again when there is now a reason to.
     let lazyEnumStarted = false;
+    let lazyEnumDeferred = false;
     async function enumerateLazily(showPermModal) {
-        if (lazyEnumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
+        if (typeof showPermModal === 'function') speakers.permModal = showPermModal;
+        if (lazyEnumStarted && !lazyEnumDeferred) {
+            return speakers._cache || { supported: speakers.supported, outputs: [] };
+        }
         lazyEnumStarted = true;
+        lazyEnumDeferred = false;
         initSpeakers();
         if (!speakers.supported) return { supported: false, outputs: [] };
 
@@ -343,9 +354,12 @@
         if (typeof showPermModal !== 'function') return speakers._cache;
 
         await new Promise((resolve) => {
-            showPermModal(() => resolve(true), () => resolve(false));
-        }).then(async (accepted) => {
-            if (!accepted) return;
+            // The skip callback is told whether the user answered or the page simply could not
+            // show the card. Only the first is a decision.
+            showPermModal(() => resolve('granted'), (deferred) => resolve(deferred ? 'deferred' : 'declined'));
+        }).then(async (outcome) => {
+            if (outcome === 'deferred') { lazyEnumDeferred = true; return; }
+            if (outcome !== 'granted') return;
             await primeMicPermission();
             const withLabels = speakers.canSink ? await listOutputs() : [];
             if (withLabels.some((d) => d.label)) {
@@ -357,6 +371,20 @@
             releasePrimedStream();
         }, note);
         return speakers._cache;
+    }
+
+    // Ask again, now that something needs the answer — the host changing this device's output,
+    // or the user opening the picker. Does nothing when the labels are already known or when
+    // the user actually declined; a decline stays declined for the session.
+    function offerOutputLabels(showPermModal) {
+        const cached = function () {
+            return Promise.resolve(speakers._cache || { supported: speakers.supported, outputs: [] });
+        };
+        if (!speakers.supported || !speakers.labelsUnavailable) return cached();
+        if (lazyEnumStarted && !lazyEnumDeferred) return cached();
+        const modal = (typeof showPermModal === 'function') ? showPermModal : speakers.permModal;
+        if (typeof modal !== 'function') return cached();
+        return enumerateLazily(modal);
     }
 
     // Firefox only resolves enumerateDevices() once the document has focus, so a
@@ -990,6 +1018,12 @@
         }, WORKER_READY_DEADLINE_MS);
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
+        // attachWorklet runs once per page but the worker is rebuilt on every
+        // reconfigure, and stopWorker throws the port away with it — so without this
+        // the direct transport existed for the first session only and every later one
+        // silently went back to relaying through the page. A no-op on the shared ring
+        // and while an offer is already outstanding.
+        offerRingPort();
         handOffRingPort();
         if (state.hostOffsetMs !== null) w.postMessage({ type: 'clockoffset', offsetMs: state.hostOffsetMs });
         return true;
@@ -1166,6 +1200,7 @@
         needsMicPermission,
         primeMicPermission,
         pickOutput,
+        offerOutputLabels,
         postOutputs,
         setSpeaker,
         setSpeakerIdentity,

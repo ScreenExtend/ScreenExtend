@@ -428,6 +428,16 @@
             function applyReconfig(j) {
                 if (typeof j.audioSink === 'string') {
                     try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) { noteSuppressed(); }
+                    // The host asking to change this device's output is the moment the
+                    // microphone grant is worth something: without it the picker on the host is
+                    // a list of unlabelled ids. Offered only where the card was deferred rather
+                    // than declined, and it does nothing at all once the labels are known.
+                    try {
+                        if (window.SEAudio && SEAudio.offerOutputLabels) {
+                            Promise.resolve(SEAudio.offerOutputLabels(offerPermModalNow))
+                                .then(() => SEAudio.postOutputs(), noteSuppressed);
+                        }
+                    } catch (_) { noteSuppressed(); }
                 }
                 if (kickEpoch !== null && j.kick !== kickEpoch) {
                     kickEpoch = j.kick;
@@ -842,6 +852,9 @@
                 visibilityHandler = async () => {
                     if (!locked || document.visibilityState !== 'visible') return;
                     enableNoSleep();
+                    // iOS suspends the context when the page is backgrounded and nothing
+                    // resumed it: the picture came back and the audio did not.
+                    try { if (window.SEAudio) SEAudio.resume(); } catch (_) { noteSuppressed(); }
                     if (!fullscreenMode) return;
                     // Fullscreen first: navigator.keyboard.lock() is specified to reject
                     // outside it, so asking on the way back from the background asked at the
@@ -1095,12 +1108,22 @@
             // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
             // public measurement says the overlay actually happens, and the constructor
             // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
+            // Runs from inside the worker's onmessage, where a throw is swallowed by the
+            // event loop and leaves the page with no video sink at all: no canvas, no
+            // generator, and a <video> nothing writes to. transferControlToOffscreen can
+            // throw — every other call of it is inside a try for exactly that reason.
             function useCanvasInstead() {
-                if (worker) {
-                    const off = freshCanvas().transferControlToOffscreen();
-                    worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                try {
+                    if (worker) {
+                        const off = freshCanvas().transferControlToOffscreen();
+                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                    }
+                    showCanvas();
+                } catch (err) {
+                    noteSuppressed();
+                    degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+                    fallbackToVideo('canvas transfer failed: ' + err);
                 }
-                showCanvas();
             }
             function attachTrackGenerator(track) {
                 if (!track) {
@@ -1123,6 +1146,10 @@
             }
 
             async function handleRenderCount(n) {
+                // pc.getStats() is a suspension point, and both watchdogs tear the session down
+                // and rebuild it from inside one. Without this the resumed call demotes the
+                // *new* session on the old one's stall count.
+                const gen = startGen;
                 let bytes = -1;
                 try {
                     if (pc) {
@@ -1134,6 +1161,7 @@
                         });
                     }
                 } catch (_) { noteSuppressed(); }
+                if (gen !== startGen) { noteSuppressed(); return; }
                 const rendersAdvanced = n !== lastRendered;
                 const knowBytes = bytes >= 0;
                 const bytesAdvanced = knowBytes && bytes !== lastBytes;
@@ -1187,7 +1215,10 @@
             // silent degradation the host would otherwise never learn about. `SEVideo.getStats`
             // is the read side; input.js ships the same numbers to the host once a second.
             const VIDEO_PATH = { none: 0, webcodecsCanvas: 1, webcodecsVideo: 2, videoElement: 3 };
-            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3 };
+            // 4 is appended rather than folded into 2: 2 has always meant "the page relays
+            // every packet", and a host reading it must go on meaning that. The
+            // MessagePort transport is a different, faster thing and gets its own code.
+            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3, workletPort: 4 };
 
             let videoWorkerStats = null;
             const fallbackStats = {
@@ -1261,7 +1292,9 @@
                 try { info = SEAudio.getSyncInfo(); } catch (_) { return AUDIO_PATH.none; }
                 if (!info || !info.path) return AUDIO_PATH.none;
                 if (info.path !== 'webcodecs') return AUDIO_PATH.opusTrack;
-                return info.transport === 'shared' ? AUDIO_PATH.workletSab : AUDIO_PATH.workletPost;
+                if (info.transport === 'shared') return AUDIO_PATH.workletSab;
+                if (info.transport === 'port') return AUDIO_PATH.workletPort;
+                return AUDIO_PATH.workletPost;
             }
 
             // One definition, so the flag the host is told cannot disagree with the branch the
@@ -2093,28 +2126,18 @@
                         httpsFixable: httpsCouldHelp,
                     });
                 }
-                if (!audioCaps.webcodecsOpus) {
+                // One row, gated on the pair, and the original wording: this modal's rendered
+                // content is not this branch's to change. Splitting it into a row per capability
+                // showed two rows where one used to appear on Safari 16.4-17 and Firefox 130+,
+                // and added a third for cross-origin isolation that is close to unreachable —
+                // WebCodecs needs a secure context, and on one the host's own COOP/COEP headers
+                // make `crossOriginIsolated` true. `httpsFixable` keeps the correction, because
+                // that one is not cosmetic: it drove a "Switch to HTTPS" button on iPhones whose
+                // Safari has never shipped an AudioDecoder for HTTPS to restore.
+                if (!audioFast) {
                     unsupported.push({
-                        name: 'WebCodecs audio',
-                        description: httpsCouldHelp
-                            ? 'Enables the lowest-latency audio path.'
-                            : 'This browser cannot decode Opus with WebCodecs, so the system audio the host sends plays over a standard audio track that the browser buffers on its own. The picture is unaffected.',
-                        severity: 'optional',
-                        httpsFixable: httpsCouldHelp,
-                    });
-                }
-                if (!audioCaps.worklet) {
-                    unsupported.push({
-                        name: 'AudioWorklet',
-                        description: 'Runs the audio jitter buffer off the main thread. Without it, audio plays over a standard track the browser buffers on its own.',
-                        severity: 'optional',
-                        httpsFixable: httpsCouldHelp,
-                    });
-                }
-                if (canWebCodecs && audioCaps.webcodecsOpus && audioCaps.worklet && !self.crossOriginIsolated) {
-                    unsupported.push({
-                        name: 'Cross-origin isolation',
-                        description: 'Lets decoded audio reach the speakers through shared memory instead of a message queue. Without it audio still plays; it just costs a little more of this device.',
+                        name: 'WebCodecs audio and AudioWorklet',
+                        description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
                         severity: 'optional',
                         httpsFixable: httpsCouldHelp,
                     });
@@ -2235,10 +2258,14 @@
             // would be invisible and its promise would never settle; the host is told the
             // labels are unavailable instead, which is the truth either way.
             const FULLSCREEN_EVENTS = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
+            // `onSkip` is called with `true` when the card could not be shown rather than
+            // answered. That distinction is what stops a session that entered fullscreen — the
+            // default — from being unable to ever ask again: a deferral is retried by
+            // `offerOutputLabels()` when something actually needs the answer, a decline is not.
             function permModalIfVisible(onContinue, onSkip) {
                 if (currentFullscreenEl()) {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
-                    try { if (onSkip) onSkip(); } catch (_) { noteSuppressed(); }
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
                     return;
                 }
                 // The check above is a single sample, and startLock() enters fullscreen
@@ -2258,13 +2285,48 @@
                     stopWatching();
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
                     document.getElementById('permModal').style.display = 'none';
-                    try { if (onSkip) onSkip(); } catch (_) { noteSuppressed(); }
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
                 };
                 FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onFsChange));
                 showPermModal(
                     () => { stopWatching(); if (onContinue) onContinue(); },
-                    () => { stopWatching(); if (onSkip) onSkip(); },
+                    () => { stopWatching(); if (onSkip) onSkip(false); },
                 );
+            }
+
+            // The retry. The card is only worth raising now because something asked for it — the
+            // host changing this device's output, or the user opening the picker — so leave
+            // fullscreen first rather than raising it into a subtree that does not render it.
+            // The gesture handler re-enters fullscreen on the next tap, which is the same path
+            // Esc already takes, so the visible state ends where it started.
+            function offerPermModalNow(onContinue, onSkip) {
+                if (!currentFullscreenEl()) { permModalIfVisible(onContinue, onSkip); return; }
+                let settled = false;
+                const stop = () => {
+                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onLeft));
+                };
+                const onLeft = () => {
+                    if (settled || currentFullscreenEl()) return;
+                    settled = true;
+                    stop();
+                    permModalIfVisible(onContinue, onSkip);
+                };
+                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onLeft));
+                try {
+                    let p = null;
+                    if (document.exitFullscreen) p = document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) p = document.webkitExitFullscreen();
+                    else if (document.mozCancelFullScreen) p = document.mozCancelFullScreen();
+                    else if (document.msExitFullscreen) p = document.msExitFullscreen();
+                    if (p && p.catch) p.catch(noteSuppressed);
+                } catch (_) { noteSuppressed(); }
+                // An exit that never lands must not strand the caller's promise.
+                setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    stop();
+                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
+                }, 1500);
             }
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
@@ -2335,6 +2397,9 @@
                     // to load. It did not, so the host is about to send a fed track and a
                     // second spare one would be the same audio twice.
                     audioCaps.wantsFallbackTrack = audioFast;
+                    // No DataChannel off the fast path, so there is nothing for a
+                    // redundant body to ride and nothing true to claim.
+                    audioCaps.redundancy = audioFast;
                 }
                 joinData.refreshRate = results[2];
 
