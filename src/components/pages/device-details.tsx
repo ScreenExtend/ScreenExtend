@@ -85,8 +85,59 @@ function TipLabel({
   );
 }
 
+// Radix unmounts `SheetContent` while the sheet is closed, but everything around it -- a
+// full formik instance, a config-store subscription, two effects and an 500-line render
+// function -- ran once per row of the devices table on every parent render, open or not.
+// The trigger stays light; the body mounts with the sheet. `SHEET_EXIT_MS` keeps it alive
+// across Radix's close animation so the slide-out is unchanged: the number to match is
+// `data-[state=closed]:duration-300` in ui/sheet.tsx.
+const SHEET_EXIT_MS = 500;
+
 export function DeviceDetails({ device }: { device: Device }) {
   const [open, setOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  // The Sheet root owns `onOpenChange`, but the unsaved-changes prompt needs the formik
+  // state that only exists inside the body.
+  const closeRequest = React.useRef<() => void>(() => setOpen(false));
+
+  useEffect(() => {
+    if (open) {
+      setMounted(true);
+      return;
+    }
+    if (!mounted) return;
+    const id = window.setTimeout(() => setMounted(false), SHEET_EXIT_MS);
+    return () => window.clearTimeout(id);
+  }, [open, mounted]);
+
+  return (
+    <Sheet onOpenChange={next => (next ? setOpen(true) : closeRequest.current())} open={open}>
+      <SheetTrigger asChild>
+        <Button variant="outline">Edit Device</Button>
+      </SheetTrigger>
+      {mounted && (
+        <DeviceDetailsBody
+          device={device}
+          open={open}
+          setOpen={setOpen}
+          closeRequest={closeRequest}
+        />
+      )}
+    </Sheet>
+  );
+}
+
+function DeviceDetailsBody({
+  device,
+  open,
+  setOpen,
+  closeRequest,
+}: {
+  device: Device;
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  closeRequest: React.MutableRefObject<() => void>;
+}) {
   const [warningDialogOpen, setWarningDialogOpen] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(true);
   const [inProgress, setInProgress] = useState(false);
@@ -259,19 +310,10 @@ export function DeviceDetails({ device }: { device: Device }) {
     void closeOrWarn();
   };
 
-  const openChangeHandler = (open: boolean) => {
-    if (open) {
-      setOpen(true);
-    } else {
-      void closeOrWarn();
-    }
-  };
+  closeRequest.current = () => void closeOrWarn();
 
   return (
-    <Sheet onOpenChange={openChangeHandler} open={open}>
-      <SheetTrigger asChild>
-        <Button variant="outline">Edit Device</Button>
-      </SheetTrigger>
+    <>
       <SheetContent
         className="min-w-[350px] overflow-y-auto"
         onInteractOutside={considerClosing}
@@ -759,7 +801,7 @@ export function DeviceDetails({ device }: { device: Device }) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </Sheet>
+    </>
   );
 }
 
