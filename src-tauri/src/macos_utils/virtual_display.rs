@@ -459,6 +459,10 @@ pub(crate) fn activate_mode(display_id: u32, width: u32, height: u32) -> Result<
 struct DisplayEntry {
     display: Retained<CGVirtualDisplay>,
     applied: AppliedSettings,
+    /// The DPR ladder this display was created with, in backing pixels. Kept so a later
+    /// `applySettings:` can re-register the same set of reachable geometries instead of shrinking
+    /// the mode list to the one mode it happens to be changing to.
+    ladder: Vec<(u32, u32)>,
     serial: u32,
 }
 
@@ -605,13 +609,17 @@ pub fn reconfigure_display(
     // Clone the handle out and drop the guard before messaging ObjC: `applySettings:` is a
     // synchronous WindowServer round trip, and holding the registry across it serializes every
     // other client's join and leave behind one client's settings change.
-    let (display, applied) = {
+    let (display, applied, ladder) = {
         let guard = registry().lock().unwrap();
         let entry = guard
             .displays
             .get(&id)
             .ok_or_else(|| format!("display {id} is not a known virtual display"))?;
-        (entry.display.clone(), entry.applied.clone())
+        (
+            entry.display.clone(),
+            entry.applied.clone(),
+            entry.ladder.clone(),
+        )
     };
 
     let (logical_w, logical_h) = to_logical((width, height), hidpi);
@@ -630,7 +638,7 @@ pub fn reconfigure_display(
             }
         }
     } else {
-        let modes = mode_list(width, height, hidpi, &[]);
+        let modes = mode_list(width, height, hidpi, &ladder);
         let settings = unsafe { make_settings(&modes, refresh, hidpi) };
         if !unsafe { display.applySettings(&settings) } {
             return Err(format!(
@@ -744,6 +752,7 @@ impl VirtualDisplayController for MacosVirtualDisplay {
             DisplayEntry {
                 display,
                 applied,
+                ladder: extra_modes.to_vec(),
                 serial,
             },
         );
@@ -837,6 +846,7 @@ mod tests {
             DisplayEntry {
                 display,
                 applied,
+                ladder: Vec::new(),
                 serial,
             },
         );
