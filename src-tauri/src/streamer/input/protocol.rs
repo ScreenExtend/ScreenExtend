@@ -196,6 +196,20 @@ pub enum InputEvent {
     ClientStats(Box<crate::streamer::telemetry::ClientStats>),
 }
 
+/// Whether a pointer frame's coordinates should move the cursor before its buttons are applied.
+///
+/// They should, for every phase that carries them — `Down` and `Up` included, which is the
+/// whole point: a browser fires `pointerdown` with no preceding `pointermove` on touch, so a
+/// backend that positions only on move-ish phases clicks wherever the host cursor already was.
+///
+/// The one exception is pointer lock. While the client holds it the browser freezes
+/// `clientX`/`clientY` at the lock point, so the coordinates a locked `POINTER_DOWN` carries are
+/// stale by construction and only `MOUSE_DELTA` may move the cursor.
+#[inline]
+pub fn positions_cursor(pointer_locked: bool, phase: Phase) -> bool {
+    !pointer_locked && !matches!(phase, Phase::Leave | Phase::Out | Phase::Cancel)
+}
+
 #[inline]
 pub fn is_fast(op: u8) -> bool {
     matches!(
@@ -726,6 +740,26 @@ mod tests {
                 assert_eq!(c.video_path, 3);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn down_and_up_position_the_cursor_unless_the_pointer_is_locked() {
+        for phase in [
+            Phase::Down,
+            Phase::Up,
+            Phase::Move,
+            Phase::Enter,
+            Phase::Over,
+        ] {
+            assert!(positions_cursor(false, phase), "{phase:?} unlocked");
+            assert!(!positions_cursor(true, phase), "{phase:?} locked");
+        }
+        for phase in [Phase::Leave, Phase::Out, Phase::Cancel] {
+            assert!(
+                !positions_cursor(false, phase),
+                "{phase:?} carries no position"
+            );
         }
     }
 

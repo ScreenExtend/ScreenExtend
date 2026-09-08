@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use objc2_core_foundation::CGPoint;
 
 use super::protocol::{
-    btn, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
+    btn, positions_cursor, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
 use super::DisplayRect;
 
@@ -258,7 +258,10 @@ pub struct Injector {
     down_keys: HashSet<u16>,
     mods: u64,
     pos: CGPoint,
+    /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
+    /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
+
     warned_drop: bool,
 }
 
@@ -293,7 +296,11 @@ impl Injector {
             down_keys: HashSet::new(),
             mods: 0,
             pos,
-            mouse_relative: true,
+            // No lock until the client says so. Starting at `true` meant the first frame of a
+            // session was treated as relative, and since this backend has no touch injection at
+            // all — every tap becomes `mouse_pointer(.., Phase::Down)` — a touch client's
+            // opening tap landed wherever the host cursor already was.
+            mouse_relative: false,
             warned_drop: false,
         }
     }
@@ -391,10 +398,12 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
+            // An absolute move is proof the client is not locked, for clients that never send
+            // `POINTERLOCK_STATE`. A `Down`/`Up` is not: those still arrive while locked.
             Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
         }
-        if !self.mouse_relative {
+        if positions_cursor(self.mouse_relative, phase) {
             let prev = self.pos;
             let pos = self.point(x, y);
             let dx = (pos.x - prev.x).round() as i64;
