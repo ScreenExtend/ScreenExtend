@@ -86,6 +86,7 @@ pub fn tune_current_thread() -> ThreadTuning {
     {
         let mmcss = register_mmcss();
         raise_current_thread_priority(THREAD_PRIORITY_TIME_CRITICAL);
+        exempt_thread_from_power_throttling();
         confine_to_performance_cores();
         ThreadTuning { mmcss }
     }
@@ -104,6 +105,7 @@ pub fn tune_timer_thread() -> ThreadTuning {
     {
         let mmcss = register_mmcss();
         raise_current_thread_priority(THREAD_PRIORITY_HIGHEST);
+        exempt_thread_from_power_throttling();
         confine_to_performance_cores();
         ThreadTuning { mmcss }
     }
@@ -215,6 +217,48 @@ fn performance_core_masks(
             None
         })
         .as_ref()
+}
+
+/// Opts one thread out of EcoQoS, on top of the process-wide exemption.
+///
+/// The process-level `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` opt-out covers the default, but
+/// Windows 11 also throttles threads belonging to a window that is minimised or fully occluded —
+/// which is the normal state of the ScreenExtend window while it is streaming to a second device.
+/// A per-thread opt-out is the documented override for exactly that, and it is a few microseconds
+/// once per thread. `SetThreadInformation` with `ThreadPowerThrottling` is Windows 10 1809+; an
+/// older build simply refuses, which is why the failure is logged once rather than propagated.
+#[cfg(windows)]
+fn exempt_thread_from_power_throttling() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::Win32::Foundation::HANDLE as WinHandle;
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadInformation, ThreadPowerThrottling,
+        THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        THREAD_POWER_THROTTLING_STATE,
+    };
+
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    let state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let rc = unsafe {
+        SetThreadInformation(
+            WinHandle(GetCurrentThread().0),
+            ThreadPowerThrottling,
+            &state as *const _ as *const core::ffi::c_void,
+            core::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if rc.is_err() && !WARNED.swap(true, Ordering::Relaxed) {
+        teprintln!(
+            "[cpu] per-thread power-throttling exemption unavailable (pre-1809?): {:?}; the              process-wide exemption still applies",
+            rc.err()
+        );
+    }
 }
 
 #[cfg(windows)]
