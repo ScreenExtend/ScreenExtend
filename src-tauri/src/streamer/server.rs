@@ -18,7 +18,7 @@ use super::config::{Config, ScalePercent};
 use super::pipeline;
 use super::platform;
 use super::session::{self, DeviceInfo, OtpLimiter, OtpOutcome, SharedLocalIps, SharedOtpLimiter};
-use super::webrtc_session::{self, RTCIceServer};
+use super::webrtc_session::{self, RTCIceServer, SessionLocality};
 
 const MAX_DEVICE_NAME_CHARS: usize = 64;
 const MAX_SESSION_ID_LEN: usize = 64;
@@ -160,6 +160,32 @@ impl AppState {
         ip.is_loopback() || self.local_ips.lock().unwrap().contains(&ip)
     }
 
+    /// Classify a peer *before* the handshake, so the session's MTU, gather wait, pacing and
+    /// playout-delay hint are right for the first packet rather than 500 ms after connection.
+    ///
+    /// `detect_session_locality` still runs afterwards and warns when this guess was wrong; it
+    /// reads the nominated ICE candidate pair, which cannot exist yet at join time.
+    pub fn locality_for(&self, client_ip: &str) -> SessionLocality {
+        let Ok(peer) = client_ip.parse::<IpAddr>() else {
+            return SessionLocality::Unknown;
+        };
+        let peer = normalize_peer_ip(peer);
+        if peer.is_loopback() {
+            return SessionLocality::SameNetwork;
+        }
+        let locals = self.local_ips.lock().unwrap().clone();
+        if locals.iter().any(|l| same_subnet(l, &peer)) {
+            return SessionLocality::SameNetwork;
+        }
+        if is_private(&peer) {
+            // A private address that does not share a subnet with any of ours is still on the
+            // local side of any NAT, so it is not a relay case — but it is a router hop away and
+            // does not get the LAN-only shortcuts.
+            return SessionLocality::Unknown;
+        }
+        SessionLocality::CrossNetwork
+    }
+
     pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
         self.ice_servers.as_ref().clone()
     }
@@ -232,6 +258,23 @@ pub fn ephemeral_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
             teprintln!("[turn] failed to mint ephemeral credentials: {e}");
             None
         }
+    }
+}
+
+fn is_private(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Same /24 for IPv4, same /64 for IPv6. Coarse on purpose: it is a hint for choosing transport
+/// constants, and the ICE-pair detector corrects it once the session is up.
+fn same_subnet(a: &IpAddr, b: &IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(x), IpAddr::V4(y)) => x.octets()[..3] == y.octets()[..3],
+        (IpAddr::V6(x), IpAddr::V6(y)) => x.segments()[..4] == y.segments()[..4],
+        _ => false,
     }
 }
 
@@ -776,6 +819,7 @@ async fn start_session(
     device_token: &str,
     ice_servers: Vec<RTCIceServer>,
 ) -> Result<String> {
+    let locality = state.locality_for(client_ip);
     let client = state
         .config
         .virtual_display
@@ -886,6 +930,10 @@ async fn start_session(
         portrait,
     };
 
+    // Join-stage timing. The join chain is a serial sequence of independent multi-second waits
+    // and nothing said which of them cost what; `whep_answer_ms` in the self-test is the total
+    // this breaks down.
+    let t_display = std::time::Instant::now();
     let mut mode_applied = true;
     let (display_id, device_name) = match existing.clone() {
         Some(prev) => {
@@ -908,7 +956,7 @@ async fn start_session(
                         teprintln!("set-mode task for {name} panicked: {e}");
                     }
                 }
-                wait_for_display_settle(&name).await;
+                wait_for_display_settle(&name, Some(monitor_dims(width, height, swap_axes))).await;
                 apply_display_scale(&name, scale).await;
                 tprintln!(
                     "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh}, scale={scale}%)",
@@ -927,7 +975,9 @@ async fn start_session(
             let (display_id, device_name, topology_reset) = {
                 let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
 
-                let before = pipeline::monitor_device_names();
+                let before = tokio::task::spawn_blocking(pipeline::monitor_device_names)
+                    .await
+                    .unwrap_or_default();
 
                 let display_id = {
                     let client = client.clone();
@@ -991,7 +1041,8 @@ async fn start_session(
                 }
             }
 
-            wait_for_display_settle(&device_name).await;
+            wait_for_display_settle(&device_name, Some(monitor_dims(width, height, swap_axes)))
+                .await;
             apply_display_scale(&device_name, scale).await;
             if topology_reset {
                 if let Some(sessions) = state.config.sessions.as_ref() {
@@ -1035,23 +1086,44 @@ async fn start_session(
         session::set_live_display(s, client_ip, landed);
     }
 
-    let session = match pipeline::start_on_monitor(&cfg, &device_name) {
-        Ok(s) => s,
-        Err(e) => return Err(e.context("starting capture for virtual display")),
+    let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
+
+    // `start_on_monitor` is the single heaviest blocking call on the join path: a DWM check,
+    // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
+    // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
+    // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
+    let t_pipeline = std::time::Instant::now();
+    let session = {
+        let cfg = cfg.clone();
+        let name = device_name.clone();
+        match tokio::task::spawn_blocking(move || pipeline::start_on_monitor(&cfg, &name))
+            .await
+            .context("start-capture task")?
+        {
+            Ok(s) => s,
+            Err(e) => return Err(e.context("starting capture for virtual display")),
+        }
     };
+    let pipeline_ms = t_pipeline.elapsed().as_secs_f64() * 1000.0;
 
     // Publish this session's counters under the client IP so `status --json` and the verbose
     // summary can find them without going through the session map, which is not reachable from
     // the process that runs `status`.
     crate::streamer::telemetry::publish(client_ip, Arc::clone(&session.pipeline.telemetry));
 
-    if let Some((left, top, width, height)) = pipeline::monitor_rect(&device_name) {
-        tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
+    {
+        let name = device_name.clone();
+        if let Ok(Some((left, top, width, height))) =
+            tokio::task::spawn_blocking(move || pipeline::monitor_rect(&name)).await
+        {
+            tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
+        }
     }
 
+    let t_handshake = std::time::Instant::now();
     let (closed_tx, closed_rx) = oneshot::channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-    let answer = match webrtc_session::handle_whep_offer(
+    let (answer, whep) = match webrtc_session::handle_whep_offer(
         req.sdp.clone(),
         &session.pipeline,
         ice_servers,
@@ -1062,10 +1134,11 @@ async fn start_session(
             control_rx: Some(control_rx),
         },
         audio_params,
+        locality,
     )
     .await
     {
-        Ok(answer) => answer,
+        Ok(pair) => pair,
         Err(e) => {
             session.stop();
             if !existed_before {
@@ -1077,6 +1150,12 @@ async fn start_session(
             return Err(e.context("WHEP handshake"));
         }
     };
+
+    tprintln!(
+        "join stages ({locality:?}): display={display_ms:.0}ms pipeline={pipeline_ms:.0}ms \
+         handshake={:.0}ms",
+        t_handshake.elapsed().as_secs_f64() * 1000.0
+    );
 
     if let Some(reporter) = state.config.device_reporter.as_ref() {
         reporter.report_join(DeviceInfo {
@@ -1140,6 +1219,15 @@ async fn start_session(
             session::clear_control_sender(s, &report_ip, &control_tx);
         }
         crate::streamer::telemetry::unregister(&report_ip);
+
+        // Give back the peer connection, its ICE agent, that agent's UDP sockets and the
+        // injector thread. Nothing did this before, and because the connection held an `Arc` to
+        // itself through its own state-change handler, nothing could have.
+        whep.close().await;
+        tprintln!(
+            "session for {report_ip} closed; live transport sessions: {}",
+            webrtc_session::live_sessions()
+        );
 
         let stop = sessions
             .as_ref()
@@ -1210,6 +1298,16 @@ fn dpr_mode_ladder(css_w: u32, css_h: u32) -> Vec<(u32, u32)> {
     modes
 }
 
+/// Requested geometry expressed the way the OS reports it back: a portrait-rotated display
+/// enumerates with its axes swapped.
+fn monitor_dims(width: u32, height: u32, swap_axes: bool) -> (u32, u32) {
+    if swap_axes {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 async fn read_back_dimensions(device_name: &str, swap_axes: bool) -> Option<(u32, u32)> {
     let name = device_name.to_string();
     let (w, h) = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
@@ -1239,7 +1337,7 @@ async fn restore_displays(displays: Vec<session::LiveDisplay>) {
         if let Ok(Err(e)) = res {
             teprintln!("could not restore {name} to {w}x{h}: {e}");
         }
-        wait_for_display_settle(&name).await;
+        wait_for_display_settle(&name, Some(monitor_dims(w, h, swap))).await;
         apply_display_scale(&name, display.scale).await;
     }
 }
@@ -1258,7 +1356,12 @@ async fn apply_display_scale(device_name: &str, percent: u32) {
     }
 }
 
-async fn wait_for_display_settle(device_name: &str) {
+/// Wait for a display's reported geometry to stop moving after a mode change.
+///
+/// `expected` is what we asked for, in monitor coordinates. Passing it turns the common case —
+/// the mode landed immediately — from "read, sleep 75 ms, read again, compare" into a single
+/// read, which is 75 ms off every join that touches a display.
+async fn wait_for_display_settle(device_name: &str, expected: Option<(u32, u32)>) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut last: Option<(u32, u32)> = None;
     loop {
@@ -1267,7 +1370,7 @@ async fn wait_for_display_settle(device_name: &str) {
             .await
             .ok()
             .flatten();
-        if dims.is_some() && dims == last {
+        if dims.is_some() && (dims == last || dims == expected) {
             return;
         }
         last = dims;
@@ -1283,7 +1386,11 @@ async fn wait_for_new_monitor(before: &[String]) -> (Option<String>, bool) {
     let deadline = start + DISPLAY_ATTACH_TIMEOUT;
     let mut topology_reset = false;
     loop {
-        let now = pipeline::monitor_device_names();
+        // `EnumDisplayDevices` is a blocking Win32 call and this loop can run 50 times over the
+        // 5 s attach timeout, all of it on a tokio worker that also drives other clients' RTP.
+        let now = tokio::task::spawn_blocking(pipeline::monitor_device_names)
+            .await
+            .unwrap_or_default();
         if let Some(name) = now.iter().find(|n| !before.contains(n)) {
             return (Some(name.clone()), topology_reset);
         }
