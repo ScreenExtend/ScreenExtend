@@ -175,15 +175,37 @@ Identical from stage 5 onward. Differences:
 
 | # | Stage | `file:line` | ESTIMATED | MEASURED | Reasoning |
 |---|---|---|---|---|---|
-| T1 | Broadcast dwell | `pipeline.rs:44` | **0–66 ms** | — | Capacity 4 at 60 fps. Overflow yields `Lagged`, and the viewer's response is `request_idr` — the biggest frame it can produce, in answer to "you are behind". `major-webrtc-lagged-viewer-requests-idr-and-makes-it-worse.md` |
+| T1 | Broadcast dwell | `pipeline.rs:44` | **0–66 ms at 60 fps, 0–33 ms at 120 Hz** | 0 lagged events in 26 self-test runs (idle desktop) | Capacity 4. Overflow yields `Lagged`; the response is no longer an unconditional `request_idr` — it goes through the per-session keyframe gate and cuts the rate at the same time, and is counted as `frames_dropped_broadcast`. Whether 4 is the right capacity is still unmeasured: `minor-pipeline-broadcast-capacity-is-four-frames-and-untested-under-loss.md` |
 | T2 | Payloading | `webrtc_session.rs:516` | **P-frame ~20 µs; 300 KB IDR ~250 allocs + 300 KB copied** | — | Per viewer. `minor-webrtc-fua-fragmentation-allocates-and-copies-every-frame-per-viewer.md` |
-| T3 | **Unpaced burst** | `webrtc_session.rs:527-545` | **10–40 ms of induced queueing delay on congested Wi-Fi** | — | ~20 packets for a P-frame, **~250 back-to-back awaited sends for a 300 KB IDR**, with no spacing. Stadia, measured on the wire, sends 7–9 packets per ~2 ms sub-burst inside each 16.7 ms frame. libwebrtc's pacer exists for exactly this and paces at 2.5× the estimate. `major-webrtc-no-send-pacer.md` |
+| T3 | Paced burst | `webrtc_session.rs` (writer) + `streamer/pacer.rs` | **10–40 ms of induced queueing delay on congested Wi-Fi, before pacing** | `pace_wait` p50/p99 = 0/0 ms on a same-subnet session, where the pacer is deliberately `Off` | A leaky bucket at libwebrtc's 2.5× factor with Stadia's measured ~8-packet burst, capped at 75% of one frame interval. Three modes by locality: `Off` on a same-subnet hop (where spacing only adds delay and `socket_write` p50 is unchanged at 2.10 ms), `Light` unclassified, `Full` relayed. The benefit is unmeasurable on loopback — there is no contention to smooth — and needs a busy AP. |
+| T3b | RTP MTU | `webrtc_session.rs` | — | — | 1188 bytes same-subnet, **1012 relayed** — a relayed datagram carries TURN encapsulation, SRTP auth and outer IP/UDP on top, which can exceed a tunnelled path MTU or the 1280-byte IPv6 minimum. Moonlight caps remote streams at 1024; Sunshine defaults to it. |
 | T4 | SRTP + socket | webrtc-rs | **µs/packet** | — | Not a factor |
 | T5 | LAN | — | **1–5 ms** | — | — |
 | T6 | Client depacketize | UA | **< 1 ms** | — | — |
 | T7 | `EncodedVideoChunk` copy | `transform-worker.js:252-256` | **< 100 µs + 1 alloc** | — | Spec-mandated |
 | T8 | Client decode | UA | **2–8 ms hardware / 10–30 ms software** | — | `optimizeForLatency: true` set; **no `hardwareAcceleration` hint** — `major-client-isconfigsupported-probes-a-different-config.md` |
 | T9 | `drawImage` + composite | `transform-worker.js:116` | **1–3 ms** | — | 5-argument destination-rect form, so a scale is applied even when the sizes match. Painting inline in the decoder callback rather than under `rAF` saves one compositor frame — the best decision in the client. |
+
+### Join chain, measured
+
+The join was a serial chain of independent waits with no instrumentation. It now logs its own
+breakdown (`join stages (<locality>): display=… pipeline=… handshake=…`) and the WHEP self-test
+reports `whep_answer_ms` and `first_rtp_ms`. On Windows 11 26200 / RTX 3080 Ti, loopback,
+1280x720, over 12 runs:
+
+| Stage | Before | After |
+|---|---|---|
+| Host WHEP handshake (PC + SDP + ICE gather) | 77–221 ms | **12–20 ms** |
+| Virtual display create/attach/mode/settle | not instrumented | 700–1300 ms |
+| `start_on_monitor` | not instrumented | 540–1020 ms |
+| `/whep` POST → answer returned | not instrumented | 1250–2130 ms |
+
+The handshake collapse is the same-subnet peer no longer being offered a STUN server, so host-only
+gathering completes almost immediately instead of waiting on a round trip to the public internet.
+What remains is dominated by display creation and pipeline start, neither of which is transport
+work — and because the handshake is now ~1% of the join on this path, overlapping the two is worth
+far less than it looks. See `minor-webrtc-handshake-does-not-overlap-display-creation.md`, which
+carries the numbers, and `major-whep-no-trickle-ice.md` for the larger change.
 
 **Steady-state glass-to-glass, best case (Windows WGC+NVENC ring, LAN, WebCodecs client):**
 capture queueing 0–33 ms + stage 3–8 ms + transport 2–6 ms + decode/paint 3–11 ms

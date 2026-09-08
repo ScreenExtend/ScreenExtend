@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
@@ -6,14 +6,69 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
+
+/// What a CPU-bridge readback hands the encoder.
+///
+/// The scale and the colour conversion are the same `VideoProcessorBlt`, so asking the video
+/// engine for NV12 costs nothing extra and shrinks the readback, the memcpy and the upload on the
+/// far side from 4 bytes per pixel to 1.5 — 8.29 MB to 3.11 MB at 1080p. Every CPU-bridge encoder
+/// converts BGRA to something 4:2:0 anyway, so the conversion is not saved, it is moved off the
+/// CPU. NVENC is the exception and stays on BGRA: `NV_ENC_BUFFER_FORMAT_ARGB` is byte-identical to
+/// the captured texture and its internal conversion beats a VideoProcessor pre-pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadbackFormat {
+    Bgra8,
+    Nv12,
+}
+
+impl ReadbackFormat {
+    fn dxgi(self) -> DXGI_FORMAT {
+        match self {
+            ReadbackFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+            ReadbackFormat::Nv12 => DXGI_FORMAT_NV12,
+        }
+    }
+
+    /// How many mapped rows a surface of `height` occupies. NV12 is one allocation: `height` rows
+    /// of luma followed by `height / 2` rows of interleaved chroma at the same row pitch.
+    fn mapped_rows(self, height: u32) -> u32 {
+        match self {
+            ReadbackFormat::Bgra8 => height,
+            ReadbackFormat::Nv12 => height + height / 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ReadbackFormat::Bgra8 => "bgra8",
+            ReadbackFormat::Nv12 => "nv12",
+        }
+    }
+}
+
+/// Whether this GPU's video processor can write `format` as an output surface.
+///
+/// Every Direct3D 11 video device that exists supports NV12 output — it is the format the whole
+/// hardware decode/encode stack is built around — but the answer is asked for rather than
+/// assumed, because a WARP or a remote-desktop adapter is a real possibility and the cost of
+/// being wrong is a black picture rather than a fallback.
+fn output_format_supported(
+    enumerator: &ID3D11VideoProcessorEnumerator,
+    format: DXGI_FORMAT,
+) -> bool {
+    match unsafe { enumerator.CheckVideoProcessorFormat(format) } {
+        Ok(flags) => flags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 != 0,
+        Err(_) => false,
+    }
+}
 
 pub struct Scaler {
     video_device: ID3D11VideoDevice,
@@ -27,6 +82,7 @@ pub struct Scaler {
     readback: Vec<u8>,
     dst_w: u32,
     dst_h: u32,
+    format: ReadbackFormat,
     cached_in_view: Option<(*mut core::ffi::c_void, ID3D11VideoProcessorInputView)>,
     cached_out_view: Option<(*mut core::ffi::c_void, ID3D11VideoProcessorOutputView)>,
 }
@@ -41,6 +97,32 @@ impl Scaler {
         src_h: u32,
         dst_w: u32,
         dst_h: u32,
+    ) -> Result<Self> {
+        Self::with_format(
+            device,
+            context,
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            ReadbackFormat::Bgra8,
+        )
+    }
+
+    /// Builds a scaler whose destination surface is `format`.
+    ///
+    /// An NV12 request that the video processor will not honour falls back to BGRA rather than
+    /// failing the session: the caller's encoder accepts both, and a working picture at the old
+    /// cost beats no picture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_format(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+        format: ReadbackFormat,
     ) -> Result<Self> {
         let video_device: ID3D11VideoDevice = device
             .cast()
@@ -69,18 +151,41 @@ impl Scaler {
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0) }
             .context("CreateVideoProcessor")?;
 
+        // NV12 is 4:2:0, so an odd dimension has no chroma sample to belong to. Everything
+        // upstream already rounds down to even (`scaled_dims`), but the scaler is the last place
+        // that could hand the driver an invalid surface.
+        let format = if format == ReadbackFormat::Nv12
+            && (!dst_w.is_multiple_of(2)
+                || !dst_h.is_multiple_of(2)
+                || !output_format_supported(&enumerator, DXGI_FORMAT_NV12))
+        {
+            teprintln!(
+                "scaler: NV12 output unavailable for {dst_w}x{dst_h} on this video processor; \
+                 falling back to BGRA (the encoder will convert on the CPU)"
+            );
+            ReadbackFormat::Bgra8
+        } else {
+            format
+        };
+
+        // An NV12 surface is a video-engine target, not a shader resource; asking for
+        // SHADER_RESOURCE alongside RENDER_TARGET is refused by several drivers.
+        let bind = match format {
+            ReadbackFormat::Bgra8 => D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0,
+            ReadbackFormat::Nv12 => D3D11_BIND_RENDER_TARGET.0,
+        } as u32;
         let dst_desc = D3D11_TEXTURE2D_DESC {
             Width: dst_w,
             Height: dst_h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format.dxgi(),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            BindFlags: bind,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -105,7 +210,10 @@ impl Scaler {
         .context("CreateVideoProcessorOutputView")?;
         let out_view = out_view.context("scaler output view was null")?;
 
-        tprintln!("GPU downscaler ready: src={src_w}x{src_h}, dst={dst_w}x{dst_h}");
+        tprintln!(
+            "GPU downscaler ready: src={src_w}x{src_h}, dst={dst_w}x{dst_h}, out={}",
+            format.name()
+        );
 
         Ok(Self {
             video_device,
@@ -119,9 +227,15 @@ impl Scaler {
             readback: Vec::new(),
             dst_w,
             dst_h,
+            format,
             cached_in_view: None,
             cached_out_view: None,
         })
+    }
+
+    /// What `read_back` will actually produce, which is not necessarily what was asked for.
+    pub fn format(&self) -> ReadbackFormat {
+        self.format
     }
 
     pub fn scale(&mut self, src: &ID3D11Texture2D) -> Result<&ID3D11Texture2D> {
@@ -221,7 +335,7 @@ impl Scaler {
                 Height: self.dst_h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Format: self.format.dxgi(),
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -238,8 +352,11 @@ impl Scaler {
                 .context("CreateTexture2D (scaler staging)")?;
             self.staging = Some(staging.context("scaler staging texture was null")?);
         }
-        let staging = self.staging.as_ref().unwrap();
+        let Some(staging) = self.staging.as_ref() else {
+            bail!("scaler staging texture missing after creation")
+        };
 
+        let rows = self.format.mapped_rows(self.dst_h);
         unsafe {
             self.immediate.CopyResource(staging, &self.dst);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -247,7 +364,7 @@ impl Scaler {
                 .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .context("Map(scaler staging)")?;
             let row_pitch = mapped.RowPitch;
-            let total = row_pitch as usize * self.dst_h as usize;
+            let total = row_pitch as usize * rows as usize;
             self.readback.resize(total, 0);
             std::ptr::copy_nonoverlapping(
                 mapped.pData as *const u8,
