@@ -166,6 +166,21 @@ only handles `PONG` and `BYE`.
   sending, plus the tier detail, in milliseconds. `SEAudio.getSyncInfo()` is its audio
   counterpart.
 
+## Testing it
+
+`node scripts/test-client-stats.mjs` runs `input.js` under Node with minimal browser stubs,
+drives one PING/PONG exchange and one stats frame, and asserts the bytes against the layout
+above plus the clock-offset arithmetic. It is not a substitute for a browser — it stubs the
+DOM, and it cannot exercise the workers — but it catches the failure that would otherwise be
+invisible: a `TypeError` inside `sendStats()` silently kills the once-a-second timer, and the
+host would simply see a client that never reports.
+
+The host half is covered by unit tests in `streamer/telemetry.rs` (bucket boundaries,
+percentiles against a known distribution, missing and out-of-order stamps),
+`streamer/input/protocol.rs` (a stats round trip, a truncated frame, a frame from a newer
+client), and the clock conversions in `windows_utils/streamer/clock.rs` and
+`macos_utils/streamer/clock.rs`.
+
 ## Adding a stage
 
 1. Add the stamp to `FrameTiming` and a `mark_*` for it.
