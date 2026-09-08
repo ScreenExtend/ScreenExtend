@@ -229,7 +229,7 @@ fn worker(
             return;
         }
     };
-    crate::tprintln!("audio: {} loaded", encoder.version());
+    crate::tprintln!("{}", encoder.describe_state());
     let lookahead = encoder.lookahead_samples();
 
     let mut backend: Box<dyn AudioSource> = 'pick: {
