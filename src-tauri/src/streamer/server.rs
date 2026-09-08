@@ -32,6 +32,11 @@ struct AudioCapabilities {
     webcodecs_opus: bool,
     #[serde(default)]
     worklet: bool,
+    /// The client can parse a `FLAG_REDUNDANT` message (previous frame's Opus payload
+    /// appended). Absent in every client that predates the flag, and the host must not send
+    /// what the client cannot read, so `false` is the only safe default.
+    #[serde(default)]
+    redundancy: bool,
 }
 
 #[derive(Deserialize)]
@@ -816,6 +821,7 @@ async fn start_session(
     ) {
         (Some(hub), Some(overrides)) => Some(webrtc_session::AudioParams {
             fast: req.audio_capabilities.webcodecs_opus && req.audio_capabilities.worklet,
+            redundancy: req.audio_capabilities.redundancy,
             hub: std::sync::Arc::clone(hub),
             overrides: std::sync::Arc::clone(overrides),
             device_key: client_ip.to_string(),
