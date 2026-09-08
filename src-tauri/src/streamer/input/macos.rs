@@ -375,7 +375,10 @@ impl Injector {
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { .. } => self.unsupported_drop(),
             // Handled by the transport before dispatch: none of these inject anything.
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
+            InputEvent::Ping { .. }
+            | InputEvent::Pong { .. }
+            | InputEvent::ClientStats(_)
+            | InputEvent::KeyframeRequest { .. } => {}
         }
     }
 

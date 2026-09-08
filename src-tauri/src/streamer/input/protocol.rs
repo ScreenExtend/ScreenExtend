@@ -33,6 +33,18 @@ pub mod op {
     /// them alongside every other counter. See `docs/INPUT-PROTOCOL.md`.
     pub const STATS: u8 = 0x62;
     pub const BYE: u8 = 0x63;
+    /// Client -> host, reliable channel, 2 bytes: opcode then a reason byte.
+    ///
+    /// The last resort for a receiver that cannot ask for a keyframe any other way. A client
+    /// running the legacy `createEncodedStreams` transform (Chrome and Edge 86-140) takes the
+    /// frames *instead of* libwebrtc's reference finder, so nothing downstream ever emits an
+    /// RTCP PLI and the host would otherwise never learn the picture is broken.
+    pub const KEYFRAME_REQUEST: u8 = 0x64;
+}
+
+/// Why a client asked for a keyframe. Only `Unspecified` is sent today.
+pub mod keyframe_reason {
+    pub const UNSPECIFIED: u8 = 0x00;
 }
 
 pub mod bye {
@@ -230,6 +242,11 @@ pub enum InputEvent {
     },
     /// The client's own view of its half of the path. See `docs/TELEMETRY.md` for the layout.
     ClientStats(Box<crate::streamer::telemetry::ClientStats>),
+    /// The client is asking for an IDR out of band. Handled by the transport; it injects
+    /// nothing, so it must never reach a backend's `dispatch`.
+    KeyframeRequest {
+        reason: u8,
+    },
 }
 
 /// Whether a pointer frame's coordinates should move the cursor before its buttons are applied.
@@ -336,6 +353,9 @@ pub fn parse(b: &[u8]) -> Option<Parsed> {
             t_ns: rd_u64(b, 1)?,
         },
         op::STATS => parse_client_stats(b)?,
+        op::KEYFRAME_REQUEST => InputEvent::KeyframeRequest {
+            reason: b.get(1).copied().unwrap_or(keyframe_reason::UNSPECIFIED),
+        },
         _ => return None,
     };
     Some(Parsed {
@@ -952,6 +972,23 @@ mod tests {
 
         b[10..12].copy_from_slice(&((MAX_DROP_ITEMS + 1) as u16).to_le_bytes());
         assert!(parse(&b).is_none());
+    }
+
+    #[test]
+    fn a_keyframe_request_parses_on_the_reliable_channel() {
+        let p = parse(&[op::KEYFRAME_REQUEST, keyframe_reason::UNSPECIFIED]).unwrap();
+        assert!(!p.fast, "an IDR request is not disposable");
+        match p.ev {
+            InputEvent::KeyframeRequest { reason } => {
+                assert_eq!(reason, keyframe_reason::UNSPECIFIED)
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A client that sends only the opcode still gets a request, not a dropped frame.
+        assert!(matches!(
+            parse(&[op::KEYFRAME_REQUEST]).unwrap().ev,
+            InputEvent::KeyframeRequest { .. }
+        ));
     }
 
     #[test]
