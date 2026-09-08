@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod clock;
 pub mod dxgi;
 pub mod pipeline;
 pub mod scaler;

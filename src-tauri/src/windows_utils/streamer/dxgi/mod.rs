@@ -40,6 +40,10 @@ pub struct Duplicator {
     output: IDXGIOutput1,
     dup: Option<IDXGIOutputDuplication>,
     redup_failures: u32,
+    /// `LastPresentTime` of the most recent dirty frame, already on the shared host clock.
+    /// The compositor's own frame time; without it the pipeline can only measure from the
+    /// moment `poll` returned, which hides however long the frame waited to be handed over.
+    last_present_host_ns: u64,
 
     rotation: DXGI_MODE_ROTATION,
     raw_rotation: DXGI_MODE_ROTATION,
@@ -282,6 +286,7 @@ impl Duplicator {
             output,
             dup: Some(dup),
             redup_failures: 0,
+            last_present_host_ns: 0,
             rotation,
             raw_rotation,
             phys_w,
@@ -394,6 +399,11 @@ impl Duplicator {
         dirty_count == 0
     }
 
+    /// Host-clock nanoseconds of the last present, or 0 if the driver has not reported one.
+    pub fn last_present_host_ns(&self) -> u64 {
+        self.last_present_host_ns
+    }
+
     pub fn poll(&mut self, timeout_ms: u32) -> Result<PollStatus> {
         let Some(dup) = self.dup.clone() else {
             self.redup()?;
@@ -415,6 +425,8 @@ impl Duplicator {
         let mut dirty = false;
 
         if info.LastPresentTime != 0 {
+            self.last_present_host_ns =
+                super::clock::dxgi_present_time_to_host_ns(info.LastPresentTime);
             if let Some(res) = &resource {
                 const MAX_CONSECUTIVE_SKIPS: u32 = 5;
                 let region_empty = self.present_region_is_empty(&dup, &info)

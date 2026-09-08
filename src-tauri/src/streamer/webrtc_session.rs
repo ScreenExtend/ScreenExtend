@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -474,16 +475,38 @@ pub async fn handle_whep_offer(
         tokio::spawn(async move {
             use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
             use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+            use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
+            let telemetry = Arc::clone(&pipeline.telemetry);
             let mut rtcp_buf = vec![0u8; 1500];
             while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
                 for p in &packets {
                     let any = p.as_any();
                     if any.downcast_ref::<PictureLossIndication>().is_some() {
+                        telemetry
+                            .degradation
+                            .keyframe_requests
+                            .fetch_add(1, Ordering::Relaxed);
                         tprintln!("RTCP PLI received, requesting IDR");
                         pipeline.request_idr();
                     } else if any.downcast_ref::<FullIntraRequest>().is_some() {
+                        telemetry
+                            .degradation
+                            .keyframe_requests
+                            .fetch_add(1, Ordering::Relaxed);
                         tprintln!("RTCP FIR received, requesting IDR");
                         pipeline.request_idr();
+                    } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
+                        // Counted, never logged: a lossy link produces these continuously and
+                        // every logbus line is a JSON IPC event to the UI.
+                        let lost: u64 = nack
+                            .nacks
+                            .iter()
+                            .map(|n| 1 + n.lost_packets.count_ones() as u64)
+                            .sum();
+                        telemetry
+                            .degradation
+                            .nacks_received
+                            .fetch_add(lost.max(1), Ordering::Relaxed);
                     }
                 }
             }
@@ -493,7 +516,7 @@ pub async fn handle_whep_offer(
     spawn_bitrate_driver(Arc::clone(&pc), pipeline.clone());
 
     if let Some(audio) = audio {
-        if let Err(e) = setup_audio(&pc, audio).await {
+        if let Err(e) = setup_audio(&pc, audio, Arc::clone(&pipeline.telemetry)).await {
             teprintln!("audio: setup failed ({e:#}); continuing without audio");
         }
     }
@@ -506,6 +529,7 @@ pub async fn handle_whep_offer(
         tokio::spawn(async move {
             let _pc = pc_keepalive;
             const RTP_PAYLOAD_MTU: usize = 1200 - 12;
+            let telemetry = Arc::clone(&pipeline.telemetry);
             let mut payloader = H264Payloader::default();
             let sequencer = new_random_sequencer();
             let playout_delay = [webrtc::rtp::extension::HeaderExtension::PlayoutDelay(
@@ -514,6 +538,7 @@ pub async fn handle_whep_offer(
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
+                        let mut timing = frame.timing;
                         let rtp_ts =
                             audio::host_ns_to_rtp90k(audio::host_instant_to_ns(frame.capture));
                         let payloads = match payloader.payload(RTP_PAYLOAD_MTU, &frame.data) {
@@ -528,6 +553,8 @@ pub async fn handle_whep_offer(
                             pipeline.request_idr();
                             continue;
                         }
+                        timing.mark_packetize_done();
+                        let frame_bytes = frame.data.len() as u64;
                         let last = payloads.len().saturating_sub(1);
                         let mut stop = false;
                         for (i, payload) in payloads.into_iter().enumerate() {
@@ -552,6 +579,11 @@ pub async fn handle_whep_offer(
                         if stop {
                             break;
                         }
+                        timing.mark_socket_write_done();
+                        telemetry
+                            .bytes_sent
+                            .fetch_add(frame_bytes, Ordering::Relaxed);
+                        telemetry.record_frame(&timing);
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         tprintln!("viewer lagged (skipped={skipped}); requesting IDR to resync");
@@ -678,6 +710,7 @@ pub async fn handle_whep_offer(
 async fn setup_audio(
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
     audio: AudioParams,
+    telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) -> Result<()> {
     if audio.fast {
         let init = RTCDataChannelInit {
@@ -696,8 +729,9 @@ async fn setup_audio(
             let dc = Arc::clone(&dc_for_open);
             let pc = Arc::clone(&pc_for_open);
             let audio = audio.clone();
+            let telemetry = Arc::clone(&telemetry);
             Box::pin(async move {
-                tokio::spawn(forward_datachannel(pc, dc, audio));
+                tokio::spawn(forward_datachannel(pc, dc, audio, telemetry));
             })
         }));
     } else {
@@ -716,7 +750,7 @@ async fn setup_audio(
             .await
             .context("add_track(opus fallback)")?;
         tprintln!("audio: added standard Opus track (NetEQ fallback path)");
-        tokio::spawn(forward_track(Arc::clone(pc), track, audio));
+        tokio::spawn(forward_track(Arc::clone(pc), track, audio, telemetry));
     }
     Ok(())
 }
@@ -751,6 +785,7 @@ async fn forward_datachannel(
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     dc: Arc<RTCDataChannel>,
     audio: AudioParams,
+    telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
     let mut sub: Option<audio::AudioSubscription> = None;
     let mut since_bp_check: u32 = 0;
@@ -799,7 +834,15 @@ async fn forward_datachannel(
                     break;
                 }
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            // The subscriber fell behind the host-wide capture and the broadcast dropped
+            // packets on its behalf: a real audio gap, previously invisible.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                telemetry
+                    .degradation
+                    .audio_broadcast_lag_drops
+                    .fetch_add(skipped, Ordering::Relaxed);
+                continue;
+            }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 sub = None;
             }
@@ -816,6 +859,7 @@ async fn forward_track(
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     track: Arc<TrackLocalStaticSample>,
     audio: AudioParams,
+    telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
     let frame_duration = Duration::from_millis(5); // 5 ms Opus frames
     let mut sub: Option<audio::AudioSubscription> = None;
@@ -852,7 +896,15 @@ async fn forward_track(
                     break;
                 }
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            // The subscriber fell behind the host-wide capture and the broadcast dropped
+            // packets on its behalf: a real audio gap, previously invisible.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                telemetry
+                    .degradation
+                    .audio_broadcast_lag_drops
+                    .fetch_add(skipped, Ordering::Relaxed);
+                continue;
+            }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 sub = None;
             }
@@ -949,6 +1001,13 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             }
 
             if let Some(target) = controller.update(estimate, now) {
+                if target < current_target {
+                    pipeline
+                        .telemetry
+                        .degradation
+                        .bitrate_cuts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 tprintln!(
                     "BWE: pushing adaptive bitrate target (measured_send_bps={measured_send_bps}, \
                      fraction_lost={fraction_lost}, rtt_ms={max_rtt_ms:.1}, estimate={estimate}, target={target})"

@@ -29,12 +29,16 @@ use super::tuning;
 use super::x264::encoder::X264Encoder;
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
 use crate::streamer::platform::BitrateApplied;
+use crate::streamer::telemetry::{FrameTiming, SessionTelemetry, SharedTelemetry};
 use crate::windows_capture::monitor::Monitor;
 
 #[derive(Clone)]
 pub struct EncodedFrame {
     pub data: Bytes,
     pub capture: Instant,
+    /// Per-stage stamps collected on the way here. The transport fills in the last two and folds
+    /// the whole set into the session histograms; see `streamer::telemetry`.
+    pub timing: FrameTiming,
 }
 
 const SP_WIDTH: u32 = 1280;
@@ -47,6 +51,7 @@ const BROADCAST_CAPACITY: usize = 4;
 pub struct Pipeline {
     pub tx: broadcast::Sender<EncodedFrame>,
     pub frame_duration: Duration,
+    pub telemetry: SharedTelemetry,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
     wake: crossbeam_channel::Sender<()>,
@@ -163,13 +168,17 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
     let target_bitrate = Arc::new(AtomicU32::new(0));
+    let telemetry = SessionTelemetry::new_shared();
 
     if cfg.synthetic_pattern {
         let frame_duration = Duration::from_nanos(1_000_000_000 / SP_FPS as u64);
         let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
+        telemetry.capture_backend.set("synthetic".into());
+        telemetry.encoder.set("nvenc".into());
         let pipeline = Pipeline {
             tx: tx.clone(),
             frame_duration,
+            telemetry: Arc::clone(&telemetry),
             idr_request: Arc::clone(&idr_request),
             target_bitrate: Arc::clone(&target_bitrate),
             wake,
@@ -189,7 +198,9 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         };
         std::thread::Builder::new()
             .name("nvenc-encode".to_string())
-            .spawn(move || synthetic_pattern_loop(tx, idr_request, target_bitrate, enc, wake_rx))
+            .spawn(move || {
+                synthetic_pattern_loop(tx, idr_request, target_bitrate, enc, wake_rx, telemetry)
+            })
             .expect("spawn encode thread");
         return Ok(pipeline);
     }
@@ -204,6 +215,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         tx.clone(),
         Arc::clone(&idr_request),
         Arc::clone(&target_bitrate),
+        Arc::clone(&telemetry),
     ) {
         Ok((pipeline, control)) => {
             std::mem::forget(control);
@@ -223,11 +235,20 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                  falling back to DXGI Desktop Duplication on {device_name}",
                 info.index
             );
-            let (pipeline, control) =
-                start_dxgi_capture(cfg, &device_name, &info, tx, idr_request, target_bitrate)
-                    .map_err(|e| {
-                        e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})"))
-                    })?;
+            telemetry
+                .degradation
+                .capture_fallback
+                .fetch_add(1, Ordering::Relaxed);
+            let (pipeline, control) = start_dxgi_capture(
+                cfg,
+                &device_name,
+                &info,
+                tx,
+                idr_request,
+                target_bitrate,
+                telemetry,
+            )
+            .map_err(|e| e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})")))?;
             drop(control);
             Ok(pipeline)
         }
@@ -276,6 +297,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
     let target_bitrate = Arc::new(AtomicU32::new(0));
+    let telemetry = SessionTelemetry::new_shared();
 
     super::capture::check_dwm_composition()?;
 
@@ -288,6 +310,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         tx.clone(),
         Arc::clone(&idr_request),
         Arc::clone(&target_bitrate),
+        Arc::clone(&telemetry),
     ) {
         Ok((pipeline, control)) => Ok(SessionCapture {
             pipeline,
@@ -298,11 +321,20 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
                 "WGC capture failed for {device_name}: {wgc_err:#}; \
                  falling back to DXGI Desktop Duplication"
             );
-            let (pipeline, control) =
-                start_dxgi_capture(cfg, device_name, &info, tx, idr_request, target_bitrate)
-                    .map_err(|e| {
-                        e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})"))
-                    })?;
+            telemetry
+                .degradation
+                .capture_fallback
+                .fetch_add(1, Ordering::Relaxed);
+            let (pipeline, control) = start_dxgi_capture(
+                cfg,
+                device_name,
+                &info,
+                tx,
+                idr_request,
+                target_bitrate,
+                telemetry,
+            )
+            .map_err(|e| e.context(format!("DXGI fallback (after WGC failed: {wgc_err:#})")))?;
             Ok(SessionCapture {
                 pipeline,
                 control: Some(SessionControl::Dxgi(control)),
@@ -311,6 +343,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_live_capture(
     cfg: &Config,
     monitor: Monitor,
@@ -318,15 +351,18 @@ fn start_live_capture(
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    telemetry: SharedTelemetry,
 ) -> Result<(Pipeline, CaptureControl<LiveCapture, anyhow::Error>)> {
     let config = live_encoder_config(info.width, info.height, info.refresh_hz, cfg);
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps as u64);
 
+    telemetry.capture_backend.set("wgc".into());
     let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
+        telemetry: Arc::clone(&telemetry),
         idr_request: Arc::clone(&idr_request),
         target_bitrate: Arc::clone(&target_bitrate),
         wake,
@@ -351,6 +387,7 @@ fn start_live_capture(
             idr_request,
             target_bitrate,
             wake_rx,
+            telemetry,
         },
     );
 
@@ -375,6 +412,7 @@ fn start_live_capture(
     Ok((pipeline, control))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_dxgi_capture(
     cfg: &Config,
     device_name: &str,
@@ -382,15 +420,18 @@ fn start_dxgi_capture(
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
+    telemetry: SharedTelemetry,
 ) -> Result<(Pipeline, DxgiControl)> {
     let config = live_encoder_config(info.width, info.height, info.refresh_hz, cfg);
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps.max(1) as u64);
 
+    telemetry.capture_backend.set("dxgi".into());
     let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
+        telemetry: Arc::clone(&telemetry),
         idr_request: Arc::clone(&idr_request),
         target_bitrate: Arc::clone(&target_bitrate),
         wake,
@@ -426,6 +467,7 @@ fn start_dxgi_capture(
         target_bitrate,
         wake_rx,
         stop: Arc::clone(&stop),
+        telemetry,
     };
     let join = std::thread::Builder::new()
         .name("dxgi-capture".to_string())
@@ -463,6 +505,7 @@ struct DxgiThreadArgs {
     target_bitrate: Arc<AtomicU32>,
     wake_rx: crossbeam_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
+    telemetry: SharedTelemetry,
 }
 
 fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<Result<()>>) {
@@ -478,6 +521,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         target_bitrate,
         wake_rx,
         stop,
+        telemetry,
     } = args;
 
     let _thread_tuning = tuning::tune_current_thread();
@@ -561,8 +605,10 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         epoch,
         Arc::clone(&stop),
         wake_rx,
+        Arc::clone(&telemetry),
     );
 
+    telemetry.encoder.set(path_name.into());
     tprintln!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
     let _ = ready_tx.send(Ok(()));
 
@@ -612,6 +658,8 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         }
 
         let capture = now;
+        let mut timing = FrameTiming::entering_capture();
+        timing.capture_available_ns = dup.last_present_host_ns();
         let encode_res = {
             let tex = match dup.frame() {
                 Ok(t) => t,
@@ -624,12 +672,18 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
                 Ok(g) => g,
                 Err(_) => break,
             };
+            timing.mark_encode_submit();
             core.encode_texture(tex)
         };
+        timing.mark_encode_done();
         let au = match encode_res {
             Ok(au) => au,
             Err(e) if is_transient_encode_error(&e) && busy_streak < MAX_TRANSIENT_ENCODE_DROPS => {
                 busy_streak += 1;
+                telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 teprintln!(
                     "dxgi encode transiently overloaded ({e:#}); dropping frame ({busy_streak} in a row)"
                 );
@@ -644,9 +698,11 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         busy_streak = 0;
 
         last_frame_at.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
         let _ = tx.send(EncodedFrame {
             data: Bytes::from(au),
             capture,
+            timing,
         });
         dirty = false;
         was_idle = true;
@@ -770,6 +826,7 @@ struct CaptureFlags {
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
     wake_rx: crossbeam_channel::Receiver<()>,
+    telemetry: SharedTelemetry,
 }
 
 enum EncodePath {
@@ -1020,9 +1077,7 @@ struct LiveCapture {
     stop: Arc<AtomicBool>,
     _thread_tuning: tuning::ThreadTuning,
     _keep_awake: tuning::KeepAwake,
-    timing_sum_ns: u128,
-    timing_count: u64,
-    timing_max_ns: u128,
+    telemetry: SharedTelemetry,
 }
 
 impl Drop for LiveCapture {
@@ -1092,6 +1147,7 @@ struct ReadyMsg {
     slot: usize,
     force_idr: bool,
     capture: Instant,
+    timing: FrameTiming,
 }
 
 struct AsyncNvencRing {
@@ -1108,6 +1164,7 @@ struct AsyncNvencRing {
     idr_request: Arc<AtomicBool>,
     epoch: Instant,
     frame_index: u64,
+    telemetry: SharedTelemetry,
 }
 
 impl AsyncNvencRing {
@@ -1123,6 +1180,7 @@ impl AsyncNvencRing {
         last_frame_at: Arc<AtomicU64>,
         idr_request: Arc<AtomicBool>,
         epoch: Instant,
+        telemetry: SharedTelemetry,
     ) -> Self {
         let k = pairs.len();
         let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
@@ -1139,6 +1197,7 @@ impl AsyncNvencRing {
             let stop = Arc::clone(&stop);
             let free_tx = free_tx.clone();
             let last_frame_at = Arc::clone(&last_frame_at);
+            let telemetry = Arc::clone(&telemetry);
             std::thread::Builder::new()
                 .name("nvenc-ring-encode".to_string())
                 .spawn(move || {
@@ -1151,6 +1210,7 @@ impl AsyncNvencRing {
                         initial_bitrate,
                         last_frame_at,
                         stop,
+                        telemetry,
                     )
                 })
                 .expect("spawn nvenc ring encode thread")
@@ -1170,13 +1230,22 @@ impl AsyncNvencRing {
             idr_request,
             epoch,
             frame_index: 0,
+            telemetry,
         }
     }
 
-    fn stage(&mut self, raw: &ID3D11Texture2D) -> Result<bool> {
+    fn stage(&mut self, raw: &ID3D11Texture2D, mut timing: FrameTiming) -> Result<bool> {
         let slot = match self.free_recv.try_recv() {
+            // Every slot is still in the encoder: this frame is dropped outright, which is the
+            // one place the ring silently discards captured pixels.
+            Err(_) => {
+                self.telemetry
+                    .degradation
+                    .frames_dropped_ring
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
             Ok(s) => s,
-            Err(_) => return Ok(false),
         };
 
         let mutex = &self.igpu_mutex[slot];
@@ -1212,12 +1281,20 @@ impl AsyncNvencRing {
             return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
         }
 
+        timing.mark_scale_done();
         let force_idr = self.frame_index == 0 || self.idr_request.swap(false, Ordering::Relaxed);
+        if force_idr {
+            self.telemetry
+                .degradation
+                .idrs_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.frame_index += 1;
         let msg = ReadyMsg {
             slot,
             force_idr,
             capture: Instant::now(),
+            timing,
         };
         if self.ready.send(msg).is_err() {
             let _ = self.free_slots.send(slot);
@@ -1252,6 +1329,7 @@ fn ring_encode_thread(
     initial_bitrate: u32,
     last_frame_at: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    telemetry: SharedTelemetry,
 ) {
     let _thread_tuning = tuning::tune_current_thread();
     let mut current_bitrate = initial_bitrate;
@@ -1281,6 +1359,10 @@ fn ring_encode_thread(
         match ready_rx.recv_timeout(keepalive) {
             Ok(msg) => {
                 if poisoned_slots.contains(&msg.slot) {
+                    telemetry
+                        .degradation
+                        .frames_dropped_ring
+                        .fetch_add(1, Ordering::Relaxed);
                     teprintln!(
                         "ring encode: skipping poisoned slot {} (keyed mutex wedged at KEY_ENCODER)",
                         msg.slot
@@ -1288,6 +1370,8 @@ fn ring_encode_thread(
                     let _ = free_tx.send(msg.slot);
                     continue;
                 }
+                let mut timing = msg.timing;
+                timing.mark_encode_submit();
 
                 apply_pending_bitrate_atomic(
                     &mut encoder,
@@ -1297,15 +1381,22 @@ fn ring_encode_thread(
                 );
                 match encoder.encode_input_slot(msg.slot, msg.force_idr) {
                     Ok(au) => {
+                        timing.mark_encode_done();
+                        telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                         let _ = tx.send(EncodedFrame {
                             data: Bytes::from(au),
                             capture: msg.capture,
+                            timing,
                         });
                         if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
                             break;
                         }
                     }
                     Err(SlotEncodeError::Poisoned(e)) => {
+                        telemetry
+                            .degradation
+                            .encoder_resets
+                            .fetch_add(1, Ordering::Relaxed);
                         teprintln!(
                             "ring encode: slot {} poisoned (AcquireSync failed — GPU hang or driver fault): {e:?}",
                             msg.slot
@@ -1322,6 +1413,10 @@ fn ring_encode_thread(
                         }
                     }
                     Err(SlotEncodeError::Encode(e)) => {
+                        telemetry
+                            .degradation
+                            .encoder_transient_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
                         if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
                             break;
@@ -1343,9 +1438,18 @@ fn ring_encode_thread(
                     );
                     match encoder.encode_repeat_slot(slot) {
                         Ok(au) => {
+                            let mut timing = FrameTiming::entering_capture();
+                            timing.mark_encode_submit();
+                            timing.mark_encode_done();
+                            telemetry
+                                .degradation
+                                .frames_repeated
+                                .fetch_add(1, Ordering::Relaxed);
+                            telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.send(EncodedFrame {
                                 data: Bytes::from(au),
                                 capture: Instant::now(),
+                                timing,
                             });
                         }
                         Err(e) => {
@@ -1506,6 +1610,7 @@ fn spawn_repeater(
     epoch: Instant,
     stop: Arc<AtomicBool>,
     wake_rx: crossbeam_channel::Receiver<()>,
+    telemetry: SharedTelemetry,
 ) {
     let tick = frame_duration.max(Duration::from_millis(8));
     let idle_after_ms = (frame_duration.as_millis() as u64 * 2).max(34);
@@ -1540,6 +1645,8 @@ fn spawn_repeater(
                     continue;
                 }
                 let capture = Instant::now();
+                let mut timing = FrameTiming::entering_capture();
+                timing.mark_encode_submit();
                 let au = {
                     let mut core = match core.lock() {
                         Ok(g) => g,
@@ -1554,9 +1661,16 @@ fn spawn_repeater(
                         }
                     }
                 };
+                timing.mark_encode_done();
+                telemetry
+                    .degradation
+                    .frames_repeated
+                    .fetch_add(1, Ordering::Relaxed);
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(EncodedFrame {
                     data: Bytes::from(au),
                     capture,
+                    timing,
                 });
                 last_emit = Instant::now();
             }
@@ -1579,6 +1693,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             idr_request,
             target_bitrate,
             wake_rx,
+            telemetry,
         } = ctx.flags;
 
         let thread_tuning = tuning::tune_current_thread();
@@ -1613,6 +1728,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         None
                     };
 
+                    telemetry.encoder.set("nvenc-zero-copy-ring".into());
                     let ring = AsyncNvencRing::new(
                         encoder,
                         pairs,
@@ -1624,6 +1740,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         Arc::clone(&last_frame_at),
                         Arc::clone(&idr_request),
                         epoch,
+                        Arc::clone(&telemetry),
                     );
 
                     tprintln!(
@@ -1643,12 +1760,14 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         stop,
                         _thread_tuning: thread_tuning,
                         _keep_awake: keep_awake,
-                        timing_sum_ns: 0,
-                        timing_count: 0,
-                        timing_max_ns: 0,
+                        telemetry,
                     });
                 }
                 Err(e) => {
+                    telemetry
+                        .degradation
+                        .capture_fallback
+                        .fetch_add(1, Ordering::Relaxed);
                     teprintln!(
                         "NVENC zero-copy ring unavailable ({e:?}); falling back to classic backend path"
                     );
@@ -1690,6 +1809,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         }
 
         let path_name = backend.name();
+        telemetry.encoder.set(path_name.into());
         let core = Arc::new(Mutex::new(EncodeCore {
             backend,
             scaler,
@@ -1711,6 +1831,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             epoch,
             Arc::clone(&stop),
             wake_rx,
+            Arc::clone(&telemetry),
         );
 
         Ok(Self {
@@ -1725,9 +1846,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             stop,
             _thread_tuning: thread_tuning,
             _keep_awake: keep_awake,
-            timing_sum_ns: 0,
-            timing_count: 0,
-            timing_max_ns: 0,
+            telemetry,
         })
     }
 
@@ -1737,10 +1856,16 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         let capture = Instant::now();
-        let t0 = capture;
+        let mut timing = FrameTiming::entering_capture();
+        // WGC's own frame time. Discarding it meant every "capture latency" number started at
+        // the moment the message pump reached us, hiding whatever the frame spent in the pool.
+        timing.capture_available_ns = frame
+            .timestamp()
+            .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
+            .unwrap_or(0);
 
         if let Some(ring) = self.ring.as_mut() {
-            match ring.stage(frame.as_raw_texture()) {
+            match ring.stage(frame.as_raw_texture(), timing) {
                 Ok(_staged) => {}
                 Err(e) => {
                     teprintln!("ring capture stage failed: {e:?}");
@@ -1755,8 +1880,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             .expect("classic path must have an EncodeCore");
         let encode_res = {
             let mut core = core.lock().expect("encode core mutex poisoned");
+            timing.mark_encode_submit();
             core.encode_captured(frame)
         };
+        timing.mark_encode_done();
         let au = match encode_res {
             Ok(au) => au,
             Err(e)
@@ -1764,6 +1891,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                     && self.busy_streak < MAX_TRANSIENT_ENCODE_DROPS =>
             {
                 self.busy_streak += 1;
+                self.telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 teprintln!(
                     "encode transiently overloaded ({e:#}); dropping frame ({} in a row)",
                     self.busy_streak
@@ -1776,30 +1907,15 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
         self.last_frame_at
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.telemetry
+            .frames_encoded
+            .fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(EncodedFrame {
             data: Bytes::from(au),
             capture,
+            timing,
         });
         self.frames_sent += 1;
-
-        let dt = t0.elapsed().as_nanos();
-        self.timing_sum_ns += dt;
-        self.timing_count += 1;
-        self.timing_max_ns = self.timing_max_ns.max(dt);
-        if self.frames_sent.is_multiple_of(60) {
-            let avg_ms = (self.timing_sum_ns / self.timing_count.max(1) as u128) as f64 / 1.0e6;
-            let max_ms = self.timing_max_ns as f64 / 1.0e6;
-            tprintln!(
-                "encode-path latency: path={}, avg_ms={:.2}, max_ms={:.2}, frames={}",
-                self.path_name,
-                avg_ms,
-                max_ms,
-                self.frames_sent
-            );
-            self.timing_sum_ns = 0;
-            self.timing_count = 0;
-            self.timing_max_ns = 0;
-        }
         Ok(())
     }
 
@@ -1815,6 +1931,7 @@ fn synthetic_pattern_loop(
     target_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
     wake_rx: crossbeam_channel::Receiver<()>,
+    telemetry: SharedTelemetry,
 ) {
     let _thread_tuning = tuning::tune_current_thread();
 
@@ -1857,11 +1974,16 @@ fn synthetic_pattern_loop(
         let force_idr = frame_index == 0 || idr_request.swap(false, Ordering::Relaxed);
         fill_synthetic_pattern(&mut frame_buf, SP_WIDTH, SP_HEIGHT, frame_index);
 
+        let mut timing = FrameTiming::entering_capture();
+        timing.mark_encode_submit();
         match encoder.encode_bgra(&frame_buf, force_idr) {
             Ok(au) => {
+                timing.mark_encode_done();
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(EncodedFrame {
                     data: Bytes::from(au),
                     capture: Instant::now(),
+                    timing,
                 });
             }
             Err(e) => {

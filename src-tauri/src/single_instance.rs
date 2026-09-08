@@ -14,6 +14,20 @@ pub const CTRL_FILE: &str = "screenextend.ctrl";
 pub enum Command {
     Focus,
     Quit,
+    /// Ask the running host for its live telemetry as one line of JSON. `ScreenExtend status`
+    /// runs in a separate process from the host, so this is the only way it can report
+    /// per-session counters that exist only in the host's memory.
+    Stats,
+}
+
+impl Command {
+    fn verb(&self) -> &'static str {
+        match self {
+            Command::Focus => "FOCUS",
+            Command::Quit => "QUIT",
+            Command::Stats => "STATS",
+        }
+    }
 }
 
 pub fn acquire_lock(path: &Path) -> Option<File> {
@@ -96,14 +110,18 @@ fn handle_connection<Q>(
 ) where
     Q: Fn(&AppHandle),
 {
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
     let mut line = String::new();
-    if BufReader::new(stream).read_line(&mut line).is_err() {
+    if BufReader::new(read_half).read_line(&mut line).is_err() {
         return;
     }
     let mut parts = line.trim().splitn(2, ' ');
     if parts.next() != Some(token) {
         return;
     }
+    let mut stream = stream;
     match parts.next() {
         Some("FOCUS") => {
             if let Some(window) = app.get_webview_window("main") {
@@ -111,8 +129,43 @@ fn handle_connection<Q>(
             }
         }
         Some("QUIT") => quit(app),
+        Some("STATS") => {
+            let json = crate::streamer::telemetry::snapshot_json().to_string();
+            let _ = stream.write_all(json.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        }
         _ => {}
     }
+}
+
+/// Send `command` and read the running instance's reply.
+///
+/// `None` means nothing is listening. The reply body is empty for commands that do not answer.
+pub fn query_running_instance(ctrl_path: &Path, command: Command) -> Option<String> {
+    let contents = std::fs::read_to_string(ctrl_path).ok()?;
+    let mut lines = contents.lines();
+    let port = lines.next().and_then(|s| s.trim().parse::<u16>().ok())?;
+    let token = lines.next().unwrap_or("").trim();
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    stream
+        .write_all(format!("{token} {}\n", command.verb()).as_bytes())
+        .ok()?;
+    let _ = stream.flush();
+    let mut reply = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => reply.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(_) => break,
+        }
+    }
+    Some(reply)
 }
 
 pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
@@ -130,11 +183,7 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
         return false;
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let verb = match command {
-        Command::Focus => "FOCUS",
-        Command::Quit => "QUIT",
-    };
     stream
-        .write_all(format!("{token} {verb}\n").as_bytes())
+        .write_all(format!("{token} {}\n", command.verb()).as_bytes())
         .is_ok()
 }
