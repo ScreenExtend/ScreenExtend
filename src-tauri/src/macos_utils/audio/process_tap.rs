@@ -351,8 +351,28 @@ impl ProcessTapCapture {
         resources.aggregate_id = aggregate_id;
         set_aggregate_buffer_size(aggregate_id, &sink.diagnostics);
 
-        let asbd = read_tap_format(tap_id).unwrap_or(asbd);
-        let desc = format::parse_asbd(&asbd).unwrap_or(desc);
+        // Re-read now that the aggregate exists: the tap can settle on a different format once
+        // it is attached, which is the only reason to read it twice. Falling back silently to the
+        // pre-aggregate answer is exactly wrong in the one case the second read exists for, so a
+        // failed re-read says so and the old value is used knowingly.
+        let asbd = match read_tap_format(tap_id) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::teprintln!(
+                    "audio: could not re-read the tap format after building the aggregate ({e});                      continuing with the format read before it"
+                );
+                asbd
+            }
+        };
+        let desc = match format::parse_asbd(&asbd) {
+            Ok(d) => d,
+            Err(e) => {
+                crate::teprintln!(
+                    "audio: post-aggregate tap ASBD unusable ({e}); continuing with the format                      read before it"
+                );
+                desc
+            }
+        };
         if desc.sample_rate != 48_000 {
             return Err(AudioCaptureError::Setup(format!(
                 "tap delivers {} Hz, not 48000; deferring to SCK backend",
