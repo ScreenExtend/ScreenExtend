@@ -10,6 +10,9 @@
     const CTRL_BYTES = 64;
     const CAP_FRAMES = 65536;
 
+    let suppressed = 0;
+    function note() { suppressed++; }
+
     function detectCapabilities() {
         const AC = window.AudioContext || window.webkitAudioContext;
         const worklet = !!(AC && AC.prototype && 'audioWorklet' in AC.prototype);
@@ -18,6 +21,29 @@
             typeof window.EncodedAudioChunk === 'function' &&
             typeof window.AudioData === 'function';
         return { webcodecsOpus, worklet };
+    }
+
+    // The constructor sniff above is not enough on its own. Safari 26 and Firefox 130 have
+    // only just shipped AudioDecoder, and the host reads this answer once: claim the fast
+    // path and it sends Opus on a DataChannel with no audio track in the SDP at all, so a
+    // decoder that then refuses `opus` is permanent silence with no way back.
+    let verified = null;
+    async function verifyCapabilities() {
+        if (verified) return verified;
+        const caps = detectCapabilities();
+        if (caps.webcodecsOpus && typeof AudioDecoder.isConfigSupported === 'function') {
+            try {
+                const s = await AudioDecoder.isConfigSupported({
+                    codec: 'opus', sampleRate: SR, numberOfChannels: CH,
+                });
+                caps.webcodecsOpus = !!(s && s.supported);
+            } catch (_) {
+                note();
+                caps.webcodecsOpus = false;
+            }
+        }
+        verified = caps;
+        return caps;
     }
 
     function sharedMemoryOk() {
@@ -34,6 +60,7 @@
         sab: null,
         dc: null,
         audioEl: null,
+        fallbackStream: null,
         path: null, // 'webcodecs' | 'netEQ' | null
         muted: false,
         prepared: false,
@@ -46,11 +73,18 @@
         lastTargetAt: 0,
         residualOffsetMs: 0,    // unachievable sync error after clamping (diagnostics)
         lastOffsetLogAt: 0,
+        outputLatencyMs: 0,
+        outputLatencyEmaMs: null,
+        outputLatencySource: 'unavailable',
+        safetyMs: 0,            // adaptive margin on top of the sync target
+        lastUnderruns: null,
+        cleanBlocks: 0,
+        concealed: 0,
+        decoderFailed: false,
     };
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
     const SE_EARPIECE = 'se:earpiece';
-    const MIC_PRIME_TIMEOUT_MS = 12000;
 
     const speakers = {
         inited: false,
@@ -79,6 +113,7 @@
         wantPrime: null,
         sessionId: '',
         deviceToken: '',
+        labelsUnavailable: false,
     };
 
     function detectIOS() {
@@ -110,9 +145,9 @@
             speakers.canSink = speakers.hasEnumerate && (speakers.hasElemSink || speakers.hasCtxSink);
             speakers.canCategory = speakers.hasEarpiece;
             speakers.supported = speakers.canSink || speakers.canCategory;
-        } catch (_) {}
+        } catch (_) { note(); }
         if (speakers.hasAudioSession) {
-            try { navigator.audioSession.type = 'playback'; } catch (_) {}
+            try { navigator.audioSession.type = 'playback'; } catch (_) { note(); }
         }
     }
 
@@ -141,52 +176,24 @@
         return speakers.micPrime;
     }
 
-    function micReady() {
-        const p = primeMicPermission();
-        return Promise.race([
-            p,
-            new Promise((r) => setTimeout(() => r(null), MIC_PRIME_TIMEOUT_MS)),
-        ]).catch(() => null);
-    }
-
     function releasePrimedStream() {
         if (!speakers.primedStream) return;
-        try { speakers.primedStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        try { speakers.primedStream.getTracks().forEach((t) => t.stop()); } catch (_) { note(); }
         speakers.primedStream = null;
     }
 
-    async function unlockAndEnumerate() {
-        initSpeakers();
-        if (!speakers.supported) return { supported: false, outputs: [] };
-        const primed = primeMicPermission();
-        try {
-            await primed;
-            let enumerated = [];
-            if (speakers.canSink) {
-                enumerated = await listOutputs();
-                if (enumerated.some((d) => d.label)) speakers._lastEnum = enumerated;
-                else if (speakers._lastEnum && speakers._lastEnum.length) enumerated = speakers._lastEnum;
-            }
-            releasePrimedStream();
-            const outputs = buildOutputs(enumerated);
-            startDeviceWatch();
-            speakers._cache = { supported: speakers.supported, outputs };
-            return speakers._cache;
-        } catch (_) {
-            releasePrimedStream();
-            speakers._cache = { supported: speakers.supported, outputs: buildOutputs([]) };
-            return speakers._cache;
-        }
-    }
 
     async function needsMicPermission() {
         initSpeakers();
         speakers.wantPrime = false;
         if (!speakers.canSink && !(speakers.hasEarpiece && !speakers.hasAudioSession)) return false;
+        // Firefox 116+ enumerates outputs with labels and offers a permission-free picker,
+        // so there is nothing a microphone grant would add.
+        if (speakers.hasSelectOut) return false;
         try {
             const p = await navigator.permissions.query({ name: 'microphone' });
             speakers.micGranted = !!(p && p.state === 'granted');
-        } catch (_) {}
+        } catch (_) { note(); }
         if (speakers.canSink) {
             const devs = await listOutputs();
             if (devs.some((d) => d.label)) {
@@ -198,13 +205,66 @@
         return !speakers.micGranted;
     }
 
+    // Enumeration is for the host's device panel, never for playback, so it happens after
+    // the picture is up. Where the browser hides output labels behind a microphone grant,
+    // the prompt is offered here — it used to stand in front of the join for up to twelve
+    // seconds, gating ICE, which gated WHEP, which gated the host creating the display.
+    let lazyEnumStarted = false;
+    async function enumerateLazily(showPermModal) {
+        if (lazyEnumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
+        lazyEnumStarted = true;
+        initSpeakers();
+        if (!speakers.supported) return { supported: false, outputs: [] };
+
+        // Post whatever is visible without any permission first: on Firefox and on any
+        // browser where the grant already exists that is the whole answer.
+        let enumerated = speakers.canSink ? await listOutputs() : [];
+        if (enumerated.some((d) => d.label)) speakers._lastEnum = enumerated;
+        speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
+        startDeviceWatch();
+        postOutputs();
+
+        let need = false;
+        try { need = await needsMicPermission(); } catch (_) { note(); }
+        if (!need) {
+            speakers.labelsUnavailable = false;
+            return speakers._cache;
+        }
+        speakers.labelsUnavailable = true;
+        if (typeof showPermModal !== 'function') return speakers._cache;
+
+        await new Promise((resolve) => {
+            showPermModal(() => resolve(true), () => resolve(false));
+        }).then(async (accepted) => {
+            if (!accepted) return;
+            await primeMicPermission();
+            const withLabels = speakers.canSink ? await listOutputs() : [];
+            if (withLabels.some((d) => d.label)) {
+                speakers._lastEnum = withLabels;
+                speakers.labelsUnavailable = false;
+                speakers._cache = { supported: speakers.supported, outputs: buildOutputs(withLabels) };
+                postOutputs();
+            }
+            releasePrimedStream();
+        }, note);
+        return speakers._cache;
+    }
+
+    // Firefox only resolves enumerateDevices() once the document has focus, so a
+    // backgrounded tab would wedge the 4 s poll on a promise that never settles.
+    const ENUM_TIMEOUT_MS = 3000;
     async function listOutputs() {
         try {
-            const devs = await navigator.mediaDevices.enumerateDevices();
+            const devs = await Promise.race([
+                navigator.mediaDevices.enumerateDevices(),
+                new Promise((r) => setTimeout(() => r(null), ENUM_TIMEOUT_MS)),
+            ]);
+            if (!devs) { note(); return []; }
             return devs
                 .filter((d) => d.kind === 'audiooutput')
                 .map((d) => ({ id: d.deviceId, label: d.label || '' }));
         } catch (_) {
+            note();
             return [];
         }
     }
@@ -242,21 +302,21 @@
 
     function releaseMicHold() {
         if (!speakers.micHold) return;
-        try { speakers.micHold.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        try { speakers.micHold.getTracks().forEach((t) => t.stop()); } catch (_) { note(); }
         speakers.micHold = null;
     }
 
     async function revertSink() {
         if (speakers.msd) {
-            try { state.gain.disconnect(speakers.msd); } catch (_) {}
-            try { if (state.ctx) state.gain.connect(state.ctx.destination); } catch (_) {}
-            if (speakers.sinkEl) { try { speakers.sinkEl.pause(); } catch (_) {} speakers.sinkEl.srcObject = null; }
+            try { state.gain.disconnect(speakers.msd); } catch (_) { note(); }
+            try { if (state.ctx) state.gain.connect(state.ctx.destination); } catch (_) { note(); }
+            if (speakers.sinkEl) { try { speakers.sinkEl.pause(); } catch (_) { note(); } speakers.sinkEl.srcObject = null; }
             speakers.msd = null;
         } else if (speakers.hasCtxSink && state.ctx) {
-            try { await state.ctx.setSinkId(''); } catch (_) {}
+            try { await state.ctx.setSinkId(''); } catch (_) { note(); }
         }
         if (state.path === 'netEQ' && state.audioEl && typeof state.audioEl.setSinkId === 'function') {
-            try { await state.audioEl.setSinkId(''); } catch (_) {}
+            try { await state.audioEl.setSinkId(''); } catch (_) { note(); }
         }
     }
 
@@ -264,7 +324,7 @@
         if (!state.ctx || !state.gain) return;
         if (!speakers.msd) {
             speakers.msd = state.ctx.createMediaStreamDestination();
-            try { state.gain.disconnect(state.ctx.destination); } catch (_) {}
+            try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
             state.gain.connect(speakers.msd);
         }
         if (!speakers.sinkEl) {
@@ -296,13 +356,13 @@
             if (md && md.addEventListener && speakers.hasDeviceChange) {
                 md.addEventListener('devicechange', onChange);
             }
-        } catch (_) {}
+        } catch (_) { note(); }
         try {
             speakers.poll = setInterval(() => {
                 if (document.visibilityState !== 'visible') return;
                 reEnumerateAndPost();
             }, 4000);
-        } catch (_) {}
+        } catch (_) { note(); }
     }
 
     async function reEnumerateAndPost() {
@@ -318,7 +378,7 @@
             }
             speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
             postOutputs();
-        } catch (_) {}
+        } catch (_) { note(); }
     }
 
     function postOutputs() {
@@ -336,8 +396,13 @@
                 headers: { 'Content-Type': 'application/json' },
                 body,
             }).catch(() => {});
-        } catch (_) {}
+        } catch (_) { note(); }
     }
+
+    // Which mechanism actually moved the audio, reported to the host so a device where the
+    // sink selection silently does nothing is distinguishable from one where it worked.
+    const SINK_TIER = { none: 0, ctxSetSinkId: 1, elementSetSinkId: 2, audioSession: 3, selectAudioOutput: 4 };
+    let sinkTier = SINK_TIER.none;
 
     async function setSpeaker(deviceId) {
         initSpeakers();
@@ -346,14 +411,18 @@
         if (speakers.appliedSink === id) return;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
-            if (state.path === 'netEQ') { try { await revertSink(); } catch (_) {} }
-            else { try { await ensureCategoryBridge(); } catch (_) {} }
+            if (state.path === 'netEQ') { try { await revertSink(); } catch (_) { note(); } }
+            else { try { await ensureCategoryBridge(); } catch (_) { note(); } }
             if (id === SE_EARPIECE) {
-                applySession('play-and-record');
-                if (!speakers.hasAudioSession && speakers.hasEarpiece)
-                    { try { await acquireMicHold(); } catch (_) {} }
+                if (applySession('play-and-record')) sinkTier = SINK_TIER.audioSession;
+                // Only where the platform has no audioSession category is the microphone
+                // hold the mechanism that routes to the earpiece; it is not a permission
+                // prime and it is released the moment the loudspeaker is chosen again.
+                if (!speakers.hasAudioSession && speakers.hasEarpiece) {
+                    try { if (await acquireMicHold()) sinkTier = SINK_TIER.audioSession; } catch (_) { note(); }
+                }
             } else {
-                applySession('playback');
+                if (applySession('playback')) sinkTier = SINK_TIER.audioSession;
                 releaseMicHold();
             }
             speakers.appliedSink = id;
@@ -382,13 +451,18 @@
             if (speakers.hasCtxSink) {
                 await state.ctx.setSinkId(id);
                 speakers.appliedSink = id;
+                sinkTier = SINK_TIER.ctxSetSinkId;
+                // A different device has a different buffer depth, so the A/V target that
+                // was right for the old one is not right for this one.
+                state.outputLatencyEmaMs = null;
+                maybeUpdateTarget();
                 return;
             }
 
             if (speakers.hasElemSink) {
                 if (!speakers.msd) {
                     speakers.msd = state.ctx.createMediaStreamDestination();
-                    try { state.gain.disconnect(state.ctx.destination); } catch (_) {}
+                    try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
                     state.gain.connect(speakers.msd);
                 }
                 if (!speakers.sinkEl) {
@@ -404,11 +478,30 @@
                 speakers.sinkEl.srcObject = speakers.msd.stream;
                 await speakers.sinkEl.setSinkId(id);
                 const p = speakers.sinkEl.play();
-                if (p && p.catch) p.catch(() => {});
+                if (p && p.catch) p.catch(note);
                 speakers.appliedSink = id;
+                sinkTier = SINK_TIER.elementSetSinkId;
+                state.outputLatencyEmaMs = null;
+                maybeUpdateTarget();
                 return;
             }
-        } catch (_) {}
+        } catch (_) { note(); }
+    }
+
+    // Firefox 116+ is the only engine with a permission-free output picker. It needs
+    // transient activation, so it is exposed for a user gesture rather than called from the
+    // host's reconfigure poll.
+    async function pickOutput() {
+        initSpeakers();
+        if (!speakers.hasSelectOut) return null;
+        try {
+            const info = await navigator.mediaDevices.selectAudioOutput();
+            if (!info || !info.deviceId) return null;
+            await setSpeaker(info.deviceId);
+            sinkTier = SINK_TIER.selectAudioOutput;
+            await reEnumerateAndPost();
+            return { id: info.deviceId, label: info.label || '' };
+        } catch (_) { note(); return null; }
     }
 
     function setSpeakerIdentity(sessionId, deviceToken) {
@@ -416,12 +509,79 @@
         speakers.deviceToken = deviceToken || '';
     }
 
+    // How long a sample takes to get from the graph to the speaker. `outputLatency` is the
+    // right answer and arrived in Chrome 102, Firefox 70 and Safari 18.4; treating its
+    // absence as zero made the commanded jitter depth too large by exactly that amount, so
+    // audio played early — by 3-10 ms on a wired desktop output and 100-200 ms on Bluetooth,
+    // which is the difference between lip-sync and obviously wrong.
+    //
+    // getOutputTimestamp() (Safari 14.1, Firefox 70, Chrome 57) answers the same question
+    // indirectly: it reports which sample the device is playing and when, so the distance
+    // between that and the graph's clock is the output latency.
+    const OUTPUT_LATENCY_FLOOR_MS = 0;
+    const OUTPUT_LATENCY_CEILING_MS = 500;
+    function estimateOutputLatencyMs(c) {
+        if (typeof c.getOutputTimestamp !== 'function') return null;
+        let ts;
+        try { ts = c.getOutputTimestamp(); } catch (_) { note(); return null; }
+        if (!ts || typeof ts.contextTime !== 'number' || typeof ts.performanceTime !== 'number') return null;
+        if (!(ts.contextTime > 0)) return null;
+        const elapsedSec = (performance.now() - ts.performanceTime) / 1000;
+        const playingContextTime = ts.contextTime + elapsedSec;
+        const latency = (c.currentTime - playingContextTime) * 1000;
+        if (!isFinite(latency)) return null;
+        return Math.max(OUTPUT_LATENCY_FLOOR_MS, Math.min(OUTPUT_LATENCY_CEILING_MS, latency));
+    }
+
     function outputLatencyMs() {
         const c = state.ctx;
         if (!c) return 0;
         const base = typeof c.baseLatency === 'number' ? c.baseLatency : 0;
-        const out = typeof c.outputLatency === 'number' ? c.outputLatency : 0;
-        return (base + out) * 1000;
+        if (typeof c.outputLatency === 'number' && c.outputLatency > 0) {
+            state.outputLatencySource = 'measured';
+            state.outputLatencyMs = (base + c.outputLatency) * 1000;
+            return state.outputLatencyMs;
+        }
+        const est = estimateOutputLatencyMs(c);
+        if (est !== null) {
+            // Low-pass it: getOutputTimestamp jitters by a quantum or two and the target it
+            // feeds is not worth chasing that.
+            state.outputLatencyEmaMs = state.outputLatencyEmaMs === null
+                ? est : state.outputLatencyEmaMs * 0.85 + est * 0.15;
+            state.outputLatencySource = 'estimated';
+            state.outputLatencyMs = base * 1000 + state.outputLatencyEmaMs;
+            return state.outputLatencyMs;
+        }
+        state.outputLatencySource = base > 0 ? 'baseLatency' : 'unavailable';
+        state.outputLatencyMs = base * 1000;
+        return state.outputLatencyMs;
+    }
+
+    // The commanded depth is the A/V answer; this is the margin on top of it that keeps the
+    // ring from starving on a link that jitters. It grows when the worklet actually runs dry
+    // and decays back on a clean one, so a good network converges to no margin at all
+    // instead of paying a fixed worst-case buffer forever.
+    const SAFETY_STEP_MS = 4;
+    const SAFETY_MAX_MS = 60;
+    const SAFETY_DECAY_MS = 1;
+    function adaptSafetyMargin(st) {
+        const under = st.underruns || 0;
+        if (state.lastUnderruns === null) { state.lastUnderruns = under; return; }
+        const fresh = under - state.lastUnderruns;
+        state.lastUnderruns = under;
+        if (fresh > 0) {
+            state.safetyMs = Math.min(SAFETY_MAX_MS, state.safetyMs + SAFETY_STEP_MS * Math.min(3, fresh));
+            state.cleanBlocks = 0;
+            maybeUpdateTarget();
+            return;
+        }
+        // maybePostStats fires roughly every 256 ms, so eight clean reports is ~2 s.
+        state.cleanBlocks++;
+        if (state.cleanBlocks >= 8 && state.safetyMs > 0) {
+            state.cleanBlocks = 0;
+            state.safetyMs = Math.max(0, state.safetyMs - SAFETY_DECAY_MS);
+            maybeUpdateTarget();
+        }
     }
 
     function maybeUpdateTarget() {
@@ -431,6 +591,7 @@
         let raw = state.videoDelayMs - state.preEnqueueEmaMs - outputLatencyMs();
         raw = ((raw % P_MS) + P_MS) % P_MS;
         if (raw > P_MS / 2) raw -= P_MS;
+        raw += state.safetyMs;
 
         const target = Math.max(MIN_TARGET_MS, Math.min(MAX_TARGET_MS, raw));
         state.residualOffsetMs = raw - target; // 0 when sync is achievable within bounds
@@ -471,13 +632,33 @@
         if (state.audioEl) state.audioEl.muted = m;
     }
 
-    async function prepare() {
-        if (state.prepared) return true;
+    // Two halves on purpose. WebKit only honours resume() from inside the user gesture that
+    // is running when it is called, and `await ctx.audioWorklet.addModule()` ends that
+    // window — so the context is constructed and resumed synchronously here, and the
+    // worklet is attached afterwards. The old order left iOS suspended for the whole
+    // session with the failure swallowed.
+    let preparePromise = null;
+    function beginFromGesture() {
+        if (state.prepared) return Promise.resolve(true);
+        if (preparePromise) return preparePromise;
         initSpeakers();
         const AC = window.AudioContext || window.webkitAudioContext;
-        if (!AC) return false;
+        if (!AC) return Promise.resolve(false);
         try {
             state.ctx = new AC({ latencyHint: 'interactive', sampleRate: SR });
+        } catch (e) {
+            console.warn('[audio] AudioContext construction failed:', e);
+            return Promise.resolve(false);
+        }
+        if (state.ctx.state === 'suspended') {
+            try { const p = state.ctx.resume(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
+        }
+        preparePromise = attachWorklet();
+        return preparePromise;
+    }
+
+    async function attachWorklet() {
+        try {
             await state.ctx.audioWorklet.addModule('/audio-worklet.js');
             state.sab = makeSharedRing();
             state.node = new AudioWorkletNode(state.ctx, 'audio-jitter', {
@@ -487,7 +668,10 @@
                 processorOptions: { capacityFrames: CAP_FRAMES, sab: state.sab },
             });
             state.node.port.onmessage = (e) => {
-                if (e.data && e.data.type === 'stats') state.stats = e.data;
+                if (e.data && e.data.type === 'stats') {
+                    state.stats = e.data;
+                    adaptSafetyMargin(e.data);
+                }
             };
             state.gain = state.ctx.createGain();
             state.gain.gain.value = state.muted ? 0 : 1;
@@ -500,10 +684,19 @@
         }
     }
 
+    // Kept for callers that are not inside a gesture (a reconfigure, say): it never
+    // constructs a second context, because two would fight over the same output.
+    function prepare() {
+        if (state.prepared) return Promise.resolve(true);
+        if (preparePromise) return preparePromise;
+        return beginFromGesture();
+    }
+
     async function resume() {
         if (state.ctx && state.ctx.state === 'suspended') {
-            try { await state.ctx.resume(); } catch (_) {}
+            try { await state.ctx.resume(); } catch (_) { note(); }
         }
+        return !!(state.ctx && state.ctx.state === 'running');
     }
 
     function makeSharedRing() {
@@ -529,12 +722,23 @@
             if (!d) return;
             if (d.type === 'sync') {
                 state.preEnqueueEmaMs = d.preEnqueueMs;
+                state.concealed = d.concealed || 0;
                 maybeUpdateTarget();
             } else if (d.type === 'samples') {
                 if (state.node) state.node.port.postMessage(d, [d.l.buffer, d.r.buffer]);
+            } else if (d.type === 'discontinuity') {
+                if (state.node) state.node.port.postMessage({ type: 'discontinuity' });
+            } else if (d.type === 'decoder-failed') {
+                // The decoder said yes to isConfigSupported and then failed anyway. Silence
+                // is the worst possible answer, so hand what is left to the fallback track
+                // if the host put one in the SDP, and make the failure visible either way.
+                state.decoderFailed = true;
+                console.warn('[audio] Opus decode failed repeatedly:', d.message);
+                stopWorker();
+                if (state.fallbackStream) attachFallbackStream(state.fallbackStream);
             }
         };
-        w.onerror = (e) => console.warn('[audio] decoder worker error:', e);
+        w.onerror = (e) => { note(); console.warn('[audio] decoder worker error:', e); };
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
         if (state.hostOffsetMs !== null) w.postMessage({ type: 'clockoffset', offsetMs: state.hostOffsetMs });
@@ -543,7 +747,7 @@
 
     function stopWorker() {
         if (!state.worker) return;
-        try { state.worker.terminate(); } catch (_) {}
+        try { state.worker.terminate(); } catch (_) { note(); }
         state.worker = null;
     }
 
@@ -567,6 +771,7 @@
     }
 
     function attachFallbackStream(stream) {
+        state.fallbackStream = stream;
         if (!state.audioEl) {
             const a = document.createElement('audio');
             a.autoplay = true;
@@ -591,9 +796,9 @@
 
     function teardown() {
         stopWorker();
-        if (state.dc) { try { state.dc.onmessage = null; } catch (_) {} state.dc = null; }
-        if (state.audioEl) { try { state.audioEl.srcObject = null; } catch (_) {} }
-        if (state.node) { try { state.node.port.postMessage({ type: 'reset' }); } catch (_) {} }
+        if (state.dc) { try { state.dc.onmessage = null; } catch (_) { note(); } state.dc = null; }
+        if (state.audioEl) { try { state.audioEl.srcObject = null; } catch (_) { note(); } }
+        if (state.node) { try { state.node.port.postMessage({ type: 'reset' }); } catch (_) { note(); } }
         state.path = null;
         state.preEnqueueEmaMs = null;
         state.lastTargetMs = null;
@@ -615,11 +820,34 @@
             underruns: st ? st.underruns : null,
             overruns: st ? st.overruns : null,
             corrections: st ? st.corrections : null,
+            concealed: state.concealed + ((st && st.concealed) || 0),
+            safetyMs: state.safetyMs,
+            outputLatencyMs: state.outputLatencyMs,
+            outputLatencySource: state.outputLatencySource,
+            contextState: state.ctx ? state.ctx.state : null,
+            decoderFailed: state.decoderFailed,
+            labelsUnavailable: !!speakers.labelsUnavailable,
+            sinkTier: sinkTier,
         };
+    }
+
+    // The page owns the degradation bitfield; this reports the audio bits into it so the
+    // host sees one number rather than two half-pictures.
+    function degradeFlags(DEG) {
+        let f = 0;
+        if (!DEG) return f;
+        if (state.decoderFailed || (verified && !verified.webcodecsOpus)) f |= DEG.AUDIO_OPUS_UNSUPPORTED;
+        if (state.ctx && state.ctx.state === 'suspended') f |= DEG.AUDIO_CONTEXT_SUSPENDED;
+        if (state.outputLatencySource !== 'measured') f |= DEG.AUDIO_OUTPUT_LATENCY_ESTIMATED;
+        if (speakers.labelsUnavailable) f |= DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE;
+        if (preparePromise && !state.prepared) f |= DEG.AUDIO_PREPARE_FAILED;
+        return f;
     }
 
     window.SEAudio = {
         detectCapabilities,
+        verifyCapabilities,
+        beginFromGesture,
         prepare,
         resume,
         attachDataChannel,
@@ -629,13 +857,16 @@
         setVideoDelay,
         setHostClockOffset,
         getSyncInfo,
+        degradeFlags,
+        sinkTier: () => sinkTier,
+        suppressedCount: () => suppressed,
         activePath,
         teardown,
         initSpeakers,
-        unlockAndEnumerate,
+        enumerateLazily,
         needsMicPermission,
         primeMicPermission,
-        micReady,
+        pickOutput,
         postOutputs,
         setSpeaker,
         setSpeakerIdentity,
