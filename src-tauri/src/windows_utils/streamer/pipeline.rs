@@ -823,6 +823,7 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
     while deadline.map_or(written < FRAMES, |d| Instant::now() < d) {
         match rx.blocking_recv() {
             Ok(frame) => {
+                let timing = frame.timing;
                 let au = frame.data;
                 if !started {
                     if is_keyframe(&au) {
@@ -831,6 +832,10 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
                         continue;
                     }
                 }
+                // The transport is what normally folds a frame's stamps into the histograms,
+                // and this probe has no transport. Without this the live probe reports frame
+                // counts and nothing else.
+                pipeline.telemetry.record_frame(&timing);
                 file.write_all(&au)?;
                 total += au.len();
                 written += 1;
