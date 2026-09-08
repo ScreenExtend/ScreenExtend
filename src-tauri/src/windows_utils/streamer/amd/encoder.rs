@@ -82,6 +82,7 @@ use super::super::nvidia::encoder::{fill_synthetic_bgra, EncoderConfig};
 use super::super::scaler::Scaler;
 use super::super::{Vendor, AMD_PCI_VENDOR_ID};
 use crate::streamer::config::{Config, H264Profile};
+use crate::streamer::platform::BitrateApplied;
 
 /// The DXGI format this backend prefers for its own input textures.
 ///
@@ -532,9 +533,9 @@ impl Encoder {
     /// no `ReInit` and no `Flush` — OBS's comment says as much, and a flush would only risk
     /// unaligned IDRs. AMD warn "you cannot change it too often", which is why
     /// `streamer::bitrate::BitrateController` stays the only writer.
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.config.qp.is_some() {
-            return Ok(());
+            return Ok(BitrateApplied::IgnoredConstantQp);
         }
         self.config.bitrate_bps = bps;
         self.config.max_bitrate_bps = bps;
@@ -545,7 +546,7 @@ impl Encoder {
         self.set_i64(prop::AMF_VIDEO_ENCODER_PEAK_BITRATE, bps)?;
         self.set_i64(prop::AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, (bps / fps).max(1))?;
         tprintln!("AMF bitrate reconfigured (bitrate_bps={bps})");
-        Ok(())
+        Ok(BitrateApplied::Applied)
     }
 
     /// GPU path: stage the captured texture into the ring (scaling and/or converting through the
@@ -1021,6 +1022,13 @@ impl Encoder {
                 prop::AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE,
                 (bitrate / fps).max(1),
             )?;
+            // The quality slider is a floor on QP, i.e. a ceiling on quality: it stops the
+            // encoder spending the whole CBR budget on an easy picture. It can only shrink the
+            // stream, so it never fights congestion control the way CONSTANT_QP does. Same
+            // meaning as `enableMinQP` on NVENC and `rc.i_qp_min` on x264.
+            if let Some(q) = cfg.min_qp.filter(|&q| q > 1) {
+                self.set_i64(prop::AMF_VIDEO_ENCODER_MIN_QP, q as i64)?;
+            }
         }
         // InitialVBVBufferFullness is left at its default of 64 (= 100%). Zero would mean an
         // *empty* buffer, which is the worst case for a rate controller that then has to fill it.
@@ -1688,6 +1696,7 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         max_bitrate_bps: BITRATE,
         profile: config.h264_profile,
         qp: config.qp,
+        min_qp: config.quality_qp,
         intra_refresh: config.intra_refresh,
     })?;
 

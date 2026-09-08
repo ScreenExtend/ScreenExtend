@@ -1362,6 +1362,7 @@ fn amf_encoder_construction_fails_cleanly_without_amd_hardware() {
         max_bitrate_bps: 10_000_000,
         profile: H264Profile::Baseline,
         qp: None,
+        min_qp: None,
         intra_refresh: false,
     };
     // On an AMD box this legitimately succeeds; the point is that neither outcome panics.
