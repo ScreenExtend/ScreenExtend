@@ -783,6 +783,33 @@ pub fn warning_name(status: mfxStatus) -> &'static str {
     }
 }
 
+/// The name for any `mfxStatus`, so a log line or an error says which failure it was.
+///
+/// A bare `mfxStatus=-9` is unreadable, and it read as something it is not: the session-creation
+/// failure was reported as "no Intel hardware oneVPL implementation" when `MFX_ERR_NOT_FOUND`
+/// from `MFXCreateSession` is also what a *concurrent* create returns on a device that has one.
+pub fn status_name(status: mfxStatus) -> &'static str {
+    match status {
+        MFX_ERR_NONE => "MFX_ERR_NONE",
+        MFX_ERR_UNKNOWN => "MFX_ERR_UNKNOWN",
+        MFX_ERR_NULL_PTR => "MFX_ERR_NULL_PTR",
+        MFX_ERR_UNSUPPORTED => "MFX_ERR_UNSUPPORTED",
+        MFX_ERR_MEMORY_ALLOC => "MFX_ERR_MEMORY_ALLOC",
+        MFX_ERR_NOT_ENOUGH_BUFFER => "MFX_ERR_NOT_ENOUGH_BUFFER",
+        MFX_ERR_INVALID_HANDLE => "MFX_ERR_INVALID_HANDLE",
+        MFX_ERR_NOT_INITIALIZED => "MFX_ERR_NOT_INITIALIZED",
+        MFX_ERR_NOT_FOUND => "MFX_ERR_NOT_FOUND",
+        MFX_ERR_MORE_DATA => "MFX_ERR_MORE_DATA",
+        MFX_ERR_MORE_SURFACE => "MFX_ERR_MORE_SURFACE",
+        MFX_ERR_DEVICE_LOST => "MFX_ERR_DEVICE_LOST",
+        MFX_ERR_INCOMPATIBLE_VIDEO_PARAM => "MFX_ERR_INCOMPATIBLE_VIDEO_PARAM",
+        MFX_ERR_INVALID_VIDEO_PARAM => "MFX_ERR_INVALID_VIDEO_PARAM",
+        MFX_ERR_DEVICE_FAILED => "MFX_ERR_DEVICE_FAILED",
+        s if s > MFX_ERR_NONE => warning_name(s),
+        _ => "MFX_ERR_?",
+    }
+}
+
 /// Map an `mfxStatus` to a `Result`, treating positive warnings as success — but saying so.
 ///
 /// The warnings this accepts are the ones that matter: `MFX_WRN_PARTIAL_ACCELERATION` means the
@@ -799,7 +826,10 @@ pub fn check(status: mfxStatus, what: &str) -> Result<()> {
     } else if status == MFX_ERR_NONE {
         Ok(())
     } else {
-        anyhow::bail!("{what} failed: mfxStatus={status}");
+        anyhow::bail!(
+            "{what} failed: {} (mfxStatus={status})",
+            status_name(status)
+        );
     }
 }
 
@@ -825,6 +855,9 @@ pub fn check_strict(status: mfxStatus, what: &str) -> Result<()> {
     if status == MFX_ERR_NONE {
         Ok(())
     } else {
-        anyhow::bail!("{what} failed: mfxStatus={status}");
+        anyhow::bail!(
+            "{what} failed: {} (mfxStatus={status})",
+            status_name(status)
+        );
     }
 }

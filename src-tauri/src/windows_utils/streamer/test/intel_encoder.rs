@@ -63,7 +63,7 @@ fn intel_quicksync_clamps_extreme_frame_rate() {
         total > 0,
         "clamped-fps encoder should produce bitstream bytes"
     );
-    tprintln!("Intel Quick Sync extreme-fps clamp OK: 1920x1080@357 -> encoded {total} bytes");
+    eprintln!("Intel Quick Sync extreme-fps clamp OK: 1920x1080@357 -> encoded {total} bytes");
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
             .encode_bgra(&frame, false)
             .expect("encode after bitrate reset");
     }
-    tprintln!("Intel Quick Sync smoke test OK: 40 frames, {total} bytes, IDR+RepeatPPS verified");
+    eprintln!("Intel Quick Sync smoke test OK: 40 frames, {total} bytes, IDR+RepeatPPS verified");
 }
 
 #[test]
@@ -210,5 +210,5 @@ fn intel_quicksync_fused_downscale() {
             .encode_texture(&tex, false)
             .expect("fused-scale encode");
     }
-    tprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
+    eprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
 }

@@ -1021,7 +1021,70 @@ impl Drop for Encoder {
     }
 }
 
+/// Serializes oneVPL implementation enumeration across the process.
+///
+/// `MFXLoad` + `MFXSetConfigFilterProperty` + `MFXCreateSession` is a dispatcher-wide
+/// enumeration: it opens the candidate runtimes and asks each one whether it can serve the
+/// filter. Run two of them at once against the same iGPU and one loses — measured on this box
+/// as `MFXCreateSession` returning `MFX_ERR_NOT_FOUND` in roughly half of concurrent pairs,
+/// which the old code reported as "no Intel hardware oneVPL implementation". An encoder is
+/// built per streaming session, so two clients joining together on an Intel host is exactly the
+/// concurrent case, and the loser did not retry — it fell to x264 for the life of that session.
+static SESSION_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How many times to re-enumerate before believing `MFX_ERR_NOT_FOUND`.
+///
+/// The lock removes the contention this process creates; the retry covers the rest — another
+/// process using the same iGPU, or a runtime still tearing down the previous session's device.
+const SESSION_CREATE_ATTEMPTS: u32 = 4;
+const SESSION_CREATE_BACKOFF_MS: u64 = 25;
+
 fn create_session(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
+    // A poisoned lock here means another thread panicked mid-enumeration. The data is `()`, so
+    // there is nothing to be inconsistent about, and refusing to encode over it would be worse.
+    let _serialize = SESSION_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..SESSION_CREATE_ATTEMPTS {
+        match create_session_once(vpl) {
+            Ok(v) => {
+                if attempt > 0 {
+                    tprintln!(
+                        "oneVPL: session created on attempt {} of {SESSION_CREATE_ATTEMPTS}",
+                        attempt + 1
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) if is_transient_session_error(&e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    SESSION_CREATE_BACKOFF_MS * u64::from(attempt + 1),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last
+        .expect("the retry loop only exits empty-handed after recording an error")
+        .context(format!(
+            "no Intel hardware oneVPL implementation after {SESSION_CREATE_ATTEMPTS} attempts \
+             (would fail over to next vendor)"
+        )))
+}
+
+/// `MFX_ERR_NOT_FOUND` and `MFX_ERR_DEVICE_*` from enumeration are "not right now", not
+/// "not on this machine". Anything else is a real refusal and retrying only delays the failover.
+fn is_transient_session_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("MFX_ERR_NOT_FOUND")
+        || s.contains("MFX_ERR_DEVICE_LOST")
+        || s.contains("MFX_ERR_DEVICE_FAILED")
+}
+
+fn create_session_once(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
     let loader = unsafe { (vpl.MFXLoad)() };
     if loader.is_null() {
         bail!("MFXLoad returned null (oneVPL dispatcher unavailable)");
@@ -1087,9 +1150,12 @@ fn create_session(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
         }
         Err(e) => {
             unsafe { (vpl.MFXUnload)(loader) };
-            Err(e.context(
-                "no Intel hardware oneVPL implementation (would fail over to next vendor)",
-            ))
+            // No blanket "no Intel hardware" here — `create_session` decides that, after the
+            // retries, and only for statuses that mean it.
+            Err(e.context(format!(
+                "oneVPL implementation enumeration failed (dispatcher {})",
+                vpl.library_path().display()
+            )))
         }
     }
 }
