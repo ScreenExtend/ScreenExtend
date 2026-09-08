@@ -282,6 +282,18 @@ fn code_to_keycode(code: &str, apple_client: bool) -> Option<u16> {
     Some(vk as u16)
 }
 
+/// `AXIsProcessTrusted` is the whole tier: with it, `CGEventPost` reaches the desktop; without
+/// it the OS drops every event and returns `void`, so nothing downstream can tell the difference
+/// between "not granted" and "the network is down". `AXIsProcessTrusted` is 10.9 API, present on
+/// the floor, and cheap enough to call on the geometry cadence.
+pub fn probe() -> super::InputBackend {
+    if crate::macos_utils::permissions::accessibility_trusted() {
+        super::InputBackend::CgEvent
+    } else {
+        super::InputBackend::NeedsAccessibility
+    }
+}
+
 pub fn boost_thread() {
     crate::macos_utils::streamer::qos::pin_current_thread_user_interactive();
 }
@@ -303,6 +315,10 @@ pub struct Injector {
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
     warned_drop: bool,
+    /// Last probed injection tier. TCC can be granted or revoked while we run, and the check
+    /// used to happen once in the constructor — which is why its own warning told the user to
+    /// relaunch.
+    tier: super::InputBackend,
 }
 
 impl Injector {
@@ -313,19 +329,19 @@ impl Injector {
         } = client;
         let apple_client = platform.is_apple();
         if platform == ClientPlatform::Unknown {
-            log::info!(
+            tprintln!(
                 "client platform not reported; assuming a PC keyboard layout (Ctrl -> Command)"
             );
         }
         let source = unsafe { CGEventSourceCreate(SOURCE_STATE_HID) };
         if source.is_null() {
-            log::warn!("CGEventSourceCreate returned null; synthesized events may be degraded");
+            teprintln!("CGEventSourceCreate returned null; synthesized events may be degraded");
         }
         if !source.is_null() {
             unsafe { CGEventSourceSetLocalEventsSuppressionInterval(source, 0.0) };
         }
         if !crate::macos_utils::permissions::accessibility_trusted() {
-            log::warn!(
+            teprintln!(
                 "Accessibility (TCC) not granted — injected input is dropped until ScreenExtend \
                  is enabled in System Settings > Privacy & Security > Accessibility, then relaunched"
             );
@@ -353,6 +369,7 @@ impl Injector {
             // opening tap landed wherever the host cursor already was.
             mouse_relative: false,
             warned_drop: false,
+            tier,
         }
     }
 
@@ -361,6 +378,20 @@ impl Injector {
             matches!(self.geom_checked, Some(t) if t.elapsed() < Duration::from_millis(500));
         if fresh {
             return;
+        }
+        // Re-probe on the same cadence. Granting Accessibility takes effect for a running
+        // process, so a session that started muted starts working within half a second of the
+        // user flipping the switch — and one whose permission is revoked says so.
+        let tier = probe();
+        if tier != self.tier {
+            if tier.injects() {
+                tprintln!("input: Accessibility granted — remote control is live");
+            } else {
+                teprintln!(
+                    "input: Accessibility was revoked — injected events are being dropped by the OS"
+                );
+            }
+            self.tier = tier;
         }
         self.desktop = desktop_bounds();
         if let Some(name) = &self.device_name {
@@ -374,7 +405,7 @@ impl Injector {
             );
             if resolved != self.target {
                 if let Some(r) = resolved {
-                    log::info!(
+                    tprintln!(
                         "remote-input geometry: display {name} at ({},{}) {}x{}",
                         r.left,
                         r.top,
@@ -757,7 +788,7 @@ impl Injector {
 
     fn clipboard(&mut self, op: u8, mime: &str, data: &[u8]) {
         if set_pasteboard(mime, data) {
-            log::info!("clipboard set ({mime}, {} bytes, op={op})", data.len());
+            tprintln!("clipboard set ({mime}, {} bytes, op={op})", data.len());
             if op == 2 {
                 self.paste_hotkey();
             }
@@ -779,7 +810,7 @@ impl Injector {
 
     fn unsupported_drop(&mut self) {
         if !self.warned_drop {
-            log::warn!("file drop injection is unsupported on macOS (no public API); ignoring");
+            teprintln!("file drop injection is unsupported on macOS (no public API); ignoring");
             self.warned_drop = true;
         }
     }

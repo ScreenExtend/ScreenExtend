@@ -1987,6 +1987,7 @@ mod desktop {
                     "display": report.display_backend,
                     "audio": report.audio_backend,
                     "hostedNetwork": report.hosted_network_backend,
+                    "input": report.input_backend,
                 },
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
                     "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
@@ -2046,6 +2047,7 @@ mod desktop {
         println!("  Display:        {}", report.display_backend);
         println!("  Audio:          {}", report.audio_backend);
         println!("  Hosted network: {}", report.hosted_network_backend);
+        println!("  Input:          {}", report.input_backend);
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {

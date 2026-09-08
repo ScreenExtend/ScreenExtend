@@ -1286,6 +1286,50 @@ impl Drop for LiveCapture {
     }
 }
 
+/// A device's adapter LUID and description, for comparing two devices' adapters.
+fn adapter_of(device: &ID3D11Device) -> Option<(i64, String)> {
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    let dxgi: IDXGIDevice = device.cast().ok()?;
+    let adapter = unsafe { dxgi.GetAdapter() }.ok()?;
+    let desc = unsafe { adapter.GetDesc() }.ok()?;
+    let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64);
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    Some((luid, String::from_utf16_lossy(&desc.Description[..end])))
+}
+
+/// Say out loud when the GPU composing the captured display is not the GPU encoding it.
+///
+/// Desktop Duplication is adapter-local, so the capture device is on whichever adapter the OS
+/// chose to compose that display. For an indirect display that choice is not ours: before
+/// IddCx 1.4 the OS composes on the POST adapter (the iGPU, on a hybrid laptop) and
+/// `IddCxAdapterSetRenderAdapter` — the only way for the driver to ask for a different one — is
+/// IddCx 1.4, while the bundled driver declares IddCx 1.2. The consequence is a full-frame
+/// cross-adapter copy per frame that a dGPU-attached physical monitor would not pay: at 1080p
+/// BGRA that is ~8.3 MB over PCIe per frame plus its synchronisation.
+///
+/// Nothing here can fix that; the point is that it stops being invisible. See
+/// `docs/OPTIMIZATIONS.md` for the driver-rebuild recommendation.
+fn report_adapter_split(capture: &ID3D11Device, encode: &ID3D11Device) {
+    let (Some((cap_luid, cap_name)), Some((enc_luid, enc_name))) =
+        (adapter_of(capture), adapter_of(encode))
+    else {
+        return;
+    };
+    if cap_luid == enc_luid {
+        tprintln!("pipeline: compose and encode are both on {cap_name}");
+    } else {
+        tprintln!(
+            "pipeline: the display is composed on {cap_name} but encoded on {enc_name}, so every \
+             frame crosses adapters. The bundled indirect display driver declares IddCx 1.2, \
+             which has no way to ask the OS to compose on the encoder's GPU"
+        );
+    }
+}
+
 fn build_zero_copy(
     config: EncoderConfig,
     igpu_device: &ID3D11Device,
@@ -1870,6 +1914,7 @@ fn build_backend(
                     "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
                     config.width, config.height, config.fps
                 );
+                report_adapter_split(device, encoder.device());
                 Ok(Backend::Nvenc { encoder, path })
             }
             Err(e) => {

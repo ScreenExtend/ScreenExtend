@@ -78,6 +78,49 @@ mod backend;
 
 pub mod scancode;
 
+/// Which injection path this host can actually take, probed rather than assumed.
+///
+/// Input was the one subsystem with no tier: audio probes and reports a backend, display probes
+/// and reports one, capture probes and reports one, and remote control reported nothing at all.
+/// The case that made it matter is macOS without Accessibility, where `CGEventPost` returns
+/// `void` and the OS drops every event with no error the process can observe — a client whose
+/// remote control is enabled, whose pointer events are being sent and acknowledged, and whose
+/// host simply never moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputBackend {
+    /// Windows: `SendInput` plus synthetic pen/touch pointer devices.
+    SendInput,
+    /// macOS: `CGEventPost`, with Accessibility granted.
+    CgEvent,
+    /// macOS: the API is present but TCC has not granted Accessibility, so injection is a
+    /// silent no-op. Recoverable at runtime — the permission can be granted while we run.
+    NeedsAccessibility,
+    /// No injection backend on this platform.
+    Unsupported,
+}
+
+impl InputBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SendInput => "SendInput",
+            Self::CgEvent => "CGEvent",
+            Self::NeedsAccessibility => "NeedsAccessibility",
+            Self::Unsupported => "Unsupported",
+        }
+    }
+
+    /// Whether injected events actually reach the desktop on this tier.
+    pub fn injects(self) -> bool {
+        matches!(self, Self::SendInput | Self::CgEvent)
+    }
+}
+
+/// Probe the injection tier. Never cached: on macOS the answer flips the moment the user grants
+/// Accessibility, and the old code demanded a relaunch precisely because it asked once.
+pub fn probe_backend() -> InputBackend {
+    backend::probe()
+}
+
 pub fn boost_current_thread() {
     backend::boost_thread();
 }
