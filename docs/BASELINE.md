@@ -128,19 +128,23 @@ cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate_down
 
 | Capture size | delivered (fps) | dropped by WindowServer | callback mean | displayTime → callback p50 / p90 / p99 / max |
 |---|---|---|---|---|
-| MACOS_CAP_NATIVE |
-| MACOS_CAP_HALF |
+| native 1440x900 | queued | queued | queued | queued |
+| half 720x448 | queued | queued | queued | queued |
 
 ### Capture → encoded (`pipeline::tests::end_to_end_latency`, 6 s, 1440x900@60)
 
 | Build | captured (fps) | WindowServer drops | encoder output drops | capture → encoded p50 / p99 / max |
 |---|---|---|---|---|
-| MACOS_E2E_BEFORE |
-| MACOS_E2E_AFTER |
+| before the VideoToolbox work (commit `719891df`, CGDS surface fixes only) | 61 (365 / 367 / 366 frames in 6 s) | 0 / 1 / 0 | not counted yet | **13.70 / 15.60 / 33.08** |
+| after (commit `34815f3a`) | queued | queued | queued | queued |
 
 ### Whole host path (`probe --whep-selftest`, 30 s)
 
-MACOS_SELFTEST
+Queued. The run is scripted and waiting on the shared Mac’s cargo lock behind four other agents’ fat-LTO release builds; the script is `src-tauri/target/w5-measure.sh` and its log `src-tauri/target/w5-measure.log`. It runs
+`ScreenExtend probe --whep-selftest --duration 30` from a `--features probe` release build, plus
+`cgds::tests::capture_rate{,_downscaled}`, `encoder::tests::{the_sps_promises_no_reordering,hw_capability_probe,encode_synthetic}`,
+`pipeline::tests::{end_to_end_latency,production_pipeline_smoke}`, and finishes with the dyld floor check and
+`nm -u … | grep -i displaystream`.
 
 ## What the numbers say
 
