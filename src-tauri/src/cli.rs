@@ -238,8 +238,10 @@ TUNING FLAGS are the streamer's own and are parsed straight off the command line
     --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
     --qp <1..51>   --h264-profile <baseline|main|high>   --intra-refresh <on|off>
     --monitor <n>   --max-bitrate-kbps <n>   --disable-gpu-encode
-    --capture <wgc|dxgi|auto>                Windows capture backend. DXGI is otherwise
+    --capture-backend <wgc|dxgi|auto>        Windows capture backend. DXGI is otherwise
                           only reached by WGC failing, so it cannot be measured without this.
+                          Spelled out in full because `--capture` above already selects the
+                          single-frame PNG probe.
     --synthetic-pattern                      encode a generated pattern, not the desktop
     --workload <mixed|static|scroll|motion|drag>   scripted synthetic workload (implies
                           --synthetic-pattern): a still desktop, scrolling text, full-frame
