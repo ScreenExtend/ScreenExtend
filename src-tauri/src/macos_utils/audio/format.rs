@@ -143,6 +143,34 @@ pub fn convert_interleaved(
     let ch = desc.channels as usize;
     let bps = desc.kind.bytes();
     let stride = ch * bps;
+
+    // 48 kHz stereo f32 interleaved is already the encoder's own layout, and it is what every
+    // backend delivers on this Mac's common path. Reassembling each sample from four indexed byte
+    // reads, running it through a two-channel "downmix" and clamping it is five scalar passes to
+    // arrive back at the bytes we started with. One `copy_nonoverlapping` plus a clamp pass does
+    // the same work in two vectorisable ones — on the real-time capture thread, where cost is
+    // IOProc deadline-miss risk rather than throughput.
+    if desc.is_fast_path() {
+        let n = (frames * OUT_CHANNELS)
+            .min(out.len())
+            .min(src.len() / std::mem::size_of::<f32>());
+        // SAFETY: `out` is `&mut [f32]` so its pointer is f32-aligned, and copying bytes into it
+        // is sound because every bit pattern is a valid f32. The source is read as bytes, so no
+        // alignment is required of it — a CoreAudio buffer is aligned in practice, but the copy
+        // does not depend on that.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                out.as_mut_ptr() as *mut u8,
+                n * std::mem::size_of::<f32>(),
+            );
+        }
+        for s in out[..n].iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+        return n;
+    }
+
     let mut scratch = [0.0f32; 8];
     let mut written = 0;
     for f in 0..frames {

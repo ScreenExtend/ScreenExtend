@@ -125,9 +125,23 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     audio::legacy::routing::recover_on_launch();
     let virtual_display = tauri::async_runtime::spawn_blocking(new_shared_controller).await;
 
+    // `setup` returns a bare bool, so the only place the reason can survive is the log backlog —
+    // and until now `Ok(None)` and a panicking `new_shared_controller` were indistinguishable, with
+    // the panic payload discarded.
     let virtual_display = match virtual_display {
         Ok(Some(vd)) => vd,
-        _ => return false,
+        Ok(None) => {
+            teprintln!(
+                "[setup] no virtual-display backend could be constructed on this Mac \
+                 (display tier: {}). Nothing else in setup ran.",
+                virtual_display::probe_display_backend().as_str()
+            );
+            return false;
+        }
+        Err(e) => {
+            teprintln!("[setup] building the virtual-display controller panicked: {e}");
+            return false;
+        }
     };
 
     let device_overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
@@ -392,6 +406,7 @@ pub fn get_server_ports(state: State<'_, AppState>) -> ServerPorts {
 #[tauri::command]
 #[specta::specta]
 pub fn set_server_ports(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     http_port: u16,
     https_port: u16,
@@ -424,15 +439,34 @@ pub fn set_server_ports(
         "[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers"
     );
 
+    // Tell the connected clients why their stream is about to end, rather than dropping the
+    // transport under them.
+    let connected: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+    for ip in connected {
+        session::send_bye(&state.sessions, &ip, session::ByeReason::HostExit);
+    }
+
     {
         let mut streamers = state.streamers.lock().unwrap();
         for (ip, streamer) in streamers.drain() {
             tprintln!("[streamer] stopping streamer bound to {ip} for port change");
-            streamer.handle.shutdown();
+            streamer
+                .handle
+                .graceful_shutdown(Some(Duration::from_millis(500)));
         }
     }
-    std::thread::sleep(Duration::from_millis(300));
-    sync_streamers(&state);
+    // Waiting for the old listeners to release their ports used to be a 300 ms
+    // `std::thread::sleep` inside a synchronous command, i.e. on the main thread, with
+    // `sync_streamers` and its per-adapter runtime spin-up behind it. The command now returns
+    // immediately and the restart finishes on its own thread.
+    std::thread::spawn(move || {
+        use tauri::Manager;
+        std::thread::sleep(Duration::from_millis(300));
+        match app.try_state::<AppState>() {
+            Some(state) => sync_streamers(&state),
+            None => teprintln!("[streamer] port change: app state went away before the restart"),
+        }
+    });
 
     ServerPorts { http, https }
 }
@@ -506,8 +540,7 @@ pub fn set_legacy_volume_key_proxy(enabled: bool) {
 }
 
 pub fn remove_all_displays(client: &SharedVirtualDisplay) {
-    let client = client.clone();
-    let _ = std::thread::spawn(move || client.remove_all_displays()).join();
+    client.remove_all_displays();
 }
 
 #[tauri::command]
@@ -580,22 +613,48 @@ fn display_slot_holder(state: &AppState) -> Option<String> {
 }
 
 pub fn sync_streamers(state: &AppState) {
-    let (desired, fresh_local_ips) = {
+    let (desired, dropped_v6, fresh_local_ips) = {
         let adapters = state.network_adapters.lock().unwrap();
         let desired: Vec<(String, Ipv4Addr)> = adapters
             .iter()
             .flat_map(|adapter| adapter.ip_addresses.iter())
             .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(|addr| (ip.clone(), addr)))
             .collect();
+        // `Config.bind_ip` is an `Ipv4Addr`, so every IPv6 address the enumeration found is
+        // dropped here — silently, until now, even though the dashboard still shows it.
+        let dropped_v6: Vec<String> = adapters
+            .iter()
+            .flat_map(|adapter| adapter.ip_addresses.iter())
+            .filter(|ip| ip.parse::<Ipv4Addr>().is_err())
+            .cloned()
+            .collect();
         let fresh_local_ips = crate::streamer::server::collect_local_ips(
             adapters
                 .iter()
                 .flat_map(|adapter| adapter.ip_addresses.iter().map(String::as_str)),
         );
-        (desired, fresh_local_ips)
+        (desired, dropped_v6, fresh_local_ips)
     };
 
     *state.local_ips.lock().unwrap() = fresh_local_ips;
+
+    if !dropped_v6.is_empty() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let first_time = !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if first_time || desired.is_empty() {
+            teprintln!(
+                "[streamer] {} IPv6 address(es) are not being served ({}): the streamer binds \
+                 IPv4 only{}",
+                dropped_v6.len(),
+                dropped_v6.join(", "),
+                if desired.is_empty() {
+                    ", and no IPv4 address is available, so nothing is listening and no device can join"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
 
     let desired = match display_slot_holder(state) {
         Some(host_ip) => {
