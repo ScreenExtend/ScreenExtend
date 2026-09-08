@@ -93,10 +93,14 @@ Sent on the **reliable** DataChannel once a second, alongside the `PING`. Fixed 
 endian. All durations are **microseconds**; a value of 0 means "not measured", which is what a
 path with no hook for that stage reports.
 
+Version 2 (96 bytes) appends the tier bytes and the degradation field below. Bytes 0..72 are
+byte-identical to v1, which is what lets a host built against v1 read the prefix and ignore the
+rest.
+
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | opcode `0x62` |
-| 1 | 1 | version (currently 1; 0 is rejected) |
+| 1 | 1 | version (currently 2; 0 is rejected) |
 | 2 | 1 | video path |
 | 3 | 1 | audio path |
 | 4 | 4 | flags (below) |
@@ -116,10 +120,25 @@ path with no hook for that stage reports.
 | 60 | 4 | audio worklet underruns |
 | 64 | 4 | audio worklet overruns |
 | 68 | 4 | RTT, µs |
-| | | **72 bytes** |
+| | | **72 bytes (v1)** |
+| 72 | 1 | video transport tier |
+| 73 | 1 | render tier |
+| 74 | 1 | keyframe-request tier |
+| 75 | 1 | audio-sink tier |
+| 76 | 4 | errors the page swallowed (the `catch (_) {}` count) |
+| 80 | 4 | degradation flags (below) |
+| 84 | 4 | commanded audio jitter depth, µs |
+| 88 | 4 | audio packets concealed |
+| 92 | 4 | audio output latency, µs (0 = unknown) |
+| | | **96 bytes (v2)** |
 
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
+
+**The v2 tail is not yet parsed by the host.** `input/protocol.rs::parse_client_stats` reads the
+first 72 bytes and stops, so the tier bytes and the degradation field reach the host and are
+discarded. Surfacing them is `findings/major-telemetry-client-stats-v2-tail-is-discarded.md`.
+Until it lands, read them with `SEVideo.getStats()` on the device.
 
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
@@ -147,6 +166,52 @@ offset has arrived; before that the client reports 0 there and clears `CLOCK_VAL
 | 7 | decoder reports hardware acceleration |
 | 8 | clock offset valid |
 
+### Tier bytes (v2)
+
+Each says which mechanism is actually live, so a device on a slow path is distinguishable from
+one on the fast path rather than looking identical to it.
+
+| Byte | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| transport (72) | none | `RTCRtpScriptTransform` | `createEncodedStreams` | | |
+| render (73) | none | OffscreenCanvas 2D in the worker | track generator → `<video>` | `<video>` element | |
+| keyframe (74) | **cannot ask** | `sendKeyFrameRequest()` | `KEYFRAME_REQUEST` (`0x64`) on the input channel | | |
+| audio sink (75) | none | `AudioContext.setSinkId` | `HTMLMediaElement.setSinkId` | `navigator.audioSession` | `selectAudioOutput()` |
+
+A keyframe tier of 0 with a transport tier of 2 is the Chrome 94–140 case: the legacy transform
+runs instead of libwebrtc's reference finder, so nothing downstream emits a PLI and the client
+has no way at all to ask for an IDR.
+
+### Degradation flags (v2, offset 80)
+
+Every one of these was previously a bare `catch (_) {}` or an untaken branch, invisible to the
+host. The field is a union of the page's own bits and the audio module's.
+
+| Bit | Meaning |
+|---:|---|
+| 0 | fullscreen was requested and refused |
+| 1 | pointer lock was requested and refused |
+| 2 | `unadjustedMovement` unavailable — the OS pointer curve is compounding with the host's |
+| 3 | Screen Wake Lock API absent; on the `nosleep.js` shim |
+| 4 | a wake lock request was refused |
+| 5 | `AudioContext`/worklet setup failed |
+| 6 | `AudioDecoder` cannot decode Opus (or failed after saying it could) |
+| 7 | `AudioContext` is suspended |
+| 8 | output latency is estimated from `getOutputTimestamp()`, not reported |
+| 9 | audio-output labels unavailable (no microphone grant) |
+| 10 | `RTCRtpScriptTransform` unavailable |
+| 11 | no way to request a keyframe |
+| 12 | `transferControlToOffscreen` unavailable |
+| 13 | demoted to the `<video>` element |
+| 14 | `getCoalescedEvents` unavailable |
+| 15 | ICE gathering ran to its deadline instead of settling |
+| 16 | no H.264 `fmtp` in the answer to pin the decoder to |
+| 17 | no hardware decoder for the negotiated configuration |
+| 18 | refresh rate was measured with rAF, not reported by the browser |
+| 19 | stepped down from `RTCRtpScriptTransform` to `createEncodedStreams` |
+| 20 | `requestVideoFrameCallback` unavailable |
+| 21 | Keyboard Lock unavailable |
+
 ### Opcode note
 
 `0x62` is used in both directions. Host → client it is the (currently unused) input-queue stats
@@ -170,7 +235,8 @@ only handles `PONG` and `BYE`.
 
 `node scripts/test-client-stats.mjs` runs `input.js` under Node with minimal browser stubs,
 drives one PING/PONG exchange and one stats frame, and asserts the bytes against the layout
-above plus the clock-offset arithmetic. It is not a substitute for a browser — it stubs the
+above (including the v2 tail and the 72-byte floor an older host reads) plus the clock-offset
+arithmetic. It is not a substitute for a browser — it stubs the
 DOM, and it cannot exercise the workers — but it catches the failure that would otherwise be
 invisible: a `TypeError` inside `sendStats()` silently kills the once-a-second timer, and the
 host would simply see a client that never reports.
