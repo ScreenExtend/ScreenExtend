@@ -42,11 +42,30 @@ pub fn wait_for_lock(path: &Path, timeout: Duration) -> Option<File> {
     }
 }
 
-pub fn start_control_server(
+/// Close the main window, which runs the app's own shutdown path.
+///
+/// The headless `serve` host has no window, so it passes its own quit closure instead —
+/// `app.exit(0)` there would skip the BYE broadcast and leave every virtual display attached.
+pub fn quit_main_window(app: &AppHandle) {
+    match app.get_webview_window("main") {
+        Some(window) => {
+            let _ = app.run_on_main_thread(move || {
+                let _ = window.close();
+            });
+        }
+        None => app.exit(0),
+    }
+}
+
+pub fn start_control_server<Q>(
     app: AppHandle,
     ctrl_path: PathBuf,
     focus: fn(&tauri::WebviewWindow),
-) -> std::io::Result<()> {
+    quit: Q,
+) -> std::io::Result<()>
+where
+    Q: Fn(&AppHandle) + Send + 'static,
+{
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
     let token = format!("{:032x}", rand::rng().random::<u128>());
@@ -56,18 +75,27 @@ pub fn start_control_server(
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            handle_connection(stream, &app, &token, focus);
+            handle_connection(stream, &app, &token, focus, &quit);
         }
     });
     Ok(())
 }
 
-fn handle_connection(
+/// Remove the control file so a later `stop` reports "no running instance" instead of dialling
+/// a port the OS has since handed to somebody else.
+pub fn clear_control_file(ctrl_path: &Path) {
+    let _ = std::fs::remove_file(ctrl_path);
+}
+
+fn handle_connection<Q>(
     stream: TcpStream,
     app: &AppHandle,
     token: &str,
     focus: fn(&tauri::WebviewWindow),
-) {
+    quit: &Q,
+) where
+    Q: Fn(&AppHandle),
+{
     let mut line = String::new();
     if BufReader::new(stream).read_line(&mut line).is_err() {
         return;
@@ -82,14 +110,7 @@ fn handle_connection(
                 let _ = app.run_on_main_thread(move || focus(&window));
             }
         }
-        Some("QUIT") => match app.get_webview_window("main") {
-            Some(window) => {
-                let _ = app.run_on_main_thread(move || {
-                    let _ = window.close();
-                });
-            }
-            None => app.exit(0),
-        },
+        Some("QUIT") => quit(app),
         _ => {}
     }
 }

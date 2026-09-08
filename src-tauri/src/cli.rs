@@ -502,16 +502,38 @@ mod desktop {
 
         print_serve_banner(http, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
 
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Without this the host answers no control connection at all, so `ScreenExtend stop`
+        // either reports "no running instance" or dials a stale port left by an earlier GUI
+        // run — while `serve`'s own "already running" message tells you to use it.
+        let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
+        let quit_tx = std::sync::Mutex::new(tx.clone());
+        if let Err(e) = single_instance::start_control_server(
+            app.clone(),
+            ctrl_path.clone(),
+            |_| {},
+            move |_app: &tauri::AppHandle| {
+                if let Ok(tx) = quit_tx.lock() {
+                    let _ = tx.send(());
+                }
+            },
+        ) {
+            eprintln!(
+                "warning: control server unavailable, `ScreenExtend stop` will not work: {e}"
+            );
+        }
+
         println!("\nHost is running. Press Ctrl+C to stop.");
         let _ = std::io::stdout().flush();
 
-        let (tx, rx) = std::sync::mpsc::channel();
         let _ = ctrlc::set_handler(move || {
             let _ = tx.send(());
         });
         let _ = rx.recv();
 
         println!("\nStopping…");
+        single_instance::clear_control_file(&ctrl_path);
         crate::streamer::session::broadcast_bye(
             &state.sessions,
             crate::streamer::session::ByeReason::HostExit,
@@ -1526,11 +1548,19 @@ mod desktop {
             exit(1);
         };
         let ctrl_path = dir.join(single_instance::CTRL_FILE);
+        // The lock is the authority on whether anything is running. Without this check a
+        // control file left behind by a crashed run would have us dial whatever now owns that
+        // recycled port and report success.
+        if !host_running(app) {
+            single_instance::clear_control_file(&ctrl_path);
+            eprintln!("No running ScreenExtend instance found.");
+            exit(1);
+        }
         if single_instance::signal_running_instance(&ctrl_path, single_instance::Command::Quit) {
             println!("Asked the running instance to quit.");
             exit(0);
         }
-        eprintln!("No running ScreenExtend instance found.");
+        eprintln!("A ScreenExtend host is running but is not answering on its control port.");
         exit(1);
     }
 
