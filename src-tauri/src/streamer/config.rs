@@ -109,6 +109,10 @@ pub struct Config {
     /// as soon as the packet threshold is met, which is a liveness check, not a
     /// measurement; a baseline run wants 30 or more.
     pub selftest_secs: u64,
+    /// Force the DXGI Desktop Duplication capture path instead of letting WGC try first.
+    /// DXGI is otherwise only ever reached as a fallback, which means it can only be
+    /// measured by first breaking WGC.
+    pub force_dxgi: bool,
     pub scale: ScalePercent,
     pub stun_urls: Vec<String>,
     pub turn_url: Option<String>,
@@ -168,6 +172,7 @@ impl Default for Config {
             workload: crate::streamer::synthetic::Workload::default(),
             counter: false,
             selftest_secs: 0,
+            force_dxgi: false,
             scale: ScalePercent::default(),
             stun_urls: vec![DEFAULT_STUN_URL.to_string()],
             turn_url: None,
@@ -422,6 +427,16 @@ impl Config {
                     c.counter = true;
                     i += 1;
                 }
+                "--capture" => {
+                    match val(&args, i).as_deref() {
+                        Some("dxgi") => c.force_dxgi = true,
+                        Some("wgc") | Some("auto") => c.force_dxgi = false,
+                        other => teprintln!(
+                            "--capture takes wgc | dxgi | auto (got {other:?}); leaving it auto"
+                        ),
+                    }
+                    i += 2;
+                }
                 "--duration" => {
                     if let Some(v) = val(&args, i).and_then(|s| s.parse().ok()) {
                         c.selftest_secs = v;
@@ -465,6 +480,8 @@ CAPTURE / ENCODE\n\
                           software = CPU-only libx264 fallback, needs libx264.dll)\n\
   --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
                           paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
+  --capture <c>           capture backend: wgc (default) | dxgi | auto. Windows only;\n\
+                          dxgi is otherwise only reached by WGC failing first\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
   --workload <w>          scripted synthetic workload, implies --synthetic-pattern:\n\
                           mixed (default) | static | scroll | motion | drag\n\

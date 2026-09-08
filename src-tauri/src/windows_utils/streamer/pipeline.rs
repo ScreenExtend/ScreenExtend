@@ -219,6 +219,22 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
     super::capture::check_dwm_composition()?;
 
     let (monitor, info) = select_monitor(cfg.monitor)?;
+    if cfg.force_dxgi {
+        let device_name = monitor
+            .device_name()
+            .map_err(|e| anyhow!("monitor device name for forced DXGI capture: {e}"))?;
+        let (pipeline, control) = start_dxgi_capture(
+            cfg,
+            &device_name,
+            &info,
+            tx,
+            idr_request,
+            target_bitrate,
+            telemetry,
+        )?;
+        drop(control);
+        return Ok(pipeline);
+    }
     match start_live_capture(
         cfg,
         monitor,
@@ -313,6 +329,22 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     super::capture::check_dwm_composition()?;
 
     let (monitor, info) = select_monitor_by_device_name(device_name)?;
+
+    if cfg.force_dxgi {
+        let (pipeline, control) = start_dxgi_capture(
+            cfg,
+            device_name,
+            &info,
+            tx,
+            idr_request,
+            target_bitrate,
+            telemetry,
+        )?;
+        return Ok(SessionCapture {
+            pipeline,
+            control: Some(SessionControl::Dxgi(control)),
+        });
+    }
 
     match start_live_capture(
         cfg,
