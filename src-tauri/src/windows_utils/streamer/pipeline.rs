@@ -15,8 +15,9 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
@@ -894,6 +895,26 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
     let setup = (|| -> Result<(Duplicator, Arc<Mutex<EncodeCore>>, &'static str)> {
         let dup = Duplicator::new(&device_name, native_w, native_h)?;
+
+        // Duplication is adapter-local, so the scaler has to live on whichever adapter composes
+        // this display — including an indirect-display adapter, which is not guaranteed to expose
+        // a video processor. Ask before configuring the encoder for a size only the scaler can
+        // produce: this used to fail the whole session with "building GPU downscaler for --scale"
+        // after WGC had already been tried, so a host with no video device and a video-scale
+        // below 100% could not stream at all. Encoding at native and letting the client scale is
+        // a worse picture, not a dead session.
+        let mut config = config;
+        let wants_downscale = config.width != native_w || config.height != native_h;
+        if wants_downscale && !video_processor_available(dup.device(), dup.context()) {
+            teprintln!(
+                "dxgi: the adapter composing {device_name} exposes no D3D11 video processor, so                  the requested {}x{} downscale cannot be done on the GPU; encoding at the native                  {native_w}x{native_h} and leaving the scale to the client",
+                config.width,
+                config.height
+            );
+            config.width = native_w & !1;
+            config.height = native_h & !1;
+        }
+
         let backend = build_backend(
             config,
             vendor,
@@ -2058,6 +2079,15 @@ fn apply_pending_bitrate_atomic(
             restore_pending_bitrate(target_bitrate, pending);
         }
     }
+}
+
+/// Whether this device can run a `VideoProcessorBlt` at all.
+///
+/// `Scaler::new` casts the device to `ID3D11VideoDevice` and the context to `ID3D11VideoContext`;
+/// both casts fail on a device created without `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` or on an
+/// adapter with no video engine. Asking first turns a failed session into a degraded one.
+fn video_processor_available(device: &ID3D11Device, context: &ID3D11DeviceContext) -> bool {
+    device.cast::<ID3D11VideoDevice>().is_ok() && context.cast::<ID3D11VideoContext>().is_ok()
 }
 
 /// The scaler's destination format for a given backend.
