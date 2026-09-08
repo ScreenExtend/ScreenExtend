@@ -1147,6 +1147,10 @@ pub async fn activate_whep(
             let _pc = pc_keepalive;
             let telemetry = Arc::clone(&pipeline.telemetry);
             let mut packetizer = H264Packetizer::new();
+            // A per-session access-unit ordinal, so transport-wide feedback can say which *frame*
+            // the client received whole rather than only which packets it did. See
+            // `SharedFeedback::acked_frame_capture_ns`.
+            let mut frame_ordinal: u32 = 0;
             // Reused across frames: the payload list is the one per-frame allocation the writer
             // still owns, and it only ever has to grow to the largest access unit of the session.
             let mut payloads: Vec<Bytes> = Vec::with_capacity(64);
@@ -1181,8 +1185,9 @@ pub async fn activate_whep(
                 match rx.recv().await {
                     Ok(frame) => {
                         let mut timing = frame.timing;
-                        let rtp_ts =
-                            audio::host_ns_to_rtp90k(audio::host_instant_to_ns(frame.capture));
+                        let capture_ns = audio::host_instant_to_ns(frame.capture);
+                        let rtp_ts = audio::host_ns_to_rtp90k(capture_ns);
+                        frame_ordinal = frame_ordinal.wrapping_add(1);
                         packetizer.packetize(mtu, &frame.data, &mut payloads);
                         if payloads.is_empty() {
                             // Nothing packetizable in this access unit at all — an encoder that
@@ -1234,7 +1239,9 @@ pub async fn activate_whep(
                                 let now = Instant::now();
                                 let transport_seq = {
                                     let mut guard = feedback.history.lock_recover();
-                                    guard.as_mut().map(|h| h.record(wire_len as u32, now))
+                                    guard.as_mut().map(|h| {
+                                        h.record(wire_len as u32, now, frame_ordinal, capture_ns)
+                                    })
                                 };
                                 if let Some(seq) = transport_seq {
                                     extensions[1] =
