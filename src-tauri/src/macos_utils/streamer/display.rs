@@ -81,3 +81,51 @@ pub fn dimensions_by_name(device_name: &str) -> Option<(u32, u32)> {
     let (w, h, _) = display_geometry(display);
     Some((w, h))
 }
+
+/// Keep a display changing for the duration of a capture measurement.
+///
+/// Every capture number in this territory is meaningless on a still screen: the delivery
+/// handlers drop frames whose dirty-rect list is empty, and WindowServer stops compositing a
+/// display that has gone to sleep (run `caffeinate -u -t 900 &` first, or these tests measure
+/// an asleep panel and report one frame). `CGDisplayMoveCursorToPoint` needs no Accessibility
+/// grant, unlike `CGEventPost`, and the cursor is composited into the frame because both
+/// backends ask for it — so moving it is the cheapest animation available over SSH.
+#[cfg(test)]
+pub struct CursorAnimation {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl CursorAnimation {
+    pub fn start(display: DisplayId, w: u32, h: u32) -> Self {
+        use objc2_core_foundation::CGPoint;
+        use objc2_core_graphics::CGDisplayMoveCursorToPoint;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let x = f64::from(i.wrapping_mul(7) % w.max(2));
+                let y = f64::from(i.wrapping_mul(11) % h.max(2));
+                let _ = unsafe { CGDisplayMoveCursorToPoint(display, CGPoint { x, y }) };
+                i = i.wrapping_add(1);
+                std::thread::sleep(std::time::Duration::from_micros(2000));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CursorAnimation {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}

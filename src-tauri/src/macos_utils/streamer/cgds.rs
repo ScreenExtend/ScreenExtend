@@ -17,10 +17,13 @@ use objc2_core_graphics::{
     kCGDisplayStreamMinimumFrameTime, kCGDisplayStreamPreserveAspectRatio,
     kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor, kCGDisplayStreamYCbCrMatrix,
     kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream, CGDisplayStreamFrameStatus,
-    CGDisplayStreamUpdate, CGDisplayStreamUpdateRectType, CGError,
+    CGDisplayStreamUpdate, CGDisplayStreamUpdateGetDropCount, CGDisplayStreamUpdateRectType,
+    CGError,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferCreateWithIOSurface};
 use objc2_io_surface::IOSurfaceRef;
+
+use crate::streamer::telemetry::SharedTelemetry;
 
 use super::frame::{Backing, Frame, FrameSink};
 use super::gpu::Gpu;
@@ -36,6 +39,8 @@ pub struct CgDisplayStreamBackend {
     cfg: CaptureConfig,
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
+    drops: Arc<AtomicU64>,
+    telemetry: SharedTelemetry,
     stream: Option<CFRetained<CGDisplayStream>>,
     _queue: Option<DispatchRetained<DispatchQueue>>,
     _handler: Option<FrameHandler>,
@@ -49,12 +54,15 @@ impl CgDisplayStreamBackend {
         _gpu: Arc<Gpu>,
         sink: Arc<FrameSink>,
         cfg: CaptureConfig,
+        telemetry: SharedTelemetry,
     ) -> Result<Self, CaptureError> {
         Ok(Self {
             display_id,
             cfg,
             sink,
             frames: Arc::new(AtomicU64::new(0)),
+            drops: Arc::new(AtomicU64::new(0)),
+            telemetry,
             stream: None,
             _queue: None,
             _handler: None,
@@ -63,6 +71,14 @@ impl CgDisplayStreamBackend {
 
     pub fn frames_captured(&self) -> u64 {
         self.frames.load(Ordering::Relaxed)
+    }
+
+    /// Frames WindowServer produced and threw away because we were not keeping up, summed over
+    /// the session. Apple documents `CGDisplayStreamUpdateGetDropCount` as *"primarily useful
+    /// for performance measurement to determine if the client is keeping up with all
+    /// WindowServer updates"* — it is the only capture-side back-pressure signal this API has.
+    pub fn frames_dropped(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
     }
 }
 
@@ -99,17 +115,37 @@ fn make_cg_properties(fps: f64) -> CFRetained<CFDictionary> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_frame(
-    sink: &FrameSink,
-    frames: &AtomicU64,
+struct HandlerCtx {
+    sink: Arc<FrameSink>,
+    frames: Arc<AtomicU64>,
+    drops: Arc<AtomicU64>,
+    telemetry: SharedTelemetry,
     width: usize,
     height: usize,
+}
+
+fn handle_frame(
+    ctx: &HandlerCtx,
     status: CGDisplayStreamFrameStatus,
     surface: *mut IOSurfaceRef,
     update: *const CGDisplayStreamUpdate,
     display_time: u64,
 ) {
+    let (sink, frames, width, height) = (&ctx.sink, &ctx.frames, ctx.width, ctx.height);
+
+    if let Some(update_ref) = unsafe { update.as_ref() } {
+        // WindowServer counts what it had to throw away because our surfaces were still busy.
+        // Three relaxed atomics on the delivery queue; no allocation, no logging.
+        let dropped = unsafe { CGDisplayStreamUpdateGetDropCount(Some(update_ref)) } as u64;
+        if dropped != 0 {
+            ctx.drops.fetch_add(dropped, Ordering::Relaxed);
+            ctx.telemetry
+                .degradation
+                .frames_dropped_ring
+                .fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
     if status != CGDisplayStreamFrameStatus::FrameComplete {
         return;
     }
@@ -171,15 +207,20 @@ impl CaptureBackend for CgDisplayStreamBackend {
         ));
         let queue = DispatchQueue::new_with_target("com.screenextend.cgds", None, Some(&ui_target));
 
-        let sink = self.sink.clone();
-        let frames = self.frames.clone();
-        let (w, h) = (self.cfg.width, self.cfg.height);
+        let ctx = HandlerCtx {
+            sink: self.sink.clone(),
+            frames: self.frames.clone(),
+            drops: self.drops.clone(),
+            telemetry: Arc::clone(&self.telemetry),
+            width: self.cfg.width,
+            height: self.cfg.height,
+        };
         let handler: FrameHandler = RcBlock::new(
             move |status: CGDisplayStreamFrameStatus,
                   display_time: u64,
                   surface: *mut IOSurfaceRef,
                   update: *const CGDisplayStreamUpdate| {
-                handle_frame(&sink, &frames, w, h, status, surface, update, display_time);
+                handle_frame(&ctx, status, surface, update, display_time);
             },
         );
 
@@ -218,6 +259,11 @@ impl CaptureBackend for CgDisplayStreamBackend {
     fn stop(&mut self) {
         if let Some(stream) = &self.stream {
             let _ = unsafe { CGDisplayStream::stop(Some(stream)) };
+            tprintln!(
+                "[cgds] capture stopped: {} frames published, {} dropped by WindowServer",
+                self.frames_captured(),
+                self.frames_dropped()
+            );
         }
         self.stream = None;
         self._queue = None;
@@ -281,7 +327,95 @@ mod tests {
     use crate::macos_utils::streamer::frame::frame_channel;
     use crate::macos_utils::streamer::mach::mach_age_ms;
     use crate::macos_utils::streamer::{CaptureConfig, PIXEL_FORMAT_420F};
+    use crate::streamer::telemetry::SessionTelemetry;
     use std::time::{Duration, Instant};
+
+    fn test_telemetry() -> SharedTelemetry {
+        SessionTelemetry::new_shared()
+    }
+
+    /// The W5 measurement instrument: delivered frame rate, WindowServer drop count, and the
+    /// `displayTime → our callback` delivery latency, on the main display with animated content.
+    /// Every capture-side change in `docs/OPTIMIZATIONS.md` is A/B'd with this.
+    ///
+    /// The main display, not a virtual one: a freshly created `CGVirtualDisplay` has no windows
+    /// and the cursor cannot be warped onto it, so it produces literally zero dirty rects and
+    /// measures nothing (that emptiness is its own finding — see `probe_virtual_display`).
+    #[test]
+    #[ignore]
+    fn capture_rate() {
+        const SECONDS: u64 = 5;
+
+        let id = display::select_display(0).expect("a main display");
+        let (gw, gh, refresh) = display::display_geometry(id);
+        println!("display {id}: {gw}x{gh} @ {refresh}fps");
+
+        let _cursor = display::CursorAnimation::start(id, gw, gh);
+
+        let gpu = Gpu::new().unwrap();
+        let (sink, source) = frame_channel();
+        let cfg = CaptureConfig {
+            width: gw as usize,
+            height: gh as usize,
+            fps: if refresh == 0 { 60 } else { refresh } as i32,
+            pixel_format: PIXEL_FORMAT_420F,
+        };
+        let mut backend =
+            CgDisplayStreamBackend::new(id, gpu, sink, cfg, test_telemetry()).expect("backend");
+        backend.start().expect("capture starts");
+
+        // Drain like the encode loop does, so the surface-holding pattern under test is the
+        // production one: take the latest frame, hold it until the next arrives.
+        let mut delivery_ms: Vec<f64> = Vec::new();
+        let mut taken = 0usize;
+        let mut no_os_stamp = 0usize;
+        let mut held: Option<Arc<crate::macos_utils::streamer::frame::Frame>> = None;
+        let deadline = Instant::now() + Duration::from_secs(SECONDS);
+        while Instant::now() < deadline {
+            source.wait(Duration::from_millis(4));
+            if let Some(frame) = source.try_take_latest() {
+                taken += 1;
+                let arrived = super::super::clock::mach_ticks_to_host_ns(frame.arrived_mach);
+                if frame.os_time_ns == 0 {
+                    no_os_stamp += 1;
+                } else {
+                    // Signed: CGDisplayStream's `displayTime` is *"when the frame was to be
+                    // displayed by the WindowServer"*, which can be ahead of our callback.
+                    delivery_ms.push((arrived as i64 - frame.os_time_ns as i64) as f64 / 1e6);
+                }
+                held = Some(frame);
+            }
+        }
+        if no_os_stamp > 0 {
+            println!("frames with no displayTime: {no_os_stamp}/{taken}");
+        }
+        drop(held);
+        let delivered = backend.frames_captured();
+        let dropped = backend.frames_dropped();
+        backend.stop();
+
+        println!(
+            "delivered={delivered} ({:.1} fps) taken={taken} windowserver_drops={dropped}",
+            delivered as f64 / SECONDS as f64
+        );
+        if delivery_ms.is_empty() {
+            println!("displayTime→callback: no OS timestamps");
+        } else {
+            delivery_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p = |q: f64| {
+                delivery_ms[((delivery_ms.len() as f64 * q) as usize).min(delivery_ms.len() - 1)]
+            };
+            println!(
+                "displayTime→callback ms: p50={:.2} p90={:.2} p99={:.2} max={:.2} (n={})",
+                p(0.5),
+                p(0.9),
+                p(0.99),
+                delivery_ms.last().unwrap(),
+                delivery_ms.len()
+            );
+        }
+        assert!(delivered > 0, "no frames delivered");
+    }
 
     #[test]
     #[ignore]
@@ -298,7 +432,8 @@ mod tests {
                 fps: 60,
                 pixel_format: PIXEL_FORMAT_420F,
             };
-            let mut backend = CgDisplayStreamBackend::new(id, gpu, sink, cfg).expect("backend");
+            let mut backend =
+                CgDisplayStreamBackend::new(id, gpu, sink, cfg, test_telemetry()).expect("backend");
             match backend.start() {
                 Ok(()) => {
                     std::thread::sleep(Duration::from_millis(400));
@@ -380,7 +515,8 @@ mod tests {
             fps: fps as i32,
             pixel_format: PIXEL_FORMAT_420F,
         };
-        let mut backend = CgDisplayStreamBackend::new(display_id, gpu, sink, cfg).expect("backend");
+        let mut backend = CgDisplayStreamBackend::new(display_id, gpu, sink, cfg, test_telemetry())
+            .expect("backend");
         if let Err(e) = backend.start() {
             eprintln!(
                 "capture did NOT start: {e:?}. On macOS 10.15 a null stream almost \

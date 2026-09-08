@@ -16,12 +16,15 @@ use objc2_core_media::{
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
-    kVTCompressionPropertyKey_MaxFrameDelayCount, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
-    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
-    kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
-    kVTProfileLevel_H264_Main_AutoLevel,
+    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_EncoderID,
+    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxFrameDelayCount,
+    kVTCompressionPropertyKey_MaxKeyFrameInterval,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+    kVTCompressionPropertyKey_NumberOfPendingFrames, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_UsingGPURegistryID,
+    kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+    kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_Baseline_AutoLevel,
+    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel,
     kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
     VTEncodeInfoFlags, VTSession, VTSessionSetProperty,
@@ -63,6 +66,7 @@ pub struct Encoder {
     frame_index: i64,
     low_latency: bool,
     qp_mode: bool,
+    identity: EncoderIdentity,
 }
 
 unsafe impl Send for Encoder {}
@@ -125,6 +129,7 @@ impl Encoder {
             frame_index: 0,
             low_latency,
             qp_mode: cfg.qp.is_some(),
+            identity: EncoderIdentity::default(),
         };
         enc.configure(&cfg)?;
         unsafe { enc.session.prepare_to_encode_frames() };
@@ -238,7 +243,7 @@ impl Encoder {
         }
 
         self.configure_rate_control(cfg);
-        self.log_hw_acceleration();
+        self.read_identity();
         Ok(())
     }
 
@@ -358,20 +363,88 @@ impl Encoder {
         self.low_latency
     }
 
-    fn log_hw_acceleration(&self) {
-        let Some(key) =
-            vt_optional_cfstring("kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder")
-        else {
-            return;
+    /// Ask the session what it actually became.
+    ///
+    /// VideoToolbox picks the encoder implementation for us and the choice is worth more than
+    /// any property: forum 748918 measured one-in/one-out on `…h264.gva` against a 4-to-16-frame
+    /// hold on `…h264.ave.avc` under an identical configuration. `EncoderID` (10.13) names it,
+    /// `UsingHardwareAcceleratedVideoEncoder` (10.9) says whether it is hardware at all, and
+    /// `UsingGPURegistryID` (10.15) says which GPU it landed on — NULL there means *either* an
+    /// integrated-GPU encoder or software, so it can never stand in for the hardware flag.
+    fn read_identity(&mut self) {
+        let s = self.vt_session();
+        self.identity = EncoderIdentity {
+            encoder_id: copy_string(s, unsafe { kVTCompressionPropertyKey_EncoderID }),
+            hardware: copy_bool(s, unsafe {
+                kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder
+            }),
+            gpu_registry_id: copy_i64(s, unsafe { kVTCompressionPropertyKey_UsingGPURegistryID }),
         };
-        let mut value: *const CFType = ptr::null();
-        let st = unsafe { VTSessionCopyProperty(self.vt_session(), key, ptr::null(), &mut value) };
-        if st == 0 && !value.is_null() {
-            let using_hw = unsafe { CFBooleanGetValue(value as *const c_void) } != 0;
-            tprintln!("[vt] UsingHardwareAcceleratedVideoEncoder = {using_hw}");
-            unsafe { CFRelease(value as *const c_void) };
+        tprintln!(
+            "[vt] encoder identity: id={} hardware={} gpu_registry_id={}",
+            self.identity.encoder_id.as_deref().unwrap_or("unknown"),
+            match self.identity.hardware {
+                Some(v) => v.to_string(),
+                None => "unknown".to_string(),
+            },
+            match self.identity.gpu_registry_id {
+                Some(v) => v.to_string(),
+                None => "none (integrated or software)".to_string(),
+            }
+        );
+    }
+
+    pub fn identity(&self) -> &EncoderIdentity {
+        &self.identity
+    }
+
+    /// The tier string reported to `CompatibilityReport` and the telemetry summary.
+    pub fn backend_name(&self) -> &'static str {
+        match self.identity.hardware {
+            Some(true) => "videotoolbox-hardware",
+            Some(false) => "videotoolbox-software",
+            None => "videotoolbox",
         }
     }
+
+    /// Live count of frames VideoToolbox is holding. Read-only since 10.8, never read before.
+    pub fn pending_frames(&self) -> Option<i64> {
+        copy_i64(self.vt_session(), unsafe {
+            kVTCompressionPropertyKey_NumberOfPendingFrames
+        })
+    }
+}
+
+/// What VideoToolbox turned our request into.
+#[derive(Clone, Debug, Default)]
+pub struct EncoderIdentity {
+    pub encoder_id: Option<String>,
+    pub hardware: Option<bool>,
+    pub gpu_registry_id: Option<i64>,
+}
+
+fn copy_property(session: &VTSession, key: &CFString) -> Option<CFRetained<CFType>> {
+    let mut value: *const CFType = ptr::null();
+    let st = unsafe { VTSessionCopyProperty(session, key, ptr::null(), &mut value) };
+    if st != 0 {
+        return None;
+    }
+    NonNull::new(value as *mut CFType).map(|p| unsafe { CFRetained::from_raw(p) })
+}
+
+fn copy_bool(session: &VTSession, key: &CFString) -> Option<bool> {
+    let v = copy_property(session, key)?;
+    v.downcast_ref::<CFBoolean>().map(|b| b.as_bool())
+}
+
+fn copy_string(session: &VTSession, key: &CFString) -> Option<String> {
+    let v = copy_property(session, key)?;
+    v.downcast_ref::<CFString>().map(|s| s.to_string())
+}
+
+fn copy_i64(session: &VTSession, key: &CFString) -> Option<i64> {
+    let v = copy_property(session, key)?;
+    v.downcast_ref::<CFNumber>().and_then(|n| n.as_i64())
 }
 
 impl Drop for Encoder {
@@ -554,8 +627,6 @@ unsafe extern "C" {
         allocator: *const c_void,
         property_value_out: *mut *const CFType,
     ) -> i32;
-    fn CFBooleanGetValue(boolean: *const c_void) -> u8;
-    fn CFRelease(cf: *const c_void);
 }
 
 fn vt_optional_cfstring(symbol: &str) -> Option<&'static CFString> {
@@ -638,25 +709,36 @@ fn data_rate_limits(max_bytes: i64, window_secs: f64) -> CFRetained<CFArray> {
     }
 }
 
-fn set_cftype(session: &VTSession, key: &CFString, value: &CFType) {
+/// Set a property, naming the key when it is refused.
+///
+/// `OSStatus -12900` on an anonymous key is un-diagnosable; the same status next to
+/// `PrioritizeEncodingSpeedOverQuality` says exactly which encoder does not honour what.
+fn set_cftype(session: &VTSession, key: &CFString, value: &CFType) -> bool {
     let st = unsafe { VTSessionSetProperty(session, key, Some(value)) };
     if st != 0 {
-        teprintln!("[vt] VTSessionSetProperty failed: OSStatus {st}");
+        teprintln!("[vt] rejected {key}: OSStatus {st}");
+        return false;
     }
+    true
 }
 
-fn set_bool(session: &VTSession, key: &CFString, value: bool) {
-    set_cftype(session, key, cfbool(value));
+fn set_bool(session: &VTSession, key: &CFString, value: bool) -> bool {
+    set_cftype(session, key, cfbool(value))
 }
 
-fn set_i32(session: &VTSession, key: &CFString, value: i32) {
+fn set_i32(session: &VTSession, key: &CFString, value: i32) -> bool {
     let n = CFNumber::new_i32(value);
-    set_cftype(session, key, &n);
+    set_cftype(session, key, &n)
 }
 
-fn set_f64(session: &VTSession, key: &CFString, value: f64) {
+fn set_f64(session: &VTSession, key: &CFString, value: f64) -> bool {
     let n = CFNumber::new_f64(value);
-    set_cftype(session, key, &n);
+    set_cftype(session, key, &n)
+}
+
+fn set_i64(session: &VTSession, key: &CFString, value: i64) -> bool {
+    let n = CFNumber::new_i64(value);
+    set_cftype(session, key, &n)
 }
 
 #[cfg(test)]
