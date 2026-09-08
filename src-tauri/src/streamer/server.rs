@@ -1040,6 +1040,11 @@ async fn start_session(
         Err(e) => return Err(e.context("starting capture for virtual display")),
     };
 
+    // Publish this session's counters under the client IP so `status --json` and the verbose
+    // summary can find them without going through the session map, which is not reachable from
+    // the process that runs `status`.
+    crate::streamer::telemetry::publish(client_ip, Arc::clone(&session.pipeline.telemetry));
+
     if let Some((left, top, width, height)) = pipeline::monitor_rect(&device_name) {
         tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
     }
@@ -1134,6 +1139,7 @@ async fn start_session(
         if let Some(s) = sessions.as_ref() {
             session::clear_control_sender(s, &report_ip, &control_tx);
         }
+        crate::streamer::telemetry::unregister(&report_ip);
 
         let stop = sessions
             .as_ref()

@@ -8,6 +8,7 @@ pub mod pipeline;
 pub mod platform;
 pub mod server;
 pub mod session;
+pub mod telemetry;
 pub mod test;
 pub mod tls;
 pub mod webrtc_session;

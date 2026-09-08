@@ -502,6 +502,13 @@ mod desktop {
 
         print_serve_banner(http, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
 
+        // Only in verbose mode: the summary is one logbus line per active session every 5 s, and
+        // every logbus line is a JSON IPC event, so it stays off unless somebody is watching.
+        let telemetry_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if arg_flag(m, "verbose") {
+            crate::streamer::telemetry::spawn_summary_printer(Arc::clone(&telemetry_stop));
+        }
+
         let (tx, rx) = std::sync::mpsc::channel();
 
         // Without this the host answers no control connection at all, so `ScreenExtend stop`
@@ -533,6 +540,7 @@ mod desktop {
         let _ = rx.recv();
 
         println!("\nStopping…");
+        telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         single_instance::clear_control_file(&ctrl_path);
         crate::streamer::session::broadcast_bye(
             &state.sessions,
@@ -628,9 +636,90 @@ mod desktop {
 
     // status
 
+    /// Live per-session telemetry, asked of the running host over the single-instance control
+    /// socket. `status` is a separate process, so this is the only path to counters that exist
+    /// only in the host's memory. `None` when no host is up or it is too old to answer.
+    fn live_telemetry(app: &tauri::AppHandle) -> Option<Value> {
+        let dir = app.path().app_local_data_dir().ok()?;
+        let reply = single_instance::query_running_instance(
+            &dir.join(single_instance::CTRL_FILE),
+            single_instance::Command::Stats,
+        )?;
+        serde_json::from_str::<Value>(reply.trim()).ok()
+    }
+
+    fn print_telemetry(telemetry: &Value) {
+        let Some(sessions) = telemetry.get("sessions").and_then(|v| v.as_object()) else {
+            return;
+        };
+        println!("\nStreaming sessions:");
+        if sessions.is_empty() {
+            println!("  (none connected)");
+            return;
+        }
+        for (ip, s) in sessions {
+            println!(
+                "  {ip}: capture={} encoder={} frames={}",
+                s.get("capture_backend")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
+                s.get("encoder").and_then(|v| v.as_str()).unwrap_or("?"),
+                s.get("frames_encoded")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            );
+            if let Some(stages) = s.get("stages").and_then(|v| v.as_object()) {
+                for (name, h) in stages {
+                    let get = |k: &str| h.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    println!(
+                        "      {name:<20} p50 {:>7.2}  p90 {:>7.2}  p99 {:>7.2}  max {:>8.2} ms  (n={})",
+                        get("p50_ms"),
+                        get("p90_ms"),
+                        get("p99_ms"),
+                        get("max_ms"),
+                        h.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    );
+                }
+            }
+            if let Some(d) = s.get("degradation").and_then(|v| v.as_object()) {
+                let hits: Vec<String> = d
+                    .iter()
+                    .filter(|(_, v)| v.as_u64().unwrap_or(0) != 0)
+                    .map(|(k, v)| format!("{k}={}", v.as_u64().unwrap_or(0)))
+                    .collect();
+                println!(
+                    "      degradation: {}",
+                    if hits.is_empty() {
+                        "none".to_string()
+                    } else {
+                        hits.join(" ")
+                    }
+                );
+            }
+            match s.get("client") {
+                Some(c) if !c.is_null() => println!(
+                    "      client: video={} audio={} sab={} isolated={} clock={}",
+                    c.get("video_path").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("audio_path").and_then(|v| v.as_str()).unwrap_or("?"),
+                    c.get("sab_available")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    c.get("cross_origin_isolated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    c.get("clock_offset_valid")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                ),
+                _ => println!("      client: has not reported stats"),
+            }
+        }
+    }
+
     fn run_status(app: &tauri::AppHandle, m: &Matches) -> ! {
         let store = open_store(app);
         let running = host_running(app);
+        let telemetry = if running { live_telemetry(app) } else { None };
         let session_id = arg_str(m, "session-id");
         let http = cfg_u64(&store, "serverPorts.http").unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
         let adapters = platform::networking::cli_adapters();
@@ -656,6 +745,7 @@ mod desktop {
                 "turnConfigured": !cfg_str(&store, "turnConfig.urls").unwrap_or_default().is_empty(),
                 "hostedNetworkName": cfg_str(&store, "hostedNetworkCredentials.name"),
                 "networks": networks,
+                "telemetry": telemetry,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             exit(0);
@@ -707,6 +797,9 @@ mod desktop {
                 (Some(ip), None) => println!("  {}: {ip}", adapter.network_name),
                 (None, _) => println!("  {}: (no IPv4)", adapter.network_name),
             }
+        }
+        if let Some(t) = telemetry.as_ref() {
+            print_telemetry(t);
         }
         if session_id.is_none() {
             println!(
