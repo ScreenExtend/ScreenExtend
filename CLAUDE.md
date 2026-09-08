@@ -62,8 +62,10 @@ Rust code lives in `src-tauri/`; run `cargo` commands from there (`cargo check`,
 
 Linting: ESLint 9 flat config in `eslint.config.js`, scoped to `src/` (`src-tauri/`,
 `src/lib/bindings.ts` and `src/lib/next-navigation-stub.ts` are ignored) with `react-hooks`
-(rules-of-hooks as an error), `react-refresh` and `typescript-eslint`. It passes with 0 errors
-and ~10 non-blocking warnings. TypeScript strictness is additionally enforced by `tsc` in
+(rules-of-hooks as an error), `react-refresh` and `typescript-eslint`, plus a Node-globals
+block for `scripts/**/*.mjs`. Type-aware linting is on (`parserOptions.project`), which is what
+`@typescript-eslint/no-floating-promises` needs. It passes with 0 errors and ~27 non-blocking
+warnings. TypeScript strictness is additionally enforced by `tsc` in
 `pnpm build`.
 
 Tests are inline `#[cfg(test)]` modules, several of them collected in per-module `test/`
