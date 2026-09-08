@@ -1,7 +1,8 @@
 # Vendored binaries — provenance
 
 These are committed third-party binaries. Checksums are pinned in `SHA256SUMS`
-(verified in CI). **When updating any blob, update both its SHA-256 here and in
+and verified by the `blob-checksums` job in `.github/workflows/ci.yml`.
+**When updating any blob, update both its SHA-256 here and in
 `SHA256SUMS`.** Values below were recorded during the hardening audit; the
 upstream version/tag marked "confirm" should be verified against the upstream
 release the next time these are refreshed.
