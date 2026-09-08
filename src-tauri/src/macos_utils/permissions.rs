@@ -614,7 +614,10 @@ fn shell_out(cmd: &str, args: &[&str]) -> String {
 }
 
 pub fn identity_report() -> IdentityReport {
+    // `current_exe` can hand back the path as invoked, `./` and all. Resolving it
+    // is what makes the `/AppTranslocation/` test and the codesign read meaningful.
     let exe = std::env::current_exe().unwrap_or_default();
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let bundle = bundle_path_of(&exe);
     let signed_path = bundle.clone().unwrap_or_else(|| exe.clone());
     let signed = signed_path.to_string_lossy().to_string();
