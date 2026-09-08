@@ -380,7 +380,14 @@
                 startReconfigPoll();
                 // Keep refining in the background; it is applied by the next reconfigure
                 // rather than by forcing one.
-                refreshRatePromise.then((r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
+                // A *second* measurement, not the promise the join already consumed — that
+                // one has resolved and re-reading it can only ever hand back the number
+                // already in joinData, which made the refinement structurally inert.
+                // Sixty samples this time, and only now that the page is foregrounded and
+                // painting, so it is a better measurement than the one the join could
+                // wait for rather than the same one again.
+                getRefreshRate(REFRESH_REFINE_SAMPLES).then(
+                    (r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
             }
 
             async function startReconfigPoll() {
@@ -1191,7 +1198,11 @@
                     // Ask for a keyframe first — that is what a stall usually needs, and
                     // until this page could ask, the only remedy was to throw the whole
                     // fast path away and take the jitter buffer back.
-                    if (worker) worker.postMessage({ type: 'stats' });
+                    // Nothing below reads the reply — the keyTier two lines down comes
+                    // from the once-a-second `videostats` message — so this only ever
+                    // fed a console.log, once every two seconds, for the whole of a
+                    // stall, on a page whose other diagnostics are behind ?debug.
+                    if (DEBUG && worker) worker.postMessage({ type: 'stats' });
                     let asked = false;
                     try { asked = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
                     const keyTier = (videoWorkerStats && videoWorkerStats.keyTier) || 0;
@@ -1271,7 +1282,7 @@
                     }
                     if (hostClockOffsetMs !== null && meta && typeof meta.rtpTimestamp === 'number') {
                         const hostMs = (meta.rtpTimestamp >>> 0) * 1000 / 90000;
-                        const paintMs = performance.timeOrigin +
+                        const paintMs = TIME_ORIGIN_MS +
                             (typeof meta.expectedDisplayTime === 'number' ? meta.expectedDisplayTime : performance.now());
                         const lag = paintMs - (hostMs - hostClockOffsetMs);
                         // The RTP timestamp is 32 bits and wraps every ~13 h; a sample that
@@ -2095,7 +2106,16 @@
             sessionInput.addEventListener('input', validate);
             nameInput.addEventListener('input', validate);
 
+            // performance.timeOrigin is Safari 15; input.js already computes it the long
+            // way for the clock offset and this is the other consumer. Without it every
+            // <video>-path lag sample was NaN, failed `lag >= 0`, and was discarded — so
+            // host-to-paint read 0 on precisely the old browsers that take that path.
+            const TIME_ORIGIN_MS = (typeof performance.timeOrigin === 'number' && isFinite(performance.timeOrigin))
+                ? performance.timeOrigin
+                : (Date.now() - performance.now());
+
             const REFRESH_SAMPLES = 24;
+            const REFRESH_REFINE_SAMPLES = 60;
             const refreshRatePromise = getRefreshRate(REFRESH_SAMPLES).catch(() => 0);
 
             const COMPAT_HIDE_KEY = 'se.compat.hideLimited';

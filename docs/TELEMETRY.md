@@ -254,10 +254,10 @@ nothing are correctly indistinguishable. A frame one byte short of 96 reads as t
 than half-parsed. `serve -v` names the four tiers in words and lists the set degradation bits by
 name; `status --json` carries the raw codes, the decoded names and the audio numbers.
 
-**The v3 tail is not parsed host-side.** `parse_client_stats` stops at 96, so bytes 96..104 reach
-the host and are discarded — which is the floor rule working, not a fault. Read them with
-`SEVideo.getStats()` (`audioRedundantUsed` / `audioRedundantDiscarded`) on the device until a host
-build wants them.
+Each tail is read whole or not at all, and independently: a frame one byte short of 104 reads as
+v3-tail-absent with everything before it intact, and a host built against v2 reads a v3 client's
+first 96 bytes and drops the rest. `serve -v` prints `redundant=<used>/<discarded>` only when the
+feature did something; `status --json` always carries both.
 
 ### Audio redundancy — the capability, the flag, and the two counters (v3)
 
@@ -299,8 +299,8 @@ decoder was actually probed, not sniffed) and `wantsFallbackTrack` (put a spare 
 the answer, because WHEP cannot add one later) — and the host logs the first and honours the
 second.
 
-The counters are still client-side only: `parse_client_stats` stops at 96, so the two v3 fields
-are the one part of this not visible from the host.
+Both counters reach the host: `parse_client_stats` reads bytes 96..104 into
+`ClientStats::audio_redundant_{used,discarded}`.
 
 The two counters are what the feature actually did once a host does send it. **used** (offset 96)
 is a copy that filled a hole the client would otherwise have concealed; **discarded** (offset

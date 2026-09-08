@@ -645,9 +645,13 @@
         } catch (_) { note(); }
     }
 
-    // Firefox 116+ is the only engine with a permission-free output picker. It needs
-    // transient activation, so it is exposed for a user gesture rather than called from the
-    // host's reconfigure poll.
+    // Firefox 116+ is the only engine with a permission-free output picker. It needs transient
+    // activation, so it is exposed for a user gesture rather than called from the host's
+    // reconfigure poll — and this page has no control to hang that gesture on, which is why
+    // `SINK_TIER.selectAudioOutput` is a tier nothing can currently report. Adding an
+    // affordance is a visible change to the client page and is deliberately not made here; it
+    // is written up under "W11 UI-visible recommendations" in docs/OPTIMIZATIONS.md. Kept
+    // rather than deleted because the moment a control exists this is the whole implementation.
     async function pickOutput() {
         initSpeakers();
         if (!speakers.hasSelectOut) return null;
