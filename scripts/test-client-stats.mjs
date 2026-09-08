@@ -86,6 +86,7 @@ ctx.SEVideo = {
     transportTier: 1, renderTier: 1, keyTier: 1, sinkTier: 2,
     suppressed: 9, degraded: (1 << 3) | (1 << 13),
     audioTargetMs: 18.5, audioConcealed: 4, audioOutputLatencyMs: 12.25,
+    audioRedundantUsed: 17, audioRedundantDiscarded: 265,
   }),
 };
 
@@ -105,15 +106,17 @@ const stats = sent.find((s) => s.bytes[0] === OP.STATS);
 if (!stats) { fail('no STATS frame was sent'); process.exit(); }
 const b = stats.bytes;
 const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-if (b.length !== 96) fail('STATS is ' + b.length + ' bytes, expected the 96 of v2');
-else ok('STATS is exactly the 96 bytes docs/TELEMETRY.md documents for v2');
+if (b.length !== 104) fail('STATS is ' + b.length + ' bytes, expected the 104 of v3');
+else ok('STATS is exactly the 104 bytes docs/TELEMETRY.md documents for v3');
 if (b.length < 72) fail('STATS is shorter than the 72-byte floor the Rust parser requires');
 else ok('STATS clears the 72-byte floor an older host reads');
+if (b.length < 96) fail('STATS is shorter than the 96 bytes a v2 host reads the tail from');
+else ok('STATS clears the 96-byte v2 tail a v2 host reads');
 if (stats.label !== 'reliable') fail('STATS went out on ' + stats.label + ', not reliable');
 else ok('STATS goes on the reliable channel');
 
 const eq = (name, got, want) => (got === want ? ok(name + ' = ' + got) : fail(name + ' = ' + got + ', expected ' + want));
-eq('version', dv.getUint8(1), 2);
+eq('version', dv.getUint8(1), 3);
 eq('video path', dv.getUint8(2), 1);
 eq('audio path', dv.getUint8(3), 2);
 // SAB | ISOLATED | KEYBOARD_LOCK | FULLSCREEN | DECODER_HW | CLOCK_VALID
@@ -139,6 +142,10 @@ eq('degradation flags', dv.getUint32(80, true), (1 << 3) | (1 << 13));
 eq('audio target us', dv.getUint32(84, true), 18500);
 eq('audio concealed', dv.getUint32(88, true), 4);
 eq('audio output latency us', dv.getUint32(92, true), 12250);
+// v3 tail. Bytes 0..96 are byte-identical to v2, so a v2 host reads this frame's prefix and
+// ignores the rest.
+eq('audio redundant used', dv.getUint32(96, true), 17);
+eq('audio redundant discarded', dv.getUint32(100, true), 265);
 
 // A host PONG carrying its clock: t0 = 1000 ms in ns, host at 5000 ms, reply read at 1010 ms.
 now = 1010;

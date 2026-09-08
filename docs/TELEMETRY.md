@@ -95,9 +95,9 @@ Sent on the **reliable** DataChannel once a second, alongside the `PING`. Fixed 
 endian. All durations are **microseconds**; a value of 0 means "not measured", which is what a
 path with no hook for that stage reports.
 
-Version 2 (96 bytes) appends the tier bytes and the degradation field below. Bytes 0..72 are
-byte-identical to v1, which is what lets a host built against v1 read the prefix and ignore the
-rest.
+Version 2 (96 bytes) appends the tier bytes and the degradation field below; version 3
+(104 bytes) appends the two audio-redundancy counters. Bytes 0..72 are byte-identical to v1 and
+0..96 to v2, which is what lets a host built against either read the prefix and ignore the rest.
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -133,14 +133,40 @@ rest.
 | 88 | 4 | audio packets concealed |
 | 92 | 4 | audio output latency, µs (0 = unknown) |
 | | | **96 bytes (v2)** |
+| 96 | 4 | redundant audio copies used — a copy that filled a real hole |
+| 100 | 4 | redundant audio copies discarded — the cost on a link that did not need one |
+| | | **104 bytes (v3)** |
 
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
 
-**The v2 tail is not yet parsed by the host.** `input/protocol.rs::parse_client_stats` reads the
-first 72 bytes and stops, so the tier bytes and the degradation field reach the host and are
-discarded. Surfacing them is `findings/major-telemetry-client-stats-v2-tail-is-discarded.md`.
-Until it lands, read them with `SEVideo.getStats()` on the device.
+**Neither tail is parsed by the host yet.** `input/protocol.rs::parse_client_stats` reads the
+first 72 bytes and stops, so the tier bytes, the degradation field and the redundancy counters
+reach the host and are discarded. Surfacing them is
+`findings/major-telemetry-client-stats-v2-tail-is-discarded.md`. Until it lands, read them with
+`SEVideo.getStats()` on the device.
+
+### Audio-redundancy fields (v3, offsets 96 and 100)
+
+The host can append the previous frame's Opus payload to a DataChannel audio packet
+(`FLAG_REDUNDANT`, `streamer/audio/protocol.rs`) when the video BWE reports loss at or above
+`AUDIO_REDUNDANCY_LOSS_THRESHOLD`. It is the only loss-robustness tool on this path — the
+encoder is CELT-only at 5 ms, where libopus's in-band FEC is structurally inert — and the host
+sets the flag only when the client has said it can split the body, because a client that cannot
+would decode the two payloads as one packet.
+
+**The client advertises it in the WHEP join request, not in a stats bit**: `audioCapabilities`
+carries `redundancy: true` alongside `webcodecsOpus` and `worklet`. It describes the client
+build rather than the browser — `audio-worker.js` always understands the format — and it is sent
+as `false` on any path that has no audio DataChannel. A client older than the field sends
+nothing and serde defaults it to `false`, so the host never sets a flag the client cannot read.
+
+The two counters are what the feature actually did. **used** is a copy that filled a hole the
+client would otherwise have concealed; **discarded** is a copy whose frame had already arrived,
+and it is the payload the feature cost. `used` climbing while `audio packets concealed` stays
+flat is redundancy working; `discarded` climbing with `used` at zero is payload spent for
+nothing, which points at the host's loss threshold rather than at the client. The client
+de-duplicates by sequence number, so a copy is never played twice.
 
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
@@ -249,6 +275,12 @@ above (including the v2 tail and the 72-byte floor an older host reads), the clo
 arithmetic, and the host-capability gate: a 17-byte `PONG` advertises nothing and
 `requestKeyframe()` must then refuse *and send nothing*, a 19-byte one enables it, and an
 attempt that could not go out must not burn the 200 ms limiter.
+
+`node scripts/test-client-audio.mjs` runs `audio-worker.js` under Node with stub WebCodecs
+classes and feeds it real DataChannel frames: a plain packet, a redundant one with no loss
+(the copy must be discarded, not played — playing it doubles the audio), a redundant one after
+a single loss (the copy is decoded first, at the earlier timestamp), a duplicate, a late
+packet, a discontinuity, and a truncated redundant body.
 
 `node scripts/test-client-ice.mjs` lifts `waitForIceGathering` and its two helpers out of
 `index.html` and drives them against a fake peer connection: the candidate/grace table, that a

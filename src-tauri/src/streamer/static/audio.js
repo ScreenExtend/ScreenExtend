@@ -32,7 +32,10 @@
             typeof window.AudioDecoder === 'function' &&
             typeof window.EncodedAudioChunk === 'function' &&
             typeof window.AudioData === 'function';
-        return { webcodecsOpus, worklet };
+        // A property of this build, not of the browser: audio-worker.js can split a
+        // FLAG_REDUNDANT body. The host will not set the flag unless it is told this, because
+        // a client that cannot split it would decode the two payloads as one packet.
+        return { webcodecsOpus, worklet, redundancy: true };
     }
 
     // The constructor sniff above is not enough on its own. Safari 26 and Firefox 130 have
@@ -151,6 +154,8 @@
         lastUnderruns: null,
         cleanBlocks: 0,
         concealed: 0,
+        redundantUsed: 0,
+        redundantDiscarded: 0,
         decoderFailed: false,
         prepareFailed: false,
     };
@@ -749,9 +754,18 @@
                 processorOptions: { capacityFrames: CAP_FRAMES, sab: state.sab },
             });
             state.node.port.onmessage = (e) => {
-                if (e.data && e.data.type === 'stats') {
+                if (!e.data) return;
+                if (e.data.type === 'stats') {
                     state.stats = e.data;
                     adaptSafetyMargin(e.data);
+                } else if (e.data.type === 'mode-mismatch') {
+                    // The worklet could not map the shared ring but the worker did, so the
+                    // worker must stop writing into it. Re-init it without the buffer and both
+                    // sides land on the postMessage ring.
+                    note();
+                    console.warn('[audio] ring mode mismatch; falling back to the postMessage ring');
+                    state.sab = null;
+                    if (state.worker) state.worker.postMessage({ type: 'init', sab: null, capFrames: CAP_FRAMES });
                 }
             };
             // A processor constructor that throws on the render thread does *not* reject
@@ -835,7 +849,11 @@
             if (d.type === 'sync') {
                 state.preEnqueueEmaMs = d.preEnqueueMs;
                 state.concealed = d.concealed || 0;
+                state.redundantUsed = d.redundantUsed || 0;
+                state.redundantDiscarded = d.redundantDiscarded || 0;
                 maybeUpdateTarget();
+            } else if (d.type === 'mode') {
+                if (state.node) state.node.port.postMessage({ type: 'mode', shared: !!d.shared });
             } else if (d.type === 'samples') {
                 if (state.node) state.node.port.postMessage(d, [d.l.buffer, d.r.buffer]);
             } else if (d.type === 'discontinuity') {
@@ -950,6 +968,8 @@
             overruns: st ? st.overruns : null,
             corrections: st ? st.corrections : null,
             concealed: state.concealed + ((st && st.concealed) || 0),
+            redundantUsed: state.redundantUsed,
+            redundantDiscarded: state.redundantDiscarded,
             safetyMs: state.safetyMs,
             outputLatencyMs: state.outputLatencyMs,
             outputLatencySource: state.outputLatencySource,

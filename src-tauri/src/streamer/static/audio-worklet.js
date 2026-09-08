@@ -95,6 +95,27 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
             this.concealFrames = 0;
             this.priming = true;
             this.corrections++;
+        } else if (d.type === 'mode') {
+            // The writer validated the same buffer on its own side. If it ended up in a
+            // different mode from this one, every packet goes somewhere nobody reads.
+            const writerShared = !!d.shared;
+            if (writerShared === this.shared) return;
+            if (this.shared) {
+                // It could not map the ring, so nothing will advance the write position we
+                // read. Fall back to the private ring it will postMessage into.
+                this.shared = false;
+                this.ctrl = null;
+                this.ringL = new Float32Array(this.capFrames);
+                this.ringR = new Float32Array(this.capFrames);
+                this.readPos = 0;
+                this.writePos = 0;
+                this.concealFrames = 0;
+                this.starvedBlocks = 0;
+                this.priming = true;
+            } else {
+                // We could not map it and the writer did. Only the page can undo that.
+                this.port.postMessage({ type: 'mode-mismatch' });
+            }
         } else if (d.type === 'reset') {
             this.readPos = this.shared ? (Atomics.load(this.ctrl, W) >>> 0) : this.writePos;
             if (this.shared) Atomics.store(this.ctrl, R, this.readPos | 0);

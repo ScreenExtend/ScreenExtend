@@ -1258,7 +1258,8 @@
                     if (audioFastRetired || !audioFast) return;
                     audioFastRetired = true;
                     audioFast = false;
-                    audioCaps = { webcodecsOpus: false, worklet: audioCaps.worklet };
+                    // No DataChannel on the track path, so no redundancy to advertise either.
+                    audioCaps = { webcodecsOpus: false, worklet: audioCaps.worklet, redundancy: false };
                     degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
                     if (!isLive || kicked) return;
                     console.warn('[audio] fast path lost; renegotiating for a standard track');
@@ -1306,6 +1307,8 @@
                         audioTargetMs: audio.targetMs || 0,
                         audioConcealed: audio.concealed || 0,
                         audioOutputLatencyMs: audio.outputLatencyMs || 0,
+                        audioRedundantUsed: audio.redundantUsed || 0,
+                        audioRedundantDiscarded: audio.redundantDiscarded || 0,
                     };
                 },
             };
