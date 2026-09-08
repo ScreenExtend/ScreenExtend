@@ -1211,39 +1211,56 @@ mod desktop {
         }) else {
             return;
         };
-        let mut banned = 0usize;
-        let mut approved = 0usize;
-        for device in known {
-            let token = device
-                .get("token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let ip = device
-                .get("ip")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if token.trim().is_empty() && ip.trim().is_empty() {
-                continue;
-            }
-            let is_banned = device
-                .get("banned")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            platform::set_device_banned(app.state(), token.clone(), ip, is_banned);
+        let entries = parse_saved_trust(&known);
+        let banned = entries.iter().filter(|e| e.banned).count();
+        let approved = entries.len() - banned;
+        for entry in entries {
+            platform::set_device_banned(app.state(), entry.token.clone(), entry.ip, entry.banned);
             // A banned device is never also auto-join approved; the GUI models the two as
             // exclusive and the join path checks the ban first either way.
-            platform::set_device_approved(app.state(), token, !is_banned);
-            if is_banned {
-                banned += 1;
-            } else {
-                approved += 1;
-            }
+            platform::set_device_approved(app.state(), entry.token, !entry.banned);
         }
         if banned > 0 || approved > 0 {
             tprintln!("replayed device trust: {approved} approved, {banned} banned");
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SavedTrust {
+        token: String,
+        ip: String,
+        banned: bool,
+    }
+
+    /// Split out from `apply_saved_trust` so the shape of `knownDevices[]` is testable without
+    /// an `AppHandle`. An entry with neither a token nor an IP addresses nothing and is skipped.
+    fn parse_saved_trust(known: &[Value]) -> Vec<SavedTrust> {
+        known
+            .iter()
+            .filter_map(|device| {
+                let field = |key: &str| {
+                    device
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let token = field("token");
+                let ip = field("ip");
+                if token.is_empty() && ip.is_empty() {
+                    return None;
+                }
+                Some(SavedTrust {
+                    token,
+                    ip,
+                    banned: device
+                        .get("banned")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                })
+            })
+            .collect()
     }
 
     /// Re-read `config.json` from disk and replay it. This is what the `RELOAD` control verb
@@ -1291,49 +1308,83 @@ mod desktop {
         }) else {
             return;
         };
-        for device in devices {
-            let Some(ip) = device.get("ip").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let num = |key: &str, default: u32| {
-                device
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(default)
-            };
-            let orientation = device
-                .get("orientation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Landscape")
-                .to_string();
-            let control = device
-                .get("remoteControl")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let audio = device
-                .get("systemAudio")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let dpr = device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        for d in parse_saved_devices(&devices) {
             platform::set_device_override(
                 app.state(),
-                ip.to_string(),
-                num("scale", 100),
-                orientation,
-                num("refreshRate", 60),
-                num("videoScale", 100),
-                num("videoQuality", 15),
-                control,
-                dpr,
-                audio,
+                d.ip.clone(),
+                d.scale,
+                d.orientation,
+                d.refresh_rate,
+                d.video_scale,
+                d.video_quality,
+                d.control,
+                d.dpr,
+                d.audio,
             );
             // Without this a device pinned to a specific host output in the GUI reverts to the
             // default output under `serve`, which is audible rather than theoretical.
-            if let Some(output) = device.get("audioOutputDeviceId").and_then(|v| v.as_str()) {
-                platform::set_device_audio_output(app.state(), ip.to_string(), output.to_string());
+            if let Some(output) = d.audio_output {
+                platform::set_device_audio_output(app.state(), d.ip, output);
             }
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SavedDevice {
+        ip: String,
+        scale: u32,
+        orientation: String,
+        refresh_rate: u32,
+        video_scale: u32,
+        video_quality: u32,
+        control: bool,
+        dpr: f64,
+        audio: bool,
+        audio_output: Option<String>,
+    }
+
+    /// Split out from `apply_saved_devices` so the defaults for a partially written
+    /// `devices[]` entry are testable without an `AppHandle`. The host clamps every value
+    /// again on its side, so this only fills gaps.
+    fn parse_saved_devices(devices: &[Value]) -> Vec<SavedDevice> {
+        devices
+            .iter()
+            .filter_map(|device| {
+                let ip = device.get("ip").and_then(|v| v.as_str())?.to_string();
+                let num = |key: &str, default: u32| {
+                    device
+                        .get(key)
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32)
+                        .unwrap_or(default)
+                };
+                Some(SavedDevice {
+                    ip,
+                    scale: num("scale", 100),
+                    orientation: device
+                        .get("orientation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Landscape")
+                        .to_string(),
+                    refresh_rate: num("refreshRate", 60),
+                    video_scale: num("videoScale", 100),
+                    video_quality: num("videoQuality", 15),
+                    control: device
+                        .get("remoteControl")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    dpr: device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0),
+                    audio: device
+                        .get("systemAudio")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    audio_output: device
+                        .get("audioOutputDeviceId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect()
     }
 
     fn install_device_listeners(app: &tauri::AppHandle) {
@@ -2662,5 +2713,78 @@ mod desktop {
         }
         eprintln!("Could not open display settings.");
         exit(1);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `serve` used to replay only the display overrides, so a headless host started from
+        /// the same `config.json` as the GUI un-banned every banned device.
+        #[test]
+        fn saved_trust_keys_on_the_token_and_skips_entries_that_address_nothing() {
+            let known = serde_json::json!([
+                { "token": "tok-banned", "ip": "192.168.1.9", "banned": true },
+                { "token": "tok-ok", "ip": "192.168.1.10" },
+                { "token": "  ", "ip": "" },
+                { "ip": "192.168.1.11", "banned": true }
+            ]);
+            let parsed = parse_saved_trust(known.as_array().unwrap());
+            assert_eq!(
+                parsed,
+                vec![
+                    SavedTrust {
+                        token: "tok-banned".into(),
+                        ip: "192.168.1.9".into(),
+                        banned: true
+                    },
+                    SavedTrust {
+                        token: "tok-ok".into(),
+                        ip: "192.168.1.10".into(),
+                        banned: false
+                    },
+                    SavedTrust {
+                        token: String::new(),
+                        ip: "192.168.1.11".into(),
+                        banned: true
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn saved_devices_fill_gaps_and_carry_the_audio_output_pin() {
+            let devices = serde_json::json!([
+                { "ip": "10.0.0.5" },
+                {
+                    "ip": "10.0.0.6", "scale": 150, "orientation": "Portrait",
+                    "refreshRate": 120, "videoScale": 80, "videoQuality": 20,
+                    "remoteControl": false, "systemAudio": true, "dpr": 2.0,
+                    "audioOutputDeviceId": "speaker-1"
+                },
+                { "name": "no ip at all" }
+            ]);
+            let parsed = parse_saved_devices(devices.as_array().unwrap());
+            assert_eq!(parsed.len(), 2, "an entry with no ip addresses nothing");
+            assert_eq!(
+                parsed[0],
+                SavedDevice {
+                    ip: "10.0.0.5".into(),
+                    scale: 100,
+                    orientation: "Landscape".into(),
+                    refresh_rate: 60,
+                    video_scale: 100,
+                    video_quality: 15,
+                    control: true,
+                    dpr: 1.0,
+                    audio: false,
+                    audio_output: None,
+                }
+            );
+            assert_eq!(parsed[1].refresh_rate, 120);
+            assert!(!parsed[1].control);
+            assert!(parsed[1].audio);
+            assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
+        }
     }
 }
