@@ -1267,6 +1267,29 @@ struct ReadyMsg {
     timing: FrameTiming,
 }
 
+/// A slot the encode thread could not acquire (GPU hang, TDR, driver fault) is wedged at
+/// `KEY_ENCODER` and nobody will ever release it. The producer must know, or it pulls the slot
+/// out of the free pool and blocks the capture callback on a mutex with no owner. `K` is at most
+/// a handful, so a bitmask is enough and can be read from the capture thread with one load.
+#[derive(Default)]
+struct PoisonedSlots(AtomicU32);
+
+impl PoisonedSlots {
+    fn mark(&self, slot: usize) {
+        if slot < 32 {
+            self.0.fetch_or(1 << slot, Ordering::Relaxed);
+        }
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        slot < 32 && self.0.load(Ordering::Relaxed) & (1 << slot) != 0
+    }
+
+    fn count(&self) -> u32 {
+        self.0.load(Ordering::Relaxed).count_ones()
+    }
+}
+
 struct AsyncNvencRing {
     shared_igpu: Vec<ID3D11Texture2D>,
     igpu_mutex: Vec<IDXGIKeyedMutex>,
@@ -1279,8 +1302,13 @@ struct AsyncNvencRing {
     stop: Arc<AtomicBool>,
     last_frame_at: Arc<AtomicU64>,
     idr_request: Arc<AtomicBool>,
+    poisoned: Arc<PoisonedSlots>,
+    slots: usize,
     epoch: Instant,
     frame_index: u64,
+    dropped: u64,
+    dropped_reported: u64,
+    stage_timeout_ms: u32,
     telemetry: SharedTelemetry,
 }
 
@@ -1296,6 +1324,8 @@ impl AsyncNvencRing {
         initial_bitrate: u32,
         last_frame_at: Arc<AtomicU64>,
         idr_request: Arc<AtomicBool>,
+        wake_rx: crossbeam_channel::Receiver<()>,
+        frame_duration: Duration,
         epoch: Instant,
         telemetry: SharedTelemetry,
     ) -> Self {
@@ -1309,29 +1339,36 @@ impl AsyncNvencRing {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let poisoned = Arc::new(PoisonedSlots::default());
 
         let encode_join = {
-            let stop = Arc::clone(&stop);
-            let free_tx = free_tx.clone();
-            let last_frame_at = Arc::clone(&last_frame_at);
-            let telemetry = Arc::clone(&telemetry);
+            let args = RingEncodeArgs {
+                encoder,
+                ready_rx,
+                free_tx: free_tx.clone(),
+                tx,
+                target_bitrate,
+                initial_bitrate,
+                idr_request: Arc::clone(&idr_request),
+                wake_rx,
+                frame_duration,
+                stop: Arc::clone(&stop),
+                poisoned: Arc::clone(&poisoned),
+                telemetry: Arc::clone(&telemetry),
+            };
             std::thread::Builder::new()
                 .name("nvenc-ring-encode".to_string())
-                .spawn(move || {
-                    ring_encode_thread(
-                        encoder,
-                        ready_rx,
-                        free_tx,
-                        tx,
-                        target_bitrate,
-                        initial_bitrate,
-                        last_frame_at,
-                        stop,
-                        telemetry,
-                    )
-                })
+                .spawn(move || ring_encode_thread(args))
                 .expect("spawn nvenc ring encode thread")
         };
+
+        // A capture-side acquire only ever waits for a slot the encoder has already released, so
+        // it should be instantaneous. `KEY_TIMEOUT_MS` (1 s) here would turn a GPU hiccup into a
+        // full second of a blocked WGC callback; two frame periods is the useful ceiling, since
+        // anything longer has already cost the frame.
+        let stage_timeout_ms = (frame_duration.as_millis() as u32)
+            .saturating_mul(2)
+            .clamp(5, 50);
 
         Self {
             shared_igpu,
@@ -1345,33 +1382,66 @@ impl AsyncNvencRing {
             stop,
             last_frame_at,
             idr_request,
+            poisoned,
+            slots: k,
             epoch,
             frame_index: 0,
+            dropped: 0,
+            dropped_reported: 0,
+            stage_timeout_ms,
             telemetry,
         }
     }
 
-    fn stage(&mut self, raw: &ID3D11Texture2D, mut timing: FrameTiming) -> Result<bool> {
-        let slot = match self.free_recv.try_recv() {
-            // Every slot is still in the encoder: this frame is dropped outright, which is the
-            // one place the ring silently discards captured pixels.
-            Err(_) => {
-                self.telemetry
-                    .degradation
-                    .frames_dropped_ring
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(false);
+    /// Pulls a usable free slot, discarding any the encode thread has quarantined. A poisoned
+    /// slot is never returned to the pool, so this drains at most once per poisoning.
+    fn take_free_slot(&mut self) -> Option<usize> {
+        while let Ok(slot) = self.free_recv.try_recv() {
+            if !self.poisoned.contains(slot) {
+                return Some(slot);
             }
-            Ok(s) => s,
+        }
+        None
+    }
+
+    fn note_drop(&mut self) {
+        self.dropped += 1;
+        self.telemetry
+            .degradation
+            .frames_dropped_ring
+            .fetch_add(1, Ordering::Relaxed);
+        // Rate-limited so a sustained overload does not put a logbus line (and therefore a UI
+        // IPC event) on every dropped frame.
+        if self.dropped - self.dropped_reported >= 120 {
+            self.dropped_reported = self.dropped;
+            let live = self.slots as u32 - self.poisoned.count();
+            teprintln!(
+                "ring: {} frames dropped for want of a free slot (live slots {live}/{}); \
+                 the encoder is not keeping up",
+                self.dropped,
+                self.slots
+            );
+        }
+    }
+
+    fn stage(&mut self, raw: &ID3D11Texture2D, mut timing: FrameTiming) -> Result<bool> {
+        let Some(slot) = self.take_free_slot() else {
+            // Every slot is still in the encoder: this frame is dropped outright, which is the
+            // one place the ring discards captured pixels.
+            self.note_drop();
+            return Ok(false);
         };
 
         let mutex = &self.igpu_mutex[slot];
         let dst = &self.shared_igpu[slot];
 
-        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, self.stage_timeout_ms) }
             .context("ring iGPU keyed mutex AcquireSync(writer)")
         {
-            let _ = self.free_slots.send(slot);
+            // Nobody released it within two frame periods; treat the slot as wedged rather than
+            // handing it back for the next frame to block on all over again.
+            self.poisoned.mark(slot);
+            self.note_drop();
             return Err(e);
         }
 
@@ -1394,7 +1464,9 @@ impl AsyncNvencRing {
             );
         }
         if let Err(e) = released {
-            let _ = self.free_slots.send(slot);
+            // The slot is still held at `KEY_WRITER` by this device and the encoder will never
+            // get it. Returning it to the free pool would wedge the next capture callback.
+            self.poisoned.mark(slot);
             return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
         }
 
@@ -1436,25 +1508,101 @@ impl Drop for AsyncNvencRing {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ring_encode_thread(
-    mut encoder: Encoder,
+struct RingEncodeArgs {
+    encoder: Encoder,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
     tx: broadcast::Sender<EncodedFrame>,
     target_bitrate: Arc<AtomicU32>,
     initial_bitrate: u32,
-    last_frame_at: Arc<AtomicU64>,
+    idr_request: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    frame_duration: Duration,
     stop: Arc<AtomicBool>,
+    poisoned: Arc<PoisonedSlots>,
     telemetry: SharedTelemetry,
+}
+
+/// What woke the ring encode thread.
+enum RingEvent {
+    Frame(ReadyMsg),
+    /// `Pipeline::request_idr` or `set_target_bitrate` poked the wake channel.
+    Wake,
+    /// Nothing arrived within the tick.
+    Idle,
+    ReadyClosed,
+    WakeClosed,
+}
+
+/// A repeat of the held slot, emitted when the desktop is static.
+///
+/// Two things make this the only place a keyframe request can land on an idle desktop: NVENC is
+/// configured with an infinite GOP and IDR period, so there is no periodic keyframe at all, and
+/// `AsyncNvencRing::stage` — the only other reader of `idr_request` — runs only when WGC delivers
+/// a new frame. Without this, a client that joined or lost its reference chain while nothing was
+/// moving waited for the user to move something.
+fn ring_keepalive(
+    encoder: &mut Encoder,
+    slot: usize,
+    force_idr: bool,
+    tx: &broadcast::Sender<EncodedFrame>,
+    telemetry: &SharedTelemetry,
 ) {
+    if force_idr {
+        encoder.request_idr();
+    }
+    match encoder.encode_repeat_slot(slot) {
+        Ok(au) => {
+            let mut timing = FrameTiming::entering_capture();
+            timing.mark_encode_submit();
+            timing.mark_encode_done();
+            telemetry
+                .degradation
+                .frames_repeated
+                .fetch_add(1, Ordering::Relaxed);
+            if force_idr {
+                telemetry
+                    .degradation
+                    .idrs_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(EncodedFrame {
+                data: Bytes::from(au),
+                capture: Instant::now(),
+                timing,
+            });
+        }
+        Err(e) => teprintln!("ring keepalive encode failed (slot={slot}): {e:?}"),
+    }
+}
+
+fn ring_encode_thread(args: RingEncodeArgs) {
+    let RingEncodeArgs {
+        mut encoder,
+        ready_rx,
+        free_tx,
+        tx,
+        target_bitrate,
+        initial_bitrate,
+        idr_request,
+        wake_rx,
+        frame_duration,
+        stop,
+        poisoned,
+        telemetry,
+    } = args;
+
     let _thread_tuning = tuning::tune_current_thread();
     let mut current_bitrate = initial_bitrate;
     let mut bitrate_warned = false;
-    let _ = last_frame_at;
-    let keepalive = Duration::from_millis(200);
+    const KEEPALIVE: Duration = Duration::from_millis(200);
+    // Tick at the frame period rather than the keepalive period so a pending IDR is honoured
+    // within one frame even when nothing is moving; a repeat is still only *emitted* every 200 ms.
+    let tick = frame_duration.clamp(Duration::from_millis(4), KEEPALIVE);
+    let mut last_emit = Instant::now();
     let mut held_slot: Option<usize> = None;
-    let mut poisoned_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut wake_open = true;
 
     let release_and_hold = |free_tx: &crossbeam_channel::Sender<usize>,
                             held: &mut Option<usize>,
@@ -1473,109 +1621,116 @@ fn ring_encode_thread(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match ready_rx.recv_timeout(keepalive) {
-            Ok(msg) => {
-                if poisoned_slots.contains(&msg.slot) {
-                    telemetry
-                        .degradation
-                        .frames_dropped_ring
-                        .fetch_add(1, Ordering::Relaxed);
-                    teprintln!(
-                        "ring encode: skipping poisoned slot {} (keyed mutex wedged at KEY_ENCODER)",
-                        msg.slot
-                    );
-                    let _ = free_tx.send(msg.slot);
+
+        let event = if wake_open {
+            crossbeam_channel::select! {
+                recv(ready_rx) -> msg => match msg {
+                    Ok(m) => RingEvent::Frame(m),
+                    Err(_) => RingEvent::ReadyClosed,
+                },
+                recv(wake_rx) -> r => if r.is_ok() { RingEvent::Wake } else { RingEvent::WakeClosed },
+                default(tick) => RingEvent::Idle,
+            }
+        } else {
+            match ready_rx.recv_timeout(tick) {
+                Ok(m) => RingEvent::Frame(m),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => RingEvent::Idle,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => RingEvent::ReadyClosed,
+            }
+        };
+
+        let msg = match event {
+            RingEvent::ReadyClosed => break,
+            RingEvent::WakeClosed => {
+                wake_open = false;
+                continue;
+            }
+            RingEvent::Wake | RingEvent::Idle => {
+                while wake_rx.try_recv().is_ok() {}
+                let Some(slot) = held_slot else { continue };
+                if poisoned.contains(slot) {
+                    held_slot = None;
                     continue;
                 }
-                let mut timing = msg.timing;
-                timing.mark_encode_submit();
-
+                let idr_pending = idr_request.swap(false, Ordering::Relaxed);
+                if !idr_pending && last_emit.elapsed() < KEEPALIVE {
+                    continue;
+                }
                 apply_pending_bitrate_atomic(
                     &mut encoder,
                     &target_bitrate,
                     &mut current_bitrate,
                     &mut bitrate_warned,
                 );
-                match encoder.encode_input_slot(msg.slot, msg.force_idr) {
-                    Ok(au) => {
-                        timing.mark_encode_done();
-                        telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(EncodedFrame {
-                            data: Bytes::from(au),
-                            capture: msg.capture,
-                            timing,
-                        });
-                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
-                            break;
-                        }
-                    }
-                    Err(SlotEncodeError::Poisoned(e)) => {
-                        telemetry
-                            .degradation
-                            .encoder_resets
-                            .fetch_add(1, Ordering::Relaxed);
-                        teprintln!(
-                            "ring encode: slot {} poisoned (AcquireSync failed — GPU hang or driver fault): {e:?}",
-                            msg.slot
-                        );
-                        poisoned_slots.insert(msg.slot);
+                ring_keepalive(&mut encoder, slot, idr_pending, &tx, &telemetry);
+                last_emit = Instant::now();
+                continue;
+            }
+            RingEvent::Frame(msg) => msg,
+        };
 
-                        let held_poisoned = held_slot.is_some_and(|s| poisoned_slots.contains(&s));
-                        if held_poisoned || held_slot.is_none() {
-                            teprintln!(
-                                "ring encode: CRITICAL — held slot also poisoned or absent; \
-                                 ring is unrecoverable, stopping encode thread"
-                            );
-                            break;
-                        }
-                    }
-                    Err(SlotEncodeError::Encode(e)) => {
-                        telemetry
-                            .degradation
-                            .encoder_transient_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
-                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
-                            break;
-                        }
-                    }
+        if poisoned.contains(msg.slot) {
+            // The producer no longer hands these out, so this can only be a message that was
+            // already in flight when the slot was quarantined.
+            telemetry
+                .degradation
+                .frames_dropped_ring
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let mut timing = msg.timing;
+        timing.mark_encode_submit();
+
+        apply_pending_bitrate_atomic(
+            &mut encoder,
+            &target_bitrate,
+            &mut current_bitrate,
+            &mut bitrate_warned,
+        );
+        match encoder.encode_input_slot(msg.slot, msg.force_idr) {
+            Ok(au) => {
+                timing.mark_encode_done();
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(EncodedFrame {
+                    data: Bytes::from(au),
+                    capture: msg.capture,
+                    timing,
+                });
+                last_emit = Instant::now();
+                if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                    break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if let Some(slot) = held_slot {
-                    if poisoned_slots.contains(&slot) {
-                        held_slot = None;
-                        continue;
-                    }
-                    apply_pending_bitrate_atomic(
-                        &mut encoder,
-                        &target_bitrate,
-                        &mut current_bitrate,
-                        &mut bitrate_warned,
+            Err(SlotEncodeError::Poisoned(e)) => {
+                telemetry
+                    .degradation
+                    .encoder_resets
+                    .fetch_add(1, Ordering::Relaxed);
+                teprintln!(
+                    "ring encode: slot {} poisoned (AcquireSync failed - GPU hang or driver fault): {e:?}",
+                    msg.slot
+                );
+                poisoned.mark(msg.slot);
+
+                let held_poisoned = held_slot.is_some_and(|s| poisoned.contains(s));
+                if held_poisoned || held_slot.is_none() {
+                    teprintln!(
+                        "ring encode: CRITICAL - held slot also poisoned or absent; \
+                         ring is unrecoverable, stopping encode thread"
                     );
-                    match encoder.encode_repeat_slot(slot) {
-                        Ok(au) => {
-                            let mut timing = FrameTiming::entering_capture();
-                            timing.mark_encode_submit();
-                            timing.mark_encode_done();
-                            telemetry
-                                .degradation
-                                .frames_repeated
-                                .fetch_add(1, Ordering::Relaxed);
-                            telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(EncodedFrame {
-                                data: Bytes::from(au),
-                                capture: Instant::now(),
-                                timing,
-                            });
-                        }
-                        Err(e) => {
-                            teprintln!("ring keepalive encode failed (slot={slot}): {e:?}");
-                        }
-                    }
+                    break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(SlotEncodeError::Encode(e)) => {
+                telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
+                if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                    break;
+                }
+            }
         }
     }
     tprintln!("nvenc ring encode thread stopped");
@@ -1895,6 +2050,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         config.bitrate_bps,
                         Arc::clone(&last_frame_at),
                         Arc::clone(&idr_request),
+                        wake_rx,
+                        frame_duration,
                         epoch,
                         Arc::clone(&telemetry),
                     );
