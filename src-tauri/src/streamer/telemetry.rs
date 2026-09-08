@@ -328,6 +328,10 @@ counters! {
     frames_dropped_ring => "frames_dropped_ring",
     frames_dropped_broadcast => "frames_dropped_broadcast",
     frames_dropped_stale => "frames_dropped_stale",
+    // `frames_dropped_capture`: presents the OS coalesced away because we were still busy with
+    // the previous frame — DXGI's `AccumulatedFrames` past the first, which was read only as an
+    // early-out and never counted.
+    frames_dropped_capture => "frames_dropped_capture",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
     keyframe_requests_suppressed => "keyframe_requests_suppressed",
@@ -507,6 +511,10 @@ pub struct SessionTelemetry {
     pub stages: Stages,
     pub degradation: Degradation,
     pub frames_encoded: AtomicU64,
+    /// `(frames_encoded, host_ns)` at the last summary line, so the next one can report a
+    /// delivered *rate*. A running total cannot distinguish a path keeping up at 60 fps from
+    /// one silently delivering 45.
+    last_rate_sample: std::sync::Mutex<(u64, u64)>,
     pub bytes_sent: AtomicU64,
     pub encoder: Slot<String>,
     pub capture_backend: Slot<String>,
@@ -595,11 +603,31 @@ impl SessionTelemetry {
             .record_span(t.packetize_done_ns, t.socket_write_done_ns);
     }
 
+    /// Delivered frames per second since the previous call, and re-arm for the next one.
+    ///
+    /// `None` on the first call of a session, and whenever no measurable time has passed.
+    fn delivered_fps(&self) -> Option<f64> {
+        let frames = self.frames_encoded.load(Ordering::Relaxed);
+        let now_ns = crate::streamer::audio::host_now_ns();
+        let mut last = self.last_rate_sample.lock().ok()?;
+        let (prev_frames, prev_ns) = *last;
+        *last = (frames, now_ns);
+        if prev_ns == 0 || now_ns <= prev_ns {
+            return None;
+        }
+        let secs = (now_ns - prev_ns) as f64 / 1.0e9;
+        Some(frames.saturating_sub(prev_frames) as f64 / secs)
+    }
+
     /// One line, all stages, `p50/p90/p99/max` in ms. Printed on a timer, never per frame.
     pub fn summary_line(&self) -> String {
         let features = self.capture_features.get();
+        let fps = match self.delivered_fps() {
+            Some(f) => format!(" fps={f:.1}"),
+            None => String::new(),
+        };
         let mut s = format!(
-            "telemetry: capture={}{} encoder={} frames={}",
+            "telemetry: capture={}{} encoder={} frames={}{fps}",
             self.capture_backend.get(),
             if features.is_empty() {
                 String::new()

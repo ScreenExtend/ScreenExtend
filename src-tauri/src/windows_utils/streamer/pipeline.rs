@@ -758,6 +758,16 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             }
         }
 
+        // Frames the OS coalesced away while we held the previous one. Drained every poll so
+        // the counter tracks the capture, not the report cadence.
+        let coalesced = dup.take_accumulated_drops();
+        if coalesced != 0 {
+            telemetry
+                .degradation
+                .frames_dropped_capture
+                .fetch_add(coalesced, Ordering::Relaxed);
+        }
+
         if !dirty {
             continue;
         }
