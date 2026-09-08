@@ -81,6 +81,35 @@ against the upstream release the next time these are refreshed.
   bundling x264.
 - **SHA-256:** `87bf8a8331691b32cf6c8e9b282c9c2a825ed0b83eba0f24e539f667c042684e`
 
+## Intel oneVPL dispatcher (`libvpl.dll`) — **deliberately not bundled**
+
+- **Upstream:** [intel/libvpl](https://github.com/intel/libvpl), MIT.
+- **Used for:** `windows_utils/streamer/intel/intel_sys.rs` loads it by name to reach the Quick
+  Sync encoder. Without a dispatcher there is no Quick Sync at all and the host falls to x264.
+- **Why nothing is shipped here.** Three reasons, in order of weight:
+  1. Intel's own guidance is that Xe (Gen12) and later driver packages install the dispatcher.
+     Measured on the Windows dev box (Intel UHD Graphics, DCH driver):
+     `C:\Windows\System32\libvpl.dll`, oneVPL Dispatcher **2.7.0** (ProductVersion 2022.2),
+     CompanyName Intel, Authenticode-valid under *Microsoft Windows Hardware Compatibility
+     Publisher*, SHA-256
+     `803a53d4a8062838a7fa85bc7385a036121162fb969d2f501803d1b01e863815`.
+  2. Pre-Gen12 hosts, the ones Intel says must ship their own dispatcher, run **Media SDK**
+     behind it — API 1.x. This encoder requires oneVPL **2.x** for internal surface allocation
+     (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`) and
+     `create_session` rejects a 1.x runtime at session creation. Shipping a dispatcher for those
+     hosts would buy a cleaner error message, not a working encoder.
+  3. There is no official prebuilt Windows binary to vendor: `intel/libvpl` releases are source
+     only (checked through v2.17.0 — no assets). The only `libvpl.dll` on a real machine is the
+     driver's, and copying a WHQL-signed driver component into our own signed installer is not a
+     provenance chain this file could honestly record.
+- **Consequences for the loader.** Because the driver's copy is the one matched to the runtime
+  the same package installed, `open_dispatcher` searches the **OS path first**, then the exe
+  directory, then `resources/`. An app-side copy must never shadow the driver's.
+- **If this is ever revisited:** build from an `intel/libvpl` release tag with MSVC, record the
+  tag, the commit, the compiler and the SHA-256 here and in `SHA256SUMS`, add
+  `"resources/libvpl.dll"` to `bundle.resources` in `tauri.conf.json`, and re-verify on a Gen12
+  host that the bundled copy does not displace the driver's.
+
 ## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
 
 - **Upstream:** [GPUOpen-LibrariesAndSDKs/AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF),
