@@ -248,6 +248,9 @@ pub struct Encoder {
 
     frame_index: u64,
     idr_requested: bool,
+    /// Whether the last access unit AMF emitted was an IDR, per its `OutputDataType`. Only
+    /// `_IDR` marks a stream-startable unit; a plain `_I` does not.
+    last_output_idr: bool,
     ltr: LtrState,
     warned_input_full: bool,
 
@@ -363,6 +366,7 @@ impl Encoder {
             extradata: Vec::new(),
             frame_index: 0,
             idr_requested: false,
+            last_output_idr: false,
             ltr: LtrState {
                 max_frames: max_ltr_frames,
                 ..LtrState::default()
@@ -515,6 +519,13 @@ impl Encoder {
     /// The LTR bitfield AMF reported the last output frame referenced, if any.
     pub fn last_referenced_ltr(&self) -> Option<i64> {
         self.ltr.last_referenced
+    }
+
+    /// Whether the last access unit AMF emitted was an IDR, per its `OutputDataType`. The
+    /// pipeline decides keyframes by scanning the Annex-B stream, so this is the encoder's own
+    /// second opinion — useful when a forced IDR does not appear to have taken.
+    pub fn last_output_was_idr(&self) -> bool {
+        self.last_output_idr
     }
 
     /// Live bitrate change. Dynamic property writes take effect at the next `SubmitInput` with
@@ -767,7 +778,7 @@ impl Encoder {
                              discipline; draining output and retrying (this should not happen)"
                         );
                     }
-                    if let Some((bytes, _)) = self.query_once()? {
+                    if let Some(bytes) = self.query_once()? {
                         carry.extend_from_slice(&bytes);
                     } else if !self.query_timeout_supported {
                         std::thread::sleep(POLL_SLEEP);
@@ -783,8 +794,7 @@ impl Encoder {
         }
 
         loop {
-            if let Some((bytes, idr)) = self.query_once()? {
-                let _ = idr;
+            if let Some(bytes) = self.query_once()? {
                 if carry.is_empty() {
                     return Ok(bytes);
                 }
@@ -804,13 +814,13 @@ impl Encoder {
         }
     }
 
-    /// One `QueryOutput`. Returns the access unit and whether it is an IDR, or `None` for
-    /// "nothing yet".
+    /// One `QueryOutput`. Returns the access unit, or `None` for "nothing yet", recording
+    /// whether it was an IDR in `last_output_idr`.
     ///
     /// "Nothing yet" is decided by the NULL out-pointer, not by a result code: `QueryOutput` can
     /// return `AMF_OK` with a null `ppData`, and neither `AMF_REPEAT` nor `AMF_NEED_MORE_INPUT`
     /// is a reliable signal. Both FFmpeg and OBS test the pointer.
-    fn query_once(&mut self) -> Result<Option<(Vec<u8>, bool)>> {
+    fn query_once(&mut self) -> Result<Option<Vec<u8>>> {
         let mut raw: *mut AMFData = ptr::null_mut();
         // SAFETY: vtable slot 23 (AMFComponent::QueryOutput) on a live initialised component.
         let r = unsafe { ((*(*self.component).pVtbl).QueryOutput)(self.component, &mut raw) };
@@ -874,7 +884,8 @@ impl Encoder {
             }
         }
 
-        Ok(Some((bytes, is_idr)))
+        self.last_output_idr = is_idr;
+        Ok(Some(bytes))
     }
 
     // -------------------------------------------------------------------------------------
@@ -1118,7 +1129,15 @@ impl Encoder {
         let echoed = self
             .get_i64(prop::AMF_VIDEO_ENCODER_QUERY_TIMEOUT)
             .unwrap_or(0);
-        self.query_timeout_supported = echoed != 0 && self.caps.query_timeout_support;
+        self.query_timeout_supported = echoed != 0;
+        if self.query_timeout_supported != self.caps.query_timeout_support {
+            tprintln!(
+                "AMF QueryTimeout: caps report support={}, the property read back as {}; \
+                 trusting the read-back",
+                self.caps.query_timeout_support,
+                echoed
+            );
+        }
 
         // SAFETY: vtable slot 17 (AMFComponent::Init) on a live, configured component.
         let r = unsafe {
@@ -1441,7 +1460,9 @@ impl Drop for Encoder {
                     }
                 }
                 let r = ((*(*self.component).pVtbl).Terminate)(self.component);
-                if r != AMF_OK {
+                // AMF_NOT_INITIALIZED is expected when construction failed between
+                // CreateComponent and Init - a normal fall-through, not a teardown bug.
+                if r != AMF_OK && r != AMF_NOT_INITIALIZED {
                     teprintln!(
                         "AMFComponent::Terminate returned {} during encoder drop",
                         result_name(r)
