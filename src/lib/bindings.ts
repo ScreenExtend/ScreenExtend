@@ -153,6 +153,18 @@ async getDisableGpuEncode() : Promise<boolean> {
 },
 async getLogBacklog() : Promise<string[]> {
     return await TAURI_INVOKE("get_log_backlog");
+},
+/**
+ * The webview's `console.error` has nowhere to go in a release build -- there are no
+ * devtools attached and nothing captures it -- so failures in the desktop UI simply
+ * vanished. This puts them on the same bus as everything else, which means they reach
+ * the Settings log terminal, `get_log_backlog` and `ScreenExtend logs`.
+ * 
+ * Defined below the macros because a `macro_rules!` is only in scope after its definition
+ * within its own file.
+ */
+async logFrontendError(message: string) : Promise<void> {
+    await TAURI_INVOKE("log_frontend_error", { message });
 }
 }
 
