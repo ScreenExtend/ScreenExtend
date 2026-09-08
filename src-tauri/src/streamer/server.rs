@@ -1061,125 +1061,134 @@ async fn start_session(
         portrait,
     };
 
-    // Join-stage timing. The join chain is a serial sequence of independent multi-second waits
-    // and nothing said which of them cost what; `whep_answer_ms` in the self-test is the total
-    // this breaks down.
+    // The join used to be a strictly serial chain: create and attach the display, apply the mode,
+    // settle, scale, start the pipeline, and only then negotiate. Nothing in the handshake needs
+    // the pipeline until the RTP writer is spawned — the peer connection, the tracks,
+    // `set_remote_description`, `create_answer` and ICE gathering all depend only on the offer, the
+    // negotiated codec and the ICE server list — so the two run as concurrent futures and the
+    // handshake term comes out of time-to-first-frame entirely. On a LAN that is 13-20 ms of a
+    // ~1600 ms join; on a relayed path, where the host gather runs to its 1500 ms cap against a
+    // 1500-2100 ms display term, it is most of the gather.
     let t_display = std::time::Instant::now();
-    let mut mode_applied = true;
-    let (display_id, device_name) = match existing.clone() {
-        Some(prev) => {
-            let display_changed = prev.display_params() != desired.display_params();
-            if display_changed {
-                let name = prev.device_name.clone();
-                let name2 = name.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_mode(&name2, width, height, refresh, swap_axes)
-                })
-                .await;
-                match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        mode_applied = false;
-                        teprintln!("could not apply display mode to {name}: {e}");
+    let display_and_pipeline = async {
+        let mut mode_applied = true;
+        let (display_id, device_name) = match existing.clone() {
+            Some(prev) => {
+                let display_changed = prev.display_params() != desired.display_params();
+                if display_changed {
+                    let name = prev.device_name.clone();
+                    let name2 = name.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        pipeline::set_display_mode(&name2, width, height, refresh, swap_axes)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            mode_applied = false;
+                            teprintln!("could not apply display mode to {name}: {e}");
+                        }
+                        Err(e) => {
+                            mode_applied = false;
+                            teprintln!("set-mode task for {name} panicked: {e}");
+                        }
                     }
-                    Err(e) => {
-                        mode_applied = false;
-                        teprintln!("set-mode task for {name} panicked: {e}");
-                    }
-                }
-                wait_for_display_settle(&name, Some(monitor_dims(width, height, swap_axes))).await;
-                apply_display_scale(&name, scale).await;
-                tprintln!(
+                    wait_for_display_settle(&name, Some(monitor_dims(width, height, swap_axes)))
+                        .await;
+                    apply_display_scale(&name, scale).await;
+                    tprintln!(
                     "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh}, scale={scale}%)",
                     prev.display_id
                 );
-            } else {
-                tprintln!(
-                    "virtual display id={} untouched (encoder-only edit)",
-                    prev.display_id
-                );
-            }
-            (prev.display_id, prev.device_name.clone())
-        }
-        None => {
-            let extra_modes = dpr_mode_ladder(req.width, req.height);
-            let (display_id, device_name, topology_reset) = {
-                // Held only for as long as the before/after device-name diff needs exclusivity.
-                // A second device joining seconds after the first used to wait out the first's
-                // whole create-and-attach window — up to `DISPLAY_ATTACH_TIMEOUT` — before its own
-                // could start, so two simultaneous joins cost t1 + t2 instead of max(t1, t2).
-                let t_lock = std::time::Instant::now();
-                let guard = DISPLAY_CORRELATION_LOCK.lock().await;
-                let lock_wait_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
-                if lock_wait_ms > 1.0 {
+                } else {
                     tprintln!(
-                        "display correlation lock: waited {lock_wait_ms:.0}ms behind another join"
+                        "virtual display id={} untouched (encoder-only edit)",
+                        prev.display_id
                     );
                 }
-
-                let before = tokio::task::spawn_blocking(pipeline::monitor_device_names)
-                    .await
-                    .unwrap_or_default();
-
-                let display_id = {
-                    let client = client.clone();
-                    tokio::task::spawn_blocking(move || {
-                        client.create_display_with_modes(
-                            display_name,
-                            width,
-                            height,
-                            refresh,
-                            &extra_modes,
-                        )
-                    })
-                    .await
-                    .context("create-display task")?
-                    .map_err(|e| anyhow::anyhow!("creating virtual display: {e}"))?
-                };
-                tprintln!("virtual display created (id={display_id}, {width}x{height}@{refresh})");
-
-                // A backend that can name its own display needs no correlation at all: the
-                // snapshot above is never read and the lock can go immediately, so the next join's
-                // create starts while this one is still waiting for Windows to attach the monitor.
-                let named = {
-                    let client = client.clone();
-                    tokio::task::spawn_blocking(move || client.display_device_name(display_id))
-                        .await
-                        .ok()
-                        .flatten()
-                };
-                if named.is_some() {
-                    drop(guard);
-                }
-
-                let (attached, topology_reset) = match named {
-                    Some(name) => {
+                (prev.display_id, prev.device_name.clone())
+            }
+            None => {
+                let extra_modes = dpr_mode_ladder(req.width, req.height);
+                let (display_id, device_name, topology_reset) = {
+                    // Held only for as long as the before/after device-name diff needs exclusivity.
+                    // A second device joining seconds after the first used to wait out the first's
+                    // whole create-and-attach window — up to `DISPLAY_ATTACH_TIMEOUT` — before its own
+                    // could start, so two simultaneous joins cost t1 + t2 instead of max(t1, t2).
+                    let t_lock = std::time::Instant::now();
+                    let guard = DISPLAY_CORRELATION_LOCK.lock().await;
+                    let lock_wait_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
+                    if lock_wait_ms > 1.0 {
                         tprintln!(
+                        "display correlation lock: waited {lock_wait_ms:.0}ms behind another join"
+                    );
+                    }
+
+                    let before = tokio::task::spawn_blocking(pipeline::monitor_device_names)
+                        .await
+                        .unwrap_or_default();
+
+                    let display_id = {
+                        let client = client.clone();
+                        tokio::task::spawn_blocking(move || {
+                            client.create_display_with_modes(
+                                display_name,
+                                width,
+                                height,
+                                refresh,
+                                &extra_modes,
+                            )
+                        })
+                        .await
+                        .context("create-display task")?
+                        .map_err(|e| anyhow::anyhow!("creating virtual display: {e}"))?
+                    };
+                    tprintln!(
+                        "virtual display created (id={display_id}, {width}x{height}@{refresh})"
+                    );
+
+                    // A backend that can name its own display needs no correlation at all: the
+                    // snapshot above is never read and the lock can go immediately, so the next join's
+                    // create starts while this one is still waiting for Windows to attach the monitor.
+                    let named = {
+                        let client = client.clone();
+                        tokio::task::spawn_blocking(move || client.display_device_name(display_id))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    if named.is_some() {
+                        drop(guard);
+                    }
+
+                    let (attached, topology_reset) = match named {
+                        Some(name) => {
+                            tprintln!(
                             "virtual display id={display_id} named directly by the backend (no correlation needed)"
                         );
-                        (Some(name), false)
+                            (Some(name), false)
+                        }
+                        None => wait_for_new_monitor(&before).await,
+                    };
+                    match attached {
+                        Some(name) => {
+                            tprintln!("virtual display id={display_id} attached as {name}");
+                            (display_id, name, topology_reset)
+                        }
+                        None => {
+                            remove_display_async(client, display_id).await;
+                            bail!("virtual display {display_id} did not attach within timeout");
+                        }
                     }
-                    None => wait_for_new_monitor(&before).await,
                 };
-                match attached {
-                    Some(name) => {
-                        tprintln!("virtual display id={display_id} attached as {name}");
-                        (display_id, name, topology_reset)
-                    }
-                    None => {
-                        remove_display_async(client, display_id).await;
-                        bail!("virtual display {display_id} did not attach within timeout");
-                    }
-                }
-            };
 
-            {
-                let name = device_name.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    pipeline::set_display_mode(&name, width, height, refresh, swap_axes)
-                })
-                .await;
-                match res {
+                {
+                    let name = device_name.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        pipeline::set_display_mode(&name, width, height, refresh, swap_axes)
+                    })
+                    .await;
+                    match res {
                     Ok(Ok(())) => tprintln!(
                         "virtual display {device_name} set to {width}x{height}@{refresh} (portrait={portrait})"
                     ),
@@ -1192,94 +1201,134 @@ async fn start_session(
                         teprintln!("set-mode task for {device_name} panicked: {e}");
                     }
                 }
-            }
+                }
 
-            wait_for_display_settle(&device_name, Some(monitor_dims(width, height, swap_axes)))
-                .await;
-            apply_display_scale(&device_name, scale).await;
-            if topology_reset {
-                if let Some(sessions) = state.config.sessions.as_ref() {
-                    let others = session::live_displays_except(sessions, client_ip);
-                    if !others.is_empty() {
-                        tokio::spawn(restore_displays(others));
+                wait_for_display_settle(&device_name, Some(monitor_dims(width, height, swap_axes)))
+                    .await;
+                apply_display_scale(&device_name, scale).await;
+                if topology_reset {
+                    if let Some(sessions) = state.config.sessions.as_ref() {
+                        let others = session::live_displays_except(sessions, client_ip);
+                        if !others.is_empty() {
+                            tokio::spawn(restore_displays(others));
+                        }
                     }
                 }
-            }
-            (display_id, device_name)
-        }
-    };
-
-    if let Some(s) = state.config.sessions.as_ref() {
-        session::set_host_ip(s, client_ip, state.config.lan_ip.clone());
-        let landed = if mode_applied {
-            session::LiveDisplay {
-                display_id,
-                device_name: device_name.clone(),
-                ..desired
-            }
-        } else {
-            let actual = read_back_dimensions(&device_name, swap_axes)
-                .await
-                .or_else(|| existing.as_ref().map(|p| (p.width, p.height)))
-                .unwrap_or((width, height));
-            teprintln!(
-                "virtual display {device_name} stayed at {}x{} instead of {width}x{height}; \
-                 will retry on the next reconfigure",
-                actual.0,
-                actual.1
-            );
-            session::LiveDisplay {
-                display_id,
-                device_name: device_name.clone(),
-                width: actual.0,
-                height: actual.1,
-                ..desired
+                (display_id, device_name)
             }
         };
-        session::set_live_display(s, client_ip, landed);
-    }
 
-    let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
-
-    // `start_on_monitor` is the single heaviest blocking call on the join path: a DWM check,
-    // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
-    // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
-    // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
-    let t_pipeline = std::time::Instant::now();
-    let session = {
-        let cfg = cfg.clone();
-        let name = device_name.clone();
-        match tokio::task::spawn_blocking(move || pipeline::start_on_monitor(&cfg, &name))
-            .await
-            .context("start-capture task")?
-        {
-            Ok(s) => s,
-            Err(e) => return Err(e.context("starting capture for virtual display")),
+        if let Some(s) = state.config.sessions.as_ref() {
+            session::set_host_ip(s, client_ip, state.config.lan_ip.clone());
+            let landed = if mode_applied {
+                session::LiveDisplay {
+                    display_id,
+                    device_name: device_name.clone(),
+                    ..desired
+                }
+            } else {
+                let actual = read_back_dimensions(&device_name, swap_axes)
+                    .await
+                    .or_else(|| existing.as_ref().map(|p| (p.width, p.height)))
+                    .unwrap_or((width, height));
+                teprintln!(
+                    "virtual display {device_name} stayed at {}x{} instead of {width}x{height}; \
+                 will retry on the next reconfigure",
+                    actual.0,
+                    actual.1
+                );
+                session::LiveDisplay {
+                    display_id,
+                    device_name: device_name.clone(),
+                    width: actual.0,
+                    height: actual.1,
+                    ..desired
+                }
+            };
+            session::set_live_display(s, client_ip, landed);
         }
+
+        let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
+
+        // `start_on_monitor` is the single heaviest blocking call on the join path: a DWM check,
+        // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
+        // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
+        // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
+        let t_pipeline = std::time::Instant::now();
+        let session = {
+            let cfg = cfg.clone();
+            let name = device_name.clone();
+            match tokio::task::spawn_blocking(move || pipeline::start_on_monitor(&cfg, &name))
+                .await
+                .context("start-capture task")?
+            {
+                Ok(s) => s,
+                Err(e) => return Err(e.context("starting capture for virtual display")),
+            }
+        };
+        let pipeline_ms = t_pipeline.elapsed().as_secs_f64() * 1000.0;
+
+        // Publish this session's counters under the client IP so `status --json` and the verbose
+        // summary can find them without going through the session map, which is not reachable from
+        // the process that runs `status`.
+        crate::streamer::telemetry::publish(client_ip, Arc::clone(&session.pipeline.telemetry));
+
+        {
+            let name = device_name.clone();
+            if let Ok(Some((left, top, width, height))) =
+                tokio::task::spawn_blocking(move || pipeline::monitor_rect(&name)).await
+            {
+                tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
+            }
+        }
+
+        anyhow::Ok((display_id, device_name, session, display_ms, pipeline_ms))
     };
-    let pipeline_ms = t_pipeline.elapsed().as_secs_f64() * 1000.0;
-
-    // Publish this session's counters under the client IP so `status --json` and the verbose
-    // summary can find them without going through the session map, which is not reachable from
-    // the process that runs `status`.
-    crate::streamer::telemetry::publish(client_ip, Arc::clone(&session.pipeline.telemetry));
-
-    {
-        let name = device_name.clone();
-        if let Ok(Some((left, top, width, height))) =
-            tokio::task::spawn_blocking(move || pipeline::monitor_rect(&name)).await
-        {
-            tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
-        }
-    }
 
     let t_handshake = std::time::Instant::now();
+    let (display_res, whep_res) = tokio::join!(
+        display_and_pipeline,
+        webrtc_session::prepare_whep(
+            req.sdp.clone(),
+            ice_servers,
+            locality,
+            video,
+            audio_params.as_ref(),
+        )
+    );
+    let handshake_ms = t_handshake.elapsed().as_secs_f64() * 1000.0;
+
+    // Both halves have to be unwound in whichever order they failed: the display half owns a real
+    // virtual display and a capture session, and the handshake half owns a peer connection, its
+    // ICE sockets and the mux read worker.
+    let pending = match whep_res {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok((display_id, _, session, _, _)) = display_res {
+                session.stop();
+                if !existed_before {
+                    if let Some(s) = state.config.sessions.as_ref() {
+                        let _ = session::take_live_display(s, client_ip);
+                    }
+                    remove_display_async(client, display_id).await;
+                }
+            }
+            return Err(e.context("WHEP handshake"));
+        }
+    };
+    let (display_id, device_name, session, display_ms, pipeline_ms) = match display_res {
+        Ok(v) => v,
+        Err(e) => {
+            pending.abandon().await;
+            return Err(e);
+        }
+    };
+
     let (closed_tx, closed_rx) = oneshot::channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (answer, whep) = match webrtc_session::handle_whep_offer(
-        req.sdp.clone(),
+    let (answer, whep) = match webrtc_session::activate_whep(
+        pending,
         &session.pipeline,
-        ice_servers,
         Some(closed_tx),
         webrtc_session::InputParams {
             device: Some(device_name.clone()),
@@ -1288,8 +1337,6 @@ async fn start_session(
             control_rx: Some(control_rx),
         },
         audio_params,
-        locality,
-        video,
     )
     .await
     {
@@ -1302,14 +1349,12 @@ async fn start_session(
                 }
                 remove_display_async(client, display_id).await;
             }
-            return Err(e.context("WHEP handshake"));
+            return Err(e.context("WHEP activation"));
         }
     };
 
     tprintln!(
-        "join stages ({locality:?}): display={display_ms:.0}ms pipeline={pipeline_ms:.0}ms \
-         handshake={:.0}ms",
-        t_handshake.elapsed().as_secs_f64() * 1000.0
+        "join stages ({locality:?}): display={display_ms:.0}ms pipeline={pipeline_ms:.0}ms handshake={handshake_ms:.0}ms (overlapped)"
     );
 
     if let Some(reporter) = state.config.device_reporter.as_ref() {

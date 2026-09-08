@@ -641,28 +641,57 @@ impl SessionHandle {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_whep_offer(
+/// A negotiated WHEP session whose pipeline does not exist yet.
+///
+/// Everything up to and including the answer depends only on the offer, the codec choice and the
+/// ICE server list — not on the encoder, the capture session or the virtual display. Splitting
+/// here is what lets `start_session` run the handshake and the display/pipeline work as two
+/// concurrent futures instead of one serial chain.
+pub struct PendingWhep {
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    media_socket: Option<MediaSocket>,
+    track: Arc<TrackLocalStaticRTP>,
+    rtp_sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
+    audio_track: Option<Arc<TrackLocalStaticSample>>,
+    audio_dc: Option<Arc<RTCDataChannel>>,
+    answer_sdp: String,
+    mtu: usize,
+    pacing_mode: PacingMode,
+    playout_delay_max: u16,
+    twcc_offered: bool,
+    locality: SessionLocality,
+}
+
+impl PendingWhep {
+    /// Give everything back when the other half of the join failed.
+    ///
+    /// Without this a display or pipeline failure would leak exactly what the peer connection used
+    /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
+    /// read worker.
+    pub async fn abandon(mut self) {
+        if let Err(e) = self.pc.close().await {
+            teprintln!("closing peer connection after a failed join: {e}");
+        }
+        if let Some(ms) = self.media_socket.take() {
+            use webrtc::ice::udp_mux::UDPMux;
+            let _ = ms.mux.close().await;
+        }
+        LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Build the peer connection, add the tracks, and produce the answer.
+///
+/// Needs no pipeline: the profile comes from the negotiation, the audio decision from the join
+/// request's capability flags, and the transport constants from the pre-classified locality.
+pub async fn prepare_whep(
     offer_sdp: String,
-    pipeline: &Pipeline,
     ice_servers: Vec<RTCIceServer>,
-    closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    input: InputParams,
-    audio: Option<AudioParams>,
     locality: SessionLocality,
     video: negotiate::NegotiatedVideo,
-) -> Result<(String, SessionHandle)> {
+    audio: Option<&AudioParams>,
+) -> Result<PendingWhep> {
     let profile = video.profile;
-    if profile != pipeline.h264_profile {
-        // The encoder is configured from the same negotiation in `start_session`, so this can
-        // only diverge if a caller reached `handle_whep_offer` by another route. Say so rather
-        // than sending a stream whose SPS disagrees with the SDP.
-        teprintln!(
-            "negotiated H.264 profile {profile:?} does not match the encoder's {:?}; \
-             answering with the encoder's",
-            pipeline.h264_profile
-        );
-    }
-    let profile = pipeline.h264_profile;
     // The LAN tier: our own socket, with the send/receive buffers and the Windows CONNRESET fix
     // webrtc-rs never applies, muxed so one port carries every host candidate. Never on a relayed
     // or unclassified path, because muxed mode gives up server-reflexive gathering.
@@ -718,6 +747,124 @@ pub async fn handle_whep_offer(
     // offer, because an extension the peer did not offer cannot be negotiated into the answer.
     let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01");
 
+    let track = Arc::new(TrackLocalStaticRTP::new(
+        RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: h264_fmtp(profile_plid(profile)),
+            rtcp_feedback: vec![],
+        },
+        "video".to_owned(),
+        "webrtc-streamer".to_owned(),
+    ));
+
+    let rtp_sender = pc
+        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+        .await
+        .context("add_track")?;
+
+    let (audio_track, audio_dc) = match audio {
+        Some(a) => add_audio_tracks(&pc, a.fast, a.fallback_track).await?,
+        None => (None, None),
+    };
+
+    tprintln!(
+        "ICE candidates in remote offer (browser): {}",
+        summarize_sdp_candidates(&offer_sdp)
+    );
+    let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer SDP")?;
+    pc.set_remote_description(offer)
+        .await
+        .context("set_remote_description(offer)")?;
+
+    // No IDR here. The track has no binding until the connection comes up, and a write to an
+    // unbound track is silently discarded — see the `Connected` arm above.
+
+    let answer = pc.create_answer(None).await.context("create_answer")?;
+
+    let mut gather_complete = pc.gathering_complete_promise().await;
+    pc.set_local_description(answer)
+        .await
+        .context("set_local_description(answer)")?;
+    // A same-subnet peer needs nothing but host candidates, and host gathering finishes in
+    // single-digit milliseconds. Waiting the WAN-shaped 1.5 s for a reflexive candidate nobody
+    // will use is pure time-to-first-frame, paid on every LAN join.
+    let gather_max_wait = match locality {
+        SessionLocality::SameNetwork => Duration::from_millis(GATHER_MAX_WAIT_LAN_MS),
+        _ => Duration::from_millis(GATHER_MAX_WAIT_MS),
+    };
+    match tokio::time::timeout(gather_max_wait, gather_complete.recv()).await {
+        Ok(_) => {}
+        Err(_) => tprintln!(
+            "ICE gathering still in progress after {gather_max_wait:?}; returning answer with candidates gathered so far"
+        ),
+    }
+
+    let local = pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow!("no local description after gathering"))?;
+
+    tprintln!(
+        "ICE candidates in local answer (host): {}",
+        summarize_sdp_candidates(&local.sdp)
+    );
+
+    // webrtc-rs answers with the offer's own codec parameters, so without this the answer keeps
+    // whatever level the browser named — Chrome always says 3.1, i.e. 1280x720@30 — no matter what
+    // resolution the session actually negotiated.
+    let answer_sdp = if video.may_raise_level {
+        tprintln!(
+            "answering H.264 {profile:?} at level 0x{:02x} (client allowed level asymmetry)",
+            video.level_idc
+        );
+        negotiate::apply_level_to_answer(&local.sdp, video.level_idc)
+    } else {
+        local.sdp
+    };
+
+    Ok(PendingWhep {
+        pc,
+        media_socket,
+        track,
+        rtp_sender,
+        audio_track,
+        audio_dc,
+        answer_sdp,
+        mtu,
+        pacing_mode,
+        playout_delay_max,
+        twcc_offered,
+        locality,
+    })
+}
+
+/// Attach the running pipeline to an already-negotiated session and start every task.
+///
+/// Runs after the answer exists but strictly before it is returned to the client, so a handler
+/// registered here is still in place before the peer can possibly connect.
+pub async fn activate_whep(
+    pending: PendingWhep,
+    pipeline: &Pipeline,
+    closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    input: InputParams,
+    audio: Option<AudioParams>,
+) -> Result<(String, SessionHandle)> {
+    let PendingWhep {
+        pc,
+        media_socket,
+        track,
+        rtp_sender,
+        audio_track,
+        audio_dc,
+        answer_sdp,
+        mtu,
+        pacing_mode,
+        playout_delay_max,
+        twcc_offered,
+        locality,
+    } = pending;
     let keyframe_gate = Arc::new(KeyframeGate::new());
     let keyframes = KeyframeRequester {
         pipeline: pipeline.clone(),
@@ -853,23 +1000,6 @@ pub async fn handle_whep_offer(
         }));
     }
 
-    let track = Arc::new(TrackLocalStaticRTP::new(
-        RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            clock_rate: 90000,
-            channels: 0,
-            sdp_fmtp_line: h264_fmtp(profile_plid(profile)),
-            rtcp_feedback: vec![],
-        },
-        "video".to_owned(),
-        "webrtc-streamer".to_owned(),
-    ));
-
-    let rtp_sender = pc
-        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
-        .await
-        .context("add_track")?;
-
     {
         let pipeline = pipeline.clone();
         let keyframes = keyframes.clone();
@@ -955,9 +1085,13 @@ pub async fn handle_whep_offer(
 
     if let Some(mut audio) = audio {
         audio.link_loss = Some(link_loss);
-        if let Err(e) = setup_audio(&pc, audio, Arc::clone(&pipeline.telemetry)).await {
-            teprintln!("audio: setup failed ({e:#}); continuing without audio");
-        }
+        start_audio_forwarders(
+            &pc,
+            audio_track,
+            audio_dc,
+            audio,
+            Arc::clone(&pipeline.telemetry),
+        );
     }
 
     {
@@ -1263,61 +1397,6 @@ pub async fn handle_whep_offer(
     }));
     let _ = grace_cancel_rx; // keep receiver alive so the watch channel stays open
 
-    tprintln!(
-        "ICE candidates in remote offer (browser): {}",
-        summarize_sdp_candidates(&offer_sdp)
-    );
-    let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer SDP")?;
-    pc.set_remote_description(offer)
-        .await
-        .context("set_remote_description(offer)")?;
-
-    // No IDR here. The track has no binding until the connection comes up, and a write to an
-    // unbound track is silently discarded — see the `Connected` arm above.
-
-    let answer = pc.create_answer(None).await.context("create_answer")?;
-
-    let mut gather_complete = pc.gathering_complete_promise().await;
-    pc.set_local_description(answer)
-        .await
-        .context("set_local_description(answer)")?;
-    // A same-subnet peer needs nothing but host candidates, and host gathering finishes in
-    // single-digit milliseconds. Waiting the WAN-shaped 1.5 s for a reflexive candidate nobody
-    // will use is pure time-to-first-frame, paid on every LAN join.
-    let gather_max_wait = match locality {
-        SessionLocality::SameNetwork => Duration::from_millis(GATHER_MAX_WAIT_LAN_MS),
-        _ => Duration::from_millis(GATHER_MAX_WAIT_MS),
-    };
-    match tokio::time::timeout(gather_max_wait, gather_complete.recv()).await {
-        Ok(_) => {}
-        Err(_) => tprintln!(
-            "ICE gathering still in progress after {gather_max_wait:?}; returning answer with candidates gathered so far"
-        ),
-    }
-
-    let local = pc
-        .local_description()
-        .await
-        .ok_or_else(|| anyhow!("no local description after gathering"))?;
-
-    tprintln!(
-        "ICE candidates in local answer (host): {}",
-        summarize_sdp_candidates(&local.sdp)
-    );
-
-    // webrtc-rs answers with the offer's own codec parameters, so without this the answer keeps
-    // whatever level the browser named — Chrome always says 3.1, i.e. 1280x720@30 — no matter what
-    // resolution the session actually negotiated.
-    let answer_sdp = if video.may_raise_level {
-        tprintln!(
-            "answering H.264 {profile:?} at level 0x{:02x} (client allowed level asymmetry)",
-            video.level_idc
-        );
-        negotiate::apply_level_to_answer(&local.sdp, video.level_idc)
-    } else {
-        local.sdp
-    };
-
     Ok((
         answer_sdp,
         SessionHandle {
@@ -1330,16 +1409,40 @@ pub async fn handle_whep_offer(
     ))
 }
 
-async fn setup_audio(
+/// Prepare and activate in one call. The serial shape, kept for the WHEP self-test and any caller
+/// that has a pipeline before it has an offer.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_whep_offer(
+    offer_sdp: String,
+    pipeline: &Pipeline,
+    ice_servers: Vec<RTCIceServer>,
+    closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    input: InputParams,
+    audio: Option<AudioParams>,
+    locality: SessionLocality,
+    video: negotiate::NegotiatedVideo,
+) -> Result<(String, SessionHandle)> {
+    let pending = prepare_whep(offer_sdp, ice_servers, locality, video, audio.as_ref()).await?;
+    activate_whep(pending, pipeline, closed_tx, input, audio).await
+}
+
+/// Add the audio media the answer must carry, before `create_answer`.
+///
+/// Both halves have to exist in the first answer: WHEP has no renegotiation verb, so a track or a
+/// data channel that is not in it can never be added later. What feeds them is a separate
+/// question, answered by [`start_audio_forwarders`] once the pipeline exists.
+async fn add_audio_tracks(
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
-    audio: AudioParams,
-    telemetry: crate::streamer::telemetry::SharedTelemetry,
-) -> Result<()> {
+    fast: bool,
+    fallback_track: bool,
+) -> Result<(
+    Option<Arc<TrackLocalStaticSample>>,
+    Option<Arc<RTCDataChannel>>,
+)> {
     // On the fast path the Opus track is added but never fed: its whole job is to exist in the
     // answer so the client has an `m=audio` section to fall back onto if its WebCodecs decoder
-    // dies mid-session. WHEP has no renegotiation verb, so a track that is not in the first
-    // answer can never be added later.
-    if !audio.fast || audio.fallback_track {
+    // dies mid-session.
+    let track = if !fast || fallback_track {
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -1354,20 +1457,17 @@ async fn setup_audio(
         pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .context("add_track(opus fallback)")?;
-        if audio.fast {
+        if fast {
             tprintln!("audio: added a standard Opus track as an unfed fallback for the client");
         } else {
             tprintln!("audio: added standard Opus track (NetEQ fallback path)");
-            tokio::spawn(forward_track(
-                Arc::clone(pc),
-                track,
-                audio.clone(),
-                Arc::clone(&telemetry),
-            ));
         }
-    }
+        Some(track)
+    } else {
+        None
+    };
 
-    if audio.fast {
+    let dc = if fast {
         let init = RTCDataChannelInit {
             ordered: Some(false),
             max_retransmits: Some(0),
@@ -1378,6 +1478,37 @@ async fn setup_audio(
             .await
             .context("create audio data channel")?;
         tprintln!("audio: created unordered/no-retransmit DataChannel 'audio'");
+        Some(dc)
+    } else {
+        None
+    };
+
+    Ok((track, dc))
+}
+
+/// Start whatever feeds the audio media that [`add_audio_tracks`] put in the answer.
+///
+/// Registering `on_open` here rather than at track-add time is safe because the answer has not
+/// been returned yet, so the peer cannot have connected and the channel cannot have opened.
+fn start_audio_forwarders(
+    pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+    track: Option<Arc<TrackLocalStaticSample>>,
+    dc: Option<Arc<RTCDataChannel>>,
+    audio: AudioParams,
+    telemetry: crate::streamer::telemetry::SharedTelemetry,
+) {
+    if !audio.fast {
+        if let Some(track) = track {
+            tokio::spawn(forward_track(
+                Arc::clone(pc),
+                track,
+                audio.clone(),
+                Arc::clone(&telemetry),
+            ));
+        }
+    }
+
+    if let Some(dc) = dc {
         let dc_for_open = Arc::clone(&dc);
         // Weak for the same reason as the connection-state handler: the data channel this
         // closure is attached to is owned by the peer connection, so an `Arc` here is a cycle.
@@ -1393,7 +1524,6 @@ async fn setup_audio(
             })
         }));
     }
-    Ok(())
 }
 
 fn pc_alive(pc: &webrtc::peer_connection::RTCPeerConnection) -> bool {
