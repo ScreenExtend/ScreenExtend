@@ -109,6 +109,9 @@ pub struct CompatibilityReport {
     pub unsupported_apis: Vec<UnsupportedApi>,
     pub audio_backend: String,
     pub display_backend: String,
+    pub capture_backend: String,
+    pub encoder_backend: String,
+    pub hosted_network_backend: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]

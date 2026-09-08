@@ -244,13 +244,28 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     if app_handle.try_state::<AppState>().is_some() {
         return true;
     }
-    tauri::async_runtime::spawn_blocking(set_display_topology_extend);
+    // Extend the desktop *before* touching the driver. These are two concurrent reconfigurations
+    // of the same OS state otherwise: `set_display_topology_extend` decides what to apply from a
+    // snapshot of the current paths, while `new_shared_reported` removes every virtual monitor.
+    match tauri::async_runtime::spawn_blocking(set_display_topology_extend).await {
+        Ok(true) => tprintln!("[display] desktop topology set to extend"),
+        Ok(false) => {}
+        Err(e) => teprintln!("[display] topology task failed: {e}"),
+    }
+
     let virtual_display =
-        tauri::async_runtime::spawn_blocking(WindowsVirtualDisplay::new_shared).await;
+        tauri::async_runtime::spawn_blocking(WindowsVirtualDisplay::new_shared_reported).await;
 
     let virtual_display = match virtual_display {
-        Ok(Some(vd)) => vd,
-        _ => return false,
+        Ok(Ok(vd)) => vd,
+        Ok(Err(e)) => {
+            teprintln!("[setup] cannot start: {e}");
+            return false;
+        }
+        Err(e) => {
+            teprintln!("[setup] the virtual-display task panicked: {e}");
+            return false;
+        }
     };
 
     let device_overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
@@ -449,7 +464,9 @@ pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
         max: max.map(|m| m as u32),
         in_use: in_use as u32,
         full: max.is_some_and(|m| in_use >= m),
-        backend: "IddDriver".to_string(),
+        backend: virtual_display::probe_display_backend()
+            .as_str()
+            .to_string(),
     }
 }
 
@@ -545,17 +562,74 @@ pub fn set_server_ports(
         "[streamer] server ports changed to HTTP :{http}, HTTPS :{https}; restarting streamers"
     );
 
+    restart_streamers(&state, "port change");
+
+    ServerPorts { http, https }
+}
+
+/// Give a stopping server this long to release its listening socket before starting the new one.
+const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Stop every per-adapter server and start it again. Used by the two settings that cannot be
+/// applied to a live server: the listening ports and the encoder selection.
+fn restart_streamers(state: &AppState, reason: &str) {
+    // Say goodbye before the socket dies, so a client sees a reason instead of a dead transport.
+    session::broadcast_bye(
+        &state.sessions,
+        session::ByeReason::HostExit,
+        Duration::from_millis(500),
+    );
+
     {
         let mut streamers = state.streamers.lock().unwrap();
         for (ip, streamer) in streamers.drain() {
-            tprintln!("[streamer] stopping streamer bound to {ip} for port change");
-            streamer.handle.shutdown();
+            tprintln!("[streamer] stopping streamer bound to {ip} for {reason}");
+            streamer
+                .handle
+                .graceful_shutdown(Some(Duration::from_millis(500)));
         }
     }
-    std::thread::sleep(Duration::from_millis(300));
-    sync_streamers(&state);
 
-    ServerPorts { http, https }
+    let (http, https) = state.server_ports.get();
+    if !wait_for_ports_free(state, http, https, PORT_RELEASE_TIMEOUT) {
+        teprintln!(
+            "[streamer] ports {http}/{https} were still held after {PORT_RELEASE_TIMEOUT:?}; \
+             starting anyway, watch for a bind failure below"
+        );
+    }
+    sync_streamers(state);
+}
+
+/// Poll the adapter addresses we are about to bind until they accept a listener again. This
+/// replaces a fixed sleep that either wasted the wait or was not long enough, silently.
+fn wait_for_ports_free(state: &AppState, http: u16, https: u16, timeout: Duration) -> bool {
+    use std::net::TcpListener;
+
+    let ips: Vec<Ipv4Addr> = state
+        .network_adapters
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|adapter| adapter.ip_addresses.iter())
+        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .collect();
+    if ips.is_empty() {
+        return true;
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let free = ips.iter().all(|ip| {
+            TcpListener::bind((*ip, http)).is_ok() && TcpListener::bind((*ip, https)).is_ok()
+        });
+        if free {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[tauri::command]
@@ -583,67 +657,78 @@ pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
             "re-enabled"
         }
     );
+    restart_streamers(&state, "encoder change");
+}
+
+/// Re-invoke ourselves elevated to run one of the legacy driver subcommands.
+///
+/// Every step here is ordinary-user-reachable: cancelling the UAC prompt, a profile path that is
+/// not valid UTF-8, a dev tree with no bundled resources. All of them used to `unwrap()`, and the
+/// result was then discarded in favour of a hardcoded `true`, so the UI reported a successful
+/// install for a driver that was never installed.
+fn run_elevated_driver_command(app: &tauri::AppHandle, subcommand: &str) -> bool {
+    let exe_path = match std::env::current_exe().map(|p| p.into_os_string().into_string()) {
+        Ok(Ok(path)) => path,
+        Ok(Err(_)) => {
+            teprintln!("[drivers] {subcommand}: the executable path is not valid UTF-8");
+            return false;
+        }
+        Err(e) => {
+            teprintln!("[drivers] {subcommand}: could not resolve the executable path: {e}");
+            return false;
+        }
+    };
+
+    let mut cmd = StdCommand::new(exe_path);
+    cmd.arg(subcommand);
+    let mut admincmd = Command::new(cmd);
+    let mut fincmd = admincmd.name("ScreenExtend".to_string());
+    if let Ok(icon) = app
+        .path()
+        .resolve("icons/icon.icns", BaseDirectory::Resource)
+        .map_err(|e| e.to_string())
+        .and_then(|p| std::fs::read(p).map_err(|e| e.to_string()))
     {
-        let mut streamers = state.streamers.lock().unwrap();
-        for (ip, streamer) in streamers.drain() {
-            tprintln!("[streamer] stopping streamer bound to {ip} for encoder change");
-            streamer.handle.shutdown();
+        fincmd = fincmd.icon(icon);
+    }
+
+    match fincmd.output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            teprintln!(
+                "[drivers] {subcommand} exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            // The ordinary case here is the user dismissing the elevation prompt.
+            teprintln!("[drivers] {subcommand} could not run elevated: {e}");
+            false
         }
     }
-    std::thread::sleep(Duration::from_millis(300));
-    sync_streamers(&state);
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn install_drivers(app: tauri::AppHandle) -> bool {
-    let resource_path = |file: &str| {
-        app.path()
-            .resolve(file, BaseDirectory::Resource)
-            .unwrap()
-            .into_os_string()
-            .into_string()
-            .unwrap()
-    };
-    let exe_path = match std::env::current_exe() {
-        Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
-        _ => "".to_string(),
-    };
-    let mut cmd = StdCommand::new(exe_path);
-    cmd.arg("installdrivers");
-    let mut admincmd = Command::new(cmd);
-    let mut fincmd = admincmd.name("ScreenExtend".to_string());
-    if let Ok(icon_bytes) = std::fs::read(resource_path("icons/icon.icns")) {
-        fincmd = fincmd.icon(icon_bytes);
+    if !run_elevated_driver_command(&app, "installdrivers") {
+        return false;
     }
-    let _ = fincmd.output().unwrap();
-    true
+    // Report what the machine now actually has, not what we asked for.
+    let backend = virtual_display::probe_display_backend();
+    tprintln!(
+        "[drivers] after install, display backend is {}",
+        backend.as_str()
+    );
+    backend == virtual_display::DisplayBackend::IddDriver
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn remove_drivers(app: tauri::AppHandle) -> bool {
-    let resource_path = |file: &str| {
-        app.path()
-            .resolve(file, BaseDirectory::Resource)
-            .unwrap()
-            .into_os_string()
-            .into_string()
-            .unwrap()
-    };
-    let exe_path = match std::env::current_exe() {
-        Ok(exe_path) => exe_path.into_os_string().into_string().unwrap(),
-        _ => "".to_string(),
-    };
-    let mut cmd = StdCommand::new(exe_path);
-    cmd.arg("removedrivers");
-    let mut admincmd = Command::new(cmd);
-    let mut fincmd = admincmd.name("ScreenExtend".to_string());
-    if let Ok(icon_bytes) = std::fs::read(resource_path("icons/icon.icns")) {
-        fincmd = fincmd.icon(icon_bytes);
-    }
-    let _ = fincmd.output().unwrap();
-    true
+    run_elevated_driver_command(&app, "removedrivers")
 }
 
 #[tauri::command]
