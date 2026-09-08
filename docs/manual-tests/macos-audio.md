@@ -200,6 +200,38 @@ It reports the segment open result with `errno`, the resolved mode, the generati
 device build. Silence there while `transport=hal_input` is reported means the plug-in never loaded
 at all — check that it is signed, or that SIP is disabled.
 
+## The one-command measurement: `probe --audio`
+
+`probe --audio` is the shared instrument — the same one W8 built for Windows — so its numbers are
+directly comparable across platforms. It subscribes to the real audio hub for ten seconds and
+prints the whole picture. Something must be playing, or it correctly reports no packets:
+
+```sh
+(ScreenExtend probe --audio > /tmp/probe.out 2>&1 &) ; sleep 3
+say "one two three four five six seven eight nine ten"
+sleep 11 ; cat /tmp/probe.out
+```
+
+Three lines are worth reading first:
+
+```
+opus: libopus … application=2051 bitrate=128000 complexity=5 signal=3002 vbr=1 vbr_constraint=1
+      lsb_depth=24 prediction_disabled=0 lookahead=120 samples (2.50 ms), frame 5 ms
+audio: capture backend = virtual_device
+capture -> subscriber   p50/p90/p99/max = 1.84/3.67/5.24/6.76 ms
+```
+
+The first must match Windows field for field, `lookahead=120` included — macOS loads a *different*
+libopus build, and that number is what the client uses to align playout. The second is the tier.
+The third is the figure to compare: on Windows 11 the endpoint-loopback tier measures
+p50 9.44 / p99 9.44 ms against this tier's 1.84 / 5.24, which is what a 2.67 ms IO cycle buys
+against a 10 ms engine period.
+
+Expect roughly 50 packets/s rather than 200 while a phrase plays: the virtual device runs no IO
+cycle during host silence, so the stream genuinely pauses between sounds and costs nothing on the
+wire. `seq gaps` must be 0; `discontinuity` counts re-seats across those pauses and 1 per gap is
+correct.
+
 ### Measured on the dev box — **VERIFIED**
 
 macOS 10.15.8, Intel, SIP disabled, driver built from the tree with `scripts/build.sh` and loaded
