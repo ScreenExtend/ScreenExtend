@@ -250,6 +250,71 @@
     resizeView.setFloat32(5, window.devicePixelRatio || 1, true);
     send(OP.RESIZE, resizeBuf);
   }
+  // Client -> host telemetry, v1. Layout and field meanings: docs/TELEMETRY.md. Fixed offsets,
+  // little-endian; a newer client may append fields and an older host will read the prefix it
+  // knows, so the length is a floor and never an equality check on either side.
+  const STATS_LEN = 72;
+  const STATS_VERSION = 1;
+  const FLAG = {
+    SAB: 1 << 0, ISOLATED: 1 << 1, WAKE_LOCK: 1 << 2, POINTER_LOCK: 1 << 3,
+    KEYBOARD_LOCK: 1 << 4, FULLSCREEN: 1 << 5, SET_SINK_ID: 1 << 6,
+    DECODER_HW: 1 << 7, CLOCK_VALID: 1 << 8,
+  };
+  const statsBuf = new ArrayBuffer(STATS_LEN), statsView = new DataView(statsBuf);
+
+  function us(v) {
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) return 0;
+    const n = Math.round(v * 1000);
+    return n > 0xffffffff ? 0xffffffff : n;
+  }
+  function u32(v) {
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) return 0;
+    return v > 0xffffffff ? 0xffffffff : (v >>> 0);
+  }
+
+  function sendStats() {
+    if (!window.SEVideo) return;
+    let st;
+    try { st = SEVideo.getStats(); } catch (_) { return; }
+    if (!st) return;
+
+    let flags = 0;
+    if (st.sab) flags |= FLAG.SAB;
+    if (st.crossOriginIsolated) flags |= FLAG.ISOLATED;
+    if (st.wakeLock) flags |= FLAG.WAKE_LOCK;
+    if (st.pointerLock) flags |= FLAG.POINTER_LOCK;
+    if (st.keyboardLock) flags |= FLAG.KEYBOARD_LOCK;
+    if (st.fullscreen) flags |= FLAG.FULLSCREEN;
+    if (st.setSinkId) flags |= FLAG.SET_SINK_ID;
+    if (st.decoderHardware) flags |= FLAG.DECODER_HW;
+    if (st.clockValid) flags |= FLAG.CLOCK_VALID;
+
+    const a = st.arrivalToPaint || {}, d = st.decode || {}, h = st.hostToPaint || {};
+    const v = statsView;
+    v.setUint8(0, OP.STATS);
+    v.setUint8(1, STATS_VERSION);
+    v.setUint8(2, st.videoPath | 0);
+    v.setUint8(3, st.audioPath | 0);
+    v.setUint32(4, flags >>> 0, true);
+    v.setUint32(8, us(a.p50), true);
+    v.setUint32(12, us(a.p90), true);
+    v.setUint32(16, us(a.p99), true);
+    v.setUint32(20, us(d.p50), true);
+    v.setUint32(24, us(d.p90), true);
+    v.setUint32(28, us(d.p99), true);
+    v.setUint32(32, us(h.p50), true);
+    v.setUint32(36, us(h.p90), true);
+    v.setUint32(40, us(h.p99), true);
+    v.setUint32(44, u32(st.framesPainted), true);
+    v.setUint32(48, u32(st.framesDropped), true);
+    v.setUint32(52, u32(st.decodeErrors), true);
+    v.setUint32(56, u32(st.keyRequests), true);
+    v.setUint32(60, u32(st.audioUnderruns), true);
+    v.setUint32(64, u32(st.audioOverruns), true);
+    v.setUint32(68, us(st.rttMs), true);
+    send(OP.STATS, statsBuf);
+  }
+
   function sendPing() {
     const t = BigInt(Math.round(performance.now() * 1e6));
     pingView.setUint8(0, OP.PING);
@@ -542,7 +607,9 @@
       if (imeSink && navigator.maxTouchPoints === 0) {
         try { imeSink.focus({ preventScroll: true }); } catch (_) {}
       }
-      if (!pingTimer) pingTimer = setInterval(sendPing, 1000);
+      if (!pingTimer) {
+        pingTimer = setInterval(function () { sendPing(); sendStats(); }, 1000);
+      }
     };
     reliable.onclose = () => { if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; } clearHeld(); };
     installListeners();
