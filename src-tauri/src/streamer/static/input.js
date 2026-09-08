@@ -319,12 +319,12 @@
     resizeView.setFloat32(5, window.devicePixelRatio || 1, true);
     send(OP.RESIZE, resizeBuf);
   }
-  // Client -> host telemetry, v2. Layout and field meanings: docs/TELEMETRY.md. Fixed offsets,
+  // Client -> host telemetry, v3. Layout and field meanings: docs/TELEMETRY.md. Fixed offsets,
   // little-endian; a newer client may append fields and an older host will read the prefix it
   // knows, so the length is a floor and never an equality check on either side. Bytes 0..72
-  // are byte-identical to v1 for exactly that reason.
-  const STATS_LEN = 96;
-  const STATS_VERSION = 2;
+  // are byte-identical to v1 and 0..96 to v2, for exactly that reason.
+  const STATS_LEN = 104;
+  const STATS_VERSION = 3;
   const FLAG = {
     SAB: 1 << 0, ISOLATED: 1 << 1, WAKE_LOCK: 1 << 2, POINTER_LOCK: 1 << 3,
     KEYBOARD_LOCK: 1 << 4, FULLSCREEN: 1 << 5, SET_SINK_ID: 1 << 6,
@@ -393,6 +393,10 @@
     v.setUint32(84, us(st.audioTargetMs), true);
     v.setUint32(88, u32(st.audioConcealed), true);
     v.setUint32(92, us(st.audioOutputLatencyMs), true);
+    // v3 tail: what the host's packet redundancy actually bought. `used` is a hole a copy
+    // filled; `discarded` is the copy's cost on a link that did not need it.
+    v.setUint32(96, u32(st.audioRedundantUsed), true);
+    v.setUint32(100, u32(st.audioRedundantDiscarded), true);
     send(OP.STATS, statsBuf);
   }
 

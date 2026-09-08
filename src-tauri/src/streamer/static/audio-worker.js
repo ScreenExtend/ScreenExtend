@@ -6,6 +6,13 @@ const SR = 48000;
 const HDR_BYTES = 13;
 const FLAG_SILENT = 1 << 0;
 const FLAG_DISCONTINUITY = 1 << 1;
+// The body carries two payloads: a u16 LE length, this frame's Opus packet, then the previous
+// frame's. RFC 2198-style redundancy without the RTP framing, and the only loss-robustness
+// tool this path has — the host's encoder is CELT-only at 5 ms, where libopus's in-band FEC is
+// structurally inert. The host sets it only when the join advertised `redundancy`, so an older
+// client is never handed a body it cannot split.
+const FLAG_REDUNDANT = 1 << 2;
+const REDUNDANCY_PREFIX_LEN = 2;
 const SYNC_POST_INTERVAL_MS = 250;
 // The host encodes 5 ms frames; a seq gap is that many frames of missing audio.
 const FRAME_MS = 5;
@@ -54,6 +61,15 @@ let scratchR = null;
 //
 // Positions are absolute uint32 frame counters indexed with `pos & (cap-1)`, so the capacity
 // must be a power of two.
+function clearShared() {
+    ctrl = null;
+    ringL = null;
+    ringR = null;
+    capFrames = 0;
+    mask = 0;
+    shared = false;
+}
+
 function setupShared(sab, frames) {
     if (!frames || (frames & (frames - 1)) !== 0) {
         console.error('[audio-worker] ring capacity is not a power of two:', frames);
@@ -152,7 +168,13 @@ function onDecoded(ad) {
     }
     if (enqueueAbsMs - lastSyncPostAt > SYNC_POST_INTERVAL_MS) {
         lastSyncPostAt = enqueueAbsMs;
-        self.postMessage({ type: 'sync', preEnqueueMs: preEnqueueEmaMs, concealed: concealed });
+        self.postMessage({
+            type: 'sync',
+            preEnqueueMs: preEnqueueEmaMs,
+            concealed: concealed,
+            redundantUsed: redundantUsed,
+            redundantDiscarded: redundantDiscarded,
+        });
     }
 
     rememberDecoded(l, r, frames);
@@ -196,6 +218,10 @@ function makeDecoder() {
 // empty ring — by then the depth has already collapsed and it re-primes, which costs a whole
 // buffer of silence. Filling the hole here keeps the ring at depth and the loss inaudible.
 let concealed = 0;
+// A redundant copy that filled a real hole, and one that arrived for a packet we already had.
+// The second number is the cost of the feature and the first is what it bought.
+let redundantUsed = 0;
+let redundantDiscarded = 0;
 let lastDecodedL = null;
 let lastDecodedR = null;
 let lastDecodedFrames = 0;
@@ -234,37 +260,74 @@ function rememberDecoded(l, r, frames) {
     lastDecodedFrames = frames;
 }
 
+function submit(buf, off, len, timestampUs) {
+    if (len <= 0) return;
+    if (!decoder || decoder.state !== 'configured') return;
+    try {
+        decoder.decode(new EncodedAudioChunk({
+            type: 'key',
+            timestamp: timestampUs, // micro-s
+            data: new Uint8Array(buf, off, len),
+        }));
+    } catch (e) {
+        console.warn('[audio-worker] decode failed:', e);
+    }
+}
+
 function handlePacket(buf) {
     if (buf.byteLength < HDR_BYTES) return;
     const dv = new DataView(buf);
     const seq = dv.getUint32(0, true);
     const captureNs = readU64(dv, 4);
     const flags = dv.getUint8(12);
+
+    let primaryOff = HDR_BYTES;
+    let primaryLen = buf.byteLength - HDR_BYTES;
+    let prevOff = 0;
+    let prevLen = 0;
+    if (flags & FLAG_REDUNDANT) {
+        if (buf.byteLength < HDR_BYTES + REDUNDANCY_PREFIX_LEN) return;
+        primaryLen = dv.getUint16(HDR_BYTES, true);
+        primaryOff = HDR_BYTES + REDUNDANCY_PREFIX_LEN;
+        if (buf.byteLength - primaryOff < primaryLen) return;
+        prevOff = primaryOff + primaryLen;
+        prevLen = buf.byteLength - prevOff;
+    }
+
+    let gap = 0;
     if (lastSeq !== null) {
         if (seq === lastSeq) return; // duplicate
         if (((seq - lastSeq) >>> 0) >= 0x80000000) return; // older --> late
-        const gap = ((seq - lastSeq) >>> 0) - 1;
-        if (gap > 0 && !(flags & FLAG_DISCONTINUITY)) concealPackets(gap);
+        gap = ((seq - lastSeq) >>> 0) - 1;
     }
-    lastSeq = seq;
+    const discontinuity = !!(flags & FLAG_DISCONTINUITY);
+    const captureUs = Math.round(captureNs / 1000);
+
+    // The trailing copy is the payload for `seq - 1` and nothing else, so it is worth
+    // decoding only when that packet never arrived. Otherwise it is a duplicate of audio
+    // already in the ring and playing it would double the frame, not repair anything.
+    let recovered = false;
+    if (prevLen > 0 && !discontinuity) {
+        if (gap > 0) {
+            // The copy reaches back exactly one frame; anything older is still a hole.
+            if (gap > 1) concealPackets(gap - 1);
+            submit(buf, prevOff, prevLen, captureUs - FRAME_MS * 1000);
+            redundantUsed++;
+            recovered = true;
+        } else {
+            redundantDiscarded++;
+        }
+    }
     // The host is telling us the capture itself broke, so there is nothing to bridge: let
     // the worklet resynchronise instead of pretending the missing audio existed.
-    if (flags & FLAG_DISCONTINUITY) {
+    if (!recovered && gap > 0 && !discontinuity) concealPackets(gap);
+
+    lastSeq = seq;
+    if (discontinuity) {
         lastDecodedFrames = 0;
         self.postMessage({ type: 'discontinuity' });
     }
-    const opus = new Uint8Array(buf, HDR_BYTES);
-    if (opus.byteLength === 0) return;
-    if (!decoder || decoder.state !== 'configured') return;
-    try {
-        decoder.decode(new EncodedAudioChunk({
-            type: 'key',
-            timestamp: Math.round(captureNs / 1000), // micro-s
-            data: opus,
-        }));
-    } catch (e) {
-        console.warn('[audio-worker] decode failed:', e);
-    }
+    submit(buf, primaryOff, primaryLen, captureUs);
 }
 
 self.onmessage = (ev) => {
@@ -278,10 +341,22 @@ self.onmessage = (ev) => {
         lastSeq = null;
         preEnqueueEmaMs = null;
         concealed = 0;
+        redundantUsed = 0;
+        redundantDiscarded = 0;
         decoderResets = 0;
         copyFailures = 0;
+        // Re-initialising must not leave the previous decoder open: the mode handshake below
+        // can send a second `init` in the same session.
+        try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (_) {}
+        decoder = null;
         lastDecodedFrames = 0;
+        clearShared();
         if (d.sab) setupShared(d.sab, d.capFrames);
+        // The reader validates the same buffer independently, and if the two ever disagreed
+        // the writer would fill a ring nobody reads while the reader primed forever on a write
+        // position nobody advances — permanent silence with both halves believing they work.
+        // Say which mode this side actually ended up in.
+        self.postMessage({ type: 'mode', shared: shared });
         makeDecoder();
     } else if (d.type === 'clockoffset') {
         if (typeof d.offsetMs === 'number' && isFinite(d.offsetMs)) {
