@@ -405,11 +405,14 @@ fn at_capacity_page() -> Response {
         .into_response()
 }
 
-// The static assets are `include_str!`'d, so the binary's version *is* their content: an
-// ETag built from it changes exactly when they do. `no-cache` keeps the client revalidating
-// rather than pinning a stale asset across an update, and the revalidation costs a 304
-// instead of the ~120 KB the page used to refetch on every reload. `index` is deliberately
-// left uncached: it carries a per-request substitution.
+// The static assets are `include_str!`'d, so each one's ETag is a hash of its own bytes,
+// folded at compile time. The version string was a proxy for the content and a wrong one:
+// the client page has no build step and is edited by hand, so any edit that did not also bump
+// the crate version served a 304 against the stale copy every browser had already cached —
+// a trap aimed squarely at the workflow that touches these files. `no-cache` keeps the client
+// revalidating rather than pinning a stale asset across an update, and the revalidation costs
+// a 304 instead of the ~120 KB the page used to refetch on every reload. `index` is
+// deliberately left uncached: it carries a per-request substitution.
 fn asset(
     content_type: &'static str,
     etag: &str,
@@ -438,80 +441,68 @@ fn asset(
         .into_response()
 }
 
-fn asset_etag() -> String {
-    format!("\"{}\"", env!("CARGO_PKG_VERSION"))
+// FNV-1a, `const` so every call site folds to a literal and no request pays for the hash.
+const fn asset_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+fn asset_etag(hash: u64) -> String {
+    format!("\"{:016x}\"", hash)
 }
 
 async fn transform_worker(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/transform-worker.js"),
-    )
+    const BODY: &str = include_str!("static/transform-worker.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn input_js(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/input.js"),
-    )
+    const BODY: &str = include_str!("static/input.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn audio_js(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/audio.js"),
-    )
+    const BODY: &str = include_str!("static/audio.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn audio_worklet_js(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/audio-worklet.js"),
-    )
+    const BODY: &str = include_str!("static/audio-worklet.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn audio_worker_js(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/audio-worker.js"),
-    )
+    const BODY: &str = include_str!("static/audio-worker.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn nosleep_js(headers: HeaderMap) -> Response {
-    asset(
-        "text/javascript",
-        &asset_etag(),
-        &headers,
-        include_str!("static/nosleep.js"),
-    )
+    const BODY: &str = include_str!("static/nosleep.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn logo(headers: HeaderMap) -> Response {
-    asset(
-        "image/svg+xml",
-        &asset_etag(),
-        &headers,
-        include_str!("static/logo.svg"),
-    )
+    const BODY: &str = include_str!("static/logo.svg");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("image/svg+xml", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn styles(headers: HeaderMap) -> Response {
-    asset(
-        "text/css",
-        &asset_etag(),
-        &headers,
-        include_str!("static/styles.css"),
-    )
+    const BODY: &str = include_str!("static/styles.css");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/css", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn ice_config(State(state): State<AppState>) -> Response {
