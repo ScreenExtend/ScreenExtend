@@ -252,6 +252,108 @@ side by side are what step 7 wants anyway.
 
 ---
 
+## 5b. What DXGI does on hybrid graphics, and how loudly it says so (10 min)
+
+The DXGI fallback is not available everywhere, and the point of this step is that a machine where
+it is unavailable must **say so** rather than negotiate a session and show a black screen.
+
+Three things changed and each has a log line that proves it:
+
+1. `IDXGIOutput5::DuplicateOutput1` is tried before `IDXGIOutput1::DuplicateOutput`, probed by
+   `QueryInterface` rather than by a build number. It takes an explicit format list and is the only
+   one that can duplicate a display in HDR mode.
+2. Every adapter that enumerates the display is tried, not just the first. On a hybrid laptop the
+   same display can be listed by more than one adapter and only the one that composes it can
+   duplicate it.
+3. A duplication that is re-established without ever producing a frame now fails the capture after
+   40 attempts instead of looping forever, and the "re-established" line is rate-limited.
+
+### The healthy shape
+
+```powershell
+cd src-tauri
+cargo run --release --features probe -- probe --capture-backend dxgi --whep-selftest --duration 30
+```
+
+```
+dxgi: duplication ready on \.\DISPLAYn via DuplicateOutput1 on <adapter> (vendor 0x____, LUID 0x____): WxH, rotation=..., logical=WxH
+pipeline: live capture ready -- DXGI duplication (DuplicateOutput1) -> <path>
+```
+
+`via DuplicateOutput` instead of `DuplicateOutput1` is fine and expected on Windows 8.1-era stacks;
+it only means the newer interface was absent or declined. Note which one you got — that is the
+answer this step exists to collect.
+
+### The unavailable shape
+
+On this project's dev box (RTX 3080 Ti Laptop + Intel UHD, hybrid), the primary display is
+enumerated **only** by the NVIDIA adapter and that adapter refuses duplication through either
+entry point:
+
+```
+probe failed: no adapter can duplicate \.\DISPLAY1 (NVIDIA GeForce RTX 3080 Ti Laptop GPU (vendor 0x10DE, LUID 0x17D9A): Error { code: HRESULT(0x887A0004), ... })
+```
+
+`0x887A0004` is `DXGI_ERROR_UNSUPPORTED`. That machine is WGC-only and that is a legitimate
+outcome — but the message must name every adapter it tried and why each declined. A bare HRESULT
+with no adapter named is a regression; report it.
+
+The compatibility report agrees, because its `dxgi` probe now creates a duplication and drops it
+rather than asking whether a DXGI factory exists:
+
+```powershell
+cargo run --release -- doctor --json
+```
+
+`capture` should read `WindowsGraphicsCapture` on any machine where WGC works. In the log from the
+same run, exactly one of these two lines must appear:
+
+```
+dxgi: duplication fallback available via DuplicateOutput1
+dxgi: duplication fallback is NOT available on this machine (...); Windows.Graphics.Capture is the only capture path here
+```
+
+| Symptom | Meaning |
+|---|---|
+| Neither line | The probe did not run. Report it — the report is back to guessing. |
+| "NOT available" on a machine where step 5 succeeded | The probe and the live path disagree; paste both. |
+| "available" on a machine where step 5 failed | Same, in the other direction, and worse. |
+
+### The spin that must not happen
+
+Against a freshly created virtual display, watch for:
+
+```
+dxgi: duplication re-established (1 since the last frame)
+dxgi: duplication re-established (10 since the last frame)
+...
+dxgi capture: duplication was re-established 41 times without ever delivering a frame; this output cannot be captured with DXGI Desktop Duplication
+```
+
+The count rising to 10, 20, 30 and then the capture stopping with that message is **correct
+behaviour**, not a bug: the alternative is an endless `ACCESS_LOST` -> re-duplicate loop that
+delivers nothing while the client sits on a negotiated session showing black. What is a bug is
+either an unbounded run of those lines (the cap is not working) or a line printed for every single
+re-establishment (the rate limit is not working — and every log line is an IPC event to the UI).
+
+A count that climbs a little and then resets to nothing as frames start flowing is the normal
+settling of a virtual display; ignore it.
+
+### The staging ring
+
+The DXGI path no longer encodes on the capture thread. Under load, the per-60-frame line now
+carries the frame budget:
+
+```
+encode-path latency: path=dxgi+<backend>, avg_ms=..., max_ms=..., frames=..., budget_ms=...
+```
+
+`avg_ms` above `budget_ms` means the encoder cannot keep up at the requested rate; pair it with
+`frames_dropped_ring` from the telemetry line in step 3, which is where the DXGI ring's drops are
+counted too.
+
+---
+
 ## 6. Cursor correctness on both backends (5 min)
 
 Each backend composites the cursor differently, and the DXGI path does it incrementally, so it
@@ -338,6 +440,9 @@ The DXGI fallback line must not appear anywhere in the log.
 3. The `pipeline: live capture ready -- ...` line — which path you got.
 4. The OS build from `winver`, and the product name from step 0.
 5. The last `telemetry: capture=...` line of the run, whole.
+5b. From step 5b: the `dxgi: duplication ready ... via <api> on <adapter>` line (or the
+   `no adapter can duplicate ...` failure), and whichever of the two `dxgi: duplication fallback
+   ...` lines the compatibility probe printed.
 6. Anything you did not expect — especially a `falling back to DXGI Desktop Duplication` line on
    any host, a flag that disagrees with the step 0 table, or a `frames_dropped_stale` count that
    kept climbing after the load stopped.

@@ -21,8 +21,19 @@ impl TauriDeviceReporter {
         Arc::new(Self { app, overrides })
     }
 
+    /// A join or a leave does not change the adapter set. The only thing this re-evaluates is
+    /// `display_slot_holder`, which returns `None` immediately unless the display backend caps
+    /// concurrent displays — true only on the macOS AirPlay tier. On the `CGVirtualDisplay` tier
+    /// it was a no-op that still cost a fresh OS thread and three lock acquisitions, once per
+    /// join and once per leave.
     fn resync_streamers(&self) {
         use tauri::Manager;
+        let Some(state) = self.app.try_state::<super::AppState>() else {
+            return;
+        };
+        if state.virtual_display.max_concurrent_displays().is_none() {
+            return;
+        }
         let app = self.app.clone();
         std::thread::spawn(move || {
             if let Some(state) = app.try_state::<super::AppState>() {
@@ -36,7 +47,10 @@ impl DeviceReporter for TauriDeviceReporter {
     fn report_join(&self, info: DeviceInfo) {
         let ip = info.ip.clone();
         let mut device = Device::defaults(info);
-        if let Some(o) = self.overrides.lock().unwrap().get(&ip) {
+        // Bound rather than left in the `if let` scrutinee: a guard produced there lives to the
+        // end of the block, which is the shape the project bans near an `.await`.
+        let override_for_ip = self.overrides.lock().unwrap().get(&ip).copied();
+        if let Some(o) = override_for_ip {
             device.scale = o.scale;
             device.refresh_rate = o.refresh_rate;
             device.video_scale = o.video_scale;
