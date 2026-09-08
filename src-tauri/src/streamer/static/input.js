@@ -8,10 +8,26 @@
     CLIPBOARD: 0x30, DRAG: 0x40, DROP: 0x41,
     FOCUS_STATE: 0x50, VISIBILITY: 0x51, RESIZE: 0x52, POINTERLOCK_STATE: 0x53,
     MOUSE_DELTA: 0x54, PING: 0x60, PONG: 0x61, STATS: 0x62, BYE: 0x63,
+    KEYFRAME_REQUEST: 0x64,
   };
+
+  // BigInt is Safari 14 / Chrome 67. This file is loaded by every client including the ones
+  // below that floor, so nothing here may construct one: a u64 is written and read as two
+  // little-endian u32 halves, which is byte-identical to setBigUint64/getBigUint64 and needs
+  // no feature test. Every value we put through it (nanosecond stamps, file sizes) is well
+  // under 2^53, so the Number round trip is exact.
+  const U32 = 4294967296;
+  function setU64(view, off, value) {
+    const v = value < 0 ? 0 : value;
+    const hi = Math.floor(v / U32);
+    view.setUint32(off, (v - hi * U32) >>> 0, true);
+    view.setUint32(off + 4, hi >>> 0, true);
+  }
+  function getU64(view, off) {
+    return view.getUint32(off, true) + view.getUint32(off + 4, true) * U32;
+  }
   const SRC = { mouse: 0x00, touch: 0x01, pen: 0x02 };
   const te = new TextEncoder();
-  const mouseRelative = true;
   const settings = { sensitivity: 1.0, accel: 0.0 };
   try {
     const saved = JSON.parse(localStorage.getItem('rib.settings') || '{}');
@@ -35,9 +51,34 @@
   let imeSink = null;
 
   let cssW = window.innerWidth, cssH = window.innerHeight;
+  // The picture is laid out `object-fit: contain`, so on any stage whose aspect ratio
+  // differs from the host display's there are bars, and a tap in a bar is not a tap on the
+  // desktop.
+  // Normalising against the stage put every touch off by half the bar width; these are the
+  // rendered picture's rect inside the stage.
+  let picX = 0, picY = 0, picW = 0, picH = 0;
+  let srcW = 0, srcH = 0;
   function refreshSize() {
     cssW = (surface && surface.clientWidth) || window.innerWidth;
     cssH = (surface && surface.clientHeight) || window.innerHeight;
+    recomputePictureRect();
+  }
+  function recomputePictureRect() {
+    if (!(srcW > 0 && srcH > 0 && cssW > 0 && cssH > 0)) {
+      picX = 0; picY = 0; picW = cssW; picH = cssH;
+      return;
+    }
+    const scale = Math.min(cssW / srcW, cssH / srcH);
+    picW = srcW * scale;
+    picH = srcH * scale;
+    picX = (cssW - picW) / 2;
+    picY = (cssH - picH) / 2;
+  }
+  function setPictureSize(w, h) {
+    if (!(w > 0 && h > 0)) return;
+    if (w === srcW && h === srcH) return;
+    srcW = w; srcH = h;
+    recomputePictureRect();
   }
 
   const moveBuf = new ArrayBuffer(40), moveView = new DataView(moveBuf);
@@ -67,14 +108,17 @@
     }
   }
   const FAST_BUFFER_MAX = 8192;
+  let fastDropped = 0;
   function rawSend(ch, buf, len) {
     if (!ch || ch.readyState !== 'open') return;
-    try { ch.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) {}
+    try { ch.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) { noteSuppressed(); }
   }
   function fastSend(buf, len) {
     if (!fast || fast.readyState !== 'open') return;
-    if (fast.bufferedAmount > FAST_BUFFER_MAX) return;
-    try { fast.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) {}
+    // Dropping under backpressure is correct on an unordered, zero-retransmit channel — a
+    // stale cursor position is worth nothing — but it used to be invisible.
+    if (fast.bufferedAmount > FAST_BUFFER_MAX) { fastDropped++; return; }
+    try { fast.send(len === undefined ? buf : new Uint8Array(buf, 0, len)); } catch (_) { noteSuppressed(); }
   }
   function send(op, buf, len) {
     const ch = channelFor(op);
@@ -97,8 +141,8 @@
   function sourceByte(e) {
     return e.pointerType === 'touch' ? SRC.touch : e.pointerType === 'pen' ? SRC.pen : SRC.mouse;
   }
-  function normX(e) { return clamp01(e.clientX / cssW); }
-  function normY(e) { return clamp01(e.clientY / cssH); }
+  function normX(e) { return clamp01((e.clientX - picX) / (picW || cssW || 1)); }
+  function normY(e) { return clamp01((e.clientY - picY) / (picH || cssH || 1)); }
 
   function sendPointer(op, e, ch) {
     moveView.setUint8(0, op);
@@ -110,8 +154,8 @@
     moveView.setFloat32(18, e.tiltX || 0, true);
     moveView.setFloat32(22, e.tiltY || 0, true);
     moveView.setFloat32(26, e.twist || 0, true);
-    moveView.setFloat32(30, (e.width || 0) / cssW, true);
-    moveView.setFloat32(34, (e.height || 0) / cssH, true);
+    moveView.setFloat32(30, (e.width || 0) / (picW || cssW || 1), true);
+    moveView.setFloat32(34, (e.height || 0) / (picH || cssH || 1), true);
     moveView.setUint16(38, e.buttons || 0, true);
     if (ch) rawSend(ch, moveBuf); else send(op, moveBuf);
   }
@@ -127,8 +171,8 @@
       let o = 10;
       for (let i = start; i < start + n; i++) {
         const s = coalesced[i];
-        batchView.setFloat32(o, clamp01(s.clientX / cssW), true);
-        batchView.setFloat32(o + 4, clamp01(s.clientY / cssH), true);
+        batchView.setFloat32(o, clamp01((s.clientX - picX) / (picW || cssW || 1)), true);
+        batchView.setFloat32(o + 4, clamp01((s.clientY - picY) / (picH || cssH || 1)), true);
         batchView.setFloat32(o + 8, s.pressure != null ? s.pressure : 0, true);
         batchView.setFloat32(o + 12, s.tiltX || 0, true);
         batchView.setFloat32(o + 16, s.tiltY || 0, true);
@@ -217,7 +261,7 @@
     const items = await Promise.all(files.map(async f => ({
       name: te.encode(f.name),
       mime: te.encode(f.type || 'application/octet-stream'),
-      size: BigInt(f.size),
+      size: f.size,
       data: new Uint8Array(await f.arrayBuffer()),
     })));
     let total = 12;
@@ -235,8 +279,8 @@
       new Uint8Array(buf, o).set(it.name); o += it.name.length;
       v.setUint32(o, it.mime.length, true); o += 4;
       new Uint8Array(buf, o).set(it.mime); o += it.mime.length;
-      v.setBigUint64(o, it.size, true); o += 8;
-      v.setBigUint64(o, BigInt(it.data.length), true); o += 8;
+      setU64(v, o, it.size); o += 8;
+      setU64(v, o, it.data.length); o += 8;
       new Uint8Array(buf, o).set(it.data); o += it.data.length;
     }
     send(OP.DROP, buf);
@@ -250,11 +294,12 @@
     resizeView.setFloat32(5, window.devicePixelRatio || 1, true);
     send(OP.RESIZE, resizeBuf);
   }
-  // Client -> host telemetry, v1. Layout and field meanings: docs/TELEMETRY.md. Fixed offsets,
+  // Client -> host telemetry, v2. Layout and field meanings: docs/TELEMETRY.md. Fixed offsets,
   // little-endian; a newer client may append fields and an older host will read the prefix it
-  // knows, so the length is a floor and never an equality check on either side.
-  const STATS_LEN = 72;
-  const STATS_VERSION = 1;
+  // knows, so the length is a floor and never an equality check on either side. Bytes 0..72
+  // are byte-identical to v1 for exactly that reason.
+  const STATS_LEN = 96;
+  const STATS_VERSION = 2;
   const FLAG = {
     SAB: 1 << 0, ISOLATED: 1 << 1, WAKE_LOCK: 1 << 2, POINTER_LOCK: 1 << 3,
     KEYBOARD_LOCK: 1 << 4, FULLSCREEN: 1 << 5, SET_SINK_ID: 1 << 6,
@@ -312,14 +357,41 @@
     v.setUint32(60, u32(st.audioUnderruns), true);
     v.setUint32(64, u32(st.audioOverruns), true);
     v.setUint32(68, us(st.rttMs), true);
+    // v2 tail: which mechanism is actually live on each axis, and everything the page had
+    // been swallowing in a bare `catch (_) {}`.
+    v.setUint8(72, st.transportTier | 0);
+    v.setUint8(73, st.renderTier | 0);
+    v.setUint8(74, st.keyTier | 0);
+    v.setUint8(75, st.sinkTier | 0);
+    v.setUint32(76, u32(st.suppressed), true);
+    v.setUint32(80, u32(st.degraded) >>> 0, true);
+    v.setUint32(84, us(st.audioTargetMs), true);
+    v.setUint32(88, u32(st.audioConcealed), true);
+    v.setUint32(92, us(st.audioOutputLatencyMs), true);
     send(OP.STATS, statsBuf);
   }
 
   function sendPing() {
-    const t = BigInt(Math.round(performance.now() * 1e6));
     pingView.setUint8(0, OP.PING);
-    pingView.setBigUint64(1, t, true);
+    setU64(pingView, 1, Math.round(performance.now() * 1e6));
     send(OP.PING, pingBuf);
+  }
+
+  // The legacy `createEncodedStreams` transform gives the client no way to ask for an IDR,
+  // so the page relays the request here instead. A host that does not know this opcode
+  // returns None from its parser and ignores the frame, which is why this is safe to send
+  // unconditionally.
+  const keyReqBuf = new ArrayBuffer(2), keyReqView = new DataView(keyReqBuf);
+  let lastKeyReqAt = 0;
+  function requestKeyframe() {
+    const now = performance.now();
+    if (now - lastKeyReqAt < 200) return false;
+    lastKeyReqAt = now;
+    if (!reliable || reliable.readyState !== 'open') return false;
+    keyReqView.setUint8(0, OP.KEYFRAME_REQUEST);
+    keyReqView.setUint8(1, 0);
+    send(OP.KEYFRAME_REQUEST, keyReqBuf);
+    return true;
   }
   let lastRttMs = 0;
 
@@ -346,13 +418,13 @@
   }
 
   function onPong(dv) {
-    const echoedNs = Number(dv.getBigUint64(1, true));
+    const echoedNs = getU64(dv, 1);
     const nowMs = performance.now();
     const rttMs = nowMs - echoedNs / 1e6;
     lastRttMs = rttMs;
     if (dv.byteLength < 17 || !isFinite(rttMs) || rttMs < 0 || rttMs > 5000) return;
     if (!(rttMs <= clock.bestRttMs || nowMs - clock.bestAt > CLOCK_SAMPLE_TTL_MS)) return;
-    const hostMs = Number(dv.getBigUint64(9, true)) / 1e6;
+    const hostMs = getU64(dv, 9) / 1e6;
     const midAbsMs = performance.timeOrigin + (echoedNs / 1e6 + nowMs) / 2;
     clock.bestRttMs = rttMs;
     clock.bestAt = nowMs;
@@ -375,7 +447,6 @@
     } catch (_) {}
   }
 
-  const TICK_MS = 4;
   const pendingMoves = new Map();
   const pendingStrokes = new Map();
   const rel = { dx: 0, dy: 0, buttons: 0, pending: false };
@@ -399,15 +470,57 @@
     mouseGateOpen = true;
     absGateOpen = true;
   }
+  // Chrome 58 / Firefox 59 (always empty on Firefox Android) / Safari 18.2. A high-rate
+  // digitiser or 1000 Hz mouse produces several samples per frame, and without this all but
+  // the last are thrown away by the MessageChannel flush — a drag becomes a polyline of
+  // whatever the browser happened to deliver on a task boundary.
+  const hasCoalesced = window.PointerEvent && ('getCoalescedEvents' in PointerEvent.prototype);
+  // The host replays a batch one injection per sample, so an uncapped burst from a 1000 Hz
+  // device would cost it more than the fidelity is worth. Eight per flush is roughly one
+  // sample per 2 ms at 60 Hz, which is finer than any host cursor can resolve.
+  const MAX_COALESCED_PER_FLUSH = 8;
   function coalescedOf(e) {
-    return (typeof e.getCoalescedEvents === 'function') ? (e.getCoalescedEvents() || [e]) : [e];
+    if (!hasCoalesced) return [e];
+    let c;
+    try { c = e.getCoalescedEvents(); } catch (_) { return [e]; }
+    if (!c || !c.length) return [e];
+    if (c.length <= MAX_COALESCED_PER_FLUSH) return c;
+    // Keep the newest samples: they are the ones the user is still looking at.
+    return c.slice(c.length - MAX_COALESCED_PER_FLUSH);
+  }
+  function pushStroke(e, src) {
+    let st = pendingStrokes.get(e.pointerId);
+    const c = coalescedOf(e);
+    if (!st && c.length === 1) {
+      // A single sample goes as a full pointer message: it carries contact width, height
+      // and per-event buttons, none of which the 24-byte batch sample has room for.
+      if (absGateOpen && pendingMoves.size === 0) {
+        absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush(); return;
+      }
+      pendingMoves.set(e.pointerId, e); armFlush(); return;
+    }
+    if (!st) { st = { source: src, buttons: e.buttons || 0, samples: [] }; pendingStrokes.set(e.pointerId, st); }
+    // Any single move already queued for this pointer is older than these samples, and the
+    // two queues flush in a fixed order, so it would arrive out of sequence.
+    pendingMoves.delete(e.pointerId);
+    st.buttons = e.buttons || 0;
+    for (let i = 0; i < c.length; i++) st.samples.push(c[i]);
+    if (st.samples.length > BATCH_MAX) st.samples.splice(0, st.samples.length - BATCH_MAX);
+    if (absGateOpen) { absGateOpen = false; flushStroke(e.pointerId, st); }
+    armFlush();
   }
 
   function onPointerMove(e) {
     const src = sourceByte(e);
-    const locked = mouseRelative && (document.pointerLockElement === surface || !!document.pointerLockElement);
+    const locked = (document.pointerLockElement === surface || !!document.pointerLockElement);
     if (src === SRC.mouse && locked) {
-      const [ax, ay] = applyMouseCurve(e.movementX || 0, e.movementY || 0);
+      // Under pointer lock the interesting quantity is the summed movement, and summing the
+      // coalesced samples recovers the motion the browser merged away.
+      let mx = 0, my = 0;
+      const c = coalescedOf(e);
+      for (let i = 0; i < c.length; i++) { mx += c[i].movementX || 0; my += c[i].movementY || 0; }
+      if (c.length === 1 && c[0] === e) { mx = e.movementX || 0; my = e.movementY || 0; }
+      const [ax, ay] = applyMouseCurve(mx, my);
       rel.dx += ax; rel.dy += ay; rel.buttons = e.buttons || 0;
       if (mouseGateOpen && !rel.pending) {
         mouseGateOpen = false;
@@ -416,27 +529,11 @@
       } else {
         rel.pending = true; armFlush();
       }
-    } else if (src === SRC.mouse) {
-      if (absGateOpen && pendingMoves.size === 0) {
-        absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush();
-      } else {
-        pendingMoves.set(e.pointerId, e); armFlush();
-      }
     } else if (src === SRC.touch) {
       updatePinch(e);
-      if (absGateOpen && pendingMoves.size === 0) {
-        absGateOpen = false; sendPointer(OP.POINTER_MOVE, e); armFlush();
-      } else {
-        pendingMoves.set(e.pointerId, e); armFlush();
-      }
+      pushStroke(e, src);
     } else {
-      let st = pendingStrokes.get(e.pointerId);
-      if (!st) { st = { source: src, buttons: e.buttons || 0, samples: [] }; pendingStrokes.set(e.pointerId, st); }
-      st.buttons = e.buttons || 0;
-      const c = coalescedOf(e);
-      for (let i = 0; i < c.length; i++) st.samples.push(c[i]);
-      if (absGateOpen) { absGateOpen = false; flushStroke(e.pointerId, st); armFlush(); }
-      else { armFlush(); }
+      pushStroke(e, src);
     }
   }
   function onPointerDown(e) {
@@ -608,7 +705,13 @@
         try { imeSink.focus({ preventScroll: true }); } catch (_) {}
       }
       if (!pingTimer) {
-        pingTimer = setInterval(function () { sendPing(); sendStats(); }, 1000);
+        // Separate guards: a throw inside sendStats() must not cost the clock sample, and
+        // vice versa. Either failing silently would leave the host with a client that
+        // simply never reports.
+        pingTimer = setInterval(function () {
+          try { sendPing(); } catch (_) { noteSuppressed(); }
+          try { sendStats(); } catch (_) { noteSuppressed(); }
+        }, 1000);
       }
     };
     reliable.onclose = () => { if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; } clearHeld(); };
@@ -628,9 +731,17 @@
     }
   }
 
+  function noteSuppressed() {
+    if (window.SEVideo && SEVideo.noteSuppressed) SEVideo.noteSuppressed();
+  }
+
   window.RemoteInput = {
     setup,
     teardown,
+    requestKeyframe,
+    setPictureSize,
+    hasCoalescedEvents() { return !!hasCoalesced; },
+    get fastDropped() { return fastDropped; },
     onViewportSettled() { refreshSize(); sendResize(); },
     get rtt() { return lastRttMs; },
   };
