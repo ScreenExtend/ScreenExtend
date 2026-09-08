@@ -142,18 +142,20 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
     }
 }
 
-pub fn start_audio_capture() -> Result<crate::streamer::audio::AudioCapture> {
+pub fn start_audio_capture(
+    sink: crate::streamer::audio::AudioSink,
+) -> Result<crate::streamer::audio::AudioCapture> {
     #[cfg(target_os = "windows")]
     {
-        crate::windows_utils::audio::start_capture()
+        crate::windows_utils::audio::start_capture(sink)
     }
     #[cfg(target_os = "macos")]
     {
-        crate::macos_utils::audio::start_capture()
+        crate::macos_utils::audio::start_capture(sink)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::linux_utils::audio::start_capture()
+        crate::linux_utils::audio::start_capture(sink)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {

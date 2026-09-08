@@ -39,6 +39,7 @@ fn is_idr_with_headers(au: &[u8]) -> bool {
 
 #[test]
 fn x264_software_encodes_synthetic_frames() {
+    super::show_measurements();
     const W: u32 = 1920;
     const H: u32 = 1080;
     const FPS: u32 = 60;
@@ -145,6 +146,7 @@ fn x264_software_encodes_synthetic_frames() {
 
 #[test]
 fn x264_software_runtime_bitrate_change() {
+    super::show_measurements();
     const W: u32 = 1280;
     const H: u32 = 720;
     const FPS: u32 = 60;
