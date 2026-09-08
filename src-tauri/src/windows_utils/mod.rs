@@ -350,24 +350,43 @@ pub fn set_device_override(
         dpr,
         audio_enabled,
     };
-    let restart_needed = {
-        let mut overrides = state.device_overrides.lock().unwrap();
-        let restart = match overrides.get(&ip) {
+    // Which overrides need the session rebuilt, and which only need the display touched. The
+    // client answers a reconfig epoch bump by tearing the whole session down — peer connection,
+    // encoder, capture, injector thread — and paying the full join cost. Everything below except
+    // the display scale is an encoder-session parameter, so that is unavoidable for them. The
+    // scale is not: it changes the extended desktop's DPI, not the captured geometry, so the
+    // stream the client is already decoding is exactly the stream it wants.
+    let (needs_rebuild, scale_only) = {
+        let mut overrides = state.device_overrides.lock_recover();
+        let verdict = match overrides.get(&ip) {
             Some(old) => {
-                old.scale != next.scale
-                    || old.orientation_portrait != next.orientation_portrait
+                let rebuild = old.orientation_portrait != next.orientation_portrait
                     || old.refresh_rate != next.refresh_rate
                     || old.video_scale != next.video_scale
                     || old.video_quality != next.video_quality
-                    || (old.dpr - next.dpr).abs() > f64::EPSILON
+                    || (old.dpr - next.dpr).abs() > f64::EPSILON;
+                (rebuild, !rebuild && old.scale != next.scale)
             }
-            None => true,
+            None => (true, false),
         };
         overrides.insert(ip.clone(), next);
-        restart
+        verdict
     };
-    if restart_needed {
+    if needs_rebuild {
         session::bump_reconfig_epoch(&state.sessions, &ip);
+    } else if scale_only {
+        let sessions = state.sessions.clone();
+        let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
+            MIN_DISPLAY_SCALE,
+            crate::streamer::server::MAX_EFFECTIVE_SCALE,
+        );
+        tauri::async_runtime::spawn(async move {
+            if !crate::streamer::server::apply_scale_live(&sessions, &ip, effective).await {
+                // Nothing live to touch, so there is nothing to apply it to; the next join reads
+                // it back out of the override map anyway.
+                tprintln!("display scale for {ip} saved; no live display to apply it to");
+            }
+        });
     }
 }
 

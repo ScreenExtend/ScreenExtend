@@ -1612,6 +1612,31 @@ async fn restore_displays(displays: Vec<session::LiveDisplay>) {
     }
 }
 
+/// Apply a display-scale change to a live display without making the client rejoin.
+///
+/// Every override the desktop UI can write used to bump the reconfig epoch, and the client answers
+/// an epoch bump by tearing the whole session down and starting again — a new peer connection, a
+/// new encoder, a new capture session, a new injector thread, and the full join cost. For most
+/// overrides that is unavoidable today because they are encoder-session parameters. **The display
+/// scale is not one of them**: it changes the extended desktop's DPI, not the captured geometry, so
+/// the stream the client is already decoding is bit-for-bit the stream it wants. Returns whether it
+/// was applied, so the caller can fall back to the epoch bump.
+pub async fn apply_scale_live(
+    sessions: &session::SharedSessions,
+    ip: &str,
+    effective: u32,
+) -> bool {
+    let Some(display) = session::get_live_display(sessions, ip) else {
+        return false;
+    };
+    apply_display_scale(&display.device_name, effective).await;
+    let mut updated = display.clone();
+    updated.scale = effective.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
+    session::set_live_display(sessions, ip, updated);
+    tprintln!("display scale for {ip} applied live at {effective}% (no rejoin)");
+    true
+}
+
 async fn apply_display_scale(device_name: &str, percent: u32) {
     let name = device_name.to_string();
     let scale = percent.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
