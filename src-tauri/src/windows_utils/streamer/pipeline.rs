@@ -880,6 +880,48 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
 
     let mut cfg = cfg.clone();
     cfg.synthetic_pattern = false;
+
+    // `--workload` normally implies `--synthetic-pattern`, which bypasses capture entirely. Here
+    // the same generated frames go onto the real display instead, so the run exercises the
+    // capture backend, the scaler and the encoder with content that is still repeatable. The
+    // window is dropped at the end of the probe, which closes it.
+    let _workload_window = match select_monitor(cfg.monitor) {
+        Ok((monitor, _)) => monitor
+            .device_name()
+            .ok()
+            .and_then(|name| super::capture::monitor_rect(&name))
+            .and_then(|(left, top, width, height)| {
+                match super::workload_window::WorkloadWindow::spawn(
+                    left,
+                    top,
+                    width,
+                    height,
+                    cfg.max_fps.clamp(1, 240),
+                    cfg.workload,
+                    cfg.counter,
+                ) {
+                    Ok(window) => {
+                        tprintln!(
+                            "probe: painting the '{}' workload onto {width}x{height} at ({left},{top})",
+                            cfg.workload.name()
+                        );
+                        Some(window)
+                    }
+                    Err(e) => {
+                        teprintln!(
+                            "probe: could not put the workload on the display ({e:#}); \
+                             capturing whatever is on it instead"
+                        );
+                        None
+                    }
+                }
+            }),
+        Err(e) => {
+            teprintln!("probe: no monitor to paint the workload onto ({e:#})");
+            None
+        }
+    };
+
     let pipeline = start(&cfg)?;
     // Without this the probe's own telemetry is unreachable: the registry is keyed by session
     // and only the HTTP server publishes into it, so a probe run collected numbers nobody
@@ -1283,50 +1325,6 @@ impl Drop for LiveCapture {
         if let Some(mut ring) = self.ring.take() {
             ring.stop();
         }
-    }
-}
-
-/// A device's adapter LUID and description, for comparing two devices' adapters.
-fn adapter_of(device: &ID3D11Device) -> Option<(i64, String)> {
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-    let dxgi: IDXGIDevice = device.cast().ok()?;
-    let adapter = unsafe { dxgi.GetAdapter() }.ok()?;
-    let desc = unsafe { adapter.GetDesc() }.ok()?;
-    let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64);
-    let end = desc
-        .Description
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(desc.Description.len());
-    Some((luid, String::from_utf16_lossy(&desc.Description[..end])))
-}
-
-/// Say out loud when the GPU composing the captured display is not the GPU encoding it.
-///
-/// Desktop Duplication is adapter-local, so the capture device is on whichever adapter the OS
-/// chose to compose that display. For an indirect display that choice is not ours: before
-/// IddCx 1.4 the OS composes on the POST adapter (the iGPU, on a hybrid laptop) and
-/// `IddCxAdapterSetRenderAdapter` — the only way for the driver to ask for a different one — is
-/// IddCx 1.4, while the bundled driver declares IddCx 1.2. The consequence is a full-frame
-/// cross-adapter copy per frame that a dGPU-attached physical monitor would not pay: at 1080p
-/// BGRA that is ~8.3 MB over PCIe per frame plus its synchronisation.
-///
-/// Nothing here can fix that; the point is that it stops being invisible. See
-/// `docs/OPTIMIZATIONS.md` for the driver-rebuild recommendation.
-fn report_adapter_split(capture: &ID3D11Device, encode: &ID3D11Device) {
-    let (Some((cap_luid, cap_name)), Some((enc_luid, enc_name))) =
-        (adapter_of(capture), adapter_of(encode))
-    else {
-        return;
-    };
-    if cap_luid == enc_luid {
-        tprintln!("pipeline: compose and encode are both on {cap_name}");
-    } else {
-        tprintln!(
-            "pipeline: the display is composed on {cap_name} but encoded on {enc_name}, so every \
-             frame crosses adapters. The bundled indirect display driver declares IddCx 1.2, \
-             which has no way to ask the OS to compose on the encoder's GPU"
-        );
     }
 }
 
@@ -1914,7 +1912,6 @@ fn build_backend(
                     "pipeline: live capture ready -- NVENC ZERO-COPY cross-adapter GPU path ({}x{}@{})",
                     config.width, config.height, config.fps
                 );
-                report_adapter_split(device, encoder.device());
                 Ok(Backend::Nvenc { encoder, path })
             }
             Err(e) => {
