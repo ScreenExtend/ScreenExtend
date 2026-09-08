@@ -73,11 +73,13 @@ pub fn install_pkg(pkg_path: &Path) -> InstallOutcome {
     }
 
     for _ in 0..10 {
+        probe::invalidate(); // the whole point of this loop is to see the state change
         if probe::driver_healthy() {
             return InstallOutcome::Installed;
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
+    probe::invalidate();
     if probe::driver_bundle_installed() {
         InstallOutcome::NeedsReboot
     } else {
@@ -104,6 +106,7 @@ pub fn uninstall() -> InstallOutcome {
         }
     }
 
+    probe::invalidate();
     if probe::driver_bundle_installed() {
         InstallOutcome::Failed("driver bundle still present after uninstall".into())
     } else if probe::driver_healthy() {
