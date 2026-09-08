@@ -12,6 +12,7 @@ pub mod virtual_display;
 use crate::streamer::cloud::{
     CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
 };
+use crate::streamer::lock::LockExt;
 use crate::streamer::session::{
     self, DeviceOverride, SessionAuth, SharedApprovedDevices, SharedBannedDevices,
     SharedDeviceOverrides, SharedDeviceReporter, SharedOtpLimiter, SharedServerPorts,
@@ -47,6 +48,7 @@ pub struct AppState {
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
+    pub stun_urls: session::SharedStunConfig,
     pub banned_devices: SharedBannedDevices,
     pub approved_devices: SharedApprovedDevices,
     pub otp_limiter: SharedOtpLimiter,
@@ -162,6 +164,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
+        stun_urls: session::new_shared_stun_config(),
         banned_devices: session::new_shared_banned_devices(),
         approved_devices: session::new_shared_approved_devices(),
         otp_limiter: session::new_shared_otp_limiter(),
@@ -171,6 +174,18 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
         audio_hub: crate::streamer::audio::AudioHub::new(),
     };
+    // The saved STUN list, read from the same store the CLI writes, so `stun set`, `serve` and
+    // the desktop app all agree. Absent means "keep the built-in default"; an empty list is the
+    // deliberate "no STUN at all", which a LAN-only host has every reason to choose.
+    if let Some(urls) = crate::cli::saved_stun_urls(&app_handle) {
+        if urls.is_empty() {
+            tprintln!("[ice] STUN disabled by configuration; host candidates only");
+        } else {
+            tprintln!("[ice] STUN servers from configuration: {}", urls.join(", "));
+        }
+        *state.stun_urls.lock_recover() = urls;
+    }
+
     app_handle.manage(state);
     true
 }
@@ -566,6 +581,7 @@ pub fn register_cloud_session(
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
+        stun_urls: state.stun_urls.lock_recover().clone(),
         banned_devices: Some(state.banned_devices.clone()),
         approved_devices: Some(state.approved_devices.clone()),
         otp_limiter: Some(state.otp_limiter.clone()),
@@ -707,6 +723,7 @@ pub fn sync_streamers(state: &AppState) {
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
+            stun_urls: state.stun_urls.lock_recover().clone(),
             banned_devices: Some(state.banned_devices.clone()),
             approved_devices: Some(state.approved_devices.clone()),
             otp_limiter: Some(state.otp_limiter.clone()),

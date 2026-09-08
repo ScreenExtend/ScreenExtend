@@ -174,6 +174,33 @@ pub fn new_shared_turn_config() -> SharedTurnConfig {
     Arc::new(Mutex::new(UserTurnConfig::default()))
 }
 
+/// The STUN servers offered to a peer that is not already known to be on this subnet.
+///
+/// `DEFAULT_STUN_URL` was a compile-time constant with no way to change or disable it, and the
+/// only writer outside `Config::default` was `--stun` in the developer probe harness, which is not
+/// wired into the shipping binary. A same-subnet peer is no longer offered STUN at all, so the
+/// common case costs nothing — but a cross-network or unclassified join still contacted a Google
+/// endpoint, with no setting and no way to point it at a private server.
+pub type SharedStunConfig = Arc<Mutex<Vec<String>>>;
+
+pub fn new_shared_stun_config() -> SharedStunConfig {
+    Arc::new(Mutex::new(vec![
+        crate::streamer::config::DEFAULT_STUN_URL.to_string()
+    ]))
+}
+
+/// Parse a comma- or whitespace-separated STUN list the way the TURN surface parses its own.
+///
+/// An empty string means "no STUN at all", which is a legitimate setting: on a LAN-only host it
+/// removes the last reason for the join path to touch the public internet.
+pub fn parse_stun_urls(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveDisplay {
     pub display_id: u32,

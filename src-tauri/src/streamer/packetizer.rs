@@ -496,7 +496,32 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
+
+    /// Counts allocations, so "one allocation per fragmented NAL instead of one per fragment" is a
+    /// number rather than an argument. One relaxed increment per allocation.
+    struct Counting;
+
+    static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, l: Layout) {
+            unsafe { System.dealloc(ptr, l) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, l, n) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
 
     fn synthetic_idr(bytes: usize) -> Bytes {
         let mut v = vec![0u8, 0, 0, 1, 0x67];
@@ -530,6 +555,7 @@ mod bench {
         let mut ours = H264Packetizer::new();
         let mut out: Vec<Bytes> = Vec::new();
         let mut ours_packets = 0usize;
+        let a0 = ALLOCS.load(Ordering::Relaxed);
         let t0 = Instant::now();
         for i in 0..ITERS {
             let frame = if i % 60 == 0 { &idr } else { &p };
@@ -537,9 +563,11 @@ mod bench {
             ours_packets += out.len();
         }
         let ours_ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+        let ours_allocs = ALLOCS.load(Ordering::Relaxed) - a0;
 
         let mut theirs = H264Payloader::default();
         let mut theirs_packets = 0usize;
+        let a1 = ALLOCS.load(Ordering::Relaxed);
         let t1 = Instant::now();
         for i in 0..ITERS {
             let frame = if i % 60 == 0 { &idr } else { &p };
@@ -547,18 +575,24 @@ mod bench {
             theirs_packets += payloads.len();
         }
         let theirs_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
+        let theirs_allocs = ALLOCS.load(Ordering::Relaxed) - a1;
 
         println!(
             "packetize {ITERS} frames @ {MTU}B MTU (1 IDR per 60):\n  \
-             local  {ours_ns:.0} ns/frame, {ours_packets} packets\n  \
-             stock  {theirs_ns:.0} ns/frame, {theirs_packets} packets\n  \
-             speedup {:.2}x",
-            theirs_ns / ours_ns
+             local  {ours_ns:.0} ns/frame, {ours_packets} packets, {ours_allocs} allocations\n  \
+             stock  {theirs_ns:.0} ns/frame, {theirs_packets} packets, {theirs_allocs} allocations\n  \
+             speedup {:.2}x, allocations {:.1}x fewer",
+            theirs_ns / ours_ns,
+            theirs_allocs as f64 / ours_allocs.max(1) as f64
         );
         // The two must agree on how many packets a stream takes, or the comparison is meaningless.
         assert!(
             (ours_packets as i64 - theirs_packets as i64).abs() <= ITERS as i64 / 60,
             "packet counts diverge: {ours_packets} vs {theirs_packets}"
+        );
+        assert!(
+            ours_allocs * 4 < theirs_allocs,
+            "the point of the rewrite is far fewer allocations: {ours_allocs} vs {theirs_allocs}"
         );
     }
 }
