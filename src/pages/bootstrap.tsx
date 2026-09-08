@@ -193,7 +193,7 @@ export default function Bootstrap() {
         // in the document at that moment the TypeError landed in the catch below and the
         // user got the driver-install dialog for what was a routing failure -- and its
         // only action retried the same thing.
-        navigate("/dashboard");
+        void navigate("/dashboard");
         scheduleConfigEditorPreload();
         void loadDevices();
         void loadSettings();
