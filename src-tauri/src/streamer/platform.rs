@@ -124,6 +124,9 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
             EncoderVendor::Intel => {
                 crate::windows_utils::streamer::intel::encoder::probe_encode(config, path)
             }
+            EncoderVendor::Amd => {
+                crate::windows_utils::streamer::amd::encoder::probe_encode(config, path)
+            }
             EncoderVendor::Software => {
                 crate::windows_utils::streamer::x264::encoder::probe_encode(config, path)
             }

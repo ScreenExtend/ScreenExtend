@@ -31,6 +31,7 @@ pub enum EncoderVendor {
     Auto,
     Nvidia,
     Intel,
+    Amd,
     Software,
 }
 
@@ -40,6 +41,7 @@ impl EncoderVendor {
             "auto" => Some(Self::Auto),
             "nvidia" | "nvenc" => Some(Self::Nvidia),
             "intel" | "quicksync" | "qsv" | "onevpl" | "vpl" => Some(Self::Intel),
+            "amd" | "amf" | "radeon" | "vce" | "vcn" => Some(Self::Amd),
             "software" | "sw" | "cpu" | "x264" => Some(Self::Software),
             _ => None,
         }
@@ -414,9 +416,11 @@ CAPTURE / ENCODE\n\
   --intra-refresh <on|off>  rolling intra refresh for passive loss recovery (default off;\n\
                           on = periodic refresh waves can be visible as bands repainting\n\
                           the image; off = steady image, recovers via PLI/FIR -> IDR)\n\
-  --encoder <v>           encoder: auto | nvidia | intel | software (default auto =\n\
-                          pick by capture adapter; intel = Quick Sync / oneVPL;\n\
-                          software = CPU-only libx264 fallback, needs libx264.dll)\n\
+  --encoder <v>           encoder: auto | nvidia | intel | amd | software (default\n\
+                          auto = pick by capture adapter; intel = Quick Sync /\n\
+                          oneVPL; amd = AMF / VCN, needs the Radeon driver's\n\
+                          amfrt64.dll; software = CPU-only libx264 fallback,\n\
+                          needs libx264.dll)\n\
   --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
                           paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
