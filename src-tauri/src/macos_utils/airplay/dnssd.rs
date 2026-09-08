@@ -36,6 +36,8 @@ unsafe extern "C" {
     ) -> DNSServiceErrorType;
 
     fn DNSServiceRefDeallocate(sdRef: DNSServiceRef);
+    fn DNSServiceRefSockFD(sdRef: DNSServiceRef) -> i32;
+    fn DNSServiceProcessResult(sdRef: DNSServiceRef) -> DNSServiceErrorType;
 
     fn TXTRecordCreate(txtRecord: *mut TXTRecordRefRaw, bufferLen: u16, buffer: *mut c_void);
     fn TXTRecordDeallocate(txtRecord: *mut TXTRecordRefRaw);
@@ -49,7 +51,39 @@ unsafe extern "C" {
     fn TXTRecordGetBytesPtr(txtRecord: *const TXTRecordRefRaw) -> *const c_void;
 }
 
-const KDNS_SERVICE_FLAGS_NO_AUTO_RENAME: DNSServiceFlags = 0x0;
+/// `kDNSServiceFlagsNoAutoRename`.
+///
+/// Without it mDNSResponder resolves a name collision by silently renaming the
+/// instance to "ScreenExtend (2)". [`super::ax::connect_to`] then looks for a
+/// picker row titled exactly "ScreenExtend", misses, and burns its whole budget
+/// on a device that is right there under another name.
+///
+/// **This flag is only legal with a registration callback.** Measured on
+/// 10.15.8: `DNSServiceRegister` with `0x8` and a NULL callback returns
+/// `kDNSServiceErr_BadParam` (-65540), on any interface, every time; the same
+/// call with a callback returns 0. That makes sense — the flag's entire meaning
+/// is "report the conflict instead of papering over it", and a NULL callback
+/// leaves nowhere to report it. So this constant and [`register_reply`] go
+/// together, and the module's "no event loop to pump" property is kept by
+/// pumping exactly once, with a deadline, at publish time.
+const KDNS_SERVICE_FLAGS_NO_AUTO_RENAME: DNSServiceFlags = 0x8;
+
+/// How long to wait at publish time for mDNSResponder's verdict.
+///
+/// The daemon answers a registration locally; it is not waiting on the network.
+const REGISTER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// `kDNSServiceFlagsIncludeAWDL` — include Apple Wireless Direct Link in a
+/// registration or browse.
+///
+/// Unused by the AirPlay receiver, which wants the LAN interface (see
+/// [`primary_interface_index`]). It is bound here because this is the only
+/// Bonjour FFI in the tree and AWDL is not reachable by interface index alone —
+/// it is these flags that enable it, and their absence is what made a
+/// peer-to-peer transport experiment look further away than it is.
+pub const KDNS_SERVICE_FLAGS_INCLUDE_AWDL: DNSServiceFlags = 0x100;
+/// `kDNSServiceInterfaceIndexP2P` — register on peer-to-peer interfaces only.
+pub const KDNS_SERVICE_INTERFACE_INDEX_P2P: u32 = 0xFFFF_FFFE;
 
 fn err(what: &str, code: DNSServiceErrorType) -> String {
     format!("{what} failed (DNSServiceErrorType {code})")
@@ -67,15 +101,32 @@ fn err(what: &str, code: DNSServiceErrorType) -> String {
 ///
 /// So: pick a real interface index, and pair it with a synthetic `deviceid`
 /// (see [`Identity::derive`]) to clear the other half of the test.
-fn primary_interface_index() -> Option<u32> {
+///
+/// Which real interface is not arbitrary. Taking whichever `getifaddrs` happens
+/// to return first puts the advertisement on a hypervisor's `vmnet`, on an
+/// Internet-Sharing `bridge`, or — worst — on the `ap` interface ScreenExtend's
+/// own hosted network brings up, which is a strange place to advertise a target
+/// meant for this Mac. Interfaces that can carry a LAN are ranked ahead of the
+/// rest and the excluded set is explicit.
+fn primary_interface_index() -> Option<(u32, String)> {
     use std::ffi::CStr;
+
+    /// Interfaces that are up and addressed but are never the LAN.
+    ///
+    /// `awdl`/`llw` are the peer-to-peer links (see
+    /// [`KDNS_SERVICE_FLAGS_INCLUDE_AWDL`] — they are not reachable by index
+    /// anyway), `utun` is a VPN, `vmnet`/`bridge` are hypervisor and
+    /// Internet-Sharing networks, and `ap` is the AP interface
+    /// `macos_utils::hosted_network` creates.
+    const NEVER: [&str; 8] = ["awdl", "llw", "utun", "vmnet", "bridge", "ap", "gif", "stf"];
 
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
             return None;
         }
-        let mut best: Option<u32> = None;
+        // (rank, index, name); lower rank wins, first match within a rank.
+        let mut best: Option<(u8, u32, String)> = None;
         let mut cur = ifap;
         while !cur.is_null() {
             let ifa = &*cur;
@@ -97,21 +148,25 @@ fn primary_interface_index() -> Option<u32> {
             let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() else {
                 continue;
             };
-            // Apple Wireless Direct Link and the low-latency companion link are
-            // not general-purpose interfaces and are a poor place to advertise.
-            if name.starts_with("awdl") || name.starts_with("llw") || name.starts_with("utun") {
+            if NEVER.iter().any(|p| name.starts_with(p)) {
+                continue;
+            }
+            // `en*` is Wi-Fi and Ethernet; anything else that survived the
+            // exclusions is a usable last resort.
+            let rank = if name.starts_with("en") { 0 } else { 1 };
+            if best.as_ref().is_some_and(|(r, _, _)| *r <= rank) {
                 continue;
             }
             let Ok(cname) = std::ffi::CString::new(name) else {
                 continue;
             };
             let index = libc::if_nametoindex(cname.as_ptr());
-            if index != 0 && best.is_none() {
-                best = Some(index);
+            if index != 0 {
+                best = Some((rank, index, name.to_string()));
             }
         }
         libc::freeifaddrs(ifap);
-        best
+        best.map(|(_, index, name)| (index, name))
     }
 }
 
@@ -166,11 +221,72 @@ impl Drop for TxtRecord {
     }
 }
 
+/// What mDNSResponder said about a registration.
+///
+/// Lives in a `Box` owned by the [`Service`] because `DNSServiceRegister` keeps
+/// the context pointer for the registration's whole life, not just for the one
+/// reply we wait for.
+#[derive(Default)]
+struct RegisterOutcome {
+    answered: bool,
+    error: DNSServiceErrorType,
+    name: Option<String>,
+}
+
+/// `DNSServiceRegisterReply`. Runs only from inside `DNSServiceProcessResult`,
+/// on the thread that calls it — so no synchronisation is needed.
+unsafe extern "C" fn register_reply(
+    _sd_ref: DNSServiceRef,
+    _flags: DNSServiceFlags,
+    error: DNSServiceErrorType,
+    name: *const c_char,
+    _regtype: *const c_char,
+    _domain: *const c_char,
+    context: *mut c_void,
+) {
+    if context.is_null() {
+        return;
+    }
+    let outcome = unsafe { &mut *(context as *mut RegisterOutcome) };
+    outcome.answered = true;
+    outcome.error = error;
+    if !name.is_null() {
+        outcome.name = unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_str()
+            .ok()
+            .map(str::to_string);
+    }
+}
+
+/// Waits for one reply on a `DNSServiceRef`, or gives up.
+///
+/// Returns whether a reply was processed. This is the whole "event loop": one
+/// bounded wait at publish time, never a background pump.
+fn pump_once(sd_ref: DNSServiceRef, timeout: std::time::Duration) -> bool {
+    let fd = unsafe { DNSServiceRefSockFD(sd_ref) };
+    if fd < 0 {
+        return false;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if ready <= 0 {
+        return false;
+    }
+    unsafe { DNSServiceProcessResult(sd_ref) == 0 }
+}
+
 /// One registered Bonjour service. Deregisters on drop.
 pub struct Service {
     sd_ref: DNSServiceRef,
     // The TXT buffer must outlive the registration.
     _txt: TxtRecord,
+    // As must the callback's context.
+    _outcome: Box<RegisterOutcome>,
     name: String,
 }
 
@@ -184,6 +300,7 @@ impl Service {
         regtype: &str,
         port: u16,
         interface_index: u32,
+        flags: DNSServiceFlags,
         pairs: &[(&str, String)],
     ) -> Result<Self, String> {
         let txt = TxtRecord::build(pairs)?;
@@ -192,11 +309,12 @@ impl Service {
         let cname = CString::new(name).map_err(|_| "service name contains a NUL".to_string())?;
         let ctype = CString::new(regtype).map_err(|_| "service type contains a NUL".to_string())?;
 
+        let mut outcome = Box::new(RegisterOutcome::default());
         let mut sd_ref: DNSServiceRef = ptr::null_mut();
         let rc = unsafe {
             DNSServiceRegister(
                 &mut sd_ref,
-                KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
+                flags,
                 interface_index,
                 cname.as_ptr(),
                 ctype.as_ptr(),
@@ -205,18 +323,51 @@ impl Service {
                 port.to_be(),
                 txt_len,
                 txt_ptr,
-                ptr::null(),
-                ptr::null_mut(),
+                register_reply as *const c_void,
+                &mut *outcome as *mut RegisterOutcome as *mut c_void,
             )
         };
         if rc != 0 {
             return Err(err(&format!("DNSServiceRegister({regtype})"), rc));
         }
-        Ok(Self {
+
+        let this = Self {
             sd_ref,
             _txt: txt,
+            _outcome: outcome,
             name: name.to_string(),
-        })
+        };
+
+        // The daemon answers locally and immediately; a reply that does not
+        // arrive here is not a failure, just an unconfirmed registration.
+        if pump_once(this.sd_ref, REGISTER_REPLY_TIMEOUT) && this._outcome.answered {
+            let error = this._outcome.error;
+            if error != 0 {
+                // -65548 is `kDNSServiceErr_NameConflict`. With auto-rename off
+                // that is what a duplicate produces, instead of a silent "(2)"
+                // suffix the picker would list and `ax::connect_to` would never
+                // match.
+                if error == -65548 {
+                    return Err(format!(
+                        "another AirPlay receiver called {name:?} is already advertised on this \
+                         network, so ScreenExtend cannot publish {regtype} under that name. A \
+                         previous ScreenExtend may not have shut down cleanly."
+                    ));
+                }
+                return Err(err(&format!("registering {regtype}"), error));
+            }
+            // Cannot happen with NoAutoRename, which is the point of asking.
+            if let Some(assigned) = this._outcome.name.as_deref() {
+                if assigned != name {
+                    return Err(format!(
+                        "mDNSResponder published {regtype} as {assigned:?} rather than {name:?}, \
+                         which the Displays picker will not match"
+                    ));
+                }
+            }
+        }
+
+        Ok(this)
     }
 }
 
@@ -231,7 +382,9 @@ impl Drop for Service {
 }
 
 /// The identity we advertise. Stable per install so the sender's pairing cache
-/// stays valid across restarts.
+/// stays valid across restarts — which is why the seed falling back to the
+/// hostname ([`machine_seed`]) is logged rather than silent: it changes
+/// `deviceid`, `pk` and `pi` all at once.
 #[derive(Clone, Debug)]
 pub struct Identity {
     /// Colon-separated *lower-case* MAC-shaped string, e.g. `a2:b4:c6:d8:ea:fc`.
@@ -318,7 +471,12 @@ fn machine_seed() -> String {
             }
         }
     }
-    whoami::hostname().unwrap_or_else(|_| "ScreenExtend".to_string())
+    let fallback = whoami::hostname().unwrap_or_else(|_| "ScreenExtend".to_string());
+    teprintln!(
+        "[airplay] could not read IOPlatformUUID; deriving the advertised identity from the \
+         hostname instead, which invalidates any pairing the sender cached"
+    );
+    fallback
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -382,6 +540,12 @@ pub fn airplay_txt_blob(id: &Identity, legacy_pairing: bool) -> Vec<u8> {
     for (k, v) in airplay_txt_pairs(id, legacy_pairing) {
         let entry = format!("{k}={v}");
         let len = entry.len().min(u8::MAX as usize);
+        if len < entry.len() {
+            // `TxtRecord::set` refuses this outright, and the two forms must
+            // agree — a truncated key here and a rejected one there is a drift
+            // nobody would find.
+            teprintln!("[airplay] TXT entry {k:?} is longer than 255 bytes and was truncated");
+        }
         out.push(len as u8);
         out.extend_from_slice(&entry.as_bytes()[..len]);
     }
@@ -405,8 +569,10 @@ impl Advertisement {
     ) -> Result<Self, String> {
         let features = features_hex(legacy_pairing);
 
-        let interface_index = primary_interface_index().ok_or_else(|| {
-            "no usable network interface to advertise on. The AirPlay display fallback needs one,              because macOS ignores an AirPlay target whose Bonjour records arrive on the              \"any\" interface as if it were the Mac itself."
+        let (interface_index, interface_name) = primary_interface_index().ok_or_else(|| {
+            "no usable network interface to advertise on. The AirPlay display fallback needs one, \
+             because macOS ignores an AirPlay target whose Bonjour records arrive on the \
+             \"any\" interface as if it were the Mac itself."
                 .to_string()
         })?;
 
@@ -415,6 +581,7 @@ impl Advertisement {
             "_airplay._tcp",
             port,
             interface_index,
+            KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
             &airplay_txt_pairs(id, legacy_pairing),
         )?;
 
@@ -425,6 +592,7 @@ impl Advertisement {
             "_raop._tcp",
             port,
             interface_index,
+            KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
             &[
                 ("txtvers", "1".to_string()),
                 ("ch", "2".to_string()),
@@ -449,7 +617,8 @@ impl Advertisement {
         )?;
 
         tprintln!(
-            "[airplay] advertising {name:?} on port {port}, interface index {interface_index},              deviceid {} (features {})",
+            "[airplay] advertising {name:?} on port {port}, interface {interface_name} \
+             (index {interface_index}), deviceid {} (features {})",
             id.device_id,
             features_hex(legacy_pairing),
         );
@@ -520,12 +689,28 @@ mod tests {
     fn a_real_interface_index_is_found() {
         // Registering on index 0 makes macOS treat the receiver as the host
         // itself, so this must never fall back to it.
-        let idx = primary_interface_index();
-        assert!(
-            idx.is_some(),
-            "a running Mac has at least one usable interface"
-        );
-        assert_ne!(idx, Some(0));
+        let chosen = primary_interface_index();
+        let Some((index, name)) = chosen else {
+            panic!("a running Mac has at least one usable interface");
+        };
+        println!("advertising interface: {name} (index {index})");
+        assert_ne!(index, 0);
+        for never in ["awdl", "llw", "utun", "vmnet", "bridge", "ap", "gif", "stf"] {
+            assert!(
+                !name.starts_with(never),
+                "{name} is not a LAN interface and must not be chosen"
+            );
+        }
+    }
+
+    #[test]
+    fn the_registration_flags_are_the_documented_constants() {
+        // 0x0 here — the value this was — is exactly the auto-rename default,
+        // which silently turns "ScreenExtend" into "ScreenExtend (2)" and makes
+        // the picker row unmatchable.
+        assert_eq!(KDNS_SERVICE_FLAGS_NO_AUTO_RENAME, 0x8);
+        assert_eq!(KDNS_SERVICE_FLAGS_INCLUDE_AWDL, 0x100);
+        assert_eq!(KDNS_SERVICE_INTERFACE_INDEX_P2P, 0xFFFF_FFFE);
     }
 
     #[test]
