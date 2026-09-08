@@ -1247,6 +1247,23 @@
                 });
             }
 
+            // The out-of-band keyframe request is a tier only if the host parses the opcode.
+            // It says so in the PONG capability bits, which land about a second into the
+            // session, so the worker starts at "no way to ask" — which keeps its own give-up
+            // signal and the page's stall demotion armed — and is told if that changes.
+            function relayOutOfBandKey() {
+                if (!worker) return;
+                let available = false;
+                try {
+                    available = !!(window.RemoteInput && RemoteInput.hostCapability &&
+                        RemoteInput.hostCapability('KEYFRAME_REQUEST'));
+                } catch (_) { noteSuppressed(); }
+                try { worker.postMessage({ type: 'outofbandkey', available: available }); } catch (_) { noteSuppressed(); }
+            }
+            if (window.RemoteInput && RemoteInput.onHostCapabilities) {
+                RemoteInput.onHostCapabilities(relayOutOfBandKey);
+            }
+
             let __workerBlobUrl = null;
             async function makeTransformWorker() {
                 try {
@@ -1347,7 +1364,7 @@
                                 console.log('[webcodecs] stats', m.data);
                             }
                         };
-                        worker.postMessage({ type: 'outofbandkey', available: true });
+                        relayOutOfBandKey();
                         if (PRESENT_PREF === 'track') {
                             worker.postMessage({ type: 'trackgen' });
                         } else {

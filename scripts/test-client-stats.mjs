@@ -167,4 +167,59 @@ channels.reliable.onmessage({ data: short });
 if (ctx.SEClock.offsetMs !== before) fail('a legacy 9-byte PONG moved the clock offset');
 else ok('a legacy 9-byte PONG is tolerated and does not move the offset');
 
+// Host capabilities ride the PONG tail. Nothing optional may be used until the host has said
+// it understands it: a 17-byte PONG is an older host and means no bits.
+const KEYFRAME_REQUEST_BIT = 1 << 0;
+if (ctx.RemoteInput.hostCapabilities() !== 0) fail('capabilities were assumed before any host said so');
+else ok('an older host (17-byte PONG) advertises no capabilities');
+sent.length = 0;
+if (ctx.RemoteInput.requestKeyframe() !== false) fail('a keyframe request was claimed against a host that drops the opcode');
+else if (sent.some((s) => s.bytes[0] === 0x64)) fail('0x64 was sent to a host that does not parse it');
+else ok('requestKeyframe() refuses, and sends nothing, without the host capability');
+
+let capsSeen = null;
+ctx.RemoteInput.onHostCapabilities((c) => { capsSeen = c; });
+now = 1200;
+const pong19 = new ArrayBuffer(19);
+const p19 = new DataView(pong19);
+p19.setUint8(0, OP.PONG);
+p19.setBigUint64(1, BigInt(Math.round(1195 * 1e6)), true);
+p19.setBigUint64(9, BigInt(Math.round(5200 * 1e6)), true);
+p19.setUint16(17, KEYFRAME_REQUEST_BIT | (1 << 1), true);
+channels.reliable.onmessage({ data: pong19 });
+
+if (capsSeen !== (KEYFRAME_REQUEST_BIT | (1 << 1))) fail('capability subscribers saw ' + capsSeen);
+else ok('the PONG capability bitfield reaches subscribers');
+if (!ctx.RemoteInput.hostCapability('KEYFRAME_REQUEST')) fail('bit 0 did not enable the keyframe request');
+else ok('bit 0 enables the out-of-band keyframe request');
+if (!ctx.RemoteInput.hostCapability('STATS_V2')) fail('bit 1 was not decoded');
+else ok('bit 1 decodes as STATS_V2');
+if (ctx.RemoteInput.hostCapability('UNRELIABLE_MOVE_CHANNEL')) fail('an unset bit read as set');
+else ok('an unset capability bit reads as unset');
+
+sent.length = 0;
+now = 1500;
+if (ctx.RemoteInput.requestKeyframe() !== true) fail('the keyframe request was refused against a capable host');
+else {
+  const kf = sent.find((s) => s.bytes[0] === 0x64);
+  if (!kf) fail('no 0x64 frame was sent');
+  else if (kf.bytes.length !== 2) fail('KEYFRAME_REQUEST is ' + kf.bytes.length + ' bytes, expected 2');
+  else if (kf.label !== 'reliable') fail('KEYFRAME_REQUEST went out on ' + kf.label);
+  else ok('KEYFRAME_REQUEST is 2 bytes on the reliable channel once the host advertises it');
+}
+
+// The 200 ms limiter must only be armed by a request that actually went out.
+sent.length = 0;
+now = 1550;
+if (ctx.RemoteInput.requestKeyframe() !== false) fail('the 200 ms keyframe limiter did not hold');
+else ok('a second keyframe request inside 200 ms is suppressed');
+channels.reliable.readyState = 'closed';
+now = 5000;
+if (ctx.RemoteInput.requestKeyframe() !== false) fail('a request was claimed on a closed channel');
+else ok('a closed channel refuses the request');
+channels.reliable.readyState = 'open';
+now = 5001;
+if (ctx.RemoteInput.requestKeyframe() !== true) fail('the attempt on a closed channel burned the rate-limit window');
+else ok('an attempt that could not send does not burn the rate-limit window');
+
 if (!process.exitCode) console.log('\nall client stats assertions passed');

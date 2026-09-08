@@ -49,7 +49,7 @@ For each device: join, confirm the picture and the mouse work, then record the r
 |---|---|---|---|---|---|---|
 | 1 | Chrome desktop (Windows or macOS), current | 1 | **1** | **1** | 1 | The single most important row: before this change every Chrome client took transport tier 2 and `keyTier` 0. If `transportTier` is 2 here, `RTCRtpScriptTransform` is missing or the 2.5 s watchdog fired — check `degraded` bit 19. |
 | 2 | Edge desktop, current | 1 | 1 | 1 | 1 | Same engine; the row exists because Edge's WebRTC field-trial set differs. |
-| 3 | Chrome desktop, an older build (≤ 140 if you can get one) | 1 | **2** | **2** | 1 | The legacy-transform path. `keyTier` 2 means the out-of-band request is being sent; it only *works* once the host parses `0x64` — see §2. |
+| 3 | Chrome desktop, an older build (≤ 140 if you can get one) | 1 | **2** | **2** against a host that parses `0x64`, else **0** | 1 | The legacy-transform path. `keyTier` is 2 only once the host has advertised capability bit 0 on the `PONG`; against a host without the arm it is 0 by design, and the `<video>` demotion stays armed — see §2. |
 | 4 | Chrome on Android | 1 | 1 | 1 | 1 or 2 | `audioPath` 2 (postMessage ring) is expected unless the page is HTTPS: Android WebView has no `SharedArrayBuffer`. Check `sab` and `crossOriginIsolated`. |
 | 5 | Safari, macOS 15 or later | 1 | 1 | 1 | 1 on Safari 26, else 3 | `audioPath` 3 on Safari 25 and below is correct, not a bug: `AudioDecoder` shipped in Safari 26. |
 | 6 | Safari, iOS/iPadOS 18 | 1 | 1 | 1 | 3 | Expect `degraded` bit 6 (no Opus decode) and, on 18.4+, *not* bit 8 (`outputLatency` arrived in 18.4). |
@@ -77,12 +77,22 @@ The change this workstream exists for. On row 1 (Chrome desktop):
 5. **The old behaviour, which must not reappear:** the picture freezes for about four seconds
    and then `videoPath` becomes 3 for the rest of the session.
 
-On row 3 (Chrome ≤ 140), `keyTier` is 2 and the request goes out as opcode `0x64` on the
-reliable channel. Until `findings/major-host-keyframe-request-opcode-unhandled.md` lands, the
-host parses it as an unknown opcode and drops it — so on that row expect the freeze, and
-confirm only that `keyRequests` is climbing (the client is asking) and that the demotion to
-`videoPath` 3 still eventually happens as the last resort. Re-run this row after the host side
-lands.
+On row 3 (Chrome ≤ 140) the answer depends on the host, and the point of the row is that the
+client tells the truth about which one it is talking to:
+
+- **Host without the `0x64` arm** (`findings/major-host-keyframe-request-opcode-unhandled.md`
+  not yet landed): `SEVideo.getStats().keyTier` must be **0**, `keyRequests` must stay flat —
+  the client sends nothing it knows will be dropped — and `degraded` bit 11
+  (`KEYFRAME_REQUEST_IMPOSSIBLE`) must be set. Provoke a loss and confirm the picture demotes
+  to `videoPath` 3 within about four seconds rather than sitting frozen for eight.
+- **Host with the arm**: `keyTier` is **2**, `keyRequests` climbs, and the picture recovers
+  within roughly one round trip without demoting. Re-run this row after the host side lands;
+  a `keyTier` of 2 against a host that does not parse `0x64` is the exact bug this gate exists
+  to prevent.
+
+`node scripts/test-client-stats.mjs` asserts the gate itself (17-byte `PONG` → no capability,
+no `0x64` on the wire; 19-byte `PONG` with bit 0 → the request goes out), so the manual run only
+has to confirm the two end-to-end behaviours above.
 
 ## 3. Join time
 

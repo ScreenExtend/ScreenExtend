@@ -32,7 +32,9 @@ PONG   0x61
 ```
 
 A client older than this reads the first 9 bytes and ignores the rest; a host older than this
-sends 9 bytes and the client simply never gets an offset.
+sends 9 bytes and the client simply never gets an offset. The same frame carries the host
+capability bitfield after the two stamps — the layout, and the rule that a short frame means no
+bits, are in `docs/INPUT-PROTOCOL.md`.
 
 The client keeps the **minimum-RTT** sample, because the least-queued exchange gives the tightest
 midpoint estimate, and ages it out after 30 s so a route change is not remembered forever:
@@ -182,6 +184,14 @@ A keyframe tier of 0 with a transport tier of 2 is the Chrome 94–140 case: the
 runs instead of libwebrtc's reference finder, so nothing downstream emits a PLI and the client
 has no way at all to ask for an IDR.
 
+**Tier 2 is claimed only against a host that has said it parses `0x64`.** The client reads the
+host-capability bitfield off the `PONG` tail (`docs/INPUT-PROTOCOL.md`) and treats bit 0 as the
+gate: an older host advertises no bits, `RemoteInput.requestKeyframe()` returns false, the tier
+stays 0, and the page keeps the two remedies that are actually available to it — the worker's
+`nokeyframe` give-up after 8 s and the stall demotion to `<video>` after two 2 s ticks. Claiming
+the tier unconditionally disarmed both and left a frozen picture with the host being told the
+client had a working keyframe path.
+
 ### Degradation flags (v2, offset 80)
 
 Every one of these was previously a bare `catch (_) {}` or an untaken branch, invisible to the
@@ -235,11 +245,21 @@ only handles `PONG` and `BYE`.
 
 `node scripts/test-client-stats.mjs` runs `input.js` under Node with minimal browser stubs,
 drives one PING/PONG exchange and one stats frame, and asserts the bytes against the layout
-above (including the v2 tail and the 72-byte floor an older host reads) plus the clock-offset
-arithmetic. It is not a substitute for a browser — it stubs the
-DOM, and it cannot exercise the workers — but it catches the failure that would otherwise be
-invisible: a `TypeError` inside `sendStats()` silently kills the once-a-second timer, and the
-host would simply see a client that never reports.
+above (including the v2 tail and the 72-byte floor an older host reads), the clock-offset
+arithmetic, and the host-capability gate: a 17-byte `PONG` advertises nothing and
+`requestKeyframe()` must then refuse *and send nothing*, a 19-byte one enables it, and an
+attempt that could not go out must not burn the 200 ms limiter.
+
+`node scripts/test-client-ice.mjs` lifts `waitForIceGathering` and its two helpers out of
+`index.html` and drives them against a fake peer connection: the candidate/grace table, that a
+relayed wait is *not* ended by a host or reflexive candidate, the relay grace, gathering
+completing, listener cleanup, and the deadline setting `ICE_GATHERING_DEADLINE`.
+
+Neither is a substitute for a browser — they stub the DOM and cannot exercise the workers — but
+each catches a failure that is otherwise invisible: a `TypeError` inside `sendStats()` silently
+kills the once-a-second timer and the host simply sees a client that never reports, and an ICE
+wait that ends too early ships an offer with no usable candidate and looks exactly like a
+network fault.
 
 The host half is covered by unit tests in `streamer/telemetry.rs` (bucket boundaries,
 percentiles against a known distribution, missing and out-of-order stamps),
