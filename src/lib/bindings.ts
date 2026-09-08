@@ -18,6 +18,14 @@ async requestPermission(key: string) : Promise<boolean> {
 async openPermissionSettings(key: string) : Promise<void> {
     await TAURI_INVOKE("open_permission_settings", { key });
 },
+/**
+ * Restart the app so it comes back as a fresh process. On macOS this is how a
+ * newly granted permission is picked up; here there is no per-process permission
+ * cache to escape, so the plain restart is enough.
+ */
+async relaunchApp() : Promise<void> {
+    await TAURI_INVOKE("relaunch_app");
+},
 async setup() : Promise<boolean> {
     return await TAURI_INVOKE("setup");
 },
@@ -202,7 +210,22 @@ export type JoinAttemptsPaused = { retryAfterSecs: number }
 export type LogLine = string
 export type NetworkChange = null
 export type NetworkInfo = { network_name: string; interface_index: number; ip_addresses: string[] }
-export type PermissionStatus = { key: string; name: string; description: string; granted: boolean; required: boolean }
+export type PermissionStatus = { key: string; name: string; description: string; 
+/**
+ * `granted` | `denied` | `unknown`. Tri-state on purpose: a probe that could
+ * not learn the answer must not be reported as a refusal, because the caller
+ * treats a refusal as a reason not to start.
+ */
+state: string; 
+/**
+ * What the probe actually concluded, in the user's words.
+ */
+detail: string; required: boolean; 
+/**
+ * macOS binds some grants to the process that asked for them, so a permission
+ * the user has just ticked can only reach a freshly launched copy.
+ */
+relaunch_required: boolean }
 export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }

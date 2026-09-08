@@ -391,9 +391,11 @@
     },
     "permissions": {
       "title": "Permissions Required",
-      "body": "ScreenExtend needs the permissions below before it can create a display and stream to your devices. Grant each one and this window continues on its own — no need to come back and press anything.",
+      "body": "ScreenExtend needs the permissions below before it can create a display and stream to your devices. Grant each one; this window updates as soon as macOS reports the change.",
       "tipTitle": "After granting a permission",
       "tipBody": "macOS may need ScreenExtend to restart before a newly granted permission takes effect. Use Restart if a permission still shows as missing.",
+      "relaunchTitle": "Restart needed",
+      "relaunchBody": "macOS gives a newly granted permission only to a freshly launched app, so ScreenExtend has to be restarted before it can use this one. Press Restart below.",
       "autoChecking": "Checking for changes…",
       "recheck": "Re-check",
       "relaunch": "Restart"

@@ -31,7 +31,20 @@ const PERMISSION_POLL_MS = 200;
 function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): boolean {
   return a !== null
     && a.length === b.length
-    && a.every((p, i) => p.key === b[i].key && p.granted === b[i].granted);
+    && a.every((p, i) => p.key === b[i].key
+      && p.state === b[i].state
+      && p.relaunch_required === b[i].relaunch_required
+      && p.detail === b[i].detail);
+}
+
+// "unknown" is a probe that could not learn the answer, not a refusal. Only a
+// definite "denied" is allowed to hold up startup.
+function blocks(p: PermissionStatus): boolean {
+  return p.required && p.state === "denied";
+}
+
+function needsRelaunch(perms: PermissionStatus[] | null): boolean {
+  return (perms ?? []).some(p => p.relaunch_required);
 }
 
 function withBold(template: string, value: ReactNode): ReactNode {
@@ -209,7 +222,7 @@ export default function Bootstrap() {
     } catch {
       return false;
     }
-    const missing = perms.filter(p => p.required && !p.granted);
+    const missing = perms.filter(blocks);
     if (missing.length === 0) return false;
     for (const p of missing) {
       try { await commands.requestPermission(p.key); } catch { /* ignore */ }
@@ -235,7 +248,7 @@ export default function Bootstrap() {
       return;
     }
     setPermReport(perms);
-    if (perms.every(p => !p.required || p.granted)) {
+    if (!perms.some(blocks)) {
       setPermReport(null);
       proceed().catch(() => setError(true));
     }
@@ -299,7 +312,7 @@ export default function Bootstrap() {
         .then(perms => {
           if (stopped) return;
           setPermReport(prev => samePermissions(prev, perms) ? prev : perms);
-          if (perms.every(p => !p.required || p.granted)) {
+          if (!perms.some(blocks)) {
             stopped = true;
             setPermReport(null);
             proceed().catch(() => setError(true));
@@ -556,8 +569,14 @@ export default function Bootstrap() {
                 <div className="flex items-start space-x-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
                   <Info className="mt-0.5 shrink-0 text-amber-600" size={16} />
                   <div>
-                    <span className="font-semibold">{t("bootstrap.permissions.tipTitle")}</span>{" "}
-                    {t("bootstrap.permissions.tipBody")}
+                    <span className="font-semibold">
+                      {needsRelaunch(permReport)
+                        ? t("bootstrap.permissions.relaunchTitle")
+                        : t("bootstrap.permissions.tipTitle")}
+                    </span>{" "}
+                    {needsRelaunch(permReport)
+                      ? t("bootstrap.permissions.relaunchBody")
+                      : t("bootstrap.permissions.tipBody")}
                   </div>
                 </div>
                 <ul className="space-y-2">
@@ -568,14 +587,16 @@ export default function Bootstrap() {
                     >
                       <div>
                         <div className="font-semibold flex items-center space-x-2">
-                          {p.granted
+                          {p.state === "granted"
                             ? <Check className="text-green-600 mr-2" size={16} />
-                            : <X className="text-red-600 mr-2" size={16} />}
+                            : p.state === "denied"
+                              ? <X className="text-red-600 mr-2" size={16} />
+                              : <Info className="text-amber-600 mr-2" size={16} />}
                           {p.name}
                         </div>
-                        <div className="text-sm text-muted-foreground">{p.description}</div>
+                        <div className="text-sm text-muted-foreground">{p.detail || p.description}</div>
                       </div>
-                      {!p.granted && (
+                      {p.state !== "granted" && (
                         <button
                           className="shrink-0 rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
                           onClick={() => {
@@ -620,7 +641,9 @@ export default function Bootstrap() {
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={() => {
-                relaunch().catch(() => {
+                // Goes through LaunchServices on macOS so the new process is its
+                // own TCC subject rather than an heir of this dying one.
+                commands.relaunchApp().catch(() => {
                   toast({
                     variant: "destructive",
                     title: t("toasts.relaunch.failureTitle"),
