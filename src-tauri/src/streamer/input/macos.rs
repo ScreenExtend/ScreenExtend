@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use objc2_core_foundation::CGPoint;
 
 use super::protocol::{
-    btn, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
+    btn, positions_cursor, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
-use super::DisplayRect;
+use super::{ClientPlatform, ClientProfile, DisplayRect};
 
 pub const NAME: &str = "macos-cgevent";
 
@@ -29,12 +29,21 @@ unsafe extern "C" {
         keycode: u16,
         key_down: bool,
     ) -> CGEventRef;
-    // (source, units, wheelCount, wheel1[, wheel2[, wheel3]]).
-    fn CGEventCreateScrollWheelEvent(
+    // The fixed-arity twin of CGEventCreateScrollWheelEvent (10.13+, below our 10.15 floor).
+    //
+    // The variadic original takes `wheel1` as a *named* parameter and only `wheel2`/`wheel3`
+    // through the ellipsis. Declaring `wheel1` past the `...` compiles and works on x86_64,
+    // where named and variadic integers share one register sequence, but breaks on Apple
+    // arm64: named arguments go in registers and variadic ones on the stack, so the callee
+    // reads `wheel1` out of `w3` while the caller wrote it to the stack. Using the non-
+    // variadic entry point removes the class of bug rather than restating the prototype.
+    fn CGEventCreateScrollWheelEvent2(
         source: CGEventSourceRef,
         units: u32,
         wheel_count: u32,
-        ...
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
@@ -109,7 +118,57 @@ fn modifier_self_flag(vk: u16) -> u64 {
     }
 }
 
-fn code_to_keycode(code: &str) -> Option<u16> {
+/// The modifier row, which is the only part of the table that depends on who is typing.
+///
+/// A PC keyboard's Ctrl is the command modifier — Ctrl+C copies — and macOS spells that Command,
+/// so a PC client's Ctrl has to become Command and its Windows key has to become Control.
+/// An Apple keyboard already has both in the right places, and swapping them there is exactly
+/// backwards: the user presses Command+C, the browser reports `MetaLeft`, and a swapped table
+/// injects Control+C, which is not copy. Their muscle-memory Ctrl+A (start of line in Cocoa)
+/// becomes Command+A, select-all.
+fn modifier_keycode(code: &str, apple_client: bool) -> Option<u16> {
+    Some(match code {
+        "ShiftLeft" => VK_SHIFT,
+        "ShiftRight" => VK_RSHIFT,
+        "AltLeft" => VK_OPTION,
+        "AltRight" => VK_ROPTION,
+        "CapsLock" => VK_CAPSLOCK,
+        "ControlLeft" => {
+            if apple_client {
+                VK_CONTROL
+            } else {
+                VK_COMMAND
+            }
+        }
+        "ControlRight" => {
+            if apple_client {
+                VK_RCONTROL
+            } else {
+                VK_RCOMMAND
+            }
+        }
+        "MetaLeft" | "OSLeft" => {
+            if apple_client {
+                VK_COMMAND
+            } else {
+                VK_CONTROL
+            }
+        }
+        "MetaRight" | "OSRight" => {
+            if apple_client {
+                VK_RCOMMAND
+            } else {
+                VK_RCONTROL
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn code_to_keycode(code: &str, apple_client: bool) -> Option<u16> {
+    if let Some(vk) = modifier_keycode(code, apple_client) {
+        return Some(vk);
+    }
     let vk = match code {
         // Letters
         "KeyA" => 0x00,
@@ -169,16 +228,6 @@ fn code_to_keycode(code: &str) -> Option<u16> {
         "Escape" => 0x35,
         "Delete" => 0x75, // ForwardDelete
         "Insert" => 0x72, // Help
-        // Modifiers (REMAPPED)
-        "ShiftLeft" => VK_SHIFT as _,
-        "ShiftRight" => VK_RSHIFT as _,
-        "ControlLeft" => VK_COMMAND as _, // Control to Command
-        "ControlRight" => VK_RCOMMAND as _,
-        "AltLeft" => VK_OPTION as _,
-        "AltRight" => VK_ROPTION as _,
-        "MetaLeft" | "OSLeft" => VK_CONTROL as _, // Windows/Super to Control
-        "MetaRight" | "OSRight" => VK_RCONTROL as _,
-        "CapsLock" => VK_CAPSLOCK as _,
         // Function keys
         "F1" => 0x7A,
         "F2" => 0x78,
@@ -237,11 +286,12 @@ pub fn boost_thread() {
     crate::macos_utils::streamer::qos::pin_current_thread_user_interactive();
 }
 
-pub fn tune_process() {}
-
 pub struct Injector {
     source: CGEventSourceRef,
     device_name: Option<String>,
+    /// The client is typing on an Apple keyboard, so the modifier row passes through instead of
+    /// being swapped.
+    apple_client: bool,
     target: Option<DisplayRect>,
     desktop: DisplayRect,
     geom_checked: Option<Instant>,
@@ -249,12 +299,24 @@ pub struct Injector {
     down_keys: HashSet<u16>,
     mods: u64,
     pos: CGPoint,
+    /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
+    /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
     warned_drop: bool,
 }
 
 impl Injector {
-    pub fn new(device_name: Option<String>) -> Self {
+    pub fn new(client: ClientProfile) -> Self {
+        let ClientProfile {
+            device_name,
+            platform,
+        } = client;
+        let apple_client = platform.is_apple();
+        if platform == ClientPlatform::Unknown {
+            log::info!(
+                "client platform not reported; assuming a PC keyboard layout (Ctrl -> Command)"
+            );
+        }
         let source = unsafe { CGEventSourceCreate(SOURCE_STATE_HID) };
         if source.is_null() {
             log::warn!("CGEventSourceCreate returned null; synthesized events may be degraded");
@@ -277,6 +339,7 @@ impl Injector {
         Injector {
             source,
             device_name,
+            apple_client,
             target: None,
             desktop,
             geom_checked: None,
@@ -284,7 +347,11 @@ impl Injector {
             down_keys: HashSet::new(),
             mods: 0,
             pos,
-            mouse_relative: true,
+            // No lock until the client says so. Starting at `true` meant the first frame of a
+            // session was treated as relative, and since this backend has no touch injection at
+            // all — every tap becomes `mouse_pointer(.., Phase::Down)` — a touch client's
+            // opening tap landed wherever the host cursor already was.
+            mouse_relative: false,
             warned_drop: false,
         }
     }
@@ -342,11 +409,14 @@ impl Injector {
                 source,
                 buttons,
                 samples,
+                predicted,
                 ..
-            } => self.pointer_batch(*source, *buttons, samples),
+            } => self.pointer_batch(*source, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
-            InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
+            InputEvent::MouseDelta {
+                dx, dy, buttons, ..
+            } => self.mouse_delta(*dx, *dy, *buttons),
             InputEvent::Key {
                 down, code, key, ..
             } => self.key(*down, code, key),
@@ -359,7 +429,10 @@ impl Injector {
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { .. } => self.unsupported_drop(),
             // Handled by the transport before dispatch: none of these inject anything.
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
+            InputEvent::Ping { .. }
+            | InputEvent::Pong { .. }
+            | InputEvent::ClientStats(_)
+            | InputEvent::KeyframeRequest { .. } => {}
         }
     }
 
@@ -382,10 +455,12 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
+            // An absolute move is proof the client is not locked, for clients that never send
+            // `POINTERLOCK_STATE`. A `Down`/`Up` is not: those still arrive while locked.
             Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
         }
-        if !self.mouse_relative {
+        if positions_cursor(self.mouse_relative, phase) {
             let prev = self.pos;
             let pos = self.point(x, y);
             let dx = (pos.x - prev.x).round() as i64;
@@ -509,7 +584,7 @@ impl Injector {
             return;
         }
         unsafe {
-            let ev = CGEventCreateScrollWheelEvent(self.source, unit, 2, v, h);
+            let ev = CGEventCreateScrollWheelEvent2(self.source, unit, 2, v, h, 0);
             if ev.is_null() {
                 return;
             }
@@ -530,7 +605,7 @@ impl Injector {
             return;
         }
         unsafe {
-            let ev = CGEventCreateScrollWheelEvent(self.source, SCROLL_UNIT_LINE, 1, lines);
+            let ev = CGEventCreateScrollWheelEvent2(self.source, SCROLL_UNIT_LINE, 1, lines, 0, 0);
             if ev.is_null() {
                 return;
             }
@@ -541,7 +616,7 @@ impl Injector {
     }
 
     fn key(&mut self, down: bool, code: &str, key: &str) {
-        if let Some(kc) = code_to_keycode(code) {
+        if let Some(kc) = code_to_keycode(code, self.apple_client) {
             if down {
                 self.down_keys.insert(kc);
             } else {
@@ -641,12 +716,41 @@ impl Injector {
         self.mouse_pointer(x, y, if contacting { btn::PRIMARY } else { 0 }, phase);
     }
 
-    fn pointer_batch(&mut self, source: u8, buttons: u16, samples: &[MoveSample]) {
-        for s in samples {
-            match source {
-                SRC_PEN => self.pen(s.x, s.y, s.pressure, buttons, Phase::Move),
-                SRC_TOUCH => self.touch(s.x, s.y, Phase::Move),
-                _ => self.mouse_pointer(s.x, s.y, buttons, Phase::Move),
+    fn pointer_batch(&mut self, source: u8, buttons: u16, samples: &[MoveSample], predicted: u8) {
+        let Some((last, _)) = samples.split_last() else {
+            return;
+        };
+        match source {
+            // A stroke is a shape, so every real sample is posted. Predicted ones are not: a
+            // guess the next real sample corrects still leaves a kink in the ink. There is no
+            // batch form of `CGEventPost`, so this is genuinely one Mach round trip per sample.
+            SRC_PEN | SRC_TOUCH => {
+                let real = samples.len() - predicted as usize;
+                for s in &samples[..real] {
+                    if source == SRC_PEN {
+                        self.pen(s.x, s.y, s.pressure, buttons, Phase::Move);
+                    } else {
+                        self.touch(s.x, s.y, Phase::Move);
+                    }
+                }
+            }
+            // The cursor is last-value-wins: only the final position is observable, and every
+            // earlier one costs a Mach IPC round trip to WindowServer for a location overwritten
+            // microseconds later. Post the last sample and carry the whole run's delta on it, so
+            // anything reading `kCGMouseEventDeltaX/Y` still sees the full movement.
+            _ => {
+                self.mouse_relative = false;
+                let prev = self.pos;
+                let pos = self.point(last.x, last.y);
+                self.pos = pos;
+                self.motion(
+                    pos,
+                    self.buttons,
+                    (pos.x - prev.x).round() as i64,
+                    (pos.y - prev.y).round() as i64,
+                );
+                self.button_transitions(self.buttons, buttons, pos);
+                self.buttons = buttons;
             }
         }
     }
@@ -781,6 +885,103 @@ fn set_pasteboard(mime: &str, data: &[u8]) -> bool {
             }
             let ok: bool = msg_send![pb, setData: nsdata, forType: &*ty];
             ok
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    }
+
+    /// The command modifier has to land on Command for both, from opposite physical keys.
+    #[test]
+    fn the_modifier_row_follows_the_keyboard_the_user_is_actually_typing_on() {
+        for (code, pc, apple) in [
+            ("ControlLeft", VK_COMMAND, VK_CONTROL),
+            ("ControlRight", VK_RCOMMAND, VK_RCONTROL),
+            ("MetaLeft", VK_CONTROL, VK_COMMAND),
+            ("OSRight", VK_RCONTROL, VK_RCOMMAND),
+        ] {
+            assert_eq!(code_to_keycode(code, false), Some(pc), "{code} from a PC");
+            assert_eq!(
+                code_to_keycode(code, true),
+                Some(apple),
+                "{code} from a Mac"
+            );
+        }
+        // Everything else is the same table for everyone.
+        for code in ["ShiftLeft", "AltLeft", "CapsLock", "KeyC", "F5", "ArrowUp"] {
+            assert_eq!(
+                code_to_keycode(code, false),
+                code_to_keycode(code, true),
+                "{code} must not depend on the client"
+            );
+        }
+        assert_eq!(code_to_keycode("NoSuchKey", false), None);
+    }
+
+    #[test]
+    fn a_client_platform_string_maps_to_the_keyboard_it_implies() {
+        for (s, apple) in [
+            ("macOS", true),
+            ("iOS", true),
+            ("Windows", false),
+            ("Android", false),
+            ("Linux", false),
+            ("Unknown", false),
+            ("", false),
+        ] {
+            assert_eq!(ClientPlatform::from_reported(s).is_apple(), apple, "{s}");
+        }
+        // The client sends its own capitalisation; the parse must not care.
+        assert_eq!(
+            ClientPlatform::from_reported("MACOS"),
+            ClientPlatform::MacOs
+        );
+    }
+
+    const FIELD_SCROLL_DELTA_AXIS_1: u32 = 11;
+    const FIELD_SCROLL_DELTA_AXIS_2: u32 = 12;
+
+    /// Pins the arity. Binding the symbol to a fully spelled-out fixed-arity pointer type is
+    /// what fails the build if anyone reintroduces a `...` or drops a wheel argument — the
+    /// variadic form of this call is an arm64 ABI mismatch that x86_64 cannot detect.
+    #[test]
+    fn the_scroll_constructor_stays_fixed_arity() {
+        let f: unsafe extern "C" fn(CGEventSourceRef, u32, u32, i32, i32, i32) -> CGEventRef =
+            CGEventCreateScrollWheelEvent2;
+        assert_eq!(f as *const (), CGEventCreateScrollWheelEvent2 as *const ());
+    }
+
+    /// The behavioural half: `wheel1`/`wheel2` have to arrive as themselves. Under the old
+    /// variadic declaration this reads back junk on Apple Silicon and the right answer on
+    /// Intel, which is exactly why the defect survived a dev box.
+    #[test]
+    fn scroll_wheel_arguments_land_on_their_own_axes() {
+        unsafe {
+            let src = CGEventSourceCreate(SOURCE_STATE_HID);
+            let ev = CGEventCreateScrollWheelEvent2(src, SCROLL_UNIT_LINE, 2, 3, -1, 0);
+            assert!(
+                !ev.is_null(),
+                "CGEventCreateScrollWheelEvent2 returned null"
+            );
+            assert_eq!(
+                CGEventGetIntegerValueField(ev, FIELD_SCROLL_DELTA_AXIS_1),
+                3
+            );
+            assert_eq!(
+                CGEventGetIntegerValueField(ev, FIELD_SCROLL_DELTA_AXIS_2),
+                -1
+            );
+            CFRelease(ev);
+            if !src.is_null() {
+                CFRelease(src);
+            }
         }
     }
 }

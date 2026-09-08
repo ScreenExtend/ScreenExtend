@@ -46,6 +46,9 @@ use super::session::{self, SharedDeviceOverrides};
 
 const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Floor on how often a client's out-of-band keyframe request may force an IDR.
+const MIN_IDR_REQUEST_GAP: Duration = Duration::from_millis(200);
+
 /// No `useinbandfec=1`: it used to be advertised and it was never true. libopus documents
 /// in-band FEC as an LPC-layer (SILK) feature, and this encoder runs
 /// `OPUS_APPLICATION_RESTRICTED_LOWDELAY` at 5 ms frames — both force CELT-only — so no FEC
@@ -97,14 +100,6 @@ static LIVE_SESSIONS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI6
 pub fn live_sessions() -> i64 {
     LIVE_SESSIONS.load(Ordering::Relaxed)
 }
-
-/// The client's `KEYFRAME_REQUEST` opcode on the reliable input channel, sent when neither
-/// insertable-streams API on its side can ask for one through RTCP.
-///
-/// Read ahead of `input::protocol::parse` so it works whether or not the input protocol has a
-/// variant for it; when one exists, that arm should call [`KeyframeRequester::request`] too
-/// rather than reaching for `pipeline.request_idr()` directly.
-pub const OP_KEYFRAME_REQUEST: u8 = 0x64;
 
 /// The one path every keyframe request in a session takes.
 ///
@@ -177,6 +172,9 @@ fn payloads_carry_parameter_sets(payloads: &[Bytes]) -> bool {
 
 pub struct InputParams {
     pub device: Option<String>,
+    /// The `os` string the client reported at join, which decides the modifier layout on a
+    /// macOS host. Empty when the client did not say.
+    pub client_os: String,
     pub control_enabled: bool,
     pub control_rx: Option<session::ControlReceiver>,
 }
@@ -628,10 +626,15 @@ pub async fn handle_whep_offer(
 
     let InputParams {
         device: input_device,
+        client_os,
         control_enabled,
         control_rx,
     } = input;
-    let (input_tx, input_join) = input::spawn(input_device);
+    let client = input::ClientProfile {
+        device_name: input_device,
+        platform: input::ClientPlatform::from_reported(&client_os),
+    };
+    let (input_tx, input_join) = input::spawn(client, Arc::clone(&pipeline.telemetry));
     {
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
@@ -666,51 +669,79 @@ pub async fn handle_whep_offer(
                     });
                 }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
+                let idr_keyframes = keyframes_dc.clone();
+                // The client rate-limits itself to one request per 200 ms, but that limit is
+                // advisory: a hostile or looping client must not be able to pin the encoder at
+                // one IDR per frame. `Instant` rather than the host clock because this is a
+                // local interval, not a stamp anything else compares against.
+                let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
+                // The Pong reply used to be written from inside the receive handler, which
+                // head-of-line blocked every later message on this channel behind an SCTP send.
+                // It goes to a task that owns the channel instead, so the handler only ever
+                // parses and enqueues.
+                let pong_tx = dc_for_pong.map(|dc_pong| {
+                    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    tokio::spawn(async move {
+                        while let Some(t_ns) = pong_rx.recv().await {
+                            let pong = input::protocol::build_pong(
+                                t_ns,
+                                crate::streamer::audio::host_now_ns(),
+                            );
+                            if dc_pong.send(&Bytes::copy_from_slice(&pong)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    pong_tx
+                });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let tx = tx.clone();
-                    let dc_pong = dc_for_pong.clone();
-                    let telemetry = Arc::clone(&telemetry_for_stats);
-                    let keyframes = keyframes_dc.clone();
-                    Box::pin(async move {
-                        // A client with neither `RTCRtpScriptTransform` nor
-                        // `createEncodedStreams` cannot make its browser emit a PLI, so it asks
-                        // in band. Answered before the control gate — a device with remote
-                        // control switched off still needs a picture — and through the same
-                        // rate limiter as every other keyframe request.
-                        if msg.data.first() == Some(&OP_KEYFRAME_REQUEST) {
-                            telemetry
+                    let Some(parsed) = input::protocol::parse(&msg.data) else {
+                        return Box::pin(async {});
+                    };
+                    // Both of these are transport business and are answered before the
+                    // remote-control gate: a device with control disabled still needs its
+                    // clock synced and still reports what its own pipeline is doing.
+                    match parsed.ev {
+                        input::protocol::InputEvent::ClientStats(stats) => {
+                            telemetry_for_stats.set_client_stats(*stats);
+                        }
+                        input::protocol::InputEvent::Ping { t_ns } => {
+                            if let Some(pong_tx) = &pong_tx {
+                                let _ = pong_tx.send(t_ns);
+                            }
+                        }
+                        // The receiver has no other way to ask: a client on the legacy encoded
+                        // transform runs instead of libwebrtc's reference finder, so no PLI is
+                        // ever emitted for it and a single lost keyframe would otherwise freeze
+                        // the picture until its own watchdog gave up on the WebCodecs path.
+                        input::protocol::InputEvent::KeyframeRequest { .. } => {
+                            let now = std::time::Instant::now();
+                            let allowed = last_idr_request
+                                .is_none_or(|t| now.duration_since(t) >= MIN_IDR_REQUEST_GAP);
+                            // The request is counted whether or not it is acted on: it is a real
+                            // observation about the client either way.
+                            telemetry_for_stats
                                 .degradation
                                 .keyframe_requests
                                 .fetch_add(1, Ordering::Relaxed);
-                            keyframes.request_quietly();
-                            return;
-                        }
-                        let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
-                            return;
-                        };
-                        // Both of these are transport business and are answered before the
-                        // remote-control gate: a device with control disabled still needs its
-                        // clock synced and still reports what its own pipeline is doing.
-                        if let input::protocol::InputEvent::ClientStats(stats) = ev {
-                            telemetry.set_client_stats(*stats);
-                            return;
-                        }
-                        if let Some(dc_pong) = &dc_pong {
-                            if let input::protocol::InputEvent::Ping { t_ns } = ev {
-                                let pong = input::protocol::build_pong(
-                                    t_ns,
-                                    crate::streamer::audio::host_now_ns(),
-                                );
-                                let _ = dc_pong.send(&Bytes::copy_from_slice(&pong)).await;
-                                return;
+                            telemetry_for_stats
+                                .degradation
+                                .client_keyframe_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            if allowed {
+                                last_idr_request = Some(now);
+                                // Through the session's one rate-limited requester, not
+                                // `pipeline.request_idr()` directly: this floor guards against a
+                                // looping client, the gate guards against answering a decoder's
+                                // whole backlog with the largest frame the encoder emits.
+                                idr_keyframes.request_quietly();
                             }
                         }
-                        if !control_enabled {
-                            return;
-                        }
-                        tx.route(ev, hot);
-                    })
+                        ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),
+                        _ => {}
+                    }
+                    Box::pin(async {})
                 }));
             })
         }));

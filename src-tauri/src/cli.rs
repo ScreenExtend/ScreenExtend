@@ -1133,6 +1133,31 @@ mod desktop {
                 ),
                 _ => println!("      client: has not reported stats"),
             }
+            if let Some(c) = s.get("client").filter(|c| !c.is_null()) {
+                let tier = |k: &str| c.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                println!(
+                    "      client tiers: transport={} render={} key={} sink={}",
+                    tier("transport_tier"),
+                    tier("render_tier"),
+                    tier("key_tier"),
+                    tier("sink_tier"),
+                );
+                // The one line a support conversation should start from: every bit here was a
+                // swallowed error or an untaken branch on the device.
+                let degraded: Vec<&str> = c
+                    .get("degraded")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                println!(
+                    "      client degraded: {}",
+                    if degraded.is_empty() {
+                        "none".to_string()
+                    } else {
+                        degraded.join(" ")
+                    }
+                );
+            }
         }
     }
 
