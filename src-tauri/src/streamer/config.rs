@@ -154,7 +154,7 @@ pub struct Config {
     pub audio_hub: Option<crate::streamer::audio::SharedAudioHub>,
 }
 
-const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
+pub const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
 
 impl Default for Config {
     fn default() -> Self {

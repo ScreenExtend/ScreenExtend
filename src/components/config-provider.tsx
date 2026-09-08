@@ -58,6 +58,12 @@ export type Config = {
     username: string,
     credential: string
   },
+  /**
+   * STUN servers offered to a peer that is not already known to be on this subnet, as a
+   * comma-separated list. Empty means no STUN at all, which is a valid setting for a LAN-only
+   * host. Read on the Rust side at setup; also writable with `ScreenExtend stun set|clear`.
+   */
+  stunUrls: string,
   dontShowAgain: {
     editDevice: boolean,
     editNetwork: boolean,
@@ -66,6 +72,7 @@ export type Config = {
   }
 };
 
+export const DEFAULT_STUN_URL = "stun:stun.l.google.com:19302";
 export const DEFAULT_HTTP_PORT = 8080;
 export const DEFAULT_HTTPS_PORT = 8443;
 
@@ -93,6 +100,7 @@ export const defaultConfig: Config = {
     username: "",
     credential: ""
   },
+  stunUrls: DEFAULT_STUN_URL,
   dontShowAgain: {
     editDevice: false,
     editNetwork: false,
