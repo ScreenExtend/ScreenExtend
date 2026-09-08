@@ -121,7 +121,7 @@ pub fn report_adapter_pairing(
                 // driver declares IddCx 1.2. The cost is a full-frame PCIe copy per frame that a
                 // dGPU-attached physical monitor would not pay. See `docs/OPTIMIZATIONS.md`.
                 tprintln!(
-                    "adapters: every frame crosses adapters. If this is a ScreenExtend virtual                      display, the bundled indirect display driver declares IddCx 1.2 and has no                      way to ask the OS to compose on the encoder's GPU"
+                    "adapters: every frame crosses adapters; if this is a ScreenExtend virtual display, the bundled driver declares IddCx 1.2 and cannot ask the OS to compose on the encoder's GPU"
                 );
             }
         }
