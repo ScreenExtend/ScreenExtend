@@ -257,7 +257,7 @@ fn worker(
     let _ = ready_tx.send(Ok(lookahead));
 
     sink.producer.set_consumer_thread(std::thread::current());
-    sink.consumer_thread.get_or_init(|| std::thread::current());
+    sink.consumer_thread.get_or_init(std::thread::current);
 
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;
@@ -267,8 +267,6 @@ fn worker(
     let mut warned_silent = false;
     let start_instant = Instant::now();
     const FRAME_NS: u64 = 5_000_000; // 5 ms per Opus frame at 48 kHz
-    let mut burst_t0: u64 = 0;
-    let mut burst_i: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(ControlMsg::Reacquire) = ctrl_rx.try_recv() {
@@ -281,8 +279,8 @@ fn worker(
 
         let mut produced = false;
         // seed once per drain pass; frames in the pass are then spaced by FRAME_NS
-        burst_t0 = host_now_ns();
-        burst_i = 0;
+        let burst_t0 = host_now_ns();
+        let mut burst_i: u64 = 0;
         while consumer.available() >= FRAME_INTERLEAVED {
             if consumer.pop(&mut frame) < FRAME_INTERLEAVED {
                 break;

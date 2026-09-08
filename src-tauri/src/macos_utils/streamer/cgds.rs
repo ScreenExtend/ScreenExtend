@@ -99,6 +99,7 @@ fn make_cg_properties(fps: f64) -> CFRetained<CFDictionary> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_frame(
     sink: &FrameSink,
     frames: &AtomicU64,
@@ -107,6 +108,7 @@ fn handle_frame(
     status: CGDisplayStreamFrameStatus,
     surface: *mut IOSurfaceRef,
     update: *const CGDisplayStreamUpdate,
+    display_time: u64,
 ) {
     if status != CGDisplayStreamFrameStatus::FrameComplete {
         return;
@@ -147,6 +149,7 @@ fn handle_frame(
             height,
             arrived_mach: mach_now(),
             captured_at: Instant::now(),
+            os_time_ns: super::clock::mach_ticks_to_host_ns(display_time),
             backing: Backing::PixelBuffer {
                 pixbuf,
                 _surface: surface_ret,
@@ -156,6 +159,10 @@ fn handle_frame(
 }
 
 impl CaptureBackend for CgDisplayStreamBackend {
+    fn name(&self) -> &'static str {
+        "cgdisplaystream"
+    }
+
     fn start(&mut self) -> Result<(), CaptureError> {
         let props = make_cg_properties(self.cfg.fps.max(1) as f64);
 
@@ -169,10 +176,10 @@ impl CaptureBackend for CgDisplayStreamBackend {
         let (w, h) = (self.cfg.width, self.cfg.height);
         let handler: FrameHandler = RcBlock::new(
             move |status: CGDisplayStreamFrameStatus,
-                  _display_time: u64,
+                  display_time: u64,
                   surface: *mut IOSurfaceRef,
                   update: *const CGDisplayStreamUpdate| {
-                handle_frame(&sink, &frames, w, h, status, surface, update);
+                handle_frame(&sink, &frames, w, h, status, surface, update, display_time);
             },
         );
 

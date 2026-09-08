@@ -271,6 +271,10 @@ fn class_nsobject() -> &'static AnyClass {
 }
 
 impl CaptureBackend for SckBackend {
+    fn name(&self) -> &'static str {
+        "screencapturekit"
+    }
+
     fn start(&mut self) -> Result<(), CaptureError> {
         // Belt-and-suspenders: confirm SCK is actually present. On 10.15 these
         // return None and we bail without ever touching a missing framework.
@@ -717,6 +721,10 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
             height: ctx.height,
             arrived_mach: mach_now(),
             captured_at: Instant::now(),
+            // ScreenCaptureKit's presentation timestamp lives on the CMSampleBuffer and is not
+            // read here; see findings/major-sck-presentation-timestamp-is-discarded.md. The dev
+            // Mac is 10.15, where SCK does not exist, so wiring it blind is not worth the risk.
+            os_time_ns: 0,
             backing: Backing::PixelBuffer {
                 pixbuf,
                 _surface: surface,

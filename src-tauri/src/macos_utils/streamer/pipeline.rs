@@ -11,6 +11,7 @@ use tokio::sync::broadcast;
 
 use crate::streamer::config::{Config, H264Profile};
 use crate::streamer::platform::BitrateApplied;
+use crate::streamer::telemetry::{FrameTiming, SessionTelemetry, SharedTelemetry};
 
 use super::config::{live_encoder_config, EncoderConfig};
 use super::display;
@@ -23,6 +24,9 @@ use super::{start_capture, CaptureBackend, CaptureConfig, DisplayId, PIXEL_FORMA
 pub struct EncodedFrame {
     pub data: Bytes,
     pub capture: Instant,
+    /// Per-stage stamps collected on the way here. The transport fills in the last two and folds
+    /// the whole set into the session histograms; see `streamer::telemetry`.
+    pub timing: FrameTiming,
 }
 
 const BROADCAST_CAPACITY: usize = 4;
@@ -31,6 +35,7 @@ const BROADCAST_CAPACITY: usize = 4;
 pub struct Pipeline {
     pub tx: broadcast::Sender<EncodedFrame>,
     pub frame_duration: Duration,
+    pub telemetry: SharedTelemetry,
     idr_request: Arc<AtomicBool>,
     target_bitrate: Arc<AtomicU32>,
     wake: crossbeam_channel::Sender<()>,
@@ -91,9 +96,12 @@ fn spawn_pipeline(
     let frame_duration = Duration::from_nanos(1_000_000_000 / enc.fps.max(1) as u64);
 
     let wake = source.wake_sender();
+    let telemetry = SessionTelemetry::new_shared();
+    telemetry.encoder.set("videotoolbox".into());
     let pipeline = Pipeline {
         tx: tx.clone(),
         frame_duration,
+        telemetry: Arc::clone(&telemetry),
         idr_request: Arc::clone(&idr_request),
         target_bitrate: Arc::clone(&target_bitrate),
         wake,
@@ -115,6 +123,7 @@ fn spawn_pipeline(
                 target_bitrate,
                 stop_thread,
                 frame_duration,
+                telemetry,
             )
         })
         .context("spawn encode thread")?;
@@ -122,6 +131,7 @@ fn spawn_pipeline(
     Ok((pipeline, stop, encode_thread))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_encode_loop(
     mut encoder: Encoder,
     source: FrameSource,
@@ -130,6 +140,7 @@ fn run_encode_loop(
     target_bitrate: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     frame_duration: Duration,
+    telemetry: SharedTelemetry,
 ) {
     super::qos::pin_current_thread_user_interactive();
     super::qos::pin_current_thread_time_constraint(frame_duration.as_nanos() as u64);
@@ -138,9 +149,14 @@ fn run_encode_loop(
     let _workgroup = super::qos::FrameWorkgroup::join(frame_duration.as_nanos() as u64);
     let _keep_awake = super::power::KeepAwake::begin();
 
-    let pending_ts: Arc<Mutex<VecDeque<Instant>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // VideoToolbox is asynchronous — submit and completion are different threads — so each
+    // frame's stamps ride the queue with its capture instant rather than being taken at drain
+    // time, which would have measured the drain thread's wake-up latency instead of the encode.
+    let pending_ts: Arc<Mutex<VecDeque<(Instant, FrameTiming)>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
 
     let drain_ts = Arc::clone(&pending_ts);
+    let drain_telemetry = Arc::clone(&telemetry);
     let output = encoder.output();
     let drain = std::thread::Builder::new()
         .name("videotoolbox-drain".to_string())
@@ -149,19 +165,24 @@ fn run_encode_loop(
             super::qos::raise_current_thread_precedence();
             super::qos::pin_current_thread_encode_affinity();
             while let Ok(sample) = output.recv() {
-                let capture = drain_ts
+                let (capture, mut timing) = drain_ts
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or_else(Instant::now);
+                    .unwrap_or_else(|| (Instant::now(), FrameTiming::entering_capture()));
+                timing.mark_encode_done();
                 let mut au: Vec<u8> = Vec::new();
                 sample.to_annexb(&mut au);
                 if au.is_empty() {
                     continue;
                 }
+                drain_telemetry
+                    .frames_encoded
+                    .fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(EncodedFrame {
                     data: Bytes::from(au),
                     capture,
+                    timing,
                 });
             }
         })
@@ -192,21 +213,36 @@ fn run_encode_loop(
                         );
                     }
                 }
-                Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}"),
+                Err(e) => {
+                    telemetry
+                        .degradation
+                        .encoder_transient_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    teprintln!("set_bitrate failed (target_bps={pending}): {e:?}")
+                }
             }
         }
 
         if let Some(frame) = source.try_take_latest() {
             if let Some(pixbuf) = frame.pixel_buffer() {
+                let mut timing = FrameTiming::entering_capture();
+                timing.capture_available_ns = frame.os_time_ns;
                 if !submit_one(
                     &mut encoder,
                     &pending_ts,
                     frame.captured_at,
+                    timing,
                     pixbuf,
                     force_idr,
                 ) {
                     teprintln!("encode submit failed; stopping encode loop");
                     break;
+                }
+                if force_idr {
+                    telemetry
+                        .degradation
+                        .idrs_sent
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 last_emit = Instant::now();
             }
@@ -215,7 +251,22 @@ fn run_encode_loop(
             if let Some(frame) = last_frame.as_ref() {
                 if let Some(pixbuf) = frame.pixel_buffer() {
                     let captured = frame.captured_at;
-                    if !submit_one(&mut encoder, &pending_ts, captured, pixbuf, force_idr) {
+                    // Re-encoding the frame we already have: the picture did not change, and
+                    // that is worth counting rather than reporting as fresh capture.
+                    let mut timing = FrameTiming::entering_capture();
+                    timing.capture_available_ns = frame.os_time_ns;
+                    telemetry
+                        .degradation
+                        .frames_repeated
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !submit_one(
+                        &mut encoder,
+                        &pending_ts,
+                        captured,
+                        timing,
+                        pixbuf,
+                        force_idr,
+                    ) {
                         break;
                     }
                     if !encoder.low_latency() {
@@ -234,14 +285,29 @@ fn run_encode_loop(
     let _ = drain.join();
 }
 
+/// Record which capture tier started, and whether reaching it cost a fallback.
+fn note_capture_backend(pipeline: &Pipeline, backend: &dyn CaptureBackend) {
+    let name = backend.name();
+    pipeline.telemetry.capture_backend.set(name.into());
+    if name == "cgdisplaystream" && super::screencapturekit_available() {
+        pipeline
+            .telemetry
+            .degradation
+            .capture_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn submit_one(
     encoder: &mut Encoder,
-    pending_ts: &Mutex<VecDeque<Instant>>,
+    pending_ts: &Mutex<VecDeque<(Instant, FrameTiming)>>,
     captured_at: Instant,
+    mut timing: FrameTiming,
     pixbuf: &objc2_core_video::CVImageBuffer,
     force_idr: bool,
 ) -> bool {
-    pending_ts.lock().unwrap().push_back(captured_at);
+    timing.mark_encode_submit();
+    pending_ts.lock().unwrap().push_back((captured_at, timing));
     if let Err(e) = encoder.submit(pixbuf, force_idr) {
         teprintln!("encode submit failed: {e:?}");
         pending_ts.lock().unwrap().pop_back();
@@ -270,6 +336,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
     let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
 
     let (pipeline, _stop, _encode_thread) = spawn_pipeline(enc, source)?;
+    note_capture_backend(&pipeline, backend.as_ref());
     std::mem::forget(backend);
     std::mem::forget(activity);
     Ok(pipeline)
@@ -296,6 +363,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
     let backend = start_capture(display, gpu, sink, cap_cfg).context("starting capture backend")?;
 
     let (pipeline, stop, encode_thread) = spawn_pipeline(enc, source)?;
+    note_capture_backend(&pipeline, backend.as_ref());
     Ok(SessionCapture {
         pipeline,
         control: Some(backend),
