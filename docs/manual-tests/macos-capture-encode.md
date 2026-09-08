@@ -222,6 +222,12 @@ Run every WindowServer-dependent step with the screen awake: `caffeinate -u -t 5
 immediately before, and the whole run under `caffeinate -dims`. A locked screen
 stalls compositing and the capture numbers become meaningless without saying so.
 
+The whole sequence is scripted as `src-tauri/target/w5-measure.sh` on the dev Mac
+(gitignored, so copy it out if you want to keep it). It runs the three latency
+trials, both capture-rate variants, the SPS check, the hardware ladder, the
+synthetic encode, the production-pipeline smoke test, the dyld floor check and the
+`nm -u | grep -i displaystream` guard, in that order, writing one log.
+
 `the_sps_promises_no_reordering` decodes the emitted SPS and asserts the decoder is
 told to hold zero frames before output. `AllowFrameReordering=false` is a request;
 `max_num_reorder_frames` in the VUI is what a decoder obeys, and a non-zero value
