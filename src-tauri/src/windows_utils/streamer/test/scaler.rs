@@ -91,13 +91,29 @@ fn source(device: &ID3D11Device) -> Option<ID3D11Texture2D> {
     tex
 }
 
-/// Runs the scale + readback loop and returns (median microseconds, bytes read back).
+/// One timing run: median microseconds for the blt submit, for the readback, and for the two
+/// together, plus the bytes read back and the format that was actually used.
+struct ScalerTiming {
+    blt_us: u128,
+    readback_us: u128,
+    total_us: u128,
+    bytes: usize,
+    format: ReadbackFormat,
+}
+
+/// Runs the scale + readback loop and returns its medians.
+///
+/// The two halves are timed apart because they are different costs: `scale` only submits a
+/// `VideoProcessorBlt`, while `read_back` copies to a staging texture, blocks in `Map` until the
+/// GPU retires that copy, and memcpys the result. Which of them the format change moves is the
+/// question, and it is also the number that decides whether double-buffering the staging texture
+/// could ever be worth a frame of latency.
 fn time_one(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     src: &ID3D11Texture2D,
     format: ReadbackFormat,
-) -> Option<(u128, usize, ReadbackFormat)> {
+) -> Option<ScalerTiming> {
     let mut scaler = match Scaler::with_format(device, context, SRC_W, SRC_H, DST_W, DST_H, format)
     {
         Ok(s) => s,
@@ -112,17 +128,32 @@ fn time_one(
     scaler.scale(src).expect("VideoProcessorBlt");
     scaler.read_back().expect("scaler readback");
 
-    let mut samples = Vec::with_capacity(ITERATIONS);
+    let mut blt = Vec::with_capacity(ITERATIONS);
+    let mut readback = Vec::with_capacity(ITERATIONS);
+    let mut total = Vec::with_capacity(ITERATIONS);
     let mut bytes = 0usize;
     for _ in 0..ITERATIONS {
         let start = std::time::Instant::now();
         scaler.scale(src).expect("VideoProcessorBlt");
+        let submitted = std::time::Instant::now();
         let (data, _pitch) = scaler.read_back().expect("scaler readback");
+        let done = std::time::Instant::now();
         bytes = data.len();
-        samples.push(start.elapsed().as_micros());
+        blt.push((submitted - start).as_micros());
+        readback.push((done - submitted).as_micros());
+        total.push((done - start).as_micros());
     }
-    samples.sort_unstable();
-    Some((samples[samples.len() / 2], bytes, landed))
+    blt.sort_unstable();
+    readback.sort_unstable();
+    total.sort_unstable();
+    let mid = ITERATIONS / 2;
+    Some(ScalerTiming {
+        blt_us: blt[mid],
+        readback_us: readback[mid],
+        total_us: total[mid],
+        bytes,
+        format: landed,
+    })
 }
 
 #[test]
@@ -135,24 +166,29 @@ fn nv12_readback_is_smaller_and_not_slower_than_bgra() {
         return;
     };
 
-    let Some((bgra_us, bgra_bytes, _)) = time_one(&device, &context, &src, ReadbackFormat::Bgra8)
-    else {
+    let Some(bgra) = time_one(&device, &context, &src, ReadbackFormat::Bgra8) else {
         return;
     };
-    let Some((nv12_us, nv12_bytes, landed)) =
-        time_one(&device, &context, &src, ReadbackFormat::Nv12)
-    else {
+    let Some(nv12) = time_one(&device, &context, &src, ReadbackFormat::Nv12) else {
         return;
     };
 
     eprintln!(
-        "scaler {SRC_W}x{SRC_H} -> {DST_W}x{DST_H}, {ITERATIONS} iterations, median per frame:\n  \
-         bgra8 {bgra_us} us, {bgra_bytes} bytes\n  \
-         {} {nv12_us} us, {nv12_bytes} bytes",
-        landed.name()
+        "scaler {SRC_W}x{SRC_H} -> {DST_W}x{DST_H}, {ITERATIONS} iterations, median us per frame:\n  \
+         bgra8 blt {} readback {} total {}, {} bytes\n  \
+         {}  blt {} readback {} total {}, {} bytes",
+        bgra.blt_us,
+        bgra.readback_us,
+        bgra.total_us,
+        bgra.bytes,
+        nv12.format.name(),
+        nv12.blt_us,
+        nv12.readback_us,
+        nv12.total_us,
+        nv12.bytes,
     );
 
-    if landed != ReadbackFormat::Nv12 {
+    if nv12.format != ReadbackFormat::Nv12 {
         skip("scaler nv12", "video processor refused NV12 output");
         return;
     }
@@ -160,8 +196,10 @@ fn nv12_readback_is_smaller_and_not_slower_than_bgra() {
     // NV12 is 1.5 bytes per pixel against BGRA's 4, but both are row-pitch padded, so compare
     // against the ratio with a margin rather than against an exact byte count.
     assert!(
-        (nv12_bytes as f64) < (bgra_bytes as f64) * 0.5,
-        "NV12 readback should be well under half of BGRA: {nv12_bytes} vs {bgra_bytes}"
+        (nv12.bytes as f64) < (bgra.bytes as f64) * 0.5,
+        "NV12 readback should be well under half of BGRA: {} vs {}",
+        nv12.bytes,
+        bgra.bytes
     );
 }
 
