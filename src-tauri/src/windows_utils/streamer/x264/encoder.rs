@@ -24,6 +24,12 @@ pub struct X264Encoder {
     width: usize,
     height: usize,
     i420: Vec<u8>,
+    /// The last NV12 frame, tightly packed at `width` pitch: `height` rows of luma followed by
+    /// `height / 2` rows of interleaved chroma. Empty until an NV12 frame arrives, so a host
+    /// whose scaler stays on BGRA never allocates it.
+    nv12: Vec<u8>,
+    /// Which of the two buffers holds the frame `encode_repeat` should re-encode.
+    input_csp: c_int,
     y_size: usize,
     c_size: usize,
     have_frame: bool,
@@ -158,6 +164,8 @@ impl X264Encoder {
             width,
             height,
             i420,
+            nv12: Vec::new(),
+            input_csp: X264_CSP_I420,
             y_size,
             c_size,
             have_frame: false,
@@ -176,6 +184,57 @@ impl X264Encoder {
         force_idr: bool,
     ) -> Result<Vec<u8>> {
         self.convert_bgra_to_i420(data, row_pitch as usize)?;
+        self.input_csp = X264_CSP_I420;
+        self.encode_converted(force_idr)
+    }
+
+    /// Encode a frame the GPU's video processor already converted to NV12.
+    ///
+    /// This is the whole point of `ReadbackFormat::Nv12`: the scale and the colour conversion are
+    /// one `VideoProcessorBlt`, so asking for NV12 output costs the video engine nothing and
+    /// deletes the CPU colour-matrix pass entirely. What is left here is a row copy into a
+    /// tightly packed buffer — the mapped staging texture's pitch is not the picture width, and
+    /// `encode_repeat` needs the frame to outlive the map — and then libx264 does the NV12→I420
+    /// deinterleave itself, in SIMD, inside `x264_frame_copy_picture`.
+    ///
+    /// The picture csp differs from `param.i_csp` here, which is allowed: `frame_internal_csp`
+    /// maps NV12 to I420, the same internal format the parameters opened with, so the SPS is
+    /// unaffected. That is the difference from the BGRA fast path this replaces, which mapped to
+    /// I444 and forced High 4:4:4 (`x264_profile_asserts_420`).
+    pub fn encode_nv12_padded(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let row_pitch = row_pitch as usize;
+        let (w, h) = (self.width, self.height);
+        let rows = h + h / 2;
+        if row_pitch < w || data.len() < row_pitch * rows {
+            bail!(
+                "encode_nv12_padded: need row_pitch >= {w} and >= {} bytes for {w}x{h} NV12 \
+                 (got pitch {row_pitch}, {} bytes)",
+                row_pitch * rows,
+                data.len()
+            );
+        }
+
+        if self.nv12.len() != w * rows {
+            self.nv12 = vec![0u8; w * rows];
+        }
+        if row_pitch == w {
+            self.nv12.copy_from_slice(&data[..w * rows]);
+        } else {
+            for (dst, src) in self
+                .nv12
+                .chunks_exact_mut(w)
+                .zip(data.chunks_exact(row_pitch))
+            {
+                dst.copy_from_slice(&src[..w]);
+            }
+        }
+
+        self.input_csp = X264_CSP_NV12;
         self.encode_converted(force_idr)
     }
 
@@ -214,22 +273,28 @@ impl X264Encoder {
     }
 
     fn encode_converted(&mut self, force_idr: bool) -> Result<Vec<u8>> {
-        let (y_ptr, u_ptr, v_ptr) = {
-            let (y, rest) = self.i420.split_at_mut(self.y_size);
-            let (u, v) = rest.split_at_mut(self.c_size);
-            (y.as_mut_ptr(), u.as_mut_ptr(), v.as_mut_ptr())
-        };
-
         let mut pic_in: x264_picture_t = unsafe { std::mem::zeroed() };
         unsafe { (self.api.picture_init)(&mut pic_in) };
-        pic_in.img.i_csp = X264_CSP_I420;
-        pic_in.img.i_plane = 3;
-        pic_in.img.plane[0] = y_ptr;
-        pic_in.img.plane[1] = u_ptr;
-        pic_in.img.plane[2] = v_ptr;
-        pic_in.img.i_stride[0] = self.width as c_int;
-        pic_in.img.i_stride[1] = (self.width / 2) as c_int;
-        pic_in.img.i_stride[2] = (self.width / 2) as c_int;
+        if self.input_csp == X264_CSP_NV12 {
+            let (y, uv) = self.nv12.split_at_mut(self.y_size);
+            pic_in.img.i_csp = X264_CSP_NV12;
+            pic_in.img.i_plane = 2;
+            pic_in.img.plane[0] = y.as_mut_ptr();
+            pic_in.img.plane[1] = uv.as_mut_ptr();
+            pic_in.img.i_stride[0] = self.width as c_int;
+            pic_in.img.i_stride[1] = self.width as c_int;
+        } else {
+            let (y, rest) = self.i420.split_at_mut(self.y_size);
+            let (u, v) = rest.split_at_mut(self.c_size);
+            pic_in.img.i_csp = X264_CSP_I420;
+            pic_in.img.i_plane = 3;
+            pic_in.img.plane[0] = y.as_mut_ptr();
+            pic_in.img.plane[1] = u.as_mut_ptr();
+            pic_in.img.plane[2] = v.as_mut_ptr();
+            pic_in.img.i_stride[0] = self.width as c_int;
+            pic_in.img.i_stride[1] = (self.width / 2) as c_int;
+            pic_in.img.i_stride[2] = (self.width / 2) as c_int;
+        }
         pic_in.i_pts = self.pts;
         pic_in.i_type = if force_idr {
             X264_TYPE_IDR
