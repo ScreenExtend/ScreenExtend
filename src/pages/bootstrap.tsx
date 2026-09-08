@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 
 import { Check, Info, Loader2, X } from "lucide-react";
@@ -12,21 +12,23 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useGlobalSetters, useLoaded } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
 import { buildQrValues, generateOtp } from "@/lib/utils";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
+import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { useTranslation } from "@/i18n";
 import { useTheme, type Theme } from "@/components/theme-provider";
-import { check } from "@tauri-apps/plugin-updater";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 const DOWNLOAD_URL = "https://screenextend.app";
 const PERMISSION_POLL_MS = 200;
+const UPDATE_CHECK_DEADLINE_MS = 2000;
 
 function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): boolean {
   return a !== null
@@ -73,8 +75,8 @@ function formatBytes(bytes: number): string {
 export default function Bootstrap() {
   const { theme, setTheme } = useTheme();
   const { t } = useTranslation();
-  const { toast } = useToast();
-  const { windowLoaded: [loaded, setLoaded], windowOtp: [, setOtp], windowHostedNetworkOn: [, setHostedNetworkOn], windowSessionId: [, setSessionId], windowQrValues: [, setQrValues], windowPublicSessionsEnabled: [, setPublicSessionsEnabled] } = useContext(GlobalProviderContext);
+  const loaded = useLoaded();
+  const { setLoaded, setOtp, setHostedNetworkOn, setSessionId, setQrValues, setPublicSessionsEnabled } = useGlobalSetters();
 
   const [error, setError] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -99,24 +101,29 @@ export default function Bootstrap() {
         success = loaded;
       }
       if (success) {
-        if (!(await getConfig())) {
+        let existing = await getConfig();
+        if (!existing) {
           await createConfig({ name: await commands.getUsername(), theme });
+          existing = await getConfig();
         }
-        const existing = await getConfig();
         if (!existing) throw new Error("config store unreadable after setup");
         setTheme(existing.theme as Theme);
-        const savedPorts = existing?.serverPorts;
+        const savedPorts = existing.serverPorts;
         if (savedPorts) {
           await commands.setServerPorts(savedPorts.http, savedPorts.https);
         }
-        if (existing?.disableGpuEncode) {
+        if (existing.disableGpuEncode) {
           await commands.setDisableGpuEncode(true);
         }
-        if (existing?.legacyVolumeKeyProxy) {
+        if (existing.legacyVolumeKeyProxy) {
           await commands.setLegacyVolumeKeyProxy(true);
         }
-        for (const device of existing?.devices ?? []) {
-          await commands.setDeviceOverride(
+        // Independent per device, so replay them together rather than one IPC round-trip
+        // at a time: with a dozen saved devices the serial version was the longest single
+        // stretch between setup() returning and the dashboard appearing.
+        const replay: Promise<unknown>[] = [];
+        for (const device of existing.devices ?? []) {
+          replay.push(commands.setDeviceOverride(
             device.ip,
             device.scale,
             device.orientation,
@@ -126,19 +133,20 @@ export default function Bootstrap() {
             device.remoteControl ?? false,
             device.dpr ?? device.maxDpr ?? 1,
             device.systemAudio ?? false
-          );
+          ));
         }
-        for (const known of existing?.knownDevices ?? []) {
+        for (const known of existing.knownDevices ?? []) {
           const token = known.token ?? "";
           if (known.banned) {
-            await commands.setDeviceBanned(token, known.ip, true);
+            replay.push(commands.setDeviceBanned(token, known.ip, true));
           } else if (token) {
-            await commands.setDeviceApproved(token, true);
+            replay.push(commands.setDeviceApproved(token, true));
           } else {
             console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
           }
         }
-        const publicSessionsEnabled = existing?.publicSessionsEnabled !== false;
+        await Promise.all(replay);
+        const publicSessionsEnabled = existing.publicSessionsEnabled !== false;
         setPublicSessionsEnabled(publicSessionsEnabled);
 
         await commands.watchForNetworkChanges();
@@ -161,11 +169,19 @@ export default function Bootstrap() {
         }
         setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
         setHostedNetworkOn(false);
-        const turn = (await getConfig())?.turnConfig;
+        const turn = existing.turnConfig;
         if (turn?.urls) {
           await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");
         }
+        const update = await pendingUpdate();
+        if (update) {
+          await installUpdate(update);
+          return;
+        }
         document.getElementById("dashlink")!.click();
+        scheduleConfigEditorPreload();
+        void loadDevices();
+        void loadSettings();
       } else {
         if (tryInstall) {
           await commands.installDrivers();
@@ -181,14 +197,30 @@ export default function Bootstrap() {
     }
   };
 
-  const runUpdate = async (): Promise<boolean> => {
-    let update;
+  // `check()` is an HTTP round-trip to the release endpoint, and on an offline or
+  // captive-portal network it takes the full timeout. It used to gate everything: no
+  // permission probe, no compatibility report, no `setup()` and so no virtual display
+  // until it settled. It is kicked off here instead and only awaited at the one point
+  // where an update would take the screen over, so it overlaps the whole startup path.
+  // The deadline bounds the pathological case; a check that misses it is picked up on
+  // the next launch.
+  const updateCheck = useRef<Promise<Update | null> | null>(null);
+
+  const pendingUpdate = async (): Promise<Update | null> => {
+    const check = updateCheck.current;
+    if (!check) return null;
+    let timer: number | undefined;
+    const deadline = new Promise<null>(resolve => {
+      timer = window.setTimeout(() => resolve(null), UPDATE_CHECK_DEADLINE_MS);
+    });
     try {
-      update = await check();
-    } catch {
-      return false;
+      return await Promise.race([check, deadline]);
+    } finally {
+      if (timer !== undefined) window.clearTimeout(timer);
     }
-    if (!update) return false;
+  };
+
+  const installUpdate = async (update: Update): Promise<void> => {
     setUpdateVersion(update.version);
     setUpdating(true);
     try {
@@ -207,11 +239,9 @@ export default function Bootstrap() {
         }
       });
       await relaunch();
-      return true;
     } catch {
       setUpdating(false);
       setUpdateFailed(true);
-      return true;
     }
   };
 
@@ -285,7 +315,10 @@ export default function Bootstrap() {
   };
 
   const start = async () => {
-    if (await runUpdate()) return;
+    updateCheck.current = check().catch(() => null);
+    // The dashboard is the next screen either way; fetching its chunk alongside the Rust
+    // setup keeps it off the entry chunk without making the navigation wait for it.
+    void loadDashboard();
     await proceed();
   };
 
@@ -294,10 +327,6 @@ export default function Bootstrap() {
     running.current = true;
     start().catch(() => setError(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    scheduleConfigEditorPreload();
   }, []);
 
   const permissionGateOpen = permReport !== null;

@@ -20,7 +20,10 @@ export function buildWifiQrValue(ssid: string, password: string): string {
   return `WIFI:T:WPA;S:${escape(ssid)};P:${escape(password)};;`;
 }
 
-window.commands = commands;
+// A devtools convenience, and nothing in `src/` reads it. In a release build there are no
+// devtools attached, so it was only keeping the whole command surface reachable from a
+// global.
+if (import.meta.env.DEV) window.commands = commands;
 
 declare global {
     interface Window {

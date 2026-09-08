@@ -1,12 +1,10 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   darkMode: ["variant", ".dark &"],
-  content: [
-    "./pages/**/*.{ts,tsx}",
-    "./components/**/*.{ts,tsx}",
-    "./app/**/*.{ts,tsx}",
-    "./src/**/*.{ts,tsx}",
-  ],
+  // Only `src/` exists. The three Next.js-shaped globs that shipped with the shadcn
+  // scaffold pointed at directories this repo has never had, so they scanned nothing and
+  // cost a filesystem walk per build. `index.html` carries no class attributes.
+  content: ["./src/**/*.{ts,tsx}"],
   prefix: "",
   theme: {
     container: {
