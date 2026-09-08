@@ -5218,6 +5218,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "block2 0.6.1",
  "bytes",
  "clap",
