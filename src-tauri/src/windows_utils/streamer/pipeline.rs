@@ -140,9 +140,14 @@ pub(crate) fn live_encoder_config(
     let fps = if let Some(f) = cfg.fps {
         f.clamp(15, 500)
     } else {
+        // The display's own rate, capped by the configured ceiling. There used to be a 60 fps
+        // floor here, which is not a floor on anything real: an indirect display has no scanout,
+        // so its reported refresh *is* the rate DWM composes at, and asking the encoder for 60
+        // when the compositor produces 30 only buys duplicate frames. Where the rate is unknown
+        // (0), 60 is still the assumption.
         let refresh = if refresh_hz == 0 { 60 } else { refresh_hz };
         let max_fps = cfg.max_fps.clamp(15, 500);
-        refresh.clamp(60.min(max_fps), max_fps)
+        refresh.clamp(15, max_fps)
     };
 
     let (width, height) = scaled_dims(native_w, native_h, cfg.scale);
