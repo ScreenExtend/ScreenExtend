@@ -171,6 +171,118 @@ impl WindowsVirtualDisplay {
     }
 }
 
+/// One active display path, as `QueryDisplayConfig` describes it.
+///
+/// `gdi_name` is the `\\.\DISPLAYn` every other Win32 display call wants; `friendly` is the name
+/// out of the monitor's EDID, which for our own virtual displays is the name we asked the driver
+/// to synthesise. Correlating the two is what lets a join skip the monitor-diff poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayPath {
+    pub gdi_name: String,
+    pub friendly: String,
+}
+
+fn wide_to_string(w: &[u16]) -> String {
+    let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+    String::from_utf16_lossy(&w[..end])
+}
+
+/// Every active display path, with its GDI device name and its EDID friendly name.
+pub fn active_display_paths() -> Vec<DisplayPath> {
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    };
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+
+    let mut n_path = 0u32;
+    let mut n_mode = 0u32;
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut n_path, &mut n_mode) }
+        != ERROR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); n_path as usize];
+    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); n_mode as usize];
+    if unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut n_path,
+            paths.as_mut_ptr(),
+            &mut n_mode,
+            modes.as_mut_ptr(),
+            None,
+        )
+    } != ERROR_SUCCESS
+    {
+        return Vec::new();
+    }
+    paths.truncate(n_path as usize);
+
+    let mut out = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != ERROR_SUCCESS.0 as i32 {
+            continue;
+        }
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        let friendly = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) }
+            == ERROR_SUCCESS.0 as i32
+        {
+            wide_to_string(&target.monitorFriendlyDeviceName)
+        } else {
+            String::new()
+        };
+        out.push(DisplayPath {
+            gdi_name: wide_to_string(&source.viewGdiDeviceName),
+            friendly,
+        });
+    }
+    out
+}
+
+/// Which `\\.\DISPLAYn` carries the monitor whose EDID friendly name is `want`.
+///
+/// `None` when nothing matches, and — deliberately — also when more than one path does. An
+/// ambiguous answer is worse than no answer here: the caller's fallback is a correct-but-slower
+/// monitor diff, while a wrong name would point the capture at somebody else's screen.
+///
+/// The comparison is a prefix match because the EDID monitor-name descriptor is 13 bytes, so a
+/// longer name we ask the driver for comes back truncated.
+pub fn gdi_name_for_friendly(paths: &[DisplayPath], want: &str) -> Option<String> {
+    let mut hit = None;
+    for p in paths {
+        if p.friendly.is_empty() {
+            continue;
+        }
+        if want == p.friendly || want.starts_with(p.friendly.as_str()) {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(p.gdi_name.clone());
+        }
+    }
+    hit
+}
+
 /// The mode Windows has actually settled on for a display device, so a caller that asked for
 /// 120 Hz can see whether it got it.
 pub fn current_display_mode(device_name: &str) -> Option<(u32, u32, u32)> {
@@ -334,6 +446,29 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         Ok(id)
     }
 
+    /// Correlate one of our monitors to its `\\.\DISPLAYn` without waiting for it to appear.
+    ///
+    /// The trait default returns `None`, which sends `server.rs` down `wait_for_new_monitor`:
+    /// a 100 ms poll of `EnumDisplayDevices` against a snapshot taken before the create,
+    /// serialised across every concurrent join by `DISPLAY_CORRELATION_LOCK` and bounded only
+    /// by the 5 s attach timeout — all of it between "the device scans the QR" and "a picture
+    /// appears". `QueryDisplayConfig` answers the same question directly when the monitor's
+    /// EDID name is unambiguous, and returns `None` when it is not, so the diff still covers
+    /// the cases this cannot.
+    fn display_device_name(&self, id: u32) -> Option<String> {
+        let want = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .owned
+                .iter()
+                .find(|m| m.id == id)?
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())?
+        };
+        gdi_name_for_friendly(&active_display_paths(), &want)
+    }
+
     fn remove_display(&self, id: u32) {
         let mut inner = self.inner.lock().unwrap();
         let mut monitors = inner.owned.clone();
@@ -364,6 +499,112 @@ mod test {
             DisplayBackend::DriverNotInstalled.as_str(),
             "DriverNotInstalled"
         );
+    }
+
+    #[test]
+    fn an_ambiguous_friendly_name_resolves_to_nothing() {
+        let paths = vec![
+            DisplayPath {
+                gdi_name: r"\\.\DISPLAY1".to_string(),
+                friendly: "ScreenExtend".to_string(),
+            },
+            DisplayPath {
+                gdi_name: r"\\.\DISPLAY2".to_string(),
+                friendly: "ScreenExtend".to_string(),
+            },
+            DisplayPath {
+                gdi_name: r"\\.\DISPLAY3".to_string(),
+                friendly: "Dell U2720Q".to_string(),
+            },
+        ];
+        // Two monitors answer to the same truncated EDID name, so the caller must fall back to
+        // the diff rather than be handed one of them at random.
+        assert_eq!(gdi_name_for_friendly(&paths, "ScreenExtend - iPad"), None);
+        assert_eq!(
+            gdi_name_for_friendly(&paths, "Dell U2720Q"),
+            Some(r"\\.\DISPLAY3".to_string())
+        );
+        assert_eq!(gdi_name_for_friendly(&paths, "Nothing"), None);
+        // An empty EDID name matches nothing, rather than matching everything by prefix.
+        let blank = vec![DisplayPath {
+            gdi_name: r"\\.\DISPLAY1".to_string(),
+            friendly: String::new(),
+        }];
+        assert_eq!(gdi_name_for_friendly(&blank, "anything"), None);
+    }
+
+    /// Dumps what `QueryDisplayConfig` says about every active display, which is the input the
+    /// `display_device_name` correlation runs on. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn report_active_display_paths() {
+        for p in active_display_paths() {
+            println!("{} <- EDID friendly name {:?}", p.gdi_name, p.friendly);
+        }
+    }
+
+    /// Times the two ways of answering "which `\\.\DISPLAYn` did my new virtual display become":
+    /// the `QueryDisplayConfig` correlation against the `EnumDisplayDevices` diff `server.rs`
+    /// falls back to. Needs the driver installed; creates three real displays for a few seconds.
+    /// Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn report_display_name_correlation() {
+        let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
+            println!("driver unavailable; skipping");
+            return;
+        };
+        let names = [
+            "ScreenExtend - alpha",
+            "ScreenExtend - beta",
+            "ScreenExtend - gamma",
+        ];
+        let mut ids = Vec::new();
+        for name in names {
+            let before = crate::windows_utils::streamer::capture::monitor_device_names();
+            let started = Instant::now();
+            let id = display
+                .create_display(name.to_string(), 1280, 720, 60)
+                .expect("create display");
+            ids.push(id);
+
+            // The lookup, polled the same way the diff is so the two are comparable.
+            let mut looked_up = None;
+            let mut lookup_ms = f64::NAN;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Some(n) = display.display_device_name(id) {
+                    looked_up = Some(n);
+                    lookup_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // The diff, from the same start instant.
+            let mut diffed = None;
+            let mut diff_ms = f64::NAN;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let now = crate::windows_utils::streamer::capture::monitor_device_names();
+                if let Some(n) = now.iter().find(|n| !before.contains(n)) {
+                    diffed = Some(n.clone());
+                    diff_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            println!(
+                "{name}: lookup={looked_up:?} in {lookup_ms:.0}ms, diff={diffed:?} in {diff_ms:.0}ms"
+            );
+        }
+        for p in active_display_paths() {
+            println!("  path {} <- friendly {:?}", p.gdi_name, p.friendly);
+        }
+        for id in ids {
+            display.remove_display(id);
+        }
     }
 
     /// Reports which display backend this machine probes to. Run with `--ignored --nocapture`.
