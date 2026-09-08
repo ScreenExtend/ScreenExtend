@@ -83,6 +83,9 @@ ctx.SEVideo = {
     hostToPaint: { p50: 41.2, p90: 55.0, p99: 90.0 },
     framesPainted: 1799, framesDropped: 3, decodeErrors: 0, keyRequests: 2,
     audioUnderruns: 7, audioOverruns: 1,
+    transportTier: 1, renderTier: 1, keyTier: 1, sinkTier: 2,
+    suppressed: 9, degraded: (1 << 3) | (1 << 13),
+    audioTargetMs: 18.5, audioConcealed: 4, audioOutputLatencyMs: 12.25,
   }),
 };
 
@@ -102,13 +105,15 @@ const stats = sent.find((s) => s.bytes[0] === OP.STATS);
 if (!stats) { fail('no STATS frame was sent'); process.exit(); }
 const b = stats.bytes;
 const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-if (b.length !== 72) fail('STATS is ' + b.length + ' bytes, the Rust parser requires >= 72');
-else ok('STATS is exactly the 72 bytes docs/TELEMETRY.md documents');
+if (b.length !== 96) fail('STATS is ' + b.length + ' bytes, expected the 96 of v2');
+else ok('STATS is exactly the 96 bytes docs/TELEMETRY.md documents for v2');
+if (b.length < 72) fail('STATS is shorter than the 72-byte floor the Rust parser requires');
+else ok('STATS clears the 72-byte floor an older host reads');
 if (stats.label !== 'reliable') fail('STATS went out on ' + stats.label + ', not reliable');
 else ok('STATS goes on the reliable channel');
 
 const eq = (name, got, want) => (got === want ? ok(name + ' = ' + got) : fail(name + ' = ' + got + ', expected ' + want));
-eq('version', dv.getUint8(1), 1);
+eq('version', dv.getUint8(1), 2);
 eq('video path', dv.getUint8(2), 1);
 eq('audio path', dv.getUint8(3), 2);
 // SAB | ISOLATED | KEYBOARD_LOCK | FULLSCREEN | DECODER_HW | CLOCK_VALID
@@ -123,6 +128,17 @@ eq('keyframe requests', dv.getUint32(56, true), 2);
 eq('audio underruns', dv.getUint32(60, true), 7);
 eq('audio overruns', dv.getUint32(64, true), 1);
 eq('rtt us', dv.getUint32(68, true), 4100);
+// v2 tail. The first 72 bytes above are byte-identical to v1, which is what lets an older
+// host read this frame's prefix and ignore the rest.
+eq('transport tier', dv.getUint8(72), 1);
+eq('render tier', dv.getUint8(73), 1);
+eq('keyframe tier', dv.getUint8(74), 1);
+eq('sink tier', dv.getUint8(75), 2);
+eq('suppressed errors', dv.getUint32(76, true), 9);
+eq('degradation flags', dv.getUint32(80, true), (1 << 3) | (1 << 13));
+eq('audio target us', dv.getUint32(84, true), 18500);
+eq('audio concealed', dv.getUint32(88, true), 4);
+eq('audio output latency us', dv.getUint32(92, true), 12250);
 
 // A host PONG carrying its clock: t0 = 1000 ms in ns, host at 5000 ms, reply read at 1010 ms.
 now = 1010;
