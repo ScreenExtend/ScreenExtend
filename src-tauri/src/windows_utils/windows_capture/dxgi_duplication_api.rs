@@ -48,7 +48,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use super::d3d11::{
-    create_d3d_device, unmap_staging_texture, MappedStagingTexture, StagingTexture,
+    create_d3d_device, unmap_staging_texture, GpuPreference, MappedStagingTexture, StagingTexture,
 };
 use super::encoder::{ImageEncoder, ImageEncoderError, ImageEncoderPixelFormat, ImageFormat};
 use super::monitor::Monitor;
@@ -201,7 +201,7 @@ impl DxgiDuplicationApi {
     /// module.
     pub fn new(monitor: Monitor) -> Result<Self, Error> {
         // Create D3D11 device and context.
-        let (d3d_device, d3d_device_context) = create_d3d_device()?;
+        let (d3d_device, d3d_device_context, _adapter) = create_d3d_device(GpuPreference::Default)?;
 
         let dxgi_device = d3d_device.cast::<IDXGIDevice4>()?;
         let output = find_output_for_monitor(&dxgi_device, monitor)?;
@@ -235,7 +235,7 @@ impl DxgiDuplicationApi {
         supported_formats: &[DxgiDuplicationFormat],
     ) -> Result<Self, Error> {
         // Create D3D11 device and context.
-        let (d3d_device, d3d_device_context) = create_d3d_device()?;
+        let (d3d_device, d3d_device_context, _adapter) = create_d3d_device(GpuPreference::Default)?;
 
         let dxgi_device = d3d_device.cast::<IDXGIDevice4>()?;
         let output = find_output_for_monitor(&dxgi_device, monitor)?;

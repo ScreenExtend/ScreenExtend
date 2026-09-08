@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_future::AsyncActionCompletedHandler;
 
-use super::d3d11::{self, create_d3d_device};
+use super::d3d11::{self, create_d3d_device, AdapterInfo};
 use super::frame::Frame;
 use super::graphics_capture_api::{self, GraphicsCaptureApi, InternalCaptureControl};
 use super::settings::{GraphicsCaptureItemType, Settings};
@@ -284,6 +284,8 @@ pub struct Context<Flags> {
     pub device: ID3D11Device,
     /// The Direct3D device context.
     pub device_context: ID3D11DeviceContext,
+    /// Which adapter the device above was created on.
+    pub adapter: AdapterInfo,
 }
 
 /// Trait implemented by types that handle graphics capture events.
@@ -317,7 +319,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let thread_id = unsafe { GetCurrentThreadId() };
 
         // Create Direct3D device and context
-        let (d3d_device, d3d_device_context) = create_d3d_device()?;
+        let (d3d_device, d3d_device_context, adapter) = create_d3d_device(settings.gpu_preference)?;
 
         // Start capture
         let result = Arc::new(Mutex::new(None));
@@ -326,6 +328,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
             flags: settings.flags,
             device: d3d_device.clone(),
             device_context: d3d_device_context.clone(),
+            adapter,
         };
 
         let callback = Arc::new(Mutex::new(
@@ -424,7 +427,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 let thread_id = unsafe { GetCurrentThreadId() };
 
                 // Create direct3d device and context
-                let (d3d_device, d3d_device_context) = create_d3d_device()?;
+                let (d3d_device, d3d_device_context, adapter) =
+                    create_d3d_device(settings.gpu_preference)?;
 
                 // Start capture
                 let result = Arc::new(Mutex::new(None));
@@ -433,6 +437,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                     flags: settings.flags,
                     device: d3d_device.clone(),
                     device_context: d3d_device_context.clone(),
+                    adapter,
                 };
 
                 let callback = Arc::new(Mutex::new(
