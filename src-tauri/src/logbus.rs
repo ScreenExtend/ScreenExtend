@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::AppHandle;
@@ -9,7 +11,25 @@ use tauri_specta::Event;
 
 const MAX_BACKLOG: usize = 2000;
 
+/// Depth of the hand-off queue between the logging call sites and the writer thread. Deep
+/// enough to absorb a startup burst, shallow enough that a wedged writer cannot grow without
+/// bound. Overflow drops the line and is reported in-band.
+const QUEUE_DEPTH: usize = 4096;
+
+/// Longest a line waits in the writer thread before it is emitted to the webview.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Most lines coalesced into one `LogLine` event.
+const MAX_BATCH: usize = 64;
+
 static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Whether anything is reading the `LogLine` stream. The Settings log panel is the only
+/// consumer and it reads the backlog on mount, so the first `get_log_backlog` call is the
+/// signal that arms the stream. Until then the writer thread never touches Tauri's event bus.
+static STREAMING: AtomicBool = AtomicBool::new(false);
+
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_verbose(on: bool) {
     VERBOSE.store(on, Ordering::Relaxed);
@@ -26,28 +46,107 @@ pub struct LogLine(pub String);
 struct LogBus {
     backlog: Mutex<VecDeque<String>>,
     app: OnceLock<AppHandle>,
+    tx: Sender<String>,
 }
 
 static BUS: OnceLock<LogBus> = OnceLock::new();
 
 fn bus() -> &'static LogBus {
-    BUS.get_or_init(|| LogBus {
-        backlog: Mutex::new(VecDeque::with_capacity(MAX_BACKLOG)),
-        app: OnceLock::new(),
+    BUS.get_or_init(|| {
+        let (tx, rx) = bounded(QUEUE_DEPTH);
+        let bus = LogBus {
+            backlog: Mutex::new(VecDeque::with_capacity(MAX_BACKLOG)),
+            app: OnceLock::new(),
+            tx,
+        };
+        // The writer cannot borrow `bus` yet, so it re-enters through `bus()` once BUS is set.
+        // `get_or_init` has not returned at this point, hence the small spin in `writer`.
+        std::thread::Builder::new()
+            .name("logbus".into())
+            .spawn(move || writer(rx))
+            .ok();
+        bus
     })
 }
 
+/// Queue a line for the backlog and the UI.
+///
+/// This is the only thing a `tprintln!` call site pays for, and it is deliberately cheap: one
+/// bounded-channel send that moves the already-formatted `String`. No lock the capture, encode
+/// or audio threads can contend on, no second allocation, and no JSON serialization — Tauri
+/// serializes an event payload before it checks whether anyone is listening, so emitting from
+/// here would cost that on every line whether or not the log panel is open.
 pub fn push_line(line: String) {
-    let bus = bus();
-    {
-        let mut backlog = bus.backlog.lock().unwrap();
-        if backlog.len() >= MAX_BACKLOG {
-            backlog.pop_front();
+    match bus().tx.try_send(line) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
         }
-        backlog.push_back(line.clone());
     }
-    if let Some(app) = bus.app.get() {
-        let _ = LogLine(line).emit(app);
+}
+
+fn writer(rx: Receiver<String>) {
+    // `bus()` is mid-`get_or_init` on the spawning thread; wait for it to publish.
+    let bus = loop {
+        if let Some(bus) = BUS.get() {
+            break bus;
+        }
+        std::thread::yield_now();
+    };
+
+    let mut batch: Vec<String> = Vec::with_capacity(MAX_BATCH);
+    while let Ok(first) = rx.recv() {
+        batch.push(first);
+
+        let streaming = STREAMING.load(Ordering::Relaxed);
+        if streaming {
+            // Trade up to FLUSH_INTERVAL of latency for one IPC hop per batch.
+            let deadline = Instant::now() + FLUSH_INTERVAL;
+            while batch.len() < MAX_BATCH {
+                match rx.recv_deadline(deadline) {
+                    Ok(line) => batch.push(line),
+                    Err(_) => break,
+                }
+            }
+        } else {
+            // Nothing is listening; keep the backlog as fresh as possible instead.
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok(line) => batch.push(line),
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            batch.push(format!(
+                "[logbus] dropped {dropped} line(s): the log queue overflowed"
+            ));
+        }
+
+        {
+            let mut backlog = bus.backlog.lock().unwrap();
+            for line in &batch {
+                if backlog.len() >= MAX_BACKLOG {
+                    backlog.pop_front();
+                }
+                backlog.push_back(line.clone());
+            }
+        }
+
+        if streaming {
+            if let Some(app) = bus.app.get() {
+                let payload = if batch.len() == 1 {
+                    batch.pop().unwrap()
+                } else {
+                    batch.join("\n")
+                };
+                let _ = LogLine(payload).emit(app);
+            }
+        }
+
+        batch.clear();
     }
 }
 
@@ -58,6 +157,7 @@ pub fn attach(app: AppHandle) {
 #[tauri::command]
 #[specta::specta]
 pub fn get_log_backlog() -> Vec<String> {
+    STREAMING.store(true, Ordering::Relaxed);
     bus().backlog.lock().unwrap().iter().cloned().collect()
 }
 
@@ -93,4 +193,144 @@ macro_rules! teprintln {
         }
         $crate::logbus::push_line(__line);
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain_settled() {
+        // The writer thread wakes on every send; give it room to catch up before reading.
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(5));
+            if bus().tx.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+                return;
+            }
+        }
+    }
+
+    /// One test, not two: the ring is process-global, so a sibling test pushing at the same
+    /// time would evict this one's lines out from under it.
+    #[test]
+    fn lines_reach_the_backlog_in_order_and_the_ring_stays_bounded() {
+        for i in 0..10 {
+            push_line(format!("logbus-order-{i}"));
+        }
+        drain_settled();
+        let backlog = bus().backlog.lock().unwrap().clone();
+        let seen: Vec<&String> = backlog
+            .iter()
+            .filter(|l| l.starts_with("logbus-order-"))
+            .collect();
+        assert_eq!(seen.len(), 10, "every line reached the ring");
+        for (i, line) in seen.iter().enumerate() {
+            assert_eq!(**line, format!("logbus-order-{i}"));
+        }
+
+        for i in 0..(MAX_BACKLOG + 500) {
+            push_line(format!("logbus-cap-{i}"));
+        }
+        drain_settled();
+        assert!(bus().backlog.lock().unwrap().len() <= MAX_BACKLOG);
+    }
+
+    /// Cost of one `tprintln!` at the call site, against the shape this module used to have.
+    /// Run with `cargo test --lib logbus::tests::bench_push_line -- --ignored --nocapture`.
+    ///
+    /// The "before" arm reproduces the old `push_line` exactly — take the global ring mutex,
+    /// clone the line, push, evict — minus the `LogLine(line).emit(app)` that followed it,
+    /// which a unit test cannot reach because no `AppHandle` exists here. That emit was the
+    /// larger half (a JSON serialization plus two Tauri-internal mutexes, paid whether or not
+    /// the log panel was mounted), so the ratio below is a lower bound on the improvement.
+    #[test]
+    #[ignore]
+    fn bench_push_line() {
+        const N: usize = 200_000;
+
+        let old_ring: Mutex<VecDeque<String>> = Mutex::new(VecDeque::with_capacity(MAX_BACKLOG));
+        let t0 = Instant::now();
+        for i in 0..N {
+            let line = format!("[bench] line {i} of {N}");
+            let mut backlog = old_ring.lock().unwrap();
+            if backlog.len() >= MAX_BACKLOG {
+                backlog.pop_front();
+            }
+            backlog.push_back(line.clone());
+        }
+        let before = t0.elapsed();
+
+        // Warm the bus and the writer thread so the spawn is not in the measurement.
+        push_line("warmup".into());
+        drain_settled();
+        DROPPED.store(0, Ordering::Relaxed);
+
+        let t1 = Instant::now();
+        for i in 0..N {
+            push_line(format!("[bench] line {i} of {N}"));
+        }
+        let after = t1.elapsed();
+
+        let before_ns = before.as_nanos() as f64 / N as f64;
+        let after_ns = after.as_nanos() as f64 / N as f64;
+        println!("push_line, {N} lines, one thread, log panel closed:");
+        println!("  before (ring lock + clone, no emit) {before_ns:.0} ns/line");
+        println!("  after  (bounded try_send)           {after_ns:.0} ns/line");
+        println!("  ratio  {:.2}x", before_ns / after_ns);
+        drain_settled();
+        println!("  dropped {}", DROPPED.load(Ordering::Relaxed));
+
+        // The shape that actually matters: capture, encode, audio and the tokio workers all
+        // log, so the old global ring mutex was contended across threads that must not block
+        // each other. Four writers is a conservative stand-in.
+        const THREADS: usize = 4;
+        const PER: usize = 50_000;
+
+        let old_ring =
+            std::sync::Arc::new(Mutex::new(VecDeque::<String>::with_capacity(MAX_BACKLOG)));
+        let t2 = Instant::now();
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let ring = old_ring.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER {
+                    let line = format!("[bench] thread {t} line {i}");
+                    let mut backlog = ring.lock().unwrap();
+                    if backlog.len() >= MAX_BACKLOG {
+                        backlog.pop_front();
+                    }
+                    backlog.push_back(line.clone());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let before_mt = t2.elapsed();
+
+        DROPPED.store(0, Ordering::Relaxed);
+        let t3 = Instant::now();
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER {
+                    push_line(format!("[bench] thread {t} line {i}"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after_mt = t3.elapsed();
+
+        let total = (THREADS * PER) as f64;
+        let before_mt_ns = before_mt.as_nanos() as f64 / total;
+        let after_mt_ns = after_mt.as_nanos() as f64 / total;
+        println!("push_line, {total} lines, {THREADS} threads, log panel closed:");
+        println!("  before (contended ring lock)        {before_mt_ns:.0} ns/line");
+        println!("  after  (bounded try_send)           {after_mt_ns:.0} ns/line");
+        println!("  ratio  {:.2}x", before_mt_ns / after_mt_ns);
+        drain_settled();
+        println!("  dropped {}", DROPPED.load(Ordering::Relaxed));
+    }
 }
