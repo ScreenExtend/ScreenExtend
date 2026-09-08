@@ -377,17 +377,41 @@
     send(OP.PING, pingBuf);
   }
 
+  // What the host on the other end of this channel actually understands. Every PONG carries
+  // a u16 bitfield at offset 17 (docs/INPUT-PROTOCOL.md); a frame shorter than 19 bytes is an
+  // older host and means no bits, which is the right answer for it. Nothing optional may be
+  // assumed to work — a request the host drops is not a mechanism, and a client that believed
+  // otherwise disarmed the watchdog that would have rescued it.
+  const HOST_CAP = {
+    KEYFRAME_REQUEST: 1 << 0,
+    STATS_V2: 1 << 1,
+    UNRELIABLE_MOVE_CHANNEL: 1 << 2,
+    INPUT_TIMESTAMP: 1 << 3,
+    INPUT_EVENT_FLAGS: 1 << 4,
+  };
+  let hostCaps = 0;
+  const capSubs = [];
+  function noteHostCaps(dv) {
+    const caps = dv.byteLength >= 19 ? dv.getUint16(17, true) : 0;
+    if (caps === hostCaps) return;
+    hostCaps = caps;
+    for (let i = 0; i < capSubs.length; i++) { try { capSubs[i](caps); } catch (_) {} }
+  }
+
   // The legacy `createEncodedStreams` transform gives the client no way to ask for an IDR,
-  // so the page relays the request here instead. A host that does not know this opcode
-  // returns None from its parser and ignores the frame, which is why this is safe to send
-  // unconditionally.
+  // so the page relays the request here instead — but only to a host that says it parses the
+  // opcode. Against an older one this returns false, which is what leaves the page's own
+  // demotion to <video> armed instead of waiting for an IDR that is never coming.
   const keyReqBuf = new ArrayBuffer(2), keyReqView = new DataView(keyReqBuf);
   let lastKeyReqAt = 0;
   function requestKeyframe() {
+    if (!(hostCaps & HOST_CAP.KEYFRAME_REQUEST)) return false;
+    if (!reliable || reliable.readyState !== 'open') return false;
+    // Armed only once the send is going to happen: a request attempted while the channel was
+    // closed used to burn the window and suppress the one that would have unfrozen the picture.
     const now = performance.now();
     if (now - lastKeyReqAt < 200) return false;
     lastKeyReqAt = now;
-    if (!reliable || reliable.readyState !== 'open') return false;
     keyReqView.setUint8(0, OP.KEYFRAME_REQUEST);
     keyReqView.setUint8(1, 0);
     send(OP.KEYFRAME_REQUEST, keyReqBuf);
@@ -437,6 +461,9 @@
       const dv = new DataView(ev.data);
       const op = dv.getUint8(0);
       if (op === OP.PONG && dv.byteLength >= 9) {
+        // Read before onPong: the clock estimate keeps only the least-queued sample and
+        // returns early on the rest, but the capability bits are the same on every frame.
+        noteHostCaps(dv);
         onPong(dv);
         if (window.SEHealth) SEHealth.alive();
       } else if (op === OP.BYE) {
@@ -748,6 +775,13 @@
     teardown,
     requestKeyframe,
     setPictureSize,
+    hostCapabilities() { return hostCaps; },
+    hostCapability(name) { return !!(hostCaps & (HOST_CAP[name] || 0)); },
+    onHostCapabilities(fn) {
+      if (typeof fn !== 'function') return;
+      capSubs.push(fn);
+      if (hostCaps) { try { fn(hostCaps); } catch (_) {} }
+    },
     hasCoalescedEvents() { return !!hasCoalesced; },
     get fastDropped() { return fastDropped; },
     onViewportSettled() { refreshSize(); sendResize(); },

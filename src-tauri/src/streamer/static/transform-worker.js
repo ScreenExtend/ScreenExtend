@@ -239,8 +239,14 @@ self.onmessage = (e) => {
       hintHeight = e.data.height | 0;
     }
   } else if (e.data.type === 'outofbandkey') {
+    // Revocable, not a latch: the page only learns whether the host parses the opcode once
+    // the first PONG arrives, and a tier that cannot be withdrawn is a tier that lies.
     outOfBandKey = !!e.data.available;
-    if (keyTier === KEYREQ.none && outOfBandKey) keyTier = KEYREQ.outOfBand;
+    if (outOfBandKey) {
+      if (keyTier === KEYREQ.none) keyTier = KEYREQ.outOfBand;
+    } else if (keyTier === KEYREQ.outOfBand) {
+      keyTier = KEYREQ.none;
+    }
   } else if (e.data.type === 'clockoffset') {
     if (typeof e.data.offsetMs === 'number' && isFinite(e.data.offsetMs)) {
       const first = !clockValid;
@@ -522,28 +528,46 @@ function resetAndRequestKey() {
   requestKey(true);
 }
 
-function requestKey(force) {
-  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-  if (!force && now - lastKeyRequestAt < KEY_REQUEST_MIN_INTERVAL_MS) return;
-  lastKeyRequestAt = now;
-  keyRequests++;
-  if (transformer && typeof transformer.sendKeyFrameRequest === 'function') {
-    keyTier = KEYREQ.sendKeyFrameRequest;
-    try {
-      const p = transformer.sendKeyFrameRequest();
-      if (p && p.catch) p.catch(note);
-    } catch (_) { note(); }
-    return;
-  }
-  // The legacy createEncodedStreams transform has no way to ask for an IDR: the transform
-  // runs instead of the reference finder, so the machinery that would normally emit a PLI
-  // never sees a frame. Ask the host directly over the input channel instead of freezing.
+// The legacy createEncodedStreams transform has no way to ask for an IDR: the transform runs
+// instead of the reference finder, so the machinery that would normally emit a PLI never sees
+// a frame. Ask the host directly over the input channel instead of freezing — but only when it
+// has said it parses the opcode, or `none` is the honest tier and the page's demotion is the
+// only remedy left.
+function requestKeyOutOfBand() {
   if (outOfBandKey) {
     keyTier = KEYREQ.outOfBand;
     self.postMessage({ type: 'requestkey' });
     return;
   }
   keyTier = KEYREQ.none;
+}
+
+// sendKeyFrameRequest() existing is not the same as it working. A throw or a rejection means
+// this receiver has no keyframe mechanism on that rung, so drop to the one below instead of
+// returning as though the request had gone out; a later success puts it back.
+const MAX_SEND_KEY_FAILURES = 2;
+let sendKeyFailures = 0;
+function noteSendKeyFailure() {
+  note();
+  sendKeyFailures++;
+  if (sendKeyFailures >= MAX_SEND_KEY_FAILURES) requestKeyOutOfBand();
+}
+
+function requestKey(force) {
+  const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  if (!force && now - lastKeyRequestAt < KEY_REQUEST_MIN_INTERVAL_MS) return;
+  lastKeyRequestAt = now;
+  keyRequests++;
+  const hasSendKey = !!(transformer && typeof transformer.sendKeyFrameRequest === 'function');
+  if (hasSendKey && sendKeyFailures < MAX_SEND_KEY_FAILURES) {
+    keyTier = KEYREQ.sendKeyFrameRequest;
+    try {
+      const p = transformer.sendKeyFrameRequest();
+      if (p && p.then) p.then(function () { sendKeyFailures = 0; }, noteSendKeyFailure);
+    } catch (_) { noteSendKeyFailure(); }
+    return;
+  }
+  requestKeyOutOfBand();
 }
 
 let firstReadDone = false;
