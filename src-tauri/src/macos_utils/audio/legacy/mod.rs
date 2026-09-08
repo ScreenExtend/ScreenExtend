@@ -226,6 +226,9 @@ impl ControlRuntime {
             }
         }
         self.router.restore();
+        // A clean stop means there is nothing left for the post-crash agent to recover, so it goes
+        // with us rather than outliving the app as a permanent background job.
+        routing::uninstall_watchdog_agent();
         crate::tprintln!("audio(legacy): stopped; default output restored");
     }
 
