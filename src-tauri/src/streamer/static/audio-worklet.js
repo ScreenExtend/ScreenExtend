@@ -198,7 +198,15 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
                 this.advanceRead(drop);
                 avail -= drop;
                 this.corrections++;
-            } else if (err < -this.slackFrames && (avail === 0 || this.peekPeak(need) < SILENCE_PEAK)) {
+            // `avail > 0` is what makes the concealment below reachable. This clause exists to
+            // *grow* the buffer at a silence boundary, and a commanded target is always at
+            // least MIN_TARGET_MS while the slack is 5 ms — so on a starved ring the test was
+            // unconditionally true and the block returned a square-edged silent quantum before
+            // conceal(), underruns++ and the re-prime hysteresis could run. The most common
+            // underrun of all, the ring at zero, took the one path that was written for
+            // everything else, and the adaptive safety margin could only ever decay because
+            // `underruns` never moved.
+            } else if (err < -this.slackFrames && avail > 0 && this.peekPeak(need) < SILENCE_PEAK) {
                 outL.fill(0);
                 if (outR) outR.fill(0);
                 this.corrections++;

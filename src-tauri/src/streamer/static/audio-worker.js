@@ -121,9 +121,24 @@ function onDecoded(ad) {
         else r.set(l);
     } catch (e) {
         ad.close();
+        // A copyTo that refuses the format conversion drops every packet the decoder
+        // produces. Swallowed frame by frame it was permanent silence with the client still
+        // reporting the fast audio path and audioUnderruns climbing for no visible reason.
+        copyFailures++;
+        if (copyFailures === MAX_COPY_FAILURES) {
+            self.postMessage({
+                type: 'decoder-failed',
+                reason: 'copyTo',
+                message: 'AudioData.copyTo refused f32-planar: ' + e,
+            });
+        }
         return;
     }
     ad.close();
+    copyFailures = 0;
+    // "Three failures in a row", the way the video worker counts them — not three in the
+    // lifetime of a four-hour session with one transient decode error an hour.
+    decoderResets = 0;
 
     const enqueueAbsMs = performance.timeOrigin + performance.now();
     const pre = enqueueAbsMs - (captureHostMs - hostOffsetMs);
@@ -149,6 +164,8 @@ function onDecoded(ad) {
 // told, so it can drop to the browser's own Opus track instead of playing silence.
 const MAX_DECODER_RESETS = 3;
 let decoderResets = 0;
+const MAX_COPY_FAILURES = 4;
+let copyFailures = 0;
 
 function makeDecoder() {
     try {
@@ -262,6 +279,7 @@ self.onmessage = (ev) => {
         preEnqueueEmaMs = null;
         concealed = 0;
         decoderResets = 0;
+        copyFailures = 0;
         lastDecodedFrames = 0;
         if (d.sab) setupShared(d.sab, d.capFrames);
         makeDecoder();

@@ -1216,8 +1216,25 @@
                 return w ? (w.renderTier || RENDER_TIER.canvas2d) : RENDER_TIER.canvas2d;
             }
 
+            let audioFastRetired = false;
             window.SEVideo = {
                 noteSuppressed,
+                // The client claimed the WebCodecs audio path, so the host answered with no
+                // audio track at all — there is nothing on the wire to fall back to when the
+                // decoder or the worklet then gives up. Drop the claim and rebuild the
+                // session, and the next answer carries a real Opus track. Once only: if the
+                // rebuilt session fails too, it is failing on the browser's own decoder and
+                // another round would be a loop.
+                onAudioFastLost() {
+                    if (audioFastRetired || !audioFast) return;
+                    audioFastRetired = true;
+                    audioFast = false;
+                    audioCaps = { webcodecsOpus: false, worklet: audioCaps.worklet };
+                    degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
+                    if (!isLive || kicked) return;
+                    console.warn('[audio] fast path lost; renegotiating for a standard track');
+                    reconfigure();
+                },
                 getStats() {
                     const w = videoWorkerStats;
                     const fb = fallbackPercentiles();

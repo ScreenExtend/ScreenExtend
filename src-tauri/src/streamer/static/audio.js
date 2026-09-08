@@ -39,6 +39,55 @@
     // only just shipped AudioDecoder, and the host reads this answer once: claim the fast
     // path and it sends Opus on a DataChannel with no audio track in the SDP at all, so a
     // decoder that then refuses `opus` is permanent silence with no way back.
+    // A CELT-only, mono, fullband 20 ms Opus frame: TOC 0xf8 is config 31, stereo bit clear,
+    // frame-count code 0. Small enough to inline and enough of a packet to make a decoder
+    // produce an AudioData that copyTo can be asked to convert.
+    const OPUS_PROBE = new Uint8Array([0xf8, 0xff, 0xfe]);
+    const DECODE_PROBE_DEADLINE_MS = 400;
+
+    // isConfigSupported answers about a configuration, not about the call that actually moves
+    // the samples. AudioData.copyTo is what deinterleaves into the ring, and an engine that
+    // says yes to `opus` and then refuses the f32-planar conversion drops every packet.
+    //
+    // Deliberately asymmetric about what counts as a refusal: only a decoder that *produced*
+    // an AudioData whose copyTo threw, or one that could not be configured at all, demotes.
+    // A decoder error or no output within the deadline is inconclusive — the probe packet
+    // itself would then be the suspect, and a wrong verdict here disables the fast audio path
+    // on every browser at once. The per-packet counter in audio-worker.js is the net for that.
+    function probeOpusDecode() {
+        return new Promise(function (resolve) {
+            let dec = null;
+            let settled = false;
+            let timer = 0;
+            const done = function (v) {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                try { if (dec && dec.state !== 'closed') dec.close(); } catch (_) { note(); }
+                resolve(v);
+            };
+            timer = setTimeout(function () { done('inconclusive'); }, DECODE_PROBE_DEADLINE_MS);
+            try {
+                dec = new AudioDecoder({
+                    output: function (ad) {
+                        let okCopy = true;
+                        try {
+                            const n = ad.numberOfFrames || 1;
+                            ad.copyTo(new Float32Array(n), { planeIndex: 0, format: 'f32-planar' });
+                        } catch (_) { okCopy = false; }
+                        try { ad.close(); } catch (_) { note(); }
+                        done(okCopy ? 'ok' : 'copy-failed');
+                    },
+                    error: function () { done('decode-error'); },
+                });
+                dec.configure({ codec: 'opus', sampleRate: SR, numberOfChannels: CH });
+                dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: 0, data: OPUS_PROBE }));
+            } catch (_) {
+                done('unsupported');
+            }
+        });
+    }
+
     let verified = null;
     async function verifyCapabilities() {
         if (verified) return verified;
@@ -52,6 +101,16 @@
             } catch (_) {
                 note();
                 caps.webcodecsOpus = false;
+            }
+        }
+        if (caps.webcodecsOpus) {
+            let outcome = 'inconclusive';
+            try { outcome = await probeOpusDecode(); } catch (_) { note(); }
+            if (outcome === 'copy-failed' || outcome === 'unsupported') {
+                console.warn('[audio] Opus decode probe: ' + outcome + '; taking the standard track');
+                caps.webcodecsOpus = false;
+            } else if (outcome !== 'ok') {
+                note();
             }
         }
         verified = caps;
@@ -93,6 +152,7 @@
         cleanBlocks: 0,
         concealed: 0,
         decoderFailed: false,
+        prepareFailed: false,
     };
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
@@ -460,15 +520,24 @@
                 return;
             }
 
+            // Its own try, so a NotFoundError on a device that has gone away — or a
+            // NotAllowedError — falls through to the element rung below instead of aborting
+            // into the shared catch with sinkTier still reporting the sink it did not set.
             if (speakers.hasCtxSink) {
-                await state.ctx.setSinkId(id);
-                speakers.appliedSink = id;
-                sinkTier = SINK_TIER.ctxSetSinkId;
-                // A different device has a different buffer depth, so the A/V target that
-                // was right for the old one is not right for this one.
-                state.outputLatencyEmaMs = null;
-                maybeUpdateTarget();
-                return;
+                let ctxSinkOk = false;
+                try {
+                    await state.ctx.setSinkId(id);
+                    ctxSinkOk = true;
+                } catch (_) { note(); }
+                if (ctxSinkOk) {
+                    speakers.appliedSink = id;
+                    sinkTier = SINK_TIER.ctxSetSinkId;
+                    // A different device has a different buffer depth, so the A/V target that
+                    // was right for the old one is not right for this one.
+                    state.outputLatencyEmaMs = null;
+                    maybeUpdateTarget();
+                    return;
+                }
             }
 
             if (speakers.hasElemSink) {
@@ -685,6 +754,18 @@
                     adaptSafetyMargin(e.data);
                 }
             };
+            // A processor constructor that throws on the render thread does *not* reject
+            // `new AudioWorkletNode`: the node is built and outputs silence. The ring ABI
+            // assertions are exactly that kind of throw, so without this the page reported
+            // worklet:true, the host answered with no audio track, and the failure was both
+            // inaudible and invisible.
+            state.node.onprocessorerror = () => {
+                note();
+                state.prepared = false;
+                state.prepareFailed = true;
+                console.error('[audio] worklet processor failed');
+                abandonWebCodecsAudio();
+            };
             state.gain = state.ctx.createGain();
             state.gain.gain.value = state.muted ? 0 : 1;
             state.node.connect(state.gain).connect(state.ctx.destination);
@@ -692,6 +773,20 @@
             return true;
         } catch (e) {
             console.warn('[audio] prepare failed:', e);
+            state.prepareFailed = true;
+            // Nothing here can play. Closing it releases the output device rather than
+            // holding an empty running graph open for the whole session — a real battery and
+            // audio-session cost on iOS, paid only by the browsers that could not use it.
+            try {
+                if (state.ctx) { const p = state.ctx.close(); if (p && p.catch) p.catch(note); }
+            } catch (_) { note(); }
+            state.ctx = null;
+            state.node = null;
+            state.gain = null;
+            // Not a permanent verdict: a module fetch can lose a race with a reconnect, and
+            // memoising the failure left the fast path dead for the life of the page — with
+            // the host already told worklet:true, so there was nothing to fall back to.
+            preparePromise = null;
             return false;
         }
     }
@@ -746,13 +841,8 @@
             } else if (d.type === 'discontinuity') {
                 if (state.node) state.node.port.postMessage({ type: 'discontinuity' });
             } else if (d.type === 'decoder-failed') {
-                // The decoder said yes to isConfigSupported and then failed anyway. Silence
-                // is the worst possible answer, so hand what is left to the fallback track
-                // if the host put one in the SDP, and make the failure visible either way.
-                state.decoderFailed = true;
                 console.warn('[audio] Opus decode failed repeatedly:', d.message);
-                stopWorker();
-                if (state.fallbackStream) attachFallbackStream(state.fallbackStream);
+                abandonWebCodecsAudio();
             }
         };
         w.onerror = (e) => { note(); console.warn('[audio] decoder worker error:', e); };
@@ -768,6 +858,27 @@
         state.worker = null;
     }
 
+    // The decoder said yes to isConfigSupported and then failed anyway. Silence is the worst
+    // possible answer, so take every rung there is: the DataChannel handler is detached first
+    // (it posted into a worker this is about to null, ~200 uncaught throws a second at the
+    // host's 5 ms framing), then the browser's own Opus track if the host put one in the SDP.
+    // When it did not — which is precisely the case where the client claimed the fast path —
+    // the only route back is a renegotiation that asks for one, which the page owns.
+    function abandonWebCodecsAudio() {
+        if (state.decoderFailed) return;
+        state.decoderFailed = true;
+        if (verified) verified.webcodecsOpus = false;
+        if (state.dc) { try { state.dc.onmessage = null; } catch (_) { note(); } }
+        stopWorker();
+        if (state.fallbackStream) {
+            attachFallbackStream(state.fallbackStream);
+            return;
+        }
+        try {
+            if (window.SEVideo && SEVideo.onAudioFastLost) SEVideo.onAudioFastLost();
+        } catch (_) { note(); }
+    }
+
     async function attachDataChannel(dc) {
         if (!(await prepare())) {
             console.warn('[audio] cannot prepare WebCodecs path');
@@ -777,6 +888,7 @@
         state.dc = dc;
         dc.binaryType = 'arraybuffer';
         dc.onmessage = (ev) => {
+            if (!state.worker) return;
             const buf = ev.data;
             if (!(buf instanceof ArrayBuffer) || buf.byteLength < HDR_BYTES) return;
             state.worker.postMessage(buf, [buf]);
@@ -857,7 +969,9 @@
         if (state.ctx && state.ctx.state === 'suspended') f |= DEG.AUDIO_CONTEXT_SUSPENDED;
         if (state.outputLatencySource !== 'measured') f |= DEG.AUDIO_OUTPUT_LATENCY_ESTIMATED;
         if (speakers.labelsUnavailable) f |= DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE;
-        if (preparePromise && !state.prepared) f |= DEG.AUDIO_PREPARE_FAILED;
+        // Latched rather than read off preparePromise, which is cleared on failure so a
+        // later attempt is not poisoned by it.
+        if (state.prepareFailed && !state.prepared) f |= DEG.AUDIO_PREPARE_FAILED;
         return f;
     }
 
