@@ -79,6 +79,49 @@ pub fn live_sessions() -> i64 {
     LIVE_SESSIONS.load(Ordering::Relaxed)
 }
 
+/// The client's `KEYFRAME_REQUEST` opcode on the reliable input channel, sent when neither
+/// insertable-streams API on its side can ask for one through RTCP.
+///
+/// Read ahead of `input::protocol::parse` so it works whether or not the input protocol has a
+/// variant for it; when one exists, that arm should call [`KeyframeRequester::request`] too
+/// rather than reaching for `pipeline.request_idr()` directly.
+pub const OP_KEYFRAME_REQUEST: u8 = 0x64;
+
+/// The one path every keyframe request in a session takes.
+///
+/// There are five callers — an RTCP PLI, an RTCP FIR, this client opcode, a payloader failure
+/// and a lagging viewer — and on an infinite-GOP encoder each one produces the largest frame the
+/// session will ever emit. Funnelling them through a single rate-limited requester is what stops
+/// a decoder's backlog from being answered five times over.
+#[derive(Clone)]
+pub struct KeyframeRequester {
+    pipeline: Pipeline,
+    gate: Arc<KeyframeGate>,
+}
+
+impl KeyframeRequester {
+    /// Ask the encoder for an IDR. Returns whether the request was admitted; a suppressed one
+    /// means an IDR is already in flight for the same event.
+    pub fn request(&self, reason: &str) -> bool {
+        if !self.gate.allow(audio::host_now_ns()) {
+            return false;
+        }
+        tprintln!("keyframe requested: {reason}");
+        self.pipeline.request_idr();
+        true
+    }
+
+    /// The same, without a log line. For the paths that fire continuously on a lossy link,
+    /// where every logbus line is a JSON IPC event to the desktop UI.
+    pub fn request_quietly(&self) -> bool {
+        if !self.gate.allow(audio::host_now_ns()) {
+            return false;
+        }
+        self.pipeline.request_idr();
+        true
+    }
+}
+
 pub struct InputParams {
     pub device: Option<String>,
     pub control_enabled: bool,
@@ -88,6 +131,11 @@ pub struct InputParams {
 #[derive(Clone)]
 pub struct AudioParams {
     pub fast: bool,
+    /// Put a standard Opus track in the answer even on the fast path, so a decoder that
+    /// answered "supported" and then failed on real packets has somewhere to go. Requested by
+    /// the client, because only the client knows whether it can switch to it — see
+    /// `AudioCapabilities::wants_fallback_track`.
+    pub fallback_track: bool,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
     pub device_key: String,
@@ -480,6 +528,10 @@ pub async fn handle_whep_offer(
     );
 
     let keyframe_gate = Arc::new(KeyframeGate::new());
+    let keyframes = KeyframeRequester {
+        pipeline: pipeline.clone(),
+        gate: Arc::clone(&keyframe_gate),
+    };
     let feedback = Arc::new(SharedFeedback::default());
     let clock_epoch = Instant::now();
     *feedback.history.lock().unwrap() = Some(SendHistory::new(clock_epoch));
@@ -497,8 +549,10 @@ pub async fn handle_whep_offer(
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
         let session_telemetry = Arc::clone(&pipeline.telemetry);
+        let keyframes_dc = keyframes.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let session_telemetry = Arc::clone(&session_telemetry);
+            let keyframes_dc = keyframes_dc.clone();
             let label = dc.label().to_string();
             if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
                 return Box::pin(async {});
@@ -530,7 +584,21 @@ pub async fn handle_whep_offer(
                     let tx = tx.clone();
                     let dc_pong = dc_for_pong.clone();
                     let telemetry = Arc::clone(&telemetry_for_stats);
+                    let keyframes = keyframes_dc.clone();
                     Box::pin(async move {
+                        // A client with neither `RTCRtpScriptTransform` nor
+                        // `createEncodedStreams` cannot make its browser emit a PLI, so it asks
+                        // in band. Answered before the control gate — a device with remote
+                        // control switched off still needs a picture — and through the same
+                        // rate limiter as every other keyframe request.
+                        if msg.data.first() == Some(&OP_KEYFRAME_REQUEST) {
+                            telemetry
+                                .degradation
+                                .keyframe_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            keyframes.request_quietly();
+                            return;
+                        }
                         let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
                             return;
                         };
@@ -580,7 +648,7 @@ pub async fn handle_whep_offer(
 
     {
         let pipeline = pipeline.clone();
-        let keyframe_gate = Arc::clone(&keyframe_gate);
+        let keyframes = keyframes.clone();
         let feedback = Arc::clone(&feedback);
         tokio::spawn(async move {
             use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
@@ -606,10 +674,7 @@ pub async fn handle_whep_offer(
                             .degradation
                             .keyframe_requests
                             .fetch_add(1, Ordering::Relaxed);
-                        if keyframe_gate.allow(audio::host_now_ns()) {
-                            tprintln!("RTCP keyframe request, requesting IDR");
-                            pipeline.request_idr();
-                        }
+                        keyframes.request_quietly();
                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
                         // Counted, never logged: a lossy link produces these continuously and
                         // every logbus line is a JSON IPC event to the UI.
@@ -669,7 +734,7 @@ pub async fn handle_whep_offer(
         let track = Arc::clone(&track);
         let pc_keepalive = Arc::clone(&pc);
         let pipeline = pipeline.clone();
-        let keyframe_gate = Arc::clone(&keyframe_gate);
+        let keyframes = keyframes.clone();
         let feedback = Arc::clone(&feedback);
         let pacing_target = Arc::clone(&pacing_target_bps);
         tokio::spawn(async move {
@@ -704,10 +769,7 @@ pub async fn handle_whep_offer(
                         let payloads = match payloader.payload(mtu, &frame.data) {
                             Ok(p) => p,
                             Err(e) => {
-                                tprintln!("h264 payload failed ({e})");
-                                if keyframe_gate.allow(audio::host_now_ns()) {
-                                    pipeline.request_idr();
-                                }
+                                keyframes.request(&format!("h264 payload failed ({e})"));
                                 continue;
                             }
                         };
@@ -716,9 +778,7 @@ pub async fn handle_whep_offer(
                             // stashes SPS and PPS rather than emitting them. Asking for another
                             // IDR would only produce another one, so the gate is what stops the
                             // spin.
-                            if keyframe_gate.allow(audio::host_now_ns()) {
-                                pipeline.request_idr();
-                            }
+                            keyframes.request_quietly();
                             continue;
                         }
                         timing.mark_packetize_done();
@@ -822,12 +882,7 @@ pub async fn handle_whep_offer(
                             .frames_dropped_broadcast
                             .fetch_add(skipped, Ordering::Relaxed);
                         feedback.note_lag();
-                        if keyframe_gate.allow(audio::host_now_ns()) {
-                            tprintln!(
-                                "viewer lagged (skipped={skipped}); requesting IDR to resync"
-                            );
-                            pipeline.request_idr();
-                        }
+                        keyframes.request(&format!("viewer lagged (skipped={skipped})"));
                         continue;
                     }
                     Err(RecvError::Closed) => {
@@ -846,8 +901,7 @@ pub async fn handle_whep_offer(
     let locality_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let closed_tx = Arc::new(Mutex::new(closed_tx));
     let input_tx_state = input_tx.clone();
-    let pipeline_state = pipeline.clone();
-    let keyframe_gate_state = Arc::clone(&keyframe_gate);
+    let keyframes_state = keyframes.clone();
     let (grace_cancel_tx, grace_cancel_rx) = tokio::sync::watch::channel(false);
     let grace_cancel_tx = Arc::new(grace_cancel_tx);
     let grace_cancel_rx_closure = grace_cancel_rx.clone();
@@ -869,9 +923,7 @@ pub async fn handle_whep_offer(
             // an infinite GOP nothing else would ever produce a keyframe. The client rescued
             // itself with a PLI, one browser PLI interval plus a round trip late. This is the
             // first moment the track can actually carry it.
-            if keyframe_gate_state.allow(audio::host_now_ns()) {
-                pipeline_state.request_idr();
-            }
+            keyframes_state.request("connection is up and the track is bound");
             if !locality_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let pc = pc_state.clone();
                 tokio::spawn(async move {
@@ -990,6 +1042,38 @@ async fn setup_audio(
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) -> Result<()> {
+    // On the fast path the Opus track is added but never fed: its whole job is to exist in the
+    // answer so the client has an `m=audio` section to fall back onto if its WebCodecs decoder
+    // dies mid-session. WHEP has no renegotiation verb, so a track that is not in the first
+    // answer can never be added later.
+    if !audio.fast || audio.fallback_track {
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_OPUS.to_owned(),
+                clock_rate: 48000,
+                channels: 2,
+                sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
+                rtcp_feedback: vec![],
+            },
+            "audio".to_owned(),
+            "webrtc-streamer".to_owned(),
+        ));
+        pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .context("add_track(opus fallback)")?;
+        if audio.fast {
+            tprintln!("audio: added a standard Opus track as an unfed fallback for the client");
+        } else {
+            tprintln!("audio: added standard Opus track (NetEQ fallback path)");
+            tokio::spawn(forward_track(
+                Arc::clone(pc),
+                track,
+                audio.clone(),
+                Arc::clone(&telemetry),
+            ));
+        }
+    }
+
     if audio.fast {
         let init = RTCDataChannelInit {
             ordered: Some(false),
@@ -1015,23 +1099,6 @@ async fn setup_audio(
                 tokio::spawn(forward_datachannel(pc, dc, audio, telemetry));
             })
         }));
-    } else {
-        let track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_OPUS.to_owned(),
-                clock_rate: 48000,
-                channels: 2,
-                sdp_fmtp_line: OPUS_FALLBACK_FMTP.to_owned(),
-                rtcp_feedback: vec![],
-            },
-            "audio".to_owned(),
-            "webrtc-streamer".to_owned(),
-        ));
-        pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await
-            .context("add_track(opus fallback)")?;
-        tprintln!("audio: added standard Opus track (NetEQ fallback path)");
-        tokio::spawn(forward_track(Arc::clone(pc), track, audio, telemetry));
     }
     Ok(())
 }
