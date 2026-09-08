@@ -191,6 +191,9 @@ function onDecoded(ad) {
         });
     }
 
+    // Anything owed in front of this packet goes in first, from this same task, which is what
+    // makes the ring order match the wire order.
+    flushConceal(ad.timestamp);
     rememberDecoded(l, r, frames);
     if (shared) writeShared(l, r, frames);
     else postSamples(l, r, frames);
@@ -239,6 +242,32 @@ let redundantDiscarded = 0;
 let lastDecodedL = null;
 let lastDecodedR = null;
 let lastDecodedFrames = 0;
+
+// Concealment used to be written inline, from the packet-arrival task. Real samples only reach
+// the ring from the decoder's output callback, which is a *separate* task, so under load — three
+// 5 ms packets queued behind one 15 ms stall — the concealment for a lost packet landed in the
+// ring before the output of the packet it follows. That plays two 5 ms blocks in the wrong
+// order, precisely in the conditions concealment exists for.
+//
+// So it is queued against the capture timestamp of the packet it must precede, and emitted from
+// that packet's own output task. A timestamp whose decode never produces an output would leak an
+// entry, so the map is bounded and drops oldest-first.
+const pendingConceal = new Map();
+const MAX_PENDING_CONCEAL = 16;
+function queueConceal(beforeTimestampUs, n) {
+    if (!lastDecodedFrames || n <= 0) return;
+    if (pendingConceal.size >= MAX_PENDING_CONCEAL) {
+        const oldest = pendingConceal.keys().next();
+        if (!oldest.done) pendingConceal.delete(oldest.value);
+    }
+    pendingConceal.set(beforeTimestampUs, (pendingConceal.get(beforeTimestampUs) || 0) + n);
+}
+function flushConceal(timestampUs) {
+    const n = pendingConceal.get(timestampUs);
+    if (!n) return;
+    pendingConceal.delete(timestampUs);
+    concealPackets(n);
+}
 
 function concealPackets(n) {
     if (!lastDecodedFrames || n <= 0) return;
@@ -323,8 +352,9 @@ function handlePacket(buf) {
     let recovered = false;
     if (prevLen > 0 && !discontinuity) {
         if (gap > 0) {
-            // The copy reaches back exactly one frame; anything older is still a hole.
-            if (gap > 1) concealPackets(gap - 1);
+            // The copy reaches back exactly one frame; anything older is still a hole, and it
+            // belongs in front of the copy rather than in front of this packet.
+            if (gap > 1) queueConceal(captureUs - FRAME_MS * 1000, gap - 1);
             submit(buf, prevOff, prevLen, captureUs - FRAME_MS * 1000);
             redundantUsed++;
             recovered = true;
@@ -334,7 +364,7 @@ function handlePacket(buf) {
     }
     // The host is telling us the capture itself broke, so there is nothing to bridge: let
     // the worklet resynchronise instead of pretending the missing audio existed.
-    if (!recovered && gap > 0 && !discontinuity) concealPackets(gap);
+    if (!recovered && gap > 0 && !discontinuity) queueConceal(captureUs, gap);
 
     lastSeq = seq;
     if (discontinuity) {
@@ -355,6 +385,7 @@ self.onmessage = (ev) => {
     if (d.type === 'init') {
         lastSeq = null;
         preEnqueueEmaMs = null;
+        pendingConceal.clear();
         concealed = 0;
         redundantUsed = 0;
         redundantDiscarded = 0;
