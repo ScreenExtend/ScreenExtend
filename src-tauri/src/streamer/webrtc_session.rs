@@ -441,7 +441,7 @@ pub async fn handle_whep_offer(
                         // remote-control gate: a device with control disabled still needs its
                         // clock synced and still reports what its own pipeline is doing.
                         if let input::protocol::InputEvent::ClientStats(stats) = ev {
-                            telemetry.client.set(Some(*stats));
+                            telemetry.set_client_stats(*stats);
                             return;
                         }
                         if let Some(dc_pong) = &dc_pong {

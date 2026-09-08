@@ -34,5 +34,8 @@ pub fn check_system_requirements() -> CompatibilityReport {
         unsupported_apis: Vec::new(),
         audio_backend: "unsupported".to_string(),
         display_backend: "unsupported".to_string(),
+        capture_backend: "unsupported".to_string(),
+        encoder_backend: "unsupported".to_string(),
+        hosted_network_backend: "unsupported".to_string(),
     }
 }

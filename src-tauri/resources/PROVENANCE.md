@@ -80,3 +80,56 @@ against the upstream release the next time these are refreshed.
 - **License:** GPL-2.0-or-later (x264). Note the licensing implications of
   bundling x264.
 - **SHA-256:** `87bf8a8331691b32cf6c8e9b282c9c2a825ed0b83eba0f24e539f667c042684e`
+
+## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
+
+- **Upstream:** [GPUOpen-LibrariesAndSDKs/AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF),
+  `amf/public/include/{core,components}` at commit
+  **`c35f613aea2e5057a688c979e75b1cf24253297e`** (`master`, 2026-07-06), which is AMF
+  **1.5.2.0** (`AMF_FULL_VERSION` = 281496451678208). Every file below was verified
+  byte-identical to that commit's blob.
+- **Used for:** measuring the AMF C ABI. `src-tauri/tools/amf_layout_gen.c` compiles these
+  headers in C mode and prints the struct sizes, field offsets, vtable slot indices, enum values
+  and property-name strings that `windows_utils/streamer/test/amd_layout.rs` asserts against the
+  hand-written bindings in `windows_utils/streamer/amd_sys/`.
+- **Not shipped, not linked, not compiled into the app.** They are a test fixture: absent from
+  `bundle.resources` in `tauri.conf.json`, unread by `build.rs`, and the encoder loads
+  `amfrt64.dll` at runtime with `libloading`. The runtime itself ships with the AMD
+  Radeon/Adrenalin driver and is never redistributed by us.
+- **License:** MIT, plus a non-license "Notice Regarding Standards" preamble disclaiming any
+  patent grant for MPEG-2/MPEG-4/AVC/HEVC/AAC/VC-1/MP3. Both blocks are kept intact at the top of
+  every vendored file. MIT is compatible with AGPL-3.0.
+- **Refreshing:** re-fetch the whole `{core,components}` set at one commit, re-run
+  `src-tauri/tools/amf_layout_build.bat`, paste the regenerated assertions into
+  `test/amd_layout.rs`, and update the commit above plus every SHA-256 in `SHA256SUMS`. A diff in
+  the generated numbers is a required review item — a changed vtable slot index is silent memory
+  corruption, not a compile error.
+
+| File | SHA-256 |
+| --- | --- |
+| `components/ColorSpace.h` | `4ef6392bb4b9c6b05d00b5cd1486b99866e40e61449206a3a515063e4ffd289b` |
+| `components/Component.h` | `f3f18680d55a65fdf5e0351d3fde1dcd9bdd2d6caec268c8c915c4227ffa1edc` |
+| `components/ComponentCaps.h` | `2479eb2a6174a1b63552c509abac1b701eddcab5a5eac5a7f4d9f40274d588b4` |
+| `components/PreAnalysis.h` | `801a197f578104c4481d21f68c3dd6ea8fbe2f9774424277499c5de70d213662` |
+| `components/VideoConverter.h` | `a7d565fbe50d82db7be7922a0d4408e989a632bc46d38cba6d9f107ad8d6dcb5` |
+| `components/VideoEncoderAV1.h` | `2c4e18f6d0be4701d9a9d9ad4298ed5d7ed7c1fd7a909995c4e745874d8203a0` |
+| `components/VideoEncoderHEVC.h` | `138ad005e4b7131582fc1f82dad8851c1362f0d156bf62f10a64e462c8a037c0` |
+| `components/VideoEncoderVCE.h` | `8dcddd6df00debd096db29f00fa155e3e179ebc6ea4c6c1edc5027eb857cffd5` |
+| `core/AudioBuffer.h` | `74b4bbc22c66520c233f258dba0642c3f4de66ae02d16201c3e224f9238b5d5d` |
+| `core/Buffer.h` | `3e52733b46e168f1b0118381df1ce17eed17353ca89b39c77394f59e254aef67` |
+| `core/Compute.h` | `dc35befae2cecf5d2b866632a8b16c2f2ec3a543a6b474f941a33fcd7a8d1e0a` |
+| `core/ComputeFactory.h` | `50acf69fb670bc6cf093384d1b698bf9e44cda8dd49e02ef24eacfb86ad8ccae` |
+| `core/Context.h` | `f9b4acb784038aad234ddec490e5f6ad6dacc4b14794eb84f3523d56dc3d6dd2` |
+| `core/Data.h` | `eaac4d80dd3215638c70f8a4ca01791d26d9df77586f665a772bb51907a8035b` |
+| `core/Debug.h` | `56666589bf6ad20c6286a048da751c2d7722f70c73d962ee3c205a6d709b6aff` |
+| `core/Factory.h` | `644814e97dd359f08d66a73748b60262149b106d28423c31b573cecb4be57979` |
+| `core/Interface.h` | `304f6d6077e9b0733859d44a5e43a343ae374c8fe72c7d79741c0aca89c21162` |
+| `core/Plane.h` | `5ad5165e9de2afcfc2da828e8704c838b1f82e8ead7422fbcfc32c758672e1f3` |
+| `core/Platform.h` | `c060dc2466d0d886d1a09e5fea891aa3bc2efd08dc8d5ef59faa4d0a7f42abd4` |
+| `core/PropertyStorage.h` | `0059b787e78cd7c4e57212ccaab56ad7e17e9474a31337da0eac5b2d056a5dd8` |
+| `core/PropertyStorageEx.h` | `871136e46586baa1fc77121935b503aaa16523d006c3e435ce50698605675fad` |
+| `core/Result.h` | `a469ff33875484b5762199da757819056ff4a7535bfdcec1f4cf2ffc403b98f2` |
+| `core/Surface.h` | `2f7f899a9f6291e0b02a447af6dd0e2c367a02271e7295c26cfd3b15de7d82a9` |
+| `core/Trace.h` | `ae8c5fee671f02b90d3ccab312cfa6f74424351f070a7dd4ed7aba437fd55c30` |
+| `core/Variant.h` | `5d15e778f3b846fa6eb95737e7222e0726b09615eb6270aac12bd2caa7137234` |
+| `core/Version.h` | `739f6559891d627fc373bfd63c4bcc3c8a432766703928d94cc1b92bc7bcfdf3` |

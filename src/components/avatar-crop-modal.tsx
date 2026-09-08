@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { AVATAR_OUTPUT_SIZE } from "@/lib/avatar";
 import { useTranslation } from "@/i18n";
 
@@ -18,7 +18,6 @@ type AvatarCropModalProps = {
 
 export function AvatarCropModal({ open, imageSrc, onCancel, onSave }: AvatarCropModalProps) {
   const { t } = useTranslation();
-  const { toast } = useToast();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const coverRef = useRef(1);

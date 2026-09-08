@@ -220,10 +220,12 @@ capture/encode/tuning/audio-start that calls into the per-OS backend.
 `banned_devices`, `approved_devices`, `otp_limiter`, `server_ports`, `disable_gpu_encode`,
 `cloud`, `cloud_status`, `audio_hub`.
 
-**Current support:** Windows (NVENC/QSV/x264) and macOS (VideoToolbox) are functional. Linux is
-scaffolded but non-functional; AMD encode is a stub (`windows_utils/streamer/amd.rs`, notes in
-`amd.md`). When adding a capability, add it to all three modules to keep the surface consistent
-(Linux/AMD paths may `bail!`).
+**Current support:** Windows (NVENC/QSV/AMF/x264) and macOS (VideoToolbox) are functional. Linux
+is scaffolded but non-functional. The AMD AMF backend (`windows_utils/streamer/amd/` +
+`amd_sys/`, design in `amd.md`) is complete and wired into the `Auto` chain, but **`UNVERIFIED`**
+— no machine on this project has an AMD GPU, so its FFI is asserted by `test/amd_layout.rs` and
+nothing in it has ever encoded a frame (`docs/manual-tests/amd-amf.md`). When adding a
+capability, add it to all three modules to keep the surface consistent (Linux paths may `bail!`).
 
 ### Concurrency & locking
 
@@ -262,7 +264,7 @@ Cross-platform core, OS-independent:
   `prepare()` sets DPI awareness + process tuning. Also exposes the `probe_*` entry points.
 - `config.rs` — `Config` (the whole streaming configuration, including the `Shared*` handles
   threaded in from `AppState`), `ScalePercent` (10–100), `EncoderVendor`
-  (`auto|nvidia|intel|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
+  (`auto|nvidia|intel|amd|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
   `max_fps` 500, Google STUN), and `from_args()`/`print_help()` for the probe harness.
 - `server.rs` — axum HTTP(S) server per network adapter; validates session ID + OTP on join,
   creates the virtual display sized to the client, starts the pipeline. Holds the clamp
@@ -333,11 +335,18 @@ Cross-platform core, OS-independent:
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing.
 - `scaler.rs`, `tuning.rs` — GPU scaling and process/thread priority tuning.
 - Encoders: `nvidia/` (hand-written NVENC FFI in `nvenc_sys/`), `intel/` (oneVPL / Quick Sync FFI
-  in `intel_sys.rs`), `x264/` (libx264 FFI, the CPU fallback), `amd.rs` (stub).
-- `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → x264; `Intel`
-  tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`), then x264;
-  `Software` goes straight to x264. Vendor detection is by DXGI adapter description
-  (`select_vendor`). NVENC uses a texture ring to decouple capture from encode.
+  in `intel_sys.rs`), `amd/` (AMF, with the hand-written C-vtable FFI in `amd_sys/`), `x264/`
+  (libx264 FFI, the CPU fallback).
+- `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → AMF → x264;
+  `Intel` tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`),
+  then x264; `Amd` likewise (`Backend::Amf` → `Backend::AmfCpu` → x264); `Software` goes straight
+  to x264. Vendor detection is by DXGI **`VendorId`** (`Vendor::from_pci_id`), falling back to
+  the description string (`select_vendor`) only where no id is available. NVENC uses a texture
+  ring to decouple capture from encode; AMF uses one to keep the capture texture free while it
+  encodes.
+- **The AMF backend is `UNVERIFIED`** — see the "Current support" note above. Its ABI is
+  regenerated from the vendored MIT headers in `resources/amf-headers/` by
+  `tools/amf_layout_gen.c`; never hand-edit the generated bodies in `test/amd_layout.rs`.
 
 ### Video capture & encode — macOS (`macos_utils/streamer/`)
 
