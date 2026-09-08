@@ -72,23 +72,6 @@ impl SckAudioCapture {
             && AnyClass::get(c"SCStreamConfiguration").is_some()
     }
 
-    pub fn try_create() -> Result<(), AudioCaptureError> {
-        if !Self::runtime_available() {
-            return Err(AudioCaptureError::Unsupported(
-                "ScreenCaptureKit not present (needs macOS 13.0+)".into(),
-            ));
-        }
-        let (producer, _consumer) = super::ring::ring(4096);
-        let sink = AudioFrameSink {
-            producer: Arc::new(producer),
-            diagnostics: Arc::new(AudioDiagnostics::default()),
-            control_tx: None,
-        };
-        let mut probe = SckAudioCapture::new();
-        probe.build_and_start(&sink)?;
-        Ok(())
-    }
-
     fn build_and_start(&mut self, sink: &AudioFrameSink) -> Result<(), AudioCaptureError> {
         let cls_content = runtime_class(c"SCShareableContent")?;
         let cls_filter = runtime_class(c"SCContentFilter")?;

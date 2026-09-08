@@ -366,10 +366,11 @@ fn worker(
             produced = true;
         }
 
-        // ring overruns (bumped by the RT callback) surface as backpressure drops
-        diagnostics
-            .dropped_backpressure
-            .store(consumer.overruns(), Ordering::Relaxed);
+        // `dropped_backpressure` is owned by the producers. Every capture callback already
+        // `fetch_add`s what `Producer::push` could not fit, and the legacy reader adds the samples
+        // it lost to a lapped shared-memory ring — a different loss with a different cause. The
+        // unconditional `store(consumer.overruns())` that used to sit here erased the second on
+        // the very next drain pass, reporting legacy-tier loss as zero.
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
             update_encode_percentiles(&encode_ns, &diagnostics);

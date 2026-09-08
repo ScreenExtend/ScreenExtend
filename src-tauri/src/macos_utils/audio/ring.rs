@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::ptr;
 use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -16,6 +17,18 @@ struct Shared {
 
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
+
+impl Shared {
+    /// The ring as a plain `*mut f32`.
+    ///
+    /// `UnsafeCell<T>` is `#[repr(transparent)]`, so the cell array and an `f32` array have the
+    /// same layout; going through the pointer is what lets `push`/`pop` copy spans instead of
+    /// storing one masked element at a time.
+    #[inline]
+    fn base_ptr(&self) -> *mut f32 {
+        self.buf.as_ptr() as *mut f32
+    }
+}
 
 /// Host-clock time of one identified sample in the stream.
 ///
@@ -99,13 +112,23 @@ impl Producer {
         let tail = s.tail.load(Ordering::Acquire);
         let free = s.buf.len() - head.wrapping_sub(tail);
         let n = data.len().min(free);
-        for (i, &sample) in data.iter().take(n).enumerate() {
-            let idx = head.wrapping_add(i) & s.mask;
-            // SAFETY: this cell is in the free region [head, head+free)
-            unsafe {
-                *s.buf[idx].get() = sample;
+
+        // Two copies around the wrap, not a masked store per sample. The backing store is
+        // `Box<[UnsafeCell<f32>]>`, which the compiler cannot see as contiguous `f32` through the
+        // per-element `get()`, so the scalar version never vectorises — and this runs on a
+        // CoreAudio IOProc, where cost is deadline-miss risk rather than throughput.
+        let base = s.base_ptr();
+        let start = head & s.mask;
+        let first = n.min(s.buf.len() - start);
+        // SAFETY: `UnsafeCell<f32>` is repr(transparent) over f32, and [head, head+n) is inside
+        // the free region, so these two spans are disjoint from anything the consumer may read.
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), base.add(start), first);
+            if first < n {
+                ptr::copy_nonoverlapping(data.as_ptr().add(first), base, n - first);
             }
         }
+
         s.head.store(head.wrapping_add(n), Ordering::Release);
         let dropped = data.len() - n;
         if dropped > 0 {
@@ -162,10 +185,20 @@ impl Consumer {
         let head = s.head.load(Ordering::Acquire);
         let avail = head.wrapping_sub(tail);
         let n = out.len().min(avail);
-        for (i, slot) in out.iter_mut().take(n).enumerate() {
-            let idx = tail.wrapping_add(i) & s.mask;
-            *slot = unsafe { *s.buf[idx].get() };
+
+        let base = s.base_ptr();
+        let start = tail & s.mask;
+        let first = n.min(s.buf.len() - start);
+        // SAFETY: the acquire load of `head` above published these samples, and [tail, tail+n) is
+        // inside the readable region, so the producer will not overwrite them before the release
+        // store of `tail` below.
+        unsafe {
+            ptr::copy_nonoverlapping(base.add(start), out.as_mut_ptr(), first);
+            if first < n {
+                ptr::copy_nonoverlapping(base, out.as_mut_ptr().add(first), n - first);
+            }
         }
+
         s.tail.store(tail.wrapping_add(n), Ordering::Release);
         n
     }

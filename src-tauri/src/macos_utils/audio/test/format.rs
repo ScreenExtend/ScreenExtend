@@ -170,3 +170,59 @@ fn parse_rejects_unknown_format() {
     let a = asbd(48000.0, 2, 0, 24, 6);
     assert!(parse_asbd(&a).is_err());
 }
+
+/// The fast path is a `copy_nonoverlapping` plus a clamp pass instead of a per-sample rebuild, so
+/// it has to agree with the general path everywhere the general path used to run.
+#[test]
+fn the_fast_path_agrees_with_the_general_one() {
+    let fast = AudioFormatDesc {
+        sample_rate: 48000,
+        channels: 2,
+        kind: SampleKind::F32,
+        non_interleaved: false,
+    };
+    assert!(fast.is_fast_path());
+    // same layout, a rate the fast path does not claim, so this one goes the long way round
+    let slow = AudioFormatDesc {
+        sample_rate: 44100,
+        ..fast
+    };
+    assert!(!slow.is_fast_path());
+
+    let vals: Vec<f32> = (0..64)
+        .map(|i| (i as f32 - 32.0) / 16.0) // spans well past +-1 in both directions
+        .collect();
+    let src = f32_bytes(&vals);
+
+    let mut a = vec![0.0f32; vals.len()];
+    let mut b = vec![0.0f32; vals.len()];
+    let n_fast = convert_interleaved(&src, vals.len() / 2, &fast, &mut a);
+    let n_slow = convert_interleaved(&src, vals.len() / 2, &slow, &mut b);
+    assert_eq!(n_fast, n_slow);
+    assert_eq!(a, b);
+    // and it still clamps, which is the one thing a bare memcpy would drop
+    assert!(a.iter().all(|v| (-1.0..=1.0).contains(v)));
+    assert_eq!(a[0], -1.0);
+    assert_eq!(*a.last().unwrap(), 1.0);
+}
+
+/// A short source must not be read past, and a short destination must not be written past.
+#[test]
+fn the_fast_path_stops_at_whichever_buffer_runs_out_first() {
+    let d = AudioFormatDesc {
+        sample_rate: 48000,
+        channels: 2,
+        kind: SampleKind::F32,
+        non_interleaved: false,
+    };
+    let src = f32_bytes(&[0.1, 0.2, 0.3, 0.4]);
+
+    let mut small = [0.0f32; 2];
+    assert_eq!(convert_interleaved(&src, 2, &d, &mut small), 2);
+    assert_eq!(small, [0.1, 0.2]);
+
+    let mut roomy = [9.0f32; 8];
+    assert_eq!(convert_interleaved(&src[..8], 2, &d, &mut roomy), 2);
+    assert_eq!(&roomy[..2], &[0.1, 0.2]);
+    assert_eq!(roomy[2], 9.0, "nothing past the source may be touched");
+}

@@ -21,7 +21,7 @@ use super::ring;
 use super::{AudioCaptureError, AudioFrameSink, AudioSource};
 use playthrough::{MonitorGain, Playthrough};
 use routing::{DefaultChange, HalDefaultDevicePort, Router, RoutingEvent, RoutingListeners};
-use shm_reader::{CaptureTargets, Reader, Transport};
+use shm_reader::{CaptureTargets, Reader};
 use volume_proxy::{VolumeEvent, VolumeListeners};
 
 const MONITOR_RING_CAPACITY: usize = 1 << 16;
@@ -29,7 +29,6 @@ const MONITOR_RING_CAPACITY: usize = 1 << 16;
 struct ControlHandle {
     stop_tx: crossbeam_channel::Sender<()>,
     join: Option<JoinHandle<()>>,
-    transport: Transport,
 }
 
 impl Drop for ControlHandle {
@@ -168,7 +167,6 @@ impl AudioSource for LegacyVirtualDeviceSource {
         self.control = Some(ControlHandle {
             stop_tx,
             join: Some(join),
-            transport,
         });
         Ok(())
     }
