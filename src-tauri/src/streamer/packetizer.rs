@@ -489,3 +489,76 @@ mod tests {
         assert!(!access_unit_has_sps(&[0, 0, 1]));
     }
 }
+
+/// A/B against the payloader this replaced, so the claim in `docs/OPTIMIZATIONS.md` has a number.
+///
+/// `cargo test --lib packetizer::bench -- --ignored --nocapture`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    fn synthetic_idr(bytes: usize) -> Bytes {
+        let mut v = vec![0u8, 0, 0, 1, 0x67];
+        v.resize(v.len() + 40, 0xAA); // SPS
+        v.extend_from_slice(&[0, 0, 0, 1, 0x68]);
+        v.resize(v.len() + 8, 0xBB); // PPS
+        v.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        v.resize(v.len() + bytes, 0xCC); // IDR slice
+        Bytes::from(v)
+    }
+
+    fn synthetic_p(bytes: usize) -> Bytes {
+        let mut v = vec![0u8, 0, 0, 1, 0x41];
+        v.resize(v.len() + bytes, 0xDD);
+        Bytes::from(v)
+    }
+
+    #[test]
+    #[ignore]
+    fn compare_with_the_stock_payloader() {
+        use webrtc::rtp::codecs::h264::H264Payloader;
+        use webrtc::rtp::packetizer::Payloader;
+
+        const MTU: usize = 1188;
+        const ITERS: usize = 2_000;
+        // One IDR then 59 P-frames, the shape of a 60 fps second with an infinite GOP and a
+        // keyframe forced at the top.
+        let idr = synthetic_idr(300 * 1024);
+        let p = synthetic_p(16 * 1024);
+
+        let mut ours = H264Packetizer::new();
+        let mut out: Vec<Bytes> = Vec::new();
+        let mut ours_packets = 0usize;
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let frame = if i % 60 == 0 { &idr } else { &p };
+            ours.packetize(MTU, frame, &mut out);
+            ours_packets += out.len();
+        }
+        let ours_ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        let mut theirs = H264Payloader::default();
+        let mut theirs_packets = 0usize;
+        let t1 = Instant::now();
+        for i in 0..ITERS {
+            let frame = if i % 60 == 0 { &idr } else { &p };
+            let payloads = theirs.payload(MTU, frame).expect("payload");
+            theirs_packets += payloads.len();
+        }
+        let theirs_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        println!(
+            "packetize {ITERS} frames @ {MTU}B MTU (1 IDR per 60):\n  \
+             local  {ours_ns:.0} ns/frame, {ours_packets} packets\n  \
+             stock  {theirs_ns:.0} ns/frame, {theirs_packets} packets\n  \
+             speedup {:.2}x",
+            theirs_ns / ours_ns
+        );
+        // The two must agree on how many packets a stream takes, or the comparison is meaningless.
+        assert!(
+            (ours_packets as i64 - theirs_packets as i64).abs() <= ITERS as i64 / 60,
+            "packet counts diverge: {ours_packets} vs {theirs_packets}"
+        );
+    }
+}
