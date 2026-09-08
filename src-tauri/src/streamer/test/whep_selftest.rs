@@ -52,6 +52,7 @@ pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
 }
 
 pub async fn run(mut config: Config) -> Result<()> {
+    let hold_secs = config.selftest_secs;
     config.whep_selftest = false;
     config.h264_profile = H264Profile::Baseline;
     if config.port == 8080 {
@@ -239,6 +240,30 @@ pub async fn run(mut config: Config) -> Result<()> {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Proving RTP flows takes about a second, which is a liveness check and not a measurement:
+    // the stage histograms would describe a session that had barely started, mostly startup
+    // transients. `--duration` holds the session open so the numbers mean something.
+    if hold_secs > 0 && rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
+        tprintln!("[selftest] holding the session open for {hold_secs}s to collect telemetry");
+        let started = rtp_count.load(Ordering::Relaxed);
+        let hold_until = tokio::time::Instant::now() + Duration::from_secs(hold_secs);
+        while tokio::time::Instant::now() < hold_until {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !matches!(
+                pc.connection_state(),
+                RTCPeerConnectionState::Connected | RTCPeerConnectionState::Connecting
+            ) {
+                teprintln!("[selftest] peer connection dropped during the hold; stopping early");
+                break;
+            }
+        }
+        let during = rtp_count.load(Ordering::Relaxed) - started;
+        tprintln!(
+            "[selftest] {during} RTP packets over {hold_secs}s ({:.0}/s)",
+            during as f64 / hold_secs as f64
+        );
     }
 
     let final_count = rtp_count.load(Ordering::Relaxed);
