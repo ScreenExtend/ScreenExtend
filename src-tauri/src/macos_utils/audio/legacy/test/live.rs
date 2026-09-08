@@ -73,7 +73,12 @@ fn legacy_live_latency_and_monotonicity() {
         return;
     }
 
-    let capture = crate::macos_utils::audio::start_capture().expect("start_capture");
+    // W8 replaced `AudioCapture::rx` with a broadcast `AudioSink` the backends publish into, so
+    // subscribe before starting: a receiver created after the fact would miss the head of the run.
+    let (tx, mut rx) = tokio::sync::broadcast::channel(64);
+    let capture =
+        crate::macos_utils::audio::start_capture(crate::streamer::audio::AudioSink::new(tx))
+            .expect("start_capture");
     // Two phrases with a gap between them. The virtual device runs no IO cycle while nothing is
     // playing, so the gap is a real pause in the packet stream - the case where a sample-counter
     // timestamp would drift behind the hardware for good if it never re-seated.
@@ -94,10 +99,20 @@ fn legacy_live_latency_and_monotonicity() {
     let mut last_ns: Option<u64> = None;
     let mut last_seq: Option<u32> = None;
     let mut seq_gaps = 0usize;
+    let mut lagged = 0u64;
 
     while std::time::Instant::now() < deadline {
-        let Ok(pkt) = capture.rx.recv_timeout(Duration::from_millis(500)) else {
-            continue;
+        let pkt = match rx.try_recv() {
+            Ok(p) => p,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                lagged += n;
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         };
         lag_ns.push(host_now_ns() as i64 - pkt.capture_ns as i64);
         if let Some(prev) = last_ns {
@@ -144,6 +159,10 @@ fn legacy_live_latency_and_monotonicity() {
         deltas.len()
     );
     eprintln!("diagnostics: {diag}");
+    assert_eq!(
+        lagged, 0,
+        "the test subscriber must keep up with the broadcast"
+    );
 
     eprintln!(
         "clock resyncs after the gap: discontinuity_count={}",

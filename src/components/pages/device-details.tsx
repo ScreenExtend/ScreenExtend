@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 
 import { Info } from "lucide-react";
 
@@ -43,8 +43,8 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
-import { GlobalProviderContext } from "@/components/global-provider";
-import { useToast } from "@/components/ui/use-toast";
+import { useAudioOutputs, useGlobalSetters } from "@/components/global-provider";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
@@ -92,7 +92,6 @@ export function DeviceDetails({ device }: { device: Device }) {
   const [inProgress, setInProgress] = useState(false);
   const [tempRate, setTempRate] = useState(device.refreshRate);
   const [tempQuality, setTempQuality] = useState(device.videoQuality);
-  const { toast } = useToast();
   const { t } = useTranslation();
 
   const [audioBackend, setAudioBackend] = useState<string | null>(null);
@@ -124,8 +123,8 @@ export function DeviceDetails({ device }: { device: Device }) {
   const volumeKeyProxy = useConfig()?.legacyVolumeKeyProxy ?? false;
   const [proxyBusy, setProxyBusy] = useState(false);
 
-  const { windowAudioOutputsByIp } = useContext(GlobalProviderContext);
-  const [audioOutputsByIp, setAudioOutputsByIp] = windowAudioOutputsByIp;
+  const audioOutputsByIp = useAudioOutputs();
+  const { setAudioOutputsByIp } = useGlobalSetters();
   const audioOutputs = audioOutputsByIp[device.ip];
   useEffect(() => {
     if (!open) return;

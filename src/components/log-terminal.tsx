@@ -1,42 +1,61 @@
 import { useEffect, useRef, useState } from "react";
 
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands, events } from "@/lib/bindings";
 
 const MAX_LINES = 2000;
+
+// A monotonic sequence number as the React key. Keyed by array index, every row's text
+// changed once the 2000-line window started sliding, so React re-painted the whole list
+// on every event instead of appending one node.
+type LogEntry = { seq: number; text: string };
 
 const stopListening = (unlisten: () => void) => {
   void Promise.resolve(unlisten()).catch(e => console.error("log unlisten failed", e));
 };
 
 export function LogTerminal() {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
-  const { toast } = useToast();
+  const pending = useRef<LogEntry[]>([]);
+  const flushHandle = useRef<number | undefined>(undefined);
+  const nextSeq = useRef(0);
   const { t } = useTranslation();
 
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
+    const flush = () => {
+      flushHandle.current = undefined;
+      const batch = pending.current;
+      if (!batch.length) return;
+      pending.current = [];
+      setLines(prev => {
+        const next = prev.concat(batch);
+        return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
+      });
+    };
     void (async () => {
       let backlogFailed = false;
       try {
         const backlog = await commands.getLogBacklog();
         if (!active) return;
-        setLines(backlog);
+        setLines(backlog.map(text => ({ seq: nextSeq.current++, text })));
       } catch (e) {
         console.error("log backlog read failed", e);
         backlogFailed = true;
       }
       if (!active) return;
       try {
+        // A device join, an encoder negotiation or a cloud reconnect storm arrives as a
+        // burst; coalescing a frame's worth into one commit keeps that off the main thread.
         const off = await events.logLine.listen(event => {
-          setLines(prev => {
-            const next = [...prev, event.payload];
-            return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
-          });
+          pending.current.push({ seq: nextSeq.current++, text: event.payload });
+          if (flushHandle.current === undefined) {
+            flushHandle.current = window.requestAnimationFrame(flush);
+          }
         });
         if (!active) {
           stopListening(off);
@@ -62,6 +81,9 @@ export function LogTerminal() {
     })();
     return () => {
       active = false;
+      if (flushHandle.current !== undefined) window.cancelAnimationFrame(flushHandle.current);
+      flushHandle.current = undefined;
+      pending.current = [];
       if (unlisten) stopListening(unlisten);
     };
   }, []);
@@ -85,7 +107,7 @@ export function LogTerminal() {
         <button
           type="button"
           className="text-xs text-muted-foreground hover:text-foreground transition-colors"
-          onClick={() => setLines([])}
+          onClick={() => { pending.current = []; setLines([]); }}
         >
           Clear
         </button>
@@ -98,9 +120,9 @@ export function LogTerminal() {
         {lines.length === 0 ? (
           <div className="text-zinc-500">Waiting for logs…</div>
         ) : (
-          lines.map((line, i) => (
-            <div key={i} className="whitespace-pre-wrap break-all">
-              {line || " "}
+          lines.map(line => (
+            <div key={line.seq} className="whitespace-pre-wrap break-all">
+              {line.text || " "}
             </div>
           ))
         )}

@@ -220,10 +220,12 @@ capture/encode/tuning/audio-start that calls into the per-OS backend.
 `banned_devices`, `approved_devices`, `otp_limiter`, `server_ports`, `disable_gpu_encode`,
 `cloud`, `cloud_status`, `audio_hub`.
 
-**Current support:** Windows (NVENC/QSV/x264) and macOS (VideoToolbox) are functional. Linux is
-scaffolded but non-functional; AMD encode is a stub (`windows_utils/streamer/amd.rs`, notes in
-`amd.md`). When adding a capability, add it to all three modules to keep the surface consistent
-(Linux/AMD paths may `bail!`).
+**Current support:** Windows (NVENC/QSV/AMF/x264) and macOS (VideoToolbox) are functional. Linux
+is scaffolded but non-functional. The AMD AMF backend (`windows_utils/streamer/amd/` +
+`amd_sys/`, design in `amd.md`) is complete and wired into the `Auto` chain, but **`UNVERIFIED`**
+— no machine on this project has an AMD GPU, so its FFI is asserted by `test/amd_layout.rs` and
+nothing in it has ever encoded a frame (`docs/manual-tests/amd-amf.md`). When adding a
+capability, add it to all three modules to keep the surface consistent (Linux paths may `bail!`).
 
 ### Concurrency & locking
 
@@ -262,7 +264,7 @@ Cross-platform core, OS-independent:
   `prepare()` sets DPI awareness + process tuning. Also exposes the `probe_*` entry points.
 - `config.rs` — `Config` (the whole streaming configuration, including the `Shared*` handles
   threaded in from `AppState`), `ScalePercent` (10–100), `EncoderVendor`
-  (`auto|nvidia|intel|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
+  (`auto|nvidia|intel|amd|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
   `max_fps` 500, Google STUN), and `from_args()`/`print_help()` for the probe harness.
 - `server.rs` — axum HTTP(S) server per network adapter; validates session ID + OTP on join,
   creates the virtual display sized to the client, starts the pipeline. Holds the clamp
@@ -318,8 +320,13 @@ Cross-platform core, OS-independent:
   one clock both audio `capture_ns` and the video RTP timestamp ride for A/V sync**), the
   reference-counted `AudioHub` (one host-wide capture fanned out to N sessions via
   `tokio::sync::broadcast`, started on the first audio-enabled subscriber and stopped when the
-  last leaves), and `protocol.rs` (the 13-byte DataChannel header: seq u32, capture ns u64,
-  flags u8 + raw Opus). It also hosts the **OS-independent Opus encoder** — the hand-written
+  last leaves — the hub's mutex guards only the refcount and the handle, never a device open or
+  close, which happen with the lock released behind a `busy` flag and a condvar), the
+  `AudioSink` the capture backends publish through, and `protocol.rs` (the 13-byte DataChannel
+  header: seq u32, capture ns u64, flags u8, then raw Opus — or, behind `FLAG_REDUNDANT`, a u16
+  length plus the current *and* previous frames, which is the only loss-robustness tool
+  available because in-band FEC is LPC-layer-only and inert under `RESTRICTED_LOWDELAY`).
+  It also hosts the **OS-independent Opus encoder** — the hand-written
   libopus FFI (`opus_sys.rs`) and the encoder wrapper (`encoder.rs`) — shared by every capture
   backend (libopus is cross-platform C; only the bundled library name differs: `libopus.dll` vs
   `libopus.dylib`). `macos_utils/audio/opus_encoder.rs` is only a re-export of these.
@@ -333,11 +340,18 @@ Cross-platform core, OS-independent:
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing.
 - `scaler.rs`, `tuning.rs` — GPU scaling and process/thread priority tuning.
 - Encoders: `nvidia/` (hand-written NVENC FFI in `nvenc_sys/`), `intel/` (oneVPL / Quick Sync FFI
-  in `intel_sys.rs`), `x264/` (libx264 FFI, the CPU fallback), `amd.rs` (stub).
-- `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → x264; `Intel`
-  tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`), then x264;
-  `Software` goes straight to x264. Vendor detection is by DXGI adapter description
-  (`select_vendor`). NVENC uses a texture ring to decouple capture from encode.
+  in `intel_sys.rs`), `amd/` (AMF, with the hand-written C-vtable FFI in `amd_sys/`), `x264/`
+  (libx264 FFI, the CPU fallback).
+- `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → AMF → x264;
+  `Intel` tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`),
+  then x264; `Amd` likewise (`Backend::Amf` → `Backend::AmfCpu` → x264); `Software` goes straight
+  to x264. Vendor detection is by DXGI **`VendorId`** (`Vendor::from_pci_id`), falling back to
+  the description string (`select_vendor`) only where no id is available. NVENC uses a texture
+  ring to decouple capture from encode; AMF uses one to keep the capture texture free while it
+  encodes.
+- **The AMF backend is `UNVERIFIED`** — see the "Current support" note above. Its ABI is
+  regenerated from the vendored MIT headers in `resources/amf-headers/` by
+  `tools/amf_layout_gen.c`; never hand-edit the generated bodies in `test/amd_layout.rs`.
 
 ### Video capture & encode — macOS (`macos_utils/streamer/`)
 
@@ -373,32 +387,61 @@ Cross-platform core, OS-independent:
   no decrypt, no VideoToolbox.** Design + measurements: `docs/airplay-fallback-design.md`.
   Live harness: `cargo test --lib macos_utils::airplay::tests::live_end_to_end -- --ignored
   --nocapture`.
-- `hosted_network.rs` + `hostap.m` — CoreWLAN ad-hoc network (prefers 5 GHz channels).
+- `hosted_network.rs` — CoreWLAN **HostAP** (infrastructure AP) mode via the private
+  `startHostAPModeWithSSID:securityType:channel:password:error:`, behind a `respondsToSelector:`
+  probe, with a deprecated-IBSS second tier and an explicit "use your own router" third tier
+  (`probe_hosted_network_backend`). Prefers 5 GHz channels 36/40/48/153/157/161 and 2.4 GHz
+  channel 11, all chosen to avoid AWDL's social channels 6/44/149. A start is only reported as
+  working once `interfaceMode()` reads HostAP *and* the interface holds a routable IPv4.
+  Read-only surface report: `cargo test --lib
+  macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture`.
 
-### System audio — Windows (`windows_utils/audio/`)
+### System audio — Windows (`windows_utils/audio/`, tiered)
 
-Per-device system-audio capture + Opus encode:
+Per-device system-audio capture + Opus encode. Two capture tiers, selected at runtime:
 
-- `loopback.rs` — WASAPI **legacy `IAudioClient::Initialize` loopback** path (the IAudioClient3
-  low-latency path rejects the loopback flag). Runs on a **dedicated OS thread** with COM MTA +
-  MMCSS "Pro Audio", event-driven, re-acquiring on default-device change /
-  `AUDCLNT_E_DEVICE_INVALIDATED`.
-- `silence.rs` — a **silent render companion** is mandatory: it is the clock source that makes
-  the loopback event fire and keeps packets flowing while the host is idle (measured: 0/20 event
-  signals without it, 20/20 with it). Started lazily, stopped with the capture.
-- `format.rs` — mix-format negotiation; 48 kHz float32 stereo is the zero-copy fast path,
-  everything else is `AUTOCONVERTPCM`'d / downmixed (ITU BS.775) / int→float.
+**Tier 1, endpoint loopback** (`loopback.rs::acquire_endpoint`) — WASAPI **legacy
+`IAudioClient::Initialize` loopback** on the `eRender`/`eConsole` endpoint (the IAudioClient3
+low-latency path rejects the loopback flag). Runs on a **dedicated OS thread** with COM MTA +
+MMCSS "Pro Audio", event-driven, re-acquiring on default-device change,
+`AUDCLNT_E_DEVICE_INVALIDATED`, a dead companion, or 2 s of an unsignalled event.
+
+**Tier 2, process loopback** (`process_loopback.rs`) —
+`ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK)` with
+`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` and
+`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` on our own pid, i.e. "the whole system
+except us". **Probed by attempting the activation, never by a build number.** It is the
+fallback rather than the default because measurement says it is not faster (both ride the same
+shared engine); what it buys is capture that survives an exclusive-mode endpoint and device
+churn, plus a format we choose instead of the endpoint's. It needs no silent companion —
+measured, not assumed. `ScreenExtend probe --audio --process-loopback` is the only way to reach
+it on a machine where tier 1 works.
+
+- `silence.rs` — a **silent render companion** is mandatory for tier 1: it is the clock source
+  that makes the loopback event fire and keeps packets flowing while the host is idle (measured:
+  0/20 event signals without it, 20/20 with it). It is also the only stream we own that may ask
+  the engine for a smaller period (`engine.rs`, `IAudioClient3::InitializeSharedAudioStream`),
+  which the capture stream then inherits — a probed tier that is a correctly-detected no-op on
+  hardware exposing a single period. Started lazily, stopped with the capture, and its death is
+  now detected, logged, counted and recovered from.
+- `engine.rs` — `GetSharedModeEnginePeriod` / `GetDevicePeriod`. The engine *period* and the
+  engine *buffer* are different numbers and are reported separately.
+- `format.rs` — mix-format negotiation; 48 kHz float32 stereo is the fast path, a non-matching
+  endpoint is `AUTOCONVERTPCM`'d by the engine, and if the engine refuses, capture falls back to
+  the endpoint's own format and downmixes (ITU BS.775) / converts int→float in userspace.
 - `device.rs` — `IMMNotificationClient`; its callback runs on a COM thread we don't own, so it
   only posts to the capture thread over `crossbeam-channel` (never blocks, never takes the
-  capture lock). `guards.rs` holds the RAII COM/handle wrappers.
+  capture lock). `guards.rs` holds the RAII COM/handle/mix-format wrappers.
 - Opus encode uses the **shared** wrapper in `streamer/audio/`: `libopus.dll` loaded via
   `libloading` and bundled in `resources/`; `RESTRICTED_LOWDELAY` (CELT-only), 5 ms frames.
 
 **Capture-thread convention:** the audio capture thread is a real-time OS thread (MMCSS), never
 a tokio task. It never allocates or locks in the drain/encode path beyond the reused accumulator
-plus the per-packet `Bytes` copy. It talks to the async world over `crossbeam-channel` (→ the
-`AudioHub` bridge → broadcast), the way the video pipeline does. Linux provides a compiling stub
-(`linux_utils/audio.rs`) that returns "unsupported".
+plus the per-packet `Bytes` copy — which rules out percentile sorting and `tprintln!` on the 2 s
+diagnostic path too; those live on a separate reporting thread. It publishes straight into the
+`AudioHub`'s `tokio::sync::broadcast` through an `AudioSink`, because `broadcast::Sender::send`
+is synchronous and non-blocking; there is no intermediate channel and no copy thread. Linux
+provides a compiling stub (`linux_utils/audio.rs`) that returns "unsupported".
 
 ### System audio — macOS (`macos_utils/audio/`, tiered)
 
