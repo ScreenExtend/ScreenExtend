@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::d3d11::StagingTexture;
 use crate::windows_capture::frame::Frame;
-use crate::windows_capture::graphics_capture_api::InternalCaptureControl;
+use crate::windows_capture::graphics_capture_api::{wgc_features, InternalCaptureControl};
 use crate::windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -107,6 +108,24 @@ fn apply_pending_bitrate(
 }
 
 const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
+
+/// `MinUpdateInterval` is a floor on the gap between delivered frames, not a throttle to a rate:
+/// WGC's default delivery is capped near 60 Hz whatever the panel does, and this property is what
+/// raises that ceiling. The old `frame_duration * 2/3` scaled the floor with the target rate,
+/// which is backwards — a floor near the target period caps delivery *below* it.
+/// `windows-capture` issue #190 measured a 120 Hz panel with the floor at 1/60 delivering ~52 fps,
+/// at 1/90 ~58 fps and at 1/120 ~59 fps. Sunshine sets a flat 4 ms (250 Hz); so do we, and let
+/// the pipeline's own pacing decide what to keep.
+const WGC_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
+
+/// Frame-pool depth for a handler that encodes inline: one buffer the compositor writes, one we
+/// read. OBS and Sunshine both use 2. The pool is a queue handed out oldest-first, so depth is
+/// latency for anything the consumer cannot keep up with.
+const FRAME_POOL_BUFFERS_INLINE: u32 = 2;
+
+/// Frame-pool depth for the ring path, which only stages a copy in the callback and encodes
+/// elsewhere: one more buffer so the copy and the encode overlap.
+const FRAME_POOL_BUFFERS_RING: u32 = 3;
 
 fn is_transient_encode_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("device busy")
@@ -401,7 +420,9 @@ fn start_live_capture(
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps as u64);
 
+    let features = wgc_features();
     telemetry.capture_backend.set("wgc".into());
+    telemetry.capture_features.set(features.summary());
     let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
@@ -414,13 +435,16 @@ fn start_live_capture(
         h264_profile: cfg.h264_profile,
     };
 
+    // Every one of these is applied only where the OS exposes the property; the ones it does not
+    // are skipped, not fatal. `ReportOnly` gives us `Frame::dirty_regions()` without asking the
+    // compositor to render the regions separately.
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3),
-        DirtyRegionSettings::Default,
+        MinimumUpdateIntervalSettings::Custom(WGC_MIN_UPDATE_INTERVAL),
+        DirtyRegionSettings::ReportOnly,
         ColorFormat::Bgra8,
         CaptureFlags {
             config,
@@ -436,7 +460,7 @@ fn start_live_capture(
     );
 
     tprintln!(
-        "pipeline: starting live monitor capture (WGC -> NVENC; zero-copy if available): \
+        "pipeline: starting live monitor capture (WGC): \
          display={}, name={}, gpu={}, native={}x{}, encode={}x{}, downscale={}, fps={}, bitrate_bps={}",
         info.index,
         info.name,
@@ -448,6 +472,15 @@ fn start_live_capture(
         downscale,
         config.fps,
         config.bitrate_bps,
+    );
+    tprintln!(
+        "wgc: feature set {} ({}); optional properties this build lacks are skipped, not fatal",
+        features.summary(),
+        if features.has_26100_properties() {
+            "build 26100+"
+        } else {
+            "pre-26100"
+        },
     );
 
     let control = LiveCapture::start_free_threaded(settings)
@@ -620,6 +653,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             backend,
             scaler,
             reader,
+            staging: None,
             target_bitrate,
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -1027,6 +1061,9 @@ struct EncodeCore {
     backend: Backend,
     scaler: Option<Scaler>,
     reader: Option<TextureReader>,
+    /// Reused readback texture for the WGC classic CPU-bridge path. Rebuilt only when the
+    /// captured content size or format changes, which is a virtual-display mode change.
+    staging: Option<StagingTexture>,
     target_bitrate: Arc<AtomicU32>,
     idr_request: Arc<AtomicBool>,
     current_bitrate: u32,
@@ -1049,7 +1086,10 @@ impl EncodeCore {
             &mut self.bitrate_warned,
         );
         let Self {
-            backend, scaler, ..
+            backend,
+            scaler,
+            staging,
+            ..
         } = self;
 
         let au = if backend.is_cpu_bridge() {
@@ -1058,7 +1098,21 @@ impl EncodeCore {
                 let (data, row_pitch) = scaler.read_back()?;
                 backend.encode_cpu(data, row_pitch, force_idr)?
             } else {
-                let mut fb = frame.buffer()?;
+                let desc = *frame.desc();
+                let stale = staging.as_ref().is_none_or(|s| {
+                    let d = s.desc();
+                    d.Width != desc.Width || d.Height != desc.Height || d.Format != desc.Format
+                });
+                if stale {
+                    *staging = Some(
+                        StagingTexture::new(frame.device(), desc.Width, desc.Height, desc.Format)
+                            .context("creating the reusable CPU-bridge readback texture")?,
+                    );
+                }
+                let staging = staging
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("cpu-bridge readback texture missing"))?;
+                let mut fb = frame.buffer_with(staging)?;
                 let row_pitch = fb.row_pitch();
                 backend.encode_cpu(fb.as_raw_buffer(), row_pitch, force_idr)?
             }
@@ -1133,6 +1187,11 @@ struct LiveCapture {
     frames_sent: u64,
     busy_streak: u32,
     stop: Arc<AtomicBool>,
+    frame_pool_buffers: u32,
+    /// Incremented by the frame pool for every frame it discards while draining to the newest.
+    /// Folded into telemetry from the callback, which is the only place that can see it move.
+    stale_frames: Arc<AtomicU32>,
+    stale_frames_reported: u32,
     _thread_tuning: tuning::ThreadTuning,
     _keep_awake: tuning::KeepAwake,
     telemetry: SharedTelemetry,
@@ -1855,6 +1914,9 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         frames_sent: 0,
                         busy_streak: 0,
                         stop,
+                        frame_pool_buffers: FRAME_POOL_BUFFERS_RING,
+                        stale_frames: Arc::new(AtomicU32::new(0)),
+                        stale_frames_reported: 0,
                         _thread_tuning: thread_tuning,
                         _keep_awake: keep_awake,
                         telemetry,
@@ -1911,6 +1973,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             backend,
             scaler,
             reader: None,
+            staging: None,
             target_bitrate: Arc::clone(&target_bitrate),
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -1941,10 +2004,21 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             frames_sent: 0,
             busy_streak: 0,
             stop,
+            frame_pool_buffers: FRAME_POOL_BUFFERS_INLINE,
+            stale_frames: Arc::new(AtomicU32::new(0)),
+            stale_frames_reported: 0,
             _thread_tuning: thread_tuning,
             _keep_awake: keep_awake,
             telemetry,
         })
+    }
+
+    fn frame_pool_buffers(&self) -> u32 {
+        self.frame_pool_buffers
+    }
+
+    fn stale_frame_counter(&self) -> Option<Arc<AtomicU32>> {
+        Some(Arc::clone(&self.stale_frames))
     }
 
     fn on_frame_arrived(
@@ -1961,6 +2035,15 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
             .unwrap_or(0);
 
+        let stale = self.stale_frames.load(Ordering::Relaxed);
+        if stale != self.stale_frames_reported {
+            self.telemetry.degradation.frames_dropped_stale.fetch_add(
+                (stale - self.stale_frames_reported) as u64,
+                Ordering::Relaxed,
+            );
+            self.stale_frames_reported = stale;
+        }
+
         if let Some(ring) = self.ring.as_mut() {
             match ring.stage(frame.as_raw_texture(), timing) {
                 Ok(_staged) => {}
@@ -1971,12 +2054,16 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             return Ok(());
         }
 
+        // No panics past this point: we are inside a WinRT `TypedEventHandler`, so an unwind
+        // would cross `extern "system"` frames. Returning `Err` halts the capture cleanly.
         let core = self
             .core
             .as_ref()
-            .expect("classic path must have an EncodeCore");
+            .ok_or_else(|| anyhow!("classic capture path has no EncodeCore"))?;
         let encode_res = {
-            let mut core = core.lock().expect("encode core mutex poisoned");
+            let mut core = core
+                .lock()
+                .map_err(|_| anyhow!("encode core mutex poisoned; stopping capture"))?;
             timing.mark_encode_submit();
             core.encode_captured(frame)
         };

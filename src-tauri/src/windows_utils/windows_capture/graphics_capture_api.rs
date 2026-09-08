@@ -1,5 +1,5 @@
-use std::sync::atomic::{self, AtomicBool, AtomicI32};
-use std::sync::Arc;
+use std::sync::atomic::{self, AtomicBool, AtomicI32, AtomicU32};
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use windows::core::{IInspectable, Interface, HSTRING};
@@ -32,25 +32,6 @@ pub enum Error {
     /// The Windows Graphics Capture API is not available on this OS.
     #[error("The Graphics Capture API is not supported on this platform.")]
     Unsupported,
-    /// Toggling cursor capture isn't supported on this platform/OS build.
-    #[error(
-        "Toggling cursor capture is not supported by the Graphics Capture API on this platform."
-    )]
-    CursorConfigUnsupported,
-    /// Toggling the capture border isn't supported on this platform/OS build.
-    #[error("Toggling the capture border is not supported by the Graphics Capture API on this platform.")]
-    BorderConfigUnsupported,
-    /// Capturing secondary (owned) windows isn't supported on this platform/OS build.
-    #[error("Capturing secondary windows is not supported by the Graphics Capture API on this platform.")]
-    SecondaryWindowsUnsupported,
-    /// Setting a minimum frame update interval isn't supported on this platform/OS build.
-    #[error("Setting a minimum update interval is not supported by the Graphics Capture API on this platform.")]
-    MinimumUpdateIntervalUnsupported,
-    /// Dirty region tracking isn't supported on this platform/OS build.
-    #[error(
-        "Dirty region tracking is not supported by the Graphics Capture API on this platform."
-    )]
-    DirtyRegionUnsupported,
     /// Capture has already been started for this session.
     #[error("The capture has already been started.")]
     AlreadyStarted,
@@ -69,6 +50,95 @@ pub enum Error {
     /// Wraps [`windows::core::Error`].
     #[error("Windows API error: {0}")]
     WindowsError(#[from] windows::core::Error),
+}
+
+/// Which optional `GraphicsCaptureSession` knobs this Windows build actually exposes.
+///
+/// Every one of these is a property that only exists from some OS build onwards, and WinRT gives
+/// no version to compare against — `ApiInformation::IsPropertyPresent` is the probe. They are
+/// resolved once and cached: the answer cannot change while the process runs, and each query
+/// allocates two `HSTRING`s.
+///
+/// The rule this type exists to enforce: a missing property means *skip the setter*, never fail
+/// the capture. `MinUpdateInterval` and `DirtyRegionMode` arrived in build 26100 (Windows 11
+/// 24H2), so treating either as required silently pushes every Windows 10 and pre-24H2 Windows 11
+/// host onto the DXGI fallback — which is the whole population minus one Windows release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WgcFeatures {
+    /// `IsCursorCaptureEnabled` — build 19041 (Windows 10 2004).
+    pub cursor_toggle: bool,
+    /// `IsBorderRequired` — build 20348. Setting it to `false` additionally needs the user to
+    /// have granted `GraphicsCaptureAccess.RequestAccessAsync(Borderless)`; without that consent
+    /// the setter succeeds and the border stays.
+    pub border_toggle: bool,
+    /// `IncludeSecondaryWindows` — build 22000 (Windows 11 21H2).
+    pub secondary_windows: bool,
+    /// `MinUpdateInterval` — build 26100 (Windows 11 24H2).
+    pub min_update_interval: bool,
+    /// `DirtyRegionMode` — build 26100 (Windows 11 24H2).
+    pub dirty_region: bool,
+    /// `Direct3D11CaptureFramePool::CreateFreeThreaded` — build 17763 (Windows 10 1809).
+    pub free_threaded_pool: bool,
+}
+
+impl WgcFeatures {
+    /// A stable one-line rendering for the log and for `docs/CAPABILITY-TIERS.md`: each feature
+    /// name, `+` when present and `-` when absent.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let flags = [
+            ("cursor", self.cursor_toggle),
+            ("border", self.border_toggle),
+            ("secondary-windows", self.secondary_windows),
+            ("min-update-interval", self.min_update_interval),
+            ("dirty-region", self.dirty_region),
+            ("free-threaded-pool", self.free_threaded_pool),
+        ];
+        flags
+            .iter()
+            .map(|(name, present)| format!("{}{name}", if *present { '+' } else { '-' }))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// True when the host is a 24H2-or-newer build, i.e. the two properties that only exist there
+    /// are both present. Used only for reporting a tier name.
+    #[must_use]
+    pub const fn has_26100_properties(&self) -> bool {
+        self.min_update_interval && self.dirty_region
+    }
+}
+
+fn session_property(name: &str) -> bool {
+    ApiInformation::IsPropertyPresent(
+        &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+        &HSTRING::from(name),
+    )
+    .unwrap_or(false)
+}
+
+/// Probes every optional capture knob once and caches the answer.
+#[inline]
+#[must_use]
+pub fn wgc_features() -> WgcFeatures {
+    static FEATURES: OnceLock<WgcFeatures> = OnceLock::new();
+    *FEATURES.get_or_init(|| {
+        if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+            return WgcFeatures::default();
+        }
+        WgcFeatures {
+            cursor_toggle: session_property("IsCursorCaptureEnabled"),
+            border_toggle: session_property("IsBorderRequired"),
+            secondary_windows: session_property("IncludeSecondaryWindows"),
+            min_update_interval: session_property("MinUpdateInterval"),
+            dirty_region: session_property("DirtyRegionMode"),
+            free_threaded_pool: ApiInformation::IsMethodPresent(
+                &HSTRING::from("Windows.Graphics.Capture.Direct3D11CaptureFramePool"),
+                &HSTRING::from("CreateFreeThreaded"),
+            )
+            .unwrap_or(false),
+        }
+    })
 }
 
 /// Provides a way to gracefully stop the capture session thread.
@@ -137,6 +207,8 @@ impl GraphicsCaptureApi {
         minimum_update_interval_settings: MinimumUpdateIntervalSettings,
         dirty_region_settings: DirtyRegionSettings,
         color_format: ColorFormat,
+        frame_pool_buffers: u32,
+        stale_frames_dropped: Arc<AtomicU32>,
         thread_id: u32,
         result: Arc<Mutex<Option<E>>>,
     ) -> Result<Self, Error> {
@@ -145,35 +217,7 @@ impl GraphicsCaptureApi {
             return Err(Error::Unsupported);
         }
 
-        if cursor_capture_settings != CursorCaptureSettings::Default
-            && !Self::is_cursor_settings_supported()?
-        {
-            return Err(Error::CursorConfigUnsupported);
-        }
-
-        if draw_border_settings != DrawBorderSettings::Default
-            && !Self::is_border_settings_supported()?
-        {
-            return Err(Error::BorderConfigUnsupported);
-        }
-
-        if secondary_window_settings != SecondaryWindowSettings::Default
-            && !Self::is_secondary_windows_supported()?
-        {
-            return Err(Error::SecondaryWindowsUnsupported);
-        }
-
-        if minimum_update_interval_settings != MinimumUpdateIntervalSettings::Default
-            && !Self::is_minimum_update_interval_supported()?
-        {
-            return Err(Error::MinimumUpdateIntervalUnsupported);
-        }
-
-        if dirty_region_settings != DirtyRegionSettings::Default
-            && !Self::is_dirty_region_supported()?
-        {
-            return Err(Error::DirtyRegionUnsupported);
-        }
+        let features = wgc_features();
 
         // Pre-calculate the title bar height so each frame doesn't need to do it
         let title_bar_height = match item_with_details {
@@ -193,8 +237,13 @@ impl GraphicsCaptureApi {
 
         let pixel_format = DirectXPixelFormat(color_format as i32);
 
-        let frame_pool =
-            Direct3D11CaptureFramePool::Create(&direct3d_device, pixel_format, 3, item.Size()?)?;
+        let buffers = frame_pool_buffers.clamp(1, 8) as i32;
+        let frame_pool = Direct3D11CaptureFramePool::Create(
+            &direct3d_device,
+            pixel_format,
+            buffers,
+            item.Size()?,
+        )?;
         let frame_pool = Arc::new(frame_pool);
 
         // Create capture session
@@ -261,7 +310,23 @@ impl GraphicsCaptureApi {
                 let Some(frame_pool) = frame.as_ref() else {
                     return Ok(());
                 };
-                let frame = frame_pool.TryGetNextFrame()?;
+                // Drain the pool to its newest frame. The pool hands frames out oldest-first, so
+                // one event per frame only holds while the consumer keeps up; the moment it does
+                // not, every later event replays a backlog that is already up to
+                // (buffers - 1) frame periods old. Discarding the stale ones costs nothing and
+                // is the difference between "one frame behind" and "permanently behind".
+                let Ok(mut frame) = frame_pool.TryGetNextFrame() else {
+                    return Ok(());
+                };
+                let mut skipped = 0u32;
+                while let Ok(newer) = frame_pool.TryGetNextFrame() {
+                    let _ = frame.Close();
+                    frame = newer;
+                    skipped += 1;
+                }
+                if skipped != 0 {
+                    stale_frames_dropped.fetch_add(skipped, atomic::Ordering::Relaxed);
+                }
 
                 // Get frame content size
                 let frame_content_size = frame.ContentSize()?;
@@ -283,10 +348,13 @@ impl GraphicsCaptureApi {
                     || frame_content_size.Height != last_size.1.load(atomic::Ordering::Relaxed)
                 {
                     let direct3d_device_recreate = &direct3d_device_recreate;
+                    // Same buffer count as `Create`. Recreating with 1 quietly re-serializes
+                    // capture against encode for the rest of the session, and a content-size
+                    // change is exactly a resolution change on the client's virtual display.
                     frame_pool_recreate.Recreate(
                         &direct3d_device_recreate.0,
                         pixel_format,
-                        1,
+                        buffers,
                         frame_content_size,
                     )?;
 
@@ -342,73 +410,51 @@ impl GraphicsCaptureApi {
             }
         }))?;
 
-        if cursor_capture_settings != CursorCaptureSettings::Default {
-            if Self::is_cursor_settings_supported()? {
-                match cursor_capture_settings {
-                    CursorCaptureSettings::Default => (),
-                    CursorCaptureSettings::WithCursor => session.SetIsCursorCaptureEnabled(true)?,
-                    CursorCaptureSettings::WithoutCursor => {
-                        session.SetIsCursorCaptureEnabled(false)?
-                    }
-                };
-            } else {
-                return Err(Error::CursorConfigUnsupported);
+        // Every setter below is optional on some supported Windows build. A property this host
+        // does not have is skipped, never fatal: failing here is what routed every Windows 10 and
+        // pre-24H2 Windows 11 host onto the DXGI fallback.
+        if features.cursor_toggle {
+            match cursor_capture_settings {
+                CursorCaptureSettings::Default => (),
+                CursorCaptureSettings::WithCursor => session.SetIsCursorCaptureEnabled(true)?,
+                CursorCaptureSettings::WithoutCursor => session.SetIsCursorCaptureEnabled(false)?,
+            };
+        }
+
+        if features.border_toggle {
+            match draw_border_settings {
+                DrawBorderSettings::Default => (),
+                DrawBorderSettings::WithBorder => session.SetIsBorderRequired(true)?,
+                DrawBorderSettings::WithoutBorder => session.SetIsBorderRequired(false)?,
             }
         }
 
-        if draw_border_settings != DrawBorderSettings::Default {
-            if Self::is_border_settings_supported()? {
-                match draw_border_settings {
-                    DrawBorderSettings::Default => (),
-                    DrawBorderSettings::WithBorder => {
-                        session.SetIsBorderRequired(true)?;
-                    }
-                    DrawBorderSettings::WithoutBorder => session.SetIsBorderRequired(false)?,
-                }
-            } else {
-                return Err(Error::BorderConfigUnsupported);
+        if features.secondary_windows {
+            match secondary_window_settings {
+                SecondaryWindowSettings::Default => (),
+                SecondaryWindowSettings::Include => session.SetIncludeSecondaryWindows(true)?,
+                SecondaryWindowSettings::Exclude => session.SetIncludeSecondaryWindows(false)?,
             }
         }
 
-        if secondary_window_settings != SecondaryWindowSettings::Default {
-            if Self::is_secondary_windows_supported()? {
-                match secondary_window_settings {
-                    SecondaryWindowSettings::Default => (),
-                    SecondaryWindowSettings::Include => session.SetIncludeSecondaryWindows(true)?,
-                    SecondaryWindowSettings::Exclude => {
-                        session.SetIncludeSecondaryWindows(false)?
-                    }
+        if features.min_update_interval {
+            match minimum_update_interval_settings {
+                MinimumUpdateIntervalSettings::Default => (),
+                MinimumUpdateIntervalSettings::Custom(duration) => {
+                    session.SetMinUpdateInterval(duration.into())?;
                 }
-            } else {
-                return Err(Error::SecondaryWindowsUnsupported);
             }
         }
 
-        if minimum_update_interval_settings != MinimumUpdateIntervalSettings::Default {
-            if Self::is_minimum_update_interval_supported()? {
-                match minimum_update_interval_settings {
-                    MinimumUpdateIntervalSettings::Default => (),
-                    MinimumUpdateIntervalSettings::Custom(duration) => {
-                        session.SetMinUpdateInterval(duration.into())?;
-                    }
+        if features.dirty_region {
+            match dirty_region_settings {
+                DirtyRegionSettings::Default => (),
+                DirtyRegionSettings::ReportOnly => {
+                    session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly)?
                 }
-            } else {
-                return Err(Error::MinimumUpdateIntervalUnsupported);
-            }
-        }
-
-        if dirty_region_settings != DirtyRegionSettings::Default {
-            if Self::is_dirty_region_supported()? {
-                match dirty_region_settings {
-                    DirtyRegionSettings::Default => (),
-                    DirtyRegionSettings::ReportOnly => {
-                        session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly)?
-                    }
-                    DirtyRegionSettings::ReportAndRender => session
-                        .SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender)?,
+                DirtyRegionSettings::ReportAndRender => {
+                    session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender)?
                 }
-            } else {
-                return Err(Error::DirtyRegionUnsupported);
             }
         }
 
@@ -470,51 +516,6 @@ impl GraphicsCaptureApi {
             &HSTRING::from("Windows.Foundation.UniversalApiContract"),
             8,
         )? && GraphicsCaptureSession::IsSupported()?)
-    }
-
-    /// Checks if the cursor capture settings can be changed.
-    #[inline]
-    pub fn is_cursor_settings_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsPropertyPresent(
-            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-            &HSTRING::from("IsCursorCaptureEnabled"),
-        )? && Self::is_supported()?)
-    }
-
-    /// Checks if the capture border settings can be changed.
-    #[inline]
-    pub fn is_border_settings_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsPropertyPresent(
-            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-            &HSTRING::from("IsBorderRequired"),
-        )? && Self::is_supported()?)
-    }
-
-    /// Checks if capturing secondary windows is supported.
-    #[inline]
-    pub fn is_secondary_windows_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsPropertyPresent(
-            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-            &HSTRING::from("IncludeSecondaryWindows"),
-        )? && Self::is_supported()?)
-    }
-
-    /// Checks if setting a minimum update interval is supported.
-    #[inline]
-    pub fn is_minimum_update_interval_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsPropertyPresent(
-            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-            &HSTRING::from("MinUpdateInterval"),
-        )? && Self::is_supported()?)
-    }
-
-    /// Checks if dirty region tracking is supported.
-    #[inline]
-    pub fn is_dirty_region_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsPropertyPresent(
-            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
-            &HSTRING::from("DirtyRegionMode"),
-        )? && Self::is_supported()?)
     }
 
     fn cleanup(&mut self) {

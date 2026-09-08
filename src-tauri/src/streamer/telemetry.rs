@@ -291,6 +291,7 @@ counters! {
     capture_fallback => "capture_fallback",
     frames_repeated => "frames_repeated",
     frames_dropped_ring => "frames_dropped_ring",
+    frames_dropped_stale => "frames_dropped_stale",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
     idrs_sent => "idrs_sent",
@@ -372,6 +373,10 @@ pub struct SessionTelemetry {
     pub bytes_sent: AtomicU64,
     pub encoder: Mutexish<String>,
     pub capture_backend: Mutexish<String>,
+    /// Which optional knobs of the chosen capture backend this OS build actually exposed. Empty
+    /// where the backend has no such tiering. Reported so a latency number can be read against
+    /// the feature set that produced it rather than against the backend name alone.
+    pub capture_features: Mutexish<String>,
     pub client: Mutexish<Option<ClientStats>>,
 }
 
@@ -434,9 +439,15 @@ impl SessionTelemetry {
 
     /// One line, all stages, `p50/p90/p99/max` in ms. Printed on a timer, never per frame.
     pub fn summary_line(&self) -> String {
+        let features = self.capture_features.get();
         let mut s = format!(
-            "telemetry: capture={} encoder={} frames={}",
+            "telemetry: capture={}{} encoder={} frames={}",
             self.capture_backend.get(),
+            if features.is_empty() {
+                String::new()
+            } else {
+                format!("[{features}]")
+            },
             self.encoder.get(),
             self.frames_encoded.load(Ordering::Relaxed),
         );
@@ -543,6 +554,7 @@ impl SessionTelemetry {
         });
         serde_json::json!({
             "capture_backend": self.capture_backend.get(),
+            "capture_features": self.capture_features.get(),
             "encoder": self.encoder.get(),
             "frames_encoded": self.frames_encoded.load(Ordering::Relaxed),
             "bytes_sent": self.bytes_sent.load(Ordering::Relaxed),
