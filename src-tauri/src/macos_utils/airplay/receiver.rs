@@ -19,9 +19,8 @@
 //! SETUP and `streamConnectionID` from the second are the inputs to AES-CTR
 //! video decryption, and we parse neither.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -53,9 +52,17 @@ pub enum Phase {
 
 struct State {
     phase: Phase,
-    last_contact: Instant,
     /// Set the first time a sender touches us, for diagnostics.
     peer: Option<String>,
+    /// Control connections currently open.
+    ///
+    /// The phase used to drop to `Ended` whenever *any* connection finished,
+    /// including one of several, and never came back — so from the second
+    /// session onwards [`super::diagnose`] reported the first session's answer.
+    live_connections: usize,
+    /// `requests` at the start of the current session, so the diagnosis can
+    /// report this session's traffic rather than a lifetime total.
+    requests_at_session_start: u64,
 }
 
 pub struct Receiver {
@@ -81,7 +88,6 @@ struct Inner {
     state: Mutex<State>,
     stats: Arc<MirrorStats>,
     requests: AtomicU64,
-    saw_teardown: AtomicBool,
 }
 
 impl Receiver {
@@ -119,12 +125,12 @@ impl Receiver {
             _audio_control: audio_control,
             state: Mutex::new(State {
                 phase: Phase::Advertised,
-                last_contact: Instant::now(),
                 peer: None,
+                live_connections: 0,
+                requests_at_session_start: 0,
             }),
             stats: stats.clone(),
             requests: AtomicU64::new(0),
-            saw_teardown: AtomicBool::new(false),
         });
 
         let advertisement =
@@ -166,8 +172,27 @@ impl Receiver {
         self.inner.state.lock().unwrap().peer.clone()
     }
 
+    /// Requests seen since [`Self::begin_session`]. A lifetime total says
+    /// nothing about the attempt that just failed.
     pub fn requests(&self) -> u64 {
-        self.inner.requests.load(Ordering::Relaxed)
+        let base = self.inner.state.lock().unwrap().requests_at_session_start;
+        self.inner
+            .requests
+            .load(Ordering::Relaxed)
+            .saturating_sub(base)
+    }
+
+    /// Clears everything that describes the previous session.
+    ///
+    /// The receiver deliberately outlives a session, so without this the phase,
+    /// the request count and the mirror latches all still describe the first
+    /// join for the rest of the process's life — and `diagnose` is the only
+    /// explanation this backend has for its hardest failure.
+    pub fn begin_session(&self) {
+        let mut st = self.inner.state.lock().unwrap();
+        st.phase = Phase::Advertised;
+        st.requests_at_session_start = self.inner.requests.load(Ordering::Relaxed);
+        self.inner.stats.begin_session();
     }
 
     pub fn mirror_connected(&self) -> bool {
@@ -176,11 +201,6 @@ impl Receiver {
 
     pub fn geometry_changed(&self) -> bool {
         self.inner.stats.geometry_changed.load(Ordering::Relaxed)
-    }
-
-    /// Seconds since the sender last said anything.
-    pub fn idle_for(&self) -> Duration {
-        self.inner.state.lock().unwrap().last_contact.elapsed()
     }
 
     /// Ends the session. Closing the control socket is the only receiver-side
@@ -221,7 +241,7 @@ async fn serve_control(listener: TcpListener, inner: Arc<Inner>, cancel: Cancel)
         {
             let mut st = inner.state.lock().unwrap();
             st.peer = Some(peer.to_string());
-            st.last_contact = Instant::now();
+            st.live_connections += 1;
         }
 
         let inner = inner.clone();
@@ -233,7 +253,11 @@ async fn serve_control(listener: TcpListener, inner: Arc<Inner>, cancel: Cancel)
                         teprintln!("[airplay] control connection ended: {e}");
                     }
                     let mut st = inner.state.lock().unwrap();
-                    if st.phase != Phase::Ended {
+                    st.live_connections = st.live_connections.saturating_sub(1);
+                    // Only the *last* connection ending means the session is
+                    // over. A sender that closes one and opens another is a
+                    // normal thing to do, and used to look like a goodbye.
+                    if st.live_connections == 0 && st.phase != Phase::Ended {
                         st.phase = Phase::Ended;
                     }
                 }
@@ -259,7 +283,6 @@ async fn serve_connection(mut stream: TcpStream, inner: Arc<Inner>) -> Result<()
         };
 
         inner.requests.fetch_add(1, Ordering::Relaxed);
-        inner.state.lock().unwrap().last_contact = Instant::now();
 
         let cseq = request.header("cseq").map(|s| s.to_string());
         let proto = request.proto;
@@ -333,7 +356,6 @@ fn handle(req: &Request, inner: &Inner) -> Response {
         ),
 
         ("TEARDOWN", _) => {
-            inner.saw_teardown.store(true, Ordering::Relaxed);
             let types = info::requested_stream_types(&req.body);
             // A bodiless TEARDOWN, or one naming the mirroring stream, ends the
             // session. One naming only audio does not.
@@ -496,12 +518,12 @@ mod tests {
             _audio_control: TimingSocket::bind().unwrap(),
             state: Mutex::new(State {
                 phase: Phase::Advertised,
-                last_contact: Instant::now(),
                 peer: None,
+                live_connections: 0,
+                requests_at_session_start: 0,
             }),
             stats: Arc::new(MirrorStats::default()),
             requests: AtomicU64::new(0),
-            saw_teardown: AtomicBool::new(false),
         }
     }
 
@@ -645,7 +667,6 @@ mod tests {
         let r = handle(&req("TEARDOWN", "rtsp://x/1"), &i);
         assert!(r.close);
         assert_eq!(i.state.lock().unwrap().phase, Phase::Ended);
-        assert!(i.saw_teardown.load(Ordering::Relaxed));
     }
 
     #[test]
