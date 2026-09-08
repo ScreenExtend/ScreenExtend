@@ -20,7 +20,7 @@ use objc2_core_audio::{
     AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectPropertyListenerProc, AudioObjectRemovePropertyListener,
 };
-use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription};
+use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStampFlags};
 use objc2_core_foundation::CFString;
 
 use super::format::{self, AudioFormatDesc};
@@ -70,11 +70,25 @@ struct IoCtx {
 unsafe impl Send for IoCtx {}
 unsafe impl Sync for IoCtx {}
 
+/// Host-clock time of the block an IOProc is handed, or 0 when the HAL did not stamp it.
+///
+/// `mHostTime` is `mach_absolute_time` at the moment the hardware read the block's first frame,
+/// which is the instant A/V sync needs — not the moment the encoder worker later gets to it.
+#[inline]
+pub(super) fn block_host_ns(ts: NonNull<objc2_core_audio_types::AudioTimeStamp>) -> u64 {
+    // SAFETY: the HAL passes a live AudioTimeStamp for the duration of the callback
+    let ts = unsafe { ts.as_ref() };
+    if !ts.mFlags.contains(AudioTimeStampFlags::HostTimeValid) {
+        return 0;
+    }
+    crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(ts.mHostTime)
+}
+
 extern "C-unwind" fn tap_ioproc(
     _in_device: AudioObjectID,
     _in_now: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     in_input_data: NonNull<AudioBufferList>,
-    _in_input_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
+    in_input_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     _out_output_data: NonNull<AudioBufferList>,
     _in_output_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     client_data: *mut c_void,
@@ -154,7 +168,7 @@ extern "C-unwind" fn tap_ioproc(
         ctx.nonsilent_samples
             .fetch_add(nonsilent, Ordering::Relaxed);
     }
-    let dropped = ctx.producer.push(frame);
+    let dropped = ctx.producer.push_at(frame, block_host_ns(in_input_time));
     if dropped > 0 {
         ctx.diag
             .dropped_backpressure
@@ -357,6 +371,12 @@ impl ProcessTapCapture {
             )));
         }
         resources.io_proc = io_proc;
+
+        // Prime the mach-to-host clock offset (a `OnceLock` that samples both clocks) off the
+        // real-time path: the IOProc must never be the thread that runs the one-time init.
+        let _ = crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(
+            crate::macos_utils::streamer::mach::mach_now(),
+        );
 
         let st = unsafe { AudioDeviceStart(aggregate_id, io_proc) };
         if st != 0 {

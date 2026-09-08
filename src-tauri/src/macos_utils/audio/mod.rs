@@ -25,6 +25,44 @@ const RING_CAPACITY: usize = 48_000 * 2 * 80 / 1000; // 7680 → rounds to 8192
 const ENCODE_WINDOW: usize = 4096;
 const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
+/// nanoseconds of audio in one interleaved stereo Opus frame (5 ms at 48 kHz)
+const FRAME_NS: u64 = 5_000_000;
+/// interleaved stereo samples per second — the ring's unit
+const RING_SAMPLES_PER_SEC: i128 = 48_000 * format::OUT_CHANNELS as i128;
+/// how far the hardware clock may run ahead of the sample counter before the timeline is re-seated
+const RESYNC_NS: u64 = 50_000_000;
+
+/// Host-clock time of the sample at absolute ring index `pos`, extrapolated from `anchor`.
+///
+/// The rate is exact by construction (every backend delivers 48 kHz stereo), so this is a
+/// sample-counter timestamp seated on a real hardware stamp rather than a reading of the wall
+/// clock at drain time.
+fn anchored_ns(anchor: ring::Anchor, pos: u64) -> u64 {
+    let delta = pos as i128 - anchor.pos as i128;
+    let ns = anchor.host_ns as i128 + (delta * 1_000_000_000i128) / RING_SAMPLES_PER_SEC;
+    if ns <= 0 {
+        0
+    } else {
+        ns as u64
+    }
+}
+
+/// Pick the capture time of the frame about to be encoded, and say whether the timeline jumped.
+///
+/// `next` is where the sample counter says this frame belongs — one frame period after the last
+/// packet — and `hw` is what the capture hardware's own stamp says. The counter wins, so the
+/// sequence is exactly one frame apart and can never regress; the hardware only takes over when it
+/// has run more than [`RESYNC_NS`] ahead, which means samples were lost and the two would otherwise
+/// stay apart for good.
+fn choose_capture_ns(next: Option<u64>, hw: Option<u64>) -> (u64, bool) {
+    match (next, hw) {
+        (Some(n), Some(h)) if h > n.saturating_add(RESYNC_NS) => (h, true),
+        (Some(n), _) => (n, false),
+        (None, Some(h)) => (h, false),
+        (None, None) => (host_now_ns(), false),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioBackend {
     ProcessTap,
@@ -260,7 +298,11 @@ fn worker(
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
-    const FRAME_NS: u64 = 5_000_000; // 5 ms per Opus frame at 48 kHz
+    // Host-clock time of the next sample to be popped. Seeded from the capture hardware's own
+    // stamp and then advanced one frame at a time, so the sequence is exactly 5 ms apart and can
+    // never regress no matter how the drain loop is scheduled.
+    let mut next_capture_ns: Option<u64> = None;
+    let mut resyncs: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(ControlMsg::Reacquire) = ctrl_rx.try_recv() {
@@ -269,16 +311,25 @@ fn worker(
                 crate::teprintln!("audio: re-acquire failed: {e}");
             }
             pending_flags |= FLAG_DISCONTINUITY;
+            next_capture_ns = None; // new device, new timeline
         }
 
         let mut produced = false;
-        // seed once per drain pass; frames in the pass are then spaced by FRAME_NS
-        let burst_t0 = host_now_ns();
-        let mut burst_i: u64 = 0;
         while consumer.available() >= FRAME_INTERLEAVED {
+            let pos = consumer.read_pos();
             if consumer.pop(&mut frame) < FRAME_INTERLEAVED {
                 break;
             }
+            let hw_ns = consumer
+                .anchor()
+                .map(|a| anchored_ns(a, pos))
+                .filter(|&ns| ns != 0);
+            let (capture_ns, jumped) = choose_capture_ns(next_capture_ns, hw_ns);
+            if jumped {
+                resyncs += 1;
+                pending_flags |= FLAG_DISCONTINUITY;
+            }
+            next_capture_ns = Some(capture_ns.saturating_add(FRAME_NS));
             let is_silent = frame.iter().all(|&x| x == 0.0);
 
             let t0 = Instant::now();
@@ -304,11 +355,10 @@ fn worker(
             }
             let pkt = AudioPacket {
                 seq,
-                capture_ns: burst_t0.saturating_add(burst_i * FRAME_NS),
+                capture_ns,
                 flags,
                 data: Bytes::copy_from_slice(encoded),
             };
-            burst_i += 1;
             if pkt_tx.send(pkt).is_err() {
                 backend.stop();
                 return;
@@ -324,7 +374,11 @@ fn worker(
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
             update_encode_percentiles(&encode_ns, &diagnostics);
-            crate::tprintln!("[{}] {}", backend.backend_name(), diagnostics.summary());
+            crate::tprintln!(
+                "[{}] {}, clock_resyncs={resyncs}",
+                backend.backend_name(),
+                diagnostics.summary()
+            );
             if !warned_silent
                 && start_instant.elapsed() >= Duration::from_secs(5)
                 && backend.nonsilent_samples() == 0
