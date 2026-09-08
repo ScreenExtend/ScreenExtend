@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::{c_void, CStr};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +22,7 @@ use objc2_foundation::NSString;
 
 use super::format::{self, AudioFormatDesc};
 use super::{AudioCaptureError, AudioFrameSink, AudioSource};
+use crate::macos_utils::streamer::mach;
 use crate::streamer::audio::AudioDiagnostics;
 
 const SC_OUTPUT_TYPE_AUDIO: isize = 1;
@@ -36,7 +37,19 @@ struct OutputCtx {
     f32_scratch: UnsafeCell<Box<[f32]>>,
     nonsilent_samples: AtomicU64,
     diag: Arc<AudioDiagnostics>,
+    /// last delivered sample rate, so a mismatch is reported once rather than per callback
+    seen_rate: AtomicU32,
 }
+
+/// How long to wait on each of SCK's async-to-sync bridges.
+///
+/// SCK offers no non-blocking variant, so the fix is bounding the waits rather than removing them.
+/// Both are taken under the `AudioHub` mutex, which holds every other session's audio subscribe
+/// and unsubscribe, and both are hit in the denied-Screen-Recording case a user is most likely to
+/// meet: at 5 s each, serially, plus the candidate loop trying the next backend after them, one
+/// device enabling audio could freeze the others for ten seconds. A display list or a stream start
+/// that has not arrived in 1.5 s is not going to succeed.
+const SCK_CALL_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct SckAudioCapture {
     stream: Option<Retained<AnyObject>>,
@@ -69,24 +82,6 @@ impl SckAudioCapture {
             && AnyClass::get(c"SCShareableContent").is_some()
             && AnyClass::get(c"SCContentFilter").is_some()
             && AnyClass::get(c"SCStreamConfiguration").is_some()
-    }
-
-    pub fn try_create() -> Result<(), AudioCaptureError> {
-        if !Self::runtime_available() {
-            return Err(AudioCaptureError::Unsupported(
-                "ScreenCaptureKit not present (needs macOS 13.0+)".into(),
-            ));
-        }
-        let (producer, _consumer, consumer_thread) = super::ring::ring(4096);
-        let sink = AudioFrameSink {
-            producer: Arc::new(producer),
-            diagnostics: Arc::new(AudioDiagnostics::default()),
-            control_tx: None,
-            consumer_thread,
-        };
-        let mut probe = SckAudioCapture::new();
-        probe.build_and_start(&sink)?;
-        Ok(())
     }
 
     fn build_and_start(&mut self, sink: &AudioFrameSink) -> Result<(), AudioCaptureError> {
@@ -136,6 +131,7 @@ impl SckAudioCapture {
             abl_scratch: UnsafeCell::new(abl_scratch),
             f32_scratch: UnsafeCell::new(f32_scratch),
             nonsilent_samples: AtomicU64::new(0),
+            seen_rate: AtomicU32::new(0),
             diag: Arc::clone(&sink.diagnostics),
         }));
         self.nonsilent_probe = unsafe { &(*ctx).nonsilent_samples as *const AtomicU64 };
@@ -193,7 +189,7 @@ impl SckAudioCapture {
             let _: () =
                 msg_send![&*stream, startCaptureWithCompletionHandler: RcBlock::as_ptr(&handler)];
         }
-        match rx.recv_timeout(Duration::from_secs(5)) {
+        match rx.recv_timeout(SCK_CALL_TIMEOUT) {
             Ok(None) => {}
             Ok(Some(detail)) => {
                 drop(unsafe { Box::from_raw(ctx) });
@@ -245,7 +241,13 @@ impl AudioSource for SckAudioCapture {
                     stopCaptureWithCompletionHandler: RcBlock::as_ptr(&handler)
                 ];
             }
-            let _ = rx.recv_timeout(Duration::from_secs(5));
+            // The delegate context is freed just below, so a stop that timed out rather than
+            // completed means a sample handler could still be in flight against it.
+            if rx.recv_timeout(SCK_CALL_TIMEOUT).is_err() {
+                crate::teprintln!(
+                    "audio: SCK stopCapture did not complete within {SCK_CALL_TIMEOUT:?}"
+                );
+            }
         }
         self.stream = None;
         self.delegate = None;
@@ -358,6 +360,22 @@ fn handle_audio_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
         return;
     };
 
+    // `setSampleRate: 48000` is a request. SCK derives its audio from the system mix and nothing
+    // downstream resamples - `format.rs` converts sample kind and channel layout only, and the
+    // reported `AudioFormat` hardcodes 48 kHz - so a stream honoured only approximately would be
+    // encoded as if it were 48 kHz: roughly 9% fast and sharp, with A/V drift accumulating at
+    // about 80 ms per second. Drop the block rather than emit that, and say so once per rate.
+    if desc.sample_rate != 48_000 {
+        if ctx.seen_rate.swap(desc.sample_rate, Ordering::Relaxed) != desc.sample_rate {
+            crate::teprintln!(
+                "audio: ScreenCaptureKit delivered {} Hz, not the 48000 it was asked for;                  dropping these blocks (nothing in the macOS audio path resamples)",
+                desc.sample_rate
+            );
+        }
+        return;
+    }
+    ctx.seen_rate.store(desc.sample_rate, Ordering::Relaxed);
+
     // SAFETY: single-thread access to the scratch cells on the SCK delivery queue
     let abl_bytes: &mut [u8] = unsafe { &mut *ctx.abl_scratch.get() };
     let abl = abl_bytes.as_mut_ptr() as *mut AudioBufferList;
@@ -453,12 +471,35 @@ fn handle_audio_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
         ctx.nonsilent_samples
             .fetch_add(nonsilent, Ordering::Relaxed);
     }
-    let dropped = ctx.producer.push(frame);
+    let dropped = ctx.producer.push_at(frame, sample_host_ns(sample));
     if dropped > 0 {
         ctx.diag
             .dropped_backpressure
             .fetch_add(dropped as u64, Ordering::Relaxed);
     }
+}
+
+/// Host-clock time of an SCK audio chunk, from its presentation timestamp.
+///
+/// SCK stamps sample buffers on the host time base, so the age of the stamp against
+/// `mach_absolute_time` is the chunk's delivery latency, and subtracting it from the shared clock
+/// gives the capture instant. A stamp that is in the future or more than a second old means a
+/// different epoch than assumed; delivery time is then used instead, which is still the callback
+/// rather than the encoder's later wakeup.
+fn sample_host_ns(sample: &CMSampleBuffer) -> u64 {
+    let now = crate::streamer::audio::host_now_ns();
+    // SAFETY: floor-present CoreMedia accessor on a sample buffer live for this call
+    let pts = unsafe { sample.presentation_time_stamp() };
+    if !pts.flags.contains(CMTimeFlags::Valid) || pts.timescale <= 0 || pts.value <= 0 {
+        return now;
+    }
+    let pts_ns = (pts.value as i128 * 1_000_000_000i128) / pts.timescale as i128;
+    let mach_ns = mach::mach_delta_ns(0, mach::mach_now()) as i128;
+    let age = mach_ns - pts_ns;
+    if !(0..=1_000_000_000).contains(&age) {
+        return now;
+    }
+    now.saturating_sub(age as u64)
 }
 
 fn runtime_class(name: &CStr) -> Result<&'static AnyClass, AudioCaptureError> {
@@ -516,7 +557,7 @@ fn resolve_any_display(cls_content: &AnyClass) -> Result<Retained<AnyObject>, Au
             getShareableContentWithCompletionHandler: RcBlock::as_ptr(&handler),
         ];
     }
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    match rx.recv_timeout(SCK_CALL_TIMEOUT) {
         Ok(Some(raw)) => {
             let ptr = NonNull::new(raw as *mut AnyObject).ok_or(AudioCaptureError::Setup(
                 "no display available for SCK audio".into(),

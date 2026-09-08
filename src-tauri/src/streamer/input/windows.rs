@@ -8,18 +8,16 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, HIGH_PRIORITY_CLASS,
-    THREAD_PRIORITY_TIME_CRITICAL,
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Controls::{
-    CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
-    POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
+    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -36,16 +34,17 @@ use windows::Win32::UI::Input::Pointer::{
 };
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PostMessageW, WindowFromPoint, PT_PEN, PT_TOUCH, SM_CXSCREEN,
+    GetCursorPos, GetSystemMetrics, PostMessageW, WindowFromPoint, PT_PEN, PT_TOUCH, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     WM_DROPFILES,
 };
 
 use super::protocol::{
-    btn, DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
+    btn, positions_cursor, DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN,
+    SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
-use super::DisplayRect;
+use super::{ClientProfile, DisplayRect};
 
 pub const NAME: &str = "windows-sendinput+syntheticpointer";
 
@@ -69,13 +68,6 @@ const TOUCH_MASK_PRESSURE: u32 = 0x0000_0004;
 pub fn boost_thread() {
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    }
-}
-
-pub fn tune_process() {
-    unsafe {
-        timeBeginPeriod(1);
-        let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     }
 }
 
@@ -130,13 +122,21 @@ pub struct Injector {
     touch_dev: Option<HSYNTHETICPOINTERDEVICE>,
     contacts: HashMap<u32, Contact>,
     pen_down: bool,
+    /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
+    /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
+    /// Where relative motion has put the cursor, in desktop pixels. Windows would happily
+    /// accumulate `MOUSEEVENTF_MOVE` for us, but then it applies its own pointer ballistics on
+    /// top of the curve the client already applied, and there is no position to clamp.
+    rel_pos: Option<POINT>,
     scratch: Vec<INPUT>,
     touch_scratch: Vec<POINTER_TYPE_INFO>,
 }
 
 impl Injector {
-    pub fn new(device_name: Option<String>) -> Self {
+    pub fn new(client: ClientProfile) -> Self {
+        // The scancode table is layout-neutral, so nothing here depends on the client platform.
+        let ClientProfile { device_name, .. } = client;
         let pen_dev = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }
             .map_err(|e| log::warn!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
             .ok();
@@ -156,7 +156,12 @@ impl Injector {
             touch_dev,
             contacts: HashMap::new(),
             pen_down: false,
-            mouse_relative: true,
+            // No lock until the client says so. Starting at `true` meant the first frame of a
+            // session was treated as relative, so a touch client's opening tap — which arrives
+            // as a bare `POINTER_DOWN` with no move before it — clicked wherever the host
+            // cursor already was.
+            mouse_relative: false,
+            rel_pos: None,
             scratch: Vec::with_capacity(16),
             touch_scratch: Vec::with_capacity(MAX_TOUCH_COUNT as usize),
         }
@@ -221,10 +226,13 @@ impl Injector {
                 id,
                 buttons,
                 samples,
-            } => self.pointer_batch(*source, *id, *buttons, samples),
+                predicted,
+            } => self.pointer_batch(*source, *id, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
-            InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
+            InputEvent::MouseDelta {
+                dx, dy, buttons, ..
+            } => self.mouse_delta(*dx, *dy, *buttons),
             InputEvent::Key {
                 down, code, key, ..
             } => self.key(*down, code, key),
@@ -237,7 +245,10 @@ impl Injector {
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { x, y, items } => self.drop_files(*x, *y, items),
             // Handled by the transport before dispatch: none of these inject anything.
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
+            InputEvent::Ping { .. }
+            | InputEvent::Pong { .. }
+            | InputEvent::ClientStats(_)
+            | InputEvent::KeyframeRequest { .. } => {}
         }
     }
 
@@ -287,17 +298,50 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
-            Phase::Move | Phase::Enter | Phase::Over => {
-                self.mouse_relative = false;
-            }
+            // An absolute move is proof the client is not locked, for clients that never send
+            // `POINTERLOCK_STATE`. A `Down`/`Up` is not: those still arrive while locked.
+            Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
         }
         self.scratch.clear();
-        if !self.mouse_relative {
+        self.push_mouse_pointer(x, y, buttons, phase);
+        send_inputs(&self.scratch);
+        self.scratch.clear();
+        self.buttons = buttons;
+    }
+
+    /// The body of `mouse_pointer` without the flush, so a batch can build several samples into
+    /// one `SendInput` array instead of paying a kernel transition per sample.
+    fn push_mouse_pointer(&mut self, x: f32, y: f32, buttons: u16, phase: Phase) {
+        if positions_cursor(self.mouse_relative, phase) {
             let (ax, ay) = self.abs(x, y);
             self.scratch.push(mouse_input(
                 ax,
                 ay,
+                0,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ));
+            self.rel_pos = None;
+        }
+        button_transitions(self.buttons, buttons, &mut self.scratch);
+    }
+
+    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
+        self.mouse_relative = true;
+        self.scratch.clear();
+        if dx != 0 || dy != 0 {
+            // Absolute, from a position we track ourselves. A raw `MOUSEEVENTF_MOVE` goes
+            // through the Windows pointer curve, and the client has already applied its own
+            // (its OS's, unless `unadjustedMovement` was granted, plus its sensitivity
+            // setting) — so the relative path used to accelerate twice while the absolute path
+            // accelerated not at all. One curve, owned by the client, is the coherent answer,
+            // and it matches what the macOS backend has always done.
+            let pos = self.advance_rel(dx as i32, dy as i32);
+            let vx = (pos.x - self.virt.left) as f32 / self.virt.width as f32;
+            let vy = (pos.y - self.virt.top) as f32 / self.virt.height as f32;
+            self.scratch.push(mouse_input(
+                (vx.clamp(0.0, 1.0) * 65535.0).round() as i32,
+                (vy.clamp(0.0, 1.0) * 65535.0).round() as i32,
                 0,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             ));
@@ -308,17 +352,30 @@ impl Injector {
         self.buttons = buttons;
     }
 
-    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
-        self.mouse_relative = true;
-        self.scratch.clear();
-        if dx != 0 || dy != 0 {
-            self.scratch
-                .push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
-        }
-        button_transitions(self.buttons, buttons, &mut self.scratch);
-        send_inputs(&self.scratch);
-        self.scratch.clear();
-        self.buttons = buttons;
+    /// Move the tracked relative position and clamp it to the virtual desktop.
+    ///
+    /// Clamped to the desktop rather than to the client's own display, which is what macOS has
+    /// always done — deliberately, so the two backends agree. Whether a locked client should be
+    /// confined to the display it is streaming is a product question, not a technical one; see
+    /// `findings/minor-input-relative-mode-escapes-the-target-display.md`.
+    fn advance_rel(&mut self, dx: i32, dy: i32) -> POINT {
+        let base = match self.rel_pos {
+            Some(p) => p,
+            None => unsafe {
+                let mut p = POINT::default();
+                if GetCursorPos(&mut p).is_ok() {
+                    p
+                } else {
+                    self.pixel(0.5, 0.5)
+                }
+            },
+        };
+        let p = POINT {
+            x: (base.x + dx).clamp(self.virt.left, self.virt.left + self.virt.width - 1),
+            y: (base.y + dy).clamp(self.virt.top, self.virt.top + self.virt.height - 1),
+        };
+        self.rel_pos = Some(p);
+        p
     }
 
     fn wheel(&mut self, dx: f32, dy: f32, mode: u8) {
@@ -342,21 +399,62 @@ impl Injector {
         self.scratch.clear();
     }
 
-    fn pointer_batch(&mut self, source: u8, id: u32, buttons: u16, samples: &[MoveSample]) {
-        for s in samples {
-            match source {
-                SRC_PEN => self.pen(
-                    s.x,
-                    s.y,
-                    s.pressure,
-                    s.tilt_x,
-                    s.tilt_y,
-                    s.twist,
-                    buttons,
-                    Phase::Move,
-                ),
-                SRC_TOUCH => self.touch(id, s.x, s.y, s.pressure, 0.0, 0.0, Phase::Move),
-                _ => self.mouse_pointer(s.x, s.y, buttons, Phase::Move),
+    fn pointer_batch(
+        &mut self,
+        source: u8,
+        id: u32,
+        buttons: u16,
+        samples: &[MoveSample],
+        predicted: u8,
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        match source {
+            // Pen and touch go one call per sample because the API says so:
+            // `InjectSyntheticPointerInput` takes a frame of *simultaneous contacts*, capped at
+            // the device's `maxCount` (1 for pen, 10 for touch) — it is not a sequence of
+            // samples over time. Predicted samples are dropped here: a stroke is a shape, and a
+            // guess that the next real sample corrects still leaves a kink in the ink.
+            SRC_PEN | SRC_TOUCH => {
+                let real = samples.len() - predicted as usize;
+                for s in &samples[..real] {
+                    if source == SRC_PEN {
+                        self.pen(
+                            s.x,
+                            s.y,
+                            s.pressure,
+                            s.tilt_x,
+                            s.tilt_y,
+                            s.twist,
+                            buttons,
+                            Phase::Move,
+                        );
+                    } else {
+                        self.touch(id, s.x, s.y, s.pressure, 0.0, 0.0, Phase::Move);
+                    }
+                }
+            }
+            // The cursor is one `SendInput` array for the whole batch: same path, one kernel
+            // transition instead of one per sample. Predictions are kept, because the cursor is
+            // last-value-wins and the next real sample lands a frame later.
+            _ => {
+                self.mouse_relative = false;
+                self.scratch.clear();
+                for s in &samples[..samples.len() - 1] {
+                    let (ax, ay) = self.abs(s.x, s.y);
+                    self.scratch.push(mouse_input(
+                        ax,
+                        ay,
+                        0,
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    ));
+                }
+                let last = samples[samples.len() - 1];
+                self.push_mouse_pointer(last.x, last.y, buttons, Phase::Move);
+                send_inputs(&self.scratch);
+                self.scratch.clear();
+                self.buttons = buttons;
             }
         }
     }
@@ -693,6 +791,12 @@ impl Injector {
     fn lifecycle(&mut self, l: Lifecycle) {
         match l {
             Lifecycle::Focus(false) | Lifecycle::Visibility(false) => self.release_all(),
+            Lifecycle::PointerLock(locked) => {
+                self.mouse_relative = locked;
+                if !locked {
+                    self.rel_pos = None;
+                }
+            }
             _ => {}
         }
     }
@@ -732,6 +836,20 @@ impl Injector {
         match self.target {
             Some(r) => (r.width as i32, r.height as i32),
             None => (self.virt.width, self.virt.height),
+        }
+    }
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        // One pair of these per session leaked for the life of the host process. Windows caps
+        // synthetic pointer devices per process, so the visible symptom was pen pressure and
+        // multi-touch quietly degrading to mouse after enough reconnects.
+        for dev in [self.pen_dev.take(), self.touch_dev.take()]
+            .into_iter()
+            .flatten()
+        {
+            unsafe { DestroySyntheticPointerDevice(dev) };
         }
     }
 }
@@ -923,4 +1041,56 @@ unsafe fn put_clipboard(format: u32, bytes: &[u8]) -> bool {
 
 fn bytemuck_u16(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn batch(n: usize) -> Vec<MoveSample> {
+        (0..n)
+            .map(|i| MoveSample {
+                x: 0.40 + i as f32 * 0.0005,
+                y: 0.40 + i as f32 * 0.0005,
+                pressure: 0.0,
+                tilt_x: 0.0,
+                tilt_y: 0.0,
+                twist: 0.0,
+            })
+            .collect()
+    }
+
+    /// Injects for real, so it moves the host cursor: run it deliberately, not in a suite.
+    /// `cargo test -- --ignored --nocapture pointer_batch_costs`
+    #[test]
+    #[ignore]
+    fn pointer_batch_costs_one_sendinput_not_one_per_sample() {
+        const SAMPLES: usize = 40;
+        const REPS: usize = 500;
+        let samples = batch(SAMPLES);
+        let mut inj = Injector::new(ClientProfile::default());
+
+        // The shape this replaces: one mouse_pointer -> one SendInput per sample.
+        let t = Instant::now();
+        for _ in 0..REPS {
+            for s in &samples {
+                inj.mouse_pointer(s.x, s.y, 0, Phase::Move);
+            }
+        }
+        let per_sample = t.elapsed();
+
+        let t = Instant::now();
+        for _ in 0..REPS {
+            inj.pointer_batch(SRC_MOUSE, 0, 0, &samples, 0);
+        }
+        let batched = t.elapsed();
+
+        println!(
+            "pointer batch of {SAMPLES}: per-sample {:.1} us/batch ({} SendInput),              batched {:.1} us/batch (1 SendInput)",
+            per_sample.as_secs_f64() * 1e6 / REPS as f64,
+            SAMPLES,
+            batched.as_secs_f64() * 1e6 / REPS as f64,
+        );
+        assert!(batched < per_sample);
+    }
 }

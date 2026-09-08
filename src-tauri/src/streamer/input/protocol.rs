@@ -28,8 +28,23 @@ pub mod op {
     pub const MOUSE_DELTA: u8 = 0x54;
     pub const PING: u8 = 0x60;
     pub const PONG: u8 = 0x61;
+    /// Client -> host only. The host-to-client twin this opcode once had was never sent; the
+    /// injector's own counters go to `SessionTelemetry` instead, where `status --json` reads
+    /// them alongside every other counter. See `docs/INPUT-PROTOCOL.md`.
     pub const STATS: u8 = 0x62;
     pub const BYE: u8 = 0x63;
+    /// Client -> host, reliable channel, 2 bytes: opcode then a reason byte.
+    ///
+    /// The last resort for a receiver that cannot ask for a keyframe any other way. A client
+    /// running the legacy `createEncodedStreams` transform (Chrome and Edge 86-140) takes the
+    /// frames *instead of* libwebrtc's reference finder, so nothing downstream ever emits an
+    /// RTCP PLI and the host would otherwise never learn the picture is broken.
+    pub const KEYFRAME_REQUEST: u8 = 0x64;
+}
+
+/// Why a client asked for a keyframe. Only `Unspecified` is sent today.
+pub mod keyframe_reason {
+    pub const UNSPECIFIED: u8 = 0x00;
 }
 
 pub mod bye {
@@ -61,6 +76,33 @@ pub mod btn {
     pub const BACK: u16 = 1 << 3; // X1
     pub const FORWARD: u16 = 1 << 4; // X2
     pub const ERASER: u16 = 1 << 5; // pen eraser
+}
+
+/// Per-event flag bits carried by the v2 tail of `MOUSE_DELTA` and `POINTER_MOVE_BATCH`.
+pub mod evflag {
+    /// The client holds pointer lock with `unadjustedMovement: true`, so its deltas are raw
+    /// device counts with no OS pointer curve applied. Without it the client's own OS has
+    /// already curved them and the host must not curve them a second time.
+    pub const UNADJUSTED: u8 = 1 << 0;
+}
+
+/// v1 wire lengths, and the offset each optional v2 tail starts at.
+pub const POINTER_LEN: usize = 40;
+pub const WHEEL_LEN: usize = 15;
+pub const MOUSE_DELTA_LEN: usize = 8;
+/// Bytes of tail: a `u64` client stamp, and for a batch two more bytes of flags + predicted
+/// count. Both tails are optional; see `docs/INPUT-PROTOCOL.md`.
+pub const STAMP_LEN: usize = 8;
+pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
+
+/// Read the trailing client stamp a v2 frame may carry at `at`, or 0 when it carries none.
+///
+/// Every tail is appended past the v1 length, so a v1 client reads as 0 and a client newer
+/// than this build can append further fields without breaking the parse. The declared length
+/// is a floor, never an equality — the same rule the client stats frame already follows.
+#[inline]
+fn rd_stamp(b: &[u8], at: usize) -> u64 {
+    rd_u64(b, at).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +180,10 @@ pub enum InputEvent {
         id: u32,
         buttons: u16,
         samples: Vec<MoveSample>,
+        /// How many of the trailing samples came from `getPredictedEvents()` rather than the
+        /// real input stream. They are speculative, so a stroke backend drops them; a cursor
+        /// backend may use them, since the next real sample corrects the guess a frame later.
+        predicted: u8,
     },
     Wheel {
         source: u8,
@@ -153,6 +199,8 @@ pub enum InputEvent {
         dx: i16,
         dy: i16,
         buttons: u16,
+        /// The client had `unadjustedMovement` granted: raw device counts, no OS curve.
+        unadjusted: bool,
     },
     Key {
         down: bool,
@@ -194,6 +242,25 @@ pub enum InputEvent {
     },
     /// The client's own view of its half of the path. See `docs/TELEMETRY.md` for the layout.
     ClientStats(Box<crate::streamer::telemetry::ClientStats>),
+    /// The client is asking for an IDR out of band. Handled by the transport; it injects
+    /// nothing, so it must never reach a backend's `dispatch`.
+    KeyframeRequest {
+        reason: u8,
+    },
+}
+
+/// Whether a pointer frame's coordinates should move the cursor before its buttons are applied.
+///
+/// They should, for every phase that carries them — `Down` and `Up` included, which is the
+/// whole point: a browser fires `pointerdown` with no preceding `pointermove` on touch, so a
+/// backend that positions only on move-ish phases clicks wherever the host cursor already was.
+///
+/// The one exception is pointer lock. While the client holds it the browser freezes
+/// `clientX`/`clientY` at the lock point, so the coordinates a locked `POINTER_DOWN` carries are
+/// stale by construction and only `MOUSE_DELTA` may move the cursor.
+#[inline]
+pub fn positions_cursor(pointer_locked: bool, phase: Phase) -> bool {
+    !pointer_locked && !matches!(phase, Phase::Leave | Phase::Out | Phase::Cancel)
 }
 
 #[inline]
@@ -234,8 +301,21 @@ fn rd_f32(b: &[u8], o: usize) -> Option<f32> {
     Some(f32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
 }
 
-pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
+/// One decoded frame, plus the two things the transport needs to know about it.
+#[derive(Debug)]
+pub struct Parsed {
+    pub ev: InputEvent,
+    /// Belongs on the lossy latency-critical queue rather than the reliable one.
+    pub fast: bool,
+    /// The client's own monotonic nanosecond stamp for this event, or 0 when the frame carries
+    /// none. It rides the same client timebase as the `PING` stamp, so the host can measure how
+    /// long the event spent in flight without the client having to report anything back.
+    pub client_ns: u64,
+}
+
+pub fn parse(b: &[u8]) -> Option<Parsed> {
     let opcode = *b.first()?;
+    let mut client_ns = 0u64;
     let ev = match opcode {
         op::POINTER_DOWN
         | op::POINTER_UP
@@ -244,12 +324,20 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
         | op::POINTER_ENTER
         | op::POINTER_LEAVE
         | op::POINTER_OVER
-        | op::POINTER_OUT => parse_pointer(b)?,
-        op::POINTER_MOVE_BATCH => parse_pointer_batch(b)?,
-        op::WHEEL => parse_wheel(b)?,
+        | op::POINTER_OUT => {
+            let ev = parse_pointer(b)?;
+            client_ns = rd_stamp(b, POINTER_LEN);
+            ev
+        }
+        op::POINTER_MOVE_BATCH => parse_pointer_batch(b, &mut client_ns)?,
+        op::WHEEL => {
+            let ev = parse_wheel(b)?;
+            client_ns = rd_stamp(b, WHEEL_LEN);
+            ev
+        }
         op::ZOOM => parse_zoom(b)?,
-        op::MOUSE_DELTA => parse_mouse_delta(b)?,
-        op::KEY => parse_key(b)?,
+        op::MOUSE_DELTA => parse_mouse_delta(b, &mut client_ns)?,
+        op::KEY => parse_key(b, &mut client_ns)?,
         op::TEXT_INPUT | op::COMPOSITION_UPDATE => parse_text(b, opcode)?,
         op::CLIPBOARD => parse_clipboard(b)?,
         op::DRAG => parse_drag(b)?,
@@ -265,13 +353,20 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
             t_ns: rd_u64(b, 1)?,
         },
         op::STATS => parse_client_stats(b)?,
+        op::KEYFRAME_REQUEST => InputEvent::KeyframeRequest {
+            reason: b.get(1).copied().unwrap_or(keyframe_reason::UNSPECIFIED),
+        },
         _ => return None,
     };
-    Some((ev, is_fast(opcode)))
+    Some(Parsed {
+        ev,
+        fast: is_fast(opcode),
+        client_ns,
+    })
 }
 
 fn parse_pointer(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 40 {
+    if b.len() < POINTER_LEN {
         return None;
     }
     Some(InputEvent::Pointer {
@@ -292,7 +387,7 @@ fn parse_pointer(b: &[u8]) -> Option<InputEvent> {
 
 const BATCH_HEADER: usize = 10;
 const SAMPLE_SIZE: usize = 24;
-fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
+fn parse_pointer_batch(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     let source = *b.get(1)?;
     let id = rd_u32(b, 2)?;
     let buttons = rd_u16(b, 6)?;
@@ -314,11 +409,20 @@ fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
         });
         o += SAMPLE_SIZE;
     }
+    let predicted = if b.len() >= need + BATCH_TAIL_LEN {
+        *client_ns = rd_stamp(b, need);
+        // A client that claims more predictions than it sent samples is malformed; clamping
+        // rather than rejecting keeps the real samples, which are still good.
+        b[need + STAMP_LEN + 1].min(count as u8)
+    } else {
+        0
+    };
     Some(InputEvent::PointerBatch {
         source,
         id,
         buttons,
         samples,
+        predicted,
     })
 }
 
@@ -329,7 +433,7 @@ fn parse_zoom(b: &[u8]) -> Option<InputEvent> {
 }
 
 fn parse_wheel(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 15 {
+    if b.len() < WHEEL_LEN {
         return None;
     }
     Some(InputEvent::Wheel {
@@ -341,18 +445,23 @@ fn parse_wheel(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
-fn parse_mouse_delta(b: &[u8]) -> Option<InputEvent> {
-    if b.len() < 8 {
+fn parse_mouse_delta(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
+    if b.len() < MOUSE_DELTA_LEN {
         return None;
     }
+    // Byte 8 was a zero pad every client already sent, which is why it can become the flags
+    // byte without a version bump: an old client reads as "no flags set".
+    let flags = b.get(MOUSE_DELTA_LEN).copied().unwrap_or(0);
+    *client_ns = rd_stamp(b, MOUSE_DELTA_LEN + 1);
     Some(InputEvent::MouseDelta {
         dx: rd_i16(b, 2)?,
         dy: rd_i16(b, 4)?,
         buttons: rd_u16(b, 6)?,
+        unadjusted: flags & evflag::UNADJUSTED != 0,
     })
 }
 
-fn parse_key(b: &[u8]) -> Option<InputEvent> {
+fn parse_key(b: &[u8], client_ns: &mut u64) -> Option<InputEvent> {
     let flags = *b.get(1)?;
     let mods = rd_u16(b, 2)?;
     let code_len = *b.get(4)? as usize;
@@ -363,6 +472,7 @@ fn parse_key(b: &[u8]) -> Option<InputEvent> {
     let key_start = code_end + 1;
     let key_end = key_start + key_len;
     let key = std::str::from_utf8(b.get(key_start..key_end)?).ok()?;
+    *client_ns = rd_stamp(b, key_end);
     Some(InputEvent::Key {
         down: flags & 0b01 != 0,
         repeat: flags & 0b10 != 0,
@@ -406,10 +516,21 @@ fn parse_drag(b: &[u8]) -> Option<InputEvent> {
     })
 }
 
+/// Smallest a `DropItem` can be on the wire: two length prefixes, a size and a data length.
+const DROP_ITEM_MIN: usize = 2 + 4 + 8 + 8;
+/// No real drag-and-drop carries more than this, and the count sizes a heap allocation.
+const MAX_DROP_ITEMS: usize = 256;
+
 fn parse_drop(b: &[u8]) -> Option<InputEvent> {
     let x = rd_f32(b, 2)?;
     let y = rd_f32(b, 6)?;
     let count = rd_u16(b, 10)? as usize;
+    // The count sizes a `Vec<DropItem>` (~72 B each), so it has to be bounded by what the
+    // message could actually contain before it is believed: a bare 12-byte header claiming
+    // 65535 items would otherwise allocate ~4.7 MB and then fail on the first read.
+    if count > MAX_DROP_ITEMS || b.len() < 12usize.checked_add(count.checked_mul(DROP_ITEM_MIN)?)? {
+        return None;
+    }
     let mut items = Vec::with_capacity(count);
     let mut pos = 12usize;
     for _ in 0..count {
@@ -460,7 +581,10 @@ fn parse_resize(b: &[u8]) -> Option<InputEvent> {
 /// Wire size of a v1 client stats frame. Anything shorter is rejected; anything longer is a
 /// later version whose extra fields this build ignores.
 pub const CLIENT_STATS_LEN: usize = 72;
-pub const CLIENT_STATS_VERSION: u8 = 1;
+/// Wire size of a v2 frame: the v1 prefix plus the tier bytes, the degradation field and the
+/// three audio numbers. Bytes 0..72 are byte-identical to v1.
+pub const CLIENT_STATS_V2_LEN: usize = 96;
+pub const CLIENT_STATS_VERSION: u8 = 2;
 
 fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if b.len() < CLIENT_STATS_LEN {
@@ -470,6 +594,13 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if version == 0 {
         return None;
     }
+    // The declared length is a floor: a v1 client sends 72 bytes and a client newer than this
+    // build may send more than 96. Take the tail only if all of it arrived.
+    let tail: &[u8] = if b.len() >= CLIENT_STATS_V2_LEN {
+        &b[CLIENT_STATS_LEN..CLIENT_STATS_V2_LEN]
+    } else {
+        &[]
+    };
     Some(InputEvent::ClientStats(Box::new(
         crate::streamer::telemetry::ClientStats {
             received_host_ns: crate::streamer::audio::host_now_ns(),
@@ -496,30 +627,69 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
                 & crate::streamer::telemetry::client_flags::CLOCK_VALID
                 != 0,
             rtt_us: rd_u32(b, 68)?,
+            // The tail is read only when the whole of it is present. A v1 client leaves these
+            // at 0, which is also what "not measured" means for every one of them.
+            transport_tier: tail.first().copied().unwrap_or(0),
+            render_tier: tail.get(1).copied().unwrap_or(0),
+            key_tier: tail.get(2).copied().unwrap_or(0),
+            sink_tier: tail.get(3).copied().unwrap_or(0),
+            suppressed_errors: tail_u32(tail, 4),
+            degraded_flags: tail_u32(tail, 8),
+            audio_target_us: tail_u32(tail, 12),
+            audio_concealed: tail_u32(tail, 16),
+            audio_output_latency_us: tail_u32(tail, 20),
         },
     )))
 }
 
-pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 17] {
-    let mut out = [0u8; 17];
+#[inline]
+fn tail_u32(tail: &[u8], at: usize) -> u32 {
+    rd_u32(tail, at).unwrap_or(0)
+}
+
+/// What this host understands, so a client can feature-detect instead of assuming.
+///
+/// Announced in the `PONG` tail, which every client already receives once a second. A host older
+/// than the tail sends 17 bytes and the client reads no bits, which is the correct answer for it.
+pub mod hostcap {
+    /// Parses `KEYFRAME_REQUEST` (`0x64`) and routes it to the encoder's IDR path.
+    pub const KEYFRAME_REQUEST: u16 = 1 << 0;
+    /// Reads the 96-byte v2 client stats frame, not only its v1 prefix.
+    pub const STATS_V2: u16 = 1 << 1;
+    /// Accepts a separate unordered/unreliable channel for pointer moves. Not implemented: the
+    /// existing `fast` channel is already unordered with `maxRetransmits: 0`, so there is
+    /// nothing for a second one to add. Reserved so the bit cannot be reused for anything else.
+    pub const UNRELIABLE_MOVE_CHANNEL: u16 = 1 << 2;
+    /// Reads the optional trailing client timestamp on the pointer, batch, wheel, key and
+    /// mouse-delta frames, and reports the resulting one-way delay as `input_recv`. A client
+    /// that does not see this bit can skip the eight bytes.
+    pub const INPUT_TIMESTAMP: u16 = 1 << 3;
+    /// Reads the `MOUSE_DELTA` flags byte, so reporting `unadjustedMovement` is worth doing.
+    pub const INPUT_EVENT_FLAGS: u16 = 1 << 4;
+}
+
+/// The bits this build sets. See `docs/INPUT-PROTOCOL.md`, "Host capabilities".
+pub const HOST_CAPABILITIES: u16 = hostcap::KEYFRAME_REQUEST
+    | hostcap::STATS_V2
+    | hostcap::INPUT_TIMESTAMP
+    | hostcap::INPUT_EVENT_FLAGS;
+
+/// `[PONG][echoed client stamp u64][host_now_ns u64][host capabilities u16]`.
+///
+/// The tail is appended, never inserted: bytes 0..17 are byte-identical to the previous form, so
+/// a client that reads only those keeps working, and one that reads past them learns what this
+/// host can do without a handshake.
+pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 19] {
+    let mut out = [0u8; 19];
     out[0] = op::PONG;
     out[1..9].copy_from_slice(&t_ns.to_le_bytes());
     out[9..17].copy_from_slice(&host_ns.to_le_bytes());
+    out[17..19].copy_from_slice(&HOST_CAPABILITIES.to_le_bytes());
     out
 }
 
 pub fn build_bye(reason: u8) -> [u8; 2] {
     [op::BYE, reason]
-}
-
-pub fn build_stats(received: u64, dropped: u64, contacts: u32, queue_depth: u32) -> [u8; 25] {
-    let mut out = [0u8; 25];
-    out[0] = op::STATS;
-    out[1..9].copy_from_slice(&received.to_le_bytes());
-    out[9..17].copy_from_slice(&dropped.to_le_bytes());
-    out[17..21].copy_from_slice(&contacts.to_le_bytes());
-    out[21..25].copy_from_slice(&queue_depth.to_le_bytes());
-    out
 }
 
 #[cfg(test)]
@@ -536,9 +706,9 @@ mod tests {
         b[10..14].copy_from_slice(&0.25f32.to_le_bytes());
         b[14..18].copy_from_slice(&0.8f32.to_le_bytes());
         b[38..40].copy_from_slice(&btn::PRIMARY.to_le_bytes());
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(p.fast);
+        match p.ev {
             InputEvent::Pointer {
                 source,
                 id,
@@ -575,15 +745,18 @@ mod tests {
             b.extend_from_slice(&0f32.to_le_bytes());
             b.extend_from_slice(&0f32.to_le_bytes());
         }
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(p.fast);
+        assert_eq!(p.client_ns, 0, "a v1 batch carries no stamp");
+        match p.ev {
             InputEvent::PointerBatch {
                 source,
                 id,
                 buttons,
                 samples,
+                predicted,
             } => {
+                assert_eq!(predicted, 0);
                 assert_eq!(source, SRC_PEN);
                 assert_eq!(id, 3);
                 assert_eq!(buttons, btn::PRIMARY);
@@ -599,7 +772,7 @@ mod tests {
     fn zoom_frame() {
         let mut b = vec![op::ZOOM];
         b.extend_from_slice(&0.15f32.to_le_bytes());
-        match parse(&b).unwrap().0 {
+        match parse(&b).unwrap().ev {
             InputEvent::Zoom { delta } => assert!((delta - 0.15).abs() < 1e-6),
             _ => panic!("wrong variant"),
         }
@@ -611,9 +784,9 @@ mod tests {
         b.extend_from_slice(b"KeyA");
         b.push(1);
         b.extend_from_slice(b"a");
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(!hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(!p.fast);
+        match p.ev {
             InputEvent::Key {
                 down, code, key, ..
             } => {
@@ -631,8 +804,8 @@ mod tests {
         let mut b = vec![op::TEXT_INPUT];
         b.extend_from_slice(&(s.len() as u32).to_le_bytes());
         b.extend_from_slice(s.as_bytes());
-        let (ev, _) = parse(&b).unwrap();
-        match ev {
+        let p = parse(&b).unwrap();
+        match p.ev {
             InputEvent::Text { composing, s: got } => {
                 assert!(!composing);
                 assert_eq!(got, "好");
@@ -651,8 +824,8 @@ mod tests {
     fn ping_pong() {
         let mut b = vec![op::PING];
         b.extend_from_slice(&123456789u64.to_le_bytes());
-        let (ev, _) = parse(&b).unwrap();
-        match ev {
+        let p = parse(&b).unwrap();
+        match p.ev {
             InputEvent::Ping { t_ns } => assert_eq!(t_ns, 123456789),
             _ => panic!(),
         }
@@ -665,6 +838,35 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(pong[9..17].try_into().unwrap()),
             987654321
+        );
+    }
+
+    #[test]
+    fn the_pong_tail_announces_what_this_host_understands() {
+        let pong = build_pong(1, 2);
+        // The v1 prefix has to stay byte-identical, or a client reading only it breaks.
+        assert_eq!(pong[0], op::PONG);
+        assert_eq!(u64::from_le_bytes(pong[1..9].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(pong[9..17].try_into().unwrap()), 2);
+
+        let caps = u16::from_le_bytes(pong[17..19].try_into().unwrap());
+        assert_eq!(caps, HOST_CAPABILITIES);
+        assert!(
+            caps & hostcap::KEYFRAME_REQUEST != 0,
+            "0x64 reaches request_idr"
+        );
+        assert!(caps & hostcap::STATS_V2 != 0, "the 96-byte tail is read");
+        assert!(
+            caps & hostcap::INPUT_TIMESTAMP != 0,
+            "client stamps become input_recv"
+        );
+        assert!(
+            caps & hostcap::INPUT_EVENT_FLAGS != 0,
+            "the MOUSE_DELTA flags byte is read"
+        );
+        assert!(
+            caps & hostcap::UNRELIABLE_MOVE_CHANNEL == 0,
+            "there is no second move channel; the fast one is already unordered"
         );
     }
 
@@ -684,9 +886,9 @@ mod tests {
         b[44..48].copy_from_slice(&1799u32.to_le_bytes());
         b[68..72].copy_from_slice(&4_100u32.to_le_bytes());
 
-        let (ev, hot) = parse(&b).unwrap();
-        assert!(!hot);
-        match ev {
+        let p = parse(&b).unwrap();
+        assert!(!p.fast);
+        match p.ev {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.version, CLIENT_STATS_VERSION);
                 assert_eq!(c.video_path, 1);
@@ -715,18 +917,229 @@ mod tests {
     }
 
     #[test]
+    fn a_v2_stats_frame_carries_the_tier_bytes_and_the_degradation_field() {
+        use crate::streamer::telemetry::client_degraded_list;
+        let mut b = vec![0u8; CLIENT_STATS_V2_LEN];
+        b[0] = op::STATS;
+        b[1] = CLIENT_STATS_VERSION;
+        b[72] = 2; // encoded-streams transport
+        b[73] = 1; // offscreen canvas
+        b[74] = 0; // cannot ask for a keyframe: the Chrome 94-140 case
+        b[75] = 4; // selectAudioOutput
+        b[76..80].copy_from_slice(&9u32.to_le_bytes());
+        b[80..84].copy_from_slice(&((1u32 << 11) | (1u32 << 19)).to_le_bytes());
+        b[84..88].copy_from_slice(&40_000u32.to_le_bytes());
+        b[92..96].copy_from_slice(&12_000u32.to_le_bytes());
+
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(
+                    (c.transport_tier, c.render_tier, c.key_tier, c.sink_tier),
+                    (2, 1, 0, 4)
+                );
+                assert_eq!(c.suppressed_errors, 9);
+                assert_eq!(c.audio_target_us, 40_000);
+                assert_eq!(c.audio_output_latency_us, 12_000);
+                assert_eq!(
+                    client_degraded_list(c.degraded_flags),
+                    ["no_keyframe_request", "stepped_down_to_encoded_streams"]
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_v1_stats_frame_still_parses_and_leaves_the_tail_zero() {
+        let mut b = vec![0u8; CLIENT_STATS_LEN];
+        b[0] = op::STATS;
+        b[1] = 1;
+        b[2] = 3;
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.version, 1);
+                assert_eq!(c.video_path, 3);
+                assert_eq!(c.transport_tier, 0);
+                assert_eq!(c.degraded_flags, 0);
+                assert_eq!(c.audio_output_latency_us, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_v2_tail_is_treated_as_absent_rather_than_half_read() {
+        let mut b = vec![0u8; CLIENT_STATS_V2_LEN - 1];
+        b[0] = op::STATS;
+        b[1] = CLIENT_STATS_VERSION;
+        b[72] = 2;
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => assert_eq!(c.transport_tier, 0),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn a_longer_stats_frame_from_a_newer_client_still_parses() {
         let mut b = vec![0u8; CLIENT_STATS_LEN + 16];
         b[0] = op::STATS;
         b[1] = 2;
         b[2] = 3;
-        match parse(&b).unwrap().0 {
+        match parse(&b).unwrap().ev {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.version, 2);
                 assert_eq!(c.video_path, 3);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn batch_frame(count: u16, tail: Option<(u64, u8, u8)>) -> Vec<u8> {
+        let mut b = vec![op::POINTER_MOVE_BATCH, SRC_PEN];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        for i in 0..count {
+            b.extend_from_slice(&(i as f32 / 100.0).to_le_bytes());
+            for _ in 0..5 {
+                b.extend_from_slice(&0f32.to_le_bytes());
+            }
+        }
+        if let Some((stamp, flags, predicted)) = tail {
+            b.extend_from_slice(&stamp.to_le_bytes());
+            b.push(flags);
+            b.push(predicted);
+        }
+        b
+    }
+
+    #[test]
+    fn a_v2_pointer_frame_carries_a_client_stamp_and_a_v1_one_does_not() {
+        let mut v1 = [0u8; POINTER_LEN];
+        v1[0] = op::POINTER_DOWN;
+        assert_eq!(parse(&v1).unwrap().client_ns, 0);
+
+        let mut v2 = [0u8; POINTER_LEN + STAMP_LEN];
+        v2[0] = op::POINTER_DOWN;
+        v2[POINTER_LEN..].copy_from_slice(&987_654_321u64.to_le_bytes());
+        assert_eq!(parse(&v2).unwrap().client_ns, 987_654_321);
+    }
+
+    #[test]
+    fn a_v2_batch_tail_carries_the_stamp_and_the_predicted_count() {
+        let p = parse(&batch_frame(4, Some((42, 0, 2)))).unwrap();
+        assert_eq!(p.client_ns, 42);
+        match p.ev {
+            InputEvent::PointerBatch {
+                samples, predicted, ..
+            } => {
+                assert_eq!(samples.len(), 4);
+                assert_eq!(predicted, 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_predicted_count_larger_than_the_batch_is_clamped_not_trusted() {
+        match parse(&batch_frame(2, Some((0, 0, 200)))).unwrap().ev {
+            InputEvent::PointerBatch {
+                samples, predicted, ..
+            } => {
+                assert_eq!(samples.len(), 2);
+                assert_eq!(predicted, 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mouse_delta_reads_the_unadjusted_flag_out_of_the_old_pad_byte() {
+        let mut v1 = vec![op::MOUSE_DELTA, 0];
+        v1.extend_from_slice(&3i16.to_le_bytes());
+        v1.extend_from_slice(&(-4i16).to_le_bytes());
+        v1.extend_from_slice(&0u16.to_le_bytes());
+        v1.push(0); // the pad byte every shipped client already sends
+        let p = parse(&v1).unwrap();
+        assert_eq!(p.client_ns, 0);
+        match p.ev {
+            InputEvent::MouseDelta {
+                dx, dy, unadjusted, ..
+            } => {
+                assert_eq!((dx, dy), (3, -4));
+                assert!(!unadjusted);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let mut v2 = v1[..MOUSE_DELTA_LEN].to_vec();
+        v2.push(evflag::UNADJUSTED);
+        v2.extend_from_slice(&7u64.to_le_bytes());
+        let p = parse(&v2).unwrap();
+        assert_eq!(p.client_ns, 7);
+        match p.ev {
+            InputEvent::MouseDelta { unadjusted, .. } => assert!(unadjusted),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_key_frame_stamp_sits_past_its_variable_tail() {
+        let mut b = vec![op::KEY, 0b01, 0, 0, 4];
+        b.extend_from_slice(b"KeyA");
+        b.push(1);
+        b.extend_from_slice(b"a");
+        assert_eq!(parse(&b).unwrap().client_ns, 0);
+        b.extend_from_slice(&555u64.to_le_bytes());
+        assert_eq!(parse(&b).unwrap().client_ns, 555);
+    }
+
+    #[test]
+    fn down_and_up_position_the_cursor_unless_the_pointer_is_locked() {
+        for phase in [
+            Phase::Down,
+            Phase::Up,
+            Phase::Move,
+            Phase::Enter,
+            Phase::Over,
+        ] {
+            assert!(positions_cursor(false, phase), "{phase:?} unlocked");
+            assert!(!positions_cursor(true, phase), "{phase:?} locked");
+        }
+        for phase in [Phase::Leave, Phase::Out, Phase::Cancel] {
+            assert!(
+                !positions_cursor(false, phase),
+                "{phase:?} carries no position"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_count_the_message_cannot_hold_is_rejected_before_it_allocates() {
+        let mut b = vec![0u8; 12];
+        b[0] = op::DROP;
+        b[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse(&b).is_none());
+
+        b[10..12].copy_from_slice(&((MAX_DROP_ITEMS + 1) as u16).to_le_bytes());
+        assert!(parse(&b).is_none());
+    }
+
+    #[test]
+    fn a_keyframe_request_parses_on_the_reliable_channel() {
+        let p = parse(&[op::KEYFRAME_REQUEST, keyframe_reason::UNSPECIFIED]).unwrap();
+        assert!(!p.fast, "an IDR request is not disposable");
+        match p.ev {
+            InputEvent::KeyframeRequest { reason } => {
+                assert_eq!(reason, keyframe_reason::UNSPECIFIED)
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A client that sends only the opcode still gets a request, not a dropped frame.
+        assert!(matches!(
+            parse(&[op::KEYFRAME_REQUEST]).unwrap().ev,
+            InputEvent::KeyframeRequest { .. }
+        ));
     }
 
     #[test]
