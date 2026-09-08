@@ -212,3 +212,70 @@ fn intel_quicksync_fused_downscale() {
     }
     eprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
 }
+
+/// Three encoders built at once must all get a session.
+///
+/// oneVPL implementation enumeration is dispatcher-wide: `MFXCreateSession` opens the candidate
+/// runtimes and asks each whether it can serve the filter, and two of those at once against the
+/// same iGPU used to leave one holding `MFX_ERR_NOT_FOUND` — reported up the stack as "no Intel
+/// hardware oneVPL implementation", which sent that session to x264 for its whole life. An
+/// encoder is built per streaming session, so this is what two clients joining together does.
+///
+/// Skipping needs care here: a box with no Intel hardware must skip, but a box that has it must
+/// not be allowed to pass by failing every thread the same way. So the first failure decides —
+/// if the *serial* probe cannot build one either, there is no hardware and the test skips.
+#[test]
+fn intel_quicksync_survives_concurrent_session_creation() {
+    const W: u32 = 640;
+    const H: u32 = 360;
+    const THREADS: usize = 3;
+
+    let cfg = || EncoderConfig {
+        width: W,
+        height: H,
+        fps: 30,
+        bitrate_bps: 2_000_000,
+        max_bitrate_bps: 2_000_000,
+        profile: H264Profile::Baseline,
+        qp: None,
+        min_qp: None,
+        intra_refresh: false,
+    };
+
+    match Encoder::new(cfg()) {
+        Ok(e) => drop(e),
+        Err(e) => {
+            super::skip("Intel concurrent-session test (no HW/runtime)", e);
+            return;
+        }
+    }
+
+    let failures: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                s.spawn(move || match Encoder::new(cfg()) {
+                    Ok(mut enc) => {
+                        let mut frame = vec![0u8; (W * H * 4) as usize];
+                        fill_synthetic_bgra(&mut frame, W, H, i as u32);
+                        enc.encode_bgra(&frame, true)
+                            .map(|au| au.len())
+                            .map_err(|e| format!("thread {i} encode: {e:#}"))
+                            .map(|_| ())
+                    }
+                    Err(e) => Err(format!("thread {i} session: {e:#}")),
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("encoder thread should not panic").err())
+            .collect()
+    });
+
+    assert!(
+        failures.is_empty(),
+        "every concurrent Quick Sync session should be created; got {} failure(s): {failures:#?}",
+        failures.len(),
+    );
+    eprintln!("Intel concurrent-session OK: {THREADS} sessions created and encoded in parallel");
+}
