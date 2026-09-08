@@ -185,6 +185,8 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             max_bitrate_bps: SP_BITRATE_BPS,
             h264_profile: cfg.h264_profile,
         };
+        let workload = cfg.workload;
+        let counter = cfg.counter;
         let enc = EncoderConfig {
             width: SP_WIDTH,
             height: SP_HEIGHT,
@@ -199,7 +201,16 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         std::thread::Builder::new()
             .name("nvenc-encode".to_string())
             .spawn(move || {
-                synthetic_pattern_loop(tx, idr_request, target_bitrate, enc, wake_rx, telemetry)
+                synthetic_pattern_loop(
+                    tx,
+                    idr_request,
+                    target_bitrate,
+                    enc,
+                    wake_rx,
+                    telemetry,
+                    workload,
+                    counter,
+                )
             })
             .expect("spawn encode thread");
         return Ok(pipeline);
@@ -1925,6 +1936,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthetic_pattern_loop(
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
@@ -1932,8 +1944,11 @@ fn synthetic_pattern_loop(
     config: EncoderConfig,
     wake_rx: crossbeam_channel::Receiver<()>,
     telemetry: SharedTelemetry,
+    workload: crate::streamer::synthetic::Workload,
+    counter: bool,
 ) {
     let _thread_tuning = tuning::tune_current_thread();
+    let counter_epoch = Instant::now();
 
     let mut encoder = match Encoder::new(config) {
         Ok(e) => e,
@@ -1951,7 +1966,11 @@ fn synthetic_pattern_loop(
     let mut frame_index: u32 = 0;
     let mut next_deadline = Instant::now();
 
-    tprintln!("pipeline: synthetic pattern encode loop started ({SP_WIDTH}x{SP_HEIGHT}@{SP_FPS})");
+    tprintln!(
+        "pipeline: synthetic pattern encode loop started ({SP_WIDTH}x{SP_HEIGHT}@{SP_FPS}, \
+         workload={}, counter={counter})",
+        workload.name()
+    );
 
     loop {
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
@@ -1972,7 +1991,22 @@ fn synthetic_pattern_loop(
         }
 
         let force_idr = frame_index == 0 || idr_request.swap(false, Ordering::Relaxed);
-        fill_synthetic_pattern(&mut frame_buf, SP_WIDTH, SP_HEIGHT, frame_index);
+        crate::streamer::synthetic::fill(
+            &mut frame_buf,
+            SP_WIDTH,
+            SP_HEIGHT,
+            frame_index,
+            workload,
+        );
+        if counter {
+            crate::streamer::synthetic::draw_counter(
+                &mut frame_buf,
+                SP_WIDTH,
+                SP_HEIGHT,
+                frame_index,
+                counter_epoch.elapsed().as_millis() as u64,
+            );
+        }
 
         let mut timing = FrameTiming::entering_capture();
         timing.mark_encode_submit();
@@ -2006,51 +2040,6 @@ fn synthetic_pattern_loop(
             while wake_rx.try_recv().is_ok() {}
         } else {
             next_deadline = now;
-        }
-    }
-}
-
-fn fill_synthetic_pattern(buf: &mut [u8], width: u32, height: u32, frame: u32) {
-    let w = width as usize;
-    let h = height as usize;
-    let f = frame as usize;
-
-    let box_w = w / 6;
-    let box_h = h / 6;
-    let span_x = w.saturating_sub(box_w).max(1);
-    let span_y = h.saturating_sub(box_h).max(1);
-    let box_x = (f * 11) % span_x;
-    let box_y = (f * 7) % span_y;
-
-    let bar_w = (w / 60).max(2);
-    let bar_x = (f * (w / 90).max(1)) % w;
-    let bar_h = h / 12;
-
-    for y in 0..h {
-        let row = y * w * 4;
-        for x in 0..w {
-            let o = row + x * 4;
-            let b = ((x + f * 3) & 0xff) as u8;
-            let g = ((y + f * 5) & 0xff) as u8;
-            let r = ((x + y + f * 2) & 0xff) as u8;
-
-            let in_box = x >= box_x && x < box_x + box_w && y >= box_y && y < box_y + box_h;
-            let in_bar = y < bar_h && x >= bar_x && x < bar_x + bar_w;
-
-            if in_bar {
-                buf[o] = 255;
-                buf[o + 1] = 255;
-                buf[o + 2] = 255;
-            } else if in_box {
-                buf[o] = 0;
-                buf[o + 1] = 255;
-                buf[o + 2] = 255;
-            } else {
-                buf[o] = b;
-                buf[o + 1] = g;
-                buf[o + 2] = r;
-            }
-            buf[o + 3] = 255;
         }
     }
 }
