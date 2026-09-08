@@ -19,6 +19,10 @@ pub struct Frame {
     pub height: usize,
     pub arrived_mach: u64,
     pub captured_at: std::time::Instant,
+    /// The OS's own frame time on the shared host clock — CGDisplayStream's `displayTime`,
+    /// ScreenCaptureKit's PTS. 0 when the backend supplied none. It is the only stamp that says
+    /// when the pixels existed rather than when our callback saw them.
+    pub os_time_ns: u64,
     pub backing: Backing,
 }
 
@@ -100,6 +104,7 @@ mod tests {
             height: 1,
             arrived_mach: tag,
             captured_at: std::time::Instant::now(),
+            os_time_ns: 0,
             backing: Backing::Empty,
         }
     }

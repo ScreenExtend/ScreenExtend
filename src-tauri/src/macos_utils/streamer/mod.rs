@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 pub mod activity;
 pub mod cgds;
+pub mod clock;
 pub mod config;
 pub mod display;
 pub mod encoder;
@@ -43,6 +44,10 @@ pub enum CaptureError {
 pub trait CaptureBackend: Send {
     fn start(&mut self) -> Result<(), CaptureError>;
     fn stop(&mut self);
+    /// Which tier actually started, for telemetry. `start_capture` silently falls back from
+    /// ScreenCaptureKit to CGDisplayStream, and a measurement that cannot say which one ran is
+    /// not a measurement.
+    fn name(&self) -> &'static str;
 }
 
 pub type DisplayId = u32;
