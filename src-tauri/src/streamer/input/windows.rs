@@ -36,13 +36,14 @@ use windows::Win32::UI::Input::Pointer::{
 };
 use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PostMessageW, WindowFromPoint, PT_PEN, PT_TOUCH, SM_CXSCREEN,
+    GetCursorPos, GetSystemMetrics, PostMessageW, WindowFromPoint, PT_PEN, PT_TOUCH, SM_CXSCREEN,
     SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     WM_DROPFILES,
 };
 
 use super::protocol::{
-    btn, DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
+    btn, positions_cursor, DropItem, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN,
+    SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
 use super::DisplayRect;
@@ -130,7 +131,13 @@ pub struct Injector {
     touch_dev: Option<HSYNTHETICPOINTERDEVICE>,
     contacts: HashMap<u32, Contact>,
     pen_down: bool,
+    /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
+    /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
+    /// Where relative motion has put the cursor, in desktop pixels. Windows would happily
+    /// accumulate `MOUSEEVENTF_MOVE` for us, but then it applies its own pointer ballistics on
+    /// top of the curve the client already applied, and there is no position to clamp.
+    rel_pos: Option<POINT>,
     scratch: Vec<INPUT>,
     touch_scratch: Vec<POINTER_TYPE_INFO>,
 }
@@ -156,7 +163,12 @@ impl Injector {
             touch_dev,
             contacts: HashMap::new(),
             pen_down: false,
-            mouse_relative: true,
+            // No lock until the client says so. Starting at `true` meant the first frame of a
+            // session was treated as relative, so a touch client's opening tap — which arrives
+            // as a bare `POINTER_DOWN` with no move before it — clicked wherever the host
+            // cursor already was.
+            mouse_relative: false,
+            rel_pos: None,
             scratch: Vec::with_capacity(16),
             touch_scratch: Vec::with_capacity(MAX_TOUCH_COUNT as usize),
         }
@@ -287,17 +299,50 @@ impl Injector {
                 self.buttons = 0;
                 return;
             }
-            Phase::Move | Phase::Enter | Phase::Over => {
-                self.mouse_relative = false;
-            }
+            // An absolute move is proof the client is not locked, for clients that never send
+            // `POINTERLOCK_STATE`. A `Down`/`Up` is not: those still arrive while locked.
+            Phase::Move | Phase::Enter | Phase::Over => self.mouse_relative = false,
             _ => {}
         }
         self.scratch.clear();
-        if !self.mouse_relative {
+        self.push_mouse_pointer(x, y, buttons, phase);
+        send_inputs(&self.scratch);
+        self.scratch.clear();
+        self.buttons = buttons;
+    }
+
+    /// The body of `mouse_pointer` without the flush, so a batch can build several samples into
+    /// one `SendInput` array instead of paying a kernel transition per sample.
+    fn push_mouse_pointer(&mut self, x: f32, y: f32, buttons: u16, phase: Phase) {
+        if positions_cursor(self.mouse_relative, phase) {
             let (ax, ay) = self.abs(x, y);
             self.scratch.push(mouse_input(
                 ax,
                 ay,
+                0,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ));
+            self.rel_pos = None;
+        }
+        button_transitions(self.buttons, buttons, &mut self.scratch);
+    }
+
+    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
+        self.mouse_relative = true;
+        self.scratch.clear();
+        if dx != 0 || dy != 0 {
+            // Absolute, from a position we track ourselves. A raw `MOUSEEVENTF_MOVE` goes
+            // through the Windows pointer curve, and the client has already applied its own
+            // (its OS's, unless `unadjustedMovement` was granted, plus its sensitivity
+            // setting) — so the relative path used to accelerate twice while the absolute path
+            // accelerated not at all. One curve, owned by the client, is the coherent answer,
+            // and it matches what the macOS backend has always done.
+            let pos = self.advance_rel(dx as i32, dy as i32);
+            let vx = (pos.x - self.virt.left) as f32 / self.virt.width as f32;
+            let vy = (pos.y - self.virt.top) as f32 / self.virt.height as f32;
+            self.scratch.push(mouse_input(
+                (vx.clamp(0.0, 1.0) * 65535.0).round() as i32,
+                (vy.clamp(0.0, 1.0) * 65535.0).round() as i32,
                 0,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             ));
@@ -308,17 +353,30 @@ impl Injector {
         self.buttons = buttons;
     }
 
-    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
-        self.mouse_relative = true;
-        self.scratch.clear();
-        if dx != 0 || dy != 0 {
-            self.scratch
-                .push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
-        }
-        button_transitions(self.buttons, buttons, &mut self.scratch);
-        send_inputs(&self.scratch);
-        self.scratch.clear();
-        self.buttons = buttons;
+    /// Move the tracked relative position and clamp it to the virtual desktop.
+    ///
+    /// Clamped to the desktop rather than to the client's own display, which is what macOS has
+    /// always done — deliberately, so the two backends agree. Whether a locked client should be
+    /// confined to the display it is streaming is a product question, not a technical one; see
+    /// `findings/minor-input-relative-mode-escapes-the-target-display.md`.
+    fn advance_rel(&mut self, dx: i32, dy: i32) -> POINT {
+        let base = match self.rel_pos {
+            Some(p) => p,
+            None => unsafe {
+                let mut p = POINT::default();
+                if GetCursorPos(&mut p).is_ok() {
+                    p
+                } else {
+                    self.pixel(0.5, 0.5)
+                }
+            },
+        };
+        let p = POINT {
+            x: (base.x + dx).clamp(self.virt.left, self.virt.left + self.virt.width - 1),
+            y: (base.y + dy).clamp(self.virt.top, self.virt.top + self.virt.height - 1),
+        };
+        self.rel_pos = Some(p);
+        p
     }
 
     fn wheel(&mut self, dx: f32, dy: f32, mode: u8) {
@@ -693,6 +751,12 @@ impl Injector {
     fn lifecycle(&mut self, l: Lifecycle) {
         match l {
             Lifecycle::Focus(false) | Lifecycle::Visibility(false) => self.release_all(),
+            Lifecycle::PointerLock(locked) => {
+                self.mouse_relative = locked;
+                if !locked {
+                    self.rel_pos = None;
+                }
+            }
             _ => {}
         }
     }
