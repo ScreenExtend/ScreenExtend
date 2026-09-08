@@ -1,0 +1,18 @@
+# Allowlist for scripts/check-macos-dyld.sh
+#
+# One mangled symbol per line (leading underscore included), '#' starts a comment.
+# Only add a symbol here when you have PROVEN it can be bound by the dyld on the
+# deployment floor (10.15) despite the checker's verdict — for example a symbol the
+# SDK stubs omit but the shipping dylib exports. "It builds on my Mac" is not proof;
+# the build Mac is newer than the floor.
+#
+# The correct fix for anything genuinely newer than 10.15 is NOT this file — it is to
+# resolve the symbol at runtime:
+#   * C function  -> libc::dlsym(libc::RTLD_DEFAULT, c"Name".as_ptr())
+#   * ObjC class  -> objc2::runtime::AnyClass::get(c"Name")
+#   * CFString constant -> dlsym + deref (see macos_utils/streamer/encoder.rs
+#     vt_optional_cfstring and macos_utils/streamer/sck.rs sck_optional_cfstring)
+# A strongly-bound undefined symbol dyld cannot resolve kills the process before
+# main() — the whole app fails to launch, not just the feature.
+
+# (empty — nothing is allowlisted today)
