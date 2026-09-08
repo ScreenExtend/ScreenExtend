@@ -40,11 +40,6 @@ pub enum Error {
     /// Wraps [`super::d3d11::Error`].
     #[error("DirectX error: {0}")]
     DirectXError(#[from] d3d11::Error),
-    /// Window helper error.
-    ///
-    /// Wraps [`super::window::Error`].
-    #[error("Window error: {0}")]
-    WindowError(#[from] super::window::Error),
     /// A Windows Runtime/Win32 API call failed.
     ///
     /// Wraps [`windows::core::Error`].
@@ -219,18 +214,7 @@ impl GraphicsCaptureApi {
 
         let features = wgc_features();
 
-        // Pre-calculate the title bar height so each frame doesn't need to do it
-        let title_bar_height = match item_with_details {
-            GraphicsCaptureItemType::Window((_, window)) => Some(window.title_bar_height()?),
-            GraphicsCaptureItemType::Monitor(_) => None,
-            GraphicsCaptureItemType::Unknown(_) => None,
-        };
-
-        let item = match &item_with_details {
-            GraphicsCaptureItemType::Window((item, _)) => item,
-            GraphicsCaptureItemType::Monitor((item, _)) => item,
-            GraphicsCaptureItemType::Unknown((item, _)) => item,
-        };
+        let GraphicsCaptureItemType::Monitor((item, _)) = &item_with_details;
 
         // Create DirectX devices
         let direct3d_device = create_direct3d_device(&d3d_device)?;
@@ -375,7 +359,7 @@ impl GraphicsCaptureApi {
                     &context,
                     desc,
                     color_format,
-                    title_bar_height,
+                    None,
                 );
 
                 // Init internal capture control
@@ -528,11 +512,7 @@ impl GraphicsCaptureApi {
             let _ = session.Close();
         }
 
-        let item = match &self.item_with_details {
-            GraphicsCaptureItemType::Window((item, _)) => item,
-            GraphicsCaptureItemType::Monitor((item, _)) => item,
-            GraphicsCaptureItemType::Unknown((item, _)) => item,
-        };
+        let GraphicsCaptureItemType::Monitor((item, _)) = &self.item_with_details;
 
         let _ = item.RemoveClosed(self.capture_closed_event_token);
         self.active = false;

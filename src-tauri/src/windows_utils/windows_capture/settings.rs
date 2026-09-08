@@ -3,25 +3,16 @@ use std::time::Duration;
 use windows::Graphics::Capture::GraphicsCaptureItem;
 
 use super::d3d11::GpuPreference;
-use super::graphics_capture_picker::HwndGuard;
 use super::monitor::Monitor;
-use super::window::Window;
 
-/// An enumeration of item types that can be captured.
+/// What can be captured.
 ///
-/// Wraps the WinRT [`GraphicsCaptureItem`] together with additional details about the source:
-/// - [`Monitor`] for display monitors,
-/// - [`Window`] for top-level windows,
-/// - [`super::graphics_capture_picker::HwndGuard`] for unknown HWND-based sources.
+/// Upstream also had `Window` and `Unknown` (an HWND from the system picker) variants; ScreenExtend
+/// only ever captures the virtual display it created, so both were removed along with the modules
+/// behind them. See `FORK.md`.
 pub enum GraphicsCaptureItemType {
     /// A display monitor. Contains the [`GraphicsCaptureItem`] and its [`Monitor`] details.
     Monitor((GraphicsCaptureItem, Monitor)),
-    /// An application window. Contains the [`GraphicsCaptureItem`] and its [`Window`] details.
-    Window((GraphicsCaptureItem, Window)),
-    /// An unknown capture item type (typically created from an HWND). Contains the
-    /// [`GraphicsCaptureItem`] and the associated
-    /// [`super::graphics_capture_picker::HwndGuard`].
-    Unknown((GraphicsCaptureItem, HwndGuard)),
 }
 
 /// Specifies the pixel format for the captured frame.
