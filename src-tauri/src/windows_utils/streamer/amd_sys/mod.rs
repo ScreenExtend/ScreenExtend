@@ -137,8 +137,12 @@ pub fn classify(r: AMF_RESULT) -> AmfErrorClass {
         AMF_OK | AMF_REPEAT | AMF_INPUT_FULL | AMF_NEED_MORE_INPUT | AMF_EOF => {
             AmfErrorClass::Transient
         }
-        AMF_RESOLUTION_CHANGED | AMF_RESOLUTION_UPDATED | AMF_NO_DEVICE | AMF_DIRECTX_FAILED
-        | AMF_OUT_OF_MEMORY | AMF_WRONG_STATE => AmfErrorClass::Recoverable,
+        AMF_RESOLUTION_CHANGED
+        | AMF_RESOLUTION_UPDATED
+        | AMF_NO_DEVICE
+        | AMF_DIRECTX_FAILED
+        | AMF_OUT_OF_MEMORY
+        | AMF_WRONG_STATE => AmfErrorClass::Recoverable,
         _ => AmfErrorClass::Fatal,
     }
 }
@@ -170,7 +174,11 @@ pub unsafe fn set_property(
     name: &[u16],
     value: AMFVariantStruct,
 ) -> AMF_RESULT {
-    debug_assert_eq!(name.last(), Some(&0), "property names must be NUL-terminated");
+    debug_assert_eq!(
+        name.last(),
+        Some(&0),
+        "property names must be NUL-terminated"
+    );
     // SAFETY: vtable slot 3 (AMFPropertyStorage::SetProperty). The variant is passed by value,
     // which on x64 Windows means by hidden reference to this stack copy — valid for the call.
     unsafe { ((*(*storage).pVtbl).SetProperty)(storage, name.as_ptr(), value) }

@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
+use super::amd::encoder::Encoder as AmfEncoder;
 use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo};
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
@@ -771,6 +772,8 @@ enum Backend {
     Nvenc { encoder: Encoder, path: EncodePath },
     Intel { encoder: IntelEncoder },
     IntelCpu { encoder: IntelEncoder },
+    Amf { encoder: AmfEncoder },
+    AmfCpu { encoder: AmfEncoder },
     X264 { encoder: X264Encoder },
 }
 
@@ -780,6 +783,8 @@ impl Backend {
             Backend::Nvenc { path, .. } => path.name(),
             Backend::Intel { .. } => "intel-same-adapter",
             Backend::IntelCpu { .. } => "intel-cpu-bridge",
+            Backend::Amf { .. } => "amd-amf-same-adapter",
+            Backend::AmfCpu { .. } => "amd-amf-cpu-bridge",
             Backend::X264 { .. } => "software-x264",
         }
     }
@@ -789,6 +794,7 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => Some(encoder.device()),
             Backend::Intel { encoder } => Some(encoder.device()),
             Backend::IntelCpu { encoder } => Some(encoder.device()),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => Some(encoder.device()),
             Backend::X264 { .. } => None,
         }
     }
@@ -798,6 +804,7 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.set_bitrate(bps),
             Backend::Intel { encoder } => encoder.set_bitrate(bps),
             Backend::IntelCpu { encoder } => encoder.set_bitrate(bps),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => encoder.set_bitrate(bps),
             Backend::X264 { encoder } => encoder.set_bitrate(bps),
         }
     }
@@ -813,6 +820,7 @@ impl Backend {
                 path: EncodePath::CpuBridge,
                 ..
             } | Backend::IntelCpu { .. }
+                | Backend::AmfCpu { .. }
                 | Backend::X264 { .. }
         )
     }
@@ -858,6 +866,9 @@ impl Backend {
                 }
                 encoder.encode_input(force_idr)
             }
+            // AMF stages into its own texture ring, so the prescaler (when there is one) blits
+            // straight into the slot the encoder is about to wrap.
+            Backend::Amf { encoder } => encoder.encode_texture(raw, scaler, force_idr),
             _ => bail!("encode_gpu called on a CPU-bridge backend"),
         }
     }
@@ -869,6 +880,7 @@ impl Backend {
                 path: EncodePath::CpuBridge,
             } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             Backend::IntelCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
+            Backend::AmfCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             Backend::X264 { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             _ => bail!("encode_cpu called on a GPU-path backend"),
         }
@@ -879,6 +891,9 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.encode_repeat(force_idr),
             Backend::Intel { encoder } => encoder.encode_repeat(force_idr),
             Backend::IntelCpu { encoder } => encoder.encode_repeat(force_idr),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => {
+                encoder.encode_repeat(force_idr)
+            }
             Backend::X264 { encoder } => encoder.encode_repeat(force_idr),
         }
     }
@@ -1414,6 +1429,34 @@ fn build_backend(
         }
     };
 
+    let try_amf = || -> Result<Backend> {
+        match AmfEncoder::new_on_device(config, device, context) {
+            Ok(encoder) => {
+                tprintln!(
+                    "pipeline: live capture ready -- AMD AMF same-adapter GPU path ({}x{}@{})",
+                    config.width,
+                    config.height,
+                    config.fps
+                );
+                Ok(Backend::Amf { encoder })
+            }
+            Err(e) => {
+                teprintln!(
+                    "AMD AMF same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
+                );
+                let encoder = AmfEncoder::new(config)
+                    .context("AMD AMF unavailable (same-adapter and CPU-bridge both failed)")?;
+                tprintln!(
+                    "pipeline: live capture ready -- AMD AMF CPU-bridge path ({}x{}@{})",
+                    config.width,
+                    config.height,
+                    config.fps
+                );
+                Ok(Backend::AmfCpu { encoder })
+            }
+        }
+    };
+
     let try_x264 = || -> Result<Backend> {
         match X264Encoder::new(config) {
             Ok(encoder) => {
@@ -1440,11 +1483,22 @@ fn build_backend(
             teprintln!("Intel Quick Sync unavailable ({ie:?}); falling back to software x264");
             try_x264().map_err(|xe| ie.context(format!("software fallback also failed: {xe:?}")))
         }),
+        EncoderVendor::Amd => try_amf().or_else(|ae| {
+            teprintln!("AMD AMF unavailable ({ae:?}); falling back to software x264");
+            try_x264().map_err(|xe| ae.context(format!("software fallback also failed: {xe:?}")))
+        }),
+        // AMF sits after Intel deliberately: an Intel-iGPU + Radeon-dGPU laptop should still
+        // prefer the same-adapter Quick Sync path, and an all-AMD box never reaches the Intel
+        // branch because its capture device is not Intel.
         EncoderVendor::Auto => try_nvenc()
             .or_else(|nv_err| {
                 teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
                 try_intel()
                     .map_err(|ie| nv_err.context(format!("Intel fallback also failed: {ie:?}")))
+            })
+            .or_else(|hw_err| {
+                teprintln!("Intel Quick Sync unavailable ({hw_err:?}); trying AMD AMF");
+                try_amf().map_err(|ae| hw_err.context(format!("AMD fallback also failed: {ae:?}")))
             })
             .or_else(|hw_err| {
                 teprintln!(

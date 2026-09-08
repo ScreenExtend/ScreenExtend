@@ -354,8 +354,7 @@ impl Encoder {
             ring_next: 0,
             last_slot: None,
             ring_format: PREFERRED_INPUT_FORMAT,
-            surface_format: amf_surface_format(PREFERRED_INPUT_FORMAT)
-                .unwrap_or(AMF_SURFACE_BGRA),
+            surface_format: amf_surface_format(PREFERRED_INPUT_FORMAT).unwrap_or(AMF_SURFACE_BGRA),
             config,
             caps: AmfCaps::unknown(),
             usage: AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY,
@@ -949,7 +948,8 @@ impl Encoder {
         {
             return false;
         }
-        self.get_i64(prop::AMF_VIDEO_ENCODER_PREENCODE_ENABLE).is_some()
+        self.get_i64(prop::AMF_VIDEO_ENCODER_PREENCODE_ENABLE)
+            .is_some()
     }
 
     fn apply_properties(&self, usage: AMF_VIDEO_ENCODER_USAGE) -> Result<()> {
@@ -1038,7 +1038,10 @@ impl Encoder {
         )?;
         self.set_bool(prop::AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, false)?;
         self.set_bool(prop::AMF_VIDEO_ENCODER_ENABLE_VBAQ, false)?;
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE, false);
+        self.set_optional_bool(
+            prop::AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE,
+            false,
+        );
 
         // 20..22. Infinite GOP; keyframes on demand only. Header spacing 0 because in-band
         // parameter sets ride the per-surface InsertSPS/InsertPPS on forced IDRs instead of
@@ -1151,7 +1154,8 @@ impl Encoder {
         let owned = Owned(iface.cast::<AMFBuffer>());
         // SAFETY: vtable slot 2 (AMFInterface::QueryInterface) on the interface the variant
         // carried; on success the buffer view is a second reference we also own.
-        let Ok(buffer) = (unsafe { query_interface::<AMFBuffer, AMFBuffer>(owned.as_ptr(), &IID_AMF_BUFFER) })
+        let Ok(buffer) =
+            (unsafe { query_interface::<AMFBuffer, AMFBuffer>(owned.as_ptr(), &IID_AMF_BUFFER) })
         else {
             return;
         };
@@ -1166,7 +1170,10 @@ impl Encoder {
                 std::slice::from_raw_parts(native as *const u8, size).to_vec()
             }
         };
-        tprintln!("AMF SPS/PPS ready (extradata_bytes={})", self.extradata.len());
+        tprintln!(
+            "AMF SPS/PPS ready (extradata_bytes={})",
+            self.extradata.len()
+        );
     }
 
     fn probe_caps(&self) -> AmfCaps {
@@ -1194,7 +1201,9 @@ impl Encoder {
         let storage = unsafe { as_property_storage(handle) };
         let read_i64 = |name: &[u16]| -> Option<i64> {
             // SAFETY: `storage` is the live caps object viewed through its storage prefix.
-            unsafe { get_property(storage, name) }.ok().and_then(|v| v.as_i64())
+            unsafe { get_property(storage, name) }
+                .ok()
+                .and_then(|v| v.as_i64())
         };
         caps.max_bitrate = read_i64(prop::AMF_VIDEO_ENCODER_CAP_MAX_BITRATE).unwrap_or(0);
         caps.num_of_streams = read_i64(prop::AMF_VIDEO_ENCODER_CAP_NUM_OF_STREAMS).unwrap_or(0);
@@ -1372,7 +1381,9 @@ impl Encoder {
     fn amf_error(&self, what: &str, r: AMF_RESULT) -> anyhow::Error {
         let hint = match classify(r) {
             AmfErrorClass::Transient => " [transient: device busy]",
-            AmfErrorClass::Recoverable => " [recoverable: encoder device lost, rebuild the session]",
+            AmfErrorClass::Recoverable => {
+                " [recoverable: encoder device lost, rebuild the session]"
+            }
             AmfErrorClass::Fatal => "",
         };
         match self.result_text(r) {

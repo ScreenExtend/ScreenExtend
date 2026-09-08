@@ -57,8 +57,11 @@ amf_object!(AMFTrace, AMFTraceVtbl);
 pub struct AMFInterfaceVtbl {
     pub Acquire: unsafe extern "system" fn(*mut AMFInterface) -> amf_long,
     pub Release: unsafe extern "system" fn(*mut AMFInterface) -> amf_long,
-    pub QueryInterface:
-        unsafe extern "system" fn(*mut AMFInterface, *const AMFGuid, *mut *mut c_void) -> AMF_RESULT,
+    pub QueryInterface: unsafe extern "system" fn(
+        *mut AMFInterface,
+        *const AMFGuid,
+        *mut *mut c_void,
+    ) -> AMF_RESULT,
 }
 
 // ===========================================================================================
@@ -145,11 +148,8 @@ pub struct AMFDataVtbl {
     pub QueryInterface:
         unsafe extern "system" fn(*mut AMFData, *const AMFGuid, *mut *mut c_void) -> AMF_RESULT,
     pub SetProperty: *const c_void,
-    pub GetProperty: unsafe extern "system" fn(
-        *mut AMFData,
-        *const u16,
-        *mut AMFVariantStruct,
-    ) -> AMF_RESULT,
+    pub GetProperty:
+        unsafe extern "system" fn(*mut AMFData, *const u16, *mut AMFVariantStruct) -> AMF_RESULT,
     pub HasProperty: *const c_void,
     pub GetPropertyCount: *const c_void,
     pub GetPropertyAt: *const c_void,
@@ -234,11 +234,8 @@ pub struct AMFBufferVtbl {
     pub Release: unsafe extern "system" fn(*mut AMFBuffer) -> amf_long,
     pub QueryInterface: *const c_void,
     pub SetProperty: *const c_void,
-    pub GetProperty: unsafe extern "system" fn(
-        *mut AMFBuffer,
-        *const u16,
-        *mut AMFVariantStruct,
-    ) -> AMF_RESULT,
+    pub GetProperty:
+        unsafe extern "system" fn(*mut AMFBuffer, *const u16, *mut AMFVariantStruct) -> AMF_RESULT,
     pub HasProperty: *const c_void,
     pub GetPropertyCount: *const c_void,
     pub GetPropertyAt: *const c_void,
@@ -449,11 +446,8 @@ pub struct AMFComponentVtbl {
     pub Acquire: unsafe extern "system" fn(*mut AMFComponent) -> amf_long,
     pub Release: unsafe extern "system" fn(*mut AMFComponent) -> amf_long,
     pub QueryInterface: *const c_void,
-    pub SetProperty: unsafe extern "system" fn(
-        *mut AMFComponent,
-        *const u16,
-        AMFVariantStruct,
-    ) -> AMF_RESULT,
+    pub SetProperty:
+        unsafe extern "system" fn(*mut AMFComponent, *const u16, AMFVariantStruct) -> AMF_RESULT,
     pub GetProperty: unsafe extern "system" fn(
         *mut AMFComponent,
         *const u16,
@@ -501,11 +495,8 @@ pub struct AMFCapsVtbl {
     pub Release: unsafe extern "system" fn(*mut AMFCaps) -> amf_long,
     pub QueryInterface: *const c_void,
     pub SetProperty: *const c_void,
-    pub GetProperty: unsafe extern "system" fn(
-        *mut AMFCaps,
-        *const u16,
-        *mut AMFVariantStruct,
-    ) -> AMF_RESULT,
+    pub GetProperty:
+        unsafe extern "system" fn(*mut AMFCaps, *const u16, *mut AMFVariantStruct) -> AMF_RESULT,
     pub HasProperty: *const c_void,
     pub GetPropertyCount: *const c_void,
     pub GetPropertyAt: *const c_void,
@@ -524,10 +515,8 @@ pub struct AMFIOCapsVtbl {
     pub Acquire: *const c_void,
     pub Release: unsafe extern "system" fn(*mut AMFIOCaps) -> amf_long,
     pub QueryInterface: *const c_void,
-    pub GetWidthRange:
-        unsafe extern "system" fn(*mut AMFIOCaps, *mut amf_int32, *mut amf_int32),
-    pub GetHeightRange:
-        unsafe extern "system" fn(*mut AMFIOCaps, *mut amf_int32, *mut amf_int32),
+    pub GetWidthRange: unsafe extern "system" fn(*mut AMFIOCaps, *mut amf_int32, *mut amf_int32),
+    pub GetHeightRange: unsafe extern "system" fn(*mut AMFIOCaps, *mut amf_int32, *mut amf_int32),
     pub GetVertAlign: unsafe extern "system" fn(*mut AMFIOCaps) -> amf_int32,
     pub GetNumOfFormats: unsafe extern "system" fn(*mut AMFIOCaps) -> amf_int32,
     /// The `native` out-flag is how you learn whether the encoder takes a format directly or
