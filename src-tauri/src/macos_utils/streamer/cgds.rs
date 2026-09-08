@@ -1,10 +1,10 @@
 #![allow(deprecated)]
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use block2::RcBlock;
@@ -13,12 +13,7 @@ use objc2_core_foundation::{
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean, CFDictionary,
     CFNumber, CFRetained, CFString,
 };
-use objc2_core_graphics::{
-    kCGDisplayStreamPreserveAspectRatio, kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor,
-    kCGDisplayStreamYCbCrMatrix, kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream,
-    CGDisplayStreamFrameStatus, CGDisplayStreamUpdate, CGDisplayStreamUpdateGetDropCount,
-    CGDisplayStreamUpdateRectType, CGError,
-};
+use objc2_core_graphics::{CGDisplayStream, CGDisplayStreamFrameStatus, CGDisplayStreamUpdate};
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferCreateWithIOSurface};
 use objc2_io_surface::IOSurfaceRef;
 
@@ -32,6 +27,107 @@ use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId, PIXEL_FORMAT
 type FrameHandler = RcBlock<
     dyn Fn(CGDisplayStreamFrameStatus, u64, *mut IOSurfaceRef, *const CGDisplayStreamUpdate),
 >;
+
+// ---------------------------------------------------------------------------
+// CGDisplayStream, resolved at runtime rather than linked against.
+//
+// The whole API is *obsoleted* — not merely deprecated — in the macOS 15 SDK, and this is the
+// fallback tier, reached only where ScreenCaptureKit is absent. A link-time reference to a symbol
+// Apple has announced the end of is a bet that the loader will keep finding it, and on the day it
+// does not, dyld fails the *entire binary* before `main` and every other feature goes with it.
+// That is the rule this codebase already applies to ScreenCaptureKit and to the newer VideoToolbox
+// keys, applied in the other direction: to an API on its way out rather than one not yet in.
+//
+// `nm -u target/release/ScreenExtend | grep -i displaystream` must print nothing.
+// ---------------------------------------------------------------------------
+
+type CreateFn = unsafe extern "C" fn(
+    display: u32,
+    output_width: usize,
+    output_height: usize,
+    pixel_format: i32,
+    properties: *const CFDictionary,
+    queue: *mut c_void,
+    handler: *mut c_void,
+) -> *mut CGDisplayStream;
+type StartFn = unsafe extern "C" fn(*mut CGDisplayStream) -> i32;
+type StopFn = unsafe extern "C" fn(*mut CGDisplayStream) -> i32;
+type DropCountFn = unsafe extern "C" fn(*const CGDisplayStreamUpdate) -> usize;
+type RectsFn = unsafe extern "C" fn(*const CGDisplayStreamUpdate, i32, *mut usize) -> *const c_void;
+
+struct CgDisplayStreamApi {
+    create: CreateFn,
+    start: StartFn,
+    stop: StopFn,
+    drop_count: DropCountFn,
+    rects: RectsFn,
+    key_queue_depth: &'static CFString,
+    key_show_cursor: &'static CFString,
+    key_preserve_aspect_ratio: &'static CFString,
+    key_ycbcr_matrix: &'static CFString,
+    ycbcr_709: &'static CFString,
+}
+
+// Function pointers and immutable framework string constants. `CFString` is not `Sync` because a
+// CFString can be mutable in general; these five are process-lifetime constants inside
+// CoreGraphics that nothing writes to.
+unsafe impl Send for CgDisplayStreamApi {}
+unsafe impl Sync for CgDisplayStreamApi {}
+
+/// `kCGDisplayStreamUpdateDirtyRects`. The rect-type enumeration is stable ABI, and inlining it
+/// keeps the whole API behind a single runtime lookup.
+const UPDATE_DIRTY_RECTS: i32 = 2;
+
+/// `kCGErrorSuccess`.
+const CG_ERROR_SUCCESS: i32 = 0;
+
+fn dlsym_ptr(symbol: &[u8]) -> Option<*mut c_void> {
+    debug_assert_eq!(symbol.last(), Some(&0), "dlsym needs a NUL-terminated name");
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr() as *const c_char) };
+    (!p.is_null()).then_some(p)
+}
+
+/// Resolve a CoreFoundation string constant exported as `const CFStringRef NAME`.
+fn cf_constant(symbol: &[u8]) -> Option<&'static CFString> {
+    let p = dlsym_ptr(symbol)?;
+    unsafe { (*(p as *const *const CFString)).as_ref() }
+}
+
+fn cg_api() -> Option<&'static CgDisplayStreamApi> {
+    static API: OnceLock<Option<CgDisplayStreamApi>> = OnceLock::new();
+    API.get_or_init(|| {
+        let api = CgDisplayStreamApi {
+            create: unsafe {
+                std::mem::transmute::<*mut c_void, CreateFn>(dlsym_ptr(
+                    b"CGDisplayStreamCreateWithDispatchQueue\0",
+                )?)
+            },
+            start: unsafe {
+                std::mem::transmute::<*mut c_void, StartFn>(dlsym_ptr(b"CGDisplayStreamStart\0")?)
+            },
+            stop: unsafe {
+                std::mem::transmute::<*mut c_void, StopFn>(dlsym_ptr(b"CGDisplayStreamStop\0")?)
+            },
+            drop_count: unsafe {
+                std::mem::transmute::<*mut c_void, DropCountFn>(dlsym_ptr(
+                    b"CGDisplayStreamUpdateGetDropCount\0",
+                )?)
+            },
+            rects: unsafe {
+                std::mem::transmute::<*mut c_void, RectsFn>(dlsym_ptr(
+                    b"CGDisplayStreamUpdateGetRects\0",
+                )?)
+            },
+            key_queue_depth: cf_constant(b"kCGDisplayStreamQueueDepth\0")?,
+            key_show_cursor: cf_constant(b"kCGDisplayStreamShowCursor\0")?,
+            key_preserve_aspect_ratio: cf_constant(b"kCGDisplayStreamPreserveAspectRatio\0")?,
+            key_ycbcr_matrix: cf_constant(b"kCGDisplayStreamYCbCrMatrix\0")?,
+            ycbcr_709: cf_constant(b"kCGDisplayStreamYCbCrMatrix_ITU_R_709_2\0")?,
+        };
+        Some(api)
+    })
+    .as_ref()
+}
 
 pub struct CgDisplayStreamBackend {
     display_id: DisplayId,
@@ -90,7 +186,7 @@ impl CgDisplayStreamBackend {
 /// an encoder joins the holding pattern.
 const QUEUE_DEPTH: isize = 5;
 
-fn make_cg_properties() -> CFRetained<CFDictionary> {
+fn make_cg_properties(api: &CgDisplayStreamApi) -> Option<CFRetained<CFDictionary>> {
     let queue_depth = CFNumber::new_isize(QUEUE_DEPTH);
     let show_cursor = CFBoolean::new(true);
     let preserve_ar = CFBoolean::new(false);
@@ -101,16 +197,16 @@ fn make_cg_properties() -> CFRetained<CFDictionary> {
     // mid-interval by up to a frame period (mean ~8 ms at 60 fps). OBS does not set it either.
     unsafe {
         let keys: [*const c_void; 4] = [
-            (kCGDisplayStreamQueueDepth as *const CFString).cast(),
-            (kCGDisplayStreamShowCursor as *const CFString).cast(),
-            (kCGDisplayStreamPreserveAspectRatio as *const CFString).cast(),
-            (kCGDisplayStreamYCbCrMatrix as *const CFString).cast(),
+            (api.key_queue_depth as *const CFString).cast(),
+            (api.key_show_cursor as *const CFString).cast(),
+            (api.key_preserve_aspect_ratio as *const CFString).cast(),
+            (api.key_ycbcr_matrix as *const CFString).cast(),
         ];
         let values: [*const c_void; 4] = [
             (&*queue_depth as *const CFNumber).cast(),
             (show_cursor as *const CFBoolean).cast(),
             (preserve_ar as *const CFBoolean).cast(),
-            (kCGDisplayStreamYCbCrMatrix_ITU_R_709_2 as *const CFString).cast(),
+            (api.ycbcr_709 as *const CFString).cast(),
         ];
         CFDictionary::new(
             None,
@@ -120,11 +216,11 @@ fn make_cg_properties() -> CFRetained<CFDictionary> {
             &kCFTypeDictionaryKeyCallBacks,
             &kCFTypeDictionaryValueCallBacks,
         )
-        .expect("CFDictionaryCreate for CGDisplayStream properties")
     }
 }
 
 struct HandlerCtx {
+    api: &'static CgDisplayStreamApi,
     sink: Arc<FrameSink>,
     frames: Arc<AtomicU64>,
     drops: Arc<AtomicU64>,
@@ -146,7 +242,7 @@ fn handle_frame(
     if let Some(update_ref) = unsafe { update.as_ref() } {
         // WindowServer counts what it had to throw away because our surfaces were still busy.
         // Three relaxed atomics on the delivery queue; no allocation, no logging.
-        let dropped = unsafe { CGDisplayStreamUpdateGetDropCount(Some(update_ref)) } as u64;
+        let dropped = unsafe { (ctx.api.drop_count)(update_ref) } as u64;
         if dropped != 0 {
             ctx.drops.fetch_add(dropped, Ordering::Relaxed);
             ctx.telemetry
@@ -168,13 +264,7 @@ fn handle_frame(
     if ctx.published_one.load(Ordering::Relaxed) {
         if let Some(update_ref) = unsafe { update.as_ref() } {
             let mut rect_count: usize = 0;
-            unsafe {
-                CGDisplayStreamUpdate::rects(
-                    Some(update_ref),
-                    CGDisplayStreamUpdateRectType::DirtyRects,
-                    NonNull::from(&mut rect_count),
-                )
-            };
+            unsafe { (ctx.api.rects)(update_ref, UPDATE_DIRTY_RECTS, &mut rect_count) };
             if rect_count == 0 {
                 return;
             }
@@ -225,7 +315,14 @@ impl CaptureBackend for CgDisplayStreamBackend {
     }
 
     fn start(&mut self) -> Result<(), CaptureError> {
-        let props = make_cg_properties();
+        let Some(api) = cg_api() else {
+            teprintln!(
+                "[cgds] CGDisplayStream is not present on this system; there is no capture \
+                 backend below ScreenCaptureKit"
+            );
+            return Err(CaptureError::StreamCreateFailed);
+        };
+        let props = make_cg_properties(api).ok_or(CaptureError::StreamCreateFailed)?;
 
         let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
             DispatchQoS::UserInteractive,
@@ -233,6 +330,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
         let queue = DispatchQueue::new_with_target("com.screenextend.cgds", None, Some(&ui_target));
 
         let ctx = HandlerCtx {
+            api,
             sink: self.sink.clone(),
             frames: self.frames.clone(),
             drops: self.drops.clone(),
@@ -251,21 +349,23 @@ impl CaptureBackend for CgDisplayStreamBackend {
         );
 
         let stream = unsafe {
-            CGDisplayStream::with_dispatch_queue(
+            (api.create)(
                 self.display_id,
                 self.cfg.width,
                 self.cfg.height,
                 self.cfg.pixel_format as i32,
-                Some(&props),
-                &queue,
-                RcBlock::as_ptr(&handler),
+                &*props,
+                (&*queue as *const DispatchQueue).cast_mut().cast(),
+                RcBlock::as_ptr(&handler).cast(),
             )
-        }
-        .ok_or(CaptureError::StreamCreateFailed)?;
+        };
+        let stream = NonNull::new(stream).ok_or(CaptureError::StreamCreateFailed)?;
+        // The create call is a `Create`, so the stream arrives +1 and this takes that ownership.
+        let stream: CFRetained<CGDisplayStream> = unsafe { CFRetained::from_raw(stream) };
 
-        let err = unsafe { CGDisplayStream::start(Some(&stream)) };
-        if err != CGError::Success {
-            teprintln!("[cgds] CGDisplayStreamStart failed: CGError {}", err.0);
+        let err = unsafe { (api.start)((&*stream as *const CGDisplayStream).cast_mut()) };
+        if err != CG_ERROR_SUCCESS {
+            teprintln!("[cgds] CGDisplayStreamStart failed: CGError {err}");
             return Err(CaptureError::StartFailed);
         }
 
@@ -283,8 +383,8 @@ impl CaptureBackend for CgDisplayStreamBackend {
     }
 
     fn stop(&mut self) {
-        if let Some(stream) = &self.stream {
-            let _ = unsafe { CGDisplayStream::stop(Some(stream)) };
+        if let (Some(api), Some(stream)) = (cg_api(), &self.stream) {
+            let _ = unsafe { (api.stop)((&**stream as *const CGDisplayStream).cast_mut()) };
             tprintln!(
                 "[cgds] capture stopped: {} frames published, {} dropped by WindowServer",
                 self.frames_captured(),
@@ -305,7 +405,12 @@ pub fn probe_screen_recording() -> bool {
         return false;
     };
 
-    let props = make_cg_properties();
+    let Some(api) = cg_api() else {
+        return false;
+    };
+    let Some(props) = make_cg_properties(api) else {
+        return false;
+    };
     let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
         DispatchQoS::UserInteractive,
     ));
@@ -325,24 +430,26 @@ pub fn probe_screen_recording() -> bool {
     );
 
     let stream = unsafe {
-        CGDisplayStream::with_dispatch_queue(
+        (api.create)(
             display_id,
             64,
             64,
             PIXEL_FORMAT_BGRA as i32,
-            Some(&props),
-            &queue,
-            RcBlock::as_ptr(&handler),
+            &*props,
+            (&*queue as *const DispatchQueue).cast_mut().cast(),
+            RcBlock::as_ptr(&handler).cast(),
         )
     };
-    let Some(stream) = stream else {
+    let Some(stream) = NonNull::new(stream) else {
         return false;
     };
-    if unsafe { CGDisplayStream::start(Some(&stream)) } != CGError::Success {
+    let stream: CFRetained<CGDisplayStream> = unsafe { CFRetained::from_raw(stream) };
+    let raw = (&*stream as *const CGDisplayStream).cast_mut();
+    if unsafe { (api.start)(raw) } != CG_ERROR_SUCCESS {
         return false;
     }
     let got_frame = rx.recv_timeout(Duration::from_millis(700)).is_ok();
-    let _ = unsafe { CGDisplayStream::stop(Some(&stream)) };
+    let _ = unsafe { (api.stop)(raw) };
     got_frame
 }
 
