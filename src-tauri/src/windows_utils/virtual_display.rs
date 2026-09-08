@@ -53,13 +53,24 @@ pub fn probe_display_backend() -> DisplayBackend {
     if !std::path::Path::new(&pipe_path()).exists() {
         return DisplayBackend::DriverNotInstalled;
     }
-    match DriverClient::new() {
-        Ok(_) => {
+    // `DriverClient::new` blocks on driver_ipc's own tokio runtime, which panics if the calling
+    // thread belongs to a runtime. Tauri commands can, so give it a plain thread of its own.
+    let connected = std::thread::spawn(|| match DriverClient::new() {
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    })
+    .join();
+    match connected {
+        Ok(None) => {
             let _ = CONNECTED.set(());
             DisplayBackend::IddDriver
         }
-        Err(e) => {
+        Ok(Some(e)) => {
             teprintln!("[virtual-display] driver pipe exists but did not answer: {e}");
+            DisplayBackend::DriverNotResponding
+        }
+        Err(_) => {
+            teprintln!("[virtual-display] the driver probe panicked");
             DisplayBackend::DriverNotResponding
         }
     }
