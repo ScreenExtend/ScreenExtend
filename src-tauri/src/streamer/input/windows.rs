@@ -233,7 +233,8 @@ impl Injector {
                 id,
                 buttons,
                 samples,
-            } => self.pointer_batch(*source, *id, *buttons, samples),
+                predicted,
+            } => self.pointer_batch(*source, *id, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
             InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
@@ -400,21 +401,62 @@ impl Injector {
         self.scratch.clear();
     }
 
-    fn pointer_batch(&mut self, source: u8, id: u32, buttons: u16, samples: &[MoveSample]) {
-        for s in samples {
-            match source {
-                SRC_PEN => self.pen(
-                    s.x,
-                    s.y,
-                    s.pressure,
-                    s.tilt_x,
-                    s.tilt_y,
-                    s.twist,
-                    buttons,
-                    Phase::Move,
-                ),
-                SRC_TOUCH => self.touch(id, s.x, s.y, s.pressure, 0.0, 0.0, Phase::Move),
-                _ => self.mouse_pointer(s.x, s.y, buttons, Phase::Move),
+    fn pointer_batch(
+        &mut self,
+        source: u8,
+        id: u32,
+        buttons: u16,
+        samples: &[MoveSample],
+        predicted: u8,
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        match source {
+            // Pen and touch go one call per sample because the API says so:
+            // `InjectSyntheticPointerInput` takes a frame of *simultaneous contacts*, capped at
+            // the device's `maxCount` (1 for pen, 10 for touch) — it is not a sequence of
+            // samples over time. Predicted samples are dropped here: a stroke is a shape, and a
+            // guess that the next real sample corrects still leaves a kink in the ink.
+            SRC_PEN | SRC_TOUCH => {
+                let real = samples.len() - predicted as usize;
+                for s in &samples[..real] {
+                    if source == SRC_PEN {
+                        self.pen(
+                            s.x,
+                            s.y,
+                            s.pressure,
+                            s.tilt_x,
+                            s.tilt_y,
+                            s.twist,
+                            buttons,
+                            Phase::Move,
+                        );
+                    } else {
+                        self.touch(id, s.x, s.y, s.pressure, 0.0, 0.0, Phase::Move);
+                    }
+                }
+            }
+            // The cursor is one `SendInput` array for the whole batch: same path, one kernel
+            // transition instead of one per sample. Predictions are kept, because the cursor is
+            // last-value-wins and the next real sample lands a frame later.
+            _ => {
+                self.mouse_relative = false;
+                self.scratch.clear();
+                for s in &samples[..samples.len() - 1] {
+                    let (ax, ay) = self.abs(s.x, s.y);
+                    self.scratch.push(mouse_input(
+                        ax,
+                        ay,
+                        0,
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    ));
+                }
+                let last = samples[samples.len() - 1];
+                self.push_mouse_pointer(last.x, last.y, buttons, Phase::Move);
+                send_inputs(&self.scratch);
+                self.scratch.clear();
+                self.buttons = buttons;
             }
         }
     }
@@ -1001,4 +1043,57 @@ unsafe fn put_clipboard(format: u32, bytes: &[u8]) -> bool {
 
 fn bytemuck_u16(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn batch(n: usize) -> Vec<MoveSample> {
+        (0..n)
+            .map(|i| MoveSample {
+                x: 0.40 + i as f32 * 0.0005,
+                y: 0.40 + i as f32 * 0.0005,
+                pressure: 0.0,
+                tilt_x: 0.0,
+                tilt_y: 0.0,
+                twist: 0.0,
+            })
+            .collect()
+    }
+
+    /// Injects for real, so it moves the host cursor: run it deliberately, not in a suite.
+    /// `cargo test -- --ignored --nocapture pointer_batch_costs`
+    #[test]
+    #[ignore]
+    fn pointer_batch_costs_one_sendinput_not_one_per_sample() {
+        const SAMPLES: usize = 40;
+        const REPS: usize = 500;
+        let samples = batch(SAMPLES);
+        let mut inj = Injector::new(None);
+
+        // The shape this replaces: one mouse_pointer -> one SendInput per sample.
+        let t = Instant::now();
+        for _ in 0..REPS {
+            for s in &samples {
+                inj.mouse_pointer(s.x, s.y, 0, Phase::Move);
+            }
+        }
+        let per_sample = t.elapsed();
+
+        let t = Instant::now();
+        for _ in 0..REPS {
+            inj.pointer_batch(SRC_MOUSE, 0, 0, &samples, 0);
+        }
+        let batched = t.elapsed();
+
+        println!(
+            "pointer batch of {SAMPLES}: per-sample {:.1} us/batch ({} SendInput),              batched {:.1} us/batch (1 SendInput)",
+            per_sample.as_secs_f64() * 1e6 / REPS as f64,
+            SAMPLES,
+            batched.as_secs_f64() * 1e6 / REPS as f64,
+        );
+        assert!(batched < per_sample);
+    }
 }

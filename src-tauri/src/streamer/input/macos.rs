@@ -358,8 +358,9 @@ impl Injector {
                 source,
                 buttons,
                 samples,
+                predicted,
                 ..
-            } => self.pointer_batch(*source, *buttons, samples),
+            } => self.pointer_batch(*source, *buttons, samples, *predicted),
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
             InputEvent::MouseDelta { dx, dy, buttons } => self.mouse_delta(*dx, *dy, *buttons),
@@ -659,12 +660,41 @@ impl Injector {
         self.mouse_pointer(x, y, if contacting { btn::PRIMARY } else { 0 }, phase);
     }
 
-    fn pointer_batch(&mut self, source: u8, buttons: u16, samples: &[MoveSample]) {
-        for s in samples {
-            match source {
-                SRC_PEN => self.pen(s.x, s.y, s.pressure, buttons, Phase::Move),
-                SRC_TOUCH => self.touch(s.x, s.y, Phase::Move),
-                _ => self.mouse_pointer(s.x, s.y, buttons, Phase::Move),
+    fn pointer_batch(&mut self, source: u8, buttons: u16, samples: &[MoveSample], predicted: u8) {
+        let Some((last, _)) = samples.split_last() else {
+            return;
+        };
+        match source {
+            // A stroke is a shape, so every real sample is posted. Predicted ones are not: a
+            // guess the next real sample corrects still leaves a kink in the ink. There is no
+            // batch form of `CGEventPost`, so this is genuinely one Mach round trip per sample.
+            SRC_PEN | SRC_TOUCH => {
+                let real = samples.len() - predicted as usize;
+                for s in &samples[..real] {
+                    if source == SRC_PEN {
+                        self.pen(s.x, s.y, s.pressure, buttons, Phase::Move);
+                    } else {
+                        self.touch(s.x, s.y, Phase::Move);
+                    }
+                }
+            }
+            // The cursor is last-value-wins: only the final position is observable, and every
+            // earlier one costs a Mach IPC round trip to WindowServer for a location overwritten
+            // microseconds later. Post the last sample and carry the whole run's delta on it, so
+            // anything reading `kCGMouseEventDeltaX/Y` still sees the full movement.
+            _ => {
+                self.mouse_relative = false;
+                let prev = self.pos;
+                let pos = self.point(last.x, last.y);
+                self.pos = pos;
+                self.motion(
+                    pos,
+                    self.buttons,
+                    (pos.x - prev.x).round() as i64,
+                    (pos.y - prev.y).round() as i64,
+                );
+                self.button_transitions(self.buttons, buttons, pos);
+                self.buttons = buttons;
             }
         }
     }

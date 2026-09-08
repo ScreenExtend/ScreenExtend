@@ -63,6 +63,12 @@ pub mod btn {
     pub const ERASER: u16 = 1 << 5; // pen eraser
 }
 
+/// Bytes of optional tail a `POINTER_MOVE_BATCH` may carry past its samples: a `u64` client
+/// stamp, a flags byte, and how many trailing samples were predicted rather than measured.
+/// The tail is optional and the declared length is a floor; see `docs/INPUT-PROTOCOL.md`.
+pub const STAMP_LEN: usize = 8;
+pub const BATCH_TAIL_LEN: usize = STAMP_LEN + 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Down,
@@ -138,6 +144,10 @@ pub enum InputEvent {
         id: u32,
         buttons: u16,
         samples: Vec<MoveSample>,
+        /// How many of the trailing samples came from `getPredictedEvents()` rather than the
+        /// real input stream. They are speculative, so a stroke backend drops them; a cursor
+        /// backend may use them, since the next real sample corrects the guess a frame later.
+        predicted: u8,
     },
     Wheel {
         source: u8,
@@ -328,11 +338,19 @@ fn parse_pointer_batch(b: &[u8]) -> Option<InputEvent> {
         });
         o += SAMPLE_SIZE;
     }
+    let predicted = if b.len() >= need + BATCH_TAIL_LEN {
+        // A client that claims more predictions than it sent samples is malformed; clamping
+        // rather than rejecting keeps the real samples, which are still good.
+        b[need + STAMP_LEN + 1].min(count as u8)
+    } else {
+        0
+    };
     Some(InputEvent::PointerBatch {
         source,
         id,
         buttons,
         samples,
+        predicted,
     })
 }
 
@@ -597,7 +615,9 @@ mod tests {
                 id,
                 buttons,
                 samples,
+                predicted,
             } => {
+                assert_eq!(predicted, 0);
                 assert_eq!(source, SRC_PEN);
                 assert_eq!(id, 3);
                 assert_eq!(buttons, btn::PRIMARY);
@@ -760,6 +780,51 @@ mod tests {
                 !positions_cursor(false, phase),
                 "{phase:?} carries no position"
             );
+        }
+    }
+
+    fn batch_frame(count: u16, tail: Option<(u64, u8, u8)>) -> Vec<u8> {
+        let mut b = vec![op::POINTER_MOVE_BATCH, SRC_PEN];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        for i in 0..count {
+            b.extend_from_slice(&(i as f32 / 100.0).to_le_bytes());
+            for _ in 0..5 {
+                b.extend_from_slice(&0f32.to_le_bytes());
+            }
+        }
+        if let Some((stamp, flags, predicted)) = tail {
+            b.extend_from_slice(&stamp.to_le_bytes());
+            b.push(flags);
+            b.push(predicted);
+        }
+        b
+    }
+
+    #[test]
+    fn a_batch_tail_carries_the_predicted_count() {
+        match parse(&batch_frame(4, Some((42, 0, 2)))).unwrap().0 {
+            InputEvent::PointerBatch {
+                samples, predicted, ..
+            } => {
+                assert_eq!(samples.len(), 4);
+                assert_eq!(predicted, 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_predicted_count_larger_than_the_batch_is_clamped_not_trusted() {
+        match parse(&batch_frame(2, Some((0, 0, 200)))).unwrap().0 {
+            InputEvent::PointerBatch {
+                samples, predicted, ..
+            } => {
+                assert_eq!(samples.len(), 2);
+                assert_eq!(predicted, 2);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 
