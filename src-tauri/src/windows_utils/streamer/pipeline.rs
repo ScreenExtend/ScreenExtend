@@ -28,6 +28,7 @@ use super::scaler::{Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
+use crate::streamer::platform::BitrateApplied;
 use crate::windows_capture::monitor::Monitor;
 
 #[derive(Clone)]
@@ -65,14 +66,34 @@ impl Pipeline {
     }
 }
 
-fn apply_pending_bitrate(backend: &mut Backend, target_bitrate: &AtomicU32, current: &mut u32) {
+/// Logged once per encode thread: repeating it would put a line on the logbus for every
+/// congestion-control target, and every logbus line is an IPC event to the UI.
+fn warn_constant_qp_once(warned: &mut bool) {
+    if !*warned {
+        *warned = true;
+        teprintln!(
+            "bitrate adaptation is inert: the encoder is in explicit constant-QP mode (--qp),              so congestion control cannot shrink the stream"
+        );
+    }
+}
+
+fn apply_pending_bitrate(
+    backend: &mut Backend,
+    target_bitrate: &AtomicU32,
+    current: &mut u32,
+    warned: &mut bool,
+) {
     let pending = target_bitrate.swap(0, Ordering::Relaxed);
     if pending == 0 || pending == *current {
         return;
     }
     match backend.set_bitrate(pending) {
-        Ok(()) => {
+        Ok(BitrateApplied::Applied) => {
             tprintln!("adapting bitrate: {} -> {pending} bps", *current);
+            *current = pending;
+        }
+        Ok(BitrateApplied::IgnoredConstantQp) => {
+            warn_constant_qp_once(warned);
             *current = pending;
         }
         Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
@@ -116,6 +137,7 @@ pub(crate) fn live_encoder_config(
         max_bitrate_bps: bitrate,
         profile: cfg.h264_profile,
         qp: cfg.qp,
+        min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
     }
 }
@@ -162,6 +184,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             max_bitrate_bps: SP_BITRATE_BPS,
             profile: cfg.h264_profile,
             qp: cfg.qp,
+            min_qp: cfg.quality_qp,
             intra_refresh: cfg.intra_refresh,
         };
         std::thread::Builder::new()
@@ -512,6 +535,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             target_bitrate,
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
+            bitrate_warned: false,
             have_frame: false,
             frame_index: 0,
         }));
@@ -793,7 +817,7 @@ impl Backend {
         }
     }
 
-    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         match self {
             Backend::Nvenc { encoder, .. } => encoder.set_bitrate(bps),
             Backend::Intel { encoder } => encoder.set_bitrate(bps),
@@ -891,6 +915,7 @@ struct EncodeCore {
     target_bitrate: Arc<AtomicU32>,
     idr_request: Arc<AtomicBool>,
     current_bitrate: u32,
+    bitrate_warned: bool,
     have_frame: bool,
     frame_index: u64,
 }
@@ -906,6 +931,7 @@ impl EncodeCore {
             &mut self.backend,
             &self.target_bitrate,
             &mut self.current_bitrate,
+            &mut self.bitrate_warned,
         );
         let Self {
             backend, scaler, ..
@@ -936,6 +962,7 @@ impl EncodeCore {
             &mut self.backend,
             &self.target_bitrate,
             &mut self.current_bitrate,
+            &mut self.bitrate_warned,
         );
         let Self {
             backend,
@@ -973,6 +1000,7 @@ impl EncodeCore {
             &mut self.backend,
             &self.target_bitrate,
             &mut self.current_bitrate,
+            &mut self.bitrate_warned,
         );
         let au = self.backend.encode_repeat(force_idr)?;
         self.frame_index += 1;
@@ -1227,6 +1255,7 @@ fn ring_encode_thread(
 ) {
     let _thread_tuning = tuning::tune_current_thread();
     let mut current_bitrate = initial_bitrate;
+    let mut bitrate_warned = false;
     let _ = last_frame_at;
     let keepalive = Duration::from_millis(200);
     let mut held_slot: Option<usize> = None;
@@ -1260,7 +1289,12 @@ fn ring_encode_thread(
                     continue;
                 }
 
-                apply_pending_bitrate_atomic(&mut encoder, &target_bitrate, &mut current_bitrate);
+                apply_pending_bitrate_atomic(
+                    &mut encoder,
+                    &target_bitrate,
+                    &mut current_bitrate,
+                    &mut bitrate_warned,
+                );
                 match encoder.encode_input_slot(msg.slot, msg.force_idr) {
                     Ok(au) => {
                         let _ = tx.send(EncodedFrame {
@@ -1305,6 +1339,7 @@ fn ring_encode_thread(
                         &mut encoder,
                         &target_bitrate,
                         &mut current_bitrate,
+                        &mut bitrate_warned,
                     );
                     match encoder.encode_repeat_slot(slot) {
                         Ok(au) => {
@@ -1329,14 +1364,19 @@ fn apply_pending_bitrate_atomic(
     encoder: &mut Encoder,
     target_bitrate: &AtomicU32,
     current: &mut u32,
+    warned: &mut bool,
 ) {
     let pending = target_bitrate.swap(0, Ordering::Relaxed);
     if pending == 0 || pending == *current {
         return;
     }
     match encoder.set_bitrate(pending) {
-        Ok(()) => {
+        Ok(BitrateApplied::Applied) => {
             tprintln!("adapting bitrate: {} -> {pending} bps", *current);
+            *current = pending;
+        }
+        Ok(BitrateApplied::IgnoredConstantQp) => {
+            warn_constant_qp_once(warned);
             *current = pending;
         }
         Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
@@ -1657,6 +1697,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             target_bitrate: Arc::clone(&target_bitrate),
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
+            bitrate_warned: false,
             have_frame: false,
             frame_index: 0,
         }));
@@ -1786,6 +1827,7 @@ fn synthetic_pattern_loop(
     };
     tuning::raise_d3d11_gpu_priority(encoder.device());
     let mut current_bitrate = config.bitrate_bps;
+    let mut bitrate_warned = false;
 
     let frame_interval = Duration::from_nanos(1_000_000_000 / SP_FPS as u64);
     let mut frame_buf = vec![0u8; (SP_WIDTH * SP_HEIGHT * 4) as usize];
@@ -1798,8 +1840,12 @@ fn synthetic_pattern_loop(
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 && pending != current_bitrate {
             match encoder.set_bitrate(pending) {
-                Ok(()) => {
+                Ok(BitrateApplied::Applied) => {
                     tprintln!("adapting bitrate: {current_bitrate} -> {pending} bps");
+                    current_bitrate = pending;
+                }
+                Ok(BitrateApplied::IgnoredConstantQp) => {
+                    warn_constant_qp_once(&mut bitrate_warned);
                     current_bitrate = pending;
                 }
                 Err(e) => {

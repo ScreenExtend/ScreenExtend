@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Dxgi::{
 
 use super::nvenc_sys::*;
 use crate::streamer::config::{Config, H264Profile};
+use crate::streamer::platform::BitrateApplied;
 
 pub const KEY_WRITER: u64 = 0;
 pub const KEY_ENCODER: u64 = 1;
@@ -53,7 +54,10 @@ pub struct EncoderConfig {
     pub bitrate_bps: u32,
     pub max_bitrate_bps: u32,
     pub profile: H264Profile,
+    /// Explicit constant-QP rate control. Disables bitrate adaptation entirely.
     pub qp: Option<u8>,
+    /// Quality ceiling under CBR: the encoder may not spend bits to go below this QP.
+    pub min_qp: Option<u8>,
     pub intra_refresh: bool,
 }
 
@@ -457,9 +461,9 @@ impl Encoder {
         Ok(out)
     }
 
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.config.qp.is_some() {
-            return Ok(());
+            return Ok(BitrateApplied::IgnoredConstantQp);
         }
         self.config.bitrate_bps = bps;
         self.config.max_bitrate_bps = bps;
@@ -487,7 +491,7 @@ impl Encoder {
         self.init_params = reconfig.reInitEncodeParams;
         self.init_params.encodeConfig = &mut self.encode_config;
         tprintln!("NVENC bitrate reconfigured (bitrate_bps={bps})");
-        Ok(())
+        Ok(BitrateApplied::Applied)
     }
 
     pub fn request_idr(&mut self) {
@@ -581,6 +585,18 @@ impl Encoder {
             config.rcParams.maxBitRate = self.config.max_bitrate_bps;
             config.rcParams.vbvBufferSize = self.config.bitrate_bps / fps;
             config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+            // The quality slider is a floor on QP, i.e. a ceiling on quality: it stops the
+            // encoder spending the whole CBR budget on an easy picture. It can only make the
+            // stream smaller, so it never fights congestion control the way CONSTQP did.
+            if let Some(q) = self.config.min_qp.filter(|&q| q > 1) {
+                let q = q as u32;
+                config.rcParams.set_enableMinQP(1);
+                config.rcParams.minQP = NV_ENC_QP {
+                    qpInterP: q,
+                    qpInterB: q,
+                    qpIntra: q,
+                };
+            }
         }
         config.rcParams.set_enableLookahead(0);
         config.rcParams.lookaheadDepth = 0;
@@ -997,6 +1013,7 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         max_bitrate_bps: BITRATE,
         profile: config.h264_profile,
         qp: config.qp,
+        min_qp: config.quality_qp,
         intra_refresh: config.intra_refresh,
     })?;
 

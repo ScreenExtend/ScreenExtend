@@ -10,6 +10,7 @@ use objc2_core_video::CVPixelBuffer;
 use tokio::sync::broadcast;
 
 use crate::streamer::config::{Config, H264Profile};
+use crate::streamer::platform::BitrateApplied;
 
 use super::config::{live_encoder_config, EncoderConfig};
 use super::display;
@@ -169,6 +170,7 @@ fn run_encode_loop(
     let idle = Duration::from_millis(4);
     let keepalive = Duration::from_millis(200);
     let mut last_frame: Option<Arc<super::frame::Frame>> = None;
+    let mut bitrate_warned = false;
     let mut last_emit = Instant::now();
 
     loop {
@@ -180,8 +182,17 @@ fn run_encode_loop(
         let force_idr = idr_request.swap(false, Ordering::Relaxed);
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 {
-            if let Err(e) = encoder.set_bitrate(pending) {
-                teprintln!("set_bitrate failed (target_bps={pending}): {e:?}");
+            match encoder.set_bitrate(pending) {
+                Ok(BitrateApplied::Applied) => {}
+                Ok(BitrateApplied::IgnoredConstantQp) => {
+                    if !bitrate_warned {
+                        bitrate_warned = true;
+                        teprintln!(
+                            "bitrate adaptation is inert: the encoder is in explicit constant-QP                              mode (--qp), so congestion control cannot shrink the stream"
+                        );
+                    }
+                }
+                Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}"),
             }
         }
 
@@ -306,6 +317,7 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
         max_bitrate_bps: high,
         profile: cfg.h264_profile,
         qp: cfg.qp,
+        min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
     };
     let mut encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
@@ -586,6 +598,7 @@ mod tests {
             max_bitrate_bps: 12_000_000,
             profile: H264Profile::Baseline,
             qp: None,
+            min_qp: None,
             intra_refresh: false,
         };
         let mut encoder = Encoder::new(enc_cfg).expect("encoder");
@@ -697,6 +710,7 @@ mod tests {
             max_bitrate_bps: 12_000_000,
             profile: H264Profile::Baseline,
             qp: None,
+            min_qp: None,
             intra_refresh: false,
         };
         let (pipeline, stop, _encode_thread) = spawn_pipeline(enc, source).expect("pipeline");

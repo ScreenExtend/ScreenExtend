@@ -824,7 +824,7 @@ async fn start_session(
     };
     if let Some(o) = override_for_ip {
         cfg.scale = ScalePercent::new(o.video_scale);
-        cfg.qp = Some(o.video_quality);
+        cfg.quality_qp = Some(o.video_quality);
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
     }
 
