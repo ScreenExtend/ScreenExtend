@@ -263,11 +263,8 @@ fn avatar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("avatar.png"))
 }
 
-#[tauri::command]
-#[specta::specta]
-fn set_avatar(app: tauri::AppHandle, bytes: Vec<u8>) -> bool {
-    match avatar_path(&app)
-        .and_then(|path| std::fs::write(&path, &bytes).map_err(|e| e.to_string()))
+fn write_avatar(app: &tauri::AppHandle, bytes: &[u8]) -> bool {
+    match avatar_path(app).and_then(|path| std::fs::write(&path, bytes).map_err(|e| e.to_string()))
     {
         Ok(()) => true,
         Err(e) => {
@@ -277,10 +274,8 @@ fn set_avatar(app: tauri::AppHandle, bytes: Vec<u8>) -> bool {
     }
 }
 
-#[tauri::command]
-#[specta::specta]
-fn get_avatar(app: tauri::AppHandle) -> Option<Vec<u8>> {
-    let path = avatar_path(&app).ok()?;
+fn read_avatar(app: &tauri::AppHandle) -> Option<Vec<u8>> {
+    let path = avatar_path(app).ok()?;
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -289,6 +284,32 @@ fn get_avatar(app: tauri::AppHandle) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+// Base64 rather than `Vec<u8>`, which tauri-specta maps to `number[]`: a 256x256 PNG then
+// crossed the bridge as a JSON array of decimal integers -- three to four bytes of JSON
+// per image byte -- to be parsed into an array of tens of thousands of boxed numbers, walked
+// into a `Uint8Array`, wrapped in a `Blob` and run through a `FileReader` to become the
+// base64 data URL the `<img>` wanted in the first place. This is the same payload the
+// webview needs, one third the size of the array encoding, with no conversion at all.
+#[tauri::command]
+#[specta::specta]
+fn set_avatar(app: tauri::AppHandle, bytes: String) -> bool {
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes()) {
+        Ok(decoded) => write_avatar(&app, &decoded),
+        Err(e) => {
+            log::error!("failed to decode the avatar payload: {e}");
+            false
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+fn get_avatar(app: tauri::AppHandle) -> Option<String> {
+    use base64::Engine as _;
+    read_avatar(&app).map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 #[tauri::command]

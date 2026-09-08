@@ -55,10 +55,10 @@ async setWindowZoom(factor: number) : Promise<Result<null, string>> {
 async getUsername() : Promise<string> {
     return await TAURI_INVOKE("get_username");
 },
-async setAvatar(bytes: number[]) : Promise<boolean> {
+async setAvatar(bytes: string) : Promise<boolean> {
     return await TAURI_INVOKE("set_avatar", { bytes });
 },
-async getAvatar() : Promise<number[] | null> {
+async getAvatar() : Promise<string | null> {
     return await TAURI_INVOKE("get_avatar");
 },
 async removeAvatar() : Promise<boolean> {

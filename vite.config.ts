@@ -1,7 +1,7 @@
 import { build, defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import path, { resolve } from "path";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -9,7 +9,17 @@ function monacoDeps(): string[] {
   const found = new Set<string>(["@monaco-editor/react"]);
   const pattern = /["'](monaco-editor\/esm\/[^"']+)["']/g;
   for (const file of ["src/lib/monaco-setup.ts", "src/components/json-editor.tsx"]) {
-    const text = readFileSync(resolve(__dirname, file), "utf8");
+    const full = resolve(__dirname, file);
+    // Without this, renaming either file kills every vite command -- dev, build, tauri
+    // dev, tauri build -- with a bare ENOENT thrown from inside the config, before any
+    // project code is reached. The path is in the message but the reason is not.
+    if (!existsSync(full)) {
+      throw new Error(
+        `vite.config: monacoDeps() lists ${file}, which does not exist. ` +
+          "Update the list if the file was renamed or moved."
+      );
+    }
+    const text = readFileSync(full, "utf8");
     let hit: RegExpExecArray | null;
     while ((hit = pattern.exec(text))) found.add(hit[1]);
   }
@@ -22,6 +32,10 @@ const WORKER_ENTRIES: Record<string, string> = {
   "monaco-json.worker": "src/lib/monaco-json.worker.ts",
 };
 
+// Vite's dev server serves `?worker` as a module worker and safari 13.1 cannot construct
+// one, so the two monaco language services are bundled here as classic IIFE scripts and
+// served from `/@classic-worker/`. Production does not go through this at all -- there the
+// same guarantee comes from `worker.format: "iife"` below.
 function classicWorkers(): Plugin {
   const bundled = new Map<string, string>();
   return {
@@ -77,12 +91,53 @@ function classicWorkers(): Plugin {
         })();
       });
     },
+    // The bundle is memoised for the life of the dev server, so without this an edit to a
+    // worker entry keeps serving the stale build until the server is restarted.
+    handleHotUpdate({ file }) {
+      for (const [name, entry] of Object.entries(WORKER_ENTRIES)) {
+        if (file === path.resolve(__dirname, entry)) bundled.delete(name);
+      }
+    },
+  };
+}
+
+// The webfont is declared inside the 50 KB render-blocking stylesheet (`non.geist` is
+// imported from App.tsx), so the browser only starts fetching it after parsing all of
+// that CSS -- and `font-display: swap` means the fallback is painted first and then
+// replaced. A preload link starts the fetch with the rest of the head instead. The
+// filename carries a content hash, so it is read out of the emitted bundle rather than
+// hardcoded; if the font is ever renamed or dropped this simply emits nothing.
+function preloadWebfont(): Plugin {
+  return {
+    name: "screenextend:preload-webfont",
+    apply: "build",
+    enforce: "post",
+    transformIndexHtml(html, ctx) {
+      const font = Object.keys(ctx.bundle ?? {}).find(name => /Geist.*\.woff2$/.test(name));
+      if (!font) return html;
+      return {
+        html,
+        tags: [
+          {
+            tag: "link",
+            attrs: {
+              rel: "preload",
+              href: `/${font}`,
+              as: "font",
+              type: "font/woff2",
+              crossorigin: "",
+            },
+            injectTo: "head",
+          },
+        ],
+      };
+    },
   };
 }
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), classicWorkers()],
+  plugins: [react(), classicWorkers(), preloadWebfont()],
 
   build: {
     target: ["es2020", "chrome87", "safari13"],
@@ -101,6 +156,9 @@ export default defineConfig(async () => ({
   // production correctness rested entirely on vite's default happening to be "iife".
   worker: { format: "iife" },
 
+  // esbuild's "safari13" means 13.0, while browserslist in package.json says 13.1. The
+  // difference is `?.` and `??`, which landed in 13.1: esbuild therefore lowers slightly
+  // more than strictly necessary, which errs in the safe direction and should stay.
   esbuild: { target: "safari13" },
   optimizeDeps: {
     include: monacoDeps(),

@@ -38,6 +38,9 @@ tauri = { version = "2", features = ["unstable", "specta"] }
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta = "=2.0.0-rc.22"
 specta-typescript = "0.0.9"
+# Already in the tree via the webrtc stack; declared here so the avatar can cross the
+# bridge as a string rather than as a JSON array of decimal integers.
+base64 = "0.22"
 
 # Tauri plugins
 tauri-plugin-cli = "2"
