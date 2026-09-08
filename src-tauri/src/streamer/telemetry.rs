@@ -185,6 +185,14 @@ impl Histogram {
 /// before doing any work. Zero means the backend did not supply one.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTiming {
+    /// True for a frame the encoder re-emitted because the picture did not change — the idle
+    /// repeater and the ring keepalive. Such a frame was never captured, so its "capture"
+    /// stamps are the moment the repeater woke up and the end-to-end spans would read as
+    /// near-zero. On a static desktop repeats are the *majority* of frames (measured: 145 of
+    /// 235 over 30 s), so folding them into the end-to-end histograms would put the p50 on the
+    /// repeater and leave only the tail describing real capture. They are counted, and their
+    /// encode and transport stages are still real, but the capture-relative spans are not.
+    pub repeated: bool,
     pub capture_available_ns: u64,
     pub capture_cb_entry_ns: u64,
     pub scale_done_ns: u64,
@@ -200,6 +208,14 @@ impl FrameTiming {
         Self {
             capture_cb_entry_ns: crate::streamer::audio::host_now_ns(),
             ..Self::default()
+        }
+    }
+
+    /// Stamps for a frame the encoder is repeating rather than one it captured.
+    pub fn repeating() -> Self {
+        Self {
+            repeated: true,
+            ..Self::entering_capture()
         }
     }
 
@@ -420,9 +436,17 @@ impl SessionTelemetry {
 
     /// Fold one finished frame's stamps into every stage histogram it can supply.
     pub fn record_frame(&self, t: &FrameTiming) {
-        self.stages
-            .capture_delivery
-            .record_span(t.capture_available_ns, t.capture_cb_entry_ns);
+        if !t.repeated {
+            self.stages
+                .capture_delivery
+                .record_span(t.capture_available_ns, t.capture_cb_entry_ns);
+            self.stages
+                .capture_to_encode_done
+                .record_span(t.origin_ns(), t.encode_done_ns);
+            self.stages
+                .capture_to_socket
+                .record_span(t.origin_ns(), t.socket_write_done_ns);
+        }
         self.stages
             .scale
             .record_span(t.capture_cb_entry_ns, t.scale_done_ns);
@@ -443,12 +467,6 @@ impl SessionTelemetry {
         self.stages
             .socket_write
             .record_span(t.packetize_done_ns, t.socket_write_done_ns);
-        self.stages
-            .capture_to_encode_done
-            .record_span(t.origin_ns(), t.encode_done_ns);
-        self.stages
-            .capture_to_socket
-            .record_span(t.origin_ns(), t.socket_write_done_ns);
     }
 
     /// One line, all stages, `p50/p90/p99/max` in ms. Printed on a timer, never per frame.
@@ -718,8 +736,27 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_frame_is_kept_out_of_the_capture_relative_stages() {
+        let tel = SessionTelemetry::default();
+        let mut t = FrameTiming::repeating();
+        t.encode_submit_ns = t.capture_cb_entry_ns + 1_000_000;
+        t.encode_done_ns = t.encode_submit_ns + 2_000_000;
+        t.packetize_done_ns = t.encode_done_ns + 100_000;
+        t.socket_write_done_ns = t.packetize_done_ns + 200_000;
+        tel.record_frame(&t);
+        // Its encode and transport really happened and are measured.
+        assert_eq!(tel.stages.encode.snapshot().count, 1);
+        assert_eq!(tel.stages.socket_write.snapshot().count, 1);
+        // Nothing was captured, so nothing capture-relative is claimed.
+        assert!(tel.stages.capture_delivery.snapshot().is_empty());
+        assert!(tel.stages.capture_to_encode_done.snapshot().is_empty());
+        assert!(tel.stages.capture_to_socket.snapshot().is_empty());
+    }
+
+    #[test]
     fn frame_timing_folds_into_every_stage_it_can() {
         let t = FrameTiming {
+            repeated: false,
             capture_available_ns: 1_000_000,
             capture_cb_entry_ns: 2_000_000,
             scale_done_ns: 3_000_000,
