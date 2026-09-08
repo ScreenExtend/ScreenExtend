@@ -24,7 +24,16 @@ use crate::streamer::audio::{
     FLAG_DISCONTINUITY, FLAG_SILENT,
 };
 
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`: "A channel matrixer and a sample rate converter are
+/// inserted as necessary to convert between the uncompressed format supplied to
+/// IAudioClient::Initialize and the audio engine mix format."
 const STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
+/// `AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`. **The name reads backwards from the meaning.**
+/// It does not select the default converter; Microsoft documents it as selecting "a sample
+/// rate converter with *better* quality than the default conversion but with a *higher
+/// performance cost* ... This should be used if the audio is ultimately intended to be heard
+/// by humans." It is the right choice here for that reason, but it is a filter with group
+/// delay, and it is only ever reached on a non-48 kHz endpoint.
 const STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 // `AUDCLNT_E_DEVICE_INVALIDATED` (`AUDCLNT_ERR(0x004)`)
@@ -142,7 +151,7 @@ fn run(
             return;
         }
     };
-    crate::tprintln!("audio: {} loaded", encoder.version());
+    crate::tprintln!("{}", encoder.describe_state());
 
     let mut session = match unsafe { acquire(&enumerator) } {
         Ok(s) => s,
