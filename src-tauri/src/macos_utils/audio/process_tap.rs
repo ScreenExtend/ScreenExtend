@@ -252,12 +252,11 @@ impl ProcessTapCapture {
             ));
         }
         // throwaway sink; dropped with its ring right after the probe
-        let (producer, _consumer, consumer_thread) = super::ring::ring(4096);
+        let (producer, _consumer) = super::ring::ring(4096);
         let sink = AudioFrameSink {
             producer: Arc::new(producer),
             diagnostics: Arc::new(AudioDiagnostics::default()),
             control_tx: None,
-            consumer_thread,
         };
         let mut probe = ProcessTapCapture::new();
         probe.build_and_start(&sink)?;
