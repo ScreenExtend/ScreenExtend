@@ -1,12 +1,12 @@
 import type { ArrowComponentProps, CardComponentProps, Step, Tour } from "nextstepjs";
-import { useCallback, useContext, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { useNextStep } from "nextstepjs";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useZoom } from "@/components/global-provider";
 import { cn } from "@/lib/utils";
 
 export const WALKTHROUGH_TOUR = "welcome";
@@ -96,7 +96,7 @@ export function HighlightProxy() {
     startNextStep,
     setCurrentStep,
   } = useNextStep();
-  const { windowZoom: [zoom] } = useContext(GlobalProviderContext);
+  const zoom = useZoom();
   const proxyRef = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {

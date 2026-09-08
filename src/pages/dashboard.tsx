@@ -1,4 +1,4 @@
-import { useEffect, useState, useContext, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 
@@ -17,10 +17,10 @@ import {
 
 import { useNextStep } from "nextstepjs";
 
-import { GlobalProviderContext } from "@/components/global-provider";
+import { useConnectedDevices, useQrValues, useSession } from "@/components/global-provider";
 import { getConfig } from "@/components/config-provider";
 import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
-import { useToast } from "@/components/ui/use-toast";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { commands, events, type DisplayCapacity } from "@/lib/bindings";
@@ -51,10 +51,11 @@ function CloudBadge({ status }: { status: CloudStatus }) {
 }
 
 export default function Dashboard() {
-  const { windowQrValues: [qrValues], windowSessionId: [sessionId], windowPublicSessionsEnabled: [publicSessionsEnabled], windowDevices: [devices] } = useContext(GlobalProviderContext);
+  const qrValues = useQrValues();
+  const { sessionId, publicSessionsEnabled } = useSession();
+  const devices = useConnectedDevices();
   const { startNextStep } = useNextStep();
   const { t } = useTranslation();
-  const { toast } = useToast();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
   const [capacity, setCapacity] = useState<DisplayCapacity | null>(null);
@@ -112,7 +113,7 @@ export default function Dashboard() {
       cancelled = true;
       if (unlisten) void Promise.resolve(unlisten() as unknown).catch((e) => console.error("cloudStatusChange unlisten failed", e));
     };
-  }, [t, toast]);
+  }, [t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,7 +225,6 @@ export default function Dashboard() {
 const QrDisplay = ({ name, url, badge, blurred, blurredLabel }: { name: string; url: string; badge?: ReactNode; blurred?: boolean; blurredLabel?: string }) => {
   const [copied, setCopied] = useState(false);
   const { t } = useTranslation();
-  const { toast } = useToast();
 
   const handleCopy = async () => {
     try {
