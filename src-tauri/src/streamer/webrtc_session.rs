@@ -77,12 +77,39 @@ pub struct AudioParams {
     /// The client said it can parse [`audio::FLAG_REDUNDANT`] messages. Old clients cannot, so
     /// this is off unless the join request opted in.
     pub redundancy: bool,
+    /// Link loss as measured by the video BWE, in hundredths of a percent. Wired in by
+    /// `start_session`; `None` outside a live session.
+    pub link_loss: Option<Arc<std::sync::atomic::AtomicU32>>,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
     pub device_key: String,
 }
 
+/// Loss at which duplicating the previous frame starts paying for itself.
+///
+/// Below this, redundancy is pure overhead: every packet doubles in payload to protect against
+/// a loss that is not happening. Above it, a single lost packet is an audible 5 ms hole with
+/// no codec-level concealment available (in-band FEC cannot exist in this configuration), so
+/// the trade inverts. 0.5 % — the same order as the point at which the video BWE starts to
+/// react.
+const AUDIO_REDUNDANCY_LOSS_THRESHOLD: u32 = 50; // hundredths of a percent
+
 impl AudioParams {
+    /// Should this packet carry the previous frame alongside it?
+    ///
+    /// Two conditions, both required: the client said it can parse the format, and the link is
+    /// actually losing packets. A client that cannot parse it must never be sent it, and a
+    /// clean link should not pay for it.
+    fn redundancy_now(&self) -> bool {
+        if !self.redundancy {
+            return false;
+        }
+        self.link_loss
+            .as_ref()
+            .map(|l| l.load(Ordering::Relaxed) >= AUDIO_REDUNDANCY_LOSS_THRESHOLD)
+            .unwrap_or(false)
+    }
+
     fn audio_enabled_now(&self) -> bool {
         self.overrides
             .lock()
@@ -546,9 +573,15 @@ pub async fn handle_whep_offer(
         });
     }
 
-    spawn_bitrate_driver(Arc::clone(&pc), pipeline.clone());
+    // One loss estimate, shared: the video BWE already polls `getStats` every 120 ms and the
+    // audio DataChannel rides the same link, so audio does not need its own measurement — and
+    // could not get a better one, since SCTP does not report loss the way RTCP does.
+    let link_loss = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    if let Some(audio) = audio {
+    spawn_bitrate_driver(Arc::clone(&pc), pipeline.clone(), Arc::clone(&link_loss));
+
+    if let Some(mut audio) = audio {
+        audio.link_loss = Some(link_loss);
         if let Err(e) = setup_audio(&pc, audio, Arc::clone(&pipeline.telemetry)).await {
             teprintln!("audio: setup failed ({e:#}); continuing without audio");
         }
@@ -870,7 +903,7 @@ async fn forward_datachannel(
                 if pending_discontinuity {
                     flags |= audio::FLAG_DISCONTINUITY;
                 }
-                let redundant = if audio.redundancy {
+                let redundant = if audio.redundancy_now() {
                     prev_payload.as_deref()
                 } else {
                     None
@@ -1003,7 +1036,11 @@ async fn forward_track(
     tprintln!("audio: track forwarder stopped");
 }
 
-fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pipeline: Pipeline) {
+fn spawn_bitrate_driver(
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    pipeline: Pipeline,
+    link_loss: Arc<std::sync::atomic::AtomicU32>,
+) {
     use webrtc::stats::StatsReportType;
 
     let max_bps = pipeline.max_bitrate_bps;
@@ -1053,6 +1090,13 @@ fn spawn_bitrate_driver(pc: Arc<webrtc::peer_connection::RTCPeerConnection>, pip
             if !have_outbound {
                 continue;
             }
+
+            // Publish for the audio forwarder, in hundredths of a percent so it fits an
+            // integer without losing the range that matters (0.5 % to 10 %).
+            link_loss.store(
+                (fraction_lost.clamp(0.0, 1.0) * 10_000.0) as u32,
+                Ordering::Relaxed,
+            );
 
             let now = Instant::now();
             let measured_send_bps = match last_bytes_sent {
