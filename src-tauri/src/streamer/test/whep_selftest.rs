@@ -164,10 +164,14 @@ pub async fn run(mut config: Config) -> Result<()> {
 
     let rtp_count = Arc::new(AtomicU64::new(0));
     let track_seen = Arc::new(AtomicU64::new(0));
+    // Host-clock stamp of the first RTP packet off the wire. Time-to-first-frame is the number
+    // the join chain is judged on, and it is not derivable from the packet count alone.
+    let first_rtp_ns = Arc::new(AtomicU64::new(0));
 
     {
         let rtp_count = Arc::clone(&rtp_count);
         let track_seen = Arc::clone(&track_seen);
+        let first_rtp_ns = Arc::clone(&first_rtp_ns);
         pc.on_track(Box::new(move |track: Arc<TrackRemote>, _recv, _trans| {
             let codec = track.codec();
             tprintln!(
@@ -177,11 +181,16 @@ pub async fn run(mut config: Config) -> Result<()> {
             );
             track_seen.fetch_add(1, Ordering::Relaxed);
             let rtp_count = Arc::clone(&rtp_count);
+            let first_rtp_ns = Arc::clone(&first_rtp_ns);
             Box::pin(async move {
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 1600];
                     while let Ok((pkt, _)) = track.read(&mut buf).await {
                         let n = rtp_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 {
+                            first_rtp_ns
+                                .store(crate::streamer::audio::host_now_ns(), Ordering::Relaxed);
+                        }
                         if n == 1 || n.is_multiple_of(30) {
                             tprintln!(
                                 "[selftest] RTP #{n} seq={} ts={} payload={}B",
@@ -212,8 +221,14 @@ pub async fn run(mut config: Config) -> Result<()> {
         .sdp;
 
     tprintln!("[selftest] POST /whep ({} bytes)", offer_sdp.len());
+    let posted_ns = crate::streamer::audio::host_now_ns();
     let answer_sdp = http_post_join(port, &offer_sdp).await?;
-    tprintln!("[selftest] got answer SDP ({} bytes)", answer_sdp.len());
+    let answered_ns = crate::streamer::audio::host_now_ns();
+    tprintln!(
+        "[selftest] JOIN whep_answer_ms={:.1} ({} bytes)",
+        (answered_ns - posted_ns) as f64 / 1.0e6,
+        answer_sdp.len()
+    );
 
     let checks = answer_sdp_checks(&answer_sdp);
     tprintln!("[selftest] --- SDP attribute checks ---");
@@ -234,12 +249,21 @@ pub async fn run(mut config: Config) -> Result<()> {
         .await?;
     tprintln!("[selftest] answer applied; waiting up to {TIMEOUT_SECS}s for >= {MIN_RTP_PACKETS} RTP packets");
 
+    let applied_ns = crate::streamer::audio::host_now_ns();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
     while tokio::time::Instant::now() < deadline {
         if rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    match first_rtp_ns.load(Ordering::Relaxed) {
+        0 => teprintln!("[selftest] JOIN first_rtp_ms=none"),
+        first => tprintln!(
+            "[selftest] JOIN first_rtp_ms={:.1} join_total_ms={:.1}",
+            (first.saturating_sub(applied_ns)) as f64 / 1.0e6,
+            (first.saturating_sub(posted_ns)) as f64 / 1.0e6,
+        ),
     }
 
     // Proving RTP flows takes about a second, which is a liveness check and not a measurement:
