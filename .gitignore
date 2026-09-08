@@ -41,7 +41,6 @@ AUDIT.md
 SSH-GIT.md
 
 # Temporary agent files
-docs/
 .agents/
 skills-lock.json
 PLAN.md
