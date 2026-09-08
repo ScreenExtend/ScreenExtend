@@ -12,9 +12,14 @@
 //! Reply tables and header transcribed from `lib/fairplay_playfair.c` of UxPlay
 //! (Copyright (C) 2018 Juho Vähä-Herttua, LGPL-2.1-or-later), used here under
 //! LGPL-2.1's "or later" grant via GPL-3, which AGPL-3 section 13 permits
-//! combining with. Changed: transcribed to Rust, request dispatch keyed on the
-//! message type/sequence bytes instead of on body length, and the table index
-//! is bounds-checked.
+//! combining with. Changed: transcribed to Rust, the version byte is checked
+//! and the table index is bounds-checked.
+//!
+//! Dispatch is on body length, as in the reference. It deliberately does not
+//! also require the sequence byte: tolerating an unexpected one is what lets
+//! this answer sender variants nobody has seen, and refusing a message that is
+//! otherwise exactly right would be a disconnect for no gain. The sequence byte
+//! is still read, and reported when a message matches nothing at all.
 
 const REPLY_MESSAGES: [[u8; 142]; 4] = [
     [
@@ -79,7 +84,8 @@ const MODE_POS: usize = 14;
 
 const SETUP1_LEN: usize = 16;
 const SETUP2_LEN: usize = 164;
-const SETUP1_SEQ: u8 = 0x01;
+/// The sequence byte message 2 carries. Read and reported, not required — see
+/// the module doc on why dispatch stays tolerant.
 const SETUP2_SEQ: u8 = 0x03;
 
 /// Trailing 20 bytes of message 2 that get echoed back.
@@ -125,21 +131,21 @@ pub fn respond(req: &[u8]) -> Result<Vec<u8>, FpError> {
     }
 
     let seq = req[SEQ_POS];
-    match (req.len(), seq) {
-        (SETUP1_LEN, SETUP1_SEQ) | (SETUP1_LEN, _) => {
+    match req.len() {
+        SETUP1_LEN => {
             let mode = req[MODE_POS];
             let table = REPLY_MESSAGES
                 .get(mode as usize)
                 .ok_or(FpError::BadMode(mode))?;
             Ok(table.to_vec())
         }
-        (SETUP2_LEN, SETUP2_SEQ) | (SETUP2_LEN, _) => {
+        SETUP2_LEN => {
             let mut out = Vec::with_capacity(FP_HEADER.len() + ECHO_LEN);
             out.extend_from_slice(&FP_HEADER);
             out.extend_from_slice(&req[ECHO_OFFSET..ECHO_OFFSET + ECHO_LEN]);
             Ok(out)
         }
-        (len, seq) => Err(FpError::Unrecognized { len, seq }),
+        len => Err(FpError::Unrecognized { len, seq }),
     }
 }
 

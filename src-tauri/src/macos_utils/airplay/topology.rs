@@ -89,11 +89,6 @@ pub fn is_airplay_display(id: u32) -> bool {
 /// "Default for display" by hand. So we remember what every display was doing
 /// and restore it ourselves.
 ///
-/// The whole `CGDisplayMode` is kept, not just its size: at one logical size
-/// there can be both a native and a scaled mode, and "Default for display" is a
-/// specific one of them. `io_display_mode_id` is what tells them apart.
-/// Which mode each display was in before we touched the topology.
-///
 /// Stored as `io_display_mode_id`, not the `CGDisplayMode` object: the object is
 /// neither `Send` nor `Sync` so it cannot live in the session registry, and the
 /// id is the stable handle anyway — it is what distinguishes "Default for
