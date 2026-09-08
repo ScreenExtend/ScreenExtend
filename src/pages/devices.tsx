@@ -154,8 +154,12 @@ export default function Devices() {
               </TableRow>
             </TableHeader>
             <TableBody className="border-t">
-              {devices.map((device, id) => (
-                <TableRow key={id}>
+              {/* Keyed by identity, not by array position: `deviceJoin` rebuilds the
+                  list as filter-then-push, so a rejoining device moves to the end and
+                  every index after it shifts. React then reuses row instances across
+                  different devices, which can carry an open sheet onto the wrong one. */}
+              {devices.map((device) => (
+                <TableRow key={device.token || device.ip}>
                   <TableCell>{device.name}</TableCell>
                   <TableCell>{device.ip}</TableCell>
                   <TableCell>{device.os}</TableCell>
