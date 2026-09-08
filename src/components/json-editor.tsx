@@ -46,6 +46,30 @@ const MAX_FOLD_TAIL = 4;
 
 const WORKER_KEEPALIVE_MS = 60_000;
 
+let keepAliveHolders = 0;
+let keepAliveTimer: number | undefined;
+
+function acquireWorkerKeepAlive(): () => void {
+  keepAliveHolders += 1;
+  if (keepAliveHolders === 1) {
+    const touch = () => {
+      void monaco.languages.json
+        .getWorker()
+        .then(accessor => accessor())
+        .catch(() => {});
+    };
+    touch();
+    keepAliveTimer = window.setInterval(touch, WORKER_KEEPALIVE_MS);
+  }
+  return () => {
+    keepAliveHolders -= 1;
+    if (keepAliveHolders === 0 && keepAliveTimer !== undefined) {
+      window.clearInterval(keepAliveTimer);
+      keepAliveTimer = undefined;
+    }
+  };
+}
+
 const VALIDATE_IDLE_MS = 900;
 const MARKER_OWNER = "screenextend-json";
 
@@ -170,17 +194,11 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
       };
     }, [schema, name]);
 
-    useEffect(() => {
-      const touch = () => {
-        void monaco.languages.json
-          .getWorker()
-          .then(accessor => accessor())
-          .catch(() => {});
-      };
-      touch();
-      const id = window.setInterval(touch, WORKER_KEEPALIVE_MS);
-      return () => window.clearInterval(id);
-    }, []);
+    // Monaco idles its language workers out, and the first keystroke after that stalls on
+    // the respawn. The keep-alive is a property of the shared worker, not of an editor, so
+    // it is refcounted: a save conflict mounts three JsonEditors at once and they were
+    // running three intervals against the same worker.
+    useEffect(() => acquireWorkerKeepAlive(), []);
 
     useEffect(() => {
       if (!onMarkersChange) return;

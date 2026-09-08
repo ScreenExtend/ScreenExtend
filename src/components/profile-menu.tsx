@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useNextStep } from "nextstepjs";
 
@@ -16,19 +16,20 @@ import {
 
 import { updateConfig, flushConfig, useConfig } from "@/components/config-provider";
 import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
-import { GlobalProviderContext } from "@/components/global-provider";
-import { useToast } from "@/components/ui/use-toast";
+import { useAvatar, useClosing, useGlobalSetters } from "@/components/global-provider";
+import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { commands } from "@/lib/bindings";
 import defaultLogo from "@/assets/default.svg";
 
 export function ProfileMenu() {
-  const { windowClosing: [closing, setClosing], windowAvatar: [avatar] } = useContext(GlobalProviderContext);
+  const closing = useClosing();
+  const avatar = useAvatar();
+  const { setClosing } = useGlobalSetters();
   const [background, setBackground] = useState(false);
   const name = useConfig()?.name ?? "";
   const navigate = useNavigate();
   const { startNextStep } = useNextStep();
-  const { toast } = useToast();
   const { t } = useTranslation();
 
   const replayTour = async () => {
