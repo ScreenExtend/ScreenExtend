@@ -393,7 +393,6 @@
     send(OP.KEYFRAME_REQUEST, keyReqBuf);
     return true;
   }
-  let lastRttMs = 0;
 
   // Host clock offset, estimated NTP-style over the PING/PONG pair this channel already
   // exchanges once a second. The host's clock (`host_now_ns`) is monotonic from its own
@@ -421,7 +420,6 @@
     const echoedNs = getU64(dv, 1);
     const nowMs = performance.now();
     const rttMs = nowMs - echoedNs / 1e6;
-    lastRttMs = rttMs;
     if (dv.byteLength < 17 || !isFinite(rttMs) || rttMs < 0 || rttMs > 5000) return;
     if (!(rttMs <= clock.bestRttMs || nowMs - clock.bestAt > CLOCK_SAMPLE_TTL_MS)) return;
     const hostMs = getU64(dv, 9) / 1e6;
@@ -680,6 +678,13 @@
     on(window, 'orientationchange', refreshSize, { passive: true });
   }
 
+  function hasFinePointer() {
+    try {
+      if (window.matchMedia) return window.matchMedia('(any-pointer: fine)').matches;
+    } catch (_) { noteSuppressed(); }
+    return navigator.maxTouchPoints === 0;
+  }
+
   function forwardClipboard(opByte, e) {
     const cd = e.clipboardData;
     if (!cd) return;
@@ -701,8 +706,11 @@
     reliable.onopen = () => {
       refreshSize();
       sendResize();
-      if (imeSink && navigator.maxTouchPoints === 0) {
-        try { imeSink.focus({ preventScroll: true }); } catch (_) {}
+      // `maxTouchPoints === 0` excluded every touchscreen laptop, which has a real keyboard
+      // and needs composition input as much as any desktop. A fine pointer is the property
+      // that actually predicts one.
+      if (imeSink && hasFinePointer()) {
+        try { imeSink.focus({ preventScroll: true }); } catch (_) { noteSuppressed(); }
       }
       if (!pingTimer) {
         // Separate guards: a throw inside sendStats() must not cost the clock sample, and
@@ -743,7 +751,6 @@
     hasCoalescedEvents() { return !!hasCoalesced; },
     get fastDropped() { return fastDropped; },
     onViewportSettled() { refreshSize(); sendResize(); },
-    get rtt() { return lastRttMs; },
   };
 
   // `offsetMs` converts between the host clock and absolute local time:

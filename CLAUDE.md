@@ -599,7 +599,24 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `PrioritizeEncodingSpeedOverQuality`, 11.0) had to move to `set_optional_bool` for exactly
   this reason. Check with `nm -u target/release/ScreenExtend`.
 - The client page has no build step and no dependencies; it must keep working in older mobile
-  browsers (that constraint is why, for instance, flex `gap` was replaced with margins).
+  browsers (that constraint is why, for instance, flex `gap` was replaced with margins). It is
+  one shared scope, so a single unsupported *token* anywhere in `index.html`, `input.js` or
+  `audio.js` takes the whole join form down — the same shape of failure as the macOS dyld rule.
+  No optional chaining, nullish coalescing, logical assignment, class fields, private `#`
+  members, top-level `await`, `BigInt` literals, or the CSS `inset` shorthand without
+  long-hands. `audio-worker.js` and `audio-worklet.js` are the exception: they are only ever
+  loaded after `AudioDecoder` and `AudioWorklet` have been probed, so they may use newer
+  syntax. `node scripts/check-legacy-webkit.mjs` scans `src-tauri/src/streamer/static/` under
+  that stricter contract.
+- **The client video path never schedules; it resynchronises.** Frames are painted inline in
+  the decoder's output callback — no `requestAnimationFrame`, no queue we control. When the
+  decoder falls behind, the answer is to drop to the freshest frame and ask for a keyframe,
+  never to buffer. Backpressure is measured as decodes that have not yet produced an *output*,
+  never as `decodeQueueSize`, which counts acceptance and can read zero with frames in flight.
+- Every silent degradation on the client page is a bit in the `OP::STATS` frame
+  (`docs/TELEMETRY.md`). A new `catch (_) {}` there should call `noteSuppressed()`, and a new
+  tier should get a byte, or the host cannot tell a device on the slow path from one on the
+  fast path.
 - DPR is only correct when the resolution multiplier and the OS scale step are the **same
   number**: resolution x `d`, DPI `100*d`%. Snap `d` with `platform::snap_display_dpr` (Windows
   exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),

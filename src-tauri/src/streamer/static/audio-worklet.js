@@ -9,15 +9,31 @@ const OVERRUNS = 2;
 
 const DEFAULT_CAP_FRAMES = 65536;
 
+// Planar audio ring ABI, reader side. Hand-duplicated in audio.js (which owns the allocation
+// size) and audio-worker.js (the writer); change all three together.
+//
+//   [0 .. 64)                        control block, 16 Int32 (W, R, OVERRUNS)
+//   [64 .. 64 + cap*4)               left channel,  Float32
+//   [64 + cap*4 .. 64 + cap*8)       right channel, Float32
+//
+// Positions are absolute uint32 frame counters indexed with `pos & (cap-1)`, so the capacity
+// must be a power of two.
 class AudioJitterProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
         const o = (options && options.processorOptions) || {};
         this.capFrames = o.capacityFrames || DEFAULT_CAP_FRAMES;
+        if ((this.capFrames & (this.capFrames - 1)) !== 0) {
+            throw new Error('audio ring capacity must be a power of two, got ' + this.capFrames);
+        }
         this.mask = this.capFrames - 1;
 
         this.shared = false;
         if (o.sab) {
+            const need = CTRL_BYTES + this.capFrames * 8;
+            if (o.sab.byteLength < need) {
+                throw new Error('audio ring is ' + o.sab.byteLength + ' bytes, needs ' + need);
+            }
             try {
                 this.ctrl = new Int32Array(o.sab, 0, CTRL_INTS);
                 this.ringL = new Float32Array(o.sab, CTRL_BYTES, this.capFrames);
