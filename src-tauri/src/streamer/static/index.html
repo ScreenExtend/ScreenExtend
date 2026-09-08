@@ -11,7 +11,10 @@
         <style>
             #permModal {
                 position: fixed;
-                inset: 0;
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
                 z-index: 20;
                 display: none;
                 align-items: center;
@@ -102,7 +105,7 @@
         <div id="modal" role="dialog" aria-modal="true" style="z-index: 9999">
             <div class="card">
                 <h2>Switch to HTTPS: faster and more secure</h2>
-                <p>This page is on an insecure (HTTP) connection. Switching to the sucre version ensures data is exchanged quicker and privately. Your browser may warn about the self-signed certificate once, which is expected; choose to More Info/Advanced --> Proceed to site.</p>
+                <p>This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video and audio paths on a secure one, so switching makes the screen faster as well as private. You will see a one-time warning about the self-signed certificate; that is expected — choose Advanced (or More Info), then continue to the site.</p>
                 <div class="row">
                     <button id="goHttps">Switch to HTTPS</button>
                     <button id="dismiss">Stay on HTTP</button>
@@ -166,11 +169,64 @@
             const hasScriptTransform = ('RTCRtpReceiver' in window) && ('transform' in RTCRtpReceiver.prototype) && (typeof RTCRtpScriptTransform !== 'undefined');
             const hasLegacyEncodedStreams = ('RTCRtpReceiver' in window) && (typeof RTCRtpReceiver.prototype.createEncodedStreams === 'function');
             const canWebCodecs = (hasScriptTransform || hasLegacyEncodedStreams) && ('VideoDecoder' in window) && (typeof canvas.transferControlToOffscreen === 'function');
-            const useScriptTransform = hasScriptTransform && !hasLegacyEncodedStreams;
-            const audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
-            const audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+            // RTCRtpScriptTransform is preferred wherever it exists, and Chrome 141+ has both
+            // it and the legacy createEncodedStreams. Only the standard one carries
+            // sendKeyFrameRequest(), and the transform runs *instead of* libwebrtc's
+            // reference finder, so a receiver without it can never ask for an IDR: a single
+            // lost keyframe froze the picture until a watchdog demoted the whole session to
+            // <video>. `forceLegacyTransform` is the escape hatch if the standard path turns
+            // out not to start on some build.
+            let forceLegacyTransform = false;
+            function useScriptTransformNow() {
+                return hasScriptTransform && !forceLegacyTransform;
+            }
+            let audioCaps = (window.SEAudio && SEAudio.detectCapabilities()) || { webcodecsOpus: false, worklet: false };
+            let audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
 
             const DEBUG = /(?:[?&#])debug\b/.test(location.search + location.hash);
+            // Presentation tier override for the manual A/B in docs/manual-tests/client-page.md.
+            // `canvas` is the default and the floor; `track` routes decoded frames through a
+            // VideoTrackGenerator into the <video> element, which may or may not win a
+            // hardware overlay depending on the platform.
+            const PRESENT_PREF = (/(?:[?&#])present=(\w+)/.exec(location.search + location.hash) || [])[1] || 'canvas';
+
+            // Everything the page used to swallow in a bare `catch (_) { noteSuppressed(); }` — 63 of them —
+            // now lands here and rides the once-a-second stats frame to the host. A silent
+            // degradation is one nobody ever fixes.
+            const DEG = {
+                FULLSCREEN_DENIED: 1 << 0,
+                POINTER_LOCK_DENIED: 1 << 1,
+                UNADJUSTED_MOVEMENT_UNAVAILABLE: 1 << 2,
+                WAKE_LOCK_API_ABSENT: 1 << 3,
+                WAKE_LOCK_REFUSED: 1 << 4,
+                AUDIO_PREPARE_FAILED: 1 << 5,
+                AUDIO_OPUS_UNSUPPORTED: 1 << 6,
+                AUDIO_CONTEXT_SUSPENDED: 1 << 7,
+                AUDIO_OUTPUT_LATENCY_ESTIMATED: 1 << 8,
+                AUDIO_OUTPUT_LABELS_UNAVAILABLE: 1 << 9,
+                SCRIPT_TRANSFORM_UNAVAILABLE: 1 << 10,
+                KEYFRAME_REQUEST_IMPOSSIBLE: 1 << 11,
+                OFFSCREEN_CANVAS_UNAVAILABLE: 1 << 12,
+                DEMOTED_TO_VIDEO: 1 << 13,
+                COALESCED_EVENTS_UNAVAILABLE: 1 << 14,
+                ICE_GATHERING_DEADLINE: 1 << 15,
+                NO_H264_FMTP: 1 << 16,
+                DECODER_HW_UNAVAILABLE: 1 << 17,
+                REFRESH_RATE_MEASURED: 1 << 18,
+                TRANSFORM_FELL_BACK_TO_LEGACY: 1 << 19,
+                RVFC_UNAVAILABLE: 1 << 20,
+                KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
+            };
+            let degradeFlags = 0;
+            let suppressedErrors = 0;
+            function degrade(bit) { degradeFlags |= bit; }
+            function undegrade(bit) { degradeFlags &= ~bit; }
+            function noteSuppressed() { suppressedErrors++; }
+
+            if (!hasScriptTransform) degrade(DEG.SCRIPT_TRANSFORM_UNAVAILABLE);
+            if (typeof canvas.transferControlToOffscreen !== 'function') degrade(DEG.OFFSCREEN_CANVAS_UNAVAILABLE);
+            if (!(navigator.keyboard && navigator.keyboard.lock)) degrade(DEG.KEYBOARD_LOCK_UNAVAILABLE);
+            if (typeof video.requestVideoFrameCallback !== 'function') degrade(DEG.RVFC_UNAVAILABLE);
 
             let pc = null;
             let worker = null;
@@ -280,6 +336,15 @@
             function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
             function showVideo() { video.style.display = 'block'; canvas.style.display = 'none'; }
 
+            // The letterboxed picture rect that input coordinates are normalised against
+            // needs the intrinsic size, and on the <video> paths this is where it arrives.
+            function relayVideoSize() {
+                if (!(video.videoWidth > 0)) return;
+                try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+            }
+            video.addEventListener('loadedmetadata', relayVideoSize);
+            video.addEventListener('resize', relayVideoSize);
+
             function freshCanvas() {
                 const replacement = document.createElement('canvas');
                 replacement.id = 'canvas';
@@ -302,7 +367,9 @@
                 setTimeout(() => { joinEl.style.display = 'none'; }, 450);
                 startLock();
                 startReconfigPoll();
-                refineRefreshRate();
+                // Keep refining in the background; it is applied by the next reconfigure
+                // rather than by forcing one.
+                refreshRatePromise.then((r) => noteRefinedRefreshRate(clampRefresh(r)), noteSuppressed);
             }
 
             async function startReconfigPoll() {
@@ -312,7 +379,7 @@
                     try {
                         const r = await fetch('/reconfig');
                         if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; markAlive(); }
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
                 }
                 armProbe();
             }
@@ -349,7 +416,7 @@
 
             function applyReconfig(j) {
                 if (typeof j.audioSink === 'string') {
-                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) {}
+                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) { noteSuppressed(); }
                 }
                 if (kickEpoch !== null && j.kick !== kickEpoch) {
                     kickEpoch = j.kick;
@@ -389,8 +456,8 @@
             const viewportSettledSubs = [];
             function onViewportSettled(cb) { viewportSettledSubs.push(cb); }
             function emitViewportSettled() {
-                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) {} }
-                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) {}
+                for (const cb of viewportSettledSubs) { try { cb(); } catch (_) { noteSuppressed(); } }
+                try { if (window.RemoteInput && RemoteInput.onViewportSettled) RemoteInput.onViewportSettled(); } catch (_) { noteSuppressed(); }
             }
 
             function readOrientationPortrait() {
@@ -489,9 +556,34 @@
 
             function liveEl() { return (canvas.style.display === 'block') ? canvas : video; }
 
-            const LOCK_KEYS = ['Escape', 'MetaLeft', 'MetaRight', 'AltLeft', 'AltRight', 'F11'];
             const GESTURE_EVENTS = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'keydown', 'wheel'];
-            const noSleep = new NoSleep();
+
+            // Screen Wake Lock (Chrome 84, Firefox 126, Safari 16.4 partial / 18.4 full) is
+            // the real API; nosleep.js — which keeps the screen alive by looping a tiny
+            // video — is the floor beneath it. NoSleep is constructed lazily so a failed
+            // /nosleep.js fetch cannot take the rest of this script down with it, which a
+            // top-level `new NoSleep()` did.
+            let noSleepImpl = null;
+            let noSleepTried = false;
+            function getNoSleep() {
+                if (noSleepTried) return noSleepImpl;
+                noSleepTried = true;
+                try {
+                    if (typeof NoSleep === 'function') {
+                        noSleepImpl = new NoSleep();
+                        // The bundled build plays an *unmuted* looping clip; muting it also
+                        // relaxes the autoplay rules that would otherwise refuse it.
+                        if (noSleepImpl.noSleepVideo) noSleepImpl.noSleepVideo.muted = true;
+                    }
+                } catch (_) { noteSuppressed(); noSleepImpl = null; }
+                return noSleepImpl;
+            }
+
+            const hasWakeLockApi = !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+            if (!hasWakeLockApi) degrade(DEG.WAKE_LOCK_API_ABSENT);
+            let wakeLockSentinel = null;
+            let wakeLockPending = false;
+
             let visibilityHandler = null;
             let beforeUnloadHandler = null;
             let fullscreenHandler = null;
@@ -499,12 +591,27 @@
             let pageshowHandler = null;
             let locked = false;
 
+            // Only the unprefixed form is specified to return a Promise. Safari below 16.4
+            // returns undefined from webkitRequestFullscreen, so the `.catch()` at every
+            // call site threw a TypeError — and because startLock() is called un-awaited
+            // from onStreamLive(), that rejection silently skipped pointer lock, keyboard
+            // lock and the wake lock for the whole session.
             function enterFullscreen(el) {
-                if (el.requestFullscreen) return el.requestFullscreen();
-                if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
-                if (el.mozRequestFullScreen) return el.mozRequestFullScreen();
-                if (el.msRequestFullscreen) return el.msRequestFullscreen();
-                if (el === video && el.webkitEnterFullscreen) { try { el.webkitEnterFullscreen(); } catch (_) {} }
+                let r;
+                try {
+                    if (el.requestFullscreen) r = el.requestFullscreen();
+                    else if (el.webkitRequestFullscreen) r = el.webkitRequestFullscreen();
+                    else if (el.mozRequestFullScreen) r = el.mozRequestFullScreen();
+                    else if (el.msRequestFullscreen) r = el.msRequestFullscreen();
+                    else if (el === video && el.webkitEnterFullscreen) el.webkitEnterFullscreen();
+                } catch (err) {
+                    degrade(DEG.FULLSCREEN_DENIED);
+                    return Promise.reject(err);
+                }
+                if (r && typeof r.then === 'function') {
+                    return r.then(function () { undegrade(DEG.FULLSCREEN_DENIED); },
+                        function (err) { degrade(DEG.FULLSCREEN_DENIED); throw err; });
+                }
                 return Promise.resolve();
             }
             function currentFullscreenEl() {
@@ -529,18 +636,77 @@
             }
             async function acquireKeyboardLock() {
                 if (navigator.keyboard && navigator.keyboard.lock) {
-                    try { await navigator.keyboard.lock(); } catch (_) {}
+                    try { await navigator.keyboard.lock(); } catch (_) { noteSuppressed(); }
                 }
             }
+            // Raw, un-accelerated deltas where the platform has them (Chrome 88+ on
+            // Windows/macOS/ChromeOS, Safari 18.4, Firefox 152 — not Linux). Without it the
+            // client's OS applies its own pointer curve and the host applies another, so
+            // the two compound. The option form rejects where unsupported, and the whole
+            // call returns undefined instead of a Promise below Chrome 92 / Safari 18.4.
+            let pointerLockUnadjusted = false;
             function acquirePointerLock(el) {
                 try {
+                    if (!el.requestPointerLock) {
+                        if (el.mozRequestPointerLock) el.mozRequestPointerLock();
+                        else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
+                        else {
+                            el.style.cursor = 'none'; el.style.userSelect = 'none';
+                            el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none';
+                            el.style.msUserSelect = 'none';
+                            degrade(DEG.POINTER_LOCK_DENIED);
+                        }
+                        degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        return;
+                    }
                     let p = null;
-                    if (el.requestPointerLock) p = el.requestPointerLock();
-                    else if (el.mozRequestPointerLock) el.mozRequestPointerLock();
-                    else if (el.webkitRequestPointerLock) el.webkitRequestPointerLock();
-                    else { el.style.cursor = 'none'; el.style.userSelect = 'none'; el.style.webkitUserSelect = 'none'; el.style.mozUserSelect = 'none'; el.style.msUserSelect = 'none'; }
-                    if (p && p.catch) p.catch(() => {});
-                } catch (_) {}
+                    try { p = el.requestPointerLock({ unadjustedMovement: true }); } catch (_) { p = null; }
+                    if (p && typeof p.then === 'function') {
+                        pointerLockUnadjusted = true;
+                        undegrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                        p.then(null, function () {
+                            pointerLockUnadjusted = false;
+                            degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                            try {
+                                const q = el.requestPointerLock();
+                                if (q && q.catch) q.catch(function () { degrade(DEG.POINTER_LOCK_DENIED); });
+                            } catch (_) { degrade(DEG.POINTER_LOCK_DENIED); }
+                        });
+                        return;
+                    }
+                    // No Promise came back, so the options bag was ignored: this engine is
+                    // old enough that it applies the OS pointer curve and says nothing.
+                    degrade(DEG.UNADJUSTED_MOVEMENT_UNAVAILABLE);
+                    pointerLockUnadjusted = false;
+                } catch (_) { noteSuppressed(); degrade(DEG.POINTER_LOCK_DENIED); }
+            }
+
+            async function acquireWakeLock() {
+                if (!hasWakeLockApi || wakeLockPending) return false;
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                wakeLockPending = true;
+                try {
+                    wakeLockSentinel = await navigator.wakeLock.request('screen');
+                    undegrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel.addEventListener('release', function () { wakeLockSentinel = null; });
+                    return true;
+                } catch (_) {
+                    degrade(DEG.WAKE_LOCK_REFUSED);
+                    wakeLockSentinel = null;
+                    return false;
+                } finally {
+                    wakeLockPending = false;
+                }
+            }
+            function releaseWakeLock() {
+                const s = wakeLockSentinel;
+                wakeLockSentinel = null;
+                if (!s) return;
+                try { const p = s.release(); if (p && p.catch) p.catch(noteSuppressed); } catch (_) { noteSuppressed(); }
+            }
+            function wakeLockHeld() {
+                if (wakeLockSentinel && !wakeLockSentinel.released) return true;
+                return !!(noSleepImpl && noSleepImpl.isEnabled);
             }
 
             function installGestureHandler() {
@@ -577,15 +743,33 @@
             }
 
             function disableNoSleep() {
-                try { noSleep.disable(); } catch (_) {}
+                releaseWakeLock();
+                if (!noSleepImpl) return;
+                try { noSleepImpl.disable(); } catch (_) { noteSuppressed(); }
             }
 
+            // Tiered: the real Wake Lock API first, the looping-video shim only where it is
+            // missing or refuses. On iOS below 18.4 (and in a standalone home-screen app
+            // even at 18.4) that is still the only thing that works.
             function enableNoSleep() {
+                if (hasWakeLockApi) {
+                    acquireWakeLock().then(function (ok) {
+                        if (ok) { if (!locked) releaseWakeLock(); return; }
+                        enableNoSleepShim();
+                    }, enableNoSleepShim);
+                    return;
+                }
+                enableNoSleepShim();
+            }
+
+            function enableNoSleepShim() {
+                const ns = getNoSleep();
+                if (!ns) return;
                 try {
-                    if (noSleep.isEnabled) return;
-                    const p = noSleep.enable();
-                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => {});
-                } catch (_) {}
+                    if (ns.isEnabled) return;
+                    const p = ns.enable();
+                    if (p && p.then) p.then(() => { if (!locked) disableNoSleep(); }, () => { degrade(DEG.WAKE_LOCK_REFUSED); });
+                } catch (_) { noteSuppressed(); degrade(DEG.WAKE_LOCK_REFUSED); }
             }
 
             async function startLock() {
@@ -601,7 +785,7 @@
                     enableNoSleep();
                     if (!fullscreenMode) return;
                     await acquireKeyboardLock();
-                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) {} }
+                    if (!currentFullscreenEl()) { try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); } }
                 };
                 document.addEventListener('visibilitychange', visibilityHandler);
 
@@ -629,7 +813,7 @@
                         enableNoSleep();
                     } else {
                         enterViewportMode();
-                        try { await enterFullscreen(fullscreenTarget()); } catch (_) {}
+                        try { await enterFullscreen(fullscreenTarget()); } catch (_) { noteSuppressed(); }
                     }
                 };
                 fullscreenEvents.forEach((ev) => document.addEventListener(ev, fullscreenHandler));
@@ -673,7 +857,7 @@
                         else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
                         else if (document.mozCancelFullScreen) await document.mozCancelFullScreen();
                         else if (document.msExitFullscreen) await document.msExitFullscreen();
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
                 }
             }
 
@@ -681,8 +865,8 @@
             function sendLeave() {
                 if (leaveSent || !isLive || reconfiguring) return;
                 leaveSent = true;
-                try { navigator.sendBeacon('/leave'); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                try { navigator.sendBeacon('/leave'); } catch (_) { noteSuppressed(); }
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
             }
             window.addEventListener('pagehide', sendLeave);
 
@@ -690,7 +874,7 @@
                 try {
                     const r = await fetch('/ice-config');
                     if (r.ok) return (await r.json()).iceServers || [];
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
                 return [];
             }
 
@@ -701,17 +885,50 @@
                     return arr.some((u) => typeof u === 'string' && /^turns?:/i.test(u));
                 });
             }
-            function waitForIceGathering(pc, timeoutMs) {
+            // WHEP is a single POST, so the offer has to carry every candidate we intend to
+            // use — there is no PATCH to trickle them in later. That does not mean waiting
+            // for gathering to *finish*: on a LAN the host candidates are the ones that will
+            // be nominated, they arrive in the first few milliseconds, and everything after
+            // them is a STUN round trip whose result the connection will never use. So the
+            // wait ends a short grace period after the last useful candidate rather than at
+            // the full deadline, and the deadline is only reached when nothing arrived.
+            const ICE_HOST_GRACE_MS = 200;
+            const ICE_RELAY_GRACE_MS = 400;
+            function waitForIceGathering(pc, timeoutMs, needRelay) {
                 if (pc.iceGatheringState === 'complete') return Promise.resolve();
                 return new Promise((resolve) => {
-                    const check = () => {
-                        if (pc.iceGatheringState === 'complete') {
-                            pc.removeEventListener('icegatheringstatechange', check);
-                            resolve();
+                    let settled = false;
+                    let graceTimer = 0;
+                    const deadline = setTimeout(() => {
+                        if (pc.iceGatheringState !== 'complete') degrade(DEG.ICE_GATHERING_DEADLINE);
+                        finish();
+                    }, timeoutMs || 3000);
+                    function finish() {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(deadline);
+                        if (graceTimer) clearTimeout(graceTimer);
+                        pc.removeEventListener('icegatheringstatechange', onState);
+                        pc.removeEventListener('icecandidate', onCandidate);
+                        resolve();
+                    }
+                    function arm(ms) {
+                        if (graceTimer) clearTimeout(graceTimer);
+                        graceTimer = setTimeout(finish, ms);
+                    }
+                    function onState() { if (pc.iceGatheringState === 'complete') finish(); }
+                    function onCandidate(ev) {
+                        const c = ev.candidate;
+                        if (!c || !c.candidate) { finish(); return; }
+                        const type = c.type || (/ typ (\w+)/.exec(c.candidate) || [])[1];
+                        if (needRelay) {
+                            if (type === 'relay') arm(ICE_RELAY_GRACE_MS);
+                        } else if (type === 'host' || type === 'srflx') {
+                            arm(ICE_HOST_GRACE_MS);
                         }
-                    };
-                    pc.addEventListener('icegatheringstatechange', check);
-                    setTimeout(resolve, timeoutMs || 3000);
+                    }
+                    pc.addEventListener('icegatheringstatechange', onState);
+                    pc.addEventListener('icecandidate', onCandidate);
                 });
             }
 
@@ -726,7 +943,8 @@
             }
 
             function teardownSession() {
-                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) {}
+                try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
+                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
@@ -735,17 +953,63 @@
                 if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
                 videoWorkerStats = null;
                 stopFallbackFrameStats();
-                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
-                try { if (pc) pc.close(); } catch (_) {}
+                try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
+                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
+            }
+
+            let transformStarted = false;
+            let transformWatchdog = null;
+
+            // One step down, not all the way: losing RTCRtpScriptTransform costs the
+            // keyframe request, losing WebCodecs entirely costs the whole jitter buffer
+            // (~90 ms) as well.
+            function retryWithLegacyTransform(reason) {
+                if (forceLegacyTransform || !hasLegacyEncodedStreams) {
+                    fallbackToVideo(reason);
+                    return;
+                }
+                forceLegacyTransform = true;
+                degrade(DEG.TRANSFORM_FELL_BACK_TO_LEGACY);
+                console.warn('falling back to createEncodedStreams:', reason);
+                teardownSession();
+                start(true);
             }
 
             function fallbackToVideo(reason) {
                 if (usingFallback) return;
                 usingFallback = true;
+                degrade(DEG.DEMOTED_TO_VIDEO);
                 console.warn('falling back to <video>:', reason);
                 teardownSession();
                 start(false);
+            }
+
+            // Presentation tier 2: decoded frames written into a track generator and played
+            // by the <video> element, which on some platforms lets the compositor take a
+            // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
+            // public measurement says the overlay actually happens, and the constructor
+            // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
+            function attachTrackGenerator(track) {
+                if (!track) {
+                    console.warn('[webcodecs] track generator unavailable; using the canvas');
+                    if (worker) {
+                        const off = freshCanvas().transferControlToOffscreen();
+                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                    }
+                    showCanvas();
+                    return;
+                }
+                try {
+                    video.srcObject = new MediaStream([track]);
+                    showVideo();
+                    startFallbackFrameStats();
+                    tryPlay();
+                } catch (err) {
+                    noteSuppressed();
+                    console.warn('[webcodecs] track generator attach failed:', err);
+                    showCanvas();
+                }
             }
 
             async function handleRenderCount(n) {
@@ -759,7 +1023,7 @@
                             }
                         });
                     }
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
                 const rendersAdvanced = n !== lastRendered;
                 const knowBytes = bytes >= 0;
                 const bytesAdvanced = knowBytes && bytes !== lastBytes;
@@ -768,7 +1032,18 @@
                 if (rendersAdvanced || bytesAdvanced) markAlive();
                 if (rendersAdvanced) { renderStalls = 0; return; }
                 if (bytesAdvanced) {
-                    if (++renderStalls >= 2) fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    renderStalls++;
+                    // Ask for a keyframe first — that is what a stall usually needs, and
+                    // until this page could ask, the only remedy was to throw the whole
+                    // fast path away and take the jitter buffer back.
+                    if (worker) worker.postMessage({ type: 'stats' });
+                    let asked = false;
+                    try { asked = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                    const keyTier = (videoWorkerStats && videoWorkerStats.keyTier) || 0;
+                    const canAsk = asked || keyTier === 1;
+                    if (renderStalls >= (canAsk ? 4 : 2)) {
+                        fallbackToVideo('webcodecs stalled (data arriving, no rendered frames)');
+                    }
                 } else {
                     renderStalls = 0;
                 }
@@ -833,6 +1108,9 @@
                 fallbackStats.rvfcSupported = true;
                 const step = function (_now, meta) {
                     fallbackStats.painted++;
+                    if (video.videoWidth > 0) {
+                        try { if (window.RemoteInput) RemoteInput.setPictureSize(video.videoWidth, video.videoHeight); } catch (_) { noteSuppressed(); }
+                    }
                     if (hostClockOffsetMs !== null && meta && typeof meta.rtpTimestamp === 'number') {
                         const hostMs = (meta.rtpTimestamp >>> 0) * 1000 / 90000;
                         const paintMs = performance.timeOrigin +
@@ -853,7 +1131,7 @@
 
             function stopFallbackFrameStats() {
                 if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
-                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) {}
+                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) { noteSuppressed(); }
                 }
                 rvfcHandle = 0;
                 fallbackStats.samples.length = 0;
@@ -862,6 +1140,8 @@
 
             function activeVideoPath() {
                 if (usingFallback || !worker) return video.srcObject ? VIDEO_PATH.videoElement : VIDEO_PATH.none;
+                const w = videoWorkerStats;
+                if (w && w.renderTier === 2) return VIDEO_PATH.webcodecsVideo;
                 return VIDEO_PATH.webcodecsCanvas;
             }
 
@@ -878,18 +1158,35 @@
                 return !!(document.fullscreenElement || document.webkitFullscreenElement);
             }
 
+            // Tier codes, mirrored in docs/TELEMETRY.md and in transform-worker.js.
+            const TRANSPORT_TIER = { none: 0, scriptTransform: 1, encodedStreams: 2 };
+            const RENDER_TIER = { none: 0, canvas2d: 1, trackGenerator: 2, videoElement: 3 };
+
+            function renderTierNow() {
+                if (usingFallback || !worker) return video.srcObject ? RENDER_TIER.videoElement : RENDER_TIER.none;
+                const w = videoWorkerStats;
+                return w ? (w.renderTier || RENDER_TIER.canvas2d) : RENDER_TIER.canvas2d;
+            }
+
             window.SEVideo = {
+                noteSuppressed,
                 getStats() {
                     const w = videoWorkerStats;
                     const fb = fallbackPercentiles();
                     const audio = (window.SEAudio && SEAudio.getSyncInfo()) || {};
+                    if (w && w.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
+                    if (w && w.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                    if (window.RemoteInput && RemoteInput.hasCoalescedEvents &&
+                        !RemoteInput.hasCoalescedEvents()) degrade(DEG.COALESCED_EVENTS_UNAVAILABLE);
+                    const workerSuppressed = (w && w.suppressed) || 0;
                     return {
                         videoPath: activeVideoPath(),
                         audioPath: activeAudioPath(),
                         sab: typeof SharedArrayBuffer === 'function',
                         crossOriginIsolated: !!self.crossOriginIsolated,
-                        wakeLock: !!(noSleep && noSleep.isEnabled),
+                        wakeLock: wakeLockHeld(),
                         pointerLock: !!document.pointerLockElement,
+                        pointerLockUnadjusted: pointerLockUnadjusted,
                         keyboardLock: !!(navigator.keyboard && navigator.keyboard.lock),
                         fullscreen: isFullscreen(),
                         setSinkId: typeof HTMLMediaElement !== 'undefined' &&
@@ -907,6 +1204,18 @@
                         audioUnderruns: audio.underruns || 0,
                         audioOverruns: audio.overruns || 0,
                         rvfcSupported: fallbackStats.rvfcSupported,
+                        // Which mechanism is live on each axis, so a device on a slow path
+                        // is distinguishable from a device on the fast one.
+                        transportTier: usingFallback ? TRANSPORT_TIER.none : ((w && w.transportTier) || TRANSPORT_TIER.none),
+                        renderTier: renderTierNow(),
+                        keyTier: (w && w.keyTier) || 0,
+                        sinkTier: (window.SEAudio && SEAudio.sinkTier && SEAudio.sinkTier()) || 0,
+                        suppressed: suppressedErrors + workerSuppressed +
+                            ((window.SEAudio && SEAudio.suppressedCount && SEAudio.suppressedCount()) || 0),
+                        degraded: degradeFlags | ((window.SEAudio && SEAudio.degradeFlags && SEAudio.degradeFlags(DEG)) || 0),
+                        audioTargetMs: audio.targetMs || 0,
+                        audioConcealed: audio.concealed || 0,
+                        audioOutputLatencyMs: audio.outputLatencyMs || 0,
                     };
                 },
             };
@@ -922,8 +1231,8 @@
             if (window.SEClock) {
                 SEClock.subscribe(function (offsetMs) {
                     hostClockOffsetMs = offsetMs;
-                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) {}
-                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) {}
+                    try { if (worker) worker.postMessage({ type: 'clockoffset', offsetMs: offsetMs }); } catch (_) { noteSuppressed(); }
+                    try { if (window.SEAudio) SEAudio.setHostClockOffset(offsetMs); } catch (_) { noteSuppressed(); }
                 });
             }
 
@@ -949,6 +1258,7 @@
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
+                    const useScriptTransform = useScriptTransformNow();
                     const iceServers = await getIceServers();
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
@@ -957,22 +1267,21 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
-                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) {}
+                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
                         if (audioFast) {
-                            SEAudio.prepare();
                             pc.ondatachannel = (ev) => {
                                 if (ev.channel && ev.channel.label === 'audio') {
                                     SEAudio.attachDataChannel(ev.channel);
                                 }
                             };
                         } else {
-                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+                            try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
                     try {
                         if ('playoutDelayHint' in videoTransceiver.receiver) videoTransceiver.receiver.playoutDelayHint = 0;
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
                         worker = await makeTransformWorker();
@@ -981,31 +1290,73 @@
                                 onStreamLive();
                             } else if (m.data.type === 'decodeerror') {
                                 console.warn('[webcodecs] decode error:', m.data.message);
+                            } else if (m.data.type === 'painterror') {
+                                noteSuppressed();
+                                console.warn('[webcodecs] paint error:', m.data.message);
                             } else if (m.data.type === 'configerror') {
                                 console.error('[webcodecs] configure() failed for codec', m.data.codec, ':', m.data.message);
                                 fallbackToVideo('VideoDecoder.configure failed: ' + m.data.message);
+                            } else if (m.data.type === 'decoderdead') {
+                                fallbackToVideo('decoder failed ' + m.data.resets + ' times in a row');
                             } else if (m.data.type === 'backlog') {
-                                console.warn('[webcodecs] decoder backlog (' + m.data.size + '); dropping to freshest frame');
+                                console.warn('[webcodecs] ' + m.data.inFlight + ' decodes still outstanding; skipping to the next keyframe');
+                            } else if (m.data.type === 'requestkey') {
+                                // The legacy transform cannot ask for an IDR itself; relay it
+                                // over the reliable input channel instead of freezing.
+                                let sent = false;
+                                try { sent = !!(window.RemoteInput && RemoteInput.requestKeyframe && RemoteInput.requestKeyframe()); } catch (_) { noteSuppressed(); }
+                                if (!sent) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                            } else if (m.data.type === 'nokeyframe') {
+                                // Only now is a demotion the right answer: we asked by every
+                                // means available and the host still sent no keyframe.
+                                console.warn('[webcodecs] no keyframe after ' + Math.round(m.data.waitedMs) + ' ms (keyTier=' + m.data.keyTier + ')');
+                                if (!m.data.keyTier) fallbackToVideo('no keyframe and no way to ask for one');
                             } else if (m.data.type === 'transformstart') {
-                                console.log('[webcodecs] onrtctransform FIRED — readable=' + m.data.hasReadable + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                                transformStarted = true;
+                                if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
+                                console.log('[webcodecs] transform started — transport=' + m.data.transport + ' sendKeyFrameRequest=' + m.data.hasSendKey);
+                            } else if (m.data.type === 'trackgen') {
+                                attachTrackGenerator(m.data.track);
                             } else if (m.data.type === 'firstframe') {
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
                             } else if (m.data.type === 'avsync') {
-                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
+                                try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'videostats') {
                                 videoWorkerStats = m.data.stats;
+                                if (m.data.stats && m.data.stats.displayWidth) {
+                                    try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.stats.displayWidth, m.data.stats.displayHeight); } catch (_) { noteSuppressed(); }
+                                }
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
                         };
-                        const off = freshCanvas().transferControlToOffscreen();
-                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        worker.postMessage({ type: 'outofbandkey', available: true });
+                        if (PRESENT_PREF === 'track') {
+                            worker.postMessage({ type: 'trackgen' });
+                        } else {
+                            const off = freshCanvas().transferControlToOffscreen();
+                            worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                        }
                         if (hostClockOffsetMs !== null) worker.postMessage({ type: 'clockoffset', offsetMs: hostClockOffsetMs });
                         startVideoStatsPoll();
                         if (useScriptTransform) {
-                            videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            try {
+                                videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
+                            } catch (err) {
+                                retryWithLegacyTransform('RTCRtpScriptTransform threw: ' + err.message);
+                                return;
+                            }
+                            // If the standard transform is present but never fires, the
+                            // legacy path is a better answer than the <video> element.
+                            if (hasLegacyEncodedStreams) {
+                                transformStarted = false;
+                                transformWatchdog = setTimeout(() => {
+                                    transformWatchdog = null;
+                                    if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
+                                }, 2500);
+                            }
                         } else {
                             let readable;
                             try {
@@ -1016,15 +1367,20 @@
                             }
                             worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
+                        // Both of these are inert on this path and deliberately kept: the
+                        // transform runs in place of libwebrtc's reference finder, so the
+                        // frame buffer they configure is never reached. They are set anyway
+                        // so a future engine that moves the transform downstream does not
+                        // silently reintroduce a jitter buffer.
                         try {
                             if ('jitterBufferTarget' in videoTransceiver.receiver) videoTransceiver.receiver.jitterBufferTarget = 0;
-                        } catch (_) {}
-                        showCanvas();
+                        } catch (_) { noteSuppressed(); }
+                        if (PRESENT_PREF !== 'track') showCanvas();
                     }
 
                     pc.ontrack = (e) => {
                         if (e.track.kind === 'audio') {
-                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) {}
+                            try { if (window.SEAudio) SEAudio.attachFallbackStream(e.streams[0]); } catch (_) { noteSuppressed(); }
                             return;
                         }
                         if (e.track.kind !== 'video') return;
@@ -1064,10 +1420,13 @@
                             }, 2000);
                         } else {
                             video.srcObject = e.streams[0];
+                            // These are real on this path, unlike on the WebCodecs one: the
+                            // <video> element goes through libwebrtc's frame buffer, so the
+                            // target it is given is the target it keeps.
                             try {
                                 if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 30;
-                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
-                            } catch (_) {}
+                                try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) { noteSuppressed(); }
+                            } catch (_) { noteSuppressed(); }
                             showVideo();
                             startFallbackFrameStats();
                             tryPlay();
@@ -1097,7 +1456,7 @@
                     await waitForIceGathering(pc, hasTurnServer(iceServers) ? 6000 : 3000);
 
                     let storedToken = '';
-                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) {}
+                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
                     const resp = await fetch('/whep', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -1118,7 +1477,7 @@
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
                     const issuedToken = resp.headers.get('X-Device-Token');
-                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) {} }
+                    if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     const answerSdp = await resp.text();
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
@@ -1127,11 +1486,21 @@
                             SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken);
                             Promise.resolve(SEAudio._enumPromise).then(() => SEAudio.postOutputs()).catch(() => {});
                         }
-                    } catch (_) {}
+                    } catch (_) { noteSuppressed(); }
 
                     if (webcodecs && worker) {
                         const plid = negotiatedProfileLevelId(answerSdp);
-                        if (plid) worker.postMessage({ type: 'codechint', profileLevelId: plid });
+                        if (!plid) degrade(DEG.NO_H264_FMTP);
+                        // The coded size goes with it: isConfigSupported can only answer
+                        // honestly about a configuration it has been given in full, and the
+                        // host was asked for exactly this size.
+                        const dpr = getDpr();
+                        worker.postMessage({
+                            type: 'codechint',
+                            profileLevelId: plid || '',
+                            width: Math.round(joinData.width * dpr),
+                            height: Math.round(joinData.height * dpr),
+                        });
                     }
                 } catch (err) {
                     console.error(err);
@@ -1152,7 +1521,7 @@
                 try {
                     const r = await fetch('/net-config');
                     if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
                 const u = new URL(location.href);
                 u.protocol = 'https:';
                 u.port = httpsPort;
@@ -1205,9 +1574,9 @@
             const DEVICE_TOKEN_KEY = 'se.deviceToken';
             try {
                 if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
-            } catch (_) {}
+            } catch (_) { noteSuppressed(); }
             fullscreenModeInput.addEventListener('change', () => {
-                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) {}
+                try { localStorage.setItem(FULLSCREEN_MODE_KEY, fullscreenModeInput.checked ? '1' : '0'); } catch (_) { noteSuppressed(); }
             });
 
             document.getElementById('brand').addEventListener('click', () => {
@@ -1255,18 +1624,31 @@
                 const r = window.screen && window.screen.refreshRate;
                 return (typeof r === 'number' && r >= 24 && r <= 500) ? clampRefresh(r) : 0;
             }
-            function relayRefreshRate(rate) {
-                if (!isLive || reconfiguring || kicked || !joinData || !rate) return;
+            // The measured rate is folded into joinData *before* the offer goes out, so the
+            // host builds the display at the right rate the first time. It used to be
+            // measured after the stream went live and then applied by tearing the session
+            // down and rebuilding it — every 90, 120 or 144 Hz client renegotiated about a
+            // second after connecting, retaking the host's display-correlation lock on the
+            // way. If the rate is still unknown at submit time it stays unknown: a later
+            // refinement only updates joinData, so the next reconfigure that happens for
+            // some other reason (an orientation change, a host setting) carries it.
+            const REFRESH_DEADLINE_MS = 400;
+            async function resolveRefreshRate() {
+                const reported = screenRefreshRate();
+                if (reported) return reported;
+                degrade(DEG.REFRESH_RATE_MEASURED);
+                const measured = await Promise.race([
+                    refreshRatePromise,
+                    new Promise((r) => setTimeout(() => r(0), REFRESH_DEADLINE_MS)),
+                ]);
+                return clampRefresh(measured) || 0;
+            }
+            function noteRefinedRefreshRate(rate) {
+                if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
                 if (Math.abs(rate - cur) < 5) return;
                 joinData.refreshRate = rate;
-                console.log('[refresh] refined to ' + rate + ' Hz; reconfiguring host display');
-                reconfigure();
-            }
-            async function refineRefreshRate() {
-                let rate = screenRefreshRate();
-                if (!rate) rate = clampRefresh(await refreshRatePromise);
-                relayRefreshRate(rate);
+                console.log('[refresh] refined to ' + rate + ' Hz; will apply at the next reconfigure');
             }
 
             function validate() {
@@ -1292,7 +1674,7 @@
                 const fs = params.get('fs');
                 if (fs === '0' || fs === '1') {
                     fullscreenModeInput.checked = fs === '1';
-                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) {}
+                    try { localStorage.setItem(FULLSCREEN_MODE_KEY, fs); } catch (_) { noteSuppressed(); }
                 }
 
                 const consumed = ['otp', 'name', 'fs'];
@@ -1351,7 +1733,7 @@
                 try {
                     if (hidden) localStorage.setItem(COMPAT_HIDE_KEY, '1');
                     else localStorage.removeItem(COMPAT_HIDE_KEY);
-                } catch (_) {}
+                } catch (_) { noteSuppressed(); }
             }
 
             function checkBrowserRequirements() {
@@ -1370,20 +1752,43 @@
                         severity: 'blocking',
                     });
                 }
+                // HTTPS can only restore what the browser withholds for lack of a secure
+                // context. On a page that is already secure it fixes nothing, and telling an
+                // iPhone that HTTPS will bring back an AudioDecoder its Safari has never
+                // shipped is simply wrong.
+                const httpsCouldHelp = !window.isSecureContext;
                 if (!canWebCodecs) {
                     unsupported.push({
                         name: 'WebCodecs video',
                         description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsCouldHelp,
                     });
                 }
-                if (!audioFast) {
+                if (!audioCaps.webcodecsOpus) {
                     unsupported.push({
-                        name: 'WebCodecs audio and AudioWorklet',
-                        description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
+                        name: 'WebCodecs audio',
+                        description: httpsCouldHelp
+                            ? 'Enables the lowest-latency audio path.'
+                            : 'This browser cannot decode Opus with WebCodecs, so the system audio the host sends plays over a standard audio track that the browser buffers on its own. The picture is unaffected.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsCouldHelp,
+                    });
+                }
+                if (!audioCaps.worklet) {
+                    unsupported.push({
+                        name: 'AudioWorklet',
+                        description: 'Runs the audio jitter buffer off the main thread. Without it, audio plays over a standard track the browser buffers on its own.',
+                        severity: 'optional',
+                        httpsFixable: httpsCouldHelp,
+                    });
+                }
+                if (canWebCodecs && audioCaps.webcodecsOpus && audioCaps.worklet && !self.crossOriginIsolated) {
+                    unsupported.push({
+                        name: 'Cross-origin isolation',
+                        description: 'Lets decoded audio reach the speakers through shared memory instead of a message queue. Without it audio still plays; it just costs a little more of this device.',
+                        severity: 'optional',
+                        httpsFixable: httpsCouldHelp,
                     });
                 }
                 const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
@@ -1491,7 +1896,7 @@
                 const m = document.getElementById('permModal');
                 const cont = document.getElementById('permContinue');
                 const skip = document.getElementById('permSkip');
-                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) {} };
+                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) { noteSuppressed(); } };
                 cont.onclick = () => done(onContinue);
                 skip.onclick = () => done(onSkip);
                 m.style.display = 'flex';
@@ -1501,13 +1906,19 @@
                 e.preventDefault();
                 if (connectBtn.disabled) return;
 
+                // Before any await: iOS only resumes an AudioContext from inside the gesture
+                // that created it, and everything after the first `await` in this handler is
+                // outside that window.
+                let audioReady = null;
+                try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
+
                 const g0 = screenGeom();
                 joinData = {
                     sessionId: sessionInput.value.trim(),
                     deviceName: nameInput.value.trim(),
                     otp: otpValue(),
                     os: detectOs(),
-                    refreshRate: screenRefreshRate() || 0,
+                    refreshRate: 0,
                     width: g0.width,
                     height: g0.height,
                 };
@@ -1529,24 +1940,39 @@
 
                 console.log('[join] connecting with', joinData);
 
-                try { if (window.SEAudio) { SEAudio.prepare().then(() => SEAudio.resume()); } } catch (_) {}
-
-                const startAudioAndStream = async () => {
+                // The fast audio path is decided here rather than from constructor
+                // existence, because the host reads `audioCapabilities` once and, if we
+                // claim the fast path, sends Opus on a DataChannel and puts no audio track
+                // in the answer at all. A prepare() that fails after that point is total
+                // silence with no way back. Safari 26 and Firefox 130 both newly pass the
+                // old constructor sniff, which is what made this urgent.
+                if (window.SEAudio) {
                     try {
-                        if (window.SEAudio) {
-                            SEAudio._enumPromise = SEAudio.unlockAndEnumerate();
-                            await SEAudio.micReady();
-                        }
-                    } catch (_) {}
-                    beginStreaming();
-                };
-                let needMic = false;
-                try { if (window.SEAudio) { SEAudio.initSpeakers(); needMic = await SEAudio.needsMicPermission(); } } catch (_) {}
-                if (needMic) {
-                    showPermModal(startAudioAndStream, () => beginStreaming());
-                } else {
-                    startAudioAndStream();
+                        audioCaps = await SEAudio.verifyCapabilities();
+                    } catch (_) { noteSuppressed(); audioCaps = { webcodecsOpus: false, worklet: false }; }
+                    if (audioReady) {
+                        let ok = false;
+                        try { ok = await audioReady; } catch (_) { noteSuppressed(); }
+                        if (!ok) { audioCaps.worklet = false; degrade(DEG.AUDIO_PREPARE_FAILED); }
+                    }
+                    audioFast = audioCaps.webcodecsOpus && audioCaps.worklet;
+                    if (!audioCaps.webcodecsOpus) degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
                 }
+
+                joinData.refreshRate = await resolveRefreshRate();
+
+                // Audio-output enumeration is for the host's device panel, not for playback:
+                // it must never stand between the user and the picture. It runs after the
+                // stream is under way and, where the browser needs a microphone grant to
+                // reveal output labels, asks then — the prompt used to gate the join for up
+                // to twelve seconds.
+                beginStreaming();
+                try {
+                    if (window.SEAudio) {
+                        SEAudio.initSpeakers();
+                        SEAudio._enumPromise = SEAudio.enumerateLazily(showPermModal);
+                    }
+                } catch (_) { noteSuppressed(); }
             });
         </script>
     </body>
