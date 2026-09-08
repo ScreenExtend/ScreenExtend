@@ -30,6 +30,7 @@ fn is_keyframe(au: &[u8]) -> bool {
 
 #[test]
 fn intel_quicksync_clamps_extreme_frame_rate() {
+    super::show_measurements();
     const W: u32 = 1920;
     const H: u32 = 1080;
 
@@ -69,6 +70,7 @@ fn intel_quicksync_clamps_extreme_frame_rate() {
 
 #[test]
 fn intel_quicksync_encodes_synthetic_frames() {
+    super::show_measurements();
     const W: u32 = 1280;
     const H: u32 = 720;
 
@@ -181,6 +183,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
 
 #[test]
 fn intel_quicksync_fused_downscale() {
+    super::show_measurements();
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };

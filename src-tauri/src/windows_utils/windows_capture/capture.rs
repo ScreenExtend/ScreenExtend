@@ -1,6 +1,6 @@
 use std::mem;
 use std::os::windows::prelude::AsRawHandle;
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, AtomicU32};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_future::AsyncActionCompletedHandler;
 
-use super::d3d11::{self, create_d3d_device};
+use super::d3d11::{self, create_d3d_device, AdapterInfo};
 use super::frame::Frame;
 use super::graphics_capture_api::{self, GraphicsCaptureApi, InternalCaptureControl};
 use super::settings::{GraphicsCaptureItemType, Settings};
@@ -284,6 +284,8 @@ pub struct Context<Flags> {
     pub device: ID3D11Device,
     /// The Direct3D device context.
     pub device_context: ID3D11DeviceContext,
+    /// Which adapter the device above was created on.
+    pub adapter: AdapterInfo,
 }
 
 /// Trait implemented by types that handle graphics capture events.
@@ -317,7 +319,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let thread_id = unsafe { GetCurrentThreadId() };
 
         // Create Direct3D device and context
-        let (d3d_device, d3d_device_context) = create_d3d_device()?;
+        let (d3d_device, d3d_device_context, adapter) = create_d3d_device(settings.gpu_preference)?;
 
         // Start capture
         let result = Arc::new(Mutex::new(None));
@@ -326,11 +328,19 @@ pub trait GraphicsCaptureApiHandler: Sized {
             flags: settings.flags,
             device: d3d_device.clone(),
             device_context: d3d_device_context.clone(),
+            adapter,
         };
 
         let callback = Arc::new(Mutex::new(
             Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
         ));
+        let (buffers, stale_frames) = {
+            let handler = callback.lock();
+            (
+                handler.frame_pool_buffers(),
+                handler.stale_frame_counter().unwrap_or_default(),
+            )
+        };
 
         let mut capture = GraphicsCaptureApi::new(
             d3d_device,
@@ -346,6 +356,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
             settings.minimum_update_interval_settings,
             settings.dirty_region_settings,
             settings.color_format,
+            buffers,
+            stale_frames,
             thread_id,
             result.clone(),
         )
@@ -415,7 +427,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 let thread_id = unsafe { GetCurrentThreadId() };
 
                 // Create direct3d device and context
-                let (d3d_device, d3d_device_context) = create_d3d_device()?;
+                let (d3d_device, d3d_device_context, adapter) =
+                    create_d3d_device(settings.gpu_preference)?;
 
                 // Start capture
                 let result = Arc::new(Mutex::new(None));
@@ -424,11 +437,19 @@ pub trait GraphicsCaptureApiHandler: Sized {
                     flags: settings.flags,
                     device: d3d_device.clone(),
                     device_context: d3d_device_context.clone(),
+                    adapter,
                 };
 
                 let callback = Arc::new(Mutex::new(
                     Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
                 ));
+                let (buffers, stale_frames) = {
+                    let handler = callback.lock();
+                    (
+                        handler.frame_pool_buffers(),
+                        handler.stale_frame_counter().unwrap_or_default(),
+                    )
+                };
 
                 let mut capture = GraphicsCaptureApi::new(
                     d3d_device,
@@ -444,6 +465,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
                     settings.minimum_update_interval_settings,
                     settings.dirty_region_settings,
                     settings.color_format,
+                    buffers,
+                    stale_frames,
                     thread_id,
                     result.clone(),
                 )
@@ -525,6 +548,24 @@ pub trait GraphicsCaptureApiHandler: Sized {
     /// Function that will be called to create the struct. The flags can be
     /// passed from settings.
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error>;
+
+    /// How deep the WinRT frame pool should be for this handler.
+    ///
+    /// Two is what OBS and Sunshine use for a consumer that encodes inline: one buffer the
+    /// compositor is writing, one we hold. A handler that hands the frame to another thread wants
+    /// one more so the copy and the encode can overlap. More than that only buys latency, because
+    /// the pool is a queue and a queue that fills is a queue you are behind.
+    #[inline]
+    fn frame_pool_buffers(&self) -> u32 {
+        2
+    }
+
+    /// Optional counter the pool increments for every frame it discards as stale while draining
+    /// to the newest one. Returning `None` means nobody is watching and the count is thrown away.
+    #[inline]
+    fn stale_frame_counter(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
 
     /// Called every time a new frame is available.
     fn on_frame_arrived(

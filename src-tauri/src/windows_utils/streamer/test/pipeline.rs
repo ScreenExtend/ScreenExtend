@@ -47,19 +47,24 @@ fn scale_never_produces_zero_dims() {
 
 #[test]
 #[allow(clippy::field_reassign_with_default)]
-fn encoder_config_tolerates_max_fps_below_60() {
+fn encoder_rate_follows_the_display_and_the_configured_ceiling() {
     let mut cfg = Config::default();
     cfg.fps = None;
     cfg.max_fps = 20;
     let enc = live_encoder_config(1920, 1080, 60, &cfg);
-    assert_eq!(enc.fps, 20);
+    assert_eq!(enc.fps, 20, "the ceiling wins over the display rate");
 
     cfg.max_fps = 144;
     let enc = live_encoder_config(1920, 1080, 120, &cfg);
     assert_eq!(enc.fps, 120);
 
+    // A 30 Hz display composes 30 times a second; encoding 60 only produces duplicates.
     cfg.max_fps = 240;
     let enc = live_encoder_config(1920, 1080, 30, &cfg);
+    assert_eq!(enc.fps, 30);
+
+    // An unreported rate still assumes 60.
+    let enc = live_encoder_config(1920, 1080, 0, &cfg);
     assert_eq!(enc.fps, 60);
 }
 

@@ -14,6 +14,17 @@ pub(crate) fn skip(what: &str, reason: impl std::fmt::Debug) {
     eprintln!("{msg}");
 }
 
+/// Route the log bus to stderr for the rest of the process.
+///
+/// The encode tests report their measurements with `tprintln!`, which only reaches stderr when
+/// `logbus::VERBOSE` is set — and nothing under `cargo test` sets it, so the only per-frame
+/// encode latency numbers this repo produces went into a ring buffer and were discarded at
+/// exit. The harness still captures them; `--nocapture` is what shows them.
+pub(crate) fn show_measurements() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::logbus::set_verbose(true));
+}
+
 mod amd_layout;
 mod h264;
 mod intel_encoder;
@@ -21,6 +32,7 @@ mod intel_layout;
 mod nvenc_encoder;
 mod nvenc_layout;
 mod pipeline;
+mod scaler;
 mod x264_encoder;
 
 #[test]
