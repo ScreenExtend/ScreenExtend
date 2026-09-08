@@ -352,6 +352,11 @@ fn worker(
             if jumped {
                 resyncs += 1;
                 pending_flags |= FLAG_DISCONTINUITY;
+                // The summary reported `discontinuity=0` through a re-seat, because nothing but
+                // the local counter recorded one.
+                diagnostics
+                    .discontinuity_count
+                    .fetch_add(1, Ordering::Relaxed);
             }
             next_capture_ns = Some(capture_ns.saturating_add(FRAME_NS));
             let is_silent = frame.iter().all(|&x| x == 0.0);
