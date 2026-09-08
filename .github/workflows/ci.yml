@@ -340,17 +340,23 @@ jobs:
       # x264 is the software fallback and the only encoder present on every machine, which
       # is what makes it comparable run to run; the GPU encoders are measured on the dev
       # boxes (docs/BASELINE.md), not here.
+      # Three runs, because a hosted runner is a shared VM: the same binary measured 4405 to
+      # 9067 us on the dev box purely according to what else was compiling. The gate takes the
+      # lowest of the three, which is the reading closest to the uncontended cost.
       - name: measure
         working-directory: src-tauri
         shell: bash
-        run: cargo test --release --lib x264_encoder -- --nocapture | tee ../perf-run.txt
+        run: |
+          for i in 1 2 3; do
+            cargo test --release --lib x264_encoder -- --nocapture | tee "../perf-run-$i.txt"
+          done
 
       - name: compare against ci/perf-baseline.json
         shell: bash
         run: |
           node scripts/perf-gate.mjs \
             --key "ci-${{ matrix.os }}" \
-            --input perf-run.txt \
+            --input perf-run-1.txt --input perf-run-2.txt --input perf-run-3.txt \
             --out perf-observed-${{ matrix.os }}.json
 
       - name: upload the observed numbers
@@ -359,6 +365,6 @@ jobs:
         with:
           name: perf-observed-${{ matrix.os }}
           path: |
-            perf-run.txt
+            perf-run-*.txt
             perf-observed-${{ matrix.os }}.json
           if-no-files-found: ignore

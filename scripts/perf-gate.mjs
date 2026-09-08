@@ -7,7 +7,11 @@
 //
 // Options:
 //   --key <k>        which entry of `baselines` to compare against. Required.
-//   --input <file>   read the measurement text from a file instead of stdin.
+//   --input <file>   read the measurement text from a file instead of stdin. Repeatable:
+//                    with several runs the LOWEST value per metric is used, which is the
+//                    one closest to the uncontended cost. On a machine with other work on
+//                    it a single run is nearly meaningless — the x264 p95 on the dev box
+//                    ranged 4405-9067 us across runs depending on what else was compiling.
 //   --baseline <f>   default ci/perf-baseline.json.
 //   --out <file>     write the observed numbers as JSON (a CI artifact; also what you
 //                    paste back into the baseline file to re-seed a runner).
@@ -60,8 +64,16 @@ function die(msg) {
   process.exit(2);
 }
 
+// The header comment above is the help text. Read it back rather than duplicating it, and stop
+// at the first non-comment line so extending it cannot silently truncate `--help`.
+function headerComment() {
+  const lines = readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1);
+  const end = lines.findIndex((l) => !l.startsWith("//"));
+  return lines.slice(0, end === -1 ? lines.length : end).join("\n");
+}
+
 function parseArgs(argv) {
-  const out = { baseline: resolve(REPO_ROOT, "ci/perf-baseline.json") };
+  const out = { baseline: resolve(REPO_ROOT, "ci/perf-baseline.json"), inputs: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => {
@@ -74,7 +86,7 @@ function parseArgs(argv) {
         out.key = next();
         break;
       case "--input":
-        out.input = next();
+        out.inputs.push(next());
         break;
       case "--baseline":
         out.baseline = resolve(next());
@@ -90,7 +102,7 @@ function parseArgs(argv) {
         break;
       case "-h":
       case "--help":
-        console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 24).join("\n"));
+        console.log(headerComment());
         process.exit(0);
         break;
       default:
@@ -100,10 +112,10 @@ function parseArgs(argv) {
   return out;
 }
 
-function readInput(path) {
-  if (path) return readFileSync(resolve(path), "utf8");
+function readRuns(paths) {
+  if (paths.length > 0) return paths.map((p) => readFileSync(resolve(p), "utf8"));
   try {
-    return readFileSync(0, "utf8");
+    return [readFileSync(0, "utf8")];
   } catch {
     die("no --input given and stdin is empty");
   }
@@ -122,12 +134,21 @@ try {
 const tolerance = args.tolerance ?? file.tolerance;
 if (!Number.isFinite(tolerance)) die("no usable tolerance (set `tolerance` in the baseline file)");
 
-const text = readInput(args.input);
+const runs = readRuns(args.inputs);
 
+// Best of N: the lowest reading is the one least polluted by whatever else the machine was
+// doing. Taking a mean or a median would fold the contention into the number and make the
+// gate a measure of the runner's mood.
 const observed = {};
-for (const [name, def] of Object.entries(METRICS)) {
-  const m = def.pattern.exec(text);
-  if (m) observed[name] = Number(m[1]);
+const samples = {};
+for (const text of runs) {
+  for (const [name, def] of Object.entries(METRICS)) {
+    const m = def.pattern.exec(text);
+    if (!m) continue;
+    const value = Number(m[1]);
+    (samples[name] ??= []).push(value);
+    if (!(name in observed) || value < observed[name]) observed[name] = value;
+  }
 }
 
 if (Object.keys(observed).length === 0) {
@@ -136,9 +157,11 @@ if (Object.keys(observed).length === 0) {
   process.exit(2);
 }
 
-console.log(`perf-gate: key=${args.key} tolerance=${(tolerance * 100).toFixed(1)}%`);
+console.log(`perf-gate: key=${args.key} tolerance=${(tolerance * 100).toFixed(1)}% runs=${runs.length}`);
 for (const [name, value] of Object.entries(observed)) {
-  console.log(`  observed  ${name} = ${value}${METRICS[name].unit}`);
+  const all = samples[name];
+  const spread = all.length > 1 ? ` (best of ${all.join(", ")})` : "";
+  console.log(`  observed  ${name} = ${value}${METRICS[name].unit}${spread}`);
 }
 
 if (args.out) {

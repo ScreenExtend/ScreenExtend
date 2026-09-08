@@ -11,11 +11,16 @@
     "as an artifact and passes, so the first CI run on a new runner tells you what to",
     "paste back here.",
     "",
-    "Tolerance is deliberately loose for hosted runners: they are shared VMs and the",
-    "encode numbers move several percent run to run. Tighten it once a key has a few",
-    "runs of history."
+    "Tolerance, and why it is not 5%: the x264 p95 measured on the dev box ranged 4405 to",
+    "9067 us across runs of the same release binary, entirely according to how many other",
+    "rustc processes were on the machine - a 2.06x spread with nothing changed in the code.",
+    "A hosted runner is a shared VM and is no quieter. Two things make the gate usable:",
+    "perf-gate.mjs takes several --input files and uses the LOWEST reading per metric (the",
+    "one least polluted by contention), and the tolerance below is set from the residual",
+    "spread of those minima rather than from a wish. Tighten it once a key has real history,",
+    "and drop it toward 5% only on a runner you know to be quiescent."
   ],
-  "tolerance": 0.05,
+  "tolerance": 0.2,
   "baselines": {
     "dev-windows-rtx3080ti": {
       "machine": "Windows 11 build 26200 (25H2), RTX 3080 Ti Laptop + Intel UHD, primary 1920x1080@360",
