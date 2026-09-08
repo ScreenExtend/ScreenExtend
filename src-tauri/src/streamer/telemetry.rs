@@ -370,17 +370,20 @@ pub struct SessionTelemetry {
     pub degradation: Degradation,
     pub frames_encoded: AtomicU64,
     pub bytes_sent: AtomicU64,
-    pub encoder: Mutexish<String>,
-    pub capture_backend: Mutexish<String>,
-    pub client: Mutexish<Option<ClientStats>>,
+    pub encoder: Slot<String>,
+    pub capture_backend: Slot<String>,
+    pub client: Slot<Option<ClientStats>>,
 }
 
-/// A one-field lock. Only the slow paths (a backend naming itself once at startup, a client stats
-/// frame arriving once a second, a reader building a report) touch these, never the frame path.
+/// One value behind a lock.
+///
+/// Only slow paths touch these — a backend naming itself once at startup, a client stats frame
+/// arriving once a second, a reader building a report — never the frame path, which is why a
+/// plain `Mutex` is the right thing here and an atomic would not be.
 #[derive(Default)]
-pub struct Mutexish<T>(std::sync::Mutex<T>);
+pub struct Slot<T>(std::sync::Mutex<T>);
 
-impl<T: Clone + Default> Mutexish<T> {
+impl<T: Clone + Default> Slot<T> {
     pub fn set(&self, v: T) {
         if let Ok(mut g) = self.0.lock() {
             *g = v;
@@ -393,6 +396,22 @@ impl<T: Clone + Default> Mutexish<T> {
 }
 
 pub type SharedTelemetry = Arc<SessionTelemetry>;
+
+impl SessionTelemetry {
+    /// Record a client stats frame, mirroring the two jitter counters into `degradation` so a
+    /// starving or spilling audio ring shows up beside the host-side degradations instead of
+    /// only inside the client blob. The client reports cumulative totals, so these are stored,
+    /// not added.
+    pub fn set_client_stats(&self, stats: ClientStats) {
+        self.degradation
+            .client_jitter_underruns
+            .store(stats.audio_underruns as u64, Ordering::Relaxed);
+        self.degradation
+            .client_jitter_overruns
+            .store(stats.audio_overruns as u64, Ordering::Relaxed);
+        self.client.set(Some(stats));
+    }
+}
 
 impl SessionTelemetry {
     pub fn new_shared() -> SharedTelemetry {
