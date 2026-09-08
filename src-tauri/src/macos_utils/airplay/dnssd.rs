@@ -36,6 +36,8 @@ unsafe extern "C" {
     ) -> DNSServiceErrorType;
 
     fn DNSServiceRefDeallocate(sdRef: DNSServiceRef);
+    fn DNSServiceRefSockFD(sdRef: DNSServiceRef) -> i32;
+    fn DNSServiceProcessResult(sdRef: DNSServiceRef) -> DNSServiceErrorType;
 
     fn TXTRecordCreate(txtRecord: *mut TXTRecordRefRaw, bufferLen: u16, buffer: *mut c_void);
     fn TXTRecordDeallocate(txtRecord: *mut TXTRecordRefRaw);
@@ -52,12 +54,24 @@ unsafe extern "C" {
 /// `kDNSServiceFlagsNoAutoRename`.
 ///
 /// Without it mDNSResponder resolves a name collision by silently renaming the
-/// instance to "ScreenExtend (2)" — and with a NULL registration callback we
-/// would never hear about it. [`super::ax::connect_to`] then looks for a picker
-/// row titled exactly "ScreenExtend", misses, and burns its whole budget. A
-/// `kDNSServiceErr_NameConflict` from `DNSServiceRegister` is far better: it is
-/// loud, and [`Advertisement::publish`] already propagates it.
+/// instance to "ScreenExtend (2)". [`super::ax::connect_to`] then looks for a
+/// picker row titled exactly "ScreenExtend", misses, and burns its whole budget
+/// on a device that is right there under another name.
+///
+/// **This flag is only legal with a registration callback.** Measured on
+/// 10.15.8: `DNSServiceRegister` with `0x8` and a NULL callback returns
+/// `kDNSServiceErr_BadParam` (-65540), on any interface, every time; the same
+/// call with a callback returns 0. That makes sense — the flag's entire meaning
+/// is "report the conflict instead of papering over it", and a NULL callback
+/// leaves nowhere to report it. So this constant and [`register_reply`] go
+/// together, and the module's "no event loop to pump" property is kept by
+/// pumping exactly once, with a deadline, at publish time.
 const KDNS_SERVICE_FLAGS_NO_AUTO_RENAME: DNSServiceFlags = 0x8;
+
+/// How long to wait at publish time for mDNSResponder's verdict.
+///
+/// The daemon answers a registration locally; it is not waiting on the network.
+const REGISTER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// `kDNSServiceFlagsIncludeAWDL` — include Apple Wireless Direct Link in a
 /// registration or browse.
@@ -207,11 +221,72 @@ impl Drop for TxtRecord {
     }
 }
 
+/// What mDNSResponder said about a registration.
+///
+/// Lives in a `Box` owned by the [`Service`] because `DNSServiceRegister` keeps
+/// the context pointer for the registration's whole life, not just for the one
+/// reply we wait for.
+#[derive(Default)]
+struct RegisterOutcome {
+    answered: bool,
+    error: DNSServiceErrorType,
+    name: Option<String>,
+}
+
+/// `DNSServiceRegisterReply`. Runs only from inside `DNSServiceProcessResult`,
+/// on the thread that calls it — so no synchronisation is needed.
+unsafe extern "C" fn register_reply(
+    _sd_ref: DNSServiceRef,
+    _flags: DNSServiceFlags,
+    error: DNSServiceErrorType,
+    name: *const c_char,
+    _regtype: *const c_char,
+    _domain: *const c_char,
+    context: *mut c_void,
+) {
+    if context.is_null() {
+        return;
+    }
+    let outcome = unsafe { &mut *(context as *mut RegisterOutcome) };
+    outcome.answered = true;
+    outcome.error = error;
+    if !name.is_null() {
+        outcome.name = unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_str()
+            .ok()
+            .map(str::to_string);
+    }
+}
+
+/// Waits for one reply on a `DNSServiceRef`, or gives up.
+///
+/// Returns whether a reply was processed. This is the whole "event loop": one
+/// bounded wait at publish time, never a background pump.
+fn pump_once(sd_ref: DNSServiceRef, timeout: std::time::Duration) -> bool {
+    let fd = unsafe { DNSServiceRefSockFD(sd_ref) };
+    if fd < 0 {
+        return false;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if ready <= 0 {
+        return false;
+    }
+    unsafe { DNSServiceProcessResult(sd_ref) == 0 }
+}
+
 /// One registered Bonjour service. Deregisters on drop.
 pub struct Service {
     sd_ref: DNSServiceRef,
     // The TXT buffer must outlive the registration.
     _txt: TxtRecord,
+    // As must the callback's context.
+    _outcome: Box<RegisterOutcome>,
     name: String,
 }
 
@@ -234,6 +309,7 @@ impl Service {
         let cname = CString::new(name).map_err(|_| "service name contains a NUL".to_string())?;
         let ctype = CString::new(regtype).map_err(|_| "service type contains a NUL".to_string())?;
 
+        let mut outcome = Box::new(RegisterOutcome::default());
         let mut sd_ref: DNSServiceRef = ptr::null_mut();
         let rc = unsafe {
             DNSServiceRegister(
@@ -247,29 +323,51 @@ impl Service {
                 port.to_be(),
                 txt_len,
                 txt_ptr,
-                ptr::null(),
-                ptr::null_mut(),
+                register_reply as *const c_void,
+                &mut *outcome as *mut RegisterOutcome as *mut c_void,
             )
         };
         if rc != 0 {
-            // -65548 is `kDNSServiceErr_NameConflict`: another instance of this
-            // name is already on the wire. With auto-rename off that is an
-            // error rather than a silent "(2)" suffix the picker would list and
-            // `ax::connect_to` would never match.
-            if rc == -65548 {
-                return Err(format!(
-                    "another AirPlay receiver called {name:?} is already advertised on this \
-                     network, so ScreenExtend cannot publish {regtype} under that name. A \
-                     previous ScreenExtend may not have shut down cleanly."
-                ));
-            }
             return Err(err(&format!("DNSServiceRegister({regtype})"), rc));
         }
-        Ok(Self {
+
+        let this = Self {
             sd_ref,
             _txt: txt,
+            _outcome: outcome,
             name: name.to_string(),
-        })
+        };
+
+        // The daemon answers locally and immediately; a reply that does not
+        // arrive here is not a failure, just an unconfirmed registration.
+        if pump_once(this.sd_ref, REGISTER_REPLY_TIMEOUT) && this._outcome.answered {
+            let error = this._outcome.error;
+            if error != 0 {
+                // -65548 is `kDNSServiceErr_NameConflict`. With auto-rename off
+                // that is what a duplicate produces, instead of a silent "(2)"
+                // suffix the picker would list and `ax::connect_to` would never
+                // match.
+                if error == -65548 {
+                    return Err(format!(
+                        "another AirPlay receiver called {name:?} is already advertised on this \
+                         network, so ScreenExtend cannot publish {regtype} under that name. A \
+                         previous ScreenExtend may not have shut down cleanly."
+                    ));
+                }
+                return Err(err(&format!("registering {regtype}"), error));
+            }
+            // Cannot happen with NoAutoRename, which is the point of asking.
+            if let Some(assigned) = this._outcome.name.as_deref() {
+                if assigned != name {
+                    return Err(format!(
+                        "mDNSResponder published {regtype} as {assigned:?} rather than {name:?}, \
+                         which the Displays picker will not match"
+                    ));
+                }
+            }
+        }
+
+        Ok(this)
     }
 }
 
