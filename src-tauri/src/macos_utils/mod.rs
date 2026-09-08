@@ -605,6 +605,7 @@ pub fn register_cloud_session(
         approved_devices: Some(state.approved_devices.clone()),
         otp_limiter: Some(state.otp_limiter.clone()),
         audio_hub: Some(state.audio_hub.clone()),
+        gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -747,6 +748,7 @@ pub fn sync_streamers(state: &AppState) {
             approved_devices: Some(state.approved_devices.clone()),
             otp_limiter: Some(state.otp_limiter.clone()),
             audio_hub: Some(state.audio_hub.clone()),
+            gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
             ..Config::default()
         };
 
