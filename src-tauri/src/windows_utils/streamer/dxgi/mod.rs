@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
 };
 
@@ -29,6 +29,23 @@ use crate::windows_capture::d3d11::AdapterInfo;
 use cursor::{build_sprite, quad_verts, BlendKind, CursorSprite, QuadRenderer};
 
 const REDUP_MAX_RETRIES: u32 = 40;
+
+/// How many `DXGI_ERROR_INVALID_CALL` recoveries to attempt before giving up. A settling virtual
+/// display produces a handful; an unbounded stream of them is a real fault.
+const INVALID_CALL_MAX_RECOVERIES: u32 = 20;
+
+/// Holds an acquired duplication frame and releases it on drop.
+///
+/// `AcquireNextFrame` and `ReleaseFrame` are a strict pair: miss one release and every subsequent
+/// acquire returns `DXGI_ERROR_INVALID_CALL` forever. `poll` has a `?` between the two, so any
+/// early return -- present or future -- used to leak the frame and wedge the capture thread.
+struct AcquiredFrame<'a>(&'a IDXGIOutputDuplication);
+
+impl Drop for AcquiredFrame<'_> {
+    fn drop(&mut self) {
+        let _ = unsafe { self.0.ReleaseFrame() };
+    }
+}
 
 /// Grows `bounds` to also contain `r`.
 fn union_rect(bounds: &mut Option<RECT>, r: RECT) {
@@ -54,6 +71,7 @@ pub struct Duplicator {
     output: IDXGIOutput1,
     dup: Option<IDXGIOutputDuplication>,
     redup_failures: u32,
+    invalid_call_recoveries: u32,
     /// `LastPresentTime` of the most recent dirty frame, already on the shared host clock.
     /// The compositor's own frame time; without it the pipeline can only measure from the
     /// moment `poll` returned, which hides however long the frame waited to be handed over.
@@ -329,6 +347,7 @@ impl Duplicator {
             output,
             dup: Some(dup),
             redup_failures: 0,
+            invalid_call_recoveries: 0,
             last_present_host_ns: 0,
             rotation,
             raw_rotation,
@@ -507,8 +526,31 @@ impl Duplicator {
                 self.dup = None;
                 return Ok(PollStatus::Timeout);
             }
+            // A frame was left acquired somewhere, or the duplication is in a state we cannot
+            // reason about. This is recoverable by re-duplicating; it used to kill the capture
+            // thread, which the client experiences as a connected session that stays black.
+            // A freshly created virtual display reliably reproduced it: the IDD is still
+            // attaching, `ACCESS_LOST` fires repeatedly, and the next acquire is invalid.
+            Err(e) if e.code() == DXGI_ERROR_INVALID_CALL => {
+                self.invalid_call_recoveries += 1;
+                if self.invalid_call_recoveries > INVALID_CALL_MAX_RECOVERIES {
+                    return Err(anyhow!(
+                        "AcquireNextFrame kept returning DXGI_ERROR_INVALID_CALL after \
+                         {INVALID_CALL_MAX_RECOVERIES} re-duplications: {e:?}"
+                    ));
+                }
+                teprintln!(
+                    "dxgi: AcquireNextFrame returned DXGI_ERROR_INVALID_CALL \
+                     (recovery {}/{INVALID_CALL_MAX_RECOVERIES}); re-duplicating",
+                    self.invalid_call_recoveries
+                );
+                self.dup = None;
+                return Ok(PollStatus::Timeout);
+            }
             Err(e) => return Err(anyhow!("AcquireNextFrame: {e:?}")),
         }
+        // Everything past here is inside the acquire; the guard releases on every exit path.
+        let _acquired = AcquiredFrame(&dup);
 
         let mut dirty = false;
 
@@ -574,8 +616,6 @@ impl Duplicator {
                 self.pointer_pos = pos;
             }
         }
-
-        let _ = unsafe { dup.ReleaseFrame() };
 
         Ok(if dirty && self.have_desktop {
             PollStatus::Dirty
