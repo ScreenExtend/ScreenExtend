@@ -932,6 +932,11 @@
         }
     }
 
+    // Proof that the worker script actually ran, not merely that `new Worker` returned.
+    const WORKER_READY_DEADLINE_MS = 3000;
+    let workerReady = false;
+    let workerReadyTimer = null;
+
     function startWorker() {
         if (state.worker) return true;
         let w;
@@ -942,6 +947,8 @@
             return false;
         }
         w.onmessage = (ev) => {
+            workerReady = true;
+            if (workerReadyTimer) { clearTimeout(workerReadyTimer); workerReadyTimer = null; }
             const d = ev.data;
             if (!d) return;
             if (d.type === 'sync') {
@@ -961,7 +968,26 @@
                 abandonWebCodecsAudio();
             }
         };
-        w.onerror = (e) => { note(); console.warn('[audio] decoder worker error:', e); };
+        // A Worker whose script 404s, is blocked by CSP, or throws while parsing is
+        // *constructed successfully* and then never posts anything. Logging that and
+        // carrying on left dc.onmessage feeding a worker that would never answer, with
+        // the client still reporting audioPath 1 while playing silence for the session.
+        w.onerror = (e) => {
+            note();
+            console.warn('[audio] decoder worker error:', e);
+            abandonWebCodecsAudio();
+        };
+        // Nothing above proves the script ran. The worker answers `init` with `mode`,
+        // so a deadline on that first reply is the only thing that distinguishes a
+        // worker that started from one that was built and is dead.
+        if (workerReadyTimer) clearTimeout(workerReadyTimer);
+        workerReady = false;
+        workerReadyTimer = setTimeout(function () {
+            workerReadyTimer = null;
+            if (workerReady || state.worker !== w) return;
+            console.warn('[audio] decoder worker never answered in ' + WORKER_READY_DEADLINE_MS + ' ms');
+            abandonWebCodecsAudio();
+        }, WORKER_READY_DEADLINE_MS);
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
         handOffRingPort();
@@ -971,6 +997,8 @@
 
     function stopWorker() {
         releaseRingPort();
+        if (workerReadyTimer) { clearTimeout(workerReadyTimer); workerReadyTimer = null; }
+        workerReady = false;
         if (!state.worker) return;
         try { state.worker.terminate(); } catch (_) { note(); }
         state.worker = null;
@@ -998,11 +1026,15 @@
     }
 
     async function attachDataChannel(dc) {
+        // Both of these used to be a bare `return`: no handler installed, no bit set, and the
+        // host already told `webcodecsOpus: true`, so the session played nothing and reported
+        // itself on the fast path. Every exit from here now takes the ladder instead.
         if (!(await prepare())) {
             console.warn('[audio] cannot prepare WebCodecs path');
+            abandonWebCodecsAudio();
             return;
         }
-        if (!startWorker()) return;
+        if (!startWorker()) { abandonWebCodecsAudio(); return; }
         state.dc = dc;
         dc.binaryType = 'arraybuffer';
         dc.onmessage = (ev) => {

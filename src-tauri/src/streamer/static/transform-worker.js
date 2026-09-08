@@ -157,6 +157,10 @@ let decodeErrors = 0;
 let keyRequests = 0;
 let framesDroppedBacklog = 0;
 let decoderHardware = false;
+// Set when every candidate was refused with the coded-size hint and accepted without it:
+// the hint was the client's request, not the host's stream. Reported, because it is the
+// difference between "this device cannot decode H.264" and "we asked the wrong question".
+let sizeHintRejected = false;
 
 function nowAbsMs() { return performance.timeOrigin + performance.now(); }
 
@@ -430,6 +434,8 @@ function collectStats() {
     keyRequests: keyRequests,
     clockValid: clockValid,
     decoderHardware: decoderHardware,
+    sizeHintRejected: sizeHintRejected,
+    configured: configured,
     transportTier: transportTier,
     renderTier: renderTier,
     keyTier: keyTier,
@@ -530,15 +536,25 @@ function makeDecoder() {
   return d;
 }
 
-function decoderConfig(codec) {
+// The coded size is a *hint*, never a requirement. It is what the client asked the host for,
+// and the host does not build that: it snaps the DPR to a step the OS actually exposes, rounds
+// the backing size down to an even number, clamps it, and then applies a per-device video scale
+// that shrinks the encoded frame again. So the hinted size is routinely larger than the stream
+// that arrives — and a UA that answers `isConfigSupported` honestly about a size it cannot
+// decode would fail every candidate and demote the whole session to <video> for good.
+//
+// A real size still lets a UA answer honestly rather than guess, so it is worth offering; it is
+// simply never worth failing over. `sized` false is the same configuration without it.
+function decoderConfig(codec, sized) {
   const cfg = { codec: codec, optimizeForLatency: true };
-  // A real coded size lets a UA answer isConfigSupported honestly instead of guessing, and
-  // it is the size the host was asked for.
-  if (hintWidth > 0 && hintHeight > 0) {
+  if (sized && hintWidth > 0 && hintHeight > 0) {
     cfg.codedWidth = hintWidth;
     cfg.codedHeight = hintHeight;
   }
   return cfg;
+}
+function hasSizeHint() {
+  return hintWidth > 0 && hintHeight > 0;
 }
 
 function withAcceleration(cfg, mode) {
@@ -572,22 +588,35 @@ async function doConfigure() {
   // Probe exactly the configuration we are about to install. The old code probed
   // `{codec}` and configured `{codec, optimizeForLatency}`, so a UA that accepted the first
   // and rejected the second threw where nothing was watching.
-  let chosen = decoderConfig(candidates[0]);
+  let chosen = decoderConfig(candidates[0], hasSizeHint());
   if (typeof VideoDecoder.isConfigSupported === 'function') {
     let anySupported = false;
-    for (const c of candidates) {
-      const cfg = decoderConfig(c);
-      try {
-        // `no-preference` first, never `prefer-hardware` alone: Chromium's prefer-hardware
-        // installs a GPU-only decoder factory with no software fallback, so it reports
-        // unsupported on machines that would decode this stream perfectly well.
-        const s = await VideoDecoder.isConfigSupported(cfg);
-        if (s && s.supported) {
-          chosen = (s.config && s.config.codec) ? s.config : cfg;
-          anySupported = true;
-          break;
-        }
-      } catch (_) { note(); }
+    // Two rounds where a size hint exists: the sized configuration first, because that is the
+    // one a UA can answer honestly about, then the same candidates unsized. Only failing both
+    // is a real "this device cannot decode H.264", which is the one verdict worth demoting on.
+    const rounds = hasSizeHint() ? [true, false] : [false];
+    for (let r = 0; r < rounds.length && !anySupported; r++) {
+      for (const c of candidates) {
+        const cfg = decoderConfig(c, rounds[r]);
+        try {
+          // `no-preference` first, never `prefer-hardware` alone: Chromium's prefer-hardware
+          // installs a GPU-only decoder factory with no software fallback, so it reports
+          // unsupported on machines that would decode this stream perfectly well.
+          const s = await VideoDecoder.isConfigSupported(cfg);
+          if (s && s.supported) {
+            chosen = (s.config && s.config.codec) ? s.config : cfg;
+            anySupported = true;
+            break;
+          }
+        } catch (_) { note(); }
+      }
+      if (!anySupported && rounds[r]) {
+        // Worth naming: it means the hinted size was the thing being refused, and the size is
+        // the client's request rather than the host's stream.
+        sizeHintRejected = true;
+        console.warn('[webcodecs] no configuration accepted ' + hintWidth + 'x' + hintHeight +
+          '; retrying without the coded-size hint');
+      }
     }
     if (!anySupported) {
       configError = 'no supported H.264 decoder configuration';

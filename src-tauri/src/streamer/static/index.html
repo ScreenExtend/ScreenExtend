@@ -932,12 +932,36 @@
             }
             window.addEventListener('pagehide', sendLeave);
 
-            async function getIceServers() {
+            // `/ice-config` answers with the servers *and* the host's own view of where this
+            // client is, which is the only reliable source for whether the session will be
+            // relayed. An older host sends no `locality` field; `unknown` is then the honest
+            // answer and the wait falls back to reading the server list, which is what this
+            // page did before the field existed.
+            async function getIceConfig() {
                 try {
                     const r = await fetch('/ice-config');
-                    if (r.ok) return (await r.json()).iceServers || [];
+                    if (r.ok) {
+                        const j = await r.json();
+                        return {
+                            iceServers: (j && j.iceServers) || [],
+                            locality: (j && typeof j.locality === 'string') ? j.locality : 'unknown',
+                        };
+                    }
                 } catch (_) { noteSuppressed(); }
-                return [];
+                return { iceServers: [], locality: 'unknown' };
+            }
+
+            // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
+            // waiting for one is only right when nothing else can carry the session. The host
+            // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
+            // the list" is not the question. On a LAN the host candidate is what gets nominated,
+            // it arrives in milliseconds, and refusing to end the wait on it cost every join on a
+            // TURN-configured host the difference; a TURN server that is merely unreachable cost
+            // the whole 6 s deadline before the WHEP POST was even sent.
+            function relayNeeded(cfg) {
+                if (cfg.locality === 'same-network') return false;
+                if (cfg.locality === 'cross-network') return hasTurnServer(cfg.iceServers);
+                return hasTurnServer(cfg.iceServers);
             }
 
             function hasTurnServer(iceServers) {
@@ -1387,6 +1411,7 @@
             }
 
             const TRANSFORM_START_TIMEOUT_MS = 2500;
+            const FRAME_WATCHDOG_MS = 5000;
             const WHEP_TIMEOUT_MS = 10000;
 
             async function start(preferWebCodecs) {
@@ -1398,12 +1423,15 @@
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const useScriptTransform = useScriptTransformNow();
-                    const iceServers = await getIceServers();
+                    const iceConfig = await getIceConfig();
                     if (stale()) return;
-                    // Computed once and carried into the gathering wait: without it the wait
-                    // took the LAN branch on every session and cut gathering ~200 ms in, before
-                    // any TURN allocation could return.
-                    const needRelay = hasTurnServer(iceServers);
+                    const iceServers = iceConfig.iceServers;
+                    // Computed once and carried into the gathering wait: without it the wait took
+                    // the LAN branch on every session and cut gathering ~200 ms in, before any
+                    // TURN allocation could return. It comes from the host's locality rather than
+                    // from the server list, because a LAN host hands out TURN as a backup.
+                    const needRelay = relayNeeded(iceConfig);
+                    if (DEBUG) console.log('[ice] locality=' + iceConfig.locality + ' needRelay=' + needRelay);
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
@@ -1419,7 +1447,16 @@
                                     SEAudio.attachDataChannel(ev.channel);
                                 }
                             };
-                        } else {
+                        }
+                        // The recvonly audio section goes in on both paths now. Off the fast
+                        // path it carries the track the host feeds. On the fast path it is the
+                        // spare `wantsFallbackTrack` asks for — and an SDP answer may not add an
+                        // m-line the offer did not contain (RFC 3264 §6), so without a section
+                        // here the host's spare track has nowhere to land and is simply dropped
+                        // from the answer. WHEP has no renegotiation verb, so this is the only
+                        // moment it can exist at all: without it a decoder that says "supported"
+                        // and then fails on real packets is silence for the rest of the session.
+                        if (!audioFast || audioCaps.wantsFallbackTrack) {
                             try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) { noteSuppressed(); }
                         }
                     }
@@ -1494,9 +1531,24 @@
                                 // Latched here rather than in SEVideo.getStats(), which is the
                                 // documented console read-side: typing it must not change what
                                 // the host is told.
+                                // The poll fires its first tick immediately, before the
+                                // transform is installed, and the worker answers from its
+                                // initial state: keyTier 0 because no transform has fired and
+                                // no PONG has landed, decoderHardware false because
+                                // doConfigure has not run. Latching either from that reply set
+                                // both bits on every session for the rest of its life. Both
+                                // conditions are re-evaluated instead, and only once the thing
+                                // that determines them has actually happened.
                                 if (m.data.stats) {
-                                    if (m.data.stats.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
-                                    if (m.data.stats.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                    const w = m.data.stats;
+                                    if (w.configured) {
+                                        if (w.decoderHardware === false) degrade(DEG.DECODER_HW_UNAVAILABLE);
+                                        else undegrade(DEG.DECODER_HW_UNAVAILABLE);
+                                    }
+                                    if (w.transportTier) {
+                                        if (w.keyTier === 0) degrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                        else undegrade(DEG.KEYFRAME_REQUEST_IMPOSSIBLE);
+                                    }
                                 }
                                 if (m.data.stats && m.data.stats.displayWidth) {
                                     try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.stats.displayWidth, m.data.stats.displayHeight); } catch (_) { noteSuppressed(); }
@@ -1551,7 +1603,16 @@
                     // sendKeyFrameRequest(). Measure from the first sign that packets should
                     // be flowing instead.
                     let transformWatchdogArmed = false;
+                    // Both watchdogs are armed from the same event, and it is this one: the
+                    // moment packets should be flowing. They used to start from different
+                    // origins — this one at ICE-connected, the 5 s demotion at `ontrack`, which
+                    // is during setRemoteDescription and therefore *earlier* — so any join whose
+                    // ICE took more than about 2.5 s after the answer had the 5 s timer fire
+                    // first and skip the ladder entirely. A cross-network or relayed join
+                    // reaching 3 s of ICE is ordinary, and the cost was landing on <video> for
+                    // the whole session instead of stepping one rung to createEncodedStreams.
                     function armTransformWatchdog() {
+                        armFrameWatchdog();
                         if (transformWatchdogArmed || transformStarted) return;
                         if (!(webcodecs && useScriptTransform && hasLegacyEncodedStreams)) return;
                         transformWatchdogArmed = true;
@@ -1559,6 +1620,25 @@
                             transformWatchdog = null;
                             if (!transformStarted) retryWithLegacyTransform('RTCRtpScriptTransform never fired');
                         }, TRANSFORM_START_TIMEOUT_MS);
+                    }
+
+                    // The bottom of the ladder, but it steps rather than jumps: a script
+                    // transform that never fired still has a rung below it that keeps WebCodecs
+                    // and the ~90 ms the <video> element costs. retryWithLegacyTransform falls
+                    // through to fallbackToVideo where there is no legacy transform, so this
+                    // stays bounded either way.
+                    function armFrameWatchdog() {
+                        // Only the WebCodecs path has anything to demote to; the <video> path
+                        // is already the floor and its liveness is the reconfig poll's job.
+                        if (watchdog || !webcodecs) return;
+                        watchdog = setTimeout(() => {
+                            watchdog = null;
+                            if (webcodecs && useScriptTransform && hasLegacyEncodedStreams && !transformStarted) {
+                                retryWithLegacyTransform('no WebCodecs frame within 5s');
+                            } else {
+                                fallbackToVideo('no WebCodecs frame within 5s');
+                            }
+                        }, FRAME_WATCHDOG_MS);
                     }
 
                     pc.ontrack = (e) => {
@@ -1600,7 +1680,6 @@
                                     if (!foundInbound) console.log('[webcodecs] NO inbound-rtp stat yet; candidate-pair=' + pair);
                                 }).catch((err) => console.log('[webcodecs] getStats failed', err));
                             }, 1000);
-                            watchdog = setTimeout(() => fallbackToVideo('no WebCodecs frame within 5s'), 5000);
                             lastRendered = -1; lastBytes = -1; renderStalls = 0;
                             if (liveWatch) clearInterval(liveWatch);
                             liveWatch = setInterval(() => {

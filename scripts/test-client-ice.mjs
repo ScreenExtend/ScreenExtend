@@ -47,6 +47,8 @@ const source = [
   takeFunction('iceCandidateType'),
   takeFunction('iceGraceFor'),
   takeFunction('waitForIceGathering'),
+  takeFunction('hasTurnServer'),
+  takeFunction('relayNeeded'),
   // `const` is lexically scoped to the script and never reaches the context object.
   'this.__grace = { host: ICE_HOST_GRACE_MS, relay: ICE_RELAY_GRACE_MS };',
 ].join('\n');
@@ -63,6 +65,27 @@ const ctx = {
 };
 vm.createContext(ctx);
 vm.runInContext(source, ctx, { filename: 'index.html:ice' });
+
+// --- who actually needs a relay ------------------------------------------------------------
+// The host serves TURN to same-subnet clients on purpose, as a backup, so the presence of a TURN
+// entry says nothing about whether the session will be relayed. Only the host's own locality
+// does, and it is the field `/ice-config` was extended to carry.
+
+const TURN = [{ urls: ['turn:relay.example:3478'], username: 'u', credential: 'c' }];
+const STUN = [{ urls: 'stun:stun.example:19302' }];
+const relayCases = [
+  [{ locality: 'same-network', iceServers: TURN }, false, 'a LAN session does not wait for a relay, even with TURN configured'],
+  [{ locality: 'same-network', iceServers: [] }, false, 'a LAN session with no servers does not wait for a relay'],
+  [{ locality: 'cross-network', iceServers: TURN }, true, 'a cross-network session with TURN waits for a relay'],
+  [{ locality: 'cross-network', iceServers: STUN }, false, 'a cross-network session with no TURN cannot wait for a relay it will never get'],
+  [{ locality: 'unknown', iceServers: TURN }, true, 'an older host with no locality field falls back to the server list'],
+  [{ locality: 'unknown', iceServers: [] }, false, 'an older host with no TURN takes the LAN branch'],
+];
+for (const [cfg, want, msg] of relayCases) {
+  const got = ctx.relayNeeded(cfg);
+  if (got !== want) fail(msg + ' (got ' + got + ')');
+  else ok(msg);
+}
 
 // --- the pure gating table -----------------------------------------------------------------
 
