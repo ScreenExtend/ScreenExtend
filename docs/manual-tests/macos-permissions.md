@@ -182,3 +182,42 @@ keeps showing a checkmark.
   binary, is what TCC keys on — which is exactly why step 4 checks the parent pid.
 - `doctor` exits 0 when everything is fine, 1 when the OS is unsupported, and 3 when
   the OS is fine but a required permission reads denied.
+
+---
+
+## 8. The mid-session re-probe (W13b) — needs macOS 15+
+
+`macos_utils::start_session_watchdog` re-reads `permissions::screen_recording_live()` every
+30 s **while at least one session holds a live display**, and acts only on a definite
+`Some(true) -> Some(false)` transition. Nothing on the 10.15.8 dev box can produce that
+transition, so this is the script for a Sequoia machine.
+
+Why it exists: macOS 15 re-asks for screen-recording consent roughly every 30 days. If the
+user dismisses that dialog, the capture APIs keep delivering frames — they just contain
+wallpaper, the menu bar and our own windows — so before this the host reported a healthy
+stream while the client showed a blank desktop, and nothing appeared in the log until
+something happened to restart the pipeline.
+
+1. Start the host and join a device. Confirm the stream is live.
+2. Revoke Screen Recording for ScreenExtend in System Settings (or move the approval date
+   backwards in
+   `~/Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist`, which
+   needs Full Disk Access, and dismiss the dialog without re-approving).
+3. Within ~30 s the host log must show
+   `[tcc] Screen Recording authorization was revoked while streaming.` and the connected
+   device must be dropped rather than left watching wallpaper.
+4. Re-grant, relaunch, reconnect: the stream comes back.
+
+Two things this deliberately does **not** do. It never treats a `None` read as a refusal —
+`screen_recording_live()` returns `None` when it could not learn the answer (no other
+titled window on screen), and acting on that would reproduce the false-positive defect the
+window-list probe was introduced to fix. And it does not raise the permission modal on the
+host: that needs a new event and a fourth button in the gate, which is a UI change and is
+recorded as a recommendation in `docs/OPTIMIZATIONS.md` instead.
+
+The same watchdog polls `airplay::take_geometry_changed()` when the display backend is the
+AirPlay tier, and bumps the reconfig epoch for every session when macOS has moved the
+display underneath us. To exercise that (pre-10.14.4 tier only): resize the AirPlay display
+from Displays preferences during a live session and confirm the client re-negotiates on its
+next `/reconfig` poll without a restart, with `[airplay] macOS changed the display
+geometry` in the log.

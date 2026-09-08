@@ -485,7 +485,51 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         Ok(())
     }
 
+    /// The display controller the probe's `platform::setup` created, so every exit path can
+    /// take its virtual displays away again.
+    ///
+    /// A measurement harness that leaves a display attached poisons the *next* run: a leftover
+    /// virtual monitor was enough to make the following `probe --live` fail with "Failed to
+    /// convert item to `GraphicsCaptureItem`", and the run after that succeeded once the
+    /// leftover had gone. One bad run silently changing the next run's numbers is the worst
+    /// failure mode a baseline can have.
+    static PROBE_DISPLAY: std::sync::Mutex<Option<crate::streamer::session::SharedVirtualDisplay>> =
+        std::sync::Mutex::new(None);
+
+    /// Remove whatever the probe created. Idempotent, and safe to call from a signal handler or
+    /// a panic hook — it takes the controller out, so a second call does nothing.
+    fn cleanup_displays() {
+        let display = PROBE_DISPLAY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(display) = display {
+            platform::remove_all_displays(&display);
+        }
+    }
+
+    /// Arm every exit path: normal return, Ctrl+C, and a panic anywhere in the process.
+    fn arm_display_cleanup(app: &tauri::AppHandle) {
+        {
+            use tauri::Manager;
+            let state = app.state::<platform::AppState>();
+            *PROBE_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(state.virtual_display.clone());
+        }
+        let _ = ctrlc::set_handler(|| {
+            cleanup_displays();
+            // 130 is the conventional "terminated by SIGINT", and the harness scripts read it.
+            exit(130);
+        });
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            cleanup_displays();
+            previous(info);
+        }));
+    }
+
     fn finish(result: anyhow::Result<()>) -> ! {
+        cleanup_displays();
         // `exit()` skips destructors, and a piped stdout is block-buffered, so without this
         // the whole report can be lost — which reads as "the probe printed nothing".
         let flush = || {
@@ -549,13 +593,14 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
             finish(audio_probe(secs));
         }
 
-        if (mode.live.is_some() || mode.selftest)
-            && !tauri::async_runtime::block_on(platform::setup(app.clone()))
-        {
-            eprintln!("error: could not initialize the virtual display driver.");
-            eprintln!("Install it first (Administrator): ScreenExtend drivers install");
-            eprintln!("Check the rest of the environment with: ScreenExtend doctor");
-            exit(1);
+        if mode.live.is_some() || mode.selftest {
+            if !tauri::async_runtime::block_on(platform::setup(app.clone())) {
+                eprintln!("error: could not initialize the virtual display driver.");
+                eprintln!("Install it first (Administrator): ScreenExtend drivers install");
+                eprintln!("Check the rest of the environment with: ScreenExtend doctor");
+                exit(1);
+            }
+            arm_display_cleanup(app);
         }
 
         if let Some(path) = mode.live {
@@ -1987,6 +2032,7 @@ mod desktop {
                     "display": report.display_backend,
                     "audio": report.audio_backend,
                     "hostedNetwork": report.hosted_network_backend,
+                    "input": report.input_backend,
                 },
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
                     "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
@@ -2046,6 +2092,7 @@ mod desktop {
         println!("  Display:        {}", report.display_backend);
         println!("  Audio:          {}", report.audio_backend);
         println!("  Hosted network: {}", report.hosted_network_backend);
+        println!("  Input:          {}", report.input_backend);
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {

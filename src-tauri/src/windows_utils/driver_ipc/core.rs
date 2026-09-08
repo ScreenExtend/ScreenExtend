@@ -58,6 +58,39 @@ pub enum EventCommand {
     Changed(Vec<Monitor>),
 }
 
+/// One item from the event stream: either an event, or the number of events that were dropped
+/// because the consumer fell behind.
+///
+/// The gap has to be observable. `DriverClient` caches the monitor list from this stream and
+/// `refresh_state` reads that cache, so a dropped `Changed` leaves the cache disagreeing with
+/// the driver and nothing downstream can repair it — the symptom being "the virtual display
+/// quietly did not appear, or quietly did not change resolution".
+#[derive(Debug, Clone)]
+pub enum EventOrLag {
+    Event(EventCommand),
+    Lagged(u64),
+}
+
+/// The wire contract this build speaks.
+///
+/// The format is one JSON object per message terminated by `0x04` over a named pipe, with
+/// `#[serde(untagged)]` enums on both sides — so a message that almost matches a variant is
+/// mis-decoded rather than rejected, and a genuinely new message type is indistinguishable from
+/// corruption. Fixing that means changing a wire format shared with a signed third-party binary,
+/// which cannot be done without rebuilding the driver.
+///
+/// What *can* be done compatibly is negotiate: a rebuilt driver serves an additional pipe named
+/// [`versioned_pipe_name`], the host prefers it, and a driver that predates versioning simply
+/// does not have it, so the host falls back to the unversioned pipe and behaves exactly as
+/// before. No new message is ever sent to an old driver — which matters, because how the shipped
+/// driver reacts to a message it cannot decode is not something this project can test.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The pipe a driver speaking [`PROTOCOL_VERSION`] would serve, alongside the unversioned one.
+pub fn versioned_pipe_name(base: &str) -> String {
+    format!("{base}.v{PROTOCOL_VERSION}")
+}
+
 /// An untagged enum of commands to be used with deserialization.
 /// This makes the deserialization process much easier to handle
 /// when a received command could be of multiple types

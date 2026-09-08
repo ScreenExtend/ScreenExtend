@@ -92,6 +92,16 @@ pub struct Duplicator {
     /// The compositor's own frame time; without it the pipeline can only measure from the
     /// moment `poll` returned, which hides however long the frame waited to be handed over.
     last_present_host_ns: u64,
+    /// Frames the OS accumulated while we were busy with the previous one, summed since the
+    /// last drain. `AccumulatedFrames` is documented as "the number of frames the operating
+    /// system accumulated since the calling application processed the last desktop image", so
+    /// everything past the first is a present the client never saw — free drop telemetry that
+    /// was read only as a `> 1` early-out.
+    accumulated_extra: u64,
+    /// `ProtectedContentMaskedOut` is reported once per capture, not per frame: DRM content is
+    /// a persistent property of what is on screen, and the symptom (a black rectangle where a
+    /// video should be) otherwise has no explanation anywhere.
+    protected_content_warned: bool,
 
     rotation: DXGI_MODE_ROTATION,
     raw_rotation: DXGI_MODE_ROTATION,
@@ -534,6 +544,8 @@ impl Duplicator {
             redup_without_frame: 0,
             invalid_call_recoveries: 0,
             last_present_host_ns: 0,
+            accumulated_extra: 0,
+            protected_content_warned: false,
             rotation,
             raw_rotation,
             phys_w,
@@ -717,6 +729,11 @@ impl Duplicator {
         self.last_present_host_ns
     }
 
+    /// Take the frames the OS coalesced away since the last call, and reset the count.
+    pub fn take_accumulated_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.accumulated_extra)
+    }
+
     pub fn poll(&mut self, timeout_ms: u32) -> Result<PollStatus> {
         let Some(dup) = self.dup.clone() else {
             self.redup()?;
@@ -761,6 +778,14 @@ impl Duplicator {
         // produced nothing" run ends here.
         self.redup_without_frame = 0;
         self.invalid_call_recoveries = 0;
+
+        self.accumulated_extra += u64::from(info.AccumulatedFrames.saturating_sub(1));
+        if info.ProtectedContentMaskedOut.as_bool() && !self.protected_content_warned {
+            self.protected_content_warned = true;
+            teprintln!(
+                "dxgi: the desktop image has protected content masked out — DRM-protected                  video will reach the client as a black rectangle"
+            );
+        }
 
         let mut dirty = false;
 
