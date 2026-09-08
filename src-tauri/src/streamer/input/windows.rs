@@ -122,6 +122,9 @@ pub struct Injector {
     touch_dev: Option<HSYNTHETICPOINTERDEVICE>,
     contacts: HashMap<u32, Contact>,
     pen_down: bool,
+    /// Pointer id of the pen contact currently down, so the release on teardown carries the
+    /// same id the down did.
+    pen_id: u32,
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
@@ -156,6 +159,7 @@ impl Injector {
             touch_dev,
             contacts: HashMap::new(),
             pen_down: false,
+            pen_id: 1,
             // No lock until the client says so. Starting at `true` meant the first frame of a
             // session was treated as relative, so a touch client's opening tap — which arrives
             // as a bare `POINTER_DOWN` with no move before it — clicked wherever the host
@@ -216,7 +220,7 @@ impl Injector {
             } => match *source {
                 SRC_MOUSE => self.mouse_pointer(*x, *y, *buttons, *phase),
                 SRC_PEN => self.pen(
-                    *x, *y, *pressure, *tilt_x, *tilt_y, *twist, *buttons, *phase,
+                    *id, *x, *y, *pressure, *tilt_x, *tilt_y, *twist, *buttons, *phase,
                 ),
                 SRC_TOUCH => self.touch(*id, *x, *y, *pressure, *w, *h, *phase),
                 _ => {}
@@ -267,7 +271,17 @@ impl Injector {
 
         if self.pen_down {
             if let Some(dev) = self.pen_dev {
-                let info = self.pen_info(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, POINTER_FLAG_UP);
+                let info = self.pen_info(
+                    self.pen_id,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                    POINTER_FLAG_UP,
+                );
                 inject_pointer(dev, &[info]);
             }
             self.pen_down = false;
@@ -421,6 +435,7 @@ impl Injector {
                 for s in &samples[..real] {
                     if source == SRC_PEN {
                         self.pen(
+                            id,
                             s.x,
                             s.y,
                             s.pressure,
@@ -525,6 +540,7 @@ impl Injector {
     #[allow(clippy::too_many_arguments)]
     fn pen(
         &mut self,
+        id: u32,
         x: f32,
         y: f32,
         pressure: f32,
@@ -543,6 +559,7 @@ impl Injector {
             self.mouse_pointer(x, y, b, phase);
             return;
         };
+        self.pen_id = pen_pointer_id(id);
         let flags = match phase {
             Phase::Down => {
                 self.pen_down = true;
@@ -568,13 +585,14 @@ impl Injector {
                 POINTER_FLAG_UP
             }
         };
-        let info = self.pen_info(x, y, pressure, tilt_x, tilt_y, twist, buttons, flags);
+        let info = self.pen_info(id, x, y, pressure, tilt_x, tilt_y, twist, buttons, flags);
         inject_pointer(dev, &[info]);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn pen_info(
         &self,
+        id: u32,
         x: f32,
         y: f32,
         pressure: f32,
@@ -595,7 +613,7 @@ impl Injector {
         let pen = POINTER_PEN_INFO {
             pointerInfo: POINTER_INFO {
                 pointerType: PT_PEN,
-                pointerId: 1,
+                pointerId: pen_pointer_id(id),
                 pointerFlags: flags,
                 ptPixelLocation: pt,
                 ..Default::default()
@@ -942,6 +960,21 @@ fn mouse_input(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
                 dwExtraInfo: 0,
             },
         },
+    }
+}
+
+/// The pointer id to inject a pen contact under.
+///
+/// It used to be the literal 1 for every client, so two sessions drawing at once presented
+/// Windows with two synthetic pen contacts sharing an id. The touch path has always passed the
+/// client's own id straight through, so this does the same, with the one guard that Windows
+/// treats 0 as "no pointer".
+#[inline]
+fn pen_pointer_id(id: u32) -> u32 {
+    if id == 0 {
+        1
+    } else {
+        id
     }
 }
 

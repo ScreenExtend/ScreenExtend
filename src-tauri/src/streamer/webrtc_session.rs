@@ -676,6 +676,11 @@ pub async fn handle_whep_offer(
                 // local interval, not a stamp anything else compares against.
                 let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
+                // One log line per distinct rejection per channel, so a client whose page has
+                // drifted from this host build is diagnosable without a flood. A drifted client
+                // repeats the same malformed frame thousands of times a second.
+                let mut reported_errors: std::collections::HashSet<input::protocol::ParseError> =
+                    std::collections::HashSet::new();
                 // The Pong reply used to be written from inside the receive handler, which
                 // head-of-line blocked every later message on this channel behind an SCTP send.
                 // It goes to a task that owns the channel instead, so the handler only ever
@@ -696,8 +701,22 @@ pub async fn handle_whep_offer(
                     pong_tx
                 });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let Some(parsed) = input::protocol::parse(&msg.data) else {
-                        return Box::pin(async {});
+                    let parsed = match input::protocol::parse(&msg.data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            telemetry_for_stats
+                                .degradation
+                                .input_parse_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            if reported_errors.insert(e) {
+                                teprintln!(
+                                    "input: rejected a frame on the {} channel: {e} ({} bytes)",
+                                    if is_reliable { "reliable" } else { "fast" },
+                                    msg.data.len()
+                                );
+                            }
+                            return Box::pin(async {});
+                        }
                     };
                     // Both of these are transport business and are answered before the
                     // remote-control gate: a device with control disabled still needs its
@@ -738,7 +757,9 @@ pub async fn handle_whep_offer(
                                 idr_keyframes.request_quietly();
                             }
                         }
-                        ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),
+                        ev if control_enabled => {
+                            tx.route(ev, parsed.fast, parsed.client_ns, parsed.seq)
+                        }
                         _ => {}
                     }
                     Box::pin(async {})
