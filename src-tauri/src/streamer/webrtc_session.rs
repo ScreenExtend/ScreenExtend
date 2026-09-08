@@ -45,6 +45,8 @@ const BWE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 const OPUS_FALLBACK_FMTP: &str = "minptime=5;useinbandfec=1;stereo=1;sprop-stereo=1";
 const AUDIO_BACKPRESSURE_BYTES: usize = 16 * 1024;
+/// Floor on how often a client's out-of-band keyframe request may force an IDR.
+const MIN_IDR_REQUEST_GAP: Duration = Duration::from_millis(200);
 
 pub struct InputParams {
     pub device: Option<String>,
@@ -400,8 +402,10 @@ pub async fn handle_whep_offer(
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
         let session_telemetry = Arc::clone(&pipeline.telemetry);
+        let pipeline_for_input = pipeline.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let session_telemetry = Arc::clone(&session_telemetry);
+            let pipeline_for_input = pipeline_for_input.clone();
             let label = dc.label().to_string();
             if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
                 return Box::pin(async {});
@@ -428,6 +432,12 @@ pub async fn handle_whep_offer(
                     });
                 }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
+                let idr_pipeline = pipeline_for_input.clone();
+                // The client rate-limits itself to one request per 200 ms, but that limit is
+                // advisory: a hostile or looping client must not be able to pin the encoder at
+                // one IDR per frame. `Instant` rather than the host clock because this is a
+                // local interval, not a stamp anything else compares against.
+                let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
                 // The Pong reply used to be written from inside the receive handler, which
                 // head-of-line blocked every later message on this channel behind an SCTP send.
@@ -462,6 +472,23 @@ pub async fn handle_whep_offer(
                         input::protocol::InputEvent::Ping { t_ns } => {
                             if let Some(pong_tx) = &pong_tx {
                                 let _ = pong_tx.send(t_ns);
+                            }
+                        }
+                        // The receiver has no other way to ask: a client on the legacy encoded
+                        // transform runs instead of libwebrtc's reference finder, so no PLI is
+                        // ever emitted for it and a single lost keyframe would otherwise freeze
+                        // the picture until its own watchdog gave up on the WebCodecs path.
+                        input::protocol::InputEvent::KeyframeRequest { .. } => {
+                            let now = std::time::Instant::now();
+                            let allowed = last_idr_request
+                                .is_none_or(|t| now.duration_since(t) >= MIN_IDR_REQUEST_GAP);
+                            if allowed {
+                                last_idr_request = Some(now);
+                                telemetry_for_stats
+                                    .degradation
+                                    .client_keyframe_requests
+                                    .fetch_add(1, Ordering::Relaxed);
+                                idr_pipeline.request_idr();
                             }
                         }
                         ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),

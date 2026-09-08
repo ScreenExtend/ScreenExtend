@@ -243,7 +243,10 @@ impl Injector {
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { x, y, items } => self.drop_files(*x, *y, items),
             // Handled by the transport before dispatch: none of these inject anything.
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
+            InputEvent::Ping { .. }
+            | InputEvent::Pong { .. }
+            | InputEvent::ClientStats(_)
+            | InputEvent::KeyframeRequest { .. } => {}
         }
     }
 

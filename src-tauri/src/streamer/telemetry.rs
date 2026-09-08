@@ -298,6 +298,7 @@ counters! {
     frames_dropped_ring => "frames_dropped_ring",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
+    client_keyframe_requests => "client_keyframe_requests",
     idrs_sent => "idrs_sent",
     encoder_resets => "encoder_resets",
     encoder_transient_errors => "encoder_transient_errors",
