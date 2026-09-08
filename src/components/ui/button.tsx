@@ -44,7 +44,11 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
     const Comp = asChild ? Slot : "button"
     return (
       <Comp
-        className={cn(buttonVariants({ variant, size, className }), "hover:opacity-75")}
+        // `hover:opacity-75` used to be merged *after* `className`, so tailwind-merge
+        // always resolved the conflict in its favour and a caller could not override it.
+        // It stays out of `buttonVariants` because alert-dialog and devices.tsx call that
+        // directly and must keep rendering without the fade.
+        className={cn(buttonVariants({ variant, size }), "hover:opacity-75", className)}
         ref={ref}
         {...props}
       />

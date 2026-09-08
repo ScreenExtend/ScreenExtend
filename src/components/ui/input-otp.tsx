@@ -35,7 +35,11 @@ const InputOTPSlot = React.forwardRef<
   React.ComponentPropsWithoutRef<"div"> & { index: number }
 >(({ index, className, ...props }, ref) => {
   const inputOTPContext = React.useContext(OTPInputContext)
-  const { char, hasFakeCaret, isActive } = inputOTPContext.slots[index]
+  // Outside an <InputOTP>, or past `maxLength`, upstream dereferences undefined and takes
+  // the whole Settings page down with it.
+  const slot = inputOTPContext?.slots?.[index]
+  if (!slot) return null
+  const { char, hasFakeCaret, isActive } = slot
 
   return (
     <div

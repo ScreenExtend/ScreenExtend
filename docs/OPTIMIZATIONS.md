@@ -87,7 +87,6 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 65 | cloud | `CloudClient::spawn`'s `.ok()` replaced with a reported error; the `signal_response` send checked; the no-op `if let Some(()) = …{}` reduced | A failed thread spawn left `handle` as `None`, so `stop()` silently did nothing and the desktop UI sat on the startup "connecting" state forever with no line explaining it. A dropped `signal_response` is a join that hangs for the client and looks like nothing at all from the host. | three errors discarded | `CloudState::Error` with the reason; a named log line when the relay writer is gone | COMPILE-CHECKED | yes | The `SESSION_TAKEN` substring match on a formatted error string is untouched — see `findings/minor-cloud-session-taken-is-a-substring-match.md`. |
 
 | 66 | input (macOS) | The Ctrl<->Command remap becomes conditional on the client's own platform: `ClientPlatform::from_reported` parses the `os` string the join request already carries, `ClientProfile` threads it to the injector, and `modifier_keycode` selects a pass-through or a swapped modifier row (`streamer/input/{mod,macos,windows,generic,linux}.rs`, `streamer/{webrtc_session,server}.rs`) | `code_to_keycode` rewrote the modifier row unconditionally — Ctrl to Command, Meta to Control — with no reference to who was typing. That is right for a PC keyboard, where Ctrl is the command modifier, and exactly backwards for an Apple one. | a Mac or iPad client pressing Command+C sent `MetaLeft`, the host injected `VK_CONTROL`, and macOS received Control+C, which is not copy; their Ctrl+A (start-of-line in Cocoa) arrived as Command+A, select-all | Command+C copies from every client and Ctrl+A moves the caret from an Apple one, with Windows and Android clients unchanged | VERIFIED (unit: both tables asserted key by key, plus that every non-modifier key is identical in both); UNVERIFIED (no Mac or iPad client available to type on) | yes | The information was already on the wire and validated — `os` is in the join request (`server.rs`, `MAX_OS_LEN`) and `detectOs()` in the client page produces it — it had simply never been threaded past the session layer. `ClientPlatform` keeps all five variants rather than collapsing to a boolean, because guessing from a boolean is how the original bug happened; an unreported platform logs once and assumes a PC layout, which is the pre-existing behaviour and the commoner client. `recompute_mods` derives its `CGEventFlags` from the *remapped* keycodes, so it is self-consistent with whichever table is chosen and needed no change. A per-device override for a non-standard layout is the natural extension and is not implemented. |
-
 | 67 | audio-win | `capture_ns` anchored to `min(qpcpos, now - read_duration)` instead of `qpcpos` alone | `qpcpos` is documented as when "the audio endpoint device read the device position", but on a **loopback** stream the endpoint is a *render* device and that position is its play cursor — so the stamp is a playout time, in the future. The client sizes its jitter buffer from `enqueue - capture_ns`, so a future capture time is surplus audio delay. | `capture -> subscriber` recorded **0 samples** (every span negative); `capture_ns` skew min -20.36 / mean -14.65 / max +5.61 ms, **1596/1601 packets stamped ahead of the host clock**, spread 26 ms, offset moving with host load | `capture -> subscriber` p50 9.44 / p90 9.44 / p99 9.44-10.49 / max 10.9 ms; skew min -3.04 / mean +7.69 / max +10.9 ms, <=1/1601 ahead | VERIFIED (Win 11 26200, `probe --audio`, 3 runs, idle) | yes | One engine period plus the intra-burst offset, which is what it should physically be. `ts_clamped` counts how often the endpoint stamp was in the future: on this box, every drain. |
 | 68 | audio-win | Silent render companion negotiates the engine period via `IAudioClient3::GetSharedModeEnginePeriod` + `InitializeSharedAudioStream(min)` | Microsoft documents that any stream on an endpoint can lower the whole endpoint's period, and the loopback capture stream cannot ask for itself (`AUDCLNT_E_INVALID_STREAM_FLAG`). The companion can, and capture inherits it. Expected -5 to -7.3 ms where a driver exposes a small buffer. | wake interval p50/p90/p99 9.44 ms, max 10.3-10.6 ms; engine periods `default = fundamental = min = max = 480 frames (10.000 ms)` | identical — the probe correctly declines, because there is no smaller period to request on this driver | VERIFIED **no-op on this hardware**; the request path is COMPILE-CHECKED | yes | Not a failure: this OEM driver exposes exactly one period. The in-box High Definition Audio Device driver documents 128-480 frames and is how the other branch gets exercised; that needs a driver swap plus a reboot, so it is a manual test. Landing it also fixed "nothing on any machine could say what period it was running at". |
 | 69 | audio-win | Process-loopback tier added (`ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, excluding our own pid), probed by attempting activation | A second tier for the cases endpoint loopback structurally cannot serve: an exclusive-mode endpoint, device churn, an endpoint that will not activate. Ordering to be decided by measurement, not assumption. | endpoint tier: wake 9.44/9.44/9.44/23.11 ms, capture->packet 5.77/9.44/9.44/24.07 ms | process tier: wake 9.44/9.44/10.49/11.32 ms, capture->packet 6.29/9.44/10.49/11.41 ms | VERIFIED (both tiers, 8 s each, idle) | yes, as **tier 2** | Neither is meaningfully faster — same shared engine. The endpoint tier keeps p99 by one bucket, so the long-shipping path stays first. Settled two open questions from the research: process loopback needs **no** silent companion (999 packets in 5 s with none anywhere), and its event does fire. |
@@ -163,8 +162,150 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 168 | ui (desktop) | Past Devices rows keyed on `${token}\|${ip}` instead of `ip`; the device-editor body mounts during render rather than from an effect | Device trust is keyed on the per-device token, so one IP legitimately owns several rows -- one per device that has used the address -- and keying on the IP alone collapsed them onto a single React identity, which is how a row can show another device's ban state. | React's duplicate-key warning on every Settings render, invisible in a release build | unique per row | VERIFIED -- found by running the app, not by reading it: `logbus::set_verbose(true)` forced on in a debug build made the frontend's `console.error` forwarding print to the terminal, and this was the only frontend line in the whole boot | yes | The same bug in the *connected* devices table was fixed in row 87. Worth noting as a method: the error-forwarding wrapper turned a class of React warning that nobody can see in a release build into something a terminal run reports. |
 | 169 | audio (macOS) | SCK audio teardown: blank the delegate ivar, stop the stream, post a synchronous barrier onto the serial delivery queue, then free the context box | `stop()` freed the box after releasing the stream, delegate and queue, on a comment that asserted no callback could still read it. Releasing a `DispatchQueue` handle neither drains nor cancels blocks already enqueued on it, and `stopCaptureWithCompletionHandler:` is not documented as a barrier against an in-flight `stream:didOutputSampleBuffer:ofType:` -- so the delegate surviving one extra retain handed a real-time callback a dangling pointer. | a use-after-free racing the `UserInteractive` delivery queue on every teardown, presenting as a rare crash on disconnecting the last audio-enabled device -- or as nothing | the ivar is null before the stop, and the serial queue is drained to a barrier before the free; three ordered steps with no window between them | COMPILE-CHECKED (13.0+ path, no machine on this project runs it) | yes | The Process Tap sibling needs none of this: `AudioDeviceDestroyIOProcID` is documented not to return while the IOProc runs. `macos_utils/streamer/sck.rs` (W5) still has the identical shape and the recipe transfers verbatim. |
 | 170 | audio (macOS) | SCK dummy video stream: added `showsCursor: false` and `queueDepth: 3` to the existing 2x2 at 1 fps | SCK has no audio-only mode before the 14.2 Process Tap, so this backend must run a real screen stream to get audio at all. The Screen Recording requirement and the menu-bar indicator are Apple's constraint; what the stream costs while it is up is not. | 2x2 at 1 fps with default cursor compositing and default queue depth | same geometry with cursor compositing off and the shallowest queue SCK accepts; no screen output is registered, so every frame produced is dropped at the delegate | COMPILE-CHECKED (13.0+ path) | yes | `powermetrics` on a 13.x machine is the measurement; `setExcludesCurrentProcessAudio: true` was already correct, so the host's own audio is not fed back. |
+| 171 | client / input | The optional input tails are sent, gated on the host's `PONG` capability bits: a `u64` client stamp on `POINTER_*`, `POINTER_MOVE_BATCH`, `WHEEL`, `KEY` and `MOUSE_DELTA`, and the `MOUSE_DELTA` event-flags byte carrying `UNADJUSTED` (`static/input.js`) | The host can measure its own queue and injection but not the wire: `input_recv` is derived from a client stamp no client sent, so the histogram stays empty however busy the session is. Separately the client knew whether `unadjustedMovement` had been granted and had nowhere to put it, so the host could not tell whether the deltas had already been through an OS pointer curve. | `input_recv` count 0 on every session; the host guesses about the pointer curve | frames carry the stamp and the flag once the host advertises bits 3 and 4, and are byte-identical to v1 until then | COMPILE-CHECKED (`node scripts/test-client-stats.mjs` asserts both directions byte for byte, and the merged host advertises all four bits and reads every tail at the offsets asserted here; nothing has been measured end to end, because neither dev box can run the client page) | yes | Gated rather than sent unconditionally even though the host's length checks are floors: a stamp a host does not read is bytes buying no measurement, and byte 8 of `MOUSE_DELTA` is a byte an older host reads as the pad it used to be. `hostCaps` is 0 until the first `PONG`, so a session's first second is plain v1 -- which is also what an older host gets for its whole life. |
+| 172 | client / audio | `audioCapabilities` gains `wantsFallbackTrack` and `verified`; `ontrack` remembers the audio stream instead of attaching it (`static/audio.js`, `static/index.html`) | WHEP has no renegotiation verb, so a track absent from the first answer can never be added later. A client claiming the WebCodecs path is answered with no audio section at all, which makes every way that path can fail *after* the answer a silence with no route back -- and the client is the only side that knows whether a spare track would be useful. | a mid-session decoder failure is silence until the user rejoins | the request is on the wire, and the client attaches a spare track only once the fast path is gone | UNVERIFIED (both halves are now on the branch: `AudioCapabilities` reads both fields, logs `verified` and honours `wantsFallbackTrack`; no browser here to join with) | yes | Attaching on `ontrack` is what would have made a spare track a regression rather than a safety net: a fast-path client handed one would report `netEQ` in the stats frame and play a silent element beside its worklet. The retirement and worklet-failed paths recompute the request, since off the fast path the host already sends a track it feeds. |
+| 173 | client / audio | Samples go worker to worklet over a transferred `MessagePort` when there is no `SharedArrayBuffer`, instead of worker to page to worklet (`static/audio.js`, `audio-worker.js`, `audio-worklet.js`) | 200 packets a second at the host's 5 ms framing means 400 postMessage hops and 400 typed-array allocations, half of them on the main thread that also runs the reconfig fetch, the `getStats` poll and every pointer event. A long task there is an underrun, and an underrun re-primes the jitter buffer -- up to `MAX_TARGET_MS` of silence from one stall. | 2 hops and 2 allocations per packet, one hop on the main thread | 1 hop, no main-thread involvement, same 2 allocations | UNVERIFIED (no browser on either dev box; the path also needs a secure context that is *not* cross-origin isolated, which is why it is almost never exercised) | yes | Offered, not assumed: the page sends the far end to the worklet, the worklet acknowledges on its own port, and only then does the worker get the near end. An engine that will not transfer a port into an `AudioWorkletGlobalScope` never acknowledges and the page relay carries on unchanged. `getSyncInfo().transport` gained a third value (`port`) so which of the three is live is readable. |
+| 174 | client / net | The `/audio-outputs` poll drops from 4 s to 30 s where `devicechange` exists, and `postOutputs` skips a body identical to the last one sent (`static/audio.js`) | Where the event exists the poll is a redundant second mechanism, and the POST fired unconditionally for a list that changes a handful of times in a session. | 15 enumerations + 15 POSTs per minute per device | 2 per minute where `devicechange` works, and a POST only when the list differs | UNVERIFIED | yes | The identity setter clears the cache, so a new connection -- including a reconfigure that rebuilt a session with the same token -- always posts once. Where `devicechange` is absent the 4 s poll is unchanged, because there it *is* the mechanism. |
+| 175 | client / input | Dropped files are screened against `pc.sctp.maxMessageSize` before they are read, and a refusal is named; `rawSend` reports a throw once per session (`static/input.js`) | A drop is one SCTP message with no chunking opcode and no host-side reassembly, so anything above the negotiated maximum threw inside an empty catch: no transfer, no error, no console line, nothing the host could log. The whole-file read also allocated the file before any size was checked. | a large drop silently does nothing | the file is refused before it is read, with the size and the limit named | UNVERIFIED | yes | Enforced only where the browser reports a limit: `maxMessageSize` can be `Infinity` and `pc.sctp` is absent on Safari and below Chrome 76, so refusing on a guess there would break drops that work today. Chunking is the real fix and needs a host opcode -- rejected here, see the note below. |
+| 176 | client | The refresh-rate refinement is a *second* 60-sample measurement taken once the page is live, and is applied once by a reconfigure when it disagrees with the join-time number by more than the clamp step (`static/index.html`) | The join can only afford 24 samples behind a 500 ms deadline. A page whose first half-second was throttled — backgrounded, or behind a layout storm — ships a rate that is far too low, and a refinement that only ever wrote `joinData` was never applied at all on a stationary tablet, where nothing else reconfigures. Re-reading the promise the join already consumed could only ever hand back the number already in `joinData`, so the refinement was structurally inert. | a throttled first second means the host display runs at the wrong rate for the whole session | a better measurement, taken while the page is foregrounded and painting, applied about a second in and never again | UNVERIFIED | yes | One-shot, because `onStreamLive` runs again after every reconfigure — without the latch the correction would reconfigure in a loop. |
+| 177 | client / audio | `detectHasEarpiece` reuses `detectIOS()` and separates phone from tablet by the screen's short edge instead of testing the User-Agent for `iPhone` (`static/audio.js`) | It was the one capability gate in the file that was a raw User-Agent sniff, and an iPhone with "Request Desktop Website" enabled sends a Macintosh UA -- losing the Speaker/Earpiece pair, which is the only output control iOS has below 18.4 where `HTMLMediaElement.setSinkId` arrives. | a desktop-UA iPhone shows an empty output list and reports `supported: false` | it keeps the category pair | UNVERIFIED | yes | No capability says "this device has an earpiece" -- `navigator.audioSession` exists on iPad too -- so some device-shape inference is unavoidable. What was avoidable was using the weakest one available. |
 
 ## Notes
+
+### Considered and rejected on the macOS capture/encode path (W5)
+
+**One VideoToolbox session shared between clients at the same resolution.** The hardware encoder
+is instance-limited and ScreenExtend creates a session per connected device, so two phones asking
+for the same geometry hold two scarce sessions to produce identical bitstreams. Sharing them is a
+real saving and it is *not* a small change: the pipeline, the bitrate controller, the IDR request
+and the telemetry are all per-session by construction, and a shared encoder would need a
+per-client keyframe policy — a joining device needs an IDR the others do not. What landed instead
+is the detection half: the instance-limit flag is read out of `VTCopyVideoEncoderList` and logged,
+and a session that falls to software says so loudly. That is what turns "it only works when I quit
+everything else" from folklore into a log line. The sharing belongs with whoever owns the session
+lifecycle, not with the encoder.
+
+**Falling back from ScreenCaptureKit to CGDisplayStream mid-session.** Rejected. The tier is
+decided at start and now requires a delivered frame before it is committed, which covers the
+documented 12.3 failure. Swapping capture backends under a live session risks a worse failure than
+the stall it would paper over, and a WindowServer stall — the usual cause of a mid-session dry
+spell — is not something the other API would fix. The watchdog that does help is the first-frame
+deadline: after 750 ms with nothing captured the encode loop synthesizes a black IDR and counts
+`capture_no_first_frame`, so the condition is visible instead of mute.
+
+**A Metal convert/scale stage in `gpu.rs`.** Rejected, and the placeholder now says why.
+WindowServer delivers the frame already scaled to the requested size and already in the pixel
+format the encoder wants (`420f`), and the delivered IOSurface is wrapped rather than copied all
+the way into VideoToolbox — so there is no CPU conversion to move onto the GPU. Whether
+WindowServer's own downscale costs anything is a separate question, and it now has an instrument:
+`cgds::tests::capture_rate` captures at native size and `cgds::tests::capture_rate_downscaled` at
+half, and both print the same `displayTime → callback` distribution.
+
+**`kVTCompressionPropertyKey_ConstantBitRate` as a replacement for the removed `DataRateLimits`.**
+Rejected. CBR spends bits to hold the rate on a screen that is not changing, which is the opposite
+of what a screen sharer wants; `AverageBitRate` plus the loss-based controller is the right shape.
+The property is probed and named in the per-session property line so the decision is visible
+rather than absent.
+
+**`CGVirtualDisplaySettings.refreshDeadline`.** Absent on the 10.15 floor, so there is nothing to
+measure here. It is probed with `respondsToSelector:` and reported, deliberately not set. It is
+the only latency-named knob on the WindowServer side of that boundary, which is where the largest
+single term in the host path lives, so the experiment is written up for a modern Mac in
+`docs/manual-tests/macos-capture-encode.md` §10.
+
+### W11 decisions made without consultation
+
+Two pieces of user-visible copy on the client page changed inside a branch whose brief is latency
+and compatibility. Both are kept, and both are recorded here with their exact before and after,
+because copy is appearance and nobody asked for either.
+
+**1. The HTTPS-upsell modal's body paragraph.** The trigger was a typo — "sucre" — but the
+sentence around it was also wrong about *why* the switch matters: the browser withholds WebCodecs
+and `SharedArrayBuffer` from an insecure context, so this is the difference between the fast paths
+and the slow ones, not a vague "quicker and privately".
+
+Before:
+
+> This page is on an insecure (HTTP) connection. Switching to the sucre version ensures data is
+> exchanged quicker and privately. Your browser may warn about the self-signed certificate once,
+> which is expected; choose to More Info/Advanced --> Proceed to site.
+
+After:
+
+> This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video
+> and audio paths on a secure one, so switching makes the screen faster as well as private. You
+> will see a one-time warning about the self-signed certificate; that is expected — choose
+> Advanced (or More Info), then continue to the site.
+
+The raw `-->` in the original renders literally in HTML and reads as a broken tag; that is why the
+arrow is gone rather than reworded.
+
+**2. The limited-browser-support modal.** The `httpsFixable` flag on each row became conditional
+(`httpsCouldHelp`) instead of a hard-coded `true`. That is a correctness fix, not a copy change:
+it drove a "Switch to HTTPS" affordance on iPhones whose Safari has never shipped an
+`AudioDecoder` for HTTPS to restore, and on pages that were already secure. The rows themselves
+were briefly split from one to three and have been **restored to the original single row with its
+original wording** — see the finding
+`minor-client-limited-browser-modal-lists-three-audio-rows.md`, now resolved.
+
+Nothing else in `<body>` moved on this branch: no element added, removed, reordered or
+re-classed, all four modals keep their ids, roles and inline `z-index`, and the only stylesheet
+changes are `inset: 0` expanded to its four long-hands (identical rendering, Safari below 14.1)
+and one `-webkit-backdrop-filter` prefix.
+
+### W11 rejections (recorded, not applied)
+
+Each of these was considered against a finding and deliberately not done. They are here so the
+next person does not re-derive them.
+
+- **`getPredictedEvents()` on the pointer batch.** The wire format has a predicted-sample count
+  byte, and the host already knows to drop predicted samples for pen and touch and keep them
+  for the cursor. The client writes 0 there and sends measured samples only. Prediction trades
+  correctness for latency, and the size of both halves of that trade is a per-engine,
+  per-device number that cannot be obtained on either dev box -- a wrong guess puts speculative
+  cursor positions on the host that the next real sample corrects, which is worse than the
+  latency it saves. The byte is in place, so enabling it later is a client-only change.
+- **Chunking a dropped file across SCTP messages.** The right fix for a file above
+  `maxMessageSize`, and it needs a continuation opcode, a transfer id and reassembly on the
+  host -- a protocol change outside this workstream. What landed is the half that can be done
+  client-side: refuse before reading, and say so. A host workstream that wants the rest should
+  start from the free opcode values in `docs/INPUT-PROTOCOL.md`.
+- **Moving the `/reconfig` poll onto the reliable DataChannel.** Would remove one HTTP request
+  per second per device and one of the three liveness mechanisms, and the channel already
+  carries `BYE` for the kick case. It is a host change -- `server.rs` would have to push the
+  epoch rather than answer a poll -- and the client would still need the HTTP path as the
+  fallback for a session with no data channel, so the saving is real but the client cannot make
+  it alone. What landed instead is the device-enumeration half, row 86.
+- **Consolidating the three client liveness signals onto one.** The reconfig poll, the `PONG`
+  and the render/bytes advance all feed one `markAlive()`. That is three mechanisms, but they
+  fail independently — a stalled render does not stop the poll, a dead DataChannel does not stop
+  the HTTP — and the cost of the extra two is a comparison each. Collapsing them would make the
+  session's liveness only as good as its weakest transport for no measurable saving. The
+  redundant *work* was the enumeration and the POST, and that is row 86.
+- **Gating the AudioWorklet's stats `postMessage` behind `DEBUG`.** Stale: those 256 ms messages
+  now drive `adaptSafetyMargin`, so the worklet's underrun count is what grows the jitter margin
+  on a link that needs it. There is no longer an unconsumed message to remove.
+- **A "choose speaker" affordance for `MediaDevices.selectAudioOutput()`.** Firefox 116+ is the
+  only engine with a permission-free output picker, `SEAudio.pickOutput()` implements it, and
+  nothing can call it because it needs transient activation and the page has no control to hang
+  it on. Adding one is a visible change to the client page, which this engagement does not
+  make. Recorded under the UI-visible recommendations below.
+- **A/B-ing `jitterBufferTarget` on the `<video>` fallback.** All three jitter-buffer knobs are
+  inert on the WebCodecs path -- an encoded transform takes the frame from
+  `RtpVideoStreamReceiver2::OnAssembledFrame` *instead of* entering the reference finder and
+  the frame buffer -- so the only place any of them can move a number is the fallback. All
+  three client sites now say so in comments; `webrtc_session.rs`'s
+  `PlayoutDelayExtension::new(0, 0)` is the fourth and belongs to the transport workstream. The
+  measurement itself needs a browser and an injected-jitter link, neither of which exists here.
+  The same branch is why every receive-side timing field in `getStats()` reads zero on the fast
+  path, and why a measurement plan that says "compare `jitterBufferDelay` before and after" is
+  only executable on the fallback.
+
+### W11 UI-visible recommendations (not applied)
+
+- **An output picker on Firefox.** See the rejection above. One small control on the stage or in
+  the join form, wired to `SEAudio.pickOutput()` from a click and gated on `hasSelectOut`, is
+  all it needs; stats byte 75 would then be able to read 4, which today it never can.
 
 
 ### UI-visible recommendation (W7): the screen-recording indicator on macOS 13.0-14.1
