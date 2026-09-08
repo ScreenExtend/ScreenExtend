@@ -373,7 +373,14 @@ Cross-platform core, OS-independent:
   no decrypt, no VideoToolbox.** Design + measurements: `docs/airplay-fallback-design.md`.
   Live harness: `cargo test --lib macos_utils::airplay::tests::live_end_to_end -- --ignored
   --nocapture`.
-- `hosted_network.rs` + `hostap.m` — CoreWLAN ad-hoc network (prefers 5 GHz channels).
+- `hosted_network.rs` — CoreWLAN **HostAP** (infrastructure AP) mode via the private
+  `startHostAPModeWithSSID:securityType:channel:password:error:`, behind a `respondsToSelector:`
+  probe, with a deprecated-IBSS second tier and an explicit "use your own router" third tier
+  (`probe_hosted_network_backend`). Prefers 5 GHz channels 36/40/48/153/157/161 and 2.4 GHz
+  channel 11, all chosen to avoid AWDL's social channels 6/44/149. A start is only reported as
+  working once `interfaceMode()` reads HostAP *and* the interface holds a routable IPv4.
+  Read-only surface report: `cargo test --lib
+  macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture`.
 
 ### System audio — Windows (`windows_utils/audio/`)
 
