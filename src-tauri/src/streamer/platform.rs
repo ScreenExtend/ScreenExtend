@@ -189,3 +189,49 @@ pub trait EncoderBackend: Send {
 
     fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied>;
 }
+
+/// What the local end of the nominated ICE pair is physically riding.
+///
+/// Every competitor in this category treats the wired path as its low-latency tier and two of them
+/// publish the gap: Luna Display's own 50-sample bench reports **11.3 ms mean over USB against
+/// 22.4 ms over Wi-Fi**, and Apple's wireless Sidecar path rides AWDL, which periodically pulls the
+/// radio onto a social channel and produces 50-200 ms spikes. ScreenExtend supports the wired path
+/// incidentally — a USB-tethered Android phone presents an ordinary IP interface and joins with no
+/// code change — and until now nothing on the host could tell it apart from Wi-Fi, so it could
+/// neither be reported nor used as a policy input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkMedium {
+    Wired,
+    Wireless,
+    Other,
+}
+
+impl LinkMedium {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkMedium::Wired => "wired",
+            LinkMedium::Wireless => "wireless",
+            LinkMedium::Other => "other",
+        }
+    }
+}
+
+/// The medium behind a local IP address, or `None` when the platform cannot say.
+///
+/// Called once per session, half a second after the connection comes up, from the same place the
+/// nominated candidate pair is read — never on a hot path.
+pub fn link_medium_for_local_ip(ip: &str) -> Option<LinkMedium> {
+    #[cfg(windows)]
+    {
+        crate::windows_utils::networking::link_medium_for_local_ip(ip)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_utils::networking::link_medium_for_local_ip(ip)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = ip;
+        None
+    }
+}

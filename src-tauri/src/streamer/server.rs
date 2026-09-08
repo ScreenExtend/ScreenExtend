@@ -4,10 +4,11 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Bytes,
+    extract::Path,
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 
@@ -372,6 +373,10 @@ pub struct ProcessedResponse {
     pub content_type: &'static str,
     pub body: String,
     pub device_token: Option<String>,
+    /// The WHEP resource this join created, as RFC 9725 requires: the client PATCHes ICE
+    /// candidates to it instead of holding the offer back until its own gathering is finished.
+    /// `None` on every error path, and on the cloud relay, which has no URL space of its own.
+    pub resource: Option<String>,
 }
 
 impl ProcessedResponse {
@@ -381,6 +386,7 @@ impl ProcessedResponse {
             content_type: "text/plain",
             body: body.into(),
             device_token: None,
+            resource: None,
         }
     }
 }
@@ -444,6 +450,10 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/", get(index))
         .route("/whep", post(whep))
+        // The WHEP resource, RFC 9725 §4.6. A client that ignores the `Location` header behaves
+        // exactly as it did before, which is what makes this safe to ship ahead of the client.
+        .route("/whep/{id}", patch(whep_patch))
+        .route("/whep/{id}", delete(whep_delete))
         .route("/leave", post(leave))
         .route("/transform-worker.js", get(transform_worker))
         .route("/input.js", get(input_js))
@@ -708,7 +718,10 @@ pub fn process_leave(state: &AppState, device_key: &str) {
 }
 
 fn build_net_json(config: &Config) -> String {
-    serde_json::json!({ "httpsPort": config.https_port }).to_string()
+    // `trickleIce` is how the client learns it may POST the offer before its own gathering has
+    // finished and PATCH the candidates afterwards. Probed, never assumed: a client that does not
+    // read it, or a host that does not send it, keeps the gather-then-post shape exactly.
+    serde_json::json!({ "httpsPort": config.https_port, "trickleIce": true }).to_string()
 }
 
 async fn whep(
@@ -739,7 +752,44 @@ async fn whep(
             headers.insert("x-device-token", value);
         }
     }
+    if let Some(resource) = out.resource.as_deref() {
+        if let Ok(value) = header::HeaderValue::from_str(&format!("/whep/{resource}")) {
+            headers.insert(header::LOCATION, value);
+        }
+    }
     (status, headers, out.body).into_response()
+}
+
+/// Trickled ICE from the client, RFC 9725 §4.6.
+///
+/// The point is what it removes from the join: without it the client cannot POST until its own
+/// gathering has finished or timed out, so the offer it sends is the only one the host will ever
+/// see. With TURN configured that wait runs until a relay candidate arrives; on a network where no
+/// candidate arrives at all it burns the full deadline.
+async fn whep_patch(Path(id): Path<String>, body: Bytes) -> Response {
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if text.len() > MAX_SDP_LEN {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    if webrtc_session::add_trickled_candidates(&id, text).await {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        // Gone rather than Not Found: the id was well-formed, the session is simply over.
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Tear the resource down, RFC 9725 §4.4. The client already has `/leave`; this exists so the
+/// resource the `Location` header hands out is a real one.
+async fn whep_delete(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(_id): Path<String>,
+) -> Response {
+    process_leave(&state, &peer.ip().to_string());
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn process_whep(
@@ -872,7 +922,7 @@ pub async fn process_whep(
     };
 
     match start_session(state, &req, device_key, &device_token, ice_servers).await {
-        Ok(answer) => {
+        Ok((answer, resource)) => {
             tprintln!(
                 "join accepted: WHEP answer generated ({} bytes)",
                 answer.len()
@@ -882,6 +932,7 @@ pub async fn process_whep(
                 content_type: "application/sdp",
                 body: answer,
                 device_token: Some(device_token),
+                resource: Some(resource),
             }
         }
         Err(e) => {
@@ -900,7 +951,7 @@ async fn start_session(
     client_ip: &str,
     device_token: &str,
     ice_servers: Vec<RTCIceServer>,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let locality = state.locality_for(client_ip);
     let client = state
         .config
@@ -1344,6 +1395,7 @@ async fn start_session(
 
     let (closed_tx, closed_rx) = oneshot::channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let resource_id = pending.resource_id().to_string();
     let (answer, whep) = match webrtc_session::activate_whep(
         pending,
         &session.pipeline,
@@ -1497,7 +1549,7 @@ async fn start_session(
         }
     });
 
-    Ok(answer)
+    Ok((answer, resource_id))
 }
 
 async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
