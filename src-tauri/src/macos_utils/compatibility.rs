@@ -86,7 +86,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         } else {
             "CGDisplayStream".to_string()
         },
-        encoder_backend: "videotoolbox".to_string(),
+        encoder_backend: super::streamer::encoder::probe_encoder_backend().to_string(),
         hosted_network_backend: "CoreWLAN HostAP".to_string(),
     }
 }

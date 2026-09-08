@@ -14,7 +14,10 @@ pub mod qos;
 pub mod sck;
 pub mod tuning;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use objc2::runtime::AnyClass;
 
 use frame::FrameSink;
 use gpu::Gpu;
@@ -50,6 +53,9 @@ pub trait CaptureBackend: Send {
     /// ScreenCaptureKit to CGDisplayStream, and a measurement that cannot say which one ran is
     /// not a measurement.
     fn name(&self) -> &'static str;
+    /// Frames delivered so far. Used to prove a started stream is actually producing, which is
+    /// what separates a slow capture path from a dead one.
+    fn frames_captured(&self) -> u64;
 }
 
 pub type DisplayId = u32;
@@ -83,10 +89,25 @@ pub fn macos_at_least(major: u32, minor: u32) -> bool {
     }
 }
 
-#[inline]
+/// Whether ScreenCaptureKit exists on this machine.
+///
+/// Probed by class lookup rather than by version number: `sw_vers` is a subprocess fork that
+/// answers a proxy for the question, and it failed *open* — an unparseable version string returned
+/// true. `AnyClass::get` is what the SCK backend already uses as its own belt-and-braces guard, so
+/// this makes the selector and the guard the same test.
 pub fn screencapturekit_available() -> bool {
-    macos_at_least(12, 3)
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        AnyClass::get(c"SCStream").is_some() && AnyClass::get(c"SCShareableContent").is_some()
+    })
 }
+
+/// How long a freshly started ScreenCaptureKit stream has to deliver its first frame.
+///
+/// Generous on purpose. The point is to catch a stream that starts cleanly and delivers *nothing*
+/// — the failure Chromium reports for full-display capture on 12.3 — not to race a busy machine
+/// into an unnecessary fallback onto the obsoleted API.
+const SCK_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Called at every pipeline start, which is also every device join and every
 /// stream refresh — so it is where a consent that lapsed *mid-session* is noticed.
@@ -126,6 +147,13 @@ pub fn probe_screen_recording() -> bool {
         if let Some(granted) = sck::probe_screen_recording() {
             return granted;
         }
+        // Only reached when SCK is present and its probe could not answer at all. CGDisplayStream
+        // is obsoleted in the macOS 15 SDK and touching it is what raises Sequoia's recurring
+        // screen-recording alert, so the reason for reaching for it is worth a line.
+        teprintln!(
+            "[capture] the ScreenCaptureKit probe was inconclusive; falling back to the \
+             deprecated CGDisplayStream probe"
+        );
     }
     cgds::probe_screen_recording()
 }
@@ -173,7 +201,23 @@ fn start_sck(
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
     let mut b = sck::SckBackend::new(display, gpu, sink, cfg, telemetry)?;
     b.start()?;
-    Ok(Box::new(b))
+    // Prove the capability, not just the class. A stream that starts and delivers nothing is
+    // indistinguishable from a slow one from the outside, and it is the documented failure mode
+    // for full-display capture on 12.3.
+    let deadline = Instant::now() + SCK_FIRST_FRAME_TIMEOUT;
+    while Instant::now() < deadline {
+        if b.frames_captured() > 0 {
+            return Ok(Box::new(b));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    b.stop();
+    teprintln!(
+        "[sck] no frame within {} ms of startCapture; treating ScreenCaptureKit as unusable on \
+         display {display}",
+        SCK_FIRST_FRAME_TIMEOUT.as_millis()
+    );
+    Err(CaptureError::StartFailed)
 }
 
 fn start_cgds(

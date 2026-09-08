@@ -305,7 +305,9 @@ macro_rules! counters {
 
 counters! {
     capture_fallback => "capture_fallback",
+    capture_no_first_frame => "capture_no_first_frame",
     frames_repeated => "frames_repeated",
+    encoder_output_drops => "encoder_output_drops",
     frames_dropped_ring => "frames_dropped_ring",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
