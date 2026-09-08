@@ -231,8 +231,10 @@ MODES:
     --whep-selftest       in-process WHEP client against a real virtual display;
                           asserts the answer SDP and that RTP actually flows
                           (requires a build with --features probe)
-    --duration <secs>     with --whep-selftest, keep streaming this long after RTP is
-                          proven so the stage histograms describe a steady session
+    --duration <secs>     how long a probe runs. The self-test holds the session open this
+                          long after RTP is proven; --live captures for this long instead of
+                          stopping at 150 frames. Without it a run is a liveness check whose
+                          histograms describe startup transients.
 
 TUNING FLAGS are the streamer's own and are parsed straight off the command line:
     --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
