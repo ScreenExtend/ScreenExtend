@@ -894,6 +894,21 @@
             // the full deadline, and the deadline is only reached when nothing arrived.
             const ICE_HOST_GRACE_MS = 200;
             const ICE_RELAY_GRACE_MS = 400;
+            // Split out so it can be asserted without a browser — scripts/test-client-ice.mjs
+            // extracts these three from this file and drives them directly. The gating is the
+            // whole correctness of a TURN join: on a relayed session a host candidate must not
+            // end the wait, because the relay allocation is a full round trip behind it and
+            // WHEP has no PATCH to trickle it in afterwards.
+            function iceCandidateType(c) {
+                if (!c) return '';
+                if (c.type) return c.type;
+                const m = / typ (\w+)/.exec(c.candidate || '');
+                return (m && m[1]) || '';
+            }
+            function iceGraceFor(type, needRelay) {
+                if (needRelay) return type === 'relay' ? ICE_RELAY_GRACE_MS : 0;
+                return (type === 'host' || type === 'srflx') ? ICE_HOST_GRACE_MS : 0;
+            }
             function waitForIceGathering(pc, timeoutMs, needRelay) {
                 if (pc.iceGatheringState === 'complete') return Promise.resolve();
                 return new Promise((resolve) => {
@@ -920,12 +935,8 @@
                     function onCandidate(ev) {
                         const c = ev.candidate;
                         if (!c || !c.candidate) { finish(); return; }
-                        const type = c.type || (/ typ (\w+)/.exec(c.candidate) || [])[1];
-                        if (needRelay) {
-                            if (type === 'relay') arm(ICE_RELAY_GRACE_MS);
-                        } else if (type === 'host' || type === 'srflx') {
-                            arm(ICE_HOST_GRACE_MS);
-                        }
+                        const ms = iceGraceFor(iceCandidateType(c), needRelay);
+                        if (ms) arm(ms);
                     }
                     pc.addEventListener('icegatheringstatechange', onState);
                     pc.addEventListener('icecandidate', onCandidate);
@@ -1260,6 +1271,10 @@
 
                     const useScriptTransform = useScriptTransformNow();
                     const iceServers = await getIceServers();
+                    // Computed once and carried into the gathering wait: without it the wait
+                    // took the LAN branch on every session and cut gathering ~200 ms in, before
+                    // any TURN allocation could return.
+                    const needRelay = hasTurnServer(iceServers);
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
@@ -1453,7 +1468,7 @@
 
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
-                    await waitForIceGathering(pc, hasTurnServer(iceServers) ? 6000 : 3000);
+                    await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
 
                     let storedToken = '';
                     try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
