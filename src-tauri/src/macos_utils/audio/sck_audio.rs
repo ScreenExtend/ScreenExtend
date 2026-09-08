@@ -241,7 +241,13 @@ impl AudioSource for SckAudioCapture {
                     stopCaptureWithCompletionHandler: RcBlock::as_ptr(&handler)
                 ];
             }
-            let _ = rx.recv_timeout(SCK_CALL_TIMEOUT);
+            // The delegate context is freed just below, so a stop that timed out rather than
+            // completed means a sample handler could still be in flight against it.
+            if rx.recv_timeout(SCK_CALL_TIMEOUT).is_err() {
+                crate::teprintln!(
+                    "audio: SCK stopCapture did not complete within {SCK_CALL_TIMEOUT:?}"
+                );
+            }
         }
         self.stream = None;
         self.delegate = None;
