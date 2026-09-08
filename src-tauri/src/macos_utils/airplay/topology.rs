@@ -21,10 +21,11 @@ use std::time::{Duration, Instant};
 
 use objc2_core_graphics::{
     CGBeginDisplayConfiguration, CGCompleteDisplayConfiguration, CGConfigureDisplayMirrorOfDisplay,
-    CGConfigureDisplayWithDisplayMode, CGConfigureOption, CGDisplayCopyAllDisplayModes,
-    CGDisplayIsBuiltin, CGDisplayIsInMirrorSet, CGDisplayIsOnline, CGDisplayMirrorsDisplay,
-    CGDisplayMode, CGDisplayModelNumber, CGDisplayPixelsHigh, CGDisplayPixelsWide,
-    CGDisplayVendorNumber, CGError, CGGetOnlineDisplayList, CGRestorePermanentDisplayConfiguration,
+    CGConfigureDisplayWithDisplayMode, CGConfigureOption, CGDisplayConfigRef,
+    CGDisplayCopyAllDisplayModes, CGDisplayIsBuiltin, CGDisplayIsInMirrorSet,
+    CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayModelNumber, CGDisplayPixelsHigh,
+    CGDisplayPixelsWide, CGDisplayVendorNumber, CGError, CGGetOnlineDisplayList,
+    CGRestorePermanentDisplayConfiguration,
 };
 
 use objc2_core_graphics::CGDisplayCopyDisplayMode;
@@ -43,15 +44,6 @@ pub struct Baseline(HashSet<u32>);
 
 pub fn baseline() -> Baseline {
     Baseline(active_displays().into_iter().collect())
-}
-
-impl Baseline {
-    fn newcomers(&self) -> Vec<u32> {
-        active_displays()
-            .into_iter()
-            .filter(|id| !self.0.contains(id))
-            .collect()
-    }
 }
 
 /// The vendor and model CoreGraphics reports for a display macOS created for an
@@ -130,13 +122,25 @@ impl ModeSnapshot {
     ///
     /// Returns how many were actually changed back.
     pub fn restore_except(&self, skip: u32) -> usize {
+        self.restore_and_set(skip, None)
+    }
+
+    /// Restores every other display *and*, in the same commit, moves `target`
+    /// onto `mode`.
+    ///
+    /// `CGBeginDisplayConfiguration` exists to batch a whole topology change
+    /// into one commit, and this is exactly that case: the restore and the
+    /// target's own mode change used to be two consecutive configurations, each
+    /// of which blanks every attached screen for about a second, with a two
+    /// second settle poll hung off the second one. They are one now.
+    pub fn restore_and_set(&self, target: u32, mode: Option<(u32, u32)>) -> usize {
         let stale: Vec<(u32, i32)> = self
             .0
             .iter()
             .copied()
-            .filter(|(id, want)| *id != skip && current_mode_id(*id) != Some(*want))
+            .filter(|(id, want)| *id != target && current_mode_id(*id) != Some(*want))
             .collect();
-        if stale.is_empty() {
+        if stale.is_empty() && mode.is_none() {
             return 0;
         }
 
@@ -147,36 +151,15 @@ impl ModeSnapshot {
                 teprintln!("[airplay] could not begin a display configuration to restore modes");
                 return 0;
             }
-            for (id, want) in &stale {
-                let Some(modes) = CGDisplayCopyAllDisplayModes(*id, None) else {
-                    continue;
-                };
-                let mut found = false;
-                for i in 0..modes.count() {
-                    let ptr = modes.value_at_index(i) as *const CGDisplayMode;
-                    if ptr.is_null() {
-                        continue;
-                    }
-                    let mode = &*ptr;
-                    if CGDisplayMode::io_display_mode_id(Some(mode)) != *want {
-                        continue;
-                    }
-                    let err = CGConfigureDisplayWithDisplayMode(config, *id, Some(mode), None);
-                    if err == CGError::Success {
-                        found = true;
-                        restored += 1;
-                    } else {
-                        teprintln!(
-                            "[airplay] could not queue a mode restore for display {id}: CGError {}",
-                            err.0
-                        );
-                    }
-                    break;
+            if let Some((w, h)) = mode {
+                if let Err(e) = queue_size(config, target, w, h) {
+                    teprintln!("[airplay] could not queue {w}x{h} for display {target}: {e}");
                 }
-                if !found {
-                    teprintln!(
-                        "[airplay] display {id} no longer offers the mode it had before the session"
-                    );
+            }
+            for (id, want) in &stale {
+                match queue_mode_id(config, *id, *want) {
+                    Ok(()) => restored += 1,
+                    Err(e) => teprintln!("[airplay] display {id}: {e}"),
                 }
             }
             let err = CGCompleteDisplayConfiguration(config, CGConfigureOption::Permanently);
@@ -195,6 +178,72 @@ impl ModeSnapshot {
             );
         }
         restored
+    }
+}
+
+/// Queues a display's move to a specific published mode id.
+///
+/// # Safety
+/// `config` must be a live configuration from `CGBeginDisplayConfiguration`.
+unsafe fn queue_mode_id(config: CGDisplayConfigRef, id: u32, want: i32) -> Result<(), String> {
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(id, None)
+            .ok_or_else(|| "CGDisplayCopyAllDisplayModes returned nil".to_string())?;
+        for i in 0..modes.count() {
+            let ptr = modes.value_at_index(i) as *const CGDisplayMode;
+            if ptr.is_null() {
+                continue;
+            }
+            let mode = &*ptr;
+            if CGDisplayMode::io_display_mode_id(Some(mode)) != want {
+                continue;
+            }
+            let err = CGConfigureDisplayWithDisplayMode(config, id, Some(mode), None);
+            return if err == CGError::Success {
+                Ok(())
+            } else {
+                Err(format!("could not queue a mode restore: CGError {}", err.0))
+            };
+        }
+        Err("no longer offers the mode it had before the session".to_string())
+    }
+}
+
+/// Queues a display's move to the published mode of a given size.
+///
+/// # Safety
+/// `config` must be a live configuration from `CGBeginDisplayConfiguration`.
+unsafe fn queue_size(
+    config: CGDisplayConfigRef,
+    id: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    unsafe {
+        let modes = CGDisplayCopyAllDisplayModes(id, None)
+            .ok_or_else(|| format!("CGDisplayCopyAllDisplayModes({id}) returned nil"))?;
+        for i in 0..modes.count() {
+            let ptr = modes.value_at_index(i) as *const CGDisplayMode;
+            if ptr.is_null() {
+                continue;
+            }
+            let mode = &*ptr;
+            if CGDisplayMode::width(Some(mode)) as u32 != width
+                || CGDisplayMode::height(Some(mode)) as u32 != height
+            {
+                continue;
+            }
+            let err = CGConfigureDisplayWithDisplayMode(config, id, Some(mode), None);
+            return if err == CGError::Success {
+                Ok(())
+            } else {
+                Err(format!(
+                    "CGConfigureDisplayWithDisplayMode -> CGError {}",
+                    err.0
+                ))
+            };
+        }
+        Err(format!("display {id} has no {width}x{height} mode"))
     }
 }
 
@@ -251,7 +300,8 @@ pub fn wait_for_airplay_display(base: &Baseline, timeout: Duration) -> Result<At
             return match fallback {
                 Some(a) => Ok(a),
                 None => Err(
-                    "macOS did not attach a display within the timeout — the AirPlay session was                      never accepted, or it was accepted and no display was created"
+                    "macOS did not attach a display within the timeout — the AirPlay session was \
+                     never accepted, or it was accepted and no display was created"
                         .to_string(),
                 ),
             };
@@ -355,7 +405,8 @@ pub fn available_modes(id: u32) -> Vec<(u32, u32, u32)> {
     out
 }
 
-/// Moves the display onto the published mode closest to what was asked for.
+/// The published mode closest to what was asked for, or `None` when the display
+/// is already there and nothing needs to change.
 ///
 /// macOS decides an AirPlay display's *initial* size from a single bit — whether
 /// the advertised height reached 1080 — so a request for anything else lands on
@@ -364,16 +415,19 @@ pub fn available_modes(id: u32) -> Vec<(u32, u32, u32)> {
 /// macOS felt like" into "the size the client asked for", whenever the request
 /// is on the ladder.
 ///
-/// Returns the geometry actually in effect.
-pub fn best_effort_mode(id: u32, want: (u32, u32)) -> (u32, u32) {
+/// Selection only: the move itself is queued into the same display
+/// configuration as the other displays' restores
+/// ([`ModeSnapshot::restore_and_set`]) so the two are one commit rather than
+/// two screen blanks.
+pub fn closest_mode(id: u32, want: (u32, u32)) -> Option<(u32, u32)> {
     let current = geometry(id);
     if current == want {
-        return current;
+        return None;
     }
 
     let modes = available_modes(id);
     if modes.is_empty() {
-        return current;
+        return None;
     }
 
     // Exact match first; otherwise the mode closest in area that does not
@@ -397,29 +451,41 @@ pub fn best_effort_mode(id: u32, want: (u32, u32)) -> (u32, u32) {
         })
         .copied();
 
-    let Some((w, h, _)) = chosen else {
-        return current;
-    };
+    let (w, h, _) = chosen?;
     if (w, h) == current {
-        return current;
+        return None;
     }
+    if (w, h) != want {
+        tprintln!(
+            "[airplay] {want:?} is not one of the modes macOS published for display {id}; \
+             using the closest, {w}x{h}"
+        );
+    }
+    Some((w, h))
+}
 
-    match set_mode_permanently(id, w, h) {
-        Ok(()) => {
-            let now = geometry(id);
-            if (w, h) == want {
-                tprintln!("[airplay] display {id} moved to the requested {w}x{h}");
-            } else {
-                tprintln!(
-                    "[airplay] {want:?} is not one of the modes macOS published for display {id};                      using the closest, {w}x{h}"
-                );
-            }
-            now
+/// Waits for a queued mode change to land, and reports the geometry in effect.
+///
+/// A display configuration commits asynchronously, so the caller cannot read the
+/// new size straight afterwards.
+pub fn settle_geometry(id: u32, want: (u32, u32), timeout: Duration) -> (u32, u32) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = geometry(id);
+        if now == want {
+            return now;
         }
-        Err(e) => {
-            teprintln!("[airplay] could not move display {id} to {w}x{h}: {e}");
-            current
+        if Instant::now() >= deadline {
+            teprintln!(
+                "[airplay] display {id} did not settle to {}x{} (still {}x{})",
+                want.0,
+                want.1,
+                now.0,
+                now.1
+            );
+            return now;
         }
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -433,37 +499,19 @@ pub fn best_effort_mode(id: u32, want: (u32, u32)) -> (u32, u32) {
 /// Going through a display configuration committed with `kCGConfigurePermanently`
 /// gets the same geometry without the process association.
 pub(crate) fn set_mode_permanently(id: u32, width: u32, height: u32) -> Result<(), String> {
+    if geometry(id) == (width, height) {
+        return Ok(());
+    }
     unsafe {
-        let modes = CGDisplayCopyAllDisplayModes(id, None)
-            .ok_or_else(|| format!("CGDisplayCopyAllDisplayModes({id}) returned nil"))?;
-        let mut chosen: Option<&CGDisplayMode> = None;
-        for i in 0..modes.count() {
-            let ptr = modes.value_at_index(i) as *const CGDisplayMode;
-            if ptr.is_null() {
-                continue;
-            }
-            let m = &*ptr;
-            if CGDisplayMode::width(Some(m)) as u32 == width
-                && CGDisplayMode::height(Some(m)) as u32 == height
-            {
-                chosen = Some(m);
-                break;
-            }
-        }
-        let mode = chosen.ok_or_else(|| format!("display {id} has no {width}x{height} mode"))?;
-
         let mut config = std::ptr::null_mut();
         let err = CGBeginDisplayConfiguration(&mut config);
         if err != CGError::Success {
             return Err(format!("CGBeginDisplayConfiguration -> CGError {}", err.0));
         }
-        let err = CGConfigureDisplayWithDisplayMode(config, id, Some(mode), None);
-        if err != CGError::Success {
+        if let Err(e) = queue_size(config, id, width, height) {
+            // Cancel rather than leaving a half-built configuration behind.
             let _ = CGCompleteDisplayConfiguration(config, CGConfigureOption::ForAppOnly);
-            return Err(format!(
-                "CGConfigureDisplayWithDisplayMode({id}, {width}x{height}) -> CGError {}",
-                err.0
-            ));
+            return Err(e);
         }
         let err = CGCompleteDisplayConfiguration(config, CGConfigureOption::Permanently);
         if err != CGError::Success {
@@ -474,18 +522,19 @@ pub(crate) fn set_mode_permanently(id: u32, width: u32, height: u32) -> Result<(
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if geometry(id) == (width, height) {
-            return Ok(());
-        }
-        std::thread::sleep(POLL_INTERVAL);
+    let now = settle_geometry(id, (width, height), MODE_SETTLE);
+    if now == (width, height) {
+        Ok(())
+    } else {
+        Err(format!(
+            "display {id} did not settle to {width}x{height} (still {}x{})",
+            now.0, now.1
+        ))
     }
-    Err(format!(
-        "display {id} did not settle to {width}x{height} (still {:?})",
-        geometry(id)
-    ))
 }
+
+/// How long a committed display configuration gets to take effect.
+pub const MODE_SETTLE: Duration = Duration::from_secs(2);
 
 /// Hands every display configuration this process made back to the system.
 ///
@@ -502,11 +551,6 @@ pub fn release_display_configuration() {
 /// `(vendor, model)` as CoreGraphics reports them, for identifying the display.
 pub fn identity(id: u32) -> (u32, u32) {
     unsafe { (CGDisplayVendorNumber(id), CGDisplayModelNumber(id)) }
-}
-
-/// Whether CoreGraphics still considers the display connected.
-pub fn is_online(id: u32) -> bool {
-    unsafe { CGDisplayIsOnline(id) }
 }
 
 /// Geometry the display settled on, once it is no longer mirroring.
