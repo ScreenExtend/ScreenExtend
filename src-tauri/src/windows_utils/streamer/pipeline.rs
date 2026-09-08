@@ -15,8 +15,11 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT,
 };
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
 use super::amd::encoder::Encoder as AmfEncoder;
@@ -79,7 +82,8 @@ fn warn_constant_qp_once(warned: &mut bool) {
     if !*warned {
         *warned = true;
         teprintln!(
-            "bitrate adaptation is inert: the encoder is in explicit constant-QP mode (--qp),              so congestion control cannot shrink the stream"
+            "bitrate adaptation is inert: the encoder is in explicit constant-QP mode (--qp), \
+             so congestion control cannot shrink the stream"
         );
     }
 }
@@ -594,6 +598,268 @@ fn start_dxgi_capture(
     }
 }
 
+/// Staging slots between the DXGI capture thread and its encode thread.
+///
+/// Two is enough to overlap one encode with one capture; three buys slack for a jittery encoder
+/// without adding a frame of latency, because the consumer always takes the oldest queued slot
+/// and the producer drops rather than queueing when none is free.
+const DXGI_STAGE_SLOTS: usize = 3;
+
+/// The ring plus the three handles its encode thread needs: the ready queue, the slot-return
+/// channel, and its own view of the slot textures.
+type DxgiRingParts = (
+    DxgiRing,
+    crossbeam_channel::Receiver<DxgiStaged>,
+    crossbeam_channel::Sender<usize>,
+    Vec<ID3D11Texture2D>,
+);
+
+/// A staged frame on its way to the DXGI encode thread.
+struct DxgiStaged {
+    slot: usize,
+    capture: Instant,
+    timing: FrameTiming,
+}
+
+/// Decouples DXGI capture from encode.
+///
+/// Before this, `dxgi_capture_thread` composited and encoded in one loop body, so capture of
+/// frame N+1 could not begin until the encode of frame N returned — the achievable rate was
+/// `1 / (capture + composite + encode)` rather than `1 / capture`, and the encode is the large
+/// term on every CPU-bridge backend. The capture thread now only copies the composed frame into
+/// a free slot (a GPU-to-GPU copy on the duplication device, which is multithread-protected) and
+/// hands the index over.
+struct DxgiRing {
+    slots: Vec<ID3D11Texture2D>,
+    context: ID3D11DeviceContext,
+    free_rx: crossbeam_channel::Receiver<usize>,
+    ready_tx: crossbeam_channel::Sender<DxgiStaged>,
+    dropped: u64,
+    dropped_reported: u64,
+    telemetry: SharedTelemetry,
+}
+
+impl DxgiRing {
+    fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        telemetry: SharedTelemetry,
+    ) -> Result<DxgiRingParts> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            // The encode side may hand this to a VideoProcessor input view (the scaler) or read
+            // it back, so it needs both of the bind flags a duplication target has.
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut slots = Vec::with_capacity(DXGI_STAGE_SLOTS);
+        for i in 0..DXGI_STAGE_SLOTS {
+            let mut tex: Option<ID3D11Texture2D> = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+                .with_context(|| format!("CreateTexture2D (dxgi stage slot {i})"))?;
+            slots.push(tex.context("dxgi stage slot texture was null")?);
+        }
+
+        let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(DXGI_STAGE_SLOTS);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded::<DxgiStaged>(DXGI_STAGE_SLOTS);
+        for i in 0..DXGI_STAGE_SLOTS {
+            free_tx.send(i).expect("prefill dxgi free slots");
+        }
+        let encode_slots = slots.clone();
+        Ok((
+            Self {
+                slots,
+                context: context.clone(),
+                free_rx,
+                ready_tx,
+                dropped: 0,
+                dropped_reported: 0,
+                telemetry,
+            },
+            ready_rx,
+            free_tx,
+            encode_slots,
+        ))
+    }
+
+    fn stage(
+        &mut self,
+        src: &ID3D11Texture2D,
+        capture: Instant,
+        timing: FrameTiming,
+    ) -> Result<()> {
+        let Ok(slot) = self.free_rx.try_recv() else {
+            // Every slot is with the encoder. Dropping here is the same trade the WGC ring makes:
+            // a fresher frame will be along before the encoder is free again.
+            self.dropped += 1;
+            self.telemetry
+                .degradation
+                .frames_dropped_ring
+                .fetch_add(1, Ordering::Relaxed);
+            if self.dropped - self.dropped_reported >= 120 {
+                self.dropped_reported = self.dropped;
+                teprintln!(
+                    "dxgi ring: {} frames dropped for want of a free slot; the encoder is not \
+                     keeping up",
+                    self.dropped
+                );
+            }
+            return Ok(());
+        };
+        // SAFETY: both textures are live, on the same multithread-protected device, and have the
+        // same descriptor.
+        unsafe {
+            self.context.CopyResource(&self.slots[slot], src);
+            self.context.Flush();
+        }
+        if self
+            .ready_tx
+            .send(DxgiStaged {
+                slot,
+                capture,
+                timing,
+            })
+            .is_err()
+        {
+            bail!("dxgi encode thread disconnected");
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_dxgi_encoder(
+    core: Arc<Mutex<EncodeCore>>,
+    slots: Vec<ID3D11Texture2D>,
+    ready_rx: crossbeam_channel::Receiver<DxgiStaged>,
+    free_tx: crossbeam_channel::Sender<usize>,
+    tx: broadcast::Sender<EncodedFrame>,
+    last_frame_at: Arc<AtomicU64>,
+    epoch: Instant,
+    frame_duration: Duration,
+    stop: Arc<AtomicBool>,
+    path_name: &'static str,
+    telemetry: SharedTelemetry,
+) -> std::thread::JoinHandle<()> {
+    // `ID3D11Texture2D` is not `Send`, but the device is multithread-protected and the slots are
+    // only ever touched by the capture thread's `CopyResource` and this thread's encode, which the
+    // free/ready channels already order.
+    struct SendSlots(Vec<ID3D11Texture2D>);
+    unsafe impl Send for SendSlots {}
+    let slots = SendSlots(slots);
+
+    std::thread::Builder::new()
+        .name("dxgi-encode".to_string())
+        .spawn(move || {
+            let slots = slots;
+            let _thread_tuning = tuning::tune_current_thread();
+            let mut busy_streak: u32 = 0;
+            let mut frames_sent: u64 = 0;
+            let mut timing_sum_ns: u128 = 0;
+            let mut timing_count: u64 = 0;
+            let mut timing_max_ns: u128 = 0;
+
+            while !stop.load(Ordering::Relaxed) {
+                let staged = match ready_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(s) => s,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+                let DxgiStaged {
+                    slot,
+                    capture,
+                    mut timing,
+                } = staged;
+                let Some(tex) = slots.0.get(slot) else {
+                    break;
+                };
+
+                let encode_res = {
+                    let mut core = match core.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    timing.mark_encode_submit();
+                    core.encode_texture(tex)
+                };
+                timing.mark_encode_done();
+                let returned = free_tx.send(slot).is_ok();
+
+                let au = match encode_res {
+                    Ok(au) => au,
+                    Err(e)
+                        if is_transient_encode_error(&e)
+                            && busy_streak < MAX_TRANSIENT_ENCODE_DROPS =>
+                    {
+                        busy_streak += 1;
+                        telemetry
+                            .degradation
+                            .encoder_transient_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        teprintln!(
+                            "dxgi encode transiently overloaded ({e:#}); dropping frame \
+                             ({busy_streak} in a row)"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        teprintln!("dxgi encode failed: {e:?}; stopping capture");
+                        break;
+                    }
+                };
+                busy_streak = 0;
+                if !returned {
+                    break;
+                }
+
+                last_frame_at.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(EncodedFrame {
+                    data: Bytes::from(au),
+                    capture,
+                    timing,
+                });
+
+                frames_sent += 1;
+                let dt = capture.elapsed().as_nanos();
+                timing_sum_ns += dt;
+                timing_count += 1;
+                timing_max_ns = timing_max_ns.max(dt);
+                if frames_sent.is_multiple_of(60) {
+                    let avg_ms = (timing_sum_ns / timing_count.max(1) as u128) as f64 / 1.0e6;
+                    let max_ms = timing_max_ns as f64 / 1.0e6;
+                    tprintln!(
+                        "encode-path latency: path=dxgi+{}, avg_ms={:.2}, max_ms={:.2}, \
+                         frames={}, budget_ms={:.2}",
+                        path_name,
+                        avg_ms,
+                        max_ms,
+                        frames_sent,
+                        frame_duration.as_secs_f64() * 1000.0,
+                    );
+                    timing_sum_ns = 0;
+                    timing_count = 0;
+                    timing_max_ns = 0;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            tprintln!("dxgi encode thread stopped");
+        })
+        .expect("spawn dxgi encode thread")
+}
+
 struct DxgiThreadArgs {
     device_name: String,
     config: EncoderConfig,
@@ -630,6 +896,28 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
     let setup = (|| -> Result<(Duplicator, Arc<Mutex<EncodeCore>>, &'static str)> {
         let dup = Duplicator::new(&device_name, native_w, native_h)?;
+
+        // Duplication is adapter-local, so the scaler has to live on whichever adapter composes
+        // this display — including an indirect-display adapter, which is not guaranteed to expose
+        // a video processor. Ask before configuring the encoder for a size only the scaler can
+        // produce: this used to fail the whole session with "building GPU downscaler for --scale"
+        // after WGC had already been tried, so a host with no video device and a video-scale
+        // below 100% could not stream at all. Encoding at native and letting the client scale is
+        // a worse picture, not a dead session.
+        let mut config = config;
+        let wants_downscale = config.width != native_w || config.height != native_h;
+        if wants_downscale && !video_processor_available(dup.device(), dup.context()) {
+            teprintln!(
+                "dxgi: the adapter composing {device_name} exposes no D3D11 video processor, \
+                 so the requested {}x{} downscale cannot be done on the GPU; encoding at the \
+                 native {native_w}x{native_h} and leaving the scale to the client",
+                config.width,
+                config.height
+            );
+            config.width = native_w & !1;
+            config.height = native_h & !1;
+        }
+
         let backend = build_backend(
             config,
             vendor,
@@ -701,6 +989,37 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
 
     let epoch = Instant::now();
     let last_frame_at = Arc::new(AtomicU64::new(0));
+
+    let ring = DxgiRing::new(
+        dup.device(),
+        dup.context(),
+        native_w,
+        native_h,
+        Arc::clone(&telemetry),
+    );
+    let (mut ring, ready_rx, free_tx, encode_slots) = match ring {
+        Ok(parts) => parts,
+        Err(e) => {
+            let _ = ready_tx.send(Err(
+                e.context("building the DXGI capture/encode staging ring")
+            ));
+            return;
+        }
+    };
+    let encode_join = spawn_dxgi_encoder(
+        Arc::clone(&core),
+        encode_slots,
+        ready_rx,
+        free_tx,
+        tx.clone(),
+        Arc::clone(&last_frame_at),
+        epoch,
+        frame_duration,
+        Arc::clone(&stop),
+        path_name,
+        Arc::clone(&telemetry),
+    );
+
     spawn_repeater(
         Arc::clone(&core),
         tx.clone(),
@@ -724,11 +1043,6 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
     let mut dirty = false;
     let mut next_due = Instant::now();
     let mut was_idle = true;
-    let mut busy_streak: u32 = 0;
-    let mut frames_sent: u64 = 0;
-    let mut timing_sum_ns: u128 = 0;
-    let mut timing_count: u64 = 0;
-    let mut timing_max_ns: u128 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -769,76 +1083,28 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         let capture = now;
         let mut timing = FrameTiming::entering_capture();
         timing.capture_available_ns = dup.last_present_host_ns();
-        let encode_res = {
-            let tex = match dup.frame() {
-                Ok(t) => t,
-                Err(e) => {
-                    teprintln!("dxgi compose failed: {e:?}; stopping capture");
-                    break;
-                }
-            };
-            let mut core = match core.lock() {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            timing.mark_encode_submit();
-            core.encode_texture(tex)
-        };
-        timing.mark_encode_done();
-        let au = match encode_res {
-            Ok(au) => au,
-            Err(e) if is_transient_encode_error(&e) && busy_streak < MAX_TRANSIENT_ENCODE_DROPS => {
-                busy_streak += 1;
-                telemetry
-                    .degradation
-                    .encoder_transient_errors
-                    .fetch_add(1, Ordering::Relaxed);
-                teprintln!(
-                    "dxgi encode transiently overloaded ({e:#}); dropping frame ({busy_streak} in a row)"
-                );
-                next_due = Instant::now() + frame_duration;
-                continue;
-            }
+        let tex = match dup.frame() {
+            Ok(t) => t,
             Err(e) => {
-                teprintln!("dxgi encode failed: {e:?}; stopping capture");
+                teprintln!("dxgi compose failed: {e:?}; stopping capture");
                 break;
             }
         };
-        busy_streak = 0;
-
-        last_frame_at.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-        telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-        let _ = tx.send(EncodedFrame {
-            data: Bytes::from(au),
-            capture,
-            timing,
-        });
+        match ring.stage(tex, capture, timing) {
+            Ok(()) => {}
+            Err(e) => {
+                teprintln!("dxgi stage failed: {e:?}; stopping capture");
+                break;
+            }
+        }
         dirty = false;
         was_idle = true;
         next_due = capture + frame_duration;
-
-        frames_sent += 1;
-        let dt = capture.elapsed().as_nanos();
-        timing_sum_ns += dt;
-        timing_count += 1;
-        timing_max_ns = timing_max_ns.max(dt);
-        if frames_sent.is_multiple_of(60) {
-            let avg_ms = (timing_sum_ns / timing_count.max(1) as u128) as f64 / 1.0e6;
-            let max_ms = timing_max_ns as f64 / 1.0e6;
-            tprintln!(
-                "encode-path latency: path=dxgi+{}, avg_ms={:.2}, max_ms={:.2}, frames={}",
-                path_name,
-                avg_ms,
-                max_ms,
-                frames_sent
-            );
-            timing_sum_ns = 0;
-            timing_count = 0;
-            timing_max_ns = 0;
-        }
     }
 
     stop.store(true, Ordering::Relaxed);
+    drop(ring);
+    let _ = encode_join.join();
     tprintln!("dxgi capture stopped");
 }
 
@@ -1877,6 +2143,15 @@ fn apply_pending_bitrate_atomic(
     }
 }
 
+/// Whether this device can run a `VideoProcessorBlt` at all.
+///
+/// `Scaler::new` casts the device to `ID3D11VideoDevice` and the context to `ID3D11VideoContext`;
+/// both casts fail on a device created without `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` or on an
+/// adapter with no video engine. Asking first turns a failed session into a degraded one.
+fn video_processor_available(device: &ID3D11Device, context: &ID3D11DeviceContext) -> bool {
+    device.cast::<ID3D11VideoDevice>().is_ok() && context.cast::<ID3D11VideoContext>().is_ok()
+}
+
 /// The scaler's destination format for a given backend.
 ///
 /// Only a CPU-bridge backend reads the scaled surface back, so only it has an opinion. A GPU-path
@@ -2060,7 +2335,7 @@ fn spawn_repeater(
     std::thread::Builder::new()
         .name("nvenc-repeat".to_string())
         .spawn(move || {
-            let _thread_tuning = tuning::tune_current_thread();
+            let _thread_tuning = tuning::tune_timer_thread();
             let mut last_emit = Instant::now();
             loop {
                 if stop.load(Ordering::Relaxed) {
