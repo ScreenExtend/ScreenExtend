@@ -208,8 +208,14 @@ struct ControlRuntime {
     stop_rx: crossbeam_channel::Receiver<()>,
 }
 
+/// How often the control thread reports playthrough underruns.
+///
+/// The IOProc can only bump two atomics; saying anything about them is this thread's job.
+const UNDERRUN_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl ControlRuntime {
     fn run(mut self) {
+        let mut reported_underruns = 0u32;
         loop {
             crossbeam_channel::select! {
                 recv(self.stop_rx) -> _ => break,
@@ -223,6 +229,9 @@ impl ControlRuntime {
                         volume_proxy::apply(self.our_device, self.playthrough_target, &self.gain);
                     }
                 }
+                default(UNDERRUN_REPORT_INTERVAL) => {
+                    self.report_underruns(&mut reported_underruns);
+                }
             }
         }
         self.router.restore();
@@ -230,6 +239,28 @@ impl ControlRuntime {
         // with us rather than outliving the app as a permanent background job.
         routing::uninstall_watchdog_agent();
         crate::tprintln!("audio(legacy): stopped; default output restored");
+    }
+
+    /// Say when the monitor ring has run dry, and what the drift loop paid for it.
+    ///
+    /// The playthrough setpoint is the host's own monitoring latency, so it starts at three output
+    /// IO periods and is only raised by a measured underrun. A `bump` that keeps climbing is this
+    /// machine telling us the floor is too low for it.
+    fn report_underruns(&self, reported: &mut u32) {
+        let Some(p) = self.playthrough.as_ref() else {
+            return;
+        };
+        let (underruns, bump) = p.underruns();
+        if underruns == *reported {
+            return;
+        }
+        crate::tprintln!(
+            "audio(legacy): playthrough underruns {underruns} (+{}), setpoint raised by {bump} \
+             frames ({:.1} ms)",
+            underruns - *reported,
+            bump as f64 / 48.0
+        );
+        *reported = underruns;
     }
 
     fn on_routing(&mut self, event: RoutingEvent) {
