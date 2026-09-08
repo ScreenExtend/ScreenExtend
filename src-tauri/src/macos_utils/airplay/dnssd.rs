@@ -49,7 +49,27 @@ unsafe extern "C" {
     fn TXTRecordGetBytesPtr(txtRecord: *const TXTRecordRefRaw) -> *const c_void;
 }
 
-const KDNS_SERVICE_FLAGS_NO_AUTO_RENAME: DNSServiceFlags = 0x0;
+/// `kDNSServiceFlagsNoAutoRename`.
+///
+/// Without it mDNSResponder resolves a name collision by silently renaming the
+/// instance to "ScreenExtend (2)" — and with a NULL registration callback we
+/// would never hear about it. [`super::ax::connect_to`] then looks for a picker
+/// row titled exactly "ScreenExtend", misses, and burns its whole budget. A
+/// `kDNSServiceErr_NameConflict` from `DNSServiceRegister` is far better: it is
+/// loud, and [`Advertisement::publish`] already propagates it.
+const KDNS_SERVICE_FLAGS_NO_AUTO_RENAME: DNSServiceFlags = 0x8;
+
+/// `kDNSServiceFlagsIncludeAWDL` — include Apple Wireless Direct Link in a
+/// registration or browse.
+///
+/// Unused by the AirPlay receiver, which wants the LAN interface (see
+/// [`primary_interface_index`]). It is bound here because this is the only
+/// Bonjour FFI in the tree and AWDL is not reachable by interface index alone —
+/// it is these flags that enable it, and their absence is what made a
+/// peer-to-peer transport experiment look further away than it is.
+pub const KDNS_SERVICE_FLAGS_INCLUDE_AWDL: DNSServiceFlags = 0x100;
+/// `kDNSServiceInterfaceIndexP2P` — register on peer-to-peer interfaces only.
+pub const KDNS_SERVICE_INTERFACE_INDEX_P2P: u32 = 0xFFFF_FFFE;
 
 fn err(what: &str, code: DNSServiceErrorType) -> String {
     format!("{what} failed (DNSServiceErrorType {code})")
@@ -67,15 +87,32 @@ fn err(what: &str, code: DNSServiceErrorType) -> String {
 ///
 /// So: pick a real interface index, and pair it with a synthetic `deviceid`
 /// (see [`Identity::derive`]) to clear the other half of the test.
-fn primary_interface_index() -> Option<u32> {
+///
+/// Which real interface is not arbitrary. Taking whichever `getifaddrs` happens
+/// to return first puts the advertisement on a hypervisor's `vmnet`, on an
+/// Internet-Sharing `bridge`, or — worst — on the `ap` interface ScreenExtend's
+/// own hosted network brings up, which is a strange place to advertise a target
+/// meant for this Mac. Interfaces that can carry a LAN are ranked ahead of the
+/// rest and the excluded set is explicit.
+fn primary_interface_index() -> Option<(u32, String)> {
     use std::ffi::CStr;
+
+    /// Interfaces that are up and addressed but are never the LAN.
+    ///
+    /// `awdl`/`llw` are the peer-to-peer links (see
+    /// [`KDNS_SERVICE_FLAGS_INCLUDE_AWDL`] — they are not reachable by index
+    /// anyway), `utun` is a VPN, `vmnet`/`bridge` are hypervisor and
+    /// Internet-Sharing networks, and `ap` is the AP interface
+    /// `macos_utils::hosted_network` creates.
+    const NEVER: [&str; 8] = ["awdl", "llw", "utun", "vmnet", "bridge", "ap", "gif", "stf"];
 
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
             return None;
         }
-        let mut best: Option<u32> = None;
+        // (rank, index, name); lower rank wins, first match within a rank.
+        let mut best: Option<(u8, u32, String)> = None;
         let mut cur = ifap;
         while !cur.is_null() {
             let ifa = &*cur;
@@ -97,21 +134,25 @@ fn primary_interface_index() -> Option<u32> {
             let Ok(name) = CStr::from_ptr(ifa.ifa_name).to_str() else {
                 continue;
             };
-            // Apple Wireless Direct Link and the low-latency companion link are
-            // not general-purpose interfaces and are a poor place to advertise.
-            if name.starts_with("awdl") || name.starts_with("llw") || name.starts_with("utun") {
+            if NEVER.iter().any(|p| name.starts_with(p)) {
+                continue;
+            }
+            // `en*` is Wi-Fi and Ethernet; anything else that survived the
+            // exclusions is a usable last resort.
+            let rank = if name.starts_with("en") { 0 } else { 1 };
+            if best.as_ref().is_some_and(|(r, _, _)| *r <= rank) {
                 continue;
             }
             let Ok(cname) = std::ffi::CString::new(name) else {
                 continue;
             };
             let index = libc::if_nametoindex(cname.as_ptr());
-            if index != 0 && best.is_none() {
-                best = Some(index);
+            if index != 0 {
+                best = Some((rank, index, name.to_string()));
             }
         }
         libc::freeifaddrs(ifap);
-        best
+        best.map(|(_, index, name)| (index, name))
     }
 }
 
@@ -184,6 +225,7 @@ impl Service {
         regtype: &str,
         port: u16,
         interface_index: u32,
+        flags: DNSServiceFlags,
         pairs: &[(&str, String)],
     ) -> Result<Self, String> {
         let txt = TxtRecord::build(pairs)?;
@@ -196,7 +238,7 @@ impl Service {
         let rc = unsafe {
             DNSServiceRegister(
                 &mut sd_ref,
-                KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
+                flags,
                 interface_index,
                 cname.as_ptr(),
                 ctype.as_ptr(),
@@ -210,6 +252,17 @@ impl Service {
             )
         };
         if rc != 0 {
+            // -65548 is `kDNSServiceErr_NameConflict`: another instance of this
+            // name is already on the wire. With auto-rename off that is an
+            // error rather than a silent "(2)" suffix the picker would list and
+            // `ax::connect_to` would never match.
+            if rc == -65548 {
+                return Err(format!(
+                    "another AirPlay receiver called {name:?} is already advertised on this \
+                     network, so ScreenExtend cannot publish {regtype} under that name. A \
+                     previous ScreenExtend may not have shut down cleanly."
+                ));
+            }
             return Err(err(&format!("DNSServiceRegister({regtype})"), rc));
         }
         Ok(Self {
@@ -231,7 +284,9 @@ impl Drop for Service {
 }
 
 /// The identity we advertise. Stable per install so the sender's pairing cache
-/// stays valid across restarts.
+/// stays valid across restarts — which is why the seed falling back to the
+/// hostname ([`machine_seed`]) is logged rather than silent: it changes
+/// `deviceid`, `pk` and `pi` all at once.
 #[derive(Clone, Debug)]
 pub struct Identity {
     /// Colon-separated *lower-case* MAC-shaped string, e.g. `a2:b4:c6:d8:ea:fc`.
@@ -318,7 +373,12 @@ fn machine_seed() -> String {
             }
         }
     }
-    whoami::hostname().unwrap_or_else(|_| "ScreenExtend".to_string())
+    let fallback = whoami::hostname().unwrap_or_else(|_| "ScreenExtend".to_string());
+    teprintln!(
+        "[airplay] could not read IOPlatformUUID; deriving the advertised identity from the \
+         hostname instead, which invalidates any pairing the sender cached"
+    );
+    fallback
 }
 
 fn fnv1a(s: &str) -> u64 {
@@ -382,6 +442,12 @@ pub fn airplay_txt_blob(id: &Identity, legacy_pairing: bool) -> Vec<u8> {
     for (k, v) in airplay_txt_pairs(id, legacy_pairing) {
         let entry = format!("{k}={v}");
         let len = entry.len().min(u8::MAX as usize);
+        if len < entry.len() {
+            // `TxtRecord::set` refuses this outright, and the two forms must
+            // agree — a truncated key here and a rejected one there is a drift
+            // nobody would find.
+            teprintln!("[airplay] TXT entry {k:?} is longer than 255 bytes and was truncated");
+        }
         out.push(len as u8);
         out.extend_from_slice(&entry.as_bytes()[..len]);
     }
@@ -405,8 +471,10 @@ impl Advertisement {
     ) -> Result<Self, String> {
         let features = features_hex(legacy_pairing);
 
-        let interface_index = primary_interface_index().ok_or_else(|| {
-            "no usable network interface to advertise on. The AirPlay display fallback needs one,              because macOS ignores an AirPlay target whose Bonjour records arrive on the              \"any\" interface as if it were the Mac itself."
+        let (interface_index, interface_name) = primary_interface_index().ok_or_else(|| {
+            "no usable network interface to advertise on. The AirPlay display fallback needs one, \
+             because macOS ignores an AirPlay target whose Bonjour records arrive on the \
+             \"any\" interface as if it were the Mac itself."
                 .to_string()
         })?;
 
@@ -415,6 +483,7 @@ impl Advertisement {
             "_airplay._tcp",
             port,
             interface_index,
+            KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
             &airplay_txt_pairs(id, legacy_pairing),
         )?;
 
@@ -425,6 +494,7 @@ impl Advertisement {
             "_raop._tcp",
             port,
             interface_index,
+            KDNS_SERVICE_FLAGS_NO_AUTO_RENAME,
             &[
                 ("txtvers", "1".to_string()),
                 ("ch", "2".to_string()),
@@ -449,7 +519,8 @@ impl Advertisement {
         )?;
 
         tprintln!(
-            "[airplay] advertising {name:?} on port {port}, interface index {interface_index},              deviceid {} (features {})",
+            "[airplay] advertising {name:?} on port {port}, interface {interface_name} \
+             (index {interface_index}), deviceid {} (features {})",
             id.device_id,
             features_hex(legacy_pairing),
         );
@@ -520,12 +591,28 @@ mod tests {
     fn a_real_interface_index_is_found() {
         // Registering on index 0 makes macOS treat the receiver as the host
         // itself, so this must never fall back to it.
-        let idx = primary_interface_index();
-        assert!(
-            idx.is_some(),
-            "a running Mac has at least one usable interface"
-        );
-        assert_ne!(idx, Some(0));
+        let chosen = primary_interface_index();
+        let Some((index, name)) = chosen else {
+            panic!("a running Mac has at least one usable interface");
+        };
+        println!("advertising interface: {name} (index {index})");
+        assert_ne!(index, 0);
+        for never in ["awdl", "llw", "utun", "vmnet", "bridge", "ap", "gif", "stf"] {
+            assert!(
+                !name.starts_with(never),
+                "{name} is not a LAN interface and must not be chosen"
+            );
+        }
+    }
+
+    #[test]
+    fn the_registration_flags_are_the_documented_constants() {
+        // 0x0 here — the value this was — is exactly the auto-rename default,
+        // which silently turns "ScreenExtend" into "ScreenExtend (2)" and makes
+        // the picker row unmatchable.
+        assert_eq!(KDNS_SERVICE_FLAGS_NO_AUTO_RENAME, 0x8);
+        assert_eq!(KDNS_SERVICE_FLAGS_INCLUDE_AWDL, 0x100);
+        assert_eq!(KDNS_SERVICE_INTERFACE_INDEX_P2P, 0xFFFF_FFFE);
     }
 
     #[test]
