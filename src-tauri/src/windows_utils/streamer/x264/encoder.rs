@@ -150,13 +150,37 @@ impl X264Encoder {
         let c_size = (width / 2) * (height / 2);
         let i420 = vec![0u8; y_size + 2 * c_size];
 
+        // Read back what libx264 settled on rather than reporting the request. `ultrafast` and
+        // `zerolatency` are a preset and a tune, both of which move fields, and
+        // `param_apply_profile` moves more — so printing `p` was printing what was asked for.
+        // Every latency-critical setting in this file is in the list because each one is a way
+        // for the encoder to be quietly buffering: a B frame, a lookahead, a frame-threaded
+        // pipeline, or an intra-refresh period that never sweeps.
+        let eff = read_back_params(&api, handle);
         tprintln!(
             "pipeline: software x264 encoder ready ({width}x{height}@{fps}, {kbps} kbps, \
-             threads={}, profile={:?}, csp=I420, intra_refresh={}, lib={})",
-            p.i_threads,
+             profile={:?}, lib={}, build={}). Effective: threads={}, sliced_threads={}, \
+             bframes={}, rc_lookahead={}, sync_lookahead={}, keyint={}, intra_refresh={}, \
+             scenecut={}, repeat_headers={}, annexb={}, nal_hrd={}, vbv_maxrate={}, \
+             vbv_bufsize={}, colmatrix={}, fullrange={}",
             config.profile,
-            config.intra_refresh,
             api.library_path().display(),
+            api.build,
+            eff.i_threads,
+            eff.b_sliced_threads,
+            eff.i_bframe,
+            eff.rc.i_lookahead,
+            eff.i_sync_lookahead,
+            eff.i_keyint_max,
+            eff.b_intra_refresh,
+            eff.i_scenecut_threshold,
+            eff.b_repeat_headers,
+            eff.b_annexb,
+            eff.i_nal_hrd,
+            eff.rc.i_vbv_max_bitrate,
+            eff.rc.i_vbv_buffer_size,
+            eff.vui.i_colmatrix,
+            eff.vui.b_fullrange,
         );
 
         Ok(Self {
@@ -174,6 +198,22 @@ impl X264Encoder {
             have_frame: false,
             pts: 0,
         })
+    }
+
+    /// The parameters libx264 actually settled on, after the preset, the tune,
+    /// `param_apply_profile` and its own validation have all had their say.
+    ///
+    /// `self.params` is the *request*. Everything this file claims about the encoder's
+    /// configuration — no B frames, no lookahead, sliced rather than frame threads, an
+    /// intra-refresh period that actually sweeps — was a claim about the request until this
+    /// existed. `x264_zerolatency_settings_were_accepted` asserts against this, not against `p`.
+    /// The libx264 build number the loader accepted, for the init log and the tests.
+    pub fn build(&self) -> i32 {
+        self.api.build
+    }
+
+    pub fn effective_params(&self) -> x264_param_t {
+        read_back_params(&self.api, self.handle)
     }
 
     pub fn encode_bgra(&mut self, bgra: &[u8], force_idr: bool) -> Result<Vec<u8>> {
@@ -430,6 +470,14 @@ fn encode_thread_count() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
         .clamp(1, MAX_ENCODE_THREADS)
+}
+
+/// `x264_encoder_parameters` into a zeroed struct. Separate from the method because the init
+/// log needs it before there is a `Self` to call it on.
+fn read_back_params(api: &X264Api, handle: *mut x264_t) -> x264_param_t {
+    let mut out: x264_param_t = unsafe { std::mem::zeroed() };
+    unsafe { (api.encoder_parameters)(handle, &mut out) };
+    out
 }
 
 fn bitrate_kbps(bps: u32) -> c_int {

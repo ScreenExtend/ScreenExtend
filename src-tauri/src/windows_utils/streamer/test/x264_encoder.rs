@@ -1,6 +1,7 @@
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
 use crate::windows_utils::streamer::x264::encoder::{fill_synthetic_bgra, X264Encoder};
+use crate::windows_utils::streamer::x264::x264_sys::X264_CSP_I420;
 
 use super::h264::{is_idr_with_headers, nal_units, parse_sps, starts_with_annexb};
 
@@ -426,5 +427,187 @@ fn x264_nv12_input_matches_the_bgra_path() {
          (ratio {ratio:.2}), encode median bgra={}us nv12={}us",
         med(&bgra_us),
         med(&nv12_us),
+    );
+}
+
+/// Every latency-critical x264 setting, read back from the encoder rather than from the request.
+///
+/// `ultrafast` is a preset and `zerolatency` is a tune; both move fields, `param_apply_profile`
+/// moves more, and `x264_encoder_open` validates and can move them again. So until
+/// `x264_encoder_parameters` was bound, everything this codebase said about the software
+/// encoder's configuration was a statement about what had been asked for. Each field below is a
+/// distinct way for the encoder to be quietly buffering a frame.
+#[test]
+fn x264_zerolatency_settings_were_accepted() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    const FPS: u32 = 60;
+
+    let enc = match X264Encoder::new(EncoderConfig {
+        width: W,
+        height: H,
+        fps: FPS,
+        bitrate_bps: 8_000_000,
+        max_bitrate_bps: 8_000_000,
+        profile: H264Profile::Baseline,
+        qp: None,
+        min_qp: None,
+        intra_refresh: true,
+    }) {
+        Ok(e) => e,
+        Err(e) => {
+            super::skip("x264 zerolatency verification (libx264 unavailable)", e);
+            return;
+        }
+    };
+    let p = enc.effective_params();
+
+    assert_eq!(p.i_bframe, 0, "any B frame is a reordering delay");
+    assert_eq!(
+        p.b_sliced_threads, 1,
+        "frame threads pipeline whole frames; sliced threads do not"
+    );
+    assert_eq!(p.rc.i_lookahead, 0, "rc-lookahead buffers frames");
+    assert_eq!(p.i_sync_lookahead, 0, "sync-lookahead buffers frames");
+    assert_eq!(
+        p.b_repeat_headers, 1,
+        "a client joining mid-stream needs SPS/PPS in band"
+    );
+    assert_eq!(p.b_annexb, 1, "the packetizer walks Annex-B start codes");
+    assert_eq!(
+        p.i_scenecut_threshold, 0,
+        "a scene cut would insert an unrequested keyframe into an infinite GOP"
+    );
+    assert_eq!(p.i_csp, X264_CSP_I420, "the internal csp must stay 4:2:0");
+
+    // Intra refresh was asked for, so keyint is the refresh period, not an IDR interval:
+    // libx264 advances the refresh column by `mb_width / i_keyint_max` macroblocks per frame,
+    // which is why leaving keyint infinite made the wave move ~1e-9 MB/frame and never sweep.
+    assert_eq!(p.b_intra_refresh, 1, "intra refresh was requested");
+    assert_eq!(
+        p.i_keyint_max, FPS as std::ffi::c_int,
+        "with intra refresh on, keyint is the sweep period and must be finite"
+    );
+
+    // The VBV is what makes ABR behave like CBR without HRD signalling and its filler data.
+    assert!(
+        p.rc.i_vbv_max_bitrate > 0 && p.rc.i_vbv_buffer_size > 0,
+        "ABR without a VBV targets an average over the whole stream, which is not a per-frame \
+         budget: maxrate={} bufsize={}",
+        p.rc.i_vbv_max_bitrate,
+        p.rc.i_vbv_buffer_size
+    );
+    assert_eq!(
+        p.rc.i_vbv_max_bitrate, p.rc.i_bitrate,
+        "peak must equal target or the VBV is a ceiling the encoder is allowed to exceed on average"
+    );
+
+    // BT.709 on both halves; see `bt709_y` and the VUI block in `X264Encoder::new`.
+    assert_eq!(p.vui.i_colmatrix, 1, "matrix_coefficients must say BT.709");
+    assert_eq!(p.vui.i_colorprim, 1, "colour_primaries must say BT.709");
+    assert_eq!(
+        p.vui.i_transfer, 1,
+        "transfer_characteristics must say BT.709"
+    );
+    assert_eq!(p.vui.b_fullrange, 0, "the samples are limited range");
+
+    eprintln!(
+        "x264 effective params OK: threads={} sliced={} bframes={} rc_lookahead={} \
+         sync_lookahead={} keyint={} intra_refresh={} scenecut={} nal_hrd={} \
+         vbv_maxrate={} vbv_bufsize={} (build {})",
+        p.i_threads,
+        p.b_sliced_threads,
+        p.i_bframe,
+        p.rc.i_lookahead,
+        p.i_sync_lookahead,
+        p.i_keyint_max,
+        p.b_intra_refresh,
+        p.i_scenecut_threshold,
+        p.i_nal_hrd,
+        p.rc.i_vbv_max_bitrate,
+        p.rc.i_vbv_buffer_size,
+        enc.build(),
+    );
+}
+
+/// Does the VBV actually bind, or is `nal-hrd=cbr` needed?
+///
+/// `minor-x264-rate-control-is-abr-without-nal-hrd-cbr` asks whether ABR-with-VBV holds the
+/// stream to a per-frame budget or merely to a long-run average. The answer decides whether to
+/// set `i_nal_hrd = X264_NAL_HRD_CBR`, which would also start inserting filler data — bandwidth
+/// spent on nothing, which is why NVENC disables filler explicitly and Quick Sync turns HRD
+/// conformance off.
+///
+/// So: measure the access-unit size distribution against the per-frame budget rather than
+/// arguing about it.
+#[test]
+fn x264_vbv_bounds_the_access_unit_size() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    const FPS: u32 = 60;
+    const BITRATE: u32 = 8_000_000;
+    const FRAMES: u32 = 240;
+
+    let mut enc = match X264Encoder::new(EncoderConfig {
+        width: W,
+        height: H,
+        fps: FPS,
+        bitrate_bps: BITRATE,
+        max_bitrate_bps: BITRATE,
+        profile: H264Profile::Baseline,
+        qp: None,
+        min_qp: None,
+        intra_refresh: false,
+    }) {
+        Ok(e) => e,
+        Err(e) => {
+            super::skip("x264 VBV measurement (libx264 unavailable)", e);
+            return;
+        }
+    };
+
+    let budget_bytes = (BITRATE / 8 / FPS) as usize;
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    let mut sizes: Vec<usize> = Vec::with_capacity(FRAMES as usize);
+    let mut idr_bytes = 0usize;
+    for i in 0..FRAMES {
+        fill_synthetic_bgra(&mut frame, W, H, i);
+        let au = enc.encode_bgra(&frame, i == 0).expect("encode");
+        if i == 0 {
+            idr_bytes = au.len();
+        } else if !au.is_empty() {
+            sizes.push(au.len());
+        }
+    }
+
+    sizes.sort_unstable();
+    let pick = |pct: usize| sizes[(sizes.len() * pct / 100).min(sizes.len() - 1)];
+    let (p50, p95, p99, max) = (pick(50), pick(95), pick(99), *sizes.last().unwrap());
+    let mean: f64 = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
+
+    eprintln!(
+        "x264 AU sizes at {}x{}@{} / {} Mbps (budget {budget_bytes} B/frame): \
+         mean={mean:.0} p50={p50} p95={p95} p99={p99} max={max} ({:.2}x budget), idr={idr_bytes} B",
+        W,
+        H,
+        FPS,
+        BITRATE / 1_000_000,
+        max as f64 / budget_bytes as f64,
+    );
+
+    // The VBV is two frame budgets (`vbv_buffer_kbit`), so a P frame may spend up to about that
+    // and no more. Four is slack for the measurement, not a target: what would fail here is ABR
+    // ignoring the VBV and targeting a whole-stream average, which is the case `nal-hrd=cbr`
+    // would exist to fix.
+    assert!(
+        max < budget_bytes * 4,
+        "largest P access unit {max} B is more than 4x the {budget_bytes} B per-frame budget; \
+         the VBV is not binding and ABR is targeting a long-run average"
+    );
+    // And the mean must actually land near the target, or the rate control is not tracking.
+    assert!(
+        mean < budget_bytes as f64 * 1.5,
+        "mean access unit {mean:.0} B against a {budget_bytes} B budget: rate control is \
+         overshooting the target"
     );
 }
