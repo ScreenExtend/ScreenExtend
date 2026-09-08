@@ -640,8 +640,13 @@ pub fn start_hosted_network(
         return false;
     }
 
-    // Start from a known state: the OS or a previous run may have left the radio in AP mode.
-    stop_host_ap_mode();
+    // Start from a known state, but only if there is something to stop: sending stopHostAPMode to
+    // an interface that is associated as a station is unverified territory, and this Mac's Wi-Fi is
+    // very likely the link the user is about to stream over.
+    if interface_mode_is_host_ap(&interface) {
+        tprintln!("[hosted-network] the interface is already in AP mode; stopping it first");
+        stop_host_ap_mode();
+    }
 
     let outcome = if backend == HostedNetworkBackend::HostApSpi {
         start_via_host_ap(&interface, name, password, had_password, &app)
