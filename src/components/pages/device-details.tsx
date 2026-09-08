@@ -86,7 +86,7 @@ function TipLabel({
 }
 
 // Radix unmounts `SheetContent` while the sheet is closed, but everything around it -- a
-// full formik instance, a config-store subscription, two effects and an 500-line render
+// full formik instance, a config-store subscription, two effects and a 500-line render
 // function -- ran once per row of the devices table on every parent render, open or not.
 // The trigger stays light; the body mounts with the sheet. `SHEET_EXIT_MS` keeps it alive
 // across Radix's close animation so the slide-out is unchanged: the number to match is
@@ -100,12 +100,12 @@ export function DeviceDetails({ device }: { device: Device }) {
   // state that only exists inside the body.
   const closeRequest = React.useRef<() => void>(() => setOpen(false));
 
+  // Mounting on open is done during render, not in an effect: an effect would put the
+  // body one commit behind the sheet and delay the slide-in by a frame. Unmounting is the
+  // part that waits.
+  if (open && !mounted) setMounted(true);
   useEffect(() => {
-    if (open) {
-      setMounted(true);
-      return;
-    }
-    if (!mounted) return;
+    if (open || !mounted) return;
     const id = window.setTimeout(() => setMounted(false), SHEET_EXIT_MS);
     return () => window.clearTimeout(id);
   }, [open, mounted]);
