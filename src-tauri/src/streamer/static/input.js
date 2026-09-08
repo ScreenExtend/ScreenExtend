@@ -94,19 +94,41 @@
     recomputePictureRect();
   }
 
-  const moveBuf = new ArrayBuffer(40), moveView = new DataView(moveBuf);
-  const wheelBuf = new ArrayBuffer(15), wheelView = new DataView(wheelBuf);
-  const deltaBuf = new ArrayBuffer(9), deltaView = new DataView(deltaBuf);
+  // Every frame is written into a buffer sized for its optional tail and sent with an explicit
+  // length, so the tail costs nothing on a host that does not want it — see the stamp block
+  // further down. v1 lengths: pointer 40, wheel 15, mouse delta 8 (byte 8 was always a pad),
+  // batch 10 + n*24.
+  const POINTER_LEN = 40, WHEEL_LEN = 15, DELTA_LEN = 9, STAMP_LEN = 8;
+  const moveBuf = new ArrayBuffer(POINTER_LEN + STAMP_LEN), moveView = new DataView(moveBuf);
+  const wheelBuf = new ArrayBuffer(WHEEL_LEN + STAMP_LEN), wheelView = new DataView(wheelBuf);
+  const deltaBuf = new ArrayBuffer(DELTA_LEN + STAMP_LEN), deltaView = new DataView(deltaBuf);
   const resizeBuf = new ArrayBuffer(9), resizeView = new DataView(resizeBuf);
   const lifeBuf = new ArrayBuffer(2), lifeView = new DataView(lifeBuf);
   const pingBuf = new ArrayBuffer(9), pingView = new DataView(pingBuf);
   const zoomBuf = new ArrayBuffer(5), zoomView = new DataView(zoomBuf);
   const keyScratch = new Uint8Array(1024), keyView = new DataView(keyScratch.buffer);
   const BATCH_MAX = 40;
-  const batchBuf = new ArrayBuffer(10 + BATCH_MAX * 24), batchView = new DataView(batchBuf);
+  const BATCH_TAIL = STAMP_LEN + 2;
+  const batchBuf = new ArrayBuffer(10 + BATCH_MAX * 24 + BATCH_TAIL), batchView = new DataView(batchBuf);
 
   function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
   function clampI16(v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : (v | 0); }
+
+  // The optional tails (docs/INPUT-PROTOCOL.md, "The optional client stamp"). Both are gated
+  // on the host having said it reads them, for the same reason the out-of-band keyframe
+  // request is: bytes a host does not parse are bytes on the wire buying nothing, and the
+  // flags byte in particular is a byte an older host reads as the zero pad it used to be.
+  // `hostCaps` is 0 until the first PONG, so a session's first second is plain v1 frames —
+  // which is what an older host would get for the whole session, and is correct for both.
+  //
+  // The stamp is `performance.now() * 1e6`, the same value and timebase the PING carries, so
+  // the host can difference the two without either side agreeing on an epoch.
+  const EVFLAG_UNADJUSTED = 1 << 0;
+  let lockIsUnadjusted = false;
+  function wantStamp() { return (hostCaps & HOST_CAP.INPUT_TIMESTAMP) !== 0; }
+  function wantEvFlags() { return (hostCaps & HOST_CAP.INPUT_EVENT_FLAGS) !== 0; }
+  function nowNs() { return Math.round(performance.now() * 1e6); }
+  function evFlags() { return lockIsUnadjusted ? EVFLAG_UNADJUSTED : 0; }
 
   function channelFor(op) {
     switch (op) {
@@ -170,7 +192,9 @@
     moveView.setFloat32(30, (e.width || 0) / (picW || cssW || 1), true);
     moveView.setFloat32(34, (e.height || 0) / (picH || cssH || 1), true);
     moveView.setUint16(38, e.buttons || 0, true);
-    if (ch) rawSend(ch, moveBuf); else send(op, moveBuf);
+    let len = POINTER_LEN;
+    if (wantStamp()) { setU64(moveView, POINTER_LEN, nowNs()); len += STAMP_LEN; }
+    if (ch) rawSend(ch, moveBuf, len); else send(op, moveBuf, len);
   }
 
   function sendPointerBatch(source, id, buttons, coalesced) {
@@ -192,6 +216,15 @@
         batchView.setFloat32(o + 20, s.twist || 0, true);
         o += 24;
       }
+      // The tail is all-or-nothing: the host reads it only when the stamp, the flags byte and
+      // the predicted count are all present, so the flags byte cannot ride without the stamp.
+      // The count is 0 because this client sends measured samples only — getPredictedEvents()
+      // is deliberately not used; see docs/OPTIMIZATIONS.md.
+      if (wantStamp()) {
+        setU64(batchView, o, nowNs()); o += STAMP_LEN;
+        batchView.setUint8(o++, wantEvFlags() ? evFlags() : 0);
+        batchView.setUint8(o++, 0);
+      }
       send(OP.POINTER_MOVE_BATCH, batchBuf, o);
     }
   }
@@ -209,7 +242,9 @@
     wheelView.setFloat32(6, e.deltaY, true);
     wheelView.setFloat32(10, e.deltaZ || 0, true);
     wheelView.setUint8(14, e.deltaMode || 0);
-    send(OP.WHEEL, wheelBuf);
+    let len = WHEEL_LEN;
+    if (wantStamp()) { setU64(wheelView, WHEEL_LEN, nowNs()); len += STAMP_LEN; }
+    send(OP.WHEEL, wheelBuf, len);
   }
   function sendMouseDelta(dx, dy, buttons) {
     deltaView.setUint8(0, OP.MOUSE_DELTA);
@@ -217,8 +252,14 @@
     deltaView.setInt16(2, clampI16(dx), true);
     deltaView.setInt16(4, clampI16(dy), true);
     deltaView.setUint16(6, buttons || 0, true);
-    deltaView.setUint8(8, 0);
-    send(OP.MOUSE_DELTA, deltaBuf);
+    // Byte 8 was always sent as a zero pad, which is what let it become the flags byte with
+    // no version bump: to a host that does not read it, nothing changed. Bit 0 says these
+    // deltas are raw device counts with no OS pointer curve on them, so the host knows not to
+    // apply a second one.
+    deltaView.setUint8(8, wantEvFlags() ? evFlags() : 0);
+    let len = DELTA_LEN;
+    if (wantStamp()) { setU64(deltaView, DELTA_LEN, nowNs()); len += STAMP_LEN; }
+    send(OP.MOUSE_DELTA, deltaBuf, len);
   }
 
   function sendKey(down, e) {
@@ -233,6 +274,7 @@
     keyScratch.set(code, o); o += code.length;
     keyView.setUint8(o++, key.length);
     keyScratch.set(key, o); o += key.length;
+    if (wantStamp()) { setU64(keyView, o, nowNs()); o += STAMP_LEN; }
     send(OP.KEY, keyScratch.buffer, o);
   }
 
@@ -822,6 +864,9 @@
       if (hostCaps) { try { fn(hostCaps); } catch (_) {} }
     },
     hasCoalescedEvents() { return !!hasCoalesced; },
+    // The page owns the pointer-lock request and therefore the only place that knows whether
+    // `unadjustedMovement` was actually granted; this is what puts it on the wire.
+    setPointerLockUnadjusted(on) { lockIsUnadjusted = !!on; },
     get fastDropped() { return fastDropped; },
     onViewportSettled() { refreshSize(); sendResize(); },
   };
