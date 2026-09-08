@@ -253,9 +253,33 @@ impl AppState {
                     "urls": turn.urls, "username": turn.username, "credential": turn.credential
                 }));
             }
-            return serde_json::json!({ "iceServers": servers }).to_string();
+            return serde_json::json!({
+                "iceServers": servers,
+                "locality": "same-network",
+            })
+            .to_string();
         }
-        self.ice_json_live()
+        // `locality` answers the one question the client cannot answer for itself: whether this
+        // session will actually be relayed. It has to gather before it POSTs — WHEP has no PATCH
+        // to trickle candidates in later — and *which* candidate it may stop gathering on depends
+        // entirely on that. Inferring it from the shape of the server list ("a TURN entry is
+        // present, so a relay is needed") is wrong in exactly the case above, where a same-subnet
+        // peer is handed TURN as a backup and will be nominated on a host candidate that arrived
+        // in the first millisecond.
+        let mut v: serde_json::Value = serde_json::from_str(&self.ice_json_live())
+            .unwrap_or_else(|_| serde_json::json!({ "iceServers": [] }));
+        if let Some(obj) = v.as_object_mut() {
+            let name = match locality {
+                SessionLocality::SameNetwork => "same-network",
+                SessionLocality::CrossNetwork => "cross-network",
+                SessionLocality::Unknown => "unknown",
+            };
+            obj.insert(
+                "locality".into(),
+                serde_json::Value::String(name.to_owned()),
+            );
+        }
+        v.to_string()
     }
 
     pub fn ice_json_live(&self) -> String {
