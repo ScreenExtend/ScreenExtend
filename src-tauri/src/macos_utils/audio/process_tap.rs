@@ -20,7 +20,7 @@ use objc2_core_audio::{
     AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectPropertyListenerProc, AudioObjectRemovePropertyListener,
 };
-use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription};
+use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStampFlags};
 use objc2_core_foundation::CFString;
 
 use super::format::{self, AudioFormatDesc};
@@ -70,11 +70,25 @@ struct IoCtx {
 unsafe impl Send for IoCtx {}
 unsafe impl Sync for IoCtx {}
 
+/// Host-clock time of the block an IOProc is handed, or 0 when the HAL did not stamp it.
+///
+/// `mHostTime` is `mach_absolute_time` at the moment the hardware read the block's first frame,
+/// which is the instant A/V sync needs — not the moment the encoder worker later gets to it.
+#[inline]
+pub(super) fn block_host_ns(ts: NonNull<objc2_core_audio_types::AudioTimeStamp>) -> u64 {
+    // SAFETY: the HAL passes a live AudioTimeStamp for the duration of the callback
+    let ts = unsafe { ts.as_ref() };
+    if !ts.mFlags.contains(AudioTimeStampFlags::HostTimeValid) {
+        return 0;
+    }
+    crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(ts.mHostTime)
+}
+
 extern "C-unwind" fn tap_ioproc(
     _in_device: AudioObjectID,
     _in_now: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     in_input_data: NonNull<AudioBufferList>,
-    _in_input_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
+    in_input_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     _out_output_data: NonNull<AudioBufferList>,
     _in_output_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     client_data: *mut c_void,
@@ -154,7 +168,7 @@ extern "C-unwind" fn tap_ioproc(
         ctx.nonsilent_samples
             .fetch_add(nonsilent, Ordering::Relaxed);
     }
-    let dropped = ctx.producer.push(frame);
+    let dropped = ctx.producer.push_at(frame, block_host_ns(in_input_time));
     if dropped > 0 {
         ctx.diag
             .dropped_backpressure
@@ -170,10 +184,23 @@ struct TapResources {
     io_proc: AudioDeviceIOProcID,
     ctx: *mut IoCtx,
     started: bool,
+    /// the user's default output device, and the rate it was on before we changed it
+    restore_rate: Option<(AudioObjectID, f64)>,
 }
 
 impl Drop for TapResources {
     fn drop(&mut self) {
+        if let Some((dev, rate)) = self.restore_rate.take() {
+            let st = set_nominal_sample_rate(dev, rate);
+            if st == 0 {
+                crate::tprintln!("audio: restored output device {dev} to {rate} Hz");
+            } else {
+                crate::teprintln!(
+                    "audio: could not restore output device {dev} to {rate} Hz (OSStatus {st}); \
+                     it is still at 48000 Hz"
+                );
+            }
+        }
         unsafe {
             if self.aggregate_id != 0 {
                 if self.started {
@@ -229,7 +256,6 @@ fn default_device_listener_address() -> AudioObjectPropertyAddress {
 pub struct ProcessTapCapture {
     resources: Option<TapResources>,
     listener_ctx: *mut ListenerCtx,
-    nonsilent_probe: Option<Arc<AtomicU64>>,
     sink: Option<AudioFrameSink>,
 }
 
@@ -240,28 +266,8 @@ impl ProcessTapCapture {
         Self {
             resources: None,
             listener_ctx: ptr::null_mut(),
-            nonsilent_probe: None,
             sink: None,
         }
-    }
-
-    pub fn try_create() -> Result<(), AudioCaptureError> {
-        if !runtime_available() {
-            return Err(AudioCaptureError::Unsupported(
-                "Core Audio Process Tap API not present (needs macOS 14.2+)".into(),
-            ));
-        }
-        // throwaway sink; dropped with its ring right after the probe
-        let (producer, _consumer, consumer_thread) = super::ring::ring(4096);
-        let sink = AudioFrameSink {
-            producer: Arc::new(producer),
-            diagnostics: Arc::new(AudioDiagnostics::default()),
-            control_tx: None,
-            consumer_thread,
-        };
-        let mut probe = ProcessTapCapture::new();
-        probe.build_and_start(&sink)?;
-        Ok(())
     }
 
     fn build_and_start(&mut self, sink: &AudioFrameSink) -> Result<(), AudioCaptureError> {
@@ -308,6 +314,7 @@ impl ProcessTapCapture {
             io_proc: None,
             ctx: ptr::null_mut(),
             started: false,
+            restore_rate: None,
         };
 
         let asbd = read_tap_format(tap_id)?;
@@ -317,12 +324,55 @@ impl ProcessTapCapture {
         let output_dev = read_default_system_output_device()?;
         let output_uid = read_device_uid(output_dev)?;
 
-        let _ = set_nominal_sample_rate(output_dev, 48_000.0);
+        // The tap delivers whatever the output device runs at and nothing downstream resamples, so
+        // the device has to be at 48 kHz. That is the user's own interface — a 96 kHz DAC or a
+        // 44.1 kHz setting chosen for bit-perfect playback — so remember the old rate and put it
+        // back on teardown, rather than reconfiguring the machine permanently to stream to a phone.
+        let prior_rate = super::legacy::hal::nominal_sample_rate(output_dev);
+        match prior_rate {
+            Some(r) if (r - 48_000.0).abs() < 1.0 => {}
+            _ => {
+                let st = set_nominal_sample_rate(output_dev, 48_000.0);
+                crate::tprintln!(
+                    "audio: output device {output_dev} was {} Hz; set to 48000 (OSStatus {st})",
+                    prior_rate
+                        .map(|r| format!("{r}"))
+                        .unwrap_or_else(|| "unreadable".into())
+                );
+                if st == 0 {
+                    if let Some(r) = prior_rate {
+                        resources.restore_rate = Some((output_dev, r));
+                    }
+                }
+            }
+        }
+
         let aggregate_id = create_aggregate_device(&output_uid, &tap_uuid_string)?;
         resources.aggregate_id = aggregate_id;
+        set_aggregate_buffer_size(aggregate_id, &sink.diagnostics);
 
-        let asbd = read_tap_format(tap_id).unwrap_or(asbd);
-        let desc = format::parse_asbd(&asbd).unwrap_or(desc);
+        // Re-read now that the aggregate exists: the tap can settle on a different format once
+        // it is attached, which is the only reason to read it twice. Falling back silently to the
+        // pre-aggregate answer is exactly wrong in the one case the second read exists for, so a
+        // failed re-read says so and the old value is used knowingly.
+        let asbd = match read_tap_format(tap_id) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::teprintln!(
+                    "audio: could not re-read the tap format after building the aggregate ({e});                      continuing with the format read before it"
+                );
+                asbd
+            }
+        };
+        let desc = match format::parse_asbd(&asbd) {
+            Ok(d) => d,
+            Err(e) => {
+                crate::teprintln!(
+                    "audio: post-aggregate tap ASBD unusable ({e}); continuing with the format                      read before it"
+                );
+                desc
+            }
+        };
         if desc.sample_rate != 48_000 {
             return Err(AudioCaptureError::Setup(format!(
                 "tap delivers {} Hz, not 48000; deferring to SCK backend",
@@ -330,7 +380,6 @@ impl ProcessTapCapture {
             )));
         }
 
-        let nonsilent = Arc::new(AtomicU64::new(0));
         let scratch = vec![0.0f32; 8192 * format::OUT_CHANNELS].into_boxed_slice();
         let ctx = Box::into_raw(Box::new(IoCtx {
             producer: Arc::clone(&sink.producer),
@@ -340,7 +389,6 @@ impl ProcessTapCapture {
             diag: Arc::clone(&sink.diagnostics),
         }));
         resources.ctx = ctx;
-        self.nonsilent_probe = Some(nonsilent);
 
         let proc_fn: objc2_core_audio::AudioDeviceIOProc = Some(tap_ioproc);
         let mut io_proc: AudioDeviceIOProcID = None;
@@ -358,6 +406,12 @@ impl ProcessTapCapture {
             )));
         }
         resources.io_proc = io_proc;
+
+        // Prime the mach-to-host clock offset (a `OnceLock` that samples both clocks) off the
+        // real-time path: the IOProc must never be the thread that runs the one-time init.
+        let _ = crate::macos_utils::streamer::clock::mach_ticks_to_host_ns(
+            crate::macos_utils::streamer::mach::mach_now(),
+        );
 
         let st = unsafe { AudioDeviceStart(aggregate_id, io_proc) };
         if st != 0 {
@@ -583,6 +637,43 @@ fn read_tap_format(
         )));
     }
     Ok(asbd)
+}
+
+/// Frames per IO cycle to ask the tap aggregate for.
+///
+/// The default for an aggregate whose main sub-device is a built-in output is commonly 512 frames
+/// = 10.67 ms at 48 kHz, and that whole cycle is added to every sample before the ring sees it —
+/// the largest single term in the macOS host budget, next to a ring sized at 80 ms, a 125 us drain
+/// poll and Opus's 7.5 ms. Chromium runs 256 on output and treats 128 as its floor, the 256 being
+/// a *render*-side under-run guard a capture IOProc does not have.
+const TARGET_BUFFER_FRAMES: u32 = 128;
+
+/// Ask the aggregate for a short IO cycle, and record what it granted.
+///
+/// Never fatal: an aggregate whose main sub-device is USB or Bluetooth may refuse, and whatever it
+/// grants still works. The logged range and granted value are the measurement — nobody has
+/// recorded what the HAL reports for a *tap* aggregate, the reference implementation this device
+/// is modelled on does not set it either.
+fn set_aggregate_buffer_size(aggregate_id: AudioObjectID, diagnostics: &AudioDiagnostics) {
+    use super::legacy::hal;
+    let before = hal::buffer_frame_size(aggregate_id);
+    let Some((lo, hi)) = hal::buffer_frame_size_range(aggregate_id) else {
+        crate::teprintln!("audio: tap aggregate reports no buffer-frame-size range; leaving it");
+        if let Some(b) = before {
+            diagnostics.period_frames.store(b, Ordering::Relaxed);
+        }
+        return;
+    };
+    let target = TARGET_BUFFER_FRAMES.clamp(lo, hi);
+    let st = hal::set_buffer_frame_size(aggregate_id, target);
+    let granted = hal::buffer_frame_size(aggregate_id).unwrap_or(target);
+    diagnostics.period_frames.store(granted, Ordering::Relaxed);
+    crate::tprintln!(
+        "audio: tap aggregate IO cycle: was {} fr, range [{lo},{hi}], asked {target}, got {granted} \
+         ({:.2} ms @ 48 kHz, OSStatus {st})",
+        before.map(|b| b.to_string()).unwrap_or_else(|| "?".into()),
+        granted as f64 / 48.0
+    );
 }
 
 fn set_nominal_sample_rate(dev: AudioObjectID, rate: f64) -> i32 {

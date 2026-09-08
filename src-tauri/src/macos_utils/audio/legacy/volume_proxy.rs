@@ -25,9 +25,29 @@ pub fn apply(our_device: AudioObjectID, real_device: AudioObjectID, gain: &Monit
     gain.set(compute_gain(scalar, muted));
 
     if real_device != 0 {
-        let _ = hal::set_output_volume_scalar(real_device, scalar);
-        let _ = hal::set_output_mute(real_device, muted);
+        // A device that rejects volume or mute control is why the volume keys can look dead with
+        // nothing in the log to say so. Report each refusal once per device rather than on every
+        // property notification, which arrives per keystroke.
+        let vol = hal::set_output_volume_scalar(real_device, scalar);
+        let mute = hal::set_output_mute(real_device, muted);
+        if vol != 0 || mute != 0 {
+            warn_once(real_device, vol, mute);
+        }
     }
+}
+
+/// The device whose refusal has already been reported; `apply` runs per keystroke.
+static WARNED_DEVICE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn warn_once(device: AudioObjectID, vol_status: i32, mute_status: i32) {
+    if WARNED_DEVICE.swap(device, std::sync::atomic::Ordering::Relaxed) == device {
+        return;
+    }
+    crate::teprintln!(
+        "audio(legacy): output device {device} refused volume/mute mirroring (OSStatus \
+         volume={vol_status} mute={mute_status}); the host's own volume keys will not move it \
+         while ScreenExtend Audio is the default output"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
