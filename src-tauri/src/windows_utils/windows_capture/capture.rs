@@ -138,7 +138,15 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
         self.halt_handle.clone()
     }
 
-    /// Gets the callback struct used to call struct methods directly.
+    /// The handler behind its mutex, for calling its methods directly.
+    ///
+    /// **Locking this blocks for a whole frame.** The `FrameArrived` closure holds the same guard
+    /// for the entire callback, and on the classic (non-ring) path that callback is a full encode.
+    /// So a `lock()` here can park the calling thread for milliseconds — which is exactly what a
+    /// tokio worker or an axum handler must never do. Nothing in ScreenExtend calls this today,
+    /// and handler state that needs to be readable from outside should be an `Arc<Atomic*>` the
+    /// handler is given at construction (as `stale_frame_counter` is) rather than the handler
+    /// itself.
     #[inline]
     #[must_use]
     pub fn callback(&self) -> Arc<Mutex<T>> {
