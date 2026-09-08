@@ -203,13 +203,21 @@ rate-limited to one per 200 ms because the client's own limiter is advisory.
 ### `PING` / `PONG` — `0x60` / `0x61`
 
 ```
-PING   0x60 + u64 client stamp, ns              9 bytes,  C→H
-PONG   0x61 + u64 echoed stamp + u64 host_now_ns  17 bytes, H→C
+PING   0x60                                     9 bytes,  C→H
+0      u8   opcode
+1      u64  client stamp, ns
+
+PONG   0x61                                     19 bytes, H→C
+0      u8   opcode
+1      u64  echoed client stamp, as sent in the PING
+9      u64  host_now_ns at the moment the PONG was built
+--- optional ---
+17     u16  host capabilities (see below)
 ```
 
 The echoed half gives the client its RTT; the host half is what lets it place a host timestamp on
-its own timeline at all. A client older than the second field reads the first 9 bytes and ignores
-the rest.
+its own timeline at all. Bytes 0..17 are frozen: a client older than a field reads the prefix it
+knows and ignores the rest, and a host older than a field sends a shorter frame.
 
 ### `BYE` — `0x63`, 2 bytes, H→C
 
@@ -233,6 +241,38 @@ it otherwise sizes a heap allocation from an unvalidated number. `FOCUS_STATE`, 
 `POINTERLOCK_STATE` (`0x50`, `0x51`, `0x53`) are one boolean byte. `RESIZE` (`0x52`) is `u16`
 width, `u16` height, `f32` devicePixelRatio.
 
+## Host capabilities
+
+The client must not assume the host understands anything optional. Every `PONG` — which it
+already receives once a second — carries a `u16` bitfield at offset 17 saying what this host
+actually does. **A frame shorter than 19 bytes means no bits: an older host, and the correct
+answer for it.** Read it as:
+
+```js
+const caps = dv.byteLength >= 19 ? dv.getUint16(17, true) : 0;
+```
+
+| Bit | Name | Set when the host |
+|---:|---|---|
+| 0 | `KEYFRAME_REQUEST` | parses `0x64` and routes it to the encoder's IDR path |
+| 1 | `STATS_V2` | reads the 96-byte v2 stats frame, not only its 72-byte v1 prefix |
+| 2 | `UNRELIABLE_MOVE_CHANNEL` | accepts a separate unordered/unreliable channel for pointer moves |
+| 3 | `INPUT_TIMESTAMP` | reads the optional trailing client stamp and reports `input_recv` |
+| 4 | `INPUT_EVENT_FLAGS` | reads the `MOUSE_DELTA` flags byte, so `unadjustedMovement` is worth reporting |
+
+This build sets bits 0, 1, 3 and 4. **Bit 2 is deliberately clear and is expected to stay clear**:
+the existing `fast` channel is already `ordered: false, maxRetransmits: 0`, so a second one has
+nothing to add. The bit is reserved rather than reused so it cannot come to mean something else.
+
+The bits are a floor, not a contract to stop sending: everything they gate is additive and safely
+ignored by a host that does not set them. A client seeing bit 0 clear should keep its `<video>`
+demotion watchdog armed rather than waiting for an IDR that is not coming; a client seeing bit 3
+clear may skip the eight stamp bytes, but sending them anyway costs the host nothing.
+
+`HOST_CAPABILITIES` in `protocol.rs` is the one place the value is assembled, and
+`the_pong_tail_announces_what_this_host_understands` asserts both the frozen prefix and every
+bit.
+
 ## Host-side queueing
 
 `route()` puts a fast opcode on a 64-deep bounded channel and everything else on an unbounded
@@ -254,5 +294,7 @@ Two things can drop an event, and both are counted:
 1. Append it past the current length of the frame; never change an existing offset.
 2. Read it only when the whole of it is present, defaulting to 0 — the length is a floor.
 3. Add the layout to the table above and a `parse` test for the old length and the new one.
-4. If the client must know the host understands it, that is what the stats frame's version byte
-   is for; a one-directional field needs no negotiation at all.
+4. If the client must know the host understands it, add a bit to `HOST_CAPABILITIES` and the
+   table under "Host capabilities". A field the client can send unconditionally — because a host
+   that does not read it is unharmed — needs no bit at all; one that changes what the client
+   *does* (whether to arm a fallback, say) needs one.

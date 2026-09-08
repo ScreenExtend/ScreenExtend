@@ -28,11 +28,13 @@ host's own clock alongside it:
 PONG   0x61
   +1   u64  echoed client stamp, ns (as sent in the PING)
   +9   u64  host_now_ns at the moment the PONG was built
-       17 bytes total
+  +17  u16  host capabilities — docs/INPUT-PROTOCOL.md, "Host capabilities"
+       19 bytes total
 ```
 
-A client older than this reads the first 9 bytes and ignores the rest; a host older than this
-sends 9 bytes and the client simply never gets an offset.
+Bytes 0..17 are frozen. A client older than a field reads the prefix it knows and ignores the
+rest; a host older than a field sends a shorter frame, and a client that sees fewer than 19 bytes
+reads no capability bits, which is the correct answer for that host.
 
 The client keeps the **minimum-RTT** sample, because the least-queued exchange gives the tightest
 midpoint estimate, and ages it out after 30 s so a route change is not remembered forever:
@@ -69,8 +71,16 @@ epochs, meaningless on their own but valid as a *difference*, which is all A/V s
 | `socket_write_done_ns` | After the last RTP packet of the frame is written. |
 
 Derived histograms: `capture_delivery`, `scale`, `encode_queue`, `encode`, `packetize`,
-`socket_write`, `capture_to_encode`, `capture_to_socket`. A stage with `count == 0` did not fire —
-that absence is a finding, not a zero.
+`socket_write`, `pace_wait`, `capture_to_encode`, `capture_to_socket`.
+
+`pace_wait` is the odd one out: it is not derived from a `FrameTiming` pair but recorded
+directly by the RTP writer, and it holds **only the time the send pacer slept** — not the
+writes that sleeping is interleaved with. That separation is the point. Pacing and sending
+both show up inside `socket_write`, and "the pacer is free on this path" has to be
+distinguishable from "the socket is slow". On a `SessionLocality::SameNetwork` session the
+pacer is off and this histogram is all zeroes, which is the correct reading.
+
+A stage with `count == 0` did not fire — that absence is a finding, not a zero.
 
 Histograms are fixed log-scale buckets, 8 per octave (any bucket is under 13% wide), 512 buckets
 of `AtomicU64`. `record` is three relaxed `fetch_add`s and a `fetch_max`: no allocation, no lock,
@@ -104,15 +114,37 @@ client contributes nothing rather than a wrong number.
 
 ## Degradation counters
 
-`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `nacks_received`,
-`keyframe_requests`, `client_keyframe_requests`, `idrs_sent`, `encoder_resets`,
-`encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the client-reported
-`client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
+`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `frames_dropped_broadcast`,
+`nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
+`keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
+`encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
+client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
 `input_queue_drops` / `input_stale_drops`.
 
 `keyframe_requests` counts RTCP PLI and FIR; `client_keyframe_requests` counts the out-of-band
 `KEYFRAME_REQUEST` (`0x64`) a client sends when it has no other way to ask, so the two sources
-stay distinguishable. `input_queue_drops` is the fast input queue shedding its oldest entry under
+stay distinguishable.
+
+Four of these describe the transport's own decisions rather than its failures, and are read as
+pairs:
+
+- `keyframe_requests_suppressed` is how many requests the per-session gate declined. A decoder
+  that has lost its reference chain emits a PLI for every frame in its backlog, and on an
+  infinite-GOP encoder answering each one produces the largest frame the session can send — which
+  is what turns a stumble into a keyframe storm. So a large suppressed/requested ratio is healthy;
+  `idrs_sent` is what the encoder was actually told to do.
+- `frames_dropped_broadcast` is frames the encoder-to-viewer broadcast dropped on a viewer that
+  fell behind. Distinct from `frames_dropped_ring`, which is the capture side.
+- `delay_overuse_events` is intervals where the delay-gradient estimator said a queue was filling.
+  It fires *before* loss, so a non-zero count against a flat loss count is the signal working, not
+  a fault.
+- `pacer_deadline_misses` is packets the pacer released early because holding them any longer
+  would have outlasted the frame interval it was smoothing. A pacer that grows unbounded is worse
+  than no pacer, so this must stay small.
+
+The process-level `live_transport_sessions` sits alongside the per-session objects in
+`snapshot_json`: peer connections, ICE agents and injector threads not yet given back. It should
+equal the number of live sessions, and a number that only climbs across joins is a leak. `input_queue_drops` is the fast input queue shedding its oldest entry under
 pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
 rather than injected late — never a key or a button, which are state transitions the host cannot
 recover from.
