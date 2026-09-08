@@ -1,13 +1,22 @@
-//! Virtual displays on macOS 10.13–10.14, where `CGVirtualDisplay` does not exist.
+//! Virtual displays where `CGVirtualDisplay` does not exist.
 //!
-//! The private `CGVirtualDisplay*` classes that
-//! [`super::virtual_display`] uses arrived with 10.15. Below that there is no
-//! supported way for a userspace process to add a display — so this module
-//! borrows one from AirPlay: it stands up a minimal fake AirPlay receiver on the
-//! loopback-visible Bonjour namespace, drives the Mac's own AirPlay picker at
-//! it, and lets **macOS** create the extended-desktop display. Once the display
-//! exists it is an ordinary `CGDirectDisplayID` and the existing
-//! CGDisplayStream + WebRTC pipeline captures it exactly as before.
+//! The private `CGVirtualDisplay*` classes that [`super::virtual_display`] uses
+//! arrived in **10.14.4** — they predate Sidecar by a release, which is why the
+//! tier is selected by looking the classes up rather than by comparing a
+//! version number. Below that there is no supported way for a userspace process
+//! to add a display, so this module borrows one from AirPlay: it stands up a
+//! minimal fake AirPlay receiver, drives the Mac's own AirPlay picker at it, and
+//! lets **macOS** create the extended-desktop display. Once the display exists
+//! it is an ordinary `CGDirectDisplayID` and the existing CGDisplayStream +
+//! WebRTC pipeline captures it exactly as before.
+//!
+//! **This tier is below the app's own floor.** `minimumSystemVersion` is 10.15,
+//! so on every release where `probe_display_backend` would actually choose this
+//! backend the binary refuses to launch. It is kept as a safety net — if the
+//! classes ever go away, or a release turns out not to have them where we
+//! assumed — and it is developed and tested on 10.15, where both AirPlay and
+//! `CGVirtualDisplay` exist. Nothing here is a reason to do further work toward
+//! supporting 10.13.
 //!
 //! What this deliberately does not do: decode H.264, derive FairPlay keys,
 //! decrypt anything, or touch VideoToolbox. The mirroring stream macOS sends us

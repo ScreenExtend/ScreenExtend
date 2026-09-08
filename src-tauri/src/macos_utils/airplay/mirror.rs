@@ -456,9 +456,13 @@ fn configure_keepalive(stream: &TcpStream) {
     set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, 60, "TCP_KEEPALIVE");
 }
 
-/// The sender expects *us* to poll *its* timing port; nothing polls ours. We
-/// still bind one and answer nothing, because the SETUP response has to name a
-/// real port — an unbound one earns ICMP unreachables.
+/// Our end of the timing exchange: bound, named in the SETUP reply, never read.
+///
+/// The SETUP response has to name a real port — an unbound one earns ICMP
+/// unreachables and the sender treats that as a broken receiver. The sender does
+/// send replies here, and a real receiver would run an NTP-style exchange over
+/// it to align clocks. We do not need to: the sender is this same Mac, so its
+/// timestamps and ours already share a hardware timebase.
 pub struct TimingSocket {
     pub port: u16,
     _socket: std::net::UdpSocket,
