@@ -282,6 +282,7 @@ stages! {
     encode => "encode",
     packetize => "packetize",
     socket_write => "socket_write",
+    pace_wait => "pace_wait",
     capture_to_encode_done => "capture_to_encode",
     capture_to_socket => "capture_to_socket",
 }
@@ -307,8 +308,12 @@ counters! {
     capture_fallback => "capture_fallback",
     frames_repeated => "frames_repeated",
     frames_dropped_ring => "frames_dropped_ring",
+    frames_dropped_broadcast => "frames_dropped_broadcast",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
+    keyframe_requests_suppressed => "keyframe_requests_suppressed",
+    delay_overuse_events => "delay_overuse_events",
+    pacer_deadline_misses => "pacer_deadline_misses",
     idrs_sent => "idrs_sent",
     encoder_resets => "encoder_resets",
     encoder_transient_errors => "encoder_transient_errors",
@@ -637,7 +642,13 @@ pub fn all() -> Vec<(String, SharedTelemetry)> {
 pub fn snapshot_json() -> serde_json::Value {
     let sessions: serde_json::Map<String, serde_json::Value> =
         all().into_iter().map(|(k, v)| (k, v.to_json())).collect();
-    serde_json::json!({ "sessions": sessions })
+    serde_json::json!({
+        "sessions": sessions,
+        // Peer connections, ICE agents and injector threads that have not been given back.
+        // It should equal the number of live sessions; a number that only climbs across joins
+        // is the leak this counter exists to make falsifiable.
+        "live_transport_sessions": crate::streamer::webrtc_session::live_sessions(),
+    })
 }
 
 /// Interval for the verbose one-line summary. Chosen so a 30 s baseline run yields six lines.
