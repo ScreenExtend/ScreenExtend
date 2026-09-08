@@ -49,33 +49,73 @@ pub struct AudioFormat {
     pub channels: u16,
 }
 
+/// What the capture path publishes about itself.
+///
+/// Every field is an atomic or a lock-free histogram, because the producer is a real-time
+/// thread — MMCSS "Pro Audio" on Windows, a HAL IOProc worker on macOS — and must never
+/// allocate or lock to report. The percentiles used to come from a 4096-element `Vec` that was
+/// cloned and sorted on that thread every two seconds; `Histogram` gives the same numbers out
+/// of a fixed array of atomics.
 #[derive(Debug, Default)]
 pub struct AudioDiagnostics {
+    /// The engine period actually in force, in frames — `IAudioClient::GetDevicePeriod` on
+    /// Windows, not `GetBufferSize`, which is the whole engine buffer and is several periods
+    /// deep. This field carried the latter and was reported as if it were the former.
     pub period_frames: AtomicU32,
+    /// The engine's total buffer capacity in frames (`GetBufferSize`).
+    pub buffer_frames: AtomicU32,
     pub sample_rate: AtomicU32,
     pub channels: AtomicU32,
     pub discontinuity_count: AtomicU64,
     pub silent_count: AtomicU64,
     pub device_changes: AtomicU64,
-    pub encode_p50_ns: AtomicU64,
-    pub encode_p99_ns: AtomicU64,
+    /// Times the mandatory silent render companion died and had to be restarted (Windows).
+    pub companion_restarts: AtomicU64,
+    /// Times the capture event went unsignalled long enough to be treated as a dead clock.
+    pub event_starvations: AtomicU64,
+    /// Packets a session's forwarder dropped because its DataChannel was backed up.
     pub dropped_backpressure: AtomicU64,
+    /// Packets the broadcast dropped on a slow subscriber's behalf (`RecvError::Lagged`).
+    pub lagged_packets: AtomicU64,
+    /// Opus encode duration per frame.
+    pub encode: crate::streamer::telemetry::Histogram,
+    /// Capture-thread wake-to-wake interval: the engine period as actually delivered, which is
+    /// the number that says whether a low-latency period request took effect.
+    pub wake_interval: crate::streamer::telemetry::Histogram,
+    /// `host_now_ns()` when a packet is handed to the transport minus that packet's own
+    /// `capture_ns` — the host-side half of the audio latency budget, end to end.
+    pub capture_to_packet: crate::streamer::telemetry::Histogram,
 }
 
 impl AudioDiagnostics {
+    /// Hot path, once per encoded frame on the capture thread.
+    #[inline]
+    pub fn record_encode_ns(&self, ns: u64) {
+        self.encode.record(ns);
+    }
+
     pub fn summary(&self) -> String {
+        let enc = self.encode.snapshot();
+        let wake = self.wake_interval.snapshot();
+        let lat = self.capture_to_packet.snapshot();
         format!(
-            "audio diag: fmt={}Hz x{}ch period={}fr, encode p50={:.2}ms p99={:.2}ms, \
-             discontinuity={}, silent={}, dev_changes={}, dc_drops={}",
+            "audio diag: fmt={}Hz x{}ch period={}fr buffer={}fr, encode={}ms, wake={}ms, \
+             capture->packet={}ms (p50/p90/p99/max), discontinuity={}, silent={}, \
+             dev_changes={}, companion_restarts={}, starvations={}, dc_drops={}, lagged={}",
             self.sample_rate.load(Ordering::Relaxed),
             self.channels.load(Ordering::Relaxed),
             self.period_frames.load(Ordering::Relaxed),
-            self.encode_p50_ns.load(Ordering::Relaxed) as f64 / 1.0e6,
-            self.encode_p99_ns.load(Ordering::Relaxed) as f64 / 1.0e6,
+            self.buffer_frames.load(Ordering::Relaxed),
+            enc.brief(),
+            wake.brief(),
+            lat.brief(),
             self.discontinuity_count.load(Ordering::Relaxed),
             self.silent_count.load(Ordering::Relaxed),
             self.device_changes.load(Ordering::Relaxed),
+            self.companion_restarts.load(Ordering::Relaxed),
+            self.event_starvations.load(Ordering::Relaxed),
             self.dropped_backpressure.load(Ordering::Relaxed),
+            self.lagged_packets.load(Ordering::Relaxed),
         )
     }
 }

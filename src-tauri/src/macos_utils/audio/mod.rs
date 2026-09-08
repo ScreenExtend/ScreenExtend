@@ -23,7 +23,6 @@ use crate::streamer::audio::{
 use opus_encoder::{OpusEncoder, OpusEncoderConfig, FRAME_INTERLEAVED};
 
 const RING_CAPACITY: usize = 48_000 * 2 * 80 / 1000; // 7680 → rounds to 8192
-const ENCODE_WINDOW: usize = 4096;
 const DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +261,6 @@ fn worker(
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;
     let mut pending_flags: u8 = FLAG_DISCONTINUITY; // first frame starts a fresh timeline
-    let mut encode_ns: Vec<u64> = Vec::with_capacity(ENCODE_WINDOW);
     let mut last_diag = Instant::now();
     let mut warned_silent = false;
     let start_instant = Instant::now();
@@ -295,12 +293,7 @@ fn worker(
                     continue;
                 }
             };
-            let dt = t0.elapsed().as_nanos() as u64;
-            if encode_ns.len() < ENCODE_WINDOW {
-                encode_ns.push(dt);
-            } else {
-                encode_ns[(seq as usize) % ENCODE_WINDOW] = dt;
-            }
+            diagnostics.record_encode_ns(t0.elapsed().as_nanos() as u64);
 
             let mut flags = pending_flags;
             pending_flags = 0;
@@ -315,6 +308,9 @@ fn worker(
                 data: Bytes::copy_from_slice(encoded),
             };
             burst_i += 1;
+            diagnostics
+                .capture_to_packet
+                .record_span(pkt.capture_ns, host_now_ns());
             if pkt_tx.send(pkt).is_err() {
                 backend.stop();
                 return;
@@ -329,7 +325,6 @@ fn worker(
             .store(consumer.overruns(), Ordering::Relaxed);
 
         if last_diag.elapsed() >= DIAG_LOG_INTERVAL {
-            update_encode_percentiles(&encode_ns, &diagnostics);
             crate::tprintln!("[{}] {}", backend.backend_name(), diagnostics.summary());
             if !warned_silent
                 && start_instant.elapsed() >= Duration::from_secs(5)
@@ -353,17 +348,6 @@ fn worker(
 
     backend.stop();
     crate::tprintln!("audio: macOS capture stopped");
-}
-
-fn update_encode_percentiles(samples: &[u64], diagnostics: &AudioDiagnostics) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut sorted: Vec<u64> = samples.to_vec();
-    sorted.sort_unstable();
-    let p = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
-    diagnostics.encode_p50_ns.store(p(0.50), Ordering::Relaxed);
-    diagnostics.encode_p99_ns.store(p(0.99), Ordering::Relaxed);
 }
 
 fn os_version() -> String {
