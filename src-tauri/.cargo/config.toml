@@ -1,0 +1,21 @@
+# Cargo settings that must hold for every build of this crate, including the ones
+# `pnpm tauri build` and CI make.
+
+[env]
+# The macOS floor. Without it rustc uses its own default (10.12 for x86_64-apple-darwin),
+# so the shipped binary's LC_BUILD_VERSION contradicts `minimumSystemVersion: "10.15"` in
+# tauri.macos.conf.json and clang's availability machinery is calibrated three releases
+# too low. aarch64 clamps this up to 11.0 on its own — Apple Silicon postdates 10.15.
+MACOSX_DEPLOYMENT_TARGET = "10.15"
+
+[target.'cfg(windows)']
+rustflags = [
+    # Bind to common controls v6. `tauri_build` writes this into the app binary's own
+    # manifest, but nothing gives one to a `cargo test` harness — so the moment dead-code
+    # elimination keeps the dialog path alive, the test binary imports
+    # comctl32!TaskDialogIndirect, the loader resolves comctl32 to the v5 in System32, and
+    # the process dies at load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before a
+    # single test runs. That is a load failure with no diagnostic, triggered by unrelated
+    # edits elsewhere in the crate, so it is pinned here rather than left to chance.
+    "-Clink-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'",
+]

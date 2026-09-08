@@ -9,7 +9,7 @@ A free desktop‑extension solution that turns any device with a web browser int
 </div>
 
 > [!WARNING]
-> Early software, not widely tested yet. Hosts run on Windows and macOS. Linux is scaffolded but doesn't work, and the AMD encoder is a stub (AMD hosts utilize CPU encoding). See [Platform support](#platform-support).
+> Early software, not widely tested yet. Hosts run on Windows and macOS. Linux is scaffolded but doesn't work, and the AMD AMF encoder is written and wired up but has never encoded a frame — nobody on the project has an AMD GPU, so an AMD host may still fall back to CPU encoding. See [Platform support](#platform-support).
 
 ---
 
@@ -30,7 +30,7 @@ Every client gets its own display and its own encoder, so several devices can ha
 - **GPU capture and encode.** Desktop capture straight into NVENC / Quick Sync / VideoToolbox, out over WebRTC. Settings changes renegotiate in place instead of tearing down the session.
 - **Remote control.** A joined device drives the host's keyboard, mouse, and clipboard. This setting can be turned off.
 - **OTP-based security.** A session ID plus a one-time code gate devices from joining, rate-limited per device and globally. Devices that make it in get a trust token and rejoin without retyping. Revoke or ban them from Edit Device.
-- **System audio (Windows / macOS).** Off by default, opt-in per device. Low-delay Opus over the same encrypted transport as the video, with a custom-coded jitter buffer. Windows uses WASAPI loopback; macOS uses Core Audio process tap on 14.2+, ScreenCaptureKit on 13+, and a bundled signed virtual output device that ScreenExtend installs on 10.15–12.x.
+- **System audio (Windows / macOS).** Off by default, opt-in per device. Low-delay Opus over the same encrypted transport as the video, with a custom-coded jitter buffer. Windows uses WASAPI loopback; macOS uses Core Audio process tap on 14.2+ and ScreenCaptureKit on 13+. Below 13 macOS has no system-audio API at all, so ScreenExtend carries its own virtual output device for 10.15–12.x — it is bundled but not yet signed, installed or loaded by anyone, so treat that tier as unfinished.
 - **No router needed.** The host can create its own ad-hoc Wi-Fi network to work offline. It also watches network adapters and rebuilds join URLs as required.
 - **Encrypted media, opt-in encrypted signaling.** Audio and video always ride DTLS-SRTP. The LAN join page is plain HTTP by default so a QR scan doesn't hit a certificate warning; the page then offers the HTTPS endpoint (self-signed, generated at runtime), which is both private and faster.
 
@@ -84,12 +84,14 @@ ScreenExtend drivers install   # virtual display driver (elevated)
 | Rust ↔ TS | [`tauri-specta`](https://github.com/oscartbeaumont/tauri-specta), generated into `src/lib/bindings.ts` |
 | Server | [`axum`](https://github.com/tokio-rs/axum) + `rustls`, certs minted at runtime with `rcgen` |
 | Streaming | [`webrtc`](https://github.com/webrtc-rs/webrtc), WHEP signaling, H.264 |
-| Capture | [`windows-capture`](https://github.com/NiiightmareXD/windows-capture), custom DXGI duplication, ScreenCaptureKit |
+| Capture | [`windows-capture`](https://github.com/NiiightmareXD/windows-capture), custom DXGI duplication, ScreenCaptureKit, CGDisplayStream below macOS 12.3 |
 | Virtual displays | Signed Windows IDD driver over IPC ([`driver_ipc`](https://github.com/MolotovCherry/virtual-display-rs)); private CoreGraphics APIs on macOS |
 
 ## Platform support
 
 The client is a web page, so anything with a reasonably modern browser can be the second monitor. Hosts need **Windows 10 20H1 (build 19041) or later, x86-64 only**, or **macOS 10.15 Catalina or later**.
+
+Those are the floors the app is built and tested against. Individual pieces have their own, higher ones — system audio needs macOS 13 for a supported path, ScreenCaptureKit capture needs 12.3 — and ScreenExtend picks what a machine actually has by probing for it rather than by reading a version number, so a host below one of those floors loses that feature rather than failing to start.
 
 ### Hardware encoder support
 
@@ -97,15 +99,17 @@ ScreenExtend encodes captured displays with the host GPU. The matrix below lists
 
 | Encoding API | GPU Vendor | Windows | macOS | Linux |
 | --- | --- | :---: | :---: | :---: |
-| AMF | AMD | 🟡 | | ➖ |
-| NVENC | NVIDIA | ✅ | | ➖ |
-| Quick Sync | Intel | ✅ | | ➖ |
-| Media Foundation | Qualcomm | ➖ | | |
-| Video Toolbox | Apple | | ✅ | |
-| | Intel | | ✅ | |
-| Software | Any | ✅ | | ➖ |
+| AMF | AMD | 🟡 | n/a | ➖ |
+| NVENC | NVIDIA | ✅ | n/a | ➖ |
+| Quick Sync | Intel | ✅ | n/a | ➖ |
+| Media Foundation | Qualcomm | ➖ | n/a | n/a |
+| Video Toolbox | Apple | n/a | ✅ | n/a |
+| Video Toolbox | Intel | n/a | ✅ | n/a |
+| Software | Any | ✅ | ✅ | ➖ |
 
-✅ Supported &nbsp;·&nbsp; 🟡 In progress &nbsp;·&nbsp; ➖ Not supported
+✅ Supported &nbsp;·&nbsp; 🟡 Written and wired up, never run on real hardware &nbsp;·&nbsp; ➖ Not supported &nbsp;·&nbsp; n/a That API does not exist on that OS
+
+Software encode is libx264 on Windows and VideoToolbox's own software encoder on macOS. It is what turning off **GPU Video Encoding** in Settings selects, and it is also the automatic fallback when no hardware encoder can be opened.
 
 ## Building from source
 
@@ -133,15 +137,19 @@ Running in dev mode also regenerates the typed TS bindings (`src/lib/bindings.ts
 pnpm tauri build
 ```
 
-Installers and the executable are emitted under `src-tauri/target/release/bundle/`.
+Installers and the executable are emitted under `target/release/bundle/` inside your cargo target directory — `src-tauri/target/release/bundle/` unless `CARGO_TARGET_DIR` says otherwise.
+
+### Development
+
+`docs/dev-workflow.md` has the working conventions: the gates to run before a commit (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `pnpm lint`/`pnpm build`/`node scripts/check-legacy-webkit.mjs` when the frontend changed), and the invariants that are easy to break silently — the macOS 10.15 link-time floor, the Safari 13.1 floor in the desktop UI, and the rule that the client page has no build step and no dependencies.
 
 ### Releases
 
-Every PR and push to `main` runs `.github/workflows/ci.yml` (build, lint, `cargo fmt`/`clippy`/`test`, dependency audits). Pushing an `app-v*` tag builds Windows x64 and macOS Intel + Apple Silicon and drafts a release. Prebuilt installers live on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
+Every push and pull request runs `.github/workflows/ci.yml`: eslint and the frontend build on Linux, `cargo fmt`/`clippy -D warnings`/`test` on Windows and on macOS 13, 14 and 15, a runtime smoke on those macOS runners for the capture and audio tiers the dev machines are too old to reach, a 10.15 dyld-floor audit of the release binary, and verification of the vendored blob checksums. Pushing an `app-v*` tag builds Windows x64 and macOS Intel + Apple Silicon and drafts a release. Prebuilt installers live on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
 
 ## Contributing
 
-Issues and pull requests are welcome, and get looked at roughly every three days.
+Issues and pull requests are welcome. This is a small project, so there is no promised response time.
 
 - **Bugs:** open an [issue](https://github.com/ScreenExtend/ScreenExtend/issues) with host OS/GPU, client device and browser, and how to reproduce it.
 - **Code:** PR against `main`. Keep it focused and match the surrounding style.

@@ -256,9 +256,33 @@ impl AppState {
                     "urls": turn.urls, "username": turn.username, "credential": turn.credential
                 }));
             }
-            return serde_json::json!({ "iceServers": servers }).to_string();
+            return serde_json::json!({
+                "iceServers": servers,
+                "locality": "same-network",
+            })
+            .to_string();
         }
-        self.ice_json_live()
+        // `locality` answers the one question the client cannot answer for itself: whether this
+        // session will actually be relayed. It has to gather before it POSTs — WHEP has no PATCH
+        // to trickle candidates in later — and *which* candidate it may stop gathering on depends
+        // entirely on that. Inferring it from the shape of the server list ("a TURN entry is
+        // present, so a relay is needed") is wrong in exactly the case above, where a same-subnet
+        // peer is handed TURN as a backup and will be nominated on a host candidate that arrived
+        // in the first millisecond.
+        let mut v: serde_json::Value = serde_json::from_str(&self.ice_json_live())
+            .unwrap_or_else(|_| serde_json::json!({ "iceServers": [] }));
+        if let Some(obj) = v.as_object_mut() {
+            let name = match locality {
+                SessionLocality::SameNetwork => "same-network",
+                SessionLocality::CrossNetwork => "cross-network",
+                SessionLocality::Unknown => "unknown",
+            };
+            obj.insert(
+                "locality".into(),
+                serde_json::Value::String(name.to_owned()),
+            );
+        }
+        v.to_string()
     }
 
     pub fn ice_json_live(&self) -> String {
@@ -532,68 +556,104 @@ fn at_capacity_page() -> Response {
         .into_response()
 }
 
-async fn transform_worker() -> Response {
+// The static assets are `include_str!`'d, so each one's ETag is a hash of its own bytes,
+// folded at compile time. The version string was a proxy for the content and a wrong one:
+// the client page has no build step and is edited by hand, so any edit that did not also bump
+// the crate version served a 304 against the stale copy every browser had already cached —
+// a trap aimed squarely at the workflow that touches these files. `no-cache` keeps the client
+// revalidating rather than pinning a stale asset across an update, and the revalidation costs
+// a 304 instead of the ~120 KB the page used to refetch on every reload. `index` is
+// deliberately left uncached: it carries a per-request substitution.
+fn asset(
+    content_type: &'static str,
+    etag: &str,
+    headers: &HeaderMap,
+    body: &'static str,
+) -> Response {
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
+        )
+            .into_response();
+    }
     (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/transform-worker.js"),
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
     )
         .into_response()
 }
 
-async fn input_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/input.js"),
-    )
-        .into_response()
+// FNV-1a, `const` so every call site folds to a literal and no request pays for the hash.
+const fn asset_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
 }
 
-async fn audio_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/audio.js"),
-    )
-        .into_response()
+fn asset_etag(hash: u64) -> String {
+    format!("\"{:016x}\"", hash)
 }
 
-async fn audio_worklet_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/audio-worklet.js"),
-    )
-        .into_response()
+async fn transform_worker(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/transform-worker.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
-async fn audio_worker_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/audio-worker.js"),
-    )
-        .into_response()
+async fn input_js(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/input.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
-async fn nosleep_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        include_str!("static/nosleep.js"),
-    )
-        .into_response()
+async fn audio_js(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/audio.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
-async fn logo() -> Response {
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml")],
-        include_str!("static/logo.svg"),
-    )
-        .into_response()
+async fn audio_worklet_js(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/audio-worklet.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
 }
 
-async fn styles() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css")],
-        include_str!("static/styles.css"),
-    )
-        .into_response()
+async fn audio_worker_js(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/audio-worker.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
+}
+
+async fn nosleep_js(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/nosleep.js");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
+}
+
+async fn logo(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/logo.svg");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("image/svg+xml", &asset_etag(TAG), &headers, BODY)
+}
+
+async fn styles(headers: HeaderMap) -> Response {
+    const BODY: &str = include_str!("static/styles.css");
+    const TAG: u64 = asset_hash(BODY.as_bytes());
+    asset("text/css", &asset_etag(TAG), &headers, BODY)
 }
 
 async fn ice_config(

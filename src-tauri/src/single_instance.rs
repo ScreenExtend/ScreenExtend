@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use fs4::fs_std::FileExt;
 use rand::Rng;
+use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Manager};
 
 pub const LOCK_FILE: &str = "screenextend.lock";
@@ -71,6 +72,37 @@ pub fn quit_main_window(app: &AppHandle) {
     }
 }
 
+/// How long a connection may take to send its one line.
+///
+/// Connections are handled one at a time on the accept thread, so this is also how long a
+/// client that connects and says nothing can delay a real `stop`.
+const CTRL_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Write the port and token, readable only by this user.
+///
+/// Whoever can read this file can send `QUIT` to the running host. On unix the app's local
+/// data directory is not necessarily private, so the mode is set explicitly and also applied
+/// to a file that already exists with wider permissions. On Windows the directory under
+/// `%LOCALAPPDATA%` already carries a user-only ACL that the file inherits.
+fn write_ctrl_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 pub fn start_control_server<Q>(
     app: AppHandle,
     ctrl_path: PathBuf,
@@ -83,12 +115,12 @@ where
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
     let token = format!("{:032x}", rand::rng().random::<u128>());
-    std::fs::write(&ctrl_path, format!("{port}\n{token}\n"))?;
+    write_ctrl_file(&ctrl_path, &format!("{port}\n{token}\n"))?;
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_read_timeout(Some(CTRL_READ_TIMEOUT));
             handle_connection(stream, &app, &token, focus, &quit);
         }
     });
@@ -118,7 +150,13 @@ fn handle_connection<Q>(
         return;
     }
     let mut parts = line.trim().splitn(2, ' ');
-    if parts.next() != Some(token) {
+    let presented = parts.next().unwrap_or("");
+    // Same treatment the join OTP gets in `streamer/session.rs`: compare in constant time so
+    // the loopback port cannot be used to guess the token a byte at a time.
+    let matches =
+        presented.len() == token.len() && bool::from(presented.as_bytes().ct_eq(token.as_bytes()));
+    if !matches {
+        teprintln!("[single-instance] control connection presented a bad token; ignoring");
         return;
     }
     let mut stream = stream;

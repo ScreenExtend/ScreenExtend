@@ -92,6 +92,15 @@
     -moz-appearance: textfield;
   }
 
+  /* Was an inline <style> inside the dashboard carousel, re-injected on every render of
+     that page. */
+  #mainCarousel::-webkit-scrollbar {
+    display: none;
+    background: transparent;
+    width: 0;
+    height: 0;
+  }
+
   /* `all` animated the layout-affecting properties too -- width, height, padding, margin,
      top/left, font-size -- so every hover, focus or disabled flip on a button or input
      forced layout and paint on each frame of the 200 ms window. Nothing in the kit relies
