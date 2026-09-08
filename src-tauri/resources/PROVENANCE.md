@@ -40,9 +40,10 @@ against the upstream release the next time these are refreshed.
   same way `libx264-164.dll` is — see `windows_utils/audio/opus_sys.rs`.
 - **Version:** built from source at commit
   `03647f524a40b05a1898522e92033810b58103c7` (2026-08-14). `opus_get_version_string()`
-  reports `libopus unknown` because the DLL was produced from a shallow git checkout that
-  lacks the generated `package_version` file; the commit hash above is the authoritative
-  pin. Built x64 Release, `-DBUILD_SHARED_LIBS=ON` (DRED/OSCE off — encoder-only path).
+  reports the literal string `libopus unknown` — upstream's own fallback, because the DLL was
+  produced from a shallow git checkout that lacks the generated `package_version` file. The
+  pointer is valid and the symbol is the right one; the library really is called that. The
+  commit hash above is the authoritative pin. Built x64 Release, `-DBUILD_SHARED_LIBS=ON` (DRED/OSCE off — encoder-only path).
 - **License:** BSD-3-Clause (Xiph.Org / Skype et al.). Compatible with this project's
   AGPL-3.0 (permissive → copyleft is fine).
 - **SHA-256:** `73924f6a4124a52c9a3e1b5cedb68339f4d21627826b2b5fce5c453dde2857b5`
@@ -54,9 +55,12 @@ against the upstream release the next time these are refreshed.
 - **Used for:** low-delay Opus encode of captured macOS system audio (Process Tap / SCK) before
   WebRTC transport. Loaded at runtime via `libloading`, same pattern as the Windows DLL.
 - **Version:** built from source at the **same** commit as the Windows DLL,
-  `03647f524a40b05a1898522e92033810b58103c7`. `opus_get_version_string()` likewise reports
-  `libopus unknown` (shallow checkout lacks the generated `package_version`); the commit hash is
-  the authoritative pin.
+  `03647f524a40b05a1898522e92033810b58103c7`. Unlike the Windows DLL, this one *does* carry a
+  version string: `opus_get_version_string()` returns `libopus 1.5.x-screenextend-src`, because
+  the hand-rolled `clang` build defines `PACKAGE_VERSION` itself rather than relying on the
+  generated `package_version` a shallow checkout does not produce. The commit hash above stays
+  the authoritative pin — the two platforms report different strings for the same source, which
+  is exactly why the host logs whatever the library says rather than assuming.
 - **Build:** `clang -O2 -fPIC -shared -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DFLOAT_APPROX`
   over the `celt_sources.mk` + float `silk_sources.mk` + `opus_sources.mk` C sources (x86/arm/mips
   intrinsics and the fixed-point SILK path excluded — generic-C float build). `otool -L` shows it

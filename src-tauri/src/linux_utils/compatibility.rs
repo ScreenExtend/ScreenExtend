@@ -37,5 +37,6 @@ pub fn check_system_requirements() -> CompatibilityReport {
         capture_backend: "unsupported".to_string(),
         encoder_backend: "unsupported".to_string(),
         hosted_network_backend: "unsupported".to_string(),
+        input_backend: crate::streamer::input::probe_backend().as_str().to_string(),
     }
 }

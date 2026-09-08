@@ -15,6 +15,10 @@ use super::ClientProfile;
 
 pub const NAME: &str = "linux-stub";
 
+pub fn probe() -> super::InputBackend {
+    super::InputBackend::Unsupported
+}
+
 pub fn boost_thread() {}
 
 pub struct Injector {
@@ -28,7 +32,7 @@ impl Injector {
 
     pub fn dispatch(&mut self, _ev: &InputEvent) {
         if !self.warned {
-            log::warn!("Linux injection backend is a stub — events are dropped (see PRD §5.7)");
+            teprintln!("Linux injection backend is a stub — events are dropped (see PRD §5.7)");
             self.warned = true;
         }
     }
