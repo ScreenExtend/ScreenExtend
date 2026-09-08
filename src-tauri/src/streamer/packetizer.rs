@@ -193,20 +193,29 @@ impl<'a> AnnexBNals<'a> {
         Self { buf, pos: 0 }
     }
 
-    /// Length of the start code at `i`, or `None`.
-    fn start_code_at(buf: &[u8], i: usize) -> Option<usize> {
-        if buf.len() >= i + 4
-            && buf[i] == 0
-            && buf[i + 1] == 0
-            && buf[i + 2] == 0
-            && buf[i + 3] == 1
-        {
-            Some(4)
-        } else if buf.len() >= i + 3 && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
-            Some(3)
-        } else {
-            None
+    /// The next start code at or after `from`, as `(offset of its first zero, its length)`.
+    ///
+    /// One pass, one comparison per byte, counting consecutive zeros — the shape a "does a start
+    /// code begin here?" predicate called at every offset is not. That mattered: the predicate
+    /// version measured **1.65x slower than the payloader it replaced** on a 16 KB P-frame, where
+    /// the scan is the whole cost and the fragmentation is one memcpy. Bounds checks are why: the
+    /// predicate reads up to four bytes per offset with a length test each, while this reads one.
+    fn next_start_code(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from >= buf.len() {
+            return None;
         }
+        let mut zeros = 0usize;
+        for (offset, &b) in buf[from..].iter().enumerate() {
+            if b == 0 {
+                zeros += 1;
+            } else if b == 1 && zeros >= 2 {
+                let len = if zeros >= 3 { 4 } else { 3 };
+                return Some((from + offset + 1 - len, len));
+            } else {
+                zeros = 0;
+            }
+        }
+        None
     }
 }
 
@@ -215,32 +224,22 @@ impl Iterator for AnnexBNals<'_> {
 
     fn next(&mut self) -> Option<(usize, usize)> {
         let buf = self.buf;
-        // Find the next start code.
-        while self.pos < buf.len() {
-            match Self::start_code_at(buf, self.pos) {
-                Some(len) => {
-                    let start = self.pos + len;
-                    let mut end = start;
-                    while end < buf.len() {
-                        match Self::start_code_at(buf, end) {
-                            Some(_) => break,
-                            None => end += 1,
-                        }
-                    }
-                    self.pos = end;
-                    if end > start {
-                        return Some((start, end));
-                    }
-                    // An empty NAL between two start codes: skip it rather than emitting nothing
-                    // forever.
-                    if end >= buf.len() {
-                        return None;
-                    }
-                }
-                None => self.pos += 1,
+        loop {
+            let (sc_at, sc_len) = Self::next_start_code(buf, self.pos)?;
+            let start = sc_at + sc_len;
+            let end = match Self::next_start_code(buf, start) {
+                Some((next_at, _)) => next_at,
+                None => buf.len(),
+            };
+            self.pos = end;
+            if end > start {
+                return Some((start, end));
+            }
+            // Two start codes back to back. Skip the empty NAL rather than spinning on it.
+            if end >= buf.len() {
+                return None;
             }
         }
-        None
     }
 }
 
@@ -552,33 +551,59 @@ mod bench {
         let idr = synthetic_idr(300 * 1024);
         let p = synthetic_p(16 * 1024);
 
+        // Interleaved rounds, and the **minimum** per implementation rather than a mean. This box
+        // runs several other workstreams' `rustc` processes, and the same binary measured 18404
+        // and 10812 ns/frame for the *same* stock payloader in two runs an hour apart — a 1.7x
+        // spread with nothing changed. The minimum is the round least polluted by contention;
+        // averaging folds the machine's mood into the number. Interleaving stops whichever went
+        // first from paying for warming the frame buffers.
+        const ROUNDS: usize = 7;
         let mut ours = H264Packetizer::new();
+        let mut theirs = H264Payloader::default();
         let mut out: Vec<Bytes> = Vec::new();
         let mut ours_packets = 0usize;
-        let a0 = ALLOCS.load(Ordering::Relaxed);
-        let t0 = Instant::now();
-        for i in 0..ITERS {
-            let frame = if i % 60 == 0 { &idr } else { &p };
-            ours.packetize(MTU, frame, &mut out);
-            ours_packets += out.len();
-        }
-        let ours_ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
-        let ours_allocs = ALLOCS.load(Ordering::Relaxed) - a0;
-
-        let mut theirs = H264Payloader::default();
         let mut theirs_packets = 0usize;
-        let a1 = ALLOCS.load(Ordering::Relaxed);
-        let t1 = Instant::now();
-        for i in 0..ITERS {
-            let frame = if i % 60 == 0 { &idr } else { &p };
-            let payloads = theirs.payload(MTU, frame).expect("payload");
-            theirs_packets += payloads.len();
+        let mut ours_ns = f64::MAX;
+        let mut theirs_ns = f64::MAX;
+        let mut ours_allocs = 0u64;
+        let mut theirs_allocs = 0u64;
+
+        for round in 0..ROUNDS {
+            let a0 = ALLOCS.load(Ordering::Relaxed);
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let frame = if i % 60 == 0 { &idr } else { &p };
+                ours.packetize(MTU, frame, &mut out);
+                ours_packets += out.len();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+            let allocs = ALLOCS.load(Ordering::Relaxed) - a0;
+
+            let a1 = ALLOCS.load(Ordering::Relaxed);
+            let t1 = Instant::now();
+            for i in 0..ITERS {
+                let frame = if i % 60 == 0 { &idr } else { &p };
+                let payloads = theirs.payload(MTU, frame).expect("payload");
+                theirs_packets += payloads.len();
+            }
+            let their_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
+            let their_allocs = ALLOCS.load(Ordering::Relaxed) - a1;
+
+            println!("  round {round}: local {ns:.0} ns/frame, stock {their_ns:.0} ns/frame");
+            if ns < ours_ns {
+                ours_ns = ns;
+            }
+            if their_ns < theirs_ns {
+                theirs_ns = their_ns;
+            }
+            ours_allocs = allocs;
+            theirs_allocs = their_allocs;
         }
-        let theirs_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
-        let theirs_allocs = ALLOCS.load(Ordering::Relaxed) - a1;
+        ours_packets /= ROUNDS;
+        theirs_packets /= ROUNDS;
 
         println!(
-            "packetize {ITERS} frames @ {MTU}B MTU (1 IDR per 60):\n  \
+            "packetize {ITERS} frames @ {MTU}B MTU (1 IDR per 60), best of {ROUNDS} interleaved rounds:\n  \
              local  {ours_ns:.0} ns/frame, {ours_packets} packets, {ours_allocs} allocations\n  \
              stock  {theirs_ns:.0} ns/frame, {theirs_packets} packets, {theirs_allocs} allocations\n  \
              speedup {:.2}x, allocations {:.1}x fewer",
