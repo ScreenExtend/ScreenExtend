@@ -100,6 +100,11 @@ pub struct Config {
     pub probe_live: Option<String>,
     pub synthetic_pattern: bool,
     pub probe_bitrate: bool,
+    /// Which scripted pattern `--synthetic-pattern` produces.
+    pub workload: crate::streamer::synthetic::Workload,
+    /// Paint a large frame number and elapsed-millisecond clock over it, for the
+    /// camera-based glass-to-glass method in `docs/BASELINE.md`.
+    pub counter: bool,
     pub scale: ScalePercent,
     pub stun_urls: Vec<String>,
     pub turn_url: Option<String>,
@@ -156,6 +161,8 @@ impl Default for Config {
             probe_live: None,
             synthetic_pattern: false,
             probe_bitrate: false,
+            workload: crate::streamer::synthetic::Workload::default(),
+            counter: false,
             scale: ScalePercent::default(),
             stun_urls: vec![DEFAULT_STUN_URL.to_string()],
             turn_url: None,
@@ -390,6 +397,26 @@ impl Config {
                     c.probe_bitrate = true;
                     i += 1;
                 }
+                "--workload" => {
+                    match val(&args, i)
+                        .as_deref()
+                        .and_then(crate::streamer::synthetic::Workload::parse)
+                    {
+                        Some(w) => {
+                            c.workload = w;
+                            c.synthetic_pattern = true;
+                            i += 2;
+                        }
+                        None => {
+                            teprintln!("--workload takes one of: mixed static scroll motion drag");
+                            i += 2;
+                        }
+                    }
+                }
+                "--counter" => {
+                    c.counter = true;
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
@@ -428,6 +455,10 @@ CAPTURE / ENCODE\n\
   --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
                           paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
+  --workload <w>          scripted synthetic workload, implies --synthetic-pattern:\n\
+                          mixed (default) | static | scroll | motion | drag\n\
+  --counter               overlay a large frame number + elapsed ms clock, for the\n\
+                          camera glass-to-glass method (docs/BASELINE.md)\n\
 \n\
 ICE / TLS\n\
   --stun <a,b,..>         comma-separated STUN urls (default Google STUN)\n\

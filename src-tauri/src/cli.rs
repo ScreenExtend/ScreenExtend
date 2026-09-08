@@ -230,7 +230,13 @@ MODES:
 TUNING FLAGS are the streamer's own and are parsed straight off the command line:
     --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
     --qp <1..51>   --h264-profile <baseline|main|high>   --intra-refresh <on|off>
-    --monitor <n>   --max-bitrate-kbps <n>   --synthetic-pattern   --disable-gpu-encode
+    --monitor <n>   --max-bitrate-kbps <n>   --disable-gpu-encode
+    --synthetic-pattern                      encode a generated pattern, not the desktop
+    --workload <mixed|static|scroll|motion|drag>   scripted synthetic workload (implies
+                          --synthetic-pattern): a still desktop, scrolling text, full-frame
+                          60 fps motion, or a rigid block translating like a dragged window
+    --counter             overlay a large frame number + elapsed ms clock, so a 240 fps
+                          camera shot of host and client can be differenced (docs/BASELINE.md)
     --turn-url/--turn-username/--turn-credential/--turn-urls/--turn-secret/--turn-ttl
     --stun <a,b,..>   --port <n>   --https-port <n>   --bind-ip <ip>   --lan-ip <ip>
 

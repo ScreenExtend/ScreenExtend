@@ -8,6 +8,7 @@ pub mod pipeline;
 pub mod platform;
 pub mod server;
 pub mod session;
+pub mod synthetic;
 pub mod telemetry;
 pub mod test;
 pub mod tls;
