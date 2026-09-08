@@ -255,7 +255,8 @@ fn exempt_thread_from_power_throttling() {
     };
     if rc.is_err() && !WARNED.swap(true, Ordering::Relaxed) {
         teprintln!(
-            "[cpu] per-thread power-throttling exemption unavailable (pre-1809?): {:?}; the              process-wide exemption still applies",
+            "[cpu] per-thread power-throttling exemption unavailable (pre-1809?): {:?}; \
+             the process-wide exemption still applies",
             rc.err()
         );
     }
