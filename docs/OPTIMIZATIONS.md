@@ -101,3 +101,20 @@ logs a `[tcc]` line naming the monthly re-consent as the likely cause. It runs a
 pipeline start — every device join and every stream refresh — so a lapsed consent is
 noticed there. There is still no re-probe *while* a session streams; see
 `findings/major-permissions-no-periodic-reprobe-while-a-session-streams.md`.
+
+### Rejected: feeding measured loss into `OPUS_SET_PACKET_LOSS_PERC`
+
+`major-audio-core-no-fec-on-an-unreliable-datachannel` proposed driving the encoder's
+packet-loss-percentage from the link loss the BWE already computes. Not done, and not because
+the number is unavailable — it is, and the redundancy switch now uses it.
+
+The encoder is **host-wide**. There is one `AudioHub`, one capture, one `OpusEncoder`, fanned
+out to every audio-enabled device; loss is **per session**. Feeding one session's loss into a
+shared encoder degrades the stream for every other device on the host, and with two devices on
+different links there is no correct value to write. Loss robustness therefore belongs on the
+per-session transport, which is where `FLAG_REDUNDANT` sits.
+
+The lever that *is* encoder-wide and does apply is `OPUS_SET_PREDICTION_DISABLED`: it makes
+frames independent regardless of who is listening. It is wired as a config field defaulting off
+because it costs bitrate at fixed quality and the trade needs a listening test — see
+`docs/manual-tests/windows-audio-tiers.md`.
