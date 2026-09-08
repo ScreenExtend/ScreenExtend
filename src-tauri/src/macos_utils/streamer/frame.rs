@@ -6,11 +6,36 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVPixelBuffer;
 use objc2_io_surface::IOSurfaceRef;
 
+/// A capture surface held past the delivery callback, with its **use count** held too.
+///
+/// `CGDisplayStream.h` is explicit about the contract: *"If you intend to hold on to the
+/// IOSurface beyond the lifetime of the handler call, you must `CFRetain()` the IOSurface until
+/// you are done with it and you must call `IOSurfaceIncrementUseCount()` to let the
+/// CGDisplayStream know that the frame is not ready for re-use."* The two counters are
+/// independent — Apple says so, and `CVPixelBufferCreateWithIOSurface` documents only that it
+/// *retains* the surface. A retain alone keeps the object alive while WindowServer happily
+/// composites new pixels into the buffer VideoToolbox is reading, which is tearing and stale
+/// bands rather than a clean stall.
+pub struct HeldSurface(CFRetained<IOSurfaceRef>);
+
+impl HeldSurface {
+    pub fn hold(surface: CFRetained<IOSurfaceRef>) -> Self {
+        surface.increment_use_count();
+        Self(surface)
+    }
+}
+
+impl Drop for HeldSurface {
+    fn drop(&mut self) {
+        self.0.decrement_use_count();
+    }
+}
+
 pub enum Backing {
     Empty,
     PixelBuffer {
         pixbuf: CFRetained<CVPixelBuffer>,
-        _surface: CFRetained<IOSurfaceRef>,
+        _surface: HeldSurface,
     },
 }
 

@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,18 +14,17 @@ use objc2_core_foundation::{
     CFNumber, CFRetained, CFString,
 };
 use objc2_core_graphics::{
-    kCGDisplayStreamMinimumFrameTime, kCGDisplayStreamPreserveAspectRatio,
-    kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor, kCGDisplayStreamYCbCrMatrix,
-    kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream, CGDisplayStreamFrameStatus,
-    CGDisplayStreamUpdate, CGDisplayStreamUpdateGetDropCount, CGDisplayStreamUpdateRectType,
-    CGError,
+    kCGDisplayStreamPreserveAspectRatio, kCGDisplayStreamQueueDepth, kCGDisplayStreamShowCursor,
+    kCGDisplayStreamYCbCrMatrix, kCGDisplayStreamYCbCrMatrix_ITU_R_709_2, CGDisplayStream,
+    CGDisplayStreamFrameStatus, CGDisplayStreamUpdate, CGDisplayStreamUpdateGetDropCount,
+    CGDisplayStreamUpdateRectType, CGError,
 };
 use objc2_core_video::{CVPixelBuffer, CVPixelBufferCreateWithIOSurface};
 use objc2_io_surface::IOSurfaceRef;
 
 use crate::streamer::telemetry::SharedTelemetry;
 
-use super::frame::{Backing, Frame, FrameSink};
+use super::frame::{Backing, Frame, FrameSink, HeldSurface};
 use super::gpu::Gpu;
 use super::mach::mach_now;
 use super::{CaptureBackend, CaptureConfig, CaptureError, DisplayId, PIXEL_FORMAT_BGRA};
@@ -82,22 +81,32 @@ impl CgDisplayStreamBackend {
     }
 }
 
-fn make_cg_properties(fps: f64) -> CFRetained<CFDictionary> {
-    let min_frame_time = CFNumber::new_f64((1.0 / fps.max(1.0)) * 0.95);
-    let queue_depth = CFNumber::new_isize(2);
+/// Surfaces the stream keeps in flight.
+///
+/// Apple's own default is 3. Ours was 2, while the pipeline held two at once — the frame in the
+/// latest-wins slot and the one pinned as `last_frame` for the keepalive — plus whatever
+/// VideoToolbox retains, so the stream had nothing free to composite into. OBS uses 5 on the
+/// same API; measured here, 2 collapses a 58 fps capture to one frame in six seconds the moment
+/// an encoder joins the holding pattern.
+const QUEUE_DEPTH: isize = 5;
+
+fn make_cg_properties() -> CFRetained<CFDictionary> {
+    let queue_depth = CFNumber::new_isize(QUEUE_DEPTH);
     let show_cursor = CFBoolean::new(true);
     let preserve_ar = CFBoolean::new(false);
 
+    // `kCGDisplayStreamMinimumFrameTime` is deliberately absent. Its documented default is
+    // zero, so setting it added a throttle rather than relaxing one: after a delivery the
+    // stream refuses to deliver again for that long, which delays every update that lands
+    // mid-interval by up to a frame period (mean ~8 ms at 60 fps). OBS does not set it either.
     unsafe {
-        let keys: [*const c_void; 5] = [
-            (kCGDisplayStreamMinimumFrameTime as *const CFString).cast(),
+        let keys: [*const c_void; 4] = [
             (kCGDisplayStreamQueueDepth as *const CFString).cast(),
             (kCGDisplayStreamShowCursor as *const CFString).cast(),
             (kCGDisplayStreamPreserveAspectRatio as *const CFString).cast(),
             (kCGDisplayStreamYCbCrMatrix as *const CFString).cast(),
         ];
-        let values: [*const c_void; 5] = [
-            (&*min_frame_time as *const CFNumber).cast(),
+        let values: [*const c_void; 4] = [
             (&*queue_depth as *const CFNumber).cast(),
             (show_cursor as *const CFBoolean).cast(),
             (preserve_ar as *const CFBoolean).cast(),
@@ -120,6 +129,7 @@ struct HandlerCtx {
     frames: Arc<AtomicU64>,
     drops: Arc<AtomicU64>,
     telemetry: SharedTelemetry,
+    published_one: AtomicBool,
     width: usize,
     height: usize,
 }
@@ -150,17 +160,24 @@ fn handle_frame(
         return;
     }
 
-    if let Some(update_ref) = unsafe { update.as_ref() } {
-        let mut rect_count: usize = 0;
-        unsafe {
-            CGDisplayStreamUpdate::rects(
-                Some(update_ref),
-                CGDisplayStreamUpdateRectType::DirtyRects,
-                NonNull::from(&mut rect_count),
-            )
-        };
-        if rect_count == 0 {
-            return;
+    // Skip a frame whose dirty-rect list is empty — nothing changed, so re-encoding it buys
+    // nothing. Except the *first* one: a client that joins a still display (a freshly created
+    // virtual display is exactly that, and it stays still until the user drags a window onto
+    // it) would otherwise wait for the first change to see anything at all, and the 200 ms
+    // keepalive cannot rescue it because the pipeline has no previous frame to repeat.
+    if ctx.published_one.load(Ordering::Relaxed) {
+        if let Some(update_ref) = unsafe { update.as_ref() } {
+            let mut rect_count: usize = 0;
+            unsafe {
+                CGDisplayStreamUpdate::rects(
+                    Some(update_ref),
+                    CGDisplayStreamUpdateRectType::DirtyRects,
+                    NonNull::from(&mut rect_count),
+                )
+            };
+            if rect_count == 0 {
+                return;
+            }
         }
     }
 
@@ -175,10 +192,12 @@ fn handle_frame(
         let Some(out) = NonNull::new(out) else {
             return;
         };
+        // CoreVideo can return non-zero *and* hand back a +1 buffer; taking ownership first and
+        // dropping it is what stops that path leaking one CVPixelBuffer per bad frame.
+        let pixbuf = CFRetained::from_raw(out);
         if r != 0 {
             return;
         }
-        let pixbuf = CFRetained::from_raw(out);
         frames.fetch_add(1, Ordering::Relaxed);
         sink.publish(Frame {
             width,
@@ -188,9 +207,11 @@ fn handle_frame(
             os_time_ns: super::clock::mach_ticks_to_host_ns(display_time),
             backing: Backing::PixelBuffer {
                 pixbuf,
-                _surface: surface_ret,
+                _surface: HeldSurface::hold(surface_ret),
             },
         });
+        // Only now is the gate armed, so a failed wrap does not consume the one free pass.
+        ctx.published_one.store(true, Ordering::Relaxed);
     }
 }
 
@@ -200,7 +221,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
     }
 
     fn start(&mut self) -> Result<(), CaptureError> {
-        let props = make_cg_properties(self.cfg.fps.max(1) as f64);
+        let props = make_cg_properties();
 
         let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
             DispatchQoS::UserInteractive,
@@ -212,6 +233,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
             frames: self.frames.clone(),
             drops: self.drops.clone(),
             telemetry: Arc::clone(&self.telemetry),
+            published_one: AtomicBool::new(false),
             width: self.cfg.width,
             height: self.cfg.height,
         };
@@ -244,7 +266,7 @@ impl CaptureBackend for CgDisplayStreamBackend {
         }
 
         tprintln!(
-            "[cgds] capture started: display={} {}x{} @ {}fps (queueDepth=2)",
+            "[cgds] capture started: display={} {}x{} @ {}fps (queueDepth={QUEUE_DEPTH}, no minimumFrameTime)",
             self.display_id,
             self.cfg.width,
             self.cfg.height,
@@ -279,7 +301,7 @@ pub fn probe_screen_recording() -> bool {
         return false;
     };
 
-    let props = make_cg_properties(60.0);
+    let props = make_cg_properties();
     let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
         DispatchQoS::UserInteractive,
     ));

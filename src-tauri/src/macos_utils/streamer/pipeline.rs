@@ -745,12 +745,15 @@ mod tests {
             }
         }
         encoder.flush().ok();
+        let captured = backend.frames_captured();
+        let cap_drops = backend.frames_dropped();
         backend.stop();
         drop(encoder);
         let (mut lat, bytes, keyframes, new_frames) = drain.join().unwrap();
 
         println!(
-            "submitted={submitted} new_frames={new_frames} keyframes={keyframes} bytes={bytes}"
+            "captured={captured} windowserver_drops={cap_drops} submitted={submitted} \
+             new_frames={new_frames} keyframes={keyframes} bytes={bytes}"
         );
         assert!(
             submitted > 0,
