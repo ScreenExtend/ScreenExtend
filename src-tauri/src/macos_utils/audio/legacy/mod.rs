@@ -75,6 +75,9 @@ impl AudioSource for LegacyVirtualDeviceSource {
                  ({:.2} ms @ 48 kHz), st={st}",
                 got as f64 / 48.0
             );
+            // Until now only the Windows path ever wrote this, so the 2 s summary reported the
+            // legacy tier's IO cycle as `period=0fr`.
+            sink.diagnostics.period_frames.store(got, Ordering::Relaxed);
         }
 
         let (mon_prod, mon_cons) = ring::ring(MONITOR_RING_CAPACITY);
