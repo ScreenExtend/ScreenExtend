@@ -166,6 +166,48 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
+### Considered and rejected on the macOS capture/encode path (W5)
+
+**One VideoToolbox session shared between clients at the same resolution.** The hardware encoder
+is instance-limited and ScreenExtend creates a session per connected device, so two phones asking
+for the same geometry hold two scarce sessions to produce identical bitstreams. Sharing them is a
+real saving and it is *not* a small change: the pipeline, the bitrate controller, the IDR request
+and the telemetry are all per-session by construction, and a shared encoder would need a
+per-client keyframe policy — a joining device needs an IDR the others do not. What landed instead
+is the detection half: the instance-limit flag is read out of `VTCopyVideoEncoderList` and logged,
+and a session that falls to software says so loudly. That is what turns "it only works when I quit
+everything else" from folklore into a log line. The sharing belongs with whoever owns the session
+lifecycle, not with the encoder.
+
+**Falling back from ScreenCaptureKit to CGDisplayStream mid-session.** Rejected. The tier is
+decided at start and now requires a delivered frame before it is committed, which covers the
+documented 12.3 failure. Swapping capture backends under a live session risks a worse failure than
+the stall it would paper over, and a WindowServer stall — the usual cause of a mid-session dry
+spell — is not something the other API would fix. The watchdog that does help is the first-frame
+deadline: after 750 ms with nothing captured the encode loop synthesizes a black IDR and counts
+`capture_no_first_frame`, so the condition is visible instead of mute.
+
+**A Metal convert/scale stage in `gpu.rs`.** Rejected, and the placeholder now says why.
+WindowServer delivers the frame already scaled to the requested size and already in the pixel
+format the encoder wants (`420f`), and the delivered IOSurface is wrapped rather than copied all
+the way into VideoToolbox — so there is no CPU conversion to move onto the GPU. Whether
+WindowServer's own downscale costs anything is a separate question, and it now has an instrument:
+`cgds::tests::capture_rate` captures at native size and `cgds::tests::capture_rate_downscaled` at
+half, and both print the same `displayTime → callback` distribution.
+
+**`kVTCompressionPropertyKey_ConstantBitRate` as a replacement for the removed `DataRateLimits`.**
+Rejected. CBR spends bits to hold the rate on a screen that is not changing, which is the opposite
+of what a screen sharer wants; `AverageBitRate` plus the loss-based controller is the right shape.
+The property is probed and named in the per-session property line so the decision is visible
+rather than absent.
+
+**`CGVirtualDisplaySettings.refreshDeadline`.** Absent on the 10.15 floor, so there is nothing to
+measure here. It is probed with `respondsToSelector:` and reported, deliberately not set. It is
+the only latency-named knob on the WindowServer side of that boundary, which is where the largest
+single term in the host path lives, so the experiment is written up for a modern Mac in
+`docs/manual-tests/macos-capture-encode.md` §10.
+
+
 
 ### UI-visible recommendation (W7): the screen-recording indicator on macOS 13.0-14.1
 
