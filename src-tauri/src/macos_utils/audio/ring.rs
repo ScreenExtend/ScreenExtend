@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct Shared {
@@ -8,10 +8,28 @@ struct Shared {
     head: AtomicUsize,
     tail: AtomicUsize,
     overruns: AtomicU64,
+    // seqlock-published capture-time anchor; see `Anchor`
+    anchor_seq: AtomicU64,
+    anchor_pos: AtomicU64,
+    anchor_ns: AtomicU64,
 }
 
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
+
+/// Host-clock time of one identified sample in the stream.
+///
+/// Every capture callback is handed a hardware timestamp for the block it delivers. Publishing that
+/// alongside the absolute ring index the block starts at lets the encoder worker date its packets
+/// from when the samples were *captured* rather than from when it woke up to encode them. The pair
+/// is guarded by a seqlock, not a mutex, because the writer is a real-time audio callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// absolute index, in ring samples, of the sample this time refers to
+    pub pos: u64,
+    /// `streamer::audio::host_now_ns()`-domain time of that sample
+    pub host_ns: u64,
+}
 
 /// producer half, held by the RT capture callback
 pub struct Producer {
@@ -33,6 +51,9 @@ pub fn ring(capacity: usize) -> (Producer, Consumer) {
         head: AtomicUsize::new(0),
         tail: AtomicUsize::new(0),
         overruns: AtomicU64::new(0),
+        anchor_seq: AtomicU64::new(0),
+        anchor_pos: AtomicU64::new(0),
+        anchor_ns: AtomicU64::new(0),
     });
     (
         Producer {
@@ -50,6 +71,29 @@ impl Producer {
     /// inversion. In particular there is deliberately no consumer wakeup — the encoder worker
     /// polls with a 125 us `park_timeout`, a quarter of one 5 ms Opus frame.
     pub fn push(&self, data: &[f32]) -> usize {
+        self.write(data)
+    }
+
+    /// Push a block whose first sample was captured at `host_ns`, publishing that as the anchor.
+    ///
+    /// `host_ns == 0` means the backend had no usable hardware stamp for this block; the previous
+    /// anchor is then left in place rather than replaced with a guess.
+    pub fn push_at(&self, data: &[f32], host_ns: u64) -> usize {
+        if host_ns != 0 {
+            let s = &*self.shared;
+            let head = s.head.load(Ordering::Relaxed) as u64;
+            let seq = s.anchor_seq.load(Ordering::Relaxed);
+            // seqlock write: an odd sequence marks the pair as in flux
+            s.anchor_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+            fence(Ordering::Release);
+            s.anchor_pos.store(head, Ordering::Relaxed);
+            s.anchor_ns.store(host_ns, Ordering::Relaxed);
+            s.anchor_seq.store(seq.wrapping_add(2), Ordering::Release);
+        }
+        self.write(data)
+    }
+
+    fn write(&self, data: &[f32]) -> usize {
         let s = &*self.shared;
         let head = s.head.load(Ordering::Relaxed);
         let tail = s.tail.load(Ordering::Acquire);
@@ -81,6 +125,35 @@ impl Consumer {
         let head = s.head.load(Ordering::Acquire);
         let tail = s.tail.load(Ordering::Relaxed);
         head.wrapping_sub(tail)
+    }
+
+    /// Absolute index of the next sample [`Consumer::pop`] will return.
+    pub fn read_pos(&self) -> u64 {
+        self.shared.tail.load(Ordering::Relaxed) as u64
+    }
+
+    /// The most recently published capture-time anchor.
+    ///
+    /// `None` if the producer has never published one, or if the seqlock was caught mid-write on
+    /// every attempt — the caller falls back to its own clock for that frame.
+    pub fn anchor(&self) -> Option<Anchor> {
+        let s = &*self.shared;
+        for _ in 0..4 {
+            let before = s.anchor_seq.load(Ordering::Acquire);
+            if before == 0 {
+                return None; // never published
+            }
+            if before & 1 != 0 {
+                continue; // write in progress
+            }
+            let pos = s.anchor_pos.load(Ordering::Relaxed);
+            let host_ns = s.anchor_ns.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if s.anchor_seq.load(Ordering::Relaxed) == before {
+                return Some(Anchor { pos, host_ns });
+            }
+        }
+        None
     }
 
     pub fn pop(&self, out: &mut [f32]) -> usize {
@@ -136,5 +209,58 @@ mod tests {
         assert_eq!(dropped, 2);
         assert_eq!(p.overruns(), 2);
         assert_eq!(c.available(), 4);
+    }
+
+    #[test]
+    fn no_anchor_until_one_is_published() {
+        let (p, c) = ring(8);
+        assert_eq!(c.anchor(), None);
+        p.push(&[1.0, 2.0]);
+        assert_eq!(c.anchor(), None);
+    }
+
+    #[test]
+    fn an_anchor_names_the_first_sample_of_its_block() {
+        let (p, c) = ring(64);
+        p.push_at(&[1.0, 2.0], 7_000);
+        assert_eq!(
+            c.anchor(),
+            Some(Anchor {
+                pos: 0,
+                host_ns: 7_000
+            })
+        );
+        p.push_at(&[3.0, 4.0], 9_000);
+        assert_eq!(
+            c.anchor(),
+            Some(Anchor {
+                pos: 2,
+                host_ns: 9_000
+            })
+        );
+    }
+
+    #[test]
+    fn a_block_without_a_stamp_leaves_the_anchor_alone() {
+        let (p, c) = ring(64);
+        p.push_at(&[1.0, 2.0], 7_000);
+        p.push_at(&[3.0, 4.0], 0);
+        assert_eq!(
+            c.anchor(),
+            Some(Anchor {
+                pos: 0,
+                host_ns: 7_000
+            })
+        );
+    }
+
+    #[test]
+    fn read_pos_tracks_what_has_been_popped() {
+        let (p, c) = ring(64);
+        p.push(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(c.read_pos(), 0);
+        let mut out = [0.0f32; 3];
+        c.pop(&mut out);
+        assert_eq!(c.read_pos(), 3);
     }
 }

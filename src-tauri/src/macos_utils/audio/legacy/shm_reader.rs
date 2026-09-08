@@ -68,8 +68,9 @@ pub struct CaptureTargets {
 const SILENCE_THRESHOLD: f32 = 1.0 / 32768.0;
 
 impl CaptureTargets {
+    /// `host_ns` is the capture time of `samples[0]`, or 0 when this transport has no stamp.
     #[inline]
-    fn publish(&self, samples: &[f32]) {
+    fn publish(&self, samples: &[f32], host_ns: u64) {
         let mut nonsilent = 0u64;
         for &x in samples {
             if x.abs() > SILENCE_THRESHOLD {
@@ -79,7 +80,7 @@ impl CaptureTargets {
         if nonsilent > 0 {
             self.nonsilent.fetch_add(nonsilent, Ordering::Relaxed);
         }
-        let dropped = self.encoder.push(samples);
+        let dropped = self.encoder.push_at(samples, host_ns);
         if dropped > 0 {
             self.diagnostics
                 .dropped_backpressure
@@ -256,7 +257,7 @@ fn shm_reader_loop(map: ShmMap, targets: CaptureTargets, stop: Arc<AtomicBool>) 
             continue;
         }
         read_pos = read_pos.wrapping_add(n as u64);
-        targets.publish(&scratch[..n]);
+        targets.publish(&scratch[..n], 0);
     }
 }
 
@@ -272,7 +273,7 @@ extern "C-unwind" fn input_ioproc(
     _dev: AudioObjectID,
     _now: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     in_input_data: NonNull<AudioBufferList>,
-    _in_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
+    in_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     _out_data: NonNull<AudioBufferList>,
     _out_time: NonNull<objc2_core_audio_types::AudioTimeStamp>,
     client_data: *mut c_void,
@@ -294,7 +295,10 @@ extern "C-unwind" fn input_ioproc(
     let scratch = unsafe { &mut *ctx.scratch.get() };
     let m = n.min(scratch.len());
     scratch[..m].copy_from_slice(&src[..m]);
-    ctx.targets.publish(&scratch[..m]);
+    ctx.targets.publish(
+        &scratch[..m],
+        crate::macos_utils::audio::process_tap::block_host_ns(in_time),
+    );
     0
 }
 

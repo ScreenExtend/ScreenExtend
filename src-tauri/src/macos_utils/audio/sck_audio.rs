@@ -22,6 +22,7 @@ use objc2_foundation::NSString;
 
 use super::format::{self, AudioFormatDesc};
 use super::{AudioCaptureError, AudioFrameSink, AudioSource};
+use crate::macos_utils::streamer::mach;
 use crate::streamer::audio::AudioDiagnostics;
 
 const SC_OUTPUT_TYPE_AUDIO: isize = 1;
@@ -452,12 +453,35 @@ fn handle_audio_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
         ctx.nonsilent_samples
             .fetch_add(nonsilent, Ordering::Relaxed);
     }
-    let dropped = ctx.producer.push(frame);
+    let dropped = ctx.producer.push_at(frame, sample_host_ns(sample));
     if dropped > 0 {
         ctx.diag
             .dropped_backpressure
             .fetch_add(dropped as u64, Ordering::Relaxed);
     }
+}
+
+/// Host-clock time of an SCK audio chunk, from its presentation timestamp.
+///
+/// SCK stamps sample buffers on the host time base, so the age of the stamp against
+/// `mach_absolute_time` is the chunk's delivery latency, and subtracting it from the shared clock
+/// gives the capture instant. A stamp that is in the future or more than a second old means a
+/// different epoch than assumed; delivery time is then used instead, which is still the callback
+/// rather than the encoder's later wakeup.
+fn sample_host_ns(sample: &CMSampleBuffer) -> u64 {
+    let now = crate::streamer::audio::host_now_ns();
+    // SAFETY: floor-present CoreMedia accessor on a sample buffer live for this call
+    let pts = unsafe { sample.presentation_time_stamp() };
+    if !pts.flags.contains(CMTimeFlags::Valid) || pts.timescale <= 0 || pts.value <= 0 {
+        return now;
+    }
+    let pts_ns = (pts.value as i128 * 1_000_000_000i128) / pts.timescale as i128;
+    let mach_ns = mach::mach_delta_ns(0, mach::mach_now()) as i128;
+    let age = mach_ns - pts_ns;
+    if !(0..=1_000_000_000).contains(&age) {
+        return now;
+    }
+    now.saturating_sub(age as u64)
 }
 
 fn runtime_class(name: &CStr) -> Result<&'static AnyClass, AudioCaptureError> {
