@@ -78,7 +78,21 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+// One frozen handle per locale, so the return value is a stable dependency and
+// `availableLocales()` is not re-allocated on every render of every consumer.
+const handles = new Map<string, ReturnType<typeof makeHandle>>();
+const ALL_LOCALES = Object.keys(locales);
+
+function makeHandle(locale: string) {
+  return { t, locale, setLocale, locales: ALL_LOCALES };
+}
+
 export function useTranslation() {
-  useSyncExternalStore(subscribe, getLocale, getLocale);
-  return { t, locale: currentLocale, setLocale, locales: availableLocales() };
+  const locale = useSyncExternalStore(subscribe, getLocale, getLocale);
+  let handle = handles.get(locale);
+  if (!handle) {
+    handle = makeHandle(locale);
+    handles.set(locale, handle);
+  }
+  return handle;
 }

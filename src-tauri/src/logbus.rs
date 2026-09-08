@@ -195,6 +195,26 @@ macro_rules! teprintln {
     }};
 }
 
+const MAX_FRONTEND_ERROR_CHARS: usize = 2000;
+
+/// The webview's `console.error` has nowhere to go in a release build -- there are no
+/// devtools attached and nothing captures it -- so failures in the desktop UI simply
+/// vanished. This puts them on the same bus as everything else, which means they reach
+/// the Settings log terminal, `get_log_backlog` and `ScreenExtend logs`.
+///
+/// Defined below the macros because a `macro_rules!` is only in scope after its definition
+/// within its own file.
+#[tauri::command]
+#[specta::specta]
+pub fn log_frontend_error(message: String) {
+    let mut text = message.replace(['\r', '\n'], " ");
+    if text.chars().count() > MAX_FRONTEND_ERROR_CHARS {
+        text = text.chars().take(MAX_FRONTEND_ERROR_CHARS).collect();
+        text.push('…');
+    }
+    teprintln!("[ui] {}", text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

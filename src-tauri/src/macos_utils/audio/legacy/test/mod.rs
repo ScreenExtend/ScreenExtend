@@ -3,8 +3,27 @@ mod ring;
 mod routing;
 
 mod gain {
-    use crate::macos_utils::audio::legacy::playthrough::{drift_trim, ramp};
+    use crate::macos_utils::audio::legacy::playthrough::{drift_trim, ramp, setpoint_frames};
     use crate::macos_utils::audio::legacy::volume_proxy::compute_gain;
+
+    /// The setpoint *is* the host's own monitoring latency, so the untroubled case must be small.
+    #[test]
+    fn the_monitor_setpoint_starts_at_a_few_output_periods() {
+        // a 512-frame output IO cycle: three periods, 32 ms — not the 85 ms a fixed 4096 was
+        assert_eq!(setpoint_frames(512, 0), 1536);
+        // a very short cycle is floored so the drift loop still has something to work with
+        assert_eq!(setpoint_frames(16, 0), 128);
+        assert!(setpoint_frames(512, 0) < 4096);
+    }
+
+    #[test]
+    fn only_a_measured_underrun_raises_the_setpoint() {
+        let base = setpoint_frames(256, 0);
+        assert_eq!(setpoint_frames(256, 64), base + 64);
+        // and it can never climb past the ceiling, however many underruns are counted
+        assert_eq!(setpoint_frames(256, 1_000_000), 4096);
+        assert_eq!(setpoint_frames(4096, 1_000_000), 4096);
+    }
 
     #[test]
     fn mute_forces_zero_gain_regardless_of_scalar() {

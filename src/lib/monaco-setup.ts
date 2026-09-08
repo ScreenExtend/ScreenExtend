@@ -1,3 +1,11 @@
+// editor.all.js pulls all 58 contributions; this is the subset this editor actually
+// uses. Dropped: code actions, codelens, colour picker, comments, document symbols,
+// goto-symbol, inlay hints, inline completions/edits, linked editing, links, parameter
+// hints, placeholder text, rename, section headers, semantic tokens, smart select,
+// sticky scroll, unicode highlighter, word highlighter, drop/paste providers, font zoom,
+// in-place replace, indentation commands, transpose/caret ops and the diff editor --
+// every one of them either has no provider registered for json or is already off in
+// editorOptions. Re-add a line here if a shortcut turns out to be missed.
 import "monaco-editor/esm/vs/base/browser/ui/codicons/codiconStyles.js";
 import "monaco-editor/esm/vs/editor/common/standaloneStrings.js";
 import "monaco-editor/esm/vs/editor/browser/coreCommands.js";
@@ -26,11 +34,15 @@ import "monaco-editor/esm/vs/language/json/monaco.contribution";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { loader } from "@monaco-editor/react";
 import { scanJson } from "@/lib/json-structure";
+// wrapped so the workers get the legacy-WebKit shims too; they never run the entry chunk
 import editorWorker from "@/lib/monaco-editor.worker?worker";
 import jsonWorker from "@/lib/monaco-json.worker?worker";
 
 window.MonacoEnvironment = {
   getWorker(_workerId: string, label: string) {
+    // in dev these come from the classic-worker plugin in vite.config.ts: vite
+    // would otherwise hand back a module worker, which safari 13 cannot load,
+    // and monaco silently falls back to the main thread instead of failing
     if (import.meta.env.DEV) {
       const name = label === "json" ? "monaco-json.worker" : "monaco-editor.worker";
       return new Worker("/@classic-worker/" + name + ".js");
@@ -139,7 +151,13 @@ monaco.languages.json.jsonDefaults.setModeConfiguration({
   ...monaco.languages.json.jsonDefaults.modeConfiguration,
   foldingRanges: false,
   colors: false,
+  // monaco's own DiagnosticsAdapter revalidates 500 ms after every keystroke, and that
+  // literal is unreachable -- no option, no constructor hook. json-editor.tsx runs the
+  // same worker call itself once typing settles instead.
   diagnostics: false,
+  // each of these is a json-worker round trip we never surface: no outline or
+  // breadcrumbs in a standalone editor, no expand-selection binding, and the
+  // format button uses the whole-document provider
   documentSymbols: false,
   selectionRanges: false,
   documentRangeFormattingEdits: false,

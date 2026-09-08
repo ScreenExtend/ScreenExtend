@@ -25,10 +25,12 @@ pub(crate) fn show_measurements() {
     ONCE.call_once(|| crate::logbus::set_verbose(true));
 }
 
+mod amd_layout;
 mod intel_encoder;
 mod intel_layout;
 mod nvenc_layout;
 mod pipeline;
+mod scaler;
 mod x264_encoder;
 
 #[test]

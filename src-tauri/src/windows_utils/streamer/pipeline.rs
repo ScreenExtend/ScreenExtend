@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::d3d11::StagingTexture;
 use crate::windows_capture::frame::Frame;
-use crate::windows_capture::graphics_capture_api::InternalCaptureControl;
+use crate::windows_capture::graphics_capture_api::{wgc_features, InternalCaptureControl};
 use crate::windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -18,13 +19,14 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
+use super::amd::encoder::Encoder as AmfEncoder;
 use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo};
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{
     Encoder, EncoderConfig, SlotEncodeError, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER,
 };
-use super::scaler::{Scaler, TextureReader};
+use super::scaler::{ReadbackFormat, Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
@@ -101,11 +103,47 @@ fn apply_pending_bitrate(
             warn_constant_qp_once(warned);
             *current = pending;
         }
-        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+        Err(e) => {
+            teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; will retry");
+            restore_pending_bitrate(target_bitrate, pending);
+        }
     }
 }
 
+/// Puts a failed target back so the next tick retries it.
+///
+/// Both appliers consume the request with `swap(0)` *before* attempting the reconfigure, so a
+/// transient `nvEncReconfigureEncoder` failure used to drop the congestion controller's response
+/// on the floor until it happened to publish a different number -- possibly never, if it had
+/// settled. `compare_exchange` so a newer target published in the meantime still wins.
+fn restore_pending_bitrate(target_bitrate: &AtomicU32, pending: u32) {
+    let _ = target_bitrate.compare_exchange(0, pending, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
+
+/// `MinUpdateInterval` is a floor on the gap between delivered frames, not a throttle to a rate:
+/// WGC's default delivery is capped near 60 Hz whatever the panel does, and this property is what
+/// raises that ceiling. The old `frame_duration * 2/3` scaled the floor with the target rate,
+/// which is backwards — a floor near the target period caps delivery *below* it.
+/// `windows-capture` issue #190 measured a 120 Hz panel with the floor at 1/60 delivering ~52 fps,
+/// at 1/90 ~58 fps and at 1/120 ~59 fps. Sunshine sets a flat 4 ms (250 Hz); so do we, and let
+/// the pipeline's own pacing decide what to keep.
+const WGC_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
+
+/// Frame-pool depth for a handler that encodes inline: one buffer the compositor writes, one we
+/// read. OBS and Sunshine both use 2. The pool is a queue handed out oldest-first, so depth is
+/// latency for anything the consumer cannot keep up with.
+const FRAME_POOL_BUFFERS_INLINE: u32 = 2;
+
+/// Frame-pool depth for the ring path, which only stages a copy in the callback and encodes
+/// elsewhere: one more buffer so the copy and the encode overlap.
+const FRAME_POOL_BUFFERS_RING: u32 = 3;
+
+/// How many consecutive "nothing changed" reports to trust before encoding anyway. The DXGI path
+/// carries the same valve for the same reason: a driver that under-reports dirty regions would
+/// otherwise serve a stale picture forever.
+const MAX_CONSECUTIVE_UNCHANGED: u32 = 5;
 
 fn is_transient_encode_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("device busy")
@@ -120,9 +158,14 @@ pub(crate) fn live_encoder_config(
     let fps = if let Some(f) = cfg.fps {
         f.clamp(15, 500)
     } else {
+        // The display's own rate, capped by the configured ceiling. There used to be a 60 fps
+        // floor here, which is not a floor on anything real: an indirect display has no scanout,
+        // so its reported refresh *is* the rate DWM composes at, and asking the encoder for 60
+        // when the compositor produces 30 only buys duplicate frames. Where the rate is unknown
+        // (0), 60 is still the assumption.
         let refresh = if refresh_hz == 0 { 60 } else { refresh_hz };
         let max_fps = cfg.max_fps.clamp(15, 500);
-        refresh.clamp(60.min(max_fps), max_fps)
+        refresh.clamp(15, max_fps)
     };
 
     let (width, height) = scaled_dims(native_w, native_h, cfg.scale);
@@ -400,7 +443,9 @@ fn start_live_capture(
     let downscale = config.width != info.width || config.height != info.height;
     let frame_duration = Duration::from_nanos(1_000_000_000 / config.fps as u64);
 
+    let features = wgc_features();
     telemetry.capture_backend.set("wgc".into());
+    telemetry.capture_features.set(features.summary());
     let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
     let pipeline = Pipeline {
         tx: tx.clone(),
@@ -413,13 +458,16 @@ fn start_live_capture(
         h264_profile: cfg.h264_profile,
     };
 
+    // Every one of these is applied only where the OS exposes the property; the ones it does not
+    // are skipped, not fatal. `ReportOnly` gives us `Frame::dirty_regions()` without asking the
+    // compositor to render the regions separately.
     let settings = Settings::new(
         monitor,
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3),
-        DirtyRegionSettings::Default,
+        MinimumUpdateIntervalSettings::Custom(WGC_MIN_UPDATE_INTERVAL),
+        DirtyRegionSettings::ReportOnly,
         ColorFormat::Bgra8,
         CaptureFlags {
             config,
@@ -432,10 +480,11 @@ fn start_live_capture(
             wake_rx,
             telemetry,
         },
-    );
+    )
+    .with_gpu_preference(super::capture_gpu_preference(effective_vendor(cfg)));
 
     tprintln!(
-        "pipeline: starting live monitor capture (WGC -> NVENC; zero-copy if available): \
+        "pipeline: starting live monitor capture (WGC): \
          display={}, name={}, gpu={}, native={}x{}, encode={}x{}, downscale={}, fps={}, bitrate_bps={}",
         info.index,
         info.name,
@@ -447,6 +496,15 @@ fn start_live_capture(
         downscale,
         config.fps,
         config.bitrate_bps,
+    );
+    tprintln!(
+        "wgc: feature set {} ({}); optional properties this build lacks are skipped, not fatal",
+        features.summary(),
+        if features.has_26100_properties() {
+            "build 26100+"
+        } else {
+            "pre-26100"
+        },
     );
 
     let control = LiveCapture::start_free_threaded(settings)
@@ -581,17 +639,20 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             dup.context(),
         )?;
 
+        // No scaler at all when the display is already the size the client asked for: the blt
+        // would be an identity pass and the extra surface a wasted allocation.
         let needs_scaler =
             backend.wants_prescale() && (config.width != native_w || config.height != native_h);
         let scaler = if needs_scaler {
             Some(
-                Scaler::new(
+                Scaler::with_format(
                     dup.device(),
                     dup.context(),
                     native_w,
                     native_h,
                     config.width,
                     config.height,
+                    scaler_output_format(&backend),
                 )
                 .context("building GPU downscaler for --scale")?,
             )
@@ -619,6 +680,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             backend,
             scaler,
             reader,
+            staging: None,
             target_bitrate,
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -652,7 +714,11 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
     );
 
     telemetry.encoder.set(path_name.into());
-    tprintln!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
+    telemetry.capture_features.set(dup.api().name().into());
+    tprintln!(
+        "pipeline: live capture ready -- DXGI duplication ({}) -> {path_name}",
+        dup.api().name()
+    );
     let _ = ready_tx.send(Ok(()));
 
     let mut dirty = false;
@@ -907,6 +973,8 @@ enum Backend {
     Nvenc { encoder: Encoder, path: EncodePath },
     Intel { encoder: IntelEncoder },
     IntelCpu { encoder: IntelEncoder },
+    Amf { encoder: AmfEncoder },
+    AmfCpu { encoder: AmfEncoder },
     X264 { encoder: X264Encoder },
 }
 
@@ -916,6 +984,8 @@ impl Backend {
             Backend::Nvenc { path, .. } => path.name(),
             Backend::Intel { .. } => "intel-same-adapter",
             Backend::IntelCpu { .. } => "intel-cpu-bridge",
+            Backend::Amf { .. } => "amd-amf-same-adapter",
+            Backend::AmfCpu { .. } => "amd-amf-cpu-bridge",
             Backend::X264 { .. } => "software-x264",
         }
     }
@@ -925,6 +995,7 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => Some(encoder.device()),
             Backend::Intel { encoder } => Some(encoder.device()),
             Backend::IntelCpu { encoder } => Some(encoder.device()),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => Some(encoder.device()),
             Backend::X264 { .. } => None,
         }
     }
@@ -934,12 +1005,37 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.set_bitrate(bps),
             Backend::Intel { encoder } => encoder.set_bitrate(bps),
             Backend::IntelCpu { encoder } => encoder.set_bitrate(bps),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => encoder.set_bitrate(bps),
             Backend::X264 { encoder } => encoder.set_bitrate(bps),
         }
     }
 
     fn wants_prescale(&self) -> bool {
         !matches!(self, Backend::Intel { .. })
+    }
+
+    /// What this backend wants a CPU-bridge readback to be in.
+    ///
+    /// The scale and the colour conversion are one `VideoProcessorBlt`, so NV12 costs the video
+    /// engine nothing extra and takes 62% off the readback, the memcpy and the upload. Every
+    /// CPU-bridge encoder here converts BGRA to 4:2:0 on the CPU anyway — x264 on a rayon pool,
+    /// oneVPL through a second VPP pass, AMF through an internal converter — so the conversion is
+    /// not saved so much as moved onto silicon that was already running.
+    ///
+    /// It stays BGRA until each encoder has an `encode_nv12_padded` to receive it
+    /// (`findings/major-scaler-win-emits-bgra-where-three-encoders-want-nv12.md`, W3b); the
+    /// scaler side is in place, so flipping a backend over is a one-line change here plus that
+    /// entry point. NVENC is deliberately not a candidate: `NV_ENC_BUFFER_FORMAT_ARGB` is
+    /// byte-identical to the captured texture and its internal conversion beats a pre-pass.
+    fn cpu_bridge_format(&self) -> ReadbackFormat {
+        match self {
+            Backend::Nvenc { .. }
+            | Backend::Intel { .. }
+            | Backend::IntelCpu { .. }
+            | Backend::Amf { .. }
+            | Backend::AmfCpu { .. }
+            | Backend::X264 { .. } => ReadbackFormat::Bgra8,
+        }
     }
 
     fn is_cpu_bridge(&self) -> bool {
@@ -949,6 +1045,7 @@ impl Backend {
                 path: EncodePath::CpuBridge,
                 ..
             } | Backend::IntelCpu { .. }
+                | Backend::AmfCpu { .. }
                 | Backend::X264 { .. }
         )
     }
@@ -994,6 +1091,9 @@ impl Backend {
                 }
                 encoder.encode_input(force_idr)
             }
+            // AMF stages into its own texture ring, so the prescaler (when there is one) blits
+            // straight into the slot the encoder is about to wrap.
+            Backend::Amf { encoder } => encoder.encode_texture(raw, scaler, force_idr),
             _ => bail!("encode_gpu called on a CPU-bridge backend"),
         }
     }
@@ -1005,6 +1105,7 @@ impl Backend {
                 path: EncodePath::CpuBridge,
             } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             Backend::IntelCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
+            Backend::AmfCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             Backend::X264 { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
             _ => bail!("encode_cpu called on a GPU-path backend"),
         }
@@ -1015,6 +1116,9 @@ impl Backend {
             Backend::Nvenc { encoder, .. } => encoder.encode_repeat(force_idr),
             Backend::Intel { encoder } => encoder.encode_repeat(force_idr),
             Backend::IntelCpu { encoder } => encoder.encode_repeat(force_idr),
+            Backend::Amf { encoder } | Backend::AmfCpu { encoder } => {
+                encoder.encode_repeat(force_idr)
+            }
             Backend::X264 { encoder } => encoder.encode_repeat(force_idr),
         }
     }
@@ -1024,6 +1128,9 @@ struct EncodeCore {
     backend: Backend,
     scaler: Option<Scaler>,
     reader: Option<TextureReader>,
+    /// Reused readback texture for the WGC classic CPU-bridge path. Rebuilt only when the
+    /// captured content size or format changes, which is a virtual-display mode change.
+    staging: Option<StagingTexture>,
     target_bitrate: Arc<AtomicU32>,
     idr_request: Arc<AtomicBool>,
     current_bitrate: u32,
@@ -1046,7 +1153,10 @@ impl EncodeCore {
             &mut self.bitrate_warned,
         );
         let Self {
-            backend, scaler, ..
+            backend,
+            scaler,
+            staging,
+            ..
         } = self;
 
         let au = if backend.is_cpu_bridge() {
@@ -1055,7 +1165,21 @@ impl EncodeCore {
                 let (data, row_pitch) = scaler.read_back()?;
                 backend.encode_cpu(data, row_pitch, force_idr)?
             } else {
-                let mut fb = frame.buffer()?;
+                let desc = *frame.desc();
+                let stale = staging.as_ref().is_none_or(|s| {
+                    let d = s.desc();
+                    d.Width != desc.Width || d.Height != desc.Height || d.Format != desc.Format
+                });
+                if stale {
+                    *staging = Some(
+                        StagingTexture::new(frame.device(), desc.Width, desc.Height, desc.Format)
+                            .context("creating the reusable CPU-bridge readback texture")?,
+                    );
+                }
+                let staging = staging
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("cpu-bridge readback texture missing"))?;
+                let mut fb = frame.buffer_with(staging)?;
                 let row_pitch = fb.row_pitch();
                 backend.encode_cpu(fb.as_raw_buffer(), row_pitch, force_idr)?
             }
@@ -1130,6 +1254,14 @@ struct LiveCapture {
     frames_sent: u64,
     busy_streak: u32,
     stop: Arc<AtomicBool>,
+    frame_pool_buffers: u32,
+    /// Incremented by the frame pool for every frame it discards while draining to the newest.
+    /// Folded into telemetry from the callback, which is the only place that can see it move.
+    stale_frames: Arc<AtomicU32>,
+    stale_frames_reported: u32,
+    /// True when this build exposes `DirtyRegionMode`, so `Frame::dirty_regions()` is meaningful.
+    dirty_region_reporting: bool,
+    unchanged_streak: u32,
     _thread_tuning: tuning::ThreadTuning,
     _keep_awake: tuning::KeepAwake,
     telemetry: SharedTelemetry,
@@ -1172,10 +1304,8 @@ fn build_zero_copy(
 fn build_zero_copy_ring(
     config: EncoderConfig,
     igpu_device: &ID3D11Device,
-    igpu_context: &ID3D11DeviceContext,
     ring: usize,
 ) -> Result<(Encoder, Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>)> {
-    let _ = igpu_context; // context is passed for symmetry with build_zero_copy / used by caller
     let encoder = Encoder::new_shared_ring(config, ring)?;
     let handles = encoder.shared_handles();
     if handles.len() != ring {
@@ -1205,6 +1335,29 @@ struct ReadyMsg {
     timing: FrameTiming,
 }
 
+/// A slot the encode thread could not acquire (GPU hang, TDR, driver fault) is wedged at
+/// `KEY_ENCODER` and nobody will ever release it. The producer must know, or it pulls the slot
+/// out of the free pool and blocks the capture callback on a mutex with no owner. `K` is at most
+/// a handful, so a bitmask is enough and can be read from the capture thread with one load.
+#[derive(Default)]
+struct PoisonedSlots(AtomicU32);
+
+impl PoisonedSlots {
+    fn mark(&self, slot: usize) {
+        if slot < 32 {
+            self.0.fetch_or(1 << slot, Ordering::Relaxed);
+        }
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        slot < 32 && self.0.load(Ordering::Relaxed) & (1 << slot) != 0
+    }
+
+    fn count(&self) -> u32 {
+        self.0.load(Ordering::Relaxed).count_ones()
+    }
+}
+
 struct AsyncNvencRing {
     shared_igpu: Vec<ID3D11Texture2D>,
     igpu_mutex: Vec<IDXGIKeyedMutex>,
@@ -1217,8 +1370,13 @@ struct AsyncNvencRing {
     stop: Arc<AtomicBool>,
     last_frame_at: Arc<AtomicU64>,
     idr_request: Arc<AtomicBool>,
+    poisoned: Arc<PoisonedSlots>,
+    slots: usize,
     epoch: Instant,
     frame_index: u64,
+    dropped: u64,
+    dropped_reported: u64,
+    stage_timeout_ms: u32,
     telemetry: SharedTelemetry,
 }
 
@@ -1234,6 +1392,8 @@ impl AsyncNvencRing {
         initial_bitrate: u32,
         last_frame_at: Arc<AtomicU64>,
         idr_request: Arc<AtomicBool>,
+        wake_rx: crossbeam_channel::Receiver<()>,
+        frame_duration: Duration,
         epoch: Instant,
         telemetry: SharedTelemetry,
     ) -> Self {
@@ -1247,29 +1407,36 @@ impl AsyncNvencRing {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let poisoned = Arc::new(PoisonedSlots::default());
 
         let encode_join = {
-            let stop = Arc::clone(&stop);
-            let free_tx = free_tx.clone();
-            let last_frame_at = Arc::clone(&last_frame_at);
-            let telemetry = Arc::clone(&telemetry);
+            let args = RingEncodeArgs {
+                encoder,
+                ready_rx,
+                free_tx: free_tx.clone(),
+                tx,
+                target_bitrate,
+                initial_bitrate,
+                idr_request: Arc::clone(&idr_request),
+                wake_rx,
+                frame_duration,
+                stop: Arc::clone(&stop),
+                poisoned: Arc::clone(&poisoned),
+                telemetry: Arc::clone(&telemetry),
+            };
             std::thread::Builder::new()
                 .name("nvenc-ring-encode".to_string())
-                .spawn(move || {
-                    ring_encode_thread(
-                        encoder,
-                        ready_rx,
-                        free_tx,
-                        tx,
-                        target_bitrate,
-                        initial_bitrate,
-                        last_frame_at,
-                        stop,
-                        telemetry,
-                    )
-                })
+                .spawn(move || ring_encode_thread(args))
                 .expect("spawn nvenc ring encode thread")
         };
+
+        // A capture-side acquire only ever waits for a slot the encoder has already released, so
+        // it should be instantaneous. `KEY_TIMEOUT_MS` (1 s) here would turn a GPU hiccup into a
+        // full second of a blocked WGC callback; two frame periods is the useful ceiling, since
+        // anything longer has already cost the frame.
+        let stage_timeout_ms = (frame_duration.as_millis() as u32)
+            .saturating_mul(2)
+            .clamp(5, 50);
 
         Self {
             shared_igpu,
@@ -1283,33 +1450,66 @@ impl AsyncNvencRing {
             stop,
             last_frame_at,
             idr_request,
+            poisoned,
+            slots: k,
             epoch,
             frame_index: 0,
+            dropped: 0,
+            dropped_reported: 0,
+            stage_timeout_ms,
             telemetry,
         }
     }
 
-    fn stage(&mut self, raw: &ID3D11Texture2D, mut timing: FrameTiming) -> Result<bool> {
-        let slot = match self.free_recv.try_recv() {
-            // Every slot is still in the encoder: this frame is dropped outright, which is the
-            // one place the ring silently discards captured pixels.
-            Err(_) => {
-                self.telemetry
-                    .degradation
-                    .frames_dropped_ring
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(false);
+    /// Pulls a usable free slot, discarding any the encode thread has quarantined. A poisoned
+    /// slot is never returned to the pool, so this drains at most once per poisoning.
+    fn take_free_slot(&mut self) -> Option<usize> {
+        while let Ok(slot) = self.free_recv.try_recv() {
+            if !self.poisoned.contains(slot) {
+                return Some(slot);
             }
-            Ok(s) => s,
+        }
+        None
+    }
+
+    fn note_drop(&mut self) {
+        self.dropped += 1;
+        self.telemetry
+            .degradation
+            .frames_dropped_ring
+            .fetch_add(1, Ordering::Relaxed);
+        // Rate-limited so a sustained overload does not put a logbus line (and therefore a UI
+        // IPC event) on every dropped frame.
+        if self.dropped - self.dropped_reported >= 120 {
+            self.dropped_reported = self.dropped;
+            let live = self.slots as u32 - self.poisoned.count();
+            teprintln!(
+                "ring: {} frames dropped for want of a free slot (live slots {live}/{}); \
+                 the encoder is not keeping up",
+                self.dropped,
+                self.slots
+            );
+        }
+    }
+
+    fn stage(&mut self, raw: &ID3D11Texture2D, mut timing: FrameTiming) -> Result<bool> {
+        let Some(slot) = self.take_free_slot() else {
+            // Every slot is still in the encoder: this frame is dropped outright, which is the
+            // one place the ring discards captured pixels.
+            self.note_drop();
+            return Ok(false);
         };
 
         let mutex = &self.igpu_mutex[slot];
         let dst = &self.shared_igpu[slot];
 
-        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
+        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, self.stage_timeout_ms) }
             .context("ring iGPU keyed mutex AcquireSync(writer)")
         {
-            let _ = self.free_slots.send(slot);
+            // Nobody released it within two frame periods; treat the slot as wedged rather than
+            // handing it back for the next frame to block on all over again.
+            self.poisoned.mark(slot);
+            self.note_drop();
             return Err(e);
         }
 
@@ -1332,7 +1532,9 @@ impl AsyncNvencRing {
             );
         }
         if let Err(e) = released {
-            let _ = self.free_slots.send(slot);
+            // The slot is still held at `KEY_WRITER` by this device and the encoder will never
+            // get it. Returning it to the free pool would wedge the next capture callback.
+            self.poisoned.mark(slot);
             return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
         }
 
@@ -1374,25 +1576,101 @@ impl Drop for AsyncNvencRing {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ring_encode_thread(
-    mut encoder: Encoder,
+struct RingEncodeArgs {
+    encoder: Encoder,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
     tx: broadcast::Sender<EncodedFrame>,
     target_bitrate: Arc<AtomicU32>,
     initial_bitrate: u32,
-    last_frame_at: Arc<AtomicU64>,
+    idr_request: Arc<AtomicBool>,
+    wake_rx: crossbeam_channel::Receiver<()>,
+    frame_duration: Duration,
     stop: Arc<AtomicBool>,
+    poisoned: Arc<PoisonedSlots>,
     telemetry: SharedTelemetry,
+}
+
+/// What woke the ring encode thread.
+enum RingEvent {
+    Frame(ReadyMsg),
+    /// `Pipeline::request_idr` or `set_target_bitrate` poked the wake channel.
+    Wake,
+    /// Nothing arrived within the tick.
+    Idle,
+    ReadyClosed,
+    WakeClosed,
+}
+
+/// A repeat of the held slot, emitted when the desktop is static.
+///
+/// Two things make this the only place a keyframe request can land on an idle desktop: NVENC is
+/// configured with an infinite GOP and IDR period, so there is no periodic keyframe at all, and
+/// `AsyncNvencRing::stage` — the only other reader of `idr_request` — runs only when WGC delivers
+/// a new frame. Without this, a client that joined or lost its reference chain while nothing was
+/// moving waited for the user to move something.
+fn ring_keepalive(
+    encoder: &mut Encoder,
+    slot: usize,
+    force_idr: bool,
+    tx: &broadcast::Sender<EncodedFrame>,
+    telemetry: &SharedTelemetry,
 ) {
+    if force_idr {
+        encoder.request_idr();
+    }
+    match encoder.encode_repeat_slot(slot) {
+        Ok(au) => {
+            let mut timing = FrameTiming::repeating();
+            timing.mark_encode_submit();
+            timing.mark_encode_done();
+            telemetry
+                .degradation
+                .frames_repeated
+                .fetch_add(1, Ordering::Relaxed);
+            if force_idr {
+                telemetry
+                    .degradation
+                    .idrs_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(EncodedFrame {
+                data: Bytes::from(au),
+                capture: Instant::now(),
+                timing,
+            });
+        }
+        Err(e) => teprintln!("ring keepalive encode failed (slot={slot}): {e:?}"),
+    }
+}
+
+fn ring_encode_thread(args: RingEncodeArgs) {
+    let RingEncodeArgs {
+        mut encoder,
+        ready_rx,
+        free_tx,
+        tx,
+        target_bitrate,
+        initial_bitrate,
+        idr_request,
+        wake_rx,
+        frame_duration,
+        stop,
+        poisoned,
+        telemetry,
+    } = args;
+
     let _thread_tuning = tuning::tune_current_thread();
     let mut current_bitrate = initial_bitrate;
     let mut bitrate_warned = false;
-    let _ = last_frame_at;
-    let keepalive = Duration::from_millis(200);
+    const KEEPALIVE: Duration = Duration::from_millis(200);
+    // Tick at the frame period rather than the keepalive period so a pending IDR is honoured
+    // within one frame even when nothing is moving; a repeat is still only *emitted* every 200 ms.
+    let tick = frame_duration.clamp(Duration::from_millis(4), KEEPALIVE);
+    let mut last_emit = Instant::now();
     let mut held_slot: Option<usize> = None;
-    let mut poisoned_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut wake_open = true;
 
     let release_and_hold = |free_tx: &crossbeam_channel::Sender<usize>,
                             held: &mut Option<usize>,
@@ -1411,109 +1689,116 @@ fn ring_encode_thread(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match ready_rx.recv_timeout(keepalive) {
-            Ok(msg) => {
-                if poisoned_slots.contains(&msg.slot) {
-                    telemetry
-                        .degradation
-                        .frames_dropped_ring
-                        .fetch_add(1, Ordering::Relaxed);
-                    teprintln!(
-                        "ring encode: skipping poisoned slot {} (keyed mutex wedged at KEY_ENCODER)",
-                        msg.slot
-                    );
-                    let _ = free_tx.send(msg.slot);
+
+        let event = if wake_open {
+            crossbeam_channel::select! {
+                recv(ready_rx) -> msg => match msg {
+                    Ok(m) => RingEvent::Frame(m),
+                    Err(_) => RingEvent::ReadyClosed,
+                },
+                recv(wake_rx) -> r => if r.is_ok() { RingEvent::Wake } else { RingEvent::WakeClosed },
+                default(tick) => RingEvent::Idle,
+            }
+        } else {
+            match ready_rx.recv_timeout(tick) {
+                Ok(m) => RingEvent::Frame(m),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => RingEvent::Idle,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => RingEvent::ReadyClosed,
+            }
+        };
+
+        let msg = match event {
+            RingEvent::ReadyClosed => break,
+            RingEvent::WakeClosed => {
+                wake_open = false;
+                continue;
+            }
+            RingEvent::Wake | RingEvent::Idle => {
+                while wake_rx.try_recv().is_ok() {}
+                let Some(slot) = held_slot else { continue };
+                if poisoned.contains(slot) {
+                    held_slot = None;
                     continue;
                 }
-                let mut timing = msg.timing;
-                timing.mark_encode_submit();
-
+                let idr_pending = idr_request.swap(false, Ordering::Relaxed);
+                if !idr_pending && last_emit.elapsed() < KEEPALIVE {
+                    continue;
+                }
                 apply_pending_bitrate_atomic(
                     &mut encoder,
                     &target_bitrate,
                     &mut current_bitrate,
                     &mut bitrate_warned,
                 );
-                match encoder.encode_input_slot(msg.slot, msg.force_idr) {
-                    Ok(au) => {
-                        timing.mark_encode_done();
-                        telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.send(EncodedFrame {
-                            data: Bytes::from(au),
-                            capture: msg.capture,
-                            timing,
-                        });
-                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
-                            break;
-                        }
-                    }
-                    Err(SlotEncodeError::Poisoned(e)) => {
-                        telemetry
-                            .degradation
-                            .encoder_resets
-                            .fetch_add(1, Ordering::Relaxed);
-                        teprintln!(
-                            "ring encode: slot {} poisoned (AcquireSync failed — GPU hang or driver fault): {e:?}",
-                            msg.slot
-                        );
-                        poisoned_slots.insert(msg.slot);
+                ring_keepalive(&mut encoder, slot, idr_pending, &tx, &telemetry);
+                last_emit = Instant::now();
+                continue;
+            }
+            RingEvent::Frame(msg) => msg,
+        };
 
-                        let held_poisoned = held_slot.is_some_and(|s| poisoned_slots.contains(&s));
-                        if held_poisoned || held_slot.is_none() {
-                            teprintln!(
-                                "ring encode: CRITICAL — held slot also poisoned or absent; \
-                                 ring is unrecoverable, stopping encode thread"
-                            );
-                            break;
-                        }
-                    }
-                    Err(SlotEncodeError::Encode(e)) => {
-                        telemetry
-                            .degradation
-                            .encoder_transient_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
-                        if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
-                            break;
-                        }
-                    }
+        if poisoned.contains(msg.slot) {
+            // The producer no longer hands these out, so this can only be a message that was
+            // already in flight when the slot was quarantined.
+            telemetry
+                .degradation
+                .frames_dropped_ring
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let mut timing = msg.timing;
+        timing.mark_encode_submit();
+
+        apply_pending_bitrate_atomic(
+            &mut encoder,
+            &target_bitrate,
+            &mut current_bitrate,
+            &mut bitrate_warned,
+        );
+        match encoder.encode_input_slot(msg.slot, msg.force_idr) {
+            Ok(au) => {
+                timing.mark_encode_done();
+                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(EncodedFrame {
+                    data: Bytes::from(au),
+                    capture: msg.capture,
+                    timing,
+                });
+                last_emit = Instant::now();
+                if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                    break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if let Some(slot) = held_slot {
-                    if poisoned_slots.contains(&slot) {
-                        held_slot = None;
-                        continue;
-                    }
-                    apply_pending_bitrate_atomic(
-                        &mut encoder,
-                        &target_bitrate,
-                        &mut current_bitrate,
-                        &mut bitrate_warned,
+            Err(SlotEncodeError::Poisoned(e)) => {
+                telemetry
+                    .degradation
+                    .encoder_resets
+                    .fetch_add(1, Ordering::Relaxed);
+                teprintln!(
+                    "ring encode: slot {} poisoned (AcquireSync failed - GPU hang or driver fault): {e:?}",
+                    msg.slot
+                );
+                poisoned.mark(msg.slot);
+
+                let held_poisoned = held_slot.is_some_and(|s| poisoned.contains(s));
+                if held_poisoned || held_slot.is_none() {
+                    teprintln!(
+                        "ring encode: CRITICAL - held slot also poisoned or absent; \
+                         ring is unrecoverable, stopping encode thread"
                     );
-                    match encoder.encode_repeat_slot(slot) {
-                        Ok(au) => {
-                            let mut timing = FrameTiming::repeating();
-                            timing.mark_encode_submit();
-                            timing.mark_encode_done();
-                            telemetry
-                                .degradation
-                                .frames_repeated
-                                .fetch_add(1, Ordering::Relaxed);
-                            telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(EncodedFrame {
-                                data: Bytes::from(au),
-                                capture: Instant::now(),
-                                timing,
-                            });
-                        }
-                        Err(e) => {
-                            teprintln!("ring keepalive encode failed (slot={slot}): {e:?}");
-                        }
-                    }
+                    break;
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(SlotEncodeError::Encode(e)) => {
+                telemetry
+                    .degradation
+                    .encoder_transient_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                teprintln!("ring encode failed (slot={}): {e:?}", msg.slot);
+                if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
+                    break;
+                }
+            }
         }
     }
     tprintln!("nvenc ring encode thread stopped");
@@ -1538,7 +1823,23 @@ fn apply_pending_bitrate_atomic(
             warn_constant_qp_once(warned);
             *current = pending;
         }
-        Err(e) => teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; keeping current"),
+        Err(e) => {
+            teprintln!("set_bitrate failed (target_bps={pending}): {e:?}; will retry");
+            restore_pending_bitrate(target_bitrate, pending);
+        }
+    }
+}
+
+/// The scaler's destination format for a given backend.
+///
+/// Only a CPU-bridge backend reads the scaled surface back, so only it has an opinion. A GPU-path
+/// backend receives the blt straight into its own input texture (`scale_into`), and that
+/// texture's format is the encoder's business.
+fn scaler_output_format(backend: &Backend) -> ReadbackFormat {
+    if backend.is_cpu_bridge() {
+        backend.cpu_bridge_format()
+    } else {
+        ReadbackFormat::Bgra8
     }
 }
 
@@ -1613,6 +1914,34 @@ fn build_backend(
         }
     };
 
+    let try_amf = || -> Result<Backend> {
+        match AmfEncoder::new_on_device(config, device, context) {
+            Ok(encoder) => {
+                tprintln!(
+                    "pipeline: live capture ready -- AMD AMF same-adapter GPU path ({}x{}@{})",
+                    config.width,
+                    config.height,
+                    config.fps
+                );
+                Ok(Backend::Amf { encoder })
+            }
+            Err(e) => {
+                teprintln!(
+                    "AMD AMF same-adapter path unavailable ({e:?}); trying own-device CPU bridge"
+                );
+                let encoder = AmfEncoder::new(config)
+                    .context("AMD AMF unavailable (same-adapter and CPU-bridge both failed)")?;
+                tprintln!(
+                    "pipeline: live capture ready -- AMD AMF CPU-bridge path ({}x{}@{})",
+                    config.width,
+                    config.height,
+                    config.fps
+                );
+                Ok(Backend::AmfCpu { encoder })
+            }
+        }
+    };
+
     let try_x264 = || -> Result<Backend> {
         match X264Encoder::new(config) {
             Ok(encoder) => {
@@ -1639,11 +1968,22 @@ fn build_backend(
             teprintln!("Intel Quick Sync unavailable ({ie:?}); falling back to software x264");
             try_x264().map_err(|xe| ie.context(format!("software fallback also failed: {xe:?}")))
         }),
+        EncoderVendor::Amd => try_amf().or_else(|ae| {
+            teprintln!("AMD AMF unavailable ({ae:?}); falling back to software x264");
+            try_x264().map_err(|xe| ae.context(format!("software fallback also failed: {xe:?}")))
+        }),
+        // AMF sits after Intel deliberately: an Intel-iGPU + Radeon-dGPU laptop should still
+        // prefer the same-adapter Quick Sync path, and an all-AMD box never reaches the Intel
+        // branch because its capture device is not Intel.
         EncoderVendor::Auto => try_nvenc()
             .or_else(|nv_err| {
                 teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
                 try_intel()
                     .map_err(|ie| nv_err.context(format!("Intel fallback also failed: {ie:?}")))
+            })
+            .or_else(|hw_err| {
+                teprintln!("Intel Quick Sync unavailable ({hw_err:?}); trying AMD AMF");
+                try_amf().map_err(|ae| hw_err.context(format!("AMD fallback also failed: {ae:?}")))
             })
             .or_else(|hw_err| {
                 teprintln!(
@@ -1753,6 +2093,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
         let thread_tuning = tuning::tune_current_thread();
         let keep_awake = tuning::KeepAwake::begin();
+        let features = wgc_features();
 
         let epoch = Instant::now();
         let last_frame_at = Arc::new(AtomicU64::new(0));
@@ -1763,7 +2104,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         const RING: usize = 3;
         let try_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
         if try_ring {
-            match build_zero_copy_ring(config, &ctx.device, &ctx.device_context, RING) {
+            match build_zero_copy_ring(config, &ctx.device, RING) {
                 Ok((encoder, pairs)) => {
                     tuning::raise_d3d11_gpu_priority(encoder.device());
 
@@ -1783,6 +2124,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         None
                     };
 
+                    super::report_adapter_pairing(&ctx.adapter, Some(encoder.device()));
                     telemetry.encoder.set("nvenc-zero-copy-ring".into());
                     let ring = AsyncNvencRing::new(
                         encoder,
@@ -1794,6 +2136,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         config.bitrate_bps,
                         Arc::clone(&last_frame_at),
                         Arc::clone(&idr_request),
+                        wake_rx,
+                        frame_duration,
                         epoch,
                         Arc::clone(&telemetry),
                     );
@@ -1813,6 +2157,11 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         frames_sent: 0,
                         busy_streak: 0,
                         stop,
+                        frame_pool_buffers: FRAME_POOL_BUFFERS_RING,
+                        stale_frames: Arc::new(AtomicU32::new(0)),
+                        stale_frames_reported: 0,
+                        dirty_region_reporting: features.dirty_region,
+                        unchanged_streak: 0,
                         _thread_tuning: thread_tuning,
                         _keep_awake: keep_awake,
                         telemetry,
@@ -1839,16 +2188,18 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             &ctx.device_context,
         )?;
 
+        // Same as the DXGI path: an equal-size display needs no blt.
         let needs_scaler =
             backend.wants_prescale() && (config.width != native_w || config.height != native_h);
         let scaler = if needs_scaler {
-            match Scaler::new(
+            match Scaler::with_format(
                 &ctx.device,
                 &ctx.device_context,
                 native_w,
                 native_h,
                 config.width,
                 config.height,
+                scaler_output_format(&backend),
             ) {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -1863,12 +2214,14 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             tuning::raise_d3d11_gpu_priority(dev);
         }
 
+        super::report_adapter_pairing(&ctx.adapter, backend.device());
         let path_name = backend.name();
         telemetry.encoder.set(path_name.into());
         let core = Arc::new(Mutex::new(EncodeCore {
             backend,
             scaler,
             reader: None,
+            staging: None,
             target_bitrate: Arc::clone(&target_bitrate),
             idr_request: Arc::clone(&idr_request),
             current_bitrate: config.bitrate_bps,
@@ -1899,10 +2252,23 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             frames_sent: 0,
             busy_streak: 0,
             stop,
+            frame_pool_buffers: FRAME_POOL_BUFFERS_INLINE,
+            stale_frames: Arc::new(AtomicU32::new(0)),
+            stale_frames_reported: 0,
+            dirty_region_reporting: features.dirty_region,
+            unchanged_streak: 0,
             _thread_tuning: thread_tuning,
             _keep_awake: keep_awake,
             telemetry,
         })
+    }
+
+    fn frame_pool_buffers(&self) -> u32 {
+        self.frame_pool_buffers
+    }
+
+    fn stale_frame_counter(&self) -> Option<Arc<AtomicU32>> {
+        Some(Arc::clone(&self.stale_frames))
     }
 
     fn on_frame_arrived(
@@ -1919,6 +2285,31 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
             .unwrap_or(0);
 
+        // The DXGI backend has skipped unchanged frames since `present_region_is_empty` landed;
+        // WGC had no equivalent and re-encoded every delivered frame. `DirtyRegionMode::ReportOnly`
+        // (build 26100+, requested only where the property exists) gives the same information, and
+        // the repeater/keepalive already emits a frame every 200 ms so a skipped frame is not a
+        // stalled client. The consecutive cap is the same safety valve the DXGI path uses, for a
+        // driver that under-reports.
+        if self.dirty_region_reporting {
+            if let Ok(regions) = frame.dirty_regions() {
+                if regions.is_empty() && self.unchanged_streak < MAX_CONSECUTIVE_UNCHANGED {
+                    self.unchanged_streak += 1;
+                    return Ok(());
+                }
+                self.unchanged_streak = 0;
+            }
+        }
+
+        let stale = self.stale_frames.load(Ordering::Relaxed);
+        if stale != self.stale_frames_reported {
+            self.telemetry.degradation.frames_dropped_stale.fetch_add(
+                (stale - self.stale_frames_reported) as u64,
+                Ordering::Relaxed,
+            );
+            self.stale_frames_reported = stale;
+        }
+
         if let Some(ring) = self.ring.as_mut() {
             match ring.stage(frame.as_raw_texture(), timing) {
                 Ok(_staged) => {}
@@ -1929,12 +2320,16 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             return Ok(());
         }
 
+        // No panics past this point: we are inside a WinRT `TypedEventHandler`, so an unwind
+        // would cross `extern "system"` frames. Returning `Err` halts the capture cleanly.
         let core = self
             .core
             .as_ref()
-            .expect("classic path must have an EncodeCore");
+            .ok_or_else(|| anyhow!("classic capture path has no EncodeCore"))?;
         let encode_res = {
-            let mut core = core.lock().expect("encode core mutex poisoned");
+            let mut core = core
+                .lock()
+                .map_err(|_| anyhow!("encode core mutex poisoned; stopping capture"))?;
             timing.mark_encode_submit();
             core.encode_captured(frame)
         };
