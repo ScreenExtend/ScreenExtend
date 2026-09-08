@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL,
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC,
@@ -70,6 +70,9 @@ pub struct Duplicator {
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
     dup: Option<IDXGIOutputDuplication>,
+    /// Which of the two duplication entry points is live, so `redup` keeps using the one that
+    /// worked and the pipeline can report it.
+    api: DuplicationApi,
     redup_failures: u32,
     invalid_call_recoveries: u32,
     /// `LastPresentTime` of the most recent dirty frame, already on the shared host clock.
@@ -213,15 +216,74 @@ fn create_device_on(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11Devi
     Ok((device, context))
 }
 
+/// Formats `DuplicateOutput1` is allowed to hand back, most-wanted first.
+///
+/// The composited desktop is BGRA8; the two HDR formats are here because a display in HDR mode
+/// has no BGRA8 surface to give and duplication would otherwise be refused outright.
+const DUP1_FORMATS: [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 3] = [
+    DXGI_FORMAT_B8G8R8A8_UNORM,
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM,
+    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+];
+
+/// Which duplication entry point produced the live duplication. Reported so a support log says
+/// which one this machine needed rather than only that capture worked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DuplicationApi {
+    /// `IDXGIOutput5::DuplicateOutput1` — Windows 10 1607+, and the only one that succeeds on
+    /// several hybrid-graphics laptops and on any display in HDR mode.
+    Output5,
+    /// `IDXGIOutput1::DuplicateOutput` — the original, present since Windows 8.
+    Output1,
+}
+
+impl DuplicationApi {
+    pub fn name(self) -> &'static str {
+        match self {
+            DuplicationApi::Output5 => "DuplicateOutput1",
+            DuplicationApi::Output1 => "DuplicateOutput",
+        }
+    }
+}
+
+/// One duplication attempt, newest API first.
+///
+/// `DuplicateOutput` returns `DXGI_ERROR_UNSUPPORTED` on the primary display of some
+/// hybrid-graphics laptops — measured on this project's dev box, an RTX 3080 Ti Laptop next to an
+/// Intel UHD iGPU — while `DuplicateOutput1` with an explicit format list succeeds on the same
+/// output and the same device. It is also the only one that can duplicate a display in HDR mode.
+/// So it is tried first and the older call is the fallback, not the other way round.
+///
+/// Probed by `QueryInterface`, never by a build number: `IDXGIOutput5` is simply absent on a
+/// machine that does not have it, and the cast fails.
+fn duplicate_once(
+    output: &IDXGIOutput1,
+    device: &ID3D11Device,
+) -> std::result::Result<(IDXGIOutputDuplication, DuplicationApi), windows::core::Error> {
+    let out5_err = match output.cast::<IDXGIOutput5>() {
+        Ok(out5) => match unsafe { out5.DuplicateOutput1(device, 0, &DUP1_FORMATS) } {
+            Ok(dup) => return Ok((dup, DuplicationApi::Output5)),
+            Err(e) => Some(e),
+        },
+        Err(e) => Some(e),
+    };
+
+    match unsafe { output.DuplicateOutput(device) } {
+        Ok(dup) => Ok((dup, DuplicationApi::Output1)),
+        // Report the newer call's failure, since it is the one that had the better chance.
+        Err(e) => Err(out5_err.unwrap_or(e)),
+    }
+}
+
 fn duplicate_with_retry(
     output: &IDXGIOutput1,
     device: &ID3D11Device,
     attempts: u32,
-) -> Result<IDXGIOutputDuplication> {
+) -> Result<(IDXGIOutputDuplication, DuplicationApi)> {
     let mut last: Option<windows::core::Error> = None;
     for i in 0..attempts {
-        match unsafe { output.DuplicateOutput(device) } {
-            Ok(dup) => return Ok(dup),
+        match duplicate_once(output, device) {
+            Ok(pair) => return Ok(pair),
             Err(e) => {
                 last = Some(e);
                 if i + 1 < attempts {
@@ -231,7 +293,54 @@ fn duplicate_with_retry(
         }
     }
     Err(anyhow!(
-        "DuplicateOutput failed after {attempts} attempts: {last:?}"
+        "DuplicateOutput1 and DuplicateOutput both failed after {attempts} attempts: {last:?}"
+    ))
+}
+
+/// Answers "would DXGI duplication actually work on this display right now", by trying it.
+///
+/// The compatibility report used to answer that question with `CreateDXGIFactory1().is_ok()`,
+/// which is true on every Windows since 7 and says nothing about duplication. On a hybrid laptop
+/// where `DuplicateOutput` is unsupported that produced a report claiming a fallback that could
+/// never run. The duplication is created and immediately dropped, so nothing is held.
+pub fn probe_duplication() -> Result<DuplicationApi> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let mut last: Option<windows::core::Error> = None;
+    let mut seen = 0u32;
+    for a in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(a) }) else {
+            break;
+        };
+        for o in 0.. {
+            let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(o) } {
+                Ok(out) => out,
+                Err(_) => break,
+            };
+            let Ok(desc) = (unsafe { output.GetDesc() }) else {
+                continue;
+            };
+            if !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let Ok(output1) = output.cast::<IDXGIOutput1>() else {
+                continue;
+            };
+            let (device, _context) = create_device_on(&adapter)?;
+            seen += 1;
+            match duplicate_once(&output1, &device) {
+                Ok((dup, api)) => {
+                    drop(dup);
+                    return Ok(api);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+    }
+    if seen == 0 {
+        bail!("no desktop-attached DXGI output to duplicate");
+    }
+    Err(anyhow!(
+        "DXGI duplication is unsupported on all {seen} desktop outputs: {last:?}"
     ))
 }
 
@@ -297,8 +406,8 @@ impl Duplicator {
         let (device, context) = create_device_on(&adapter)?;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let (dup, phys_w, phys_h, raw_rotation, rotation) = loop {
-            let dup = duplicate_with_retry(&output, &device, 5)?;
+        let (dup, api, phys_w, phys_h, raw_rotation, rotation) = loop {
+            let (dup, api) = duplicate_with_retry(&output, &device, 5)?;
             let dd: DXGI_OUTDUPL_DESC = unsafe { dup.GetDesc() };
             let (w, h) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
             let rotated = matches!(
@@ -306,7 +415,7 @@ impl Duplicator {
                 DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270
             );
             if rotated && (h, w) == (logical_w, logical_h) {
-                break (dup, w, h, dd.Rotation, dd.Rotation);
+                break (dup, api, w, h, dd.Rotation, dd.Rotation);
             }
             if (w, h) == (logical_w, logical_h) {
                 let effective = if rotated {
@@ -319,7 +428,7 @@ impl Duplicator {
                 } else {
                     dd.Rotation
                 };
-                break (dup, w, h, dd.Rotation, effective);
+                break (dup, api, w, h, dd.Rotation, effective);
             }
             if std::time::Instant::now() >= deadline {
                 bail!(
@@ -337,8 +446,9 @@ impl Duplicator {
         let renderer = QuadRenderer::new(&device, &context)?;
 
         tprintln!(
-            "dxgi: duplication ready on {device_name}: {phys_w}x{phys_h}, rotation={rotation:?}, \
-             logical={logical_w}x{logical_h}"
+            "dxgi: duplication ready on {device_name} via {}: {phys_w}x{phys_h}, \
+             rotation={rotation:?}, logical={logical_w}x{logical_h}",
+            api.name()
         );
 
         Ok(Self {
@@ -346,6 +456,7 @@ impl Duplicator {
             context,
             output,
             dup: Some(dup),
+            api,
             redup_failures: 0,
             invalid_call_recoveries: 0,
             last_present_host_ns: 0,
@@ -384,9 +495,15 @@ impl Duplicator {
         &self.context
     }
 
+    /// Which duplication entry point is live.
+    pub fn api(&self) -> DuplicationApi {
+        self.api
+    }
+
     fn redup(&mut self) -> Result<()> {
-        match unsafe { self.output.DuplicateOutput(&self.device) } {
-            Ok(dup) => {
+        match duplicate_once(&self.output, &self.device) {
+            Ok((dup, api)) => {
+                self.api = api;
                 let dd: DXGI_OUTDUPL_DESC = unsafe { dup.GetDesc() };
                 if (dd.ModeDesc.Width, dd.ModeDesc.Height) != (self.phys_w, self.phys_h)
                     || dd.Rotation != self.raw_rotation
