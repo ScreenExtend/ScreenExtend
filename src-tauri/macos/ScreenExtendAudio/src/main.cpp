@@ -3,6 +3,7 @@
 
 #include "branding.hpp"
 #include "device.hpp"
+#include "log.hpp"
 #include "shm_ring.hpp"
 
 #include <aspl/Context.hpp>
@@ -20,7 +21,11 @@ std::shared_ptr<aspl::Driver> CreateDriver()
     auto context = std::make_shared<aspl::Context>();
 
     auto shm = std::make_shared<se_audio::ShmRing>();
-    shm->Open(); // best-effort; a failed open is not fatal
+    if (!shm->Open()) {
+        // not fatal: the host falls back to reading the loopback stream over the HAL, which costs
+        // a round trip. `ShmRing::Open` has already logged why.
+        SE_LOG_ERROR("shared memory unavailable; the host will use the HAL-input transport");
+    }
 
     auto handler = std::make_shared<se_audio::CaptureHandler>(shm);
     auto device = se_audio::BuildDevice(context, handler);

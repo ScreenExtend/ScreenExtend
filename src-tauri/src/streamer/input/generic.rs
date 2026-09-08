@@ -1,14 +1,14 @@
 use super::protocol::InputEvent;
+use super::ClientProfile;
 
 pub const NAME: &str = "generic-noop";
 
 pub fn boost_thread() {}
-pub fn tune_process() {}
 
 pub struct Injector;
 
 impl Injector {
-    pub fn new(_device_name: Option<String>) -> Self {
+    pub fn new(_client: ClientProfile) -> Self {
         Injector
     }
     pub fn dispatch(&mut self, _ev: &InputEvent) {}
