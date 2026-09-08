@@ -605,7 +605,13 @@ pub fn all() -> Vec<(String, SharedTelemetry)> {
 pub fn snapshot_json() -> serde_json::Value {
     let sessions: serde_json::Map<String, serde_json::Value> =
         all().into_iter().map(|(k, v)| (k, v.to_json())).collect();
-    serde_json::json!({ "sessions": sessions })
+    serde_json::json!({
+        "sessions": sessions,
+        // Peer connections, ICE agents and injector threads that have not been given back.
+        // It should equal the number of live sessions; a number that only climbs across joins
+        // is the leak this counter exists to make falsifiable.
+        "live_transport_sessions": crate::streamer::webrtc_session::live_sessions(),
+    })
 }
 
 /// Interval for the verbose one-line summary. Chosen so a 30 s baseline run yields six lines.
