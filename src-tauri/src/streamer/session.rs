@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+use super::lock::LockExt;
+
 #[derive(Default)]
 pub struct LeaveSignal {
     pub left: AtomicBool,
@@ -101,7 +103,7 @@ pub fn new_shared_banned_devices() -> SharedBannedDevices {
 }
 
 pub fn is_device_banned(banned: &SharedBannedDevices, token: &str, ip: &str) -> bool {
-    let set = banned.lock().unwrap();
+    let set = banned.lock_recover();
     (!token.is_empty() && set.contains(token)) || set.contains(ip)
 }
 
@@ -112,7 +114,7 @@ pub fn new_shared_approved_devices() -> SharedApprovedDevices {
 }
 
 pub fn is_device_approved(approved: &SharedApprovedDevices, token: &str) -> bool {
-    !token.is_empty() && approved.lock().unwrap().contains(token)
+    !token.is_empty() && approved.lock_recover().contains(token)
 }
 
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
@@ -268,7 +270,7 @@ pub fn set_control_sender(sessions: &SharedSessions, ip: &str, tx: ControlSender
 }
 
 pub fn clear_control_sender(sessions: &SharedSessions, ip: &str, tx: &ControlSender) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     if let Some(state) = map.get_mut(ip) {
         if state.control.as_ref().is_some_and(|c| c.same_channel(tx)) {
             state.control = None;
@@ -298,7 +300,7 @@ fn send_bye_acked(
 }
 
 pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Duration) {
-    let ips: Vec<String> = sessions.lock().unwrap().keys().cloned().collect();
+    let ips: Vec<String> = sessions.lock_recover().keys().cloned().collect();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut queued = 0usize;
     for ip in &ips {
@@ -347,7 +349,7 @@ pub fn take_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisp
 }
 
 pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     map.entry(ip.to_string()).or_default().reconfig_epoch += 1;
 }
 
@@ -361,7 +363,7 @@ pub fn reconfig_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
 }
 
 pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     map.entry(ip.to_string()).or_default().kick_epoch += 1;
 }
 
@@ -397,7 +399,7 @@ pub fn take_active_capture_if(
     ip: &str,
     seq: u64,
 ) -> Option<CaptureStopper> {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let state = map.get_mut(ip)?;
     match &state.active_capture {
         Some((s, _)) if *s == seq => state.active_capture.take().map(|(_, stop)| stop),
@@ -406,7 +408,7 @@ pub fn take_active_capture_if(
 }
 
 pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
     entry.session_seq += 1;
     entry.session_seq
@@ -427,7 +429,7 @@ pub fn set_audio_outputs(
     supported: bool,
     outputs: Vec<AudioOutput>,
 ) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
     entry.audio_outputs_supported = supported;
     entry.audio_outputs = outputs;
@@ -472,8 +474,8 @@ pub struct SessionAuth {
 impl SessionAuth {
     pub fn validate(&self, session_id: &str, otp: &str) -> bool {
         use subtle::ConstantTimeEq;
-        let want_session = self.session_id.lock().unwrap();
-        let want_otp = self.otp.lock().unwrap();
+        let want_session = self.session_id.lock_recover();
+        let want_otp = self.otp.lock_recover();
         if want_session.is_empty() || want_otp.is_empty() {
             return false;
         }
@@ -528,7 +530,7 @@ impl OtpLimiter {
     }
 
     pub fn global_paused(&self) -> Option<Duration> {
-        let mut g = self.global.lock().unwrap();
+        let mut g = self.global.lock_recover();
         match g.paused_until {
             Some(until) => {
                 let now = Instant::now();
@@ -544,7 +546,7 @@ impl OtpLimiter {
     }
 
     pub fn note_global_failure(&self) -> Option<Duration> {
-        let mut g = self.global.lock().unwrap();
+        let mut g = self.global.lock_recover();
         let now = Instant::now();
 
         if let Some(until) = g.paused_until {
@@ -572,12 +574,12 @@ impl OtpLimiter {
     }
 
     pub fn reset(&self) {
-        self.attempts.lock().unwrap().clear();
-        *self.global.lock().unwrap() = GlobalOtpState::default();
+        self.attempts.lock_recover().clear();
+        *self.global.lock_recover() = GlobalOtpState::default();
     }
 
     pub fn locked_for(&self, key: &str) -> Option<Duration> {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = self.attempts.lock_recover();
         let entry = map.get_mut(key)?;
         match entry.locked_until {
             Some(until) => {
@@ -594,7 +596,7 @@ impl OtpLimiter {
     }
 
     pub fn record_failure(&self, key: &str) -> OtpOutcome {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = self.attempts.lock_recover();
         let entry = map.entry(key.to_string()).or_default();
 
         if let Some(until) = entry.locked_until {
@@ -617,8 +619,8 @@ impl OtpLimiter {
     }
 
     pub fn record_success(&self, key: &str) {
-        self.attempts.lock().unwrap().remove(key);
-        *self.global.lock().unwrap() = GlobalOtpState::default();
+        self.attempts.lock_recover().remove(key);
+        *self.global.lock_recover() = GlobalOtpState::default();
     }
 }
 
@@ -759,8 +761,8 @@ mod tests {
     fn session_auth_matches_and_rejects() {
         let auth = SessionAuth::default();
         assert!(!auth.validate("ABCDEFGHJKLM", "123456"));
-        *auth.session_id.lock().unwrap() = "ABCDEFGHJKLM".to_string();
-        *auth.otp.lock().unwrap() = "123456".to_string();
+        *auth.session_id.lock_recover() = "ABCDEFGHJKLM".to_string();
+        *auth.otp.lock_recover() = "123456".to_string();
         assert!(auth.validate("ABCDEFGHJKLM", "123456"));
         assert!(!auth.validate("ABCDEFGHJKLM", "123457")); // wrong otp
         assert!(!auth.validate("XBCDEFGHJKLM", "123456")); // wrong session

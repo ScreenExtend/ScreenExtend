@@ -15,6 +15,8 @@ use serde::Deserialize;
 use tokio::sync::oneshot;
 
 use super::config::{Config, ScalePercent};
+use super::lock::LockExt;
+use super::negotiate;
 use super::pipeline;
 use super::platform;
 use super::session::{self, DeviceInfo, OtpLimiter, OtpOutcome, SharedLocalIps, SharedOtpLimiter};
@@ -182,7 +184,7 @@ impl AppState {
 
     pub fn is_same_device(&self, peer: IpAddr) -> bool {
         let ip = normalize_peer_ip(peer);
-        ip.is_loopback() || self.local_ips.lock().unwrap().contains(&ip)
+        ip.is_loopback() || self.local_ips.lock_recover().contains(&ip)
     }
 
     /// Classify a peer *before* the handshake, so the session's MTU, gather wait, pacing and
@@ -198,7 +200,7 @@ impl AppState {
         if peer.is_loopback() {
             return SessionLocality::SameNetwork;
         }
-        let locals = self.local_ips.lock().unwrap().clone();
+        let locals = self.local_ips.lock_recover().clone();
         if locals.iter().any(|l| same_subnet(l, &peer)) {
             return SessionLocality::SameNetwork;
         }
@@ -289,7 +291,7 @@ impl AppState {
 
 pub fn user_turn_ice_server(config: &Config) -> Option<RTCIceServer> {
     let shared = config.user_turn.as_ref()?;
-    let cfg = shared.lock().unwrap();
+    let cfg = shared.lock_recover();
     if cfg.urls.is_empty() {
         return None;
     }
@@ -480,6 +482,25 @@ fn isolation_headers() -> [(header::HeaderName, header::HeaderValue); 2] {
     ]
 }
 
+/// The client page with `__SAME_DEVICE_FLAG__` already substituted, one variant each.
+///
+/// `String::replace` on the largest asset in the tree, on every page load, is a full scan plus a
+/// fresh allocation for a substitution that has exactly two possible answers. Every other static
+/// route already serves a `&'static str` with no copy; this one now does too. The cost was never
+/// large — the page is fetched once per join — but the join path is what this work measures, and a
+/// client stuck in a reload loop paid it repeatedly.
+fn same_device_page(same_device: bool) -> &'static str {
+    static SAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static REMOTE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let cell = if same_device { &SAME } else { &REMOTE };
+    cell.get_or_init(|| {
+        include_str!("static/index.html").replace(
+            "__SAME_DEVICE_FLAG__",
+            if same_device { "true" } else { "false" },
+        )
+    })
+}
+
 async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -487,12 +508,7 @@ async fn index(
     if state.display_slot_unavailable(&peer.ip().to_string()) {
         return at_capacity_page();
     }
-    let flag = if state.is_same_device(peer.ip()) {
-        "true"
-    } else {
-        "false"
-    };
-    let html = include_str!("static/index.html").replace("__SAME_DEVICE_FLAG__", flag);
+    let html = same_device_page(state.is_same_device(peer.ip()));
     (isolation_headers(), Html(html)).into_response()
 }
 
@@ -925,7 +941,7 @@ async fn start_session(
         .config
         .device_overrides
         .as_ref()
-        .and_then(|o| o.lock().unwrap().get(client_ip).copied());
+        .and_then(|o| o.lock_recover().get(client_ip).copied());
     let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
     let audio_params = match (
         state.config.audio_hub.as_ref(),
@@ -961,6 +977,12 @@ async fn start_session(
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
     }
 
+    // What the client's offer says it can decode, read before the encoder is built because the
+    // profile is an encoder-session parameter and cannot be changed afterwards. Baseline was the
+    // hardcoded answer to every client until now — CAVLC and no 8x8 transform, 5-15 % of the
+    // bitrate given away on every session that could have taken High.
+    let offered_video = negotiate::read_offer(&req.sdp);
+
     let native_dpr = if req.dpr.is_finite() { req.dpr } else { 1.0 };
     let dpr = platform::snap_display_dpr(override_for_ip.map(|o| o.dpr).unwrap_or(native_dpr));
     let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
@@ -980,6 +1002,17 @@ async fn start_session(
     let refresh = stream_fps
         .max(DISPLAY_COMPOSE_HZ)
         .clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
+
+    let video = negotiate::choose(&offered_video, width, height, stream_fps);
+    cfg.h264_profile = video.profile;
+    tprintln!(
+        "H.264 negotiated: profile={:?} level=0x{:02x} (offered={:?}, level-asymmetry={}, hevc={})",
+        video.profile,
+        video.level_idc,
+        offered_video.h264_profiles,
+        offered_video.level_asymmetry_allowed,
+        offered_video.hevc
+    );
 
     let display_name = if req.device_name.trim().is_empty() {
         "ScreenExtend".to_string()
@@ -1006,7 +1039,7 @@ async fn start_session(
     };
     if honor_device {
         if let Some(overrides) = state.config.device_overrides.as_ref() {
-            if let Some(o) = overrides.lock().unwrap().get_mut(client_ip) {
+            if let Some(o) = overrides.lock_recover().get_mut(client_ip) {
                 o.orientation_portrait = client_portrait;
             }
         }
@@ -1071,7 +1104,18 @@ async fn start_session(
         None => {
             let extra_modes = dpr_mode_ladder(req.width, req.height);
             let (display_id, device_name, topology_reset) = {
-                let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
+                // Held only for as long as the before/after device-name diff needs exclusivity.
+                // A second device joining seconds after the first used to wait out the first's
+                // whole create-and-attach window — up to `DISPLAY_ATTACH_TIMEOUT` — before its own
+                // could start, so two simultaneous joins cost t1 + t2 instead of max(t1, t2).
+                let t_lock = std::time::Instant::now();
+                let guard = DISPLAY_CORRELATION_LOCK.lock().await;
+                let lock_wait_ms = t_lock.elapsed().as_secs_f64() * 1000.0;
+                if lock_wait_ms > 1.0 {
+                    tprintln!(
+                        "display correlation lock: waited {lock_wait_ms:.0}ms behind another join"
+                    );
+                }
 
                 let before = tokio::task::spawn_blocking(pipeline::monitor_device_names)
                     .await
@@ -1094,6 +1138,9 @@ async fn start_session(
                 };
                 tprintln!("virtual display created (id={display_id}, {width}x{height}@{refresh})");
 
+                // A backend that can name its own display needs no correlation at all: the
+                // snapshot above is never read and the lock can go immediately, so the next join's
+                // create starts while this one is still waiting for Windows to attach the monitor.
                 let named = {
                     let client = client.clone();
                     tokio::task::spawn_blocking(move || client.display_device_name(display_id))
@@ -1101,9 +1148,17 @@ async fn start_session(
                         .ok()
                         .flatten()
                 };
+                if named.is_some() {
+                    drop(guard);
+                }
 
                 let (attached, topology_reset) = match named {
-                    Some(name) => (Some(name), false),
+                    Some(name) => {
+                        tprintln!(
+                            "virtual display id={display_id} named directly by the backend (no correlation needed)"
+                        );
+                        (Some(name), false)
+                    }
                     None => wait_for_new_monitor(&before).await,
                 };
                 match attached {
@@ -1234,6 +1289,7 @@ async fn start_session(
         },
         audio_params,
         locality,
+        video,
     )
     .await
     {
@@ -1578,7 +1634,7 @@ mod tests {
 
     fn state_with_local_ips(ips: &[&str]) -> AppState {
         let local_ips = session::new_shared_local_ips();
-        *local_ips.lock().unwrap() = ips.iter().map(|s| s.parse().unwrap()).collect();
+        *local_ips.lock_recover() = ips.iter().map(|s| s.parse().unwrap()).collect();
         AppState::new(Config {
             local_ips: Some(local_ips),
             stun_urls: vec!["stun:stun.l.google.com:19302".to_string()],
