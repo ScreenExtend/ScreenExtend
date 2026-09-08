@@ -405,68 +405,113 @@ fn at_capacity_page() -> Response {
         .into_response()
 }
 
-async fn transform_worker() -> Response {
+// The static assets are `include_str!`'d, so the binary's version *is* their content: an
+// ETag built from it changes exactly when they do. `no-cache` keeps the client revalidating
+// rather than pinning a stale asset across an update, and the revalidation costs a 304
+// instead of the ~120 KB the page used to refetch on every reload. `index` is deliberately
+// left uncached: it carries a per-request substitution.
+fn asset(
+    content_type: &'static str,
+    etag: &str,
+    headers: &HeaderMap,
+    body: &'static str,
+) -> Response {
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
+        )
+            .into_response();
+    }
     (
-        [(header::CONTENT_TYPE, "text/javascript")],
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn asset_etag() -> String {
+    format!("\"{}\"", env!("CARGO_PKG_VERSION"))
+}
+
+async fn transform_worker(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/transform-worker.js"),
     )
-        .into_response()
 }
 
-async fn input_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
+async fn input_js(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/input.js"),
     )
-        .into_response()
 }
 
-async fn audio_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
+async fn audio_js(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/audio.js"),
     )
-        .into_response()
 }
 
-async fn audio_worklet_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
+async fn audio_worklet_js(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/audio-worklet.js"),
     )
-        .into_response()
 }
 
-async fn audio_worker_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
+async fn audio_worker_js(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/audio-worker.js"),
     )
-        .into_response()
 }
 
-async fn nosleep_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
+async fn nosleep_js(headers: HeaderMap) -> Response {
+    asset(
+        "text/javascript",
+        &asset_etag(),
+        &headers,
         include_str!("static/nosleep.js"),
     )
-        .into_response()
 }
 
-async fn logo() -> Response {
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml")],
+async fn logo(headers: HeaderMap) -> Response {
+    asset(
+        "image/svg+xml",
+        &asset_etag(),
+        &headers,
         include_str!("static/logo.svg"),
     )
-        .into_response()
 }
 
-async fn styles() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css")],
+async fn styles(headers: HeaderMap) -> Response {
+    asset(
+        "text/css",
+        &asset_etag(),
+        &headers,
         include_str!("static/styles.css"),
     )
-        .into_response()
 }
 
 async fn ice_config(State(state): State<AppState>) -> Response {

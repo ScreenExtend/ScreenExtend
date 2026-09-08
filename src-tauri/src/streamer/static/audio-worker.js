@@ -45,7 +45,24 @@ let lastSyncPostAt = 0;
 let scratchL = null;
 let scratchR = null;
 
+// Planar audio ring ABI, writer side. Hand-duplicated in audio.js (which owns the allocation
+// size) and audio-worklet.js (the reader); change all three together.
+//
+//   [0 .. 64)                        control block, 16 Int32 (W, R, OVERRUNS)
+//   [64 .. 64 + cap*4)               left channel,  Float32
+//   [64 + cap*4 .. 64 + cap*8)       right channel, Float32
+//
+// Positions are absolute uint32 frame counters indexed with `pos & (cap-1)`, so the capacity
+// must be a power of two.
 function setupShared(sab, frames) {
+    if (!frames || (frames & (frames - 1)) !== 0) {
+        console.error('[audio-worker] ring capacity is not a power of two:', frames);
+        return;
+    }
+    if (sab.byteLength < CTRL_BYTES + frames * 8) {
+        console.error('[audio-worker] ring is too small for', frames, 'frames:', sab.byteLength);
+        return;
+    }
     ctrl = new Int32Array(sab, 0, CTRL_INTS);
     ringL = new Float32Array(sab, CTRL_BYTES, frames);
     ringR = new Float32Array(sab, CTRL_BYTES + frames * 4, frames);

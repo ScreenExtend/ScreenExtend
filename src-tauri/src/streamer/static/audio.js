@@ -7,6 +7,18 @@
     const MAX_TARGET_MS = 400;
     const P_MS = 0x100000000 / 90;
     const HDR_BYTES = 13;
+    // Planar audio ring ABI. Hand-duplicated in audio-worker.js (the writer) and
+    // audio-worklet.js (the reader); change all three together.
+    //
+    //   [0 .. 64)                        control block, 16 Int32
+    //                                      [0] W  absolute write position, frames
+    //                                      [1] R  absolute read position, frames
+    //                                      [2] OVERRUNS
+    //   [64 .. 64 + cap*4)               left channel,  Float32
+    //   [64 + cap*4 .. 64 + cap*8)       right channel, Float32
+    //
+    // Positions are absolute uint32 frame counters and the index is `pos & (cap-1)`, so the
+    // capacity must stay a power of two.
     const CTRL_BYTES = 64;
     const CAP_FRAMES = 65536;
 
@@ -701,9 +713,14 @@
 
     function makeSharedRing() {
         if (!sharedMemoryOk()) return null;
+        if ((CAP_FRAMES & (CAP_FRAMES - 1)) !== 0) {
+            console.error('[audio] ring capacity must be a power of two');
+            return null;
+        }
         try {
             return new SharedArrayBuffer(CTRL_BYTES + CAP_FRAMES * 4 * 2);
         } catch (_) {
+            note();
             return null;
         }
     }
