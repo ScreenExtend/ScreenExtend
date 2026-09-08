@@ -10,7 +10,6 @@ mod test;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -65,7 +64,6 @@ pub struct AudioFrameSink {
     pub producer: Arc<ring::Producer>,
     pub diagnostics: Arc<AudioDiagnostics>,
     pub control_tx: Option<crossbeam_channel::Sender<ControlMsg>>,
-    pub consumer_thread: Arc<OnceLock<Thread>>,
 }
 
 pub trait AudioSource: Send {
@@ -149,13 +147,12 @@ pub fn start_capture() -> Result<AudioCapture> {
     }
 
     let diagnostics = Arc::new(AudioDiagnostics::default());
-    let (producer, consumer, consumer_thread_lock) = ring::ring(RING_CAPACITY);
+    let (producer, consumer) = ring::ring(RING_CAPACITY);
     let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded::<ControlMsg>(8);
     let sink = AudioFrameSink {
         producer: Arc::new(producer),
         diagnostics: Arc::clone(&diagnostics),
         control_tx: Some(ctrl_tx),
-        consumer_thread: consumer_thread_lock,
     };
 
     let (pkt_tx, pkt_rx) = crossbeam_channel::unbounded::<AudioPacket>();
@@ -255,9 +252,6 @@ fn worker(
         return;
     };
     let _ = ready_tx.send(Ok(lookahead));
-
-    sink.producer.set_consumer_thread(std::thread::current());
-    sink.consumer_thread.get_or_init(std::thread::current);
 
     let mut frame = [0.0f32; FRAME_INTERLEAVED];
     let mut seq: u32 = 0;

@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 struct Shared {
     buf: Box<[UnsafeCell<f32>]>,
@@ -16,7 +16,6 @@ unsafe impl Sync for Shared {}
 /// producer half, held by the RT capture callback
 pub struct Producer {
     shared: Arc<Shared>,
-    consumer_thread: Arc<OnceLock<std::thread::Thread>>,
 }
 
 /// consumer half, held by the encoder thread
@@ -24,7 +23,7 @@ pub struct Consumer {
     shared: Arc<Shared>,
 }
 
-pub fn ring(capacity: usize) -> (Producer, Consumer, Arc<OnceLock<std::thread::Thread>>) {
+pub fn ring(capacity: usize) -> (Producer, Consumer) {
     let cap = capacity.next_power_of_two().max(2);
     let mut cells = Vec::with_capacity(cap);
     cells.resize_with(cap, || UnsafeCell::new(0.0f32));
@@ -35,22 +34,21 @@ pub fn ring(capacity: usize) -> (Producer, Consumer, Arc<OnceLock<std::thread::T
         tail: AtomicUsize::new(0),
         overruns: AtomicU64::new(0),
     });
-    let consumer_thread: Arc<OnceLock<std::thread::Thread>> = Arc::new(OnceLock::new());
     (
         Producer {
             shared: Arc::clone(&shared),
-            consumer_thread: Arc::clone(&consumer_thread),
         },
         Consumer { shared },
-        consumer_thread,
     )
 }
 
 impl Producer {
-    pub fn set_consumer_thread(&self, t: std::thread::Thread) {
-        self.consumer_thread.get_or_init(|| t);
-    }
-
+    /// Write what fits and return how many samples had to be dropped.
+    ///
+    /// Every operation here is wait-free: this runs on a CoreAudio IOProc or the SCK delivery
+    /// queue, where a blocking mutex acquisition against a lower-priority thread is a priority
+    /// inversion. In particular there is deliberately no consumer wakeup — the encoder worker
+    /// polls with a 125 us `park_timeout`, a quarter of one 5 ms Opus frame.
     pub fn push(&self, data: &[f32]) -> usize {
         let s = &*self.shared;
         let head = s.head.load(Ordering::Relaxed);
@@ -65,11 +63,6 @@ impl Producer {
             }
         }
         s.head.store(head.wrapping_add(n), Ordering::Release);
-        if n > 0 {
-            if let Some(t) = self.consumer_thread.get() {
-                t.unpark();
-            }
-        }
         let dropped = data.len() - n;
         if dropped > 0 {
             s.overruns.fetch_add(dropped as u64, Ordering::Relaxed);
@@ -115,7 +108,7 @@ mod tests {
 
     #[test]
     fn round_trips_in_order() {
-        let (p, c, _t) = ring(8);
+        let (p, c) = ring(8);
         assert_eq!(p.push(&[1.0, 2.0, 3.0]), 0);
         let mut out = [0.0f32; 4];
         assert_eq!(c.pop(&mut out), 3);
@@ -125,7 +118,7 @@ mod tests {
 
     #[test]
     fn wraps_around_capacity() {
-        let (p, c, _t) = ring(4);
+        let (p, c) = ring(4);
         let mut out = [0.0f32; 4];
         for round in 0..10 {
             let a = round as f32;
@@ -137,7 +130,7 @@ mod tests {
 
     #[test]
     fn counts_overruns_without_blocking() {
-        let (p, c, _t) = ring(4);
+        let (p, c) = ring(4);
         // 6 into a 4-slot ring: 4 fit, 2 dropped
         let dropped = p.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(dropped, 2);
