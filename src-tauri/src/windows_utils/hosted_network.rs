@@ -161,12 +161,100 @@ fn wifi_direct_available() -> bool {
     }
 }
 
+/// RAII wrapper for a WLAN client handle, so every early return closes it.
+struct WlanHandle(windows::Win32::Foundation::HANDLE);
+
+impl WlanHandle {
+    /// Open a WLAN client session, negotiating the highest version this OS offers.
+    fn open() -> Option<Self> {
+        use windows::Win32::NetworkManagement::WiFi::WlanOpenHandle;
+        let mut negotiated = 0u32;
+        let mut handle = windows::Win32::Foundation::HANDLE::default();
+        // Version 2 is Vista+; every OS this project supports negotiates it or better.
+        let rc = unsafe { WlanOpenHandle(2, None, &mut negotiated, &mut handle) };
+        (rc == 0).then_some(Self(handle))
+    }
+}
+
+impl Drop for WlanHandle {
+    fn drop(&mut self) {
+        use windows::Win32::NetworkManagement::WiFi::WlanCloseHandle;
+        unsafe { WlanCloseHandle(self.0, None) };
+    }
+}
+
+/// Ask the WLAN service, per interface, whether its driver can host a network.
+///
+/// `wlan_intf_opcode_hosted_network_capable` returns a `BOOL` and is the answer `netsh wlan show
+/// drivers` prints as "Hosted network supported". Reading it directly is locale-proof; the
+/// string was not, and on a German, French, Japanese or Chinese Windows the phrase never appears
+/// at all, so the probe returned "no" unconditionally.
+///
+/// `None` means the question could not be asked (no WLAN service, no interfaces, an opcode this
+/// build of Windows does not know) — distinct from a definite "no", which is what makes the
+/// `netsh` fallback below worth keeping.
+fn wlan_hosted_network_capable() -> Option<bool> {
+    use windows::Win32::NetworkManagement::WiFi::{
+        wlan_intf_opcode_hosted_network_capable, WlanEnumInterfaces, WlanFreeMemory,
+        WlanQueryInterface, WLAN_INTERFACE_INFO_LIST, WLAN_OPCODE_VALUE_TYPE,
+    };
+
+    let handle = WlanHandle::open()?;
+    let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+    if unsafe { WlanEnumInterfaces(handle.0, None, &mut list) } != 0 || list.is_null() {
+        return None;
+    }
+    // Everything past here must reach the free, so the answer is computed and then returned.
+    let mut answer: Option<bool> = None;
+    unsafe {
+        let count = (*list).dwNumberOfItems as usize;
+        for i in 0..count {
+            let info = (*list).InterfaceInfo.as_ptr().add(i);
+            let mut size = 0u32;
+            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut value_type = WLAN_OPCODE_VALUE_TYPE::default();
+            let rc = WlanQueryInterface(
+                handle.0,
+                &(*info).InterfaceGuid,
+                wlan_intf_opcode_hosted_network_capable,
+                None,
+                &mut size,
+                &mut data,
+                Some(&mut value_type),
+            );
+            if rc != 0 || data.is_null() || size < 4 {
+                continue;
+            }
+            let capable = *(data as *const i32) != 0;
+            WlanFreeMemory(data);
+            // Any interface that can host is enough; the tier only needs one.
+            answer = Some(answer.unwrap_or(false) || capable);
+            if capable {
+                break;
+            }
+        }
+        WlanFreeMemory(list as *const std::ffi::c_void);
+    }
+    answer
+}
+
 /// The netsh legacy tier's capability. A static property of the installed WLAN driver, so it is
 /// computed at most once per process — it used to be re-derived by spawning `netsh` on every
 /// start/stop/status call, and the adapter enumeration reached it once a second.
 fn supports_legacy_hosted_network(app: &AppHandle) -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
+        if let Some(capable) = wlan_hosted_network_capable() {
+            tprintln!(
+                "[hosted-network] WlanQueryInterface(hosted_network_capable) => {capable} \
+                 (locale-independent)"
+            );
+            return capable;
+        }
+        tprintln!(
+            "[hosted-network] the WLAN service could not answer hosted_network_capable; \
+             falling back to parsing `netsh wlan show drivers`"
+        );
         let output = tauri::async_runtime::block_on(async {
             app.shell()
                 .command("netsh")
@@ -195,6 +283,29 @@ fn supports_legacy_hosted_network(app: &AppHandle) -> bool {
         tprintln!("[hosted-network] legacy netsh hosted network supported: {supported}");
         supported
     })
+}
+
+/// Whether the legacy hosted network is running right now, read from the WLAN service instead
+/// of from a localized `netsh` status line.
+///
+/// `WLAN_HOSTED_NETWORK_STATE` distinguishes `active` from `idle` and `unavailable` with no
+/// string involved, which is exactly the readback the old code got wrong: on localized Windows a
+/// *successfully started* hosted network was reported as not running.
+fn wlan_hosted_network_active() -> Option<bool> {
+    use windows::Win32::NetworkManagement::WiFi::{
+        wlan_hosted_network_active, WlanFreeMemory, WlanHostedNetworkQueryStatus,
+        WLAN_HOSTED_NETWORK_STATUS,
+    };
+
+    let handle = WlanHandle::open()?;
+    let mut status: *mut WLAN_HOSTED_NETWORK_STATUS = std::ptr::null_mut();
+    let rc = unsafe { WlanHostedNetworkQueryStatus(handle.0, &mut status, None) };
+    if rc != 0 || status.is_null() {
+        return None;
+    }
+    let active = unsafe { (*status).HostedNetworkState } == wlan_hosted_network_active;
+    unsafe { WlanFreeMemory(status as *const std::ffi::c_void) };
+    Some(active)
 }
 
 /// The best backend this machine can actually run, newest first.
@@ -588,6 +699,11 @@ fn start_legacy(app: &AppHandle, name: &str, password: &str) -> bool {
 }
 
 fn legacy_started(app: &AppHandle) -> bool {
+    if let Some(active) = wlan_hosted_network_active() {
+        return active;
+    }
+    // Only if the WLAN service declined to answer at all. This branch is English-only and known
+    // to be: on a localized Windows a running hosted network reads as stopped here.
     let output = tauri::async_runtime::block_on(async {
         app.shell()
             .command("netsh")
@@ -746,5 +862,20 @@ mod test {
             ),
             None => println!("no connection profile to probe"),
         }
+    }
+
+    /// The locale-independent legacy probe, next to the localized string it replaces. Run with
+    /// `--ignored --nocapture`; needs no elevation.
+    #[test]
+    #[ignore]
+    fn report_wlan_hosted_network_capability() {
+        println!(
+            "WlanQueryInterface(hosted_network_capable) => {:?}",
+            wlan_hosted_network_capable()
+        );
+        println!(
+            "WlanHostedNetworkQueryStatus(active) => {:?}",
+            wlan_hosted_network_active()
+        );
     }
 }

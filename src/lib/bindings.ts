@@ -212,7 +212,7 @@ sessionIdChange: "session-id-change"
 export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device
