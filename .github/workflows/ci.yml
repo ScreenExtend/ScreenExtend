@@ -58,6 +58,17 @@ jobs:
       - name: client stats harness
         run: node scripts/test-client-stats.mjs
 
+      # bindings.ts is written by whichever debug binary last ran with no CLI arguments, and
+      # it carries `// @ts-nocheck`, so a stale binary can revert the whole TS API surface
+      # with nothing failing afterwards -- the only symptom is a runtime "command not found"
+      # in the webview. This is a static cross-check against the macro lists in lib.rs, so it
+      # needs no build.
+      - name: bindings.ts matches lib.rs
+        run: node scripts/check-bindings.mjs
+
+      - name: app version is the same in all four files
+        run: node scripts/check-versions.mjs
+
   # ---------------------------------------------------------------- rust gates
   # `pnpm build` first because tauri_build embeds ../dist at compile time, so even
   # `cargo check` fails without it.

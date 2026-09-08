@@ -20,8 +20,7 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/libopus.dylib",
-      "resources/ScreenExtendAudio.pkg"
+      "resources/libopus.dylib"
     ],
     "externalBin": [],
     "publisher": "Sarvesh Madullapalli",
@@ -37,7 +36,10 @@
     "macOS": {
       "entitlements": "./Entitlements.plist",
       "infoPlist": "./Info.plist",
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "10.15",
+      "files": {
+        "Resources/resources/ScreenExtendAudio.pkg": "resources/ScreenExtendAudio.pkg"
+      }
     }
   }
 }

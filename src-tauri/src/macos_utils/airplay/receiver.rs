@@ -210,8 +210,15 @@ impl Receiver {
         self.inner.stats.connected.load(Ordering::Relaxed)
     }
 
-    pub fn geometry_changed(&self) -> bool {
-        self.inner.stats.geometry_changed.load(Ordering::Relaxed)
+    /// Read and clear the "macOS moved the display under us" latch.
+    ///
+    /// Clearing on read is what makes it usable as an edge: the sender sets it every time it
+    /// re-sends codec data, and the caller wants each of those once.
+    pub fn take_geometry_changed(&self) -> bool {
+        self.inner
+            .stats
+            .geometry_changed
+            .swap(false, Ordering::Relaxed)
     }
 
     /// Ends the session. Closing the control socket is the only receiver-side

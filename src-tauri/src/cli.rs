@@ -1011,6 +1011,7 @@ mod desktop {
         }
         let state = app.state::<platform::AppState>();
         crate::streamer::input::prime();
+        platform::permissions::prime();
 
         let store = app.store(CONFIG_STORE).ok();
         let http = arg_u16(m, "http-port")
@@ -2377,7 +2378,7 @@ mod desktop {
 
     fn run_doctor(app: &tauri::AppHandle, m: &Matches) -> ! {
         let report = platform::compatibility::check_system_requirements();
-        let permissions = platform::permissions::check_permissions();
+        let permissions = platform::permissions::probe_permissions();
         let drivers = driver_state(app);
         let permission_missing = permissions
             .iter()
@@ -2387,6 +2388,18 @@ mod desktop {
         let probes = platform::permissions::raw_probes();
         #[cfg(target_os = "macos")]
         let identity = platform::permissions::identity_report();
+        // Only on the AirPlay tier, and only there because that backend drives the real
+        // Displays picker: when it fails, it fails by macOS quietly not creating a display,
+        // and "does the picker list us at all?" is the one question a user could otherwise
+        // never answer. `probe()` carries its own deadline.
+        #[cfg(target_os = "macos")]
+        let airplay = if platform::virtual_display::probe_display_backend()
+            == platform::virtual_display::DisplayBackend::AirPlayFallback
+        {
+            Some(platform::airplay::probe())
+        } else {
+            None
+        };
 
         if wants_json(m) {
             #[allow(unused_mut)]
@@ -2438,6 +2451,12 @@ mod desktop {
                         "tccutil reset Accessibility app.screenextend.desktop",
                     ],
                 });
+                if let Some(result) = &airplay {
+                    out["macos"]["airplayPicker"] = match result {
+                        Ok(devices) => serde_json::json!({ "devices": devices }),
+                        Err(e) => serde_json::json!({ "error": e }),
+                    };
+                }
             }
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             exit(doctor_code(report.os_supported, permission_missing));
@@ -2540,6 +2559,26 @@ mod desktop {
                 tribool(probes.sck),
                 probes.sck_us
             );
+            if let Some(result) = &airplay {
+                println!("\nAirPlay Displays picker (this Mac is on the AirPlay display tier):");
+                match result {
+                    Ok(devices) if devices.is_empty() => {
+                        println!("  the picker lists no AirPlay devices at all")
+                    }
+                    Ok(devices) => {
+                        for name in devices {
+                            println!("  {name}");
+                        }
+                        if !devices.iter().any(|d| d == "ScreenExtend") {
+                            println!(
+                                "  ScreenExtend is NOT listed - the receiver is not being \
+                                 discovered, so no display can be created"
+                            );
+                        }
+                    }
+                    Err(e) => println!("  could not read the picker: {e}"),
+                }
+            }
             println!(
                 "\nIf System Settings shows the toggle on but a probe above says denied, the grant \
                  is bound to\na different code identity. Reset it and grant again:\n  \
