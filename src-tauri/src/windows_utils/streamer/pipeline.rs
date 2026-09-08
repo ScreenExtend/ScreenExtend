@@ -711,7 +711,11 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
     );
 
     telemetry.encoder.set(path_name.into());
-    tprintln!("pipeline: live capture ready -- DXGI duplication -> {path_name}");
+    telemetry.capture_features.set(dup.api().name().into());
+    tprintln!(
+        "pipeline: live capture ready -- DXGI duplication ({}) -> {path_name}",
+        dup.api().name()
+    );
     let _ = ready_tx.send(Ok(()));
 
     let mut dirty = false;
