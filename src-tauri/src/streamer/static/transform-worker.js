@@ -14,12 +14,13 @@ let configured = false;
 let waitingForKey = true;
 let waitingSince = 0;
 let renderedOnce = false;
-let renderFromTs = 0;
+let renderFromTs = null;
 
 let framesIn = 0;
 let keyframesIn = 0;
 let framesDecoded = 0;
 let framesRendered = 0;
+let framesUnpainted = 0;
 let lastKeyRequestAt = 0;
 let configError = null;
 
@@ -57,6 +58,14 @@ const KEY_WAIT_GIVE_UP_MS = 8000;
 const MAX_IN_FLIGHT = 2;
 let inFlight = 0;
 let backlogStreak = 0;
+// The counter is only repaid by an output, and a decoder may accept a chunk and silently
+// discard it — a delta whose reference frame was lost, a frame dropped after a corrupt NAL.
+// Three of those put the count permanently over the cap, every subsequent delta is dropped and
+// the stream collapses into a keyframe-only slideshow that nothing demotes, because keyframes
+// still render. So the count is resynchronised from two independent signals: an empty accept
+// queue, and no output at all for this long.
+const IN_FLIGHT_STALE_MS = 500;
+let lastOutputAtMs = 0;
 
 // Bounded so a decoder that errors on every frame cannot spin: after this many resets we
 // stop rebuilding and let the page decide.
@@ -154,8 +163,24 @@ function notePending(ts, arrivalMs) {
 // overrides none of it), so on an OffscreenCanvas it is inert and only misleads a reader.
 function setupCanvas(off) {
   canvas = off;
-  ctx = canvas.getContext('2d', { alpha: false });
+  try {
+    ctx = canvas.getContext('2d', { alpha: false });
+  } catch (_) {
+    note();
+    ctx = null;
+  }
+  // Claiming the tier without a context meant every frame counted as rendered while nothing
+  // was drawn: the watchdog was cleared, the stall detector saw progress, and the session sat
+  // live on a black canvas reporting renderTier 1.
+  if (!ctx) {
+    canvas = null;
+    renderTier = RENDER.none;
+    configError = 'no 2d context';
+    self.postMessage({ type: 'configerror', message: configError });
+    return;
+  }
   renderTier = RENDER.canvas2d;
+  lastPostedWidth = 0;
 }
 
 function trackGeneratorCtor() {
@@ -186,37 +211,64 @@ function setupTrackGenerator() {
   }
 }
 
-// The writer's promise is the only backpressure signal the generator offers. We never await
-// it on the decode path -- a slow sink must drop, not queue -- so failures are counted and
-// the frame is closed regardless.
+// A generator that was set up and then could not be handed to the page owns nothing, but
+// `genWriter` still wins in presentFrame, so every decoded frame goes into a writable attached
+// to no sink: a permanently black canvas that reports itself as live.
+function releaseTrackGenerator() {
+  if (genWriter) {
+    try { genWriter.close().then(null, note); } catch (_) { note(); }
+  }
+  if (generator) {
+    const t = generator.track || generator;
+    try { if (t && typeof t.stop === 'function') t.stop(); } catch (_) { note(); }
+  }
+  generator = null;
+  genWriter = null;
+}
+
+// Three outcomes, not two: a frame handed to a writable, a frame drawn, and a frame that
+// reached no sink at all. The last one used to be indistinguishable from the second, so it
+// still counted as rendered — which cleared the no-frame watchdog and blinded the stall
+// detector to the very state it exists to catch.
+const PRESENT = { handedOff: 1, painted: 2, noSink: 0 };
+let lastPostedWidth = 0;
+
 function presentFrame(frame) {
   if (genWriter) {
-    let ok = false;
     try {
+      // The writer's promise is the only backpressure signal the generator offers, and we
+      // never await it on the decode path: a slow sink must drop, not queue.
       genWriter.write(frame).then(null, note);
-      ok = true;
+      return PRESENT.handedOff; // the writable owns the frame from here
     } catch (_) {
       note();
+      return PRESENT.noSink;
     }
-    if (ok) return true; // the writable owns the frame from here
-    return false;
   }
-  if (!ctx || !canvas) return false;
+  if (!ctx || !canvas) return PRESENT.noSink;
   if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
     if (frame.displayWidth > 0 && frame.displayHeight > 0) {
       canvas.width = frame.displayWidth;
       canvas.height = frame.displayHeight;
     }
   }
+  // The picture rect input coordinates are normalised against needs the intrinsic size, and
+  // the 1 s stats poll's first tick is a full second after the stream starts — every tap in
+  // that window landed off by half the letterbox bar. Push it the moment it is known.
+  if (canvas.width > 0 && canvas.width !== lastPostedWidth) {
+    lastPostedWidth = canvas.width;
+    self.postMessage({ type: 'size', width: canvas.width, height: canvas.height });
+  }
   // Three-argument form: the five-argument destination-rect version applies a scale even
   // when the sizes already match.
   ctx.drawImage(frame, 0, 0);
-  return false;
+  return PRESENT.painted;
 }
 
 self.onmessage = (e) => {
   if (!e.data) return;
   if (e.data.type === 'canvas') {
+    releaseTrackGenerator();
     setupCanvas(e.data.canvas);
   } else if (e.data.type === 'trackgen') {
     const track = setupTrackGenerator();
@@ -225,6 +277,8 @@ self.onmessage = (e) => {
         self.postMessage({ type: 'trackgen', track: track }, [track]);
       } catch (_) {
         note();
+        releaseTrackGenerator();
+        renderTier = RENDER.none;
         self.postMessage({ type: 'trackgen', track: null });
       }
     } else {
@@ -281,7 +335,9 @@ function hostCaptureAbsMsOf(tsTicks) {
   return hostMs - hostOffsetMs;
 }
 
-function reportAvSync(tsTicks) {
+// The 32-bit RTP timestamp wraps every ~13.25 h of host uptime. Everything that compares two
+// of them has to go through a signed 32-bit difference or the comparison inverts at the wrap.
+function advanceRtpUnwrap(tsTicks) {
   const ts = tsTicks >>> 0;
   if (rtpUnwrapLast !== null) {
     const d = ts - rtpUnwrapLast;
@@ -289,7 +345,21 @@ function reportAvSync(tsTicks) {
     else if (d > 0x80000000) rtpWraps--;
   }
   rtpUnwrapLast = ts;
-  const videoHostMs = ((rtpWraps * 0x100000000) + ts) * 1000 / RTP_HZ;
+  return (rtpWraps * 0x100000000) + ts;
+}
+
+// `renderFromTs` is the raw stamp of the keyframe the stream resumed from and is never
+// refreshed once the stream is running, so a plain `ts >= renderFromTs` dropped every frame
+// for the rest of the session after the wrap — silently, with no counter, until the stall
+// detector demoted the whole session to <video> thirteen hours in.
+function beforeRenderStart(ts) {
+  if (renderFromTs === null) return false;
+  return (((ts >>> 0) - renderFromTs) | 0) < 0;
+}
+
+function reportAvSync(tsTicks) {
+  const ts = tsTicks >>> 0;
+  const videoHostMs = advanceRtpUnwrap(ts) * 1000 / RTP_HZ;
   const drawAbsMs = performance.timeOrigin + performance.now();
   const delta = drawAbsMs - (videoHostMs - hostOffsetMs);
   if (videoDelayEmaMs === null) {
@@ -331,6 +401,7 @@ function collectStats() {
     framesIn: framesIn,
     framesDecoded: framesDecoded,
     framesRendered: framesRendered,
+    framesUnpainted: framesUnpainted,
     framesDropped: framesDroppedBacklog,
     decodeErrors: decodeErrors,
     keyRequests: keyRequests,
@@ -352,7 +423,7 @@ function collectStats() {
 function postStats() {
   self.postMessage({
     type: 'stats',
-    framesIn, keyframesIn, framesDecoded, framesRendered,
+    framesIn, keyframesIn, framesDecoded, framesRendered, framesUnpainted,
     decoderState: decoder ? decoder.state : 'none',
     queue: decoder ? decoder.decodeQueueSize : 0,
     inFlight, transportTier, renderTier, keyTier,
@@ -363,31 +434,40 @@ function postStats() {
 function onDecodedFrame(frame) {
   framesDecoded++;
   if (inFlight > 0) inFlight--;
+  lastOutputAtMs = performance.now();
   let handedOff = false;
   // Read the timestamp before presenting: a track generator's writable takes ownership of
   // the frame, after which touching it is a detached-object error.
   const ts = frame.timestamp;
   try {
-    if (ts >= renderFromTs) {
-      handedOff = presentFrame(frame);
-      framesRendered++;
-      // Both tiers hand the frame to the compositor synchronously here, so this instant is
-      // as close to the paint as this thread can observe.
-      const paintMs = nowAbsMs();
-      const rec = pending.get(ts);
-      if (rec) {
-        pending.delete(ts);
-        wArrivalToPaint.push(paintMs - rec.arrival);
-        if (rec.submit) wDecode.push(paintMs - rec.submit);
-      }
-      if (clockValid) {
-        const hostCaptureAbsMs = hostCaptureAbsMsOf(ts);
-        if (hostCaptureAbsMs !== null) wHostToPaint.push(paintMs - hostCaptureAbsMs);
-      }
-      reportAvSync(ts);
-      if (!renderedOnce) {
-        renderedOnce = true;
-        self.postMessage({ type: 'rendered' });
+    if (!beforeRenderStart(ts)) {
+      const outcome = presentFrame(frame);
+      handedOff = outcome === PRESENT.handedOff;
+      if (outcome === PRESENT.noSink) {
+        // Nothing painted it, so it is not a rendered frame. Counting it cleared the page's
+        // no-frame watchdog and hid the stall from the detector that would have recovered it.
+        framesUnpainted++;
+        advanceRtpUnwrap(ts);
+      } else {
+        framesRendered++;
+        // Both tiers hand the frame to the compositor synchronously here, so this instant is
+        // as close to the paint as this thread can observe.
+        const paintMs = nowAbsMs();
+        const rec = pending.get(ts);
+        if (rec) {
+          pending.delete(ts);
+          wArrivalToPaint.push(paintMs - rec.arrival);
+          if (rec.submit) wDecode.push(paintMs - rec.submit);
+        }
+        if (clockValid) {
+          const hostCaptureAbsMs = hostCaptureAbsMsOf(ts);
+          if (hostCaptureAbsMs !== null) wHostToPaint.push(paintMs - hostCaptureAbsMs);
+        }
+        reportAvSync(ts);
+        if (!renderedOnce) {
+          renderedOnce = true;
+          self.postMessage({ type: 'rendered' });
+        }
       }
     }
   } catch (err) {
@@ -417,7 +497,11 @@ function makeDecoder() {
   if ('ondequeue' in d) {
     hasDequeueEvent = true;
     d.ondequeue = function () {
-      if (d.decodeQueueSize === 0 && inFlight <= MAX_IN_FLIGHT) backlogStreak = 0;
+      if (d.decodeQueueSize !== 0) return;
+      // An empty accept queue with the counter still over the cap can only mean decodes the
+      // browser took and never returned an output for.
+      if (inFlight > MAX_IN_FLIGHT) inFlight = 0;
+      backlogStreak = 0;
     };
   }
   return d;
@@ -441,8 +525,22 @@ function withAcceleration(cfg, mode) {
   return out;
 }
 
-async function ensureConfigured() {
-  if (configured && decoder && decoder.state !== 'closed') return true;
+// Memoised while it runs: startPump calls this un-awaited to get the first keyframe request
+// out, and the pump awaits it again on the first frame. Both used to run the whole probe loop
+// and both used to assign `decoder`, orphaning a configured VideoDecoder — a GPU-process
+// decode session on Chromium — with no close() on every session start.
+let configuring = null;
+function ensureConfigured() {
+  if (configured && decoder && decoder.state !== 'closed') return Promise.resolve(true);
+  if (!configuring) {
+    const done = function () { configuring = null; };
+    configuring = doConfigure();
+    configuring.then(done, done);
+  }
+  return configuring;
+}
+
+async function doConfigure() {
   const candidates = preferredCodec
     ? [preferredCodec].concat(CODEC_CANDIDATES.filter((c) => c !== preferredCodec))
     : CODEC_CANDIDATES.slice();
@@ -491,6 +589,7 @@ async function ensureConfigured() {
   configured = true;
   setWaitingForKey(true);
   inFlight = 0;
+  lastOutputAtMs = 0;
   return true;
 }
 
@@ -508,6 +607,7 @@ function resetAndRequestKey() {
   configured = false;
   setWaitingForKey(true);
   inFlight = 0;
+  lastOutputAtMs = 0;
   const old = decoder;
   decoder = null;
   if (old) {
@@ -623,6 +723,15 @@ function startPump(readable) {
       // Never schedule, always resynchronise: if the decoder is behind, the freshest frame
       // is worth more than the queued ones. A single late frame is normal jitter, so only a
       // repeated overrun counts.
+      // Second resync, for engines with no `ondequeue` and for one that stops firing it:
+      // frames are still arriving and nothing has come back out, so the decodes the counter
+      // is holding are gone.
+      if (inFlight > MAX_IN_FLIGHT && lastOutputAtMs &&
+          performance.now() - lastOutputAtMs > IN_FLIGHT_STALE_MS) {
+        inFlight = 0;
+        backlogStreak = 0;
+      }
+
       if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
         if (inFlight > MAX_IN_FLIGHT) {
           backlogStreak++;

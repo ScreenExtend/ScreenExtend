@@ -1033,14 +1033,17 @@
             // hardware overlay instead of a texture upload. Opt-in (`?present=track`) — no
             // public measurement says the overlay actually happens, and the constructor
             // exists on Chrome (legacy name) and Safari 18 (new name) but nowhere else.
+            function useCanvasInstead() {
+                if (worker) {
+                    const off = freshCanvas().transferControlToOffscreen();
+                    worker.postMessage({ type: 'canvas', canvas: off }, [off]);
+                }
+                showCanvas();
+            }
             function attachTrackGenerator(track) {
                 if (!track) {
                     console.warn('[webcodecs] track generator unavailable; using the canvas');
-                    if (worker) {
-                        const off = freshCanvas().transferControlToOffscreen();
-                        worker.postMessage({ type: 'canvas', canvas: off }, [off]);
-                    }
-                    showCanvas();
+                    useCanvasInstead();
                     return;
                 }
                 try {
@@ -1051,7 +1054,9 @@
                 } catch (err) {
                     noteSuppressed();
                     console.warn('[webcodecs] track generator attach failed:', err);
-                    showCanvas();
+                    // Without the canvas transfer the worker has no sink at all: it kept
+                    // writing into a generator attached to nothing and the page showed black.
+                    useCanvasInstead();
                 }
             }
 
@@ -1266,9 +1271,12 @@
             let videoStatsPoll = null;
             function startVideoStatsPoll() {
                 if (videoStatsPoll) clearInterval(videoStatsPoll);
-                videoStatsPoll = setInterval(function () {
-                    if (worker) worker.postMessage({ type: 'videostats' });
-                }, 1000);
+                const tick = function () { if (worker) worker.postMessage({ type: 'videostats' }); };
+                // A plain setInterval's first tick is a full second out, and until it lands
+                // videoWorkerStats is null — which is also the whole first second after every
+                // reconfigure, because teardownSession clears it.
+                tick();
+                videoStatsPoll = setInterval(tick, 1000);
             }
 
             if (window.SEClock) {
@@ -1402,6 +1410,8 @@
                                 attachTrackGenerator(m.data.track);
                             } else if (m.data.type === 'firstframe') {
                                 console.log('[webcodecs] FIRST encoded frame reached transform readable; type=' + m.data.frameType);
+                            } else if (m.data.type === 'size') {
+                                try { if (window.RemoteInput) RemoteInput.setPictureSize(m.data.width, m.data.height); } catch (_) { noteSuppressed(); }
                             } else if (m.data.type === 'rendercount') {
                                 handleRenderCount(m.data.n);
                             } else if (m.data.type === 'avsync') {
@@ -1479,7 +1489,10 @@
                         if (e.track.kind !== 'video') return;
 
                         if (webcodecs) {
-                            showCanvas();
+                            // ontrack lands after a network round trip, well after the worker
+                            // answered `trackgen`, so an unguarded showCanvas() here hid the
+                            // <video> the generator had just been attached to.
+                            if (PRESENT_PREF !== 'track') showCanvas();
                             if (DEBUG) statsPoll = setInterval(() => {
                                 if (worker) worker.postMessage({ type: 'stats' });
                                 if (pc) pc.getStats().then((rep) => {
