@@ -1289,24 +1289,33 @@ impl Backend {
     /// not saved so much as moved onto silicon that was already running.
     ///
     /// x264 takes NV12: libx264 deinterleaves it to its internal I420 in SIMD inside
-    /// `x264_frame_copy_picture`, so the scalar BT.601 matrix that ran on a rayon pool is gone
+    /// `x264_frame_copy_picture`, so the scalar colour matrix that ran on a rayon pool is gone
     /// entirely. Measured at 640x360, 30 frames, debug libraries: 1655 us median per frame on the
     /// BGRA path against 450 us on the NV12 one, coding the same picture to within 1% of the same
     /// bytes (`x264_nv12_input_matches_the_bgra_path`).
     ///
+    /// The Intel CPU bridge takes NV12 for a bigger reason: it can then skip its VPP pass
+    /// altogether. On BGRA it re-uploaded 4 bytes a pixel and ran a `VideoProcessorBlt` to reach
+    /// NV12 — a conversion the scaler has already done, on the same kind of fixed-function block,
+    /// as part of a blt it was running anyway.
+    ///
+    /// The AMF bridge takes NV12 because VCN wants it: AMD state that packed-RGB input silently
+    /// invokes an internal GPU colour converter competing with the foreground application, and
+    /// OBS refuses BGRA on its texture path for the same reason. `UNVERIFIED` — no machine on
+    /// this project has an AMD GPU (`docs/manual-tests/amd-amf.md`).
+    ///
     /// NVENC is deliberately not a candidate: `NV_ENC_BUFFER_FORMAT_ARGB` is byte-identical to
-    /// the captured texture and its internal conversion beats a pre-pass. The two remaining
-    /// bridges still say BGRA because their encoders have no NV12 entry point yet — Quick Sync
-    /// re-uploads and runs a second VPP pass, AMF an internal converter — and a backend must
-    /// never claim a format its `encode_cpu` arm cannot read.
+    /// the captured texture and its internal conversion beats a pre-pass. `Backend::Amf` — the
+    /// GPU path — is not a bridge and takes the blt straight into its own ring texture, whose
+    /// format is the encoder's business.
     fn cpu_bridge_format(&self) -> ReadbackFormat {
         match self {
-            Backend::X264 { .. } => ReadbackFormat::Nv12,
-            Backend::Nvenc { .. }
-            | Backend::Intel { .. }
-            | Backend::IntelCpu { .. }
-            | Backend::Amf { .. }
-            | Backend::AmfCpu { .. } => ReadbackFormat::Bgra8,
+            Backend::X264 { .. } | Backend::IntelCpu { .. } | Backend::AmfCpu { .. } => {
+                ReadbackFormat::Nv12
+            }
+            Backend::Nvenc { .. } | Backend::Intel { .. } | Backend::Amf { .. } => {
+                ReadbackFormat::Bgra8
+            }
         }
     }
 
@@ -1394,8 +1403,14 @@ impl Backend {
             (Backend::IntelCpu { encoder }, ReadbackFormat::Bgra8) => {
                 encoder.encode_bgra_padded(data, row_pitch, force_idr)
             }
+            (Backend::IntelCpu { encoder }, ReadbackFormat::Nv12) => {
+                encoder.encode_nv12_padded(data, row_pitch, force_idr)
+            }
             (Backend::AmfCpu { encoder }, ReadbackFormat::Bgra8) => {
                 encoder.encode_bgra_padded(data, row_pitch, force_idr)
+            }
+            (Backend::AmfCpu { encoder }, ReadbackFormat::Nv12) => {
+                encoder.encode_nv12_padded(data, row_pitch, force_idr)
             }
             (Backend::X264 { encoder }, ReadbackFormat::Bgra8) => {
                 encoder.encode_bgra_padded(data, row_pitch, force_idr)

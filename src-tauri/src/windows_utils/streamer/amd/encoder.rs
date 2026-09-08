@@ -636,6 +636,66 @@ impl Encoder {
         self.submit_slot(slot, force_idr)
     }
 
+    /// Encode a frame the GPU's video processor already scaled and converted to NV12.
+    ///
+    /// NV12 is what VCN wants. AMF accepts BGRA — FFmpeg's format map lists it as first-class —
+    /// but AMD state that packed-RGB input silently invokes an internal GPU colour converter
+    /// that competes with the foreground application, and OBS refuses BGRA on its texture path
+    /// for the same reason. That converter is a pass this code neither controls nor measures;
+    /// taking NV12 removes it, and the conversion that replaces it is one the scaler was already
+    /// doing inside a `VideoProcessorBlt` it had to run anyway.
+    ///
+    /// Layout per `Scaler::read_back` with `ReadbackFormat::Nv12`: `height` rows of luma then
+    /// `height / 2` rows of interleaved chroma (U then V), all at one `row_pitch`. That is one
+    /// D3D11 NV12 subresource, so `UpdateSubresource` takes it in a single call.
+    ///
+    /// **UNVERIFIED**: no machine on this project has an AMD GPU. See
+    /// `docs/manual-tests/amd-amf.md`.
+    pub fn encode_nv12_padded(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        let rows = h + h / 2;
+        let need = rows * row_pitch as usize;
+        if (row_pitch as usize) < w || data.len() < need {
+            bail!(
+                "encode_nv12_padded: need row_pitch >= {w} and >= {need} bytes for {w}x{h} NV12                  (got pitch {row_pitch}, {} bytes)",
+                data.len()
+            );
+        }
+        // The ring is BGRA until the first NV12 frame arrives. `retune_input_format` rebuilds it
+        // and re-`Init`s the component, which is the same path a format change on the GPU side
+        // takes and runs at most once per session.
+        if self.ring_format != DXGI_FORMAT_NV12 {
+            self.retune_input_format(DXGI_FORMAT_NV12)?;
+        }
+
+        let slot = self.ring_next;
+        let dst = self
+            .ring
+            .get(slot)
+            .ok_or_else(|| anyhow!("AMF ring slot {slot} out of range"))?
+            .clone();
+        // SAFETY: `data` holds at least `(height + height / 2) * row_pitch` bytes, checked
+        // above, and `dst` is a live default-usage NV12 texture of exactly the encoder's
+        // dimensions — one subresource covering both planes.
+        unsafe {
+            self.context.UpdateSubresource(
+                &dst,
+                0,
+                None,
+                data.as_ptr() as *const c_void,
+                row_pitch,
+                0,
+            );
+            self.context.Flush();
+        }
+        self.submit_slot(slot, force_idr)
+    }
+
     /// Static-desktop repeat: re-submit the texture that is already staged. AMF has no
     /// "encode the previous frame again" call, but the input texture is still valid and still
     /// holds the last picture, so a repeat costs one encode and zero copies.
@@ -1086,13 +1146,18 @@ impl Encoder {
         };
         self.set_i64(prop::AMF_VIDEO_ENCODER_CABAC_ENABLE, coding as i64)?;
 
-        // 26. We feed full-range colour and the NVENC path signals videoFullRangeFlag = 1; keep
-        // the two vendors consistent or AMD hosts look washed out next to NVIDIA ones.
+        // 26. Colour range follows the input, because the two input formats do not carry the
+        // same one. Packed BGRA off the capture is full range; NV12 out of W3a's scaler comes
+        // from the D3D11 video processor, whose default output is BT.709 **limited**. Signalling
+        // full range over limited-range samples is the washed-out picture this is here to avoid,
+        // so the flag is the format's answer rather than a constant.
+        //
         // `FullRangeColor` is the only colour property AMF actually writes into an AVC
-        // bitstream — the three below are set anyway in case a future driver honours them, and
+        // bitstream — the two below are set anyway in case a future driver honours them, and
         // their failure is logged once rather than fatal.
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR, true);
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, true);
+        let full_range = self.surface_format != AMF_SURFACE_NV12;
+        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR, full_range);
+        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, full_range);
         self.set_optional_i64(
             prop::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
             COLOR_PRIMARIES_BT709,
@@ -1100,6 +1165,18 @@ impl Encoder {
         self.set_optional_i64(
             prop::AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
             TRANSFER_CHARACTERISTIC_BT709,
+        );
+        self.set_optional_i64(
+            prop::AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF,
+            MATRIX_COEFF_BT709,
+        );
+        self.set_optional_i64(
+            prop::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
+            if full_range {
+                COLOR_PROFILE_FULL_709
+            } else {
+                COLOR_PROFILE_709
+            },
         );
 
         // 27. SmartAccess Video parallelises *throughput* across VCN instances; splitting one
@@ -1512,8 +1589,16 @@ impl Drop for Encoder {
 /// (components/ColorSpace.h). Set for completeness; AMF is reported not to write any of the
 /// `Out*` colour properties into an AVC bitstream, which is why `FullRangeColor` carries the
 /// signalling that actually reaches the client.
-const COLOR_PRIMARIES_BT709: i64 = 1;
-const TRANSFER_CHARACTERISTIC_BT709: i64 = 1;
+pub(crate) const COLOR_PRIMARIES_BT709: i64 = 1;
+pub(crate) const TRANSFER_CHARACTERISTIC_BT709: i64 = 1;
+/// `AMF_COLOR_MATRIX_COEFF_BT_709`, the VUI `matrix_coefficients` value.
+pub(crate) const MATRIX_COEFF_BT709: i64 = 1;
+/// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_709` — BT.709 *studio* (limited) range.
+pub(crate) const COLOR_PROFILE_709: i64 = 1;
+/// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709` — BT.709 full range. Note this is 7, not the
+/// 4/5/6 the commented-out G10/G2084 entries above it occupy in `ColorSpace.h`; counting down
+/// the enum rather than reading the assigned values is how that goes wrong.
+pub(crate) const COLOR_PROFILE_FULL_709: i64 = 7;
 
 fn usage_name(u: AMF_VIDEO_ENCODER_USAGE) -> &'static str {
     match u {

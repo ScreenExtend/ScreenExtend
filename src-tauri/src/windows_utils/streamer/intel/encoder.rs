@@ -15,7 +15,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
     DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
@@ -327,6 +329,7 @@ pub struct Encoder {
     src_h: u32,
 
     upload_texture: Option<ID3D11Texture2D>,
+    nv12_upload_texture: Option<ID3D11Texture2D>,
     last_nv12: *mut mfxFrameSurface1,
 
     /// What the runtime agreed to for slicing, decided by `ENCODE_Query`, not by us.
@@ -450,6 +453,7 @@ impl Encoder {
             src_w,
             src_h,
             upload_texture: None,
+            nv12_upload_texture: None,
             last_nv12: ptr::null_mut(),
             slice_mode: SliceMode::FixedCount(0),
             frame_index: 0,
@@ -906,6 +910,62 @@ impl Encoder {
         self.encode_texture(&tex, force_idr)
     }
 
+    /// Encode a frame the GPU's video processor already scaled *and* converted to NV12.
+    ///
+    /// This is the CPU-bridge path's whole VPP pass gone, not just a smaller upload. The bridge
+    /// exists because the captured display lives on an adapter Quick Sync cannot read, so the
+    /// frame has to come back through system memory either way; what changes is that the scaler
+    /// hands over 1.5 bytes a pixel already in the encoder's own format instead of 4 bytes of
+    /// BGRA that this encoder then re-uploaded and ran a `VideoProcessorBlt` over. The upload
+    /// goes straight into the encode surface.
+    ///
+    /// Layout per `Scaler::read_back` with `ReadbackFormat::Nv12`: `height` rows of luma then
+    /// `height / 2` rows of interleaved chroma (U then V), all at one `row_pitch`. That is
+    /// exactly one D3D11 NV12 subresource, so `UpdateSubresource` takes it in a single call.
+    pub fn encode_nv12_padded(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        let rows = h + h / 2;
+        let need = rows * row_pitch as usize;
+        if (row_pitch as usize) < w || data.len() < need {
+            bail!(
+                "encode_nv12_padded: need row_pitch >= {w} and >= {need} bytes for {w}x{h} NV12                  (got pitch {row_pitch}, {} bytes)",
+                data.len()
+            );
+        }
+
+        let staging = self.ensure_nv12_upload_texture()?;
+        unsafe {
+            self.context.UpdateSubresource(
+                &staging,
+                0,
+                None,
+                data.as_ptr() as *const c_void,
+                row_pitch,
+                0,
+            );
+        }
+
+        let force_idr = force_idr || self.idr_requested;
+        let surf = self.get_surface(SurfaceKind::Encode)?;
+        if let Err(e) = unsafe { self.copy_into_nv12_surface(surf, &staging) } {
+            self.release_surface(surf);
+            return Err(e);
+        }
+        let out = unsafe { self.encode_surface(surf, force_idr) };
+        self.replace_last_nv12(surf);
+        let out = out?;
+        if force_idr {
+            self.idr_requested = false;
+        }
+        self.frame_index += 1;
+        Ok(out)
+    }
+
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         if self.last_nv12.is_null() {
             return Ok(Vec::new());
@@ -917,6 +977,83 @@ impl Encoder {
         }
         self.frame_index += 1;
         Ok(out)
+    }
+
+    /// The NV12 upload texture the CPU-bridge NV12 path writes into, created once.
+    ///
+    /// Separate from `upload_texture`, which is BGRA: a session uses one or the other for its
+    /// whole life, so only one is ever allocated.
+    fn ensure_nv12_upload_texture(&mut self) -> Result<ID3D11Texture2D> {
+        if let Some(t) = &self.nv12_upload_texture {
+            return Ok(t.clone());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.config.width,
+            Height: self.config.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D (Intel NV12 CPU-upload staging)")?;
+        let tex = tex.context("CreateTexture2D returned no NV12 texture")?;
+        self.nv12_upload_texture = Some(tex.clone());
+        Ok(tex)
+    }
+
+    /// Copy a whole NV12 texture into a oneVPL surface's own D3D11 texture.
+    ///
+    /// No `D3D11_BOX`: the two are the same size by construction, and a box on an NV12 resource
+    /// has to be expressed in luma coordinates with even bounds, which is a needless way to be
+    /// wrong. `Flush` for the same reason `copy_into_surface` flushes — the oneVPL submit that
+    /// follows is on this same context, and starting the copy early is measurably worth more
+    /// than the extra submit costs.
+    unsafe fn copy_into_nv12_surface(
+        &self,
+        surf: *mut mfxFrameSurface1,
+        src: &ID3D11Texture2D,
+    ) -> Result<()> {
+        let iface = unsafe { (*surf).FrameInterface };
+        if iface.is_null() {
+            bail!("encode surface has no FrameInterface");
+        }
+        let get_native = unsafe { (*iface).GetNativeHandle }
+            .ok_or_else(|| anyhow!("FrameInterface::GetNativeHandle is null"))?;
+        let mut res: mfxHDL = ptr::null_mut();
+        let mut res_type: mfxResourceType = 0;
+        check_strict(
+            unsafe { get_native(surf, &mut res, &mut res_type) },
+            "FrameInterface::GetNativeHandle (encode surface)",
+        )?;
+        if res_type != MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
+            bail!("encode surface is not a D3D11 texture (resource_type={res_type})");
+        }
+        let dst_ptr = res;
+        let dst = unsafe { ID3D11Texture2D::from_raw_borrowed(&dst_ptr) }
+            .ok_or_else(|| anyhow!("GetNativeHandle returned null texture"))?;
+        let dst_res: ID3D11Resource = dst
+            .cast()
+            .context("encode surface texture as ID3D11Resource")?;
+        let src_res: ID3D11Resource = src
+            .cast()
+            .context("NV12 upload texture as ID3D11Resource")?;
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, None);
+            if per_frame_flush_enabled() {
+                self.context.Flush();
+            }
+        }
+        Ok(())
     }
 
     fn ensure_upload_texture(&mut self) -> Result<ID3D11Texture2D> {

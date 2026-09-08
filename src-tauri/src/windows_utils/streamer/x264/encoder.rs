@@ -114,11 +114,14 @@ impl X264Encoder {
         p.b_annexb = 1;
         p.i_log_level = X264_LOG_ERROR;
 
-        // colour signalling
+        // Colour signalling. BT.709 limited range, which is what both input paths now carry:
+        // the CPU BGRA converter uses the BT.709 matrix, and the scaler's NV12 comes out of the
+        // D3D11 video processor in BT.709 limited. This used to say SMPTE 170M (BT.601, value 6)
+        // and was correct only while the CPU converter — which was BT.601 — was the only door in.
         p.vui.b_fullrange = 0;
-        p.vui.i_colorprim = 6; // SMPTE 170M (BT.601)
-        p.vui.i_transfer = 6; // SMPTE 170M
-        p.vui.i_colmatrix = 6; // SMPTE 170M
+        p.vui.i_colorprim = 1; // BT.709
+        p.vui.i_transfer = 1; // BT.709
+        p.vui.i_colmatrix = 1; // BT.709
 
         let profile = match config.profile {
             H264Profile::Baseline => PROFILE_BASELINE,
@@ -446,11 +449,11 @@ fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &m
         let b0 = row0[i] as i32;
         let g0 = row0[i + 1] as i32;
         let r0 = row0[i + 2] as i32;
-        y0[x] = bt601_y(r0, g0, b0);
+        y0[x] = bt709_y(r0, g0, b0);
         let b1 = row1[i] as i32;
         let g1 = row1[i + 1] as i32;
         let r1 = row1[i + 2] as i32;
-        y1[x] = bt601_y(r1, g1, b1);
+        y1[x] = bt709_y(r1, g1, b1);
     }
     for cx in 0..w / 2 {
         let i = (cx * 2) * 4;
@@ -462,24 +465,33 @@ fn convert_row_pair(row0: &[u8], row1: &[u8], y2: &mut [u8], u: &mut [u8], v: &m
         let r =
             (row0[i + 2] as i32 + row0[i + 6] as i32 + row1[i + 2] as i32 + row1[i + 6] as i32 + 2)
                 >> 2;
-        u[cx] = bt601_u(r, g, b);
-        v[cx] = bt601_v(r, g, b);
+        u[cx] = bt709_u(r, g, b);
+        v[cx] = bt709_v(r, g, b);
     }
 }
 
+// BT.709 limited range, 8-bit, in the usual >> 8 integer form.
+//
+// These were BT.601 (`66/129/25`, `-38/-74/112`, `112/-94/-18`), matching a BT.601 VUI, which was
+// self-consistent as long as this CPU conversion was the only way in. It is not any more: the
+// scaler's NV12 output comes from the D3D11 video processor, whose default output space is
+// BT.709 limited on every driver observed, and there is one VUI for both. So the CPU path moves
+// to BT.709 rather than the signalling moving to a lie. It also matches what the NVENC path has
+// always written into its own VUI.
+
 #[inline(always)]
-fn bt601_y(r: i32, g: i32, b: i32) -> u8 {
-    clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16)
+fn bt709_y(r: i32, g: i32, b: i32) -> u8 {
+    clamp8(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16)
 }
 
 #[inline(always)]
-fn bt601_u(r: i32, g: i32, b: i32) -> u8 {
-    clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128)
+fn bt709_u(r: i32, g: i32, b: i32) -> u8 {
+    clamp8(((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128)
 }
 
 #[inline(always)]
-fn bt601_v(r: i32, g: i32, b: i32) -> u8 {
-    clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128)
+fn bt709_v(r: i32, g: i32, b: i32) -> u8 {
+    clamp8(((112 * r - 102 * g - 10 * b + 128) >> 8) + 128)
 }
 
 #[inline(always)]
