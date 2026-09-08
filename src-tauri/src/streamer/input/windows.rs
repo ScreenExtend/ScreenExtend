@@ -18,8 +18,8 @@ use windows::Win32::System::Threading::{
     THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Controls::{
-    CreateSyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
-    POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
+    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
@@ -796,6 +796,20 @@ impl Injector {
         match self.target {
             Some(r) => (r.width as i32, r.height as i32),
             None => (self.virt.width, self.virt.height),
+        }
+    }
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        // One pair of these per session leaked for the life of the host process. Windows caps
+        // synthetic pointer devices per process, so the visible symptom was pen pressure and
+        // multi-touch quietly degrading to mouse after enough reconnects.
+        for dev in [self.pen_dev.take(), self.touch_dev.take()]
+            .into_iter()
+            .flatten()
+        {
+            unsafe { DestroySyntheticPointerDevice(dev) };
         }
     }
 }
