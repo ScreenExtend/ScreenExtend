@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 use super::protocol::{
     btn, positions_cursor, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
-use super::DisplayRect;
+use super::{ClientPlatform, ClientProfile, DisplayRect};
 
 pub const NAME: &str = "macos-cgevent";
 
@@ -118,7 +118,57 @@ fn modifier_self_flag(vk: u16) -> u64 {
     }
 }
 
-fn code_to_keycode(code: &str) -> Option<u16> {
+/// The modifier row, which is the only part of the table that depends on who is typing.
+///
+/// A PC keyboard's Ctrl is the command modifier — Ctrl+C copies — and macOS spells that Command,
+/// so a PC client's Ctrl has to become Command and its Windows key has to become Control.
+/// An Apple keyboard already has both in the right places, and swapping them there is exactly
+/// backwards: the user presses Command+C, the browser reports `MetaLeft`, and a swapped table
+/// injects Control+C, which is not copy. Their muscle-memory Ctrl+A (start of line in Cocoa)
+/// becomes Command+A, select-all.
+fn modifier_keycode(code: &str, apple_client: bool) -> Option<u16> {
+    Some(match code {
+        "ShiftLeft" => VK_SHIFT,
+        "ShiftRight" => VK_RSHIFT,
+        "AltLeft" => VK_OPTION,
+        "AltRight" => VK_ROPTION,
+        "CapsLock" => VK_CAPSLOCK,
+        "ControlLeft" => {
+            if apple_client {
+                VK_CONTROL
+            } else {
+                VK_COMMAND
+            }
+        }
+        "ControlRight" => {
+            if apple_client {
+                VK_RCONTROL
+            } else {
+                VK_RCOMMAND
+            }
+        }
+        "MetaLeft" | "OSLeft" => {
+            if apple_client {
+                VK_COMMAND
+            } else {
+                VK_CONTROL
+            }
+        }
+        "MetaRight" | "OSRight" => {
+            if apple_client {
+                VK_RCOMMAND
+            } else {
+                VK_RCONTROL
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn code_to_keycode(code: &str, apple_client: bool) -> Option<u16> {
+    if let Some(vk) = modifier_keycode(code, apple_client) {
+        return Some(vk);
+    }
     let vk = match code {
         // Letters
         "KeyA" => 0x00,
@@ -178,16 +228,6 @@ fn code_to_keycode(code: &str) -> Option<u16> {
         "Escape" => 0x35,
         "Delete" => 0x75, // ForwardDelete
         "Insert" => 0x72, // Help
-        // Modifiers (REMAPPED)
-        "ShiftLeft" => VK_SHIFT as _,
-        "ShiftRight" => VK_RSHIFT as _,
-        "ControlLeft" => VK_COMMAND as _, // Control to Command
-        "ControlRight" => VK_RCOMMAND as _,
-        "AltLeft" => VK_OPTION as _,
-        "AltRight" => VK_ROPTION as _,
-        "MetaLeft" | "OSLeft" => VK_CONTROL as _, // Windows/Super to Control
-        "MetaRight" | "OSRight" => VK_RCONTROL as _,
-        "CapsLock" => VK_CAPSLOCK as _,
         // Function keys
         "F1" => 0x7A,
         "F2" => 0x78,
@@ -249,6 +289,9 @@ pub fn boost_thread() {
 pub struct Injector {
     source: CGEventSourceRef,
     device_name: Option<String>,
+    /// The client is typing on an Apple keyboard, so the modifier row passes through instead of
+    /// being swapped.
+    apple_client: bool,
     target: Option<DisplayRect>,
     desktop: DisplayRect,
     geom_checked: Option<Instant>,
@@ -263,7 +306,17 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn new(device_name: Option<String>) -> Self {
+    pub fn new(client: ClientProfile) -> Self {
+        let ClientProfile {
+            device_name,
+            platform,
+        } = client;
+        let apple_client = platform.is_apple();
+        if platform == ClientPlatform::Unknown {
+            log::info!(
+                "client platform not reported; assuming a PC keyboard layout (Ctrl -> Command)"
+            );
+        }
         let source = unsafe { CGEventSourceCreate(SOURCE_STATE_HID) };
         if source.is_null() {
             log::warn!("CGEventSourceCreate returned null; synthesized events may be degraded");
@@ -286,6 +339,7 @@ impl Injector {
         Injector {
             source,
             device_name,
+            apple_client,
             target: None,
             desktop,
             geom_checked: None,
@@ -562,7 +616,7 @@ impl Injector {
     }
 
     fn key(&mut self, down: bool, code: &str, key: &str) {
-        if let Some(kc) = code_to_keycode(code) {
+        if let Some(kc) = code_to_keycode(code, self.apple_client) {
             if down {
                 self.down_keys.insert(kc);
             } else {
@@ -842,6 +896,53 @@ mod tests {
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    }
+
+    /// The command modifier has to land on Command for both, from opposite physical keys.
+    #[test]
+    fn the_modifier_row_follows_the_keyboard_the_user_is_actually_typing_on() {
+        for (code, pc, apple) in [
+            ("ControlLeft", VK_COMMAND, VK_CONTROL),
+            ("ControlRight", VK_RCOMMAND, VK_RCONTROL),
+            ("MetaLeft", VK_CONTROL, VK_COMMAND),
+            ("OSRight", VK_RCONTROL, VK_RCOMMAND),
+        ] {
+            assert_eq!(code_to_keycode(code, false), Some(pc), "{code} from a PC");
+            assert_eq!(
+                code_to_keycode(code, true),
+                Some(apple),
+                "{code} from a Mac"
+            );
+        }
+        // Everything else is the same table for everyone.
+        for code in ["ShiftLeft", "AltLeft", "CapsLock", "KeyC", "F5", "ArrowUp"] {
+            assert_eq!(
+                code_to_keycode(code, false),
+                code_to_keycode(code, true),
+                "{code} must not depend on the client"
+            );
+        }
+        assert_eq!(code_to_keycode("NoSuchKey", false), None);
+    }
+
+    #[test]
+    fn a_client_platform_string_maps_to_the_keyboard_it_implies() {
+        for (s, apple) in [
+            ("macOS", true),
+            ("iOS", true),
+            ("Windows", false),
+            ("Android", false),
+            ("Linux", false),
+            ("Unknown", false),
+            ("", false),
+        ] {
+            assert_eq!(ClientPlatform::from_reported(s).is_apple(), apple, "{s}");
+        }
+        // The client sends its own capitalisation; the parse must not care.
+        assert_eq!(
+            ClientPlatform::from_reported("MACOS"),
+            ClientPlatform::MacOs
+        );
     }
 
     const FIELD_SCROLL_DELTA_AXIS_1: u32 = 11;

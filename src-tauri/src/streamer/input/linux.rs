@@ -11,6 +11,7 @@
 //!   - Wayland vs X11: uinput is kernel-level and works under both.
 
 use super::protocol::InputEvent;
+use super::ClientProfile;
 
 pub const NAME: &str = "linux-stub";
 
@@ -21,7 +22,7 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn new(_device_name: Option<String>) -> Self {
+    pub fn new(_client: ClientProfile) -> Self {
         Injector { warned: false }
     }
 

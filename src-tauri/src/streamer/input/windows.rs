@@ -44,7 +44,7 @@ use super::protocol::{
     SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
-use super::DisplayRect;
+use super::{ClientProfile, DisplayRect};
 
 pub const NAME: &str = "windows-sendinput+syntheticpointer";
 
@@ -134,7 +134,9 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn new(device_name: Option<String>) -> Self {
+    pub fn new(client: ClientProfile) -> Self {
+        // The scancode table is layout-neutral, so nothing here depends on the client platform.
+        let ClientProfile { device_name, .. } = client;
         let pen_dev = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }
             .map_err(|e| log::warn!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
             .ok();
@@ -1066,7 +1068,7 @@ mod tests {
         const SAMPLES: usize = 40;
         const REPS: usize = 500;
         let samples = batch(SAMPLES);
-        let mut inj = Injector::new(None);
+        let mut inj = Injector::new(ClientProfile::default());
 
         // The shape this replaces: one mouse_pointer -> one SendInput per sample.
         let t = Instant::now();
