@@ -346,7 +346,11 @@ impl CaptureBackend for SckBackend {
         let delegate = unsafe {
             let d: *mut AnyObject = msg_send![delegate_class(), new];
             let d = retain_new(d).ok_or(CaptureError::StreamCreateFailed)?;
-            set_ctx_ivar(&d, ctx);
+            if !set_ctx_ivar(&d, ctx) {
+                drop(Box::from_raw(ctx));
+                teprintln!("[sck] the output delegate has no ctx ivar; cannot start SCK capture");
+                return Err(CaptureError::StreamCreateFailed);
+            }
             d
         };
 
@@ -442,6 +446,8 @@ impl CaptureBackend for SckBackend {
         if let Some(delegate) = &self.delegate {
             // SAFETY: `delegate` is an instance of our own class, which declares the ivar.
             unsafe { set_ctx_ivar(delegate, ptr::null_mut()) };
+            // A false return here would mean the delegate is not ours, which cannot happen; the
+            // barrier below is what actually makes the free safe either way.
         }
         if let Some(stream) = &self.stream {
             // Bridge the async stop to sync so the delegate is guaranteed not to
@@ -494,14 +500,14 @@ impl Drop for SckBackend {
 /// # Safety
 /// `delegate` must be an instance of [`delegate_class`] (which declares the
 /// `ctx` ivar of type `*mut c_void`).
-unsafe fn set_ctx_ivar(delegate: &AnyObject, ctx: *mut OutputCtx) {
-    let ivar = delegate
-        .class()
-        .instance_variable(CTX_IVAR_NAME)
-        .expect("SCK delegate must have the ctx ivar");
+unsafe fn set_ctx_ivar(delegate: &AnyObject, ctx: *mut OutputCtx) -> bool {
+    let Some(ivar) = delegate.class().instance_variable(CTX_IVAR_NAME) else {
+        return false;
+    };
     // SAFETY: the ivar was declared as `*mut c_void` on this exact class.
     let slot = unsafe { ivar.load_ptr::<*mut c_void>(delegate) };
     unsafe { *slot = ctx.cast::<c_void>() };
+    true
 }
 
 /// Read the boxed `OutputCtx` pointer back out of the delegate's ivar.
@@ -555,7 +561,7 @@ fn resolve_display(
         Ok(Some(raw)) => {
             let ptr = NonNull::new(raw as *mut AnyObject).ok_or(CaptureError::DisplayNotFound)?;
             // SAFETY: re-wrap the +1 retain leaked in the block.
-            Ok(unsafe { Retained::from_raw(ptr.as_ptr()).unwrap() })
+            unsafe { Retained::from_raw(ptr.as_ptr()) }.ok_or(CaptureError::DisplayNotFound)
         }
         Ok(None) => Err(CaptureError::DisplayNotFound),
         Err(_) => Err(CaptureError::ShareableContent),
@@ -579,7 +585,7 @@ unsafe fn find_display(content: &AnyObject, display_id: DisplayId) -> Option<Ret
         let id: u32 = unsafe { msg_send![&*display, displayID] };
         if id == display_id {
             // SAFETY: retain the +0 element to hand it back across the bridge.
-            return Some(unsafe { Retained::retain(display).unwrap() });
+            return unsafe { Retained::retain(display) };
         }
     }
     None
