@@ -1,4 +1,5 @@
 pub mod device;
+pub mod engine;
 pub mod format;
 pub mod guards;
 pub mod loopback;

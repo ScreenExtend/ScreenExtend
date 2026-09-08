@@ -9,13 +9,14 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
+use windows::Win32::System::Com::CLSCTX_ALL;
 
 use super::device::{
     create_enumerator, default_render_endpoint, DeviceEvent, NotifierRegistration,
 };
+use super::engine;
 use super::format::{convert_to_stereo_f32, parse_mix_format, MixFormat, SampleKind};
-use super::guards::{ComGuard, EventHandle, MmcssGuard};
+use super::guards::{ComGuard, EventHandle, MixFormatPtr, MmcssGuard};
 use super::silence::SilenceCompanion;
 use crate::streamer::audio::encoder::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES};
 use crate::streamer::audio::{
@@ -85,6 +86,7 @@ struct Session {
     mix: MixFormat,
     companion: SilenceCompanion,
     period_frames: u32,
+    buffer_frames: u32,
 }
 
 impl Drop for Session {
@@ -155,6 +157,9 @@ fn run(
     diagnostics
         .period_frames
         .store(session.period_frames, Ordering::Relaxed);
+    diagnostics
+        .buffer_frames
+        .store(session.buffer_frames, Ordering::Relaxed);
 
     let _ = ready_tx.send(Ok((
         AudioFormat {
@@ -388,8 +393,17 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
         .Activate(CLSCTX_ALL, None)
         .context("Activate IAudioClient (loopback)")?;
 
-    let pwfx = client.GetMixFormat().context("GetMixFormat")?;
-    let mix = parse_mix_format(pwfx)?;
+    // RAII from here: every `?` below used to leak this `CoTaskMemAlloc`'d format, and
+    // `acquire` sits on a 200 ms retry loop.
+    let pwfx = MixFormatPtr::from_raw(client.GetMixFormat().context("GetMixFormat")?);
+    let mix = parse_mix_format(pwfx.as_ptr())?;
+
+    if let Some(periods) = engine::query_engine_periods(&client, pwfx.as_ptr()) {
+        crate::tprintln!(
+            "audio: endpoint engine periods {}",
+            periods.describe(mix.sample_rate)
+        );
+    }
 
     let base_flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
@@ -398,14 +412,20 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
         && matches!(mix.kind, SampleKind::F32)
     {
         // Fast path (§4.4): 48 kHz float32 stereo — take the mix format verbatim.
-        let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, base_flags, 0, 0, pwfx, None);
-        CoTaskMemFree(Some(pwfx as *const _));
-        init.context("Initialize loopback (fast path)")?;
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                base_flags,
+                0,
+                0,
+                pwfx.as_ptr(),
+                None,
+            )
+            .context("Initialize loopback (fast path)")?;
         mix
     } else {
         // Non-48k / non-stereo / integer: ask the engine to convert to 48 kHz float stereo
         // (§4.4 option 1: AUTOCONVERTPCM). No userspace resampler needed.
-        CoTaskMemFree(Some(pwfx as *const _));
         let want = target_wave_format();
         let flags = base_flags | STREAMFLAGS_AUTOCONVERTPCM | STREAMFLAGS_SRC_DEFAULT_QUALITY;
         client
@@ -439,22 +459,53 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
         }
     };
 
-    let event = EventHandle::new_auto_reset()?;
-    client
-        .SetEventHandle(event.raw())
-        .context("SetEventHandle")?;
-    let capture: IAudioCaptureClient = client
-        .GetService()
-        .context("GetService(IAudioCaptureClient)")?;
-    let period_frames = client.GetBufferSize().unwrap_or(0);
-    client.Start().context("Start loopback capture")?;
+    // Everything between `Initialize` and `Start` is fallible, and dropping an initialized
+    // client without stopping it leaves the engine holding a stream we no longer own —
+    // `Session::drop` cannot help because no `Session` exists yet.
+    let started = (|| -> Result<(EventHandle, IAudioCaptureClient)> {
+        let event = EventHandle::new_auto_reset()?;
+        client
+            .SetEventHandle(event.raw())
+            .context("SetEventHandle")?;
+        let capture: IAudioCaptureClient = client
+            .GetService()
+            .context("GetService(IAudioCaptureClient)")?;
+        Ok((event, capture))
+    })();
+    let (event, capture) = match started {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = client.Stop();
+            let _ = client.Reset();
+            return Err(e);
+        }
+    };
+
+    let buffer_frames = match client.GetBufferSize() {
+        Ok(n) => n,
+        Err(e) => {
+            crate::teprintln!("audio: GetBufferSize failed ({e}); reporting 0");
+            0
+        }
+    };
+    // `GetDevicePeriod` is the period; `GetBufferSize` is the whole engine buffer, several
+    // periods deep. The two were reported as the same number under the name `period_frames`.
+    let period_frames = engine::device_period_frames(&client, effective_mix.sample_rate)
+        .map(|(default, _min)| default)
+        .unwrap_or(0);
+
+    if let Err(e) = client.Start() {
+        let _ = client.Reset();
+        return Err(anyhow::Error::from(e).context("Start loopback capture"));
+    }
 
     crate::tprintln!(
-        "audio: loopback acquired ({}Hz x{}ch {:?}, engine buffer {} frames)",
+        "audio: loopback acquired ({}Hz x{}ch {:?}, engine period {} frames, engine buffer {} frames)",
         effective_mix.sample_rate,
         effective_mix.channels,
         effective_mix.kind,
-        period_frames
+        period_frames,
+        buffer_frames
     );
 
     Ok(Session {
@@ -464,6 +515,7 @@ unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
         mix: effective_mix,
         companion,
         period_frames,
+        buffer_frames,
     })
 }
 

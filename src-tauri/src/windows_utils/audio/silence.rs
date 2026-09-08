@@ -7,10 +7,10 @@ use windows::Win32::Media::Audio::{
     IAudioClient, IAudioRenderClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
 };
-use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
+use windows::Win32::System::Com::CLSCTX_ALL;
 
 use super::device::{create_enumerator, default_render_endpoint};
-use super::guards::{ComGuard, EventHandle};
+use super::guards::{ComGuard, EventHandle, MixFormatPtr};
 
 pub struct SilenceCompanion {
     stop: Arc<AtomicBool>,
@@ -87,17 +87,17 @@ unsafe fn setup(
     let client: IAudioClient = device
         .Activate(CLSCTX_ALL, None)
         .context("Activate IAudioClient (silence companion)")?;
-    let pwfx = client.GetMixFormat().context("GetMixFormat (silence)")?;
-    let init = client.Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        0,
-        0,
-        pwfx,
-        None,
-    );
-    CoTaskMemFree(Some(pwfx as *const _));
-    init.context("Initialize render (silence companion)")?;
+    let pwfx = MixFormatPtr::from_raw(client.GetMixFormat().context("GetMixFormat (silence)")?);
+    client
+        .Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            0,
+            0,
+            pwfx.as_ptr(),
+            None,
+        )
+        .context("Initialize render (silence companion)")?;
 
     let event = EventHandle::new_auto_reset()?;
     client
