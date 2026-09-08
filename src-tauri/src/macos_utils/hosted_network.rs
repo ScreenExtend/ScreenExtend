@@ -375,11 +375,19 @@ fn wait_for_ap_mode(interface: &CWInterface) -> bool {
 /// AP mode with no address on the interface means nothing is serving DHCP: clients will see the
 /// network and fail to join. This is the difference between advertised and working, and it settles
 /// a second or two after the start, so it is watched rather than waited on.
-fn wait_for_ipv4(name: &str, timeout: Duration) -> Option<Ipv4Addr> {
+///
+/// `previous` is the address the interface held *before* the start, and rejecting it is not a
+/// refinement. Measured on 10.15.8: two seconds after `startHostAPModeWithSSID:` returned YES and
+/// `interfaceMode()` read HostAP, `getifaddrs` still reported the station address from the network
+/// the Mac had just left — so a naive read reports the AP as verified, on the LAN address, before
+/// the interface has been reconfigured at all. Forty-five seconds later the real answer was that
+/// the AP holds no address whatsoever.
+fn wait_for_ipv4(name: &str, previous: Option<Ipv4Addr>, timeout: Duration) -> Option<Ipv4Addr> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(ip) = super::networking::interface_ipv4(name) {
-            return Some(ip);
+        match crate::macos_utils::networking::interface_ipv4(name) {
+            Some(ip) if Some(ip) != previous => return Some(ip),
+            _ => {}
         }
         if Instant::now() >= deadline {
             return None;
@@ -394,13 +402,19 @@ fn wait_for_ipv4(name: &str, timeout: Duration) -> Option<Ipv4Addr> {
 /// of the two outcomes happened. Phase two notices an AP that goes away on its own — a radio reset,
 /// a Wi-Fi mode change from the menu bar, or the OS reclaiming the interface — which is what
 /// otherwise leaves the dashboard with a green light on a dead AP.
-fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<String>) {
+fn watch_liveness(
+    app: AppHandle,
+    generation: u64,
+    ssid: String,
+    iface: Option<String>,
+    previous_ipv4: Option<Ipv4Addr>,
+) {
     std::thread::spawn(move || {
         use tauri::Manager;
 
         let host_ipv4 = iface
             .as_deref()
-            .and_then(|name| wait_for_ipv4(name, DHCP_SETTLE_TIMEOUT));
+            .and_then(|name| wait_for_ipv4(name, previous_ipv4, DHCP_SETTLE_TIMEOUT));
         if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
             return;
         }
@@ -671,6 +685,13 @@ pub fn start_hosted_network(
         return false;
     };
 
+    // Read before anything touches the radio. macOS leaves the station address on the interface
+    // for seconds after the AP is up, and a verification that accepts it reports the AP as
+    // working, on the address of the network the Mac just left.
+    let station_ipv4 = interface_bsd_name(&interface)
+        .as_deref()
+        .and_then(crate::macos_utils::networking::interface_ipv4);
+
     let backend = probe_hosted_network_backend();
     if backend == HostedNetworkBackend::Unsupported {
         teprintln!(
@@ -750,11 +771,13 @@ pub fn start_hosted_network(
 
     *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
     *state.hosted_network_running.lock().unwrap() = true;
+    let bsd = interface_bsd_name(&interface);
     watch_liveness(
         app,
         WATCH_GENERATION.load(Ordering::Relaxed),
         name.to_string(),
-        interface_bsd_name(&interface),
+        bsd.clone(),
+        station_ipv4,
     );
     true
 }
@@ -909,7 +932,10 @@ mod tests {
         let number = unsafe { channel.channelNumber() };
         println!("channel {number} ({})", channel_band(&channel));
         let name = interface_bsd_name(&interface);
-        println!("interface {name:?}");
+        let station_ipv4 = name
+            .as_deref()
+            .and_then(crate::macos_utils::networking::interface_ipv4);
+        println!("interface {name:?}, station address before the start {station_ipv4:?}");
 
         let ssid = "ScreenExtend-Measure";
         let password = "screenextend";
@@ -932,17 +958,39 @@ mod tests {
             let ip = mode_ok
                 .then(|| name.clone())
                 .flatten()
-                .and_then(|n| wait_for_ipv4(&n, DHCP_SETTLE_TIMEOUT));
+                .and_then(|n| wait_for_ipv4(&n, station_ipv4, DHCP_SETTLE_TIMEOUT));
             let ip_at = t0.elapsed();
             println!(
                 "{}: accepted={accepted} in {accepted_at:?}, ap_mode={mode_ok} at {mode_at:?},                  ip={ip:?} at {ip_at:?}",
                 attempt.label
             );
-            stop_host_ap_mode();
-            std::thread::sleep(Duration::from_millis(400));
             if mode_ok {
+                // Hold the AP up long enough for a second device to scan it, which is the only
+                // way to learn what security an accepted `securityType:` actually advertises.
+                let hold = std::env::var("SCREENEXTEND_HOSTAP_HOLD_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if hold > 0 {
+                    println!("holding '{ssid}' up for {hold}s — scan it from another device now");
+                    let held = Instant::now();
+                    while held.elapsed() < Duration::from_secs(hold) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        println!(
+                            "  t+{:>3}s mode_is_ap={} ipv4={:?}",
+                            held.elapsed().as_secs(),
+                            interface_mode_is_host_ap(&interface),
+                            name.as_deref()
+                                .and_then(crate::macos_utils::networking::interface_ipv4),
+                        );
+                    }
+                }
+                stop_host_ap_mode();
+                std::thread::sleep(Duration::from_millis(400));
                 break;
             }
+            stop_host_ap_mode();
+            std::thread::sleep(Duration::from_millis(400));
         }
         println!("stopped; the radio should rejoin its known network on its own");
     }
@@ -974,6 +1022,9 @@ mod tests {
         };
         let ssid = "ScreenExtend-Sweep";
         let password = "screenextend";
+        let station = interface_bsd_name(&interface)
+            .as_deref()
+            .and_then(crate::macos_utils::networking::interface_ipv4);
         let mut candidates: Vec<u64> = (0..=64).collect();
         candidates.extend([96, 128, 160, 192, 256, 384, 512, 768, 1024, 2048]);
         for security in candidates {
@@ -982,7 +1033,7 @@ mod tests {
             let ip = mode_ok
                 .then(|| interface_bsd_name(&interface))
                 .flatten()
-                .and_then(|name| wait_for_ipv4(&name, DHCP_SETTLE_TIMEOUT));
+                .and_then(|name| wait_for_ipv4(&name, station, DHCP_SETTLE_TIMEOUT));
             println!("securityType {security:5}: accepted={accepted} ap_mode={mode_ok} ip={ip:?}");
             stop_host_ap_mode();
             std::thread::sleep(Duration::from_millis(400));
