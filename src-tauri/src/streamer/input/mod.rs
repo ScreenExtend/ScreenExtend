@@ -1,11 +1,59 @@
-use crossbeam_channel::{bounded, select, unbounded, Sender};
+use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender, TrySendError};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crate::streamer::audio::host_now_ns;
+use crate::streamer::telemetry::SharedTelemetry;
+
 pub mod protocol;
 
 use self::protocol::InputEvent;
+
+/// What the injector needs to know about the client driving it.
+///
+/// The display name is which virtual display its coordinates address; the platform decides the
+/// modifier layout on macOS, and is ignored everywhere else.
+#[derive(Clone, Debug, Default)]
+pub struct ClientProfile {
+    pub device_name: Option<String>,
+    pub platform: ClientPlatform,
+}
+
+/// The client's own operating system, as it reported at join.
+///
+/// Only the Apple/not-Apple distinction is load-bearing today, but the variants are kept whole
+/// because guessing from a boolean is how the original bug happened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientPlatform {
+    Windows,
+    MacOs,
+    IOs,
+    Android,
+    Linux,
+    #[default]
+    Unknown,
+}
+
+impl ClientPlatform {
+    /// Parses the `os` string the join request carries (`detectOs()` in the client page).
+    pub fn from_reported(os: &str) -> Self {
+        match os.trim().to_ascii_lowercase().as_str() {
+            "windows" => Self::Windows,
+            "macos" => Self::MacOs,
+            "ios" => Self::IOs,
+            "android" => Self::Android,
+            "linux" => Self::Linux,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether the keyboard in front of the user is an Apple one, where Command is the command
+    /// modifier and Control is the Emacs-style caret modifier.
+    pub fn is_apple(self) -> bool {
+        matches!(self, Self::MacOs | Self::IOs)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayRect {
@@ -13,12 +61,6 @@ pub struct DisplayRect {
     pub top: i32,
     pub width: u32,
     pub height: u32,
-}
-
-#[derive(Default)]
-pub struct Stats {
-    pub fast_received: AtomicU64,
-    pub fast_dropped: AtomicU64,
 }
 
 #[cfg(target_os = "windows")]
@@ -40,78 +82,200 @@ pub fn boost_current_thread() {
     backend::boost_thread();
 }
 
-pub fn tune_process() {
-    backend::tune_process();
-}
-
 pub fn prime() {
     #[cfg(target_os = "macos")]
     backend::prime_keyboard();
 }
 
-pub const FAST_CAP: usize = 512;
+/// Depth of the lossy queue, in events.
+///
+/// This is last-value-wins data: only where the pointer is *now* is observable, so a deep queue
+/// buys nothing and costs everything. At 512 a backlog was seconds of history that then got
+/// replayed in order, which is strictly worse for a cursor than dropping it — the user watches
+/// the pointer crawl through the past instead of jumping to their finger. 64 is a burst
+/// absorber, not a buffer; anything that does not clear inside [`MAX_FAST_AGE_NS`] is stale by
+/// the time it would be injected anyway.
+pub const FAST_CAP: usize = 64;
+
+/// How old a queued positional event may be before injecting it is worse than skipping it.
+///
+/// Three 60 Hz frames. A pointer position that old has already been superseded on the client;
+/// putting it on the screen produces the backwards crawl the queue depth used to cause.
+pub const MAX_FAST_AGE_NS: u64 = 50_000_000;
+
+/// Window over which the host keeps its minimum observed client-to-host delay.
+///
+/// The same 30 s the client uses to age out its own best RTT sample, for the same reason: a
+/// route change should not be remembered for the life of the session.
+const OFFSET_WINDOW_NS: u64 = 30_000_000_000;
+
+/// The host's own estimate of how far a stamped input frame ran behind the best case.
+///
+/// The client already estimates the clock offset NTP-style from the `PING`/`PONG` pair, but it
+/// never sends the result back, and the host needs a number to say how long an event spent in
+/// flight. What the host can see unaided is `host_recv - client_send` for every stamped frame:
+/// the true offset plus that frame's one-way delay. Its *minimum* over a window is therefore the
+/// tightest offset estimate obtainable from one direction alone, and subtracting it leaves the
+/// excess one-way delay — 0 on the best sample, growing with queueing. That relative reading is
+/// exactly what a latency budget wants, and it needs nothing from the client but a stamp.
+///
+/// Relaxed atomics throughout: these are statistics on the SCTP receive path, not
+/// synchronization, and a reader one sample stale reports a percentile one sample stale.
+#[derive(Debug)]
+struct ClockOffset {
+    current: AtomicU64,
+    previous: AtomicU64,
+    window_start_ns: AtomicU64,
+}
+
+impl Default for ClockOffset {
+    fn default() -> Self {
+        Self {
+            current: AtomicU64::new(u64::MAX),
+            previous: AtomicU64::new(u64::MAX),
+            window_start_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ClockOffset {
+    /// Fold one observation in and return this frame's excess delay, or `None` when the frame
+    /// carried no client stamp.
+    fn observe(&self, client_ns: u64, host_recv_ns: u64) -> Option<u64> {
+        if client_ns == 0 {
+            return None;
+        }
+        let raw = host_recv_ns.saturating_sub(client_ns);
+        let start = self.window_start_ns.load(Ordering::Relaxed);
+        if start == 0 {
+            self.window_start_ns.store(host_recv_ns, Ordering::Relaxed);
+        } else if host_recv_ns.saturating_sub(start) > OFFSET_WINDOW_NS {
+            self.previous
+                .store(self.current.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.current.store(u64::MAX, Ordering::Relaxed);
+            self.window_start_ns.store(host_recv_ns, Ordering::Relaxed);
+        }
+        self.current.fetch_min(raw, Ordering::Relaxed);
+        let base = self
+            .current
+            .load(Ordering::Relaxed)
+            .min(self.previous.load(Ordering::Relaxed));
+        Some(raw.saturating_sub(base))
+    }
+}
+
+/// An event with the two stamps the telemetry needs, moved through the channel as one unit.
+pub struct Queued {
+    pub ev: InputEvent,
+    /// `host_now_ns()` at the moment the transport handed the event over.
+    pub host_recv_ns: u64,
+}
+
+/// Whether an event is positional last-value-wins data that a fresher one supersedes.
+///
+/// Everything else — keys, buttons, clipboard, lifecycle — is a state transition whose loss the
+/// host cannot recover from, so it is never dropped for age however far behind the injector is.
+fn is_supersedable(ev: &InputEvent) -> bool {
+    matches!(
+        ev,
+        InputEvent::Pointer {
+            phase: protocol::Phase::Move | protocol::Phase::Enter | protocol::Phase::Over,
+            ..
+        } | InputEvent::PointerBatch { .. }
+            | InputEvent::MouseDelta { .. }
+    )
+}
 
 #[derive(Clone)]
 pub struct InjectorTx {
-    pub fast: Sender<InputEvent>,
-    pub reliable: Sender<InputEvent>,
-    pub stats: Arc<Stats>,
+    fast: Sender<Queued>,
+    /// The consumer's own end, kept here only so a full queue can be relieved from the head.
+    /// crossbeam has no ring-drop, and the channel is MPMC, so popping the oldest from the
+    /// producer side is exactly the "newest wins" policy this data wants.
+    fast_relief: Receiver<Queued>,
+    reliable: Sender<Queued>,
+    telemetry: SharedTelemetry,
+    offset: Arc<ClockOffset>,
 }
 
 impl InjectorTx {
     #[inline]
-    pub fn route(&self, ev: InputEvent, hot: bool) {
+    pub fn route(&self, ev: InputEvent, hot: bool, client_ns: u64) {
+        let host_recv_ns = host_now_ns();
+        if let Some(excess_ns) = self.offset.observe(client_ns, host_recv_ns) {
+            self.telemetry.stages.input_recv.record(excess_ns);
+        }
+        let q = Queued { ev, host_recv_ns };
         if hot {
-            match self.fast.try_send(ev) {
-                Ok(()) => {
-                    self.stats.fast_received.fetch_add(1, Ordering::Relaxed);
+            // Newest wins. Dropping the head rather than the tail is the whole point: when the
+            // queue is full the events in it are the stale ones and the arriving event is where
+            // the pointer actually is.
+            if let Err(TrySendError::Full(q)) = self.fast.try_send(q) {
+                let _ = self.fast_relief.try_recv();
+                if self.fast.try_send(q).is_err() {
+                    self.count(&self.telemetry.degradation.input_queue_drops);
+                    return;
                 }
-                Err(_) => {
-                    self.stats.fast_dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                self.count(&self.telemetry.degradation.input_queue_drops);
             }
         } else {
-            let _ = self.reliable.send(ev);
+            let _ = self.reliable.send(q);
         }
     }
 
     #[inline]
-    pub fn fast_queue_depth(&self) -> usize {
-        self.fast.len()
+    fn count(&self, c: &AtomicU64) {
+        c.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn release_all(&self) {
         use self::protocol::Lifecycle;
-        let _ = self
-            .reliable
-            .send(InputEvent::Lifecycle(Lifecycle::Focus(false)));
+        let _ = self.reliable.send(Queued {
+            ev: InputEvent::Lifecycle(Lifecycle::Focus(false)),
+            host_recv_ns: host_now_ns(),
+        });
     }
 }
 
-pub fn spawn(device_name: Option<String>) -> (InjectorTx, JoinHandle<()>) {
-    let (fast_tx, fast_rx) = bounded::<InputEvent>(FAST_CAP);
-    let (rel_tx, rel_rx) = unbounded::<InputEvent>();
-    let stats = Arc::new(Stats::default());
+pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, JoinHandle<()>) {
+    let (fast_tx, fast_rx) = bounded::<Queued>(FAST_CAP);
+    let fast_relief = fast_rx.clone();
+    let (rel_tx, rel_rx) = unbounded::<Queued>();
 
+    let thread_telemetry = Arc::clone(&telemetry);
     let join = thread::Builder::new()
         .name("injector".into())
         .spawn(move || {
             backend::boost_thread();
-            let mut inj = backend::Injector::new(device_name);
-            log::info!("injector thread up ({})", backend::NAME);
+            let mut inj = backend::Injector::new(client);
+            tprintln!("injector thread up ({})", backend::NAME);
+            let t = thread_telemetry;
             loop {
-                select! {
+                let q = select! {
                     recv(rel_rx) -> m => match m {
-                        Ok(ev) => inj.dispatch(&ev),
+                        Ok(q) => q,
                         Err(_) => break,
                     },
                     recv(fast_rx) -> m => match m {
-                        Ok(ev) => inj.dispatch(&ev),
+                        Ok(q) => q,
                         Err(_) => break,
                     },
+                };
+                let picked_up_ns = host_now_ns();
+                let age_ns = picked_up_ns.saturating_sub(q.host_recv_ns);
+                t.stages.input_queue.record(age_ns);
+                if age_ns > MAX_FAST_AGE_NS && is_supersedable(&q.ev) {
+                    t.degradation
+                        .input_stale_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
+                inj.dispatch(&q.ev);
+                t.stages
+                    .input_inject
+                    .record(host_now_ns().saturating_sub(q.host_recv_ns));
             }
-            log::info!("injector shutting down: releasing all held input");
+            tprintln!("injector shutting down: releasing all held input");
             inj.release_all();
         })
         .expect("spawn injector thread");
@@ -119,9 +283,80 @@ pub fn spawn(device_name: Option<String>) -> (InjectorTx, JoinHandle<()>) {
     (
         InjectorTx {
             fast: fast_tx,
+            fast_relief,
             reliable: rel_tx,
-            stats,
+            telemetry,
+            offset: Arc::new(ClockOffset::default()),
         },
         join,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streamer::input::protocol::Phase;
+
+    fn pointer(phase: Phase) -> InputEvent {
+        InputEvent::Pointer {
+            source: protocol::SRC_MOUSE,
+            id: 0,
+            x: 0.0,
+            y: 0.0,
+            pressure: 0.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            twist: 0.0,
+            w: 0.0,
+            h: 0.0,
+            buttons: 0,
+            phase,
+        }
+    }
+
+    #[test]
+    fn only_positional_events_may_be_dropped_for_age() {
+        assert!(is_supersedable(&pointer(Phase::Move)));
+        assert!(is_supersedable(&InputEvent::MouseDelta {
+            dx: 1,
+            dy: 1,
+            buttons: 0,
+            unadjusted: false,
+        }));
+        assert!(!is_supersedable(&pointer(Phase::Down)));
+        assert!(!is_supersedable(&pointer(Phase::Up)));
+        assert!(!is_supersedable(&InputEvent::Key {
+            down: true,
+            repeat: false,
+            mods: 0,
+            code: "KeyA".into(),
+            key: "a".into(),
+        }));
+    }
+
+    #[test]
+    fn the_offset_estimator_reports_excess_delay_over_its_best_sample() {
+        let c = ClockOffset::default();
+        // An unstamped frame contributes nothing and is not measured.
+        assert_eq!(c.observe(0, 1_000), None);
+        // First sample is by definition the best one seen.
+        assert_eq!(c.observe(1_000, 6_000), Some(0));
+        // 2 ms further behind than the best sample.
+        assert_eq!(c.observe(2_000, 9_000), Some(2_000));
+        // A better sample re-bases the estimate.
+        assert_eq!(c.observe(3_000, 7_000), Some(0));
+        assert_eq!(c.observe(4_000, 9_000), Some(1_000));
+    }
+
+    #[test]
+    fn a_stale_window_does_not_pin_the_estimate_forever() {
+        let c = ClockOffset::default();
+        assert_eq!(c.observe(1_000, 6_000), Some(0));
+        // Two windows later the 5 000 ns baseline has aged out of both slots, so a link that
+        // settled at 8 000 ns reads as its own best case rather than as permanent lateness.
+        let far = OFFSET_WINDOW_NS * 2 + 10_000;
+        c.observe(far, far + 8_000);
+        c.observe(far * 2, far * 2 + 8_000);
+        assert_eq!(c.observe(far * 3, far * 3 + 8_000), Some(0));
+    }
 }

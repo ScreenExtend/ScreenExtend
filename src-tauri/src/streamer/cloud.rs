@@ -220,6 +220,7 @@ impl CloudClient {
     pub fn spawn(config: CloudConfig, server_config: Config, sink: SharedCloudStatusSink) -> Self {
         let stop = Arc::new(Notify::new());
         let stop_for_thread = stop.clone();
+        let sink_for_error = Arc::clone(&sink);
         let handle = std::thread::Builder::new()
             .name("cloud-relay-client".to_string())
             .spawn(move || {
@@ -242,8 +243,21 @@ impl CloudClient {
                         }
                     }
                 });
-            })
-            .ok();
+            });
+        let handle = match handle {
+            Ok(h) => Some(h),
+            Err(e) => {
+                // Discarding this left `handle` as `None`, so `stop()` silently did nothing and
+                // the desktop UI sat on the "connecting" state it was given at startup forever,
+                // with no line anywhere saying why.
+                teprintln!("[cloud] could not start the relay client thread: {e}");
+                sink_for_error.report(
+                    CloudState::Error,
+                    format!("relay client did not start: {e}"),
+                );
+                None
+            }
+        };
         Self { stop, handle }
     }
 
@@ -378,7 +392,7 @@ async fn read_loop(
                         continue;
                     }
                 };
-                if let Some(()) = handle_relay_message(state, sink, tx, parsed)? {}
+                handle_relay_message(state, sink, tx, parsed)?;
             }
             Message::Ping(payload) => {
                 let _ = tx.send(Message::Pong(payload));
@@ -394,7 +408,7 @@ fn handle_relay_message(
     sink: &SharedCloudStatusSink,
     tx: &mpsc::UnboundedSender<Message>,
     msg: RelayToHost,
-) -> Result<Option<()>> {
+) -> Result<()> {
     match msg {
         RelayToHost::Registered { join_url, .. } => {
             tprintln!("[cloud] registered; clients can join at {join_url}");
@@ -432,7 +446,13 @@ fn handle_relay_message(
                 .await;
                 match serde_json::to_string(&resp) {
                     Ok(text) => {
-                        let _ = tx.send(Message::Text(text));
+                        // The writer loop breaks on its first send error, so a dropped
+                        // `signal_response` is a join that hangs with nothing logged.
+                        if tx.send(Message::Text(text)).is_err() {
+                            teprintln!(
+                                "[cloud] relay writer is gone; the WHEP answer for {client_id} was not delivered"
+                            );
+                        }
                     }
                     Err(e) => teprintln!("[cloud] failed to serialize signal_response: {e}"),
                 }
@@ -451,7 +471,7 @@ fn handle_relay_message(
             bail!("relay shutdown: {reason}");
         }
     }
-    Ok(Some(()))
+    Ok(())
 }
 
 async fn dispatch(
