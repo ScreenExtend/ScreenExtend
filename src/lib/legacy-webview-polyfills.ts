@@ -43,6 +43,14 @@ const removeBridged: ListenerBridge = function (type, listener) {
 };
 
 function bridgeMediaQueryListEvents() {
+  // Unlike the others this one replaces a global function rather than filling a gap on a
+  // prototype, so bail out before touching `window.matchMedia` when the host already has
+  // the events. Otherwise every matchMedia call on WebView2 pays an extra JS frame.
+  if (
+    typeof MediaQueryList !== "undefined"
+    && typeof MediaQueryList.prototype.addEventListener === "function"
+  ) return;
+
   const shim = (list: MediaQueryList | null) => {
     if (!list || typeof list.addEventListener === "function") return list;
     const target = list as unknown as {
@@ -203,10 +211,27 @@ function shimFindLast() {
   define(Array.prototype, "findLastIndex", findLastIndex);
 }
 
+// requestIdleCallback is safari 15.4. This is a deadline scheduler, NOT an idle scheduler:
+// it cannot know when the main thread is free, so on the floor a call degrades to exactly
+// the setTimeout it replaces. Only use it where the `timeout` option carries the guarantee.
+function shimRequestIdleCallback() {
+  define(globalThis, "requestIdleCallback", (callback: IdleRequestCallback, options?: IdleRequestOptions) => {
+    const start = Date.now();
+    return window.setTimeout(() => {
+      callback({
+        didTimeout: false,
+        timeRemaining: () => Math.max(0, 50 - (Date.now() - start)),
+      });
+    }, options?.timeout ?? 1);
+  });
+  define(globalThis, "cancelIdleCallback", (handle: number) => { window.clearTimeout(handle); });
+}
+
 bridgeMediaQueryListEvents();
 shimWeakRef();
 shimAggregateError();
 shimReplaceChildren();
 shimRelativeIndexing();
 shimFindLast();
+shimRequestIdleCallback();
 shimRegExpFlags();

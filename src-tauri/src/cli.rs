@@ -147,6 +147,11 @@ pub fn fast_path() {
     let Some(first) = raw.first().map(String::as_str) else {
         return;
     };
+    // `probe` has its own help and its own flags; the global scan for -h/--help would
+    // otherwise swallow `probe --help` and print the shipped command list instead.
+    if first == "probe" {
+        return;
+    }
     if first == "help" || raw.iter().any(|a| a == "-h" || a == "--help") {
         attach_console();
         print_help();
@@ -226,13 +231,19 @@ MODES:
     --whep-selftest       in-process WHEP client against a real virtual display;
                           asserts the answer SDP and that RTP actually flows
                           (requires a build with --features probe)
-    --duration <secs>     with --whep-selftest, keep streaming this long after RTP is
-                          proven so the stage histograms describe a steady session
+    --duration <secs>     how long a probe runs. The self-test holds the session open this
+                          long after RTP is proven; --live captures for this long instead of
+                          stopping at 150 frames. Without it a run is a liveness check whose
+                          histograms describe startup transients.
 
 TUNING FLAGS are the streamer's own and are parsed straight off the command line:
     --encoder <auto|nvidia|intel|software>   --scale <10..100>   --fps <n>   --max-fps <n>
     --qp <1..51>   --h264-profile <baseline|main|high>   --intra-refresh <on|off>
     --monitor <n>   --max-bitrate-kbps <n>   --disable-gpu-encode
+    --capture-backend <wgc|dxgi|auto>        Windows capture backend. DXGI is otherwise
+                          only reached by WGC failing, so it cannot be measured without this.
+                          Spelled out in full because `--capture` above already selects the
+                          single-frame PNG probe.
     --synthetic-pattern                      encode a generated pattern, not the desktop
     --workload <mixed|static|scroll|motion|drag>   scripted synthetic workload (implies
                           --synthetic-pattern): a still desktop, scrolling text, full-frame
@@ -1770,8 +1781,13 @@ mod desktop {
             #[allow(unused_mut)]
             let mut out = serde_json::json!({
                 "os": { "name": report.os_name, "version": report.os_version, "supported": report.os_supported, "minimum": report.min_os_version },
-                "audioBackend": report.audio_backend,
-                "displayBackend": report.display_backend,
+                "backends": {
+                    "capture": report.capture_backend,
+                    "encoder": report.encoder_backend,
+                    "display": report.display_backend,
+                    "audio": report.audio_backend,
+                    "hostedNetwork": report.hosted_network_backend,
+                },
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
                     "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
                 })).collect::<Vec<_>>(),
@@ -1825,8 +1841,11 @@ mod desktop {
             if report.os_supported { "yes" } else { "NO" }
         );
         println!("\nBackends:");
-        println!("  Audio:   {}", report.audio_backend);
-        println!("  Display: {}", report.display_backend);
+        println!("  Capture:        {}", report.capture_backend);
+        println!("  Encoder:        {}", report.encoder_backend);
+        println!("  Display:        {}", report.display_backend);
+        println!("  Audio:          {}", report.audio_backend);
+        println!("  Hosted network: {}", report.hosted_network_backend);
         if report.unsupported_apis.is_empty() {
             println!("\nAll capabilities available.");
         } else {

@@ -31,6 +31,7 @@ pub enum EncoderVendor {
     Auto,
     Nvidia,
     Intel,
+    Amd,
     Software,
 }
 
@@ -40,6 +41,7 @@ impl EncoderVendor {
             "auto" => Some(Self::Auto),
             "nvidia" | "nvenc" => Some(Self::Nvidia),
             "intel" | "quicksync" | "qsv" | "onevpl" | "vpl" => Some(Self::Intel),
+            "amd" | "amf" | "radeon" | "vce" | "vcn" => Some(Self::Amd),
             "software" | "sw" | "cpu" | "x264" => Some(Self::Software),
             _ => None,
         }
@@ -105,10 +107,15 @@ pub struct Config {
     /// Paint a large frame number and elapsed-millisecond clock over it, for the
     /// camera-based glass-to-glass method in `docs/BASELINE.md`.
     pub counter: bool,
-    /// Seconds the WHEP self-test keeps streaming after it has proved RTP flows. 0 stops
-    /// as soon as the packet threshold is met, which is a liveness check, not a
-    /// measurement; a baseline run wants 30 or more.
-    pub selftest_secs: u64,
+    /// How long a probe runs, in seconds. The self-test keeps streaming this long after it
+    /// has proved RTP flows; `--live` captures for this long instead of stopping at a fixed
+    /// frame count. 0 means "just prove it works", which is a liveness check and not a
+    /// measurement — a baseline run wants 30 or more.
+    pub probe_secs: u64,
+    /// Force the DXGI Desktop Duplication capture path instead of letting WGC try first.
+    /// DXGI is otherwise only ever reached as a fallback, which means it can only be
+    /// measured by first breaking WGC.
+    pub force_dxgi: bool,
     pub scale: ScalePercent,
     pub stun_urls: Vec<String>,
     pub turn_url: Option<String>,
@@ -167,7 +174,8 @@ impl Default for Config {
             probe_bitrate: false,
             workload: crate::streamer::synthetic::Workload::default(),
             counter: false,
-            selftest_secs: 0,
+            probe_secs: 0,
+            force_dxgi: false,
             scale: ScalePercent::default(),
             stun_urls: vec![DEFAULT_STUN_URL.to_string()],
             turn_url: None,
@@ -422,9 +430,20 @@ impl Config {
                     c.counter = true;
                     i += 1;
                 }
+                "--capture-backend" => {
+                    match val(&args, i).as_deref() {
+                        Some("dxgi") => c.force_dxgi = true,
+                        Some("wgc") | Some("auto") => c.force_dxgi = false,
+                        other => teprintln!(
+                            "--capture-backend takes wgc | dxgi | auto (got {other:?}); \
+                             leaving it auto"
+                        ),
+                    }
+                    i += 2;
+                }
                 "--duration" => {
                     if let Some(v) = val(&args, i).and_then(|s| s.parse().ok()) {
-                        c.selftest_secs = v;
+                        c.probe_secs = v;
                     }
                     i += 2;
                 }
@@ -460,11 +479,15 @@ CAPTURE / ENCODE\n\
   --intra-refresh <on|off>  rolling intra refresh for passive loss recovery (default off;\n\
                           on = periodic refresh waves can be visible as bands repainting\n\
                           the image; off = steady image, recovers via PLI/FIR -> IDR)\n\
-  --encoder <v>           encoder: auto | nvidia | intel | software (default auto =\n\
-                          pick by capture adapter; intel = Quick Sync / oneVPL;\n\
-                          software = CPU-only libx264 fallback, needs libx264.dll)\n\
+  --encoder <v>           encoder: auto | nvidia | intel | amd | software (default\n\
+                          auto = pick by capture adapter; intel = Quick Sync /\n\
+                          oneVPL; amd = AMF / VCN, needs the Radeon driver's\n\
+                          amfrt64.dll; software = CPU-only libx264 fallback,\n\
+                          needs libx264.dll)\n\
   --disable-gpu-encode    force the CPU-only software encoder, skip all hardware\n\
                           paths (discouraged; high CPU cost; for VMs / no-GPU boxes)\n\
+  --capture-backend <c>   capture backend: wgc (default) | dxgi | auto. Windows only;\n\
+                          dxgi is otherwise only reached by WGC failing first\n\
   --synthetic-pattern     synthetic pattern instead of live capture\n\
   --workload <w>          scripted synthetic workload, implies --synthetic-pattern:\n\
                           mixed (default) | static | scroll | motion | drag\n\
@@ -491,8 +514,9 @@ PROBES / SELF-TEST (no browser)\n\
   --probe-live [path]     150 live frames -> Annex-B (default live.h264)\n\
   --probe-bitrate         exercise adaptive-bitrate reconfigure\n\
   --whep-selftest         in-process WHEP client, assert RTP flows\n\
-  --duration <secs>       keep the self-test streaming this long after RTP is proven,\n\
-                          so the stage histograms have something to describe (default 0)\n\
+  --duration <secs>       how long a probe runs: the self-test holds the session open this\n\
+                          long after RTP is proven, and --probe-live captures for this long\n\
+                          instead of stopping at 150 frames (default 0 = liveness only)\n\
 \n\
   -h, --help              print this help and exit"
     );

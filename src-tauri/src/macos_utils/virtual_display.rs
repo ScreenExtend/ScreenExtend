@@ -403,9 +403,21 @@ pub fn reconfigure_display(
         } else {
             (width, height)
         };
-        return activate_mode(id, logical_w, logical_h).map_err(|e| {
+        // Deliberately not `activate_mode`. That is `CGDisplaySetDisplayMode`,
+        // which scopes the change to the calling process and makes macOS hold
+        // the display open until that process exits — measured at 48 s past the
+        // end of a session, which is exactly why `airplay::topology` routes
+        // every mode change through a `kCGConfigurePermanently` configuration
+        // instead. Calling it here, on the display that module had just
+        // created, undid the precaution on every single join.
+        return super::airplay::topology::set_mode_permanently(id, logical_w, logical_h).map_err(|e| {
+            let ladder = super::airplay::topology::available_modes(id)
+                .iter()
+                .map(|(w, h, _)| format!("{w}x{h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "{e}. This display was created over AirPlay, so its geometry is whatever macOS negotiated — only the modes macOS published for it can be selected."
+                "{e}. This display was created over AirPlay, so its geometry is whatever macOS negotiated — the only modes macOS published for it are: {ladder}"
             )
         });
     }

@@ -1,4 +1,4 @@
-import React, { createContext } from "react";
+import React, { createContext, useContext } from "react";
 import { type Device } from "@/components/config-provider";
 
 export type AudioOutputsInfo = {
@@ -7,43 +7,68 @@ export type AudioOutputsInfo = {
   selected: string;
 };
 
-export const GlobalContextDefault = {
-  hostedNetworkOn: false,
-  otp: "",
-  sessionId: "",
-  qrValues: [] as { title: string, value: string }[],
-  loaded: false,
-  devices: [] as Device[],
-  publicSessionsEnabled: true,
-  avatar: null as string | null,
-  zoom: 1,
-  audioOutputsByIp: {} as Record<string, AudioOutputsInfo>
+export type QrValue = { title: string; value: string };
+
+export type SessionInfo = {
+  sessionId: string;
+  otp: string;
+  publicSessionsEnabled: boolean;
+  hostedNetworkOn: boolean;
 };
 
-export type GlobalContextType = {
-  windowHostedNetworkOn: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
-  windowOtp: [string, React.Dispatch<React.SetStateAction<string>>],
-  windowSessionId: [string, React.Dispatch<React.SetStateAction<string>>],
-  windowQrValues: [{ title: string, value: string }[], React.Dispatch<React.SetStateAction<{ title: string, value: string }[]>>],
-  windowLoaded: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
-  windowClosing: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
-  windowDevices: [Device[], React.Dispatch<React.SetStateAction<Device[]>>],
-  windowPublicSessionsEnabled: [boolean, React.Dispatch<React.SetStateAction<boolean>>],
-  windowAvatar: [string | null, React.Dispatch<React.SetStateAction<string | null>>],
-  windowZoom: [number, React.Dispatch<React.SetStateAction<number>>],
-  windowAudioOutputsByIp: [Record<string, AudioOutputsInfo>, React.Dispatch<React.SetStateAction<Record<string, AudioOutputsInfo>>>]
-}
+// The setters are `useState` dispatchers, so this object can be built once and
+// never change. A component that only writes never re-renders.
+export type GlobalSetters = {
+  setHostedNetworkOn: React.Dispatch<React.SetStateAction<boolean>>;
+  setOtp: React.Dispatch<React.SetStateAction<string>>;
+  setSessionId: React.Dispatch<React.SetStateAction<string>>;
+  setQrValues: React.Dispatch<React.SetStateAction<QrValue[]>>;
+  setLoaded: React.Dispatch<React.SetStateAction<boolean>>;
+  setClosing: React.Dispatch<React.SetStateAction<boolean>>;
+  setDevices: React.Dispatch<React.SetStateAction<Device[]>>;
+  setPublicSessionsEnabled: React.Dispatch<React.SetStateAction<boolean>>;
+  setAvatar: React.Dispatch<React.SetStateAction<string | null>>;
+  setZoom: React.Dispatch<React.SetStateAction<number>>;
+  setAudioOutputsByIp: React.Dispatch<React.SetStateAction<Record<string, AudioOutputsInfo>>>;
+};
 
-export const GlobalProviderContext = createContext<GlobalContextType>({
-  windowHostedNetworkOn: [false, () => {}],
-  windowOtp: ["", () => {}],
-  windowSessionId: ["", () => {}],
-  windowQrValues: [[] as { title: string, value: string }[], () => {}],
-  windowLoaded: [false, () => {}],
-  windowClosing: [false, () => {}],
-  windowDevices: [[] as Device[], () => {}],
-  windowPublicSessionsEnabled: [true, () => {}],
-  windowAvatar: [null, () => {}],
-  windowZoom: [1, () => {}],
-  windowAudioOutputsByIp: [{}, () => {}]
+const noop = () => {};
+
+export const SettersContext = createContext<GlobalSetters>({
+  setHostedNetworkOn: noop,
+  setOtp: noop,
+  setSessionId: noop,
+  setQrValues: noop,
+  setLoaded: noop,
+  setClosing: noop,
+  setDevices: noop,
+  setPublicSessionsEnabled: noop,
+  setAvatar: noop,
+  setZoom: noop,
+  setAudioOutputsByIp: noop,
 });
+
+export const SessionContext = createContext<SessionInfo>({
+  sessionId: "",
+  otp: "",
+  publicSessionsEnabled: true,
+  hostedNetworkOn: false,
+});
+
+export const QrValuesContext = createContext<QrValue[]>([]);
+export const DevicesContext = createContext<Device[]>([]);
+export const AudioOutputsContext = createContext<Record<string, AudioOutputsInfo>>({});
+export const AvatarContext = createContext<string | null>(null);
+export const ZoomContext = createContext<number>(1);
+export const ClosingContext = createContext<boolean>(false);
+export const LoadedContext = createContext<boolean>(false);
+
+export const useGlobalSetters = () => useContext(SettersContext);
+export const useSession = () => useContext(SessionContext);
+export const useQrValues = () => useContext(QrValuesContext);
+export const useConnectedDevices = () => useContext(DevicesContext);
+export const useAudioOutputs = () => useContext(AudioOutputsContext);
+export const useAvatar = () => useContext(AvatarContext);
+export const useZoom = () => useContext(ZoomContext);
+export const useClosing = () => useContext(ClosingContext);
+export const useLoaded = () => useContext(LoadedContext);
