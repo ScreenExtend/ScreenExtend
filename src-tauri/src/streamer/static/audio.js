@@ -213,8 +213,28 @@
         } catch (_) { return false; }
     }
 
+    // There is no capability that says "this device has an earpiece" — `navigator.audioSession`
+    // exists on iPad too — so some device-shape inference is unavoidable here. What is avoidable
+    // is making it the weakest one available: a raw /iPhone/ test loses the Speaker/Earpiece
+    // choice on an iPhone with "Request Desktop Website" on, which sends a Macintosh UA. That is
+    // the one output control iOS has below 18.4, where HTMLMediaElement.setSinkId arrives.
+    //
+    // So: iOS by the same test the rest of the file uses (which already handles iPadOS reporting
+    // MacIntel), minus the iPads. An iPad is a large touch device — the desktop-UA iPhone still
+    // qualifies through `maxTouchPoints` and its screen's short edge, and a real Mac fails
+    // detectIOS() outright.
     function detectHasEarpiece() {
-        try { return /iPhone/.test(navigator.userAgent || ''); } catch (_) { return false; }
+        try {
+            if (!detectIOS()) return false;
+            const ua = navigator.userAgent || '';
+            if (/iPhone|iPod/.test(ua)) return true;
+            if (/iPad/.test(ua)) return false;
+            // Desktop-mode UA. Phones are the narrow ones: every iPhone ever made is at most
+            // 440 CSS px on its short edge, every iPad at least 744.
+            const s = window.screen || {};
+            const shortEdge = Math.min(s.width || 0, s.height || 0);
+            return shortEdge > 0 && shortEdge <= 500;
+        } catch (_) { note(); return false; }
     }
 
     function initSpeakers() {
@@ -446,11 +466,16 @@
                 md.addEventListener('devicechange', onChange);
             }
         } catch (_) { note(); }
+        // The poll is the backstop for a browser with no `devicechange` event. Where the event
+        // exists it is the mechanism, and a 4 s enumerate-and-POST on the same thread that
+        // forwards every 5 ms audio packet on the postMessage ring is a cost paid for nothing.
+        // 30 s there is a liveness check, not a device watch.
+        const period = speakers.hasDeviceChange ? 30000 : 4000;
         try {
             speakers.poll = setInterval(() => {
                 if (document.visibilityState !== 'visible') return;
                 reEnumerateAndPost();
-            }, 4000);
+            }, period);
         } catch (_) { note(); }
     }
 
@@ -470,7 +495,8 @@
         } catch (_) { note(); }
     }
 
-    function postOutputs() {
+    let lastPostedOutputs = null;
+    function postOutputs(force) {
         try {
             const cache = speakers._cache || { supported: speakers.supported, outputs: [] };
             const body = JSON.stringify({
@@ -480,6 +506,11 @@
                 outputs: cache.outputs,
                 selected: speakers.appliedSink || '',
             });
+            // The list is identical on all but a handful of ticks in a session, and the host
+            // does the same work whether or not it changed. Re-POSTing it was a request per
+            // period per device buying nothing.
+            if (!force && body === lastPostedOutputs) return;
+            lastPostedOutputs = body;
             fetch('/audio-outputs', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -605,6 +636,10 @@
     function setSpeakerIdentity(sessionId, deviceToken) {
         speakers.sessionId = sessionId || '';
         speakers.deviceToken = deviceToken || '';
+        // A new session — or a reconfigure that rebuilt one with the same identity — needs the
+        // list once regardless of whether it changed, so the change detection in postOutputs
+        // cannot swallow the first post of a connection.
+        lastPostedOutputs = null;
     }
 
     // How long a sample takes to get from the graph to the speaker. `outputLatency` is the
@@ -770,6 +805,12 @@
                 if (e.data.type === 'stats') {
                     state.stats = e.data;
                     adaptSafetyMargin(e.data);
+                } else if (e.data.type === 'ringport-ok') {
+                    // The worklet took the far end, so the near end is worth handing to the
+                    // worker. Until this arrives — and it never does on an engine that cannot
+                    // transfer a port into an AudioWorkletGlobalScope — the samples keep
+                    // taking the page relay, which is unchanged.
+                    noteRingPortAck();
                 } else if (e.data.type === 'mode-mismatch') {
                     // The worklet could not map the shared ring but the worker did, so the
                     // worker must stop writing into it. Re-init it without the buffer and both
@@ -796,6 +837,7 @@
             state.gain.gain.value = state.muted ? 0 : 1;
             state.node.connect(state.gain).connect(state.ctx.destination);
             state.prepared = true;
+            offerRingPort();
             return true;
         } catch (e) {
             console.warn('[audio] prepare failed:', e);
@@ -830,6 +872,50 @@
             try { await state.ctx.resume(); } catch (_) { note(); }
         }
         return !!(state.ctx && state.ctx.state === 'running');
+    }
+
+    // Without a SharedArrayBuffer the decoded samples used to go worker → page → worklet: two
+    // postMessage hops and two fresh Float32Arrays per packet, 200 times a second at the host's
+    // 5 ms framing, half of them through the main thread that also runs the reconfig fetch, the
+    // getStats poll and every pointer event. One long task there is an underrun, and an
+    // underrun is up to MAX_TARGET_MS of silence while the buffer re-primes.
+    //
+    // A MessagePort is transferable, so the two ends can go straight to the worker and the
+    // worklet and the page drops out of the path. It is offered rather than assumed: not every
+    // engine will transfer a port into an AudioWorkletGlobalScope, so the worklet acknowledges
+    // and only then does the worker get the other end. No acknowledgement, no change.
+    let ringPortForWorker = null;
+    let ringPortAcked = false;
+    let ringPortDirect = false;
+    function offerRingPort() {
+        if (state.sab || ringPortForWorker || !state.node) return;
+        if (typeof MessageChannel !== 'function') return;
+        let mc;
+        try { mc = new MessageChannel(); } catch (_) { note(); return; }
+        try {
+            state.node.port.postMessage({ type: 'ringport', port: mc.port2 }, [mc.port2]);
+        } catch (_) { note(); return; }
+        ringPortForWorker = mc.port1;
+    }
+    function noteRingPortAck() {
+        ringPortAcked = true;
+        handOffRingPort();
+    }
+    // Runs from the worklet's acknowledgement and again when the worker is built, because
+    // either can be the later of the two.
+    function handOffRingPort() {
+        if (!ringPortAcked || !ringPortForWorker || !state.worker) return;
+        const port = ringPortForWorker;
+        ringPortForWorker = null;
+        try {
+            state.worker.postMessage({ type: 'ringport', port: port }, [port]);
+            ringPortDirect = true;
+        } catch (_) { note(); }
+    }
+    function releaseRingPort() {
+        ringPortForWorker = null;
+        ringPortAcked = false;
+        ringPortDirect = false;
     }
 
     function makeSharedRing() {
@@ -878,11 +964,13 @@
         w.onerror = (e) => { note(); console.warn('[audio] decoder worker error:', e); };
         w.postMessage({ type: 'init', sab: state.sab, capFrames: CAP_FRAMES });
         state.worker = w;
+        handOffRingPort();
         if (state.hostOffsetMs !== null) w.postMessage({ type: 'clockoffset', offsetMs: state.hostOffsetMs });
         return true;
     }
 
     function stopWorker() {
+        releaseRingPort();
         if (!state.worker) return;
         try { state.worker.terminate(); } catch (_) { note(); }
         state.worker = null;
@@ -981,7 +1069,10 @@
         const st = state.stats;
         return {
             path: state.path,
-            transport: state.sab ? 'shared' : 'postMessage',
+            // 'shared'      the SharedArrayBuffer ring, worker writes and worklet reads it
+            // 'port'        the private ring, samples worker -> worklet over a MessagePort
+            // 'postMessage' the private ring, samples worker -> page -> worklet
+            transport: state.sab ? 'shared' : (ringPortDirect ? 'port' : 'postMessage'),
             videoDelayMs: state.videoDelayMs,
             hostOffsetMs: state.hostOffsetMs,
             preEnqueueMs: state.preEnqueueEmaMs,

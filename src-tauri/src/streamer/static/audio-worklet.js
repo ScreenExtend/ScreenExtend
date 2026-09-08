@@ -116,6 +116,16 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
                 // We could not map it and the writer did. Only the page can undo that.
                 this.port.postMessage({ type: 'mode-mismatch' });
             }
+        } else if (d.type === 'ringport' && d.port) {
+            // The decode worker's end of a MessageChannel. Taking it removes the main thread
+            // from the sample path entirely on the private-ring transport, where every packet
+            // otherwise went worker -> page -> here, 200 times a second. Acknowledging is what
+            // releases the far end to the worker: on an engine that will not transfer a port
+            // into this scope nothing arrives here, no acknowledgement goes back, and the page
+            // relay carries on unchanged.
+            this.samplePort = d.port;
+            this.samplePort.onmessage = (e) => this.onMessage(e.data);
+            this.port.postMessage({ type: 'ringport-ok' });
         } else if (d.type === 'reset') {
             this.readPos = this.shared ? (Atomics.load(this.ctrl, W) >>> 0) : this.writePos;
             if (this.shared) Atomics.store(this.ctrl, R, this.readPos | 0);

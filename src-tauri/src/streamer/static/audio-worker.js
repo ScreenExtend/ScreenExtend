@@ -108,12 +108,26 @@ function writeShared(l, r, frames) {
     Atomics.store(ctrl, W, (w + n) >>> 0);
 }
 
+// Set once the page has handed over one end of a MessageChannel whose other end the worklet
+// took. Until then — and on any engine that will not transfer a port into an
+// AudioWorkletGlobalScope — samples go to the page, which re-posts them to the worklet.
+let samplePort = null;
+
 function postSamples(l, r, frames) {
     const cl = new Float32Array(frames);
     const cr = new Float32Array(frames);
     cl.set(l);
     cr.set(r);
-    self.postMessage({ type: 'samples', l: cl, r: cr }, [cl.buffer, cr.buffer]);
+    const msg = { type: 'samples', l: cl, r: cr };
+    const transfer = [cl.buffer, cr.buffer];
+    if (samplePort) samplePort.postMessage(msg, transfer);
+    else self.postMessage(msg, transfer);
+}
+// The worklet reads these on the same port, so they must not overtake or fall behind the
+// samples they describe.
+function postToWorklet(msg) {
+    if (samplePort) samplePort.postMessage(msg);
+    else self.postMessage(msg);
 }
 
 function onDecoded(ad) {
@@ -325,7 +339,8 @@ function handlePacket(buf) {
     lastSeq = seq;
     if (discontinuity) {
         lastDecodedFrames = 0;
-        self.postMessage({ type: 'discontinuity' });
+        // Rides the same channel as the samples it sits between, or it could overtake them.
+        postToWorklet({ type: 'discontinuity' });
     }
     submit(buf, primaryOff, primaryLen, captureUs);
 }
@@ -363,5 +378,9 @@ self.onmessage = (ev) => {
             if (hostOffsetMs === 0) preEnqueueEmaMs = null;
             hostOffsetMs = d.offsetMs;
         }
+    } else if (d.type === 'ringport' && d.port) {
+        // The page only sends this once the worklet has confirmed it took the other end, so
+        // from here the samples go straight across and the main thread is out of the path.
+        samplePort = d.port;
     }
 };
