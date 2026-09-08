@@ -34,7 +34,7 @@ async function run(): Promise<void> {
     void monaco.languages.json
       .getWorker()
       .then(accessor => accessor())
-      .catch(() => {});
+      .catch(e => console.error("warming the JSON worker failed", e));
 
     const host = document.createElement("div");
     host.setAttribute("aria-hidden", "true");
@@ -56,8 +56,11 @@ async function run(): Promise<void> {
     editor.getModel()?.dispose();
     editor.dispose();
     host.remove();
-  } catch {
-    // a failed warm-up must never break startup; the editor still loads on demand
+  } catch (e) {
+    // a failed warm-up must never break startup; the editor still loads on demand --
+    // but silently was the wrong amount of quiet: a broken monaco chunk was only
+    // discovered when the user opened Advanced.
+    console.error("warming the settings editor failed", e);
   }
 }
 

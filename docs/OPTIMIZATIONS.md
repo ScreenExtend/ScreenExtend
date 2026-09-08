@@ -87,7 +87,6 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 65 | cloud | `CloudClient::spawn`'s `.ok()` replaced with a reported error; the `signal_response` send checked; the no-op `if let Some(()) = …{}` reduced | A failed thread spawn left `handle` as `None`, so `stop()` silently did nothing and the desktop UI sat on the startup "connecting" state forever with no line explaining it. A dropped `signal_response` is a join that hangs for the client and looks like nothing at all from the host. | three errors discarded | `CloudState::Error` with the reason; a named log line when the relay writer is gone | COMPILE-CHECKED | yes | The `SESSION_TAKEN` substring match on a formatted error string is untouched — see `findings/minor-cloud-session-taken-is-a-substring-match.md`. |
 
 | 66 | input (macOS) | The Ctrl<->Command remap becomes conditional on the client's own platform: `ClientPlatform::from_reported` parses the `os` string the join request already carries, `ClientProfile` threads it to the injector, and `modifier_keycode` selects a pass-through or a swapped modifier row (`streamer/input/{mod,macos,windows,generic,linux}.rs`, `streamer/{webrtc_session,server}.rs`) | `code_to_keycode` rewrote the modifier row unconditionally — Ctrl to Command, Meta to Control — with no reference to who was typing. That is right for a PC keyboard, where Ctrl is the command modifier, and exactly backwards for an Apple one. | a Mac or iPad client pressing Command+C sent `MetaLeft`, the host injected `VK_CONTROL`, and macOS received Control+C, which is not copy; their Ctrl+A (start-of-line in Cocoa) arrived as Command+A, select-all | Command+C copies from every client and Ctrl+A moves the caret from an Apple one, with Windows and Android clients unchanged | VERIFIED (unit: both tables asserted key by key, plus that every non-modifier key is identical in both); UNVERIFIED (no Mac or iPad client available to type on) | yes | The information was already on the wire and validated — `os` is in the join request (`server.rs`, `MAX_OS_LEN`) and `detectOs()` in the client page produces it — it had simply never been threaded past the session layer. `ClientPlatform` keeps all five variants rather than collapsing to a boolean, because guessing from a boolean is how the original bug happened; an unreported platform logs once and assumes a PC layout, which is the pre-existing behaviour and the commoner client. `recompute_mods` derives its `CGEventFlags` from the *remapped* keycodes, so it is self-consistent with whichever table is chosen and needed no change. A per-device override for a non-standard layout is the natural extension and is not implemented. |
-
 | 67 | audio-win | `capture_ns` anchored to `min(qpcpos, now - read_duration)` instead of `qpcpos` alone | `qpcpos` is documented as when "the audio endpoint device read the device position", but on a **loopback** stream the endpoint is a *render* device and that position is its play cursor — so the stamp is a playout time, in the future. The client sizes its jitter buffer from `enqueue - capture_ns`, so a future capture time is surplus audio delay. | `capture -> subscriber` recorded **0 samples** (every span negative); `capture_ns` skew min -20.36 / mean -14.65 / max +5.61 ms, **1596/1601 packets stamped ahead of the host clock**, spread 26 ms, offset moving with host load | `capture -> subscriber` p50 9.44 / p90 9.44 / p99 9.44-10.49 / max 10.9 ms; skew min -3.04 / mean +7.69 / max +10.9 ms, <=1/1601 ahead | VERIFIED (Win 11 26200, `probe --audio`, 3 runs, idle) | yes | One engine period plus the intra-burst offset, which is what it should physically be. `ts_clamped` counts how often the endpoint stamp was in the future: on this box, every drain. |
 | 68 | audio-win | Silent render companion negotiates the engine period via `IAudioClient3::GetSharedModeEnginePeriod` + `InitializeSharedAudioStream(min)` | Microsoft documents that any stream on an endpoint can lower the whole endpoint's period, and the loopback capture stream cannot ask for itself (`AUDCLNT_E_INVALID_STREAM_FLAG`). The companion can, and capture inherits it. Expected -5 to -7.3 ms where a driver exposes a small buffer. | wake interval p50/p90/p99 9.44 ms, max 10.3-10.6 ms; engine periods `default = fundamental = min = max = 480 frames (10.000 ms)` | identical — the probe correctly declines, because there is no smaller period to request on this driver | VERIFIED **no-op on this hardware**; the request path is COMPILE-CHECKED | yes | Not a failure: this OEM driver exposes exactly one period. The in-box High Definition Audio Device driver documents 128-480 frames and is how the other branch gets exercised; that needs a driver swap plus a reboot, so it is a manual test. Landing it also fixed "nothing on any machine could say what period it was running at". |
 | 69 | audio-win | Process-loopback tier added (`ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, excluding our own pid), probed by attempting activation | A second tier for the cases endpoint loopback structurally cannot serve: an exclusive-mode endpoint, device churn, an endpoint that will not activate. Ordering to be decided by measurement, not assumption. | endpoint tier: wake 9.44/9.44/9.44/23.11 ms, capture->packet 5.77/9.44/9.44/24.07 ms | process tier: wake 9.44/9.44/10.49/11.32 ms, capture->packet 6.29/9.44/10.49/11.41 ms | VERIFIED (both tiers, 8 s each, idle) | yes, as **tier 2** | Neither is meaningfully faster — same shared engine. The endpoint tier keeps p99 by one bucket, so the long-shipping path stays first. Settled two open questions from the research: process loopback needs **no** silent companion (999 packets in 5 s with none anywhere), and its event does fire. |
@@ -105,7 +104,7 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 81 | cli / security | `single_instance`: constant-time control-token comparison, `screenextend.ctrl` created 0o600 and re-chmodded if wider, per-connection read timeout 2 s -> 500 ms, bad tokens logged | The token was compared with `!=` on `&str` while the join OTP two modules over already used `subtle::ConstantTimeEq`. The ctrl file took whatever the umask gave it, and whoever can read it can `QUIT` the host. Connections are served one at a time, so anything that connected and said nothing stalled a real `stop` for 2 s. | `!=`, umask-dependent mode, 2 s stall, silent drop | constant-time, 0o600, 500 ms, one log line per bad token | COMPILE-CHECKED (the loopback path is not exercised by a test) | yes | The two remaining items in that finding change `acquire_lock`'s signature and every caller, and every caller is in `cli.rs`/`lib.rs` — retagged W13b, with the suggested `LockOutcome` enum written out. |
 | 82 | build / CI | `.github/workflows/ci.yml` (six jobs), a dyld-floor gate on the release job, `scripts/perf-gate.mjs` + `ci/perf-baseline.json` | CI was added and deleted 4m13s apart in 2026-08 and has never run, so nothing gated `cargo fmt`/`clippy`/`test`/`pnpm lint`, nothing verified the blob checksums the two PROVENANCE files claim are "verified in CI", and nothing checked the shipped macOS binary against the 10.15 dyld floor — a load failure that is invisible on every machine that could debug it. | no gate of any kind since 2026-08-22 | frontend (eslint, build, Safari 13.1 re-derivation, client-stats harness), rust matrix (windows + macos-13/14/15), macos-smoke (doctor's probed tiers + the `#[ignore]`d VideoToolbox encode tests), dyld-floor, blob-checksums, perf-gate | UNVERIFIED — the workflow cannot run until the user pushes; validated by parsing the YAML and checking every job/step key, not by an actual run | yes | The macOS matrix is the point: the dev Mac is 10.15, so `macos-13/14/15` are the only machines on the project where ScreenCaptureKit, the Core Audio process tap and VideoToolbox execute at all. `macos-smoke` asserts the audio probe picks `screencapturekit` on 13 and `process_tap` on 14/15 — a silent demotion is exactly the regression nobody here can see. || 95 | capture-win (wgc) | `MinUpdateInterval`, `DirtyRegionMode` and `IsBorderRequired` are each probed with `ApiInformation::IsPropertyPresent` and the setter skipped when absent, instead of `GraphicsCaptureApi::new` failing on the first missing one. The feature set is logged and carried in telemetry as `capture_features`. | The three are **build 26100** (Win 11 24H2) / **20348** properties. Requesting any absent one made the whole WGC session fail, so **every Windows 10 host and every Windows 11 before 24H2** fell silently through to DXGI Desktop Duplication — losing the NVENC zero-copy ring and serializing capture against encode. Sunshine's shape is per-property probing. | every pre-24H2 host: DXGI, no ring | those hosts stay on WGC; the dev box (26200) reports `+cursor +border +secondary-windows +min-update-interval +dirty-region +free-threaded-pool (build 26100+)` and is unchanged | VERIFIED on 26200 (no regression); the pre-26100 half is COMPILE-CHECKED | yes | The change here with the largest population behind it and the least ability to measure it locally. Script: `docs/manual-tests/windows-capture.md` §1-2 |
 | 96 | capture-win (wgc) | Frame-pool depth is per-path — 2 for the handler that encodes inline, 3 for the ring that only stages — and `TryGetNextFrame` drains to the **newest** frame, counting what it discards into `frames_dropped_stale`. | `Recreate` passed buffer count 1 while `Create` passed 3, so a content-size change silently undid the capture/encode decoupling for the rest of the session. The pool is a queue handed out oldest-first, so depth is latency for any consumer that falls behind: at 3 buffers and 60 Hz an unlucky frame was 33 ms old before the encoder saw it. OBS and Sunshine both use 2 for an inline consumer. | oldest-first, up to 33 ms of pool age | newest-first; `frames_dropped_stale` counts the difference | VERIFIED (counter moves under load on 26200) | yes | The counter is the point: the drain is only correct if what it drops is visible. |
-| 97 | capture-win (wgc) | A keyframe request now always produces an IDR within one frame period, including on a completely static desktop: the ring's keepalive reads `idr_request` and calls `encode_repeat_slot` with it, and the encode thread ticks at the frame period rather than at the 200 ms keepalive interval. | NVENC is configured with an infinite GOP and IDR period, so there is no periodic keyframe at all. `idr_request` was read only in `AsyncNvencRing::stage`, which runs only when WGC delivers a *new* frame; the 200 ms keepalive read `Encoder::idr_requested`, whose only writer had no callers. A client that joined, or lost its reference chain, while nothing moved on the extended display waited for the user to move something. | **2 IDRs in a 30 s static selftest**, both at session start | an IDR within one frame period of any request | VERIFIED (`idrs_sent` in the selftest telemetry) | yes | Corroborated by baseline note 5 in `docs/BASELINE.md`, which recorded the 2-IDR symptom before the cause was known. |
+| 97 | capture-win (wgc) | A keyframe request now always produces an IDR within one frame period, including on a completely static desktop: the ring's keepalive reads `idr_request` and calls `encode_repeat_slot` with it, and the encode thread ticks at the frame period rather than at the 200 ms keepalive interval. | NVENC is configured with an infinite GOP and IDR period, so there is no periodic keyframe at all. `idr_request` was read only in `AsyncNvencRing::stage`, which runs only when WGC delivers a *new* frame; the 200 ms keepalive read `Encoder::idr_requested`, whose only writer had no callers. A client that joined, or lost its reference chain, while nothing moved on the extended display waited for the user to move something. | **2 IDRs in a 30 s static selftest**, both at session start | an IDR within one frame period of any request | COMPILE-CHECKED as to the *request* path — no probe asks for a mid-session keyframe on a static desktop, so nothing here exercises it end to end. The selftest confirms no regression: still exactly the 2 session-start IDRs, and `idrs_sent` is now written by both the stage and the keepalive. | yes | Corroborated by baseline note 5 in `docs/BASELINE.md`, which recorded the 2-IDR symptom before the cause was known. Verifying it needs a browser client that drops a frame mid-session, or a probe flag that injects a keyframe request at t+15 s — worth adding. |
 | 98 | capture-win (wgc) | The WGC D3D device is created on the encoder's adapter: `IDXGIFactory6::EnumAdapterByGpuPreference` (probed by `QueryInterface`, Win 10 1803+) plus `VendorId`, with `GpuPreference::Vendor`/`HighPerformance`/`MinimumPower` chosen from the configured encoder. The registry write that only applied to the *next* launch was dropped. Which adapter captures, which encodes, and whether they match is logged once per session. | The encoder input is a `SHARED_NTHANDLE \| SHARED_KEYEDMUTEX` texture opened on the capture device, and that mechanism is same-adapter only; when the two adapters differ every frame takes a GPU→CPU→GPU round trip. WGC can capture any monitor from a device on any adapter, so the choice is free. x264 gets `MinimumPower` for the opposite reason: reading back from the iGPU that composes the desktop beats dragging the frame across PCIe. | inferable only from a "zero-copy path unavailable" line that named no adapter | `adapters: capture=… encode=… same_adapter=true\|false` once per session | VERIFIED (`same_adapter=true` on the dev box for NVENC and for x264) | yes | Also shouts when the capture adapter is a software rasteriser, which is what a WARP-composed indirect display looks like. |
 | 99 | tuning-win | Capture and encode threads are confined to the highest-`EfficiencyClass` CPU sets (`GetSystemCpuSetInformation` + `SetThreadSelectedCpuSetMasks`), probed by "does this machine report more than one distinct efficiency class". | Thread priority orders threads *within* a core's queue and says nothing about which core the scheduler picks, so an MMCSS-critical capture thread could still be parked on an efficiency core. The cost shows up as tail latency, not as a lower average. `SetThreadSelectedCpuSetMasks` is a soft restriction, unlike `SetThreadAffinityMask`, so the scheduler may still migrate rather than deadlock. | no core-class preference | `[cpu] hybrid CPU detected: confining capture/encode threads to the 12 logical processors of efficiency class 1` | VERIFIED (the dev box is a hybrid Intel part and takes the branch) | yes | Probed by capability, never by CPU model; a homogeneous CPU takes no action at all. |
 | 100 | capture-win (fork) | ~2,800 lines removed from the vendored `windows_capture` fork — the unused DXGI duplication API, `window.rs`, `graphics_capture_picker.rs` and the Media Foundation `VideoEncoder` — with the `Media_*`/`Storage*` `windows` features and the `clap` dependency they forced. The six genuine upstream bug fixes the fork carries are recorded in `windows_capture/FORK.md`. | The fork's provenance was undocumented, so every one of those fixes was one careless dependency refresh away from being lost, and the dead half made the diff against upstream unreadable. | 2,800 lines + 3 crate features + 1 dependency | gone; `FORK.md` names each surviving divergence | VERIFIED (builds, tests pass) | yes | Compile time and binary size, not frame latency. |
@@ -128,16 +127,16 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 117 | audio (macOS) | SCK's two async-to-sync bridges 5 s -> 1.5 s; `start_capture`'s `ready_rx.recv()` given a 15 s ceiling where it had none | Both SCK waits are taken serially under the `AudioHub` mutex, which holds every other session's audio subscribe and unsubscribe, and both are hit in the denied-Screen-Recording case a user is most likely to meet. | up to **10 s** of frozen audio subscribe for every other device, more once the candidate loop moved on to the next backend; `start_capture` could wait forever | 3 s worst case for the SCK pair, 15 s hard ceiling overall | COMPILE-CHECKED (13.0+ path) | yes | SCK offers no non-blocking variant, so bounding the waits is the whole fix. A display list or a stream start that has not arrived in 1.5 s is not going to. |
 | 118 | audio (macOS) | Driver shm ring layout 1 -> 2: capture-time seqlock anchor, reader-published `readPos`, `overruns` actually written, scalar write loop -> two `memcpy`s, umask cleared across `shm_open`, `os_log` throughout | The ring carried no time, so a reader could only date samples from its own drain. `overruns` was declared in the ABI and never incremented, so the one signal that says this tier is dropping samples read a constant 0. And `shm_open` applied `coreaudiod`'s umask, so under 077 the host got a bare `EACCES` and silently took the slower HAL-input path with nothing anywhere saying so. | no anchor, no `readPos`, `overruns` always 0, 1024 scalar stores per callback, mode at the mercy of a umask this code does not control, and zero logging in the entire driver | anchor published per block; `readPos` tracking `writePos` at a backlog of **0** with `overruns` **0** over 2,083,840 samples; `O_RDWR` **granted**; geometry and errno visible in `log stream` | **VERIFIED** on macOS 10.15.8 | yes | ABI bumped on both sides in one change (`shm_ring.hpp` <-> `shm_reader.rs`); a layout-1 segment is unlinked and recreated at load. `legacy/test/ring.rs` now **scrapes the C++ header** and fails if the two drift, instead of comparing Rust constants to literals typed in the same repo. |
 | 119 | audio (macOS) | `dropped_backpressure`: the worker's unconditional `store(consumer.overruns())` per drain pass removed; the capture callbacks and the shm reader own the counter | Three producers `fetch_add` into it -- ring overruns from each callback, and the samples the legacy reader loses to a lapped shared-memory ring, which is a different loss with a different cause and the interesting number for that tier. The worker then overwrote all of it within milliseconds. | legacy-tier loss reported as a flat **0** in `AudioDiagnostics::summary()` | both loss sources accumulate; measured 0 on a healthy run, which now means something | **VERIFIED** on macOS 10.15.8 | yes | Picked the producers as the single owner rather than adding a second field, because both numbers are genuinely "samples lost to backpressure" and the shared `AudioDiagnostics` struct is W8's to grow. |
-| 138 | macos capture | CGDisplayStream: `IOSurfaceIncrementUseCount`/`DecrementUseCount` around every surface held past the callback (RAII `HeldSurface`), `kCGDisplayStreamQueueDepth` 2 -> 5, `kCGDisplayStreamMinimumFrameTime` deleted | `CGDisplayStream.h` requires *both* a `CFRetain` and a use-count increment of a client that keeps a delivered surface; we did the retain only, so WindowServer was free to composite the next frame into the buffer VideoToolbox was reading. Marking surfaces in use makes the queue depth real for the first time, so the depth had to move in the same change: 2 was below CoreGraphics' own documented default of 3 while the pipeline pinned two surfaces. `MinimumFrameTime` defaults to zero, so setting it to 0.95/fps added a hold-off nothing asked for. | PRE | POST | VERIFIED (10.15.8) | yes | The three had to land together: the increment alone converts a corruption bug into a starvation bug, and the hold-off is invisible while the queue is the binding constraint. |
+| 138 | macos capture | CGDisplayStream: `IOSurfaceIncrementUseCount`/`DecrementUseCount` around every surface held past the callback (RAII `HeldSurface`), `kCGDisplayStreamQueueDepth` 2 -> 5, `kCGDisplayStreamMinimumFrameTime` deleted | `CGDisplayStream.h` requires *both* a `CFRetain` and a use-count increment of a client that keeps a delivered surface; we did the retain only, so WindowServer was free to composite the next frame into the buffer VideoToolbox was reading. Marking surfaces in use makes the queue depth real for the first time, so the depth had to move in the same change: 2 was below CoreGraphics' own documented default of 3 while the pipeline pinned two surfaces. `MinimumFrameTime` defaults to zero, so setting it to 0.95/fps added a hold-off nothing asked for. | queueDepth 2 + the use count missing: a 58 fps capture collapsed to one frame in six seconds the moment an encoder joined the holding pattern | 61 fps sustained (365/367/366 frames in 6 s), **0** frames dropped by WindowServer over three trials | VERIFIED (10.15.8) | yes | The three had to land together: the increment alone converts a corruption bug into a starvation bug, and the hold-off is invisible while the queue is the binding constraint. |
 | 139 | macos capture | the first frame of a session is exempt from the empty-dirty-rect skip; both wrap paths take ownership of the `CVPixelBuffer` before checking the `CVReturn` | A freshly created virtual display is completely still until a window is dragged onto it, so every frame reports zero dirty rects, nothing is ever published, and the 200 ms keepalive has no previous frame to repeat. CoreVideo can also return non-zero *and* hand back a +1 buffer. | client saw black until something moved | first frame always published | VERIFIED (10.15.8) | yes | The other half of "connected but black" is row 94. |
 | 140 | macos capture | CGDisplayStream de-linked: five functions and five CFString constants resolved by one cached `dlsym` | The API is *obsoleted*, not merely deprecated, in the macOS 15 SDK, and it is the fallback tier. A link-time reference to a symbol Apple has announced the end of makes the entire binary unloadable the day it goes — the rule the codebase already applies to ScreenCaptureKit, in the other direction. | `nm -u \| grep -i displaystream` listed 10 symbols | listed none; capture and the TCC probe both run through the resolved pointers | VERIFIED (10.15.8) | yes | A machine without the API now fails its capture start with a line, instead of failing to launch. |
 | 141 | macos encode | `VTCopyVideoEncoderList` logged once per process; `VTCopySupportedPropertyDictionaryForEncoder` queried per session; every `macos_at_least` gate on this path deleted | The encoder was configured from OS version numbers. The property set actually depends on the encoder VideoToolbox picks, which depends on the frame size and the machine. The version gate on `EnableLowLatencyRateControl` named 11.0; the key is 11.3, and the spec ladder already answers the question by trying. | no inventory, no property report, one `sw_vers` fork per query | one `[vt] encoder:` line per H.264 encoder (id, hardware, GPU, instance-limited) and one `[vt] properties:` line per session | VERIFIED (10.15.8) | yes | `InstanceLimit` is the documented mechanism behind "it only works when I quit everything else", and nothing had ever printed it. |
 | 142 | macos encode | `UsingHardwareAcceleratedVideoEncoder` read back and stored; a software session logs at error level; `CompatibilityReport.encoder_backend` reports the probed tier | The `hardware` flag recorded on success was the flag that had been *requested*. A session created on the `Require` rung can still be software, and then nothing was logged at all. | `encoder_backend` was the constant `"videotoolbox"` | `videotoolbox-hardware` / `videotoolbox-software`, from the encoder list at report time and from the session read-back at stream time | VERIFIED (10.15.8) | yes | `UsingGPURegistryID` is NULL for a built-in-GPU hardware encoder *and* for software, so it can never stand in for the hardware flag. |
 | 143 | macos encode | `PreferredEncoderGPURegistryID` from `CGDirectDisplayCopyCurrentMetalDevice` of the captured display | On a multi-GPU Mac, WindowServer vends the display's IOSurface from the GPU driving that display while VideoToolbox picks an encoder by its own criteria; when they differ, every frame migrates across the PCIe bridge. `Preferred`, never `Required`, which would defeat the fallback ladder. | not set | set when the display reports a Metal device | COMPILE-CHECKED — the 10.15.8 dev Mac is single-GPU, so it correctly reports `gpu_registry_id=none` | yes | Needs a 2016-2019 15-inch MacBook Pro or an eGPU to verify. Script: `docs/manual-tests/macos-capture-encode.md` §9. |
-| 144 | macos encode | `DataRateLimits` removed; `MaxFrameDelayCount` unset; `MaxKeyFrameIntervalDuration` 10 s -> 600 s | QA1958 defines `DataRateLimits` as a hard cap over a sliding window and `AverageBitRate` as a target; Chromium documents the cap as undocumented-incompatible with `EnableLowLatencyRateControl` and as making the encoder undershoot regardless. The loss-based controller already owns the bitrate. `MaxFrameDelayCount` is a contract on the *calling* thread, so `1` blocks the deadline-scheduled encode loop inside the encoder. A 10 s periodic IDR is a bitrate spike the removed cap then had to absorb. | two rate controllers with different time constants, plus a periodic IDR | one target, no cap, keyframes only on request | PRE_POST | yes | OBS reports `RealTime = true` *plus* bitrate limiting caused heavy frame drops on M1-era Macs; the pairing is gone, `RealTime` stays. |
+| 144 | macos encode | `DataRateLimits` removed; `MaxFrameDelayCount` unset; `MaxKeyFrameIntervalDuration` 10 s -> 600 s | QA1958 defines `DataRateLimits` as a hard cap over a sliding window and `AverageBitRate` as a target; Chromium documents the cap as undocumented-incompatible with `EnableLowLatencyRateControl` and as making the encoder undershoot regardless. The loss-based controller already owns the bitrate. `MaxFrameDelayCount` is a contract on the *calling* thread, so `1` blocks the deadline-scheduled encode loop inside the encoder. A 10 s periodic IDR is a bitrate spike the removed cap then had to absorb. | two rate controllers with different time constants, plus a periodic IDR | one target, no cap, keyframes only on request | capture-to-encoded p50 **13.70 ms**, p99 15.60 ms, over three 6 s trials at 1440x900@60 immediately before this row landed (medians of 13.587/13.910/13.695 and 40.894/15.597/15.499). VERIFIED as the *before*; the *after* run is queued behind four other agents’ release builds on the shared Mac and is not in yet | yes | OBS reports `RealTime = true` *plus* bitrate limiting caused heavy frame drops on M1-era Macs; the pairing is gone, `RealTime` stays. |
 | 145 | macos encode | per-frame stamps travel through VideoToolbox as `sourceFrameRefCon` | A `std::sync::Mutex<VecDeque>` sat between the real-time encode thread and the drain thread, and assumed submit order equals emit order. VideoToolbox carries an opaque pointer per frame for exactly this. | a lock per submit and per emit | none; the stamps arrive with their own frame | VERIFIED (10.15.8) | yes | Also deletes the ordering assumption, which mattered the moment frames could be dropped. |
 | 146 | macos encode | encoder output channel bounded at 4, drop-oldest, counted, and the count forces an IDR | The channel was unbounded, so a drain thread that fell behind turned into latency rather than into a visible drop. A dropped access unit breaks the reference chain, which is why the count has to become a keyframe. | unbounded | 4, with `encoder_output_drops` in `status --json` | VERIFIED (10.15.8: 0 drops over three 6 s runs) | yes | Dropping the oldest keeps the freshest picture; either end of the queue needs the IDR. |
-| 147 | macos encode | frames in flight counted and capped at 2, with the cap standing aside to 16 after 100 ms of no output; the blocking `CompleteFrames` is gone from the encode loop | VideoToolbox accepts frames until memory runs out. A comparable product measured ~8 resident when overfed — 130 ms at 60 fps, invisible to every timer we have. But a hard cap against an encoder that structurally holds frames is a deadlock, which is what the old blocking flush on the keepalive path was really working around; that flush was synchronous and unbounded on a deadline thread, five times a second on a still screen. | unbounded, plus a blocking flush per keepalive | 2, or 16 against a frame-holding encoder, and no flush | PRE_POST | yes | The max depth reached is logged next to VideoToolbox's own `NumberOfPendingFrames`; a disagreement between the two says which problem you have. |
+| 147 | macos encode | frames in flight counted and capped at 2, with the cap standing aside to 16 after 100 ms of no output; the blocking `CompleteFrames` is gone from the encode loop | VideoToolbox accepts frames until memory runs out. A comparable product measured ~8 resident when overfed — 130 ms at 60 fps, invisible to every timer we have. But a hard cap against an encoder that structurally holds frames is a deadlock, which is what the old blocking flush on the keepalive path was really working around; that flush was synchronous and unbounded on a deadline thread, five times a second on a still screen. | unbounded, plus a blocking flush per keepalive | 2, or 16 against a frame-holding encoder, and no flush | same before-number as row 144 (p50 13.70 ms / p99 15.60 ms); the after-run is queued. The 10.15 encoder is a frame-holder, so it is tier 2 of the cap that applies here — which is the case that would have deadlocked under a hard cap, and the reason the bypass exists | yes | The max depth reached is logged next to VideoToolbox's own `NumberOfPendingFrames`; a disagreement between the two says which problem you have. |
 | 148 | macos encode | a submit failure no longer ends the stream: three consecutive failures rebuild the encoder, old session released first | One `VTCompressionSessionEncodeFrame` error broke out of the encode loop forever. The session stayed up, the transport stayed connected, and the picture simply stopped, with one line in the log. | first error = permanent freeze | up to three rebuilds, then a deliberate end so clients are told | COMPILE-CHECKED — the failure is not reproducible on demand | yes | The old session is released *before* the replacement is asked for; the hardware encoder is instance-limited, so the other order turns a transient error into a permanent software fallback. |
 | 149 | macos encode | a first-frame deadline: 750 ms with no capture yields a synthesized black IDR, counted as `capture_no_first_frame` | A capture backend that delivers nothing produced a session that negotiated, connected, reported healthy and showed nothing, forever — this is why every macOS cell in `docs/BASELINE.md` was empty. | `probe --whep-selftest` sent 0 frames; `probe --live` wrote 2 in 5 s | the client gets a decodable picture within a second, and the silence is visible in `status --json` | VERIFIED (10.15.8) | yes | Pairs with row 84: one fixes the still-display capture, the other covers a backend that fails outright. |
 | 150 | macos sched | one scheduling scheme per thread; every `thread_policy_set` / `pthread_set_qos_class_self_np` return checked and logged once; `THREAD_TIME_CONSTRAINT` computation `period/8` -> `0.75 x period`, read back with `thread_policy_get`; `os_workgroup` deleted; `setpriority(-10)` deleted | The encode thread was given a QoS class *and* a deadline policy *and* a precedence policy *and* an affinity tag, with every return value discarded — a QoS class is how the kernel manages priority and a deadline reservation is how that management is removed, so the last writer won and nothing said which. 2.08 ms of a 16.67 ms frame is under a third of what the work costs, and a reservation smaller than the work is worse than none. The workgroup was created and joined but never given an interval. `setpriority(-10)` needs root and printed EACCES on every normal launch. | budget 2.08 ms, no readback, one inert workgroup, one error line per launch | budget 12.5 ms, effective policy printed, no workgroup, no error line | VERIFIED (10.15.8) | yes | Research is explicit that a `DEFAULT`-type workgroup is a no-op and interval workgroups are audio-only. |
@@ -146,6 +145,7 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 153 | macos capture | capture tier chosen by `AnyClass::get`, and ScreenCaptureKit not committed to until it has delivered a frame (1500 ms); the CGDisplayStream TCC probe is not reached on a host that has SCK | The selector was a `sw_vers` fork whose parse failure returned *true*. Chromium reports full-display SCK capture is broken on 12.3 — it starts and delivers nothing, which from outside is indistinguishable from slow. Probing with the obsoleted API on a modern Mac is also what raises Sequoia's recurring privacy alert. | version string comparison, no frame-level check | class probe plus a first-frame gate, both logged | VERIFIED (10.15.8 selects CGDisplayStream by class absence); the frame gate is UNVERIFIED | yes | A mid-session fallback from SCK to CGDisplayStream was considered and **rejected**: swapping capture backends under a live session risks a worse failure than the stall it papers over, and CGDisplayStream would not fix a WindowServer stall anyway. The watchdog that matters is row 94, which covers both. |
 | 154 | macos | `pipeline::start` returns a `SessionCapture` instead of leaking; the drain thread reuses one Annex B buffer; the wake token is consumed when a frame is taken; the reachable CoreFoundation panics on the encode path return `None` | `start` called `mem::forget` on the capture backend and the latency activity and dropped the stop flag and the join handle, so one call permanently held a capture stream, a VideoToolbox session, a real-time thread, a process-wide App Nap suppression and two power assertions. The wake channel is a `bounded(1)` counter and a frame taken after a timeout left its token behind, so the next wait returned instantly with nothing to take. | leaks per call; a `Vec` grown from empty per frame; a spurious wake per timed-out take; `expect` on every `CFDictionaryCreate`, including the per-frame force-keyframe dictionary | none of the above | VERIFIED (10.15.8; `start` has no production caller, so the leak was latent) | yes | |
 | 155 | macos encode | `ConstantBitRate` and `BaseLayerFrameRate` probed and reported, deliberately not set | CBR spends bits on a static screen to hold the rate, which is the opposite of what a screen sharer wants and is why the removed `DataRateLimits` was not replaced with one. `BaseLayerFrameRate` is hierarchical-P temporal layering: it adds reference depth to buy scalability nothing here consumes. | both unmentioned | both named in the `[vt] properties:` line as `available` or `absent` | VERIFIED (10.15.8 reports both `absent`) | n/a — recorded rejection | The report exists so a future reader can see the decision was made rather than missed. |
+| 178 | macos build | `NSSupportsAutomaticGraphicsSwitching` = true in `src-tauri/Info.plist` | On a dual-GPU Mac, an app that touches Metal or OpenGL without this key forces the discrete GPU on for its entire lifetime, streaming or not. QA1734 attaches a condition — the app must work correctly with multiple GPUs — which is satisfied by construction here: `gpu.rs` is an empty placeholder and nothing in this process does direct GPU work; the surfaces come from WindowServer and go to VideoToolbox. | absent | present | **COMPILE-CHECKED**, and inert until a separate fix lands: `findings/minor-build-mac-info-plist-is-never-referenced-by-either-tauri-config.md` says `src-tauri/Info.plist` is not referenced by `tauri.conf.json` or `tauri.macos.conf.json`, so the key does not reach the bundled app yet. W13b is wiring the config on its own branch. | yes | Manual check once both are in: `defaults read ScreenExtend.app/Contents/Info.plist NSSupportsAutomaticGraphicsSwitching`. Pairs with row 143 — pinning the encoder to the display GPU is only half the decision if the app is also forcing the wrong GPU on. |
 
 
 | 156 | ui (desktop) | Deleted `ui/form.tsx` and `ui/resizable.tsx` (no importers), `generateSlug`, `useInterval`, two never-assigned `Window` globals and a commented-out component; dropped nine now-unreferenced runtime dependencies | Rollup already tree-shook the two components out of the bundle, so the claim to test was whether removing them was pure hygiene or an actual size win. It is a CSS win: tailwind was still scanning their class names. | `main-*.js` **565.27 kB** (gzip 181.44), `main-*.css` **52.92 kB** (gzip 9.33) | JS **565.26 kB**, CSS **50.14 kB** (gzip 9.03) -- CSS -2.78 kB (-5.3%), JS unchanged | VERIFIED | yes | Deps removed: `react-hook-form`, `react-resizable-panels`, `@radix-ui/react-icons`, `zod`, `@hookform/resolvers`, `react-avatar`, `react-svg`, `@radix-ui/react-tooltip`, `@tauri-apps/plugin-dialog`. `motion` looks unused and is not -- it is `nextstepjs`'s peer and the walkthrough breaks without it. |
@@ -163,8 +163,267 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 168 | ui (desktop) | Past Devices rows keyed on `${token}\|${ip}` instead of `ip`; the device-editor body mounts during render rather than from an effect | Device trust is keyed on the per-device token, so one IP legitimately owns several rows -- one per device that has used the address -- and keying on the IP alone collapsed them onto a single React identity, which is how a row can show another device's ban state. | React's duplicate-key warning on every Settings render, invisible in a release build | unique per row | VERIFIED -- found by running the app, not by reading it: `logbus::set_verbose(true)` forced on in a debug build made the frontend's `console.error` forwarding print to the terminal, and this was the only frontend line in the whole boot | yes | The same bug in the *connected* devices table was fixed in row 87. Worth noting as a method: the error-forwarding wrapper turned a class of React warning that nobody can see in a release build into something a terminal run reports. |
 | 169 | audio (macOS) | SCK audio teardown: blank the delegate ivar, stop the stream, post a synchronous barrier onto the serial delivery queue, then free the context box | `stop()` freed the box after releasing the stream, delegate and queue, on a comment that asserted no callback could still read it. Releasing a `DispatchQueue` handle neither drains nor cancels blocks already enqueued on it, and `stopCaptureWithCompletionHandler:` is not documented as a barrier against an in-flight `stream:didOutputSampleBuffer:ofType:` -- so the delegate surviving one extra retain handed a real-time callback a dangling pointer. | a use-after-free racing the `UserInteractive` delivery queue on every teardown, presenting as a rare crash on disconnecting the last audio-enabled device -- or as nothing | the ivar is null before the stop, and the serial queue is drained to a barrier before the free; three ordered steps with no window between them | COMPILE-CHECKED (13.0+ path, no machine on this project runs it) | yes | The Process Tap sibling needs none of this: `AudioDeviceDestroyIOProcID` is documented not to return while the IOProc runs. `macos_utils/streamer/sck.rs` (W5) still has the identical shape and the recipe transfers verbatim. |
 | 170 | audio (macOS) | SCK dummy video stream: added `showsCursor: false` and `queueDepth: 3` to the existing 2x2 at 1 fps | SCK has no audio-only mode before the 14.2 Process Tap, so this backend must run a real screen stream to get audio at all. The Screen Recording requirement and the menu-bar indicator are Apple's constraint; what the stream costs while it is up is not. | 2x2 at 1 fps with default cursor compositing and default queue depth | same geometry with cursor compositing off and the shallowest queue SCK accepts; no screen output is registered, so every frame produced is dropped at the delegate | COMPILE-CHECKED (13.0+ path) | yes | `powermetrics` on a 13.x machine is the measurement; `setExcludesCurrentProcessAudio: true` was already correct, so the host's own audio is not fed back. |
+| 171 | client / input | The optional input tails are sent, gated on the host's `PONG` capability bits: a `u64` client stamp on `POINTER_*`, `POINTER_MOVE_BATCH`, `WHEEL`, `KEY` and `MOUSE_DELTA`, and the `MOUSE_DELTA` event-flags byte carrying `UNADJUSTED` (`static/input.js`) | The host can measure its own queue and injection but not the wire: `input_recv` is derived from a client stamp no client sent, so the histogram stays empty however busy the session is. Separately the client knew whether `unadjustedMovement` had been granted and had nowhere to put it, so the host could not tell whether the deltas had already been through an OS pointer curve. | `input_recv` count 0 on every session; the host guesses about the pointer curve | frames carry the stamp and the flag once the host advertises bits 3 and 4, and are byte-identical to v1 until then | COMPILE-CHECKED (`node scripts/test-client-stats.mjs` asserts both directions byte for byte, and the merged host advertises all four bits and reads every tail at the offsets asserted here; nothing has been measured end to end, because neither dev box can run the client page) | yes | Gated rather than sent unconditionally even though the host's length checks are floors: a stamp a host does not read is bytes buying no measurement, and byte 8 of `MOUSE_DELTA` is a byte an older host reads as the pad it used to be. `hostCaps` is 0 until the first `PONG`, so a session's first second is plain v1 -- which is also what an older host gets for its whole life. |
+| 172 | client / audio | `audioCapabilities` gains `wantsFallbackTrack` and `verified`; `ontrack` remembers the audio stream instead of attaching it (`static/audio.js`, `static/index.html`) | WHEP has no renegotiation verb, so a track absent from the first answer can never be added later. A client claiming the WebCodecs path is answered with no audio section at all, which makes every way that path can fail *after* the answer a silence with no route back -- and the client is the only side that knows whether a spare track would be useful. | a mid-session decoder failure is silence until the user rejoins | the request is on the wire, and the client attaches a spare track only once the fast path is gone | UNVERIFIED (both halves are now on the branch: `AudioCapabilities` reads both fields, logs `verified` and honours `wantsFallbackTrack`; no browser here to join with) | yes | Attaching on `ontrack` is what would have made a spare track a regression rather than a safety net: a fast-path client handed one would report `netEQ` in the stats frame and play a silent element beside its worklet. The retirement and worklet-failed paths recompute the request, since off the fast path the host already sends a track it feeds. |
+| 173 | client / audio | Samples go worker to worklet over a transferred `MessagePort` when there is no `SharedArrayBuffer`, instead of worker to page to worklet (`static/audio.js`, `audio-worker.js`, `audio-worklet.js`) | 200 packets a second at the host's 5 ms framing means 400 postMessage hops and 400 typed-array allocations, half of them on the main thread that also runs the reconfig fetch, the `getStats` poll and every pointer event. A long task there is an underrun, and an underrun re-primes the jitter buffer -- up to `MAX_TARGET_MS` of silence from one stall. | 2 hops and 2 allocations per packet, one hop on the main thread | 1 hop, no main-thread involvement, same 2 allocations | UNVERIFIED (no browser on either dev box; the path also needs a secure context that is *not* cross-origin isolated, which is why it is almost never exercised) | yes | Offered, not assumed: the page sends the far end to the worklet, the worklet acknowledges on its own port, and only then does the worker get the near end. An engine that will not transfer a port into an `AudioWorkletGlobalScope` never acknowledges and the page relay carries on unchanged. `getSyncInfo().transport` gained a third value (`port`) so which of the three is live is readable. |
+| 174 | client / net | The `/audio-outputs` poll drops from 4 s to 30 s where `devicechange` exists, and `postOutputs` skips a body identical to the last one sent (`static/audio.js`) | Where the event exists the poll is a redundant second mechanism, and the POST fired unconditionally for a list that changes a handful of times in a session. | 15 enumerations + 15 POSTs per minute per device | 2 per minute where `devicechange` works, and a POST only when the list differs | UNVERIFIED | yes | The identity setter clears the cache, so a new connection -- including a reconfigure that rebuilt a session with the same token -- always posts once. Where `devicechange` is absent the 4 s poll is unchanged, because there it *is* the mechanism. |
+| 175 | client / input | Dropped files are screened against `pc.sctp.maxMessageSize` before they are read, and a refusal is named; `rawSend` reports a throw once per session (`static/input.js`) | A drop is one SCTP message with no chunking opcode and no host-side reassembly, so anything above the negotiated maximum threw inside an empty catch: no transfer, no error, no console line, nothing the host could log. The whole-file read also allocated the file before any size was checked. | a large drop silently does nothing | the file is refused before it is read, with the size and the limit named | UNVERIFIED | yes | Enforced only where the browser reports a limit: `maxMessageSize` can be `Infinity` and `pc.sctp` is absent on Safari and below Chrome 76, so refusing on a guess there would break drops that work today. Chunking is the real fix and needs a host opcode -- rejected here, see the note below. |
+| 176 | client | The refresh-rate refinement is a *second* 60-sample measurement taken once the page is live, and is applied once by a reconfigure when it disagrees with the join-time number by more than the clamp step (`static/index.html`) | The join can only afford 24 samples behind a 500 ms deadline. A page whose first half-second was throttled — backgrounded, or behind a layout storm — ships a rate that is far too low, and a refinement that only ever wrote `joinData` was never applied at all on a stationary tablet, where nothing else reconfigures. Re-reading the promise the join already consumed could only ever hand back the number already in `joinData`, so the refinement was structurally inert. | a throttled first second means the host display runs at the wrong rate for the whole session | a better measurement, taken while the page is foregrounded and painting, applied about a second in and never again | UNVERIFIED | yes | One-shot, because `onStreamLive` runs again after every reconfigure — without the latch the correction would reconfigure in a loop. |
+| 177 | client / audio | `detectHasEarpiece` reuses `detectIOS()` and separates phone from tablet by the screen's short edge instead of testing the User-Agent for `iPhone` (`static/audio.js`) | It was the one capability gate in the file that was a raw User-Agent sniff, and an iPhone with "Request Desktop Website" enabled sends a Macintosh UA -- losing the Speaker/Earpiece pair, which is the only output control iOS has below 18.4 where `HTMLMediaElement.setSinkId` arrives. | a desktop-UA iPhone shows an empty output list and reports `supported: false` | it keeps the category pair | UNVERIFIED | yes | No capability says "this device has an earpiece" -- `navigator.audioSession` exists on iPad too -- so some device-shape inference is unavoidable. What was avoidable was using the weakest one available. |
+| 207 | webrtc / packetize | `streamer/packetizer.rs` replaces `rtp::codecs::h264::H264Payloader`: SPS and PPS are sent as separate packets (FU-A fragmented if either needs it) when the STAP-A aggregate exceeds the MTU; a fragmented NAL gets one allocation carved with `split_to` instead of one `BytesMut` per fragment; a NAL that fits is a zero-copy `Bytes::slice` of the frame; the payload vector is reused across frames. | The stock payloader drops an oversized STAP-A with no error and clears the stashed copies anyway, so they are never retried -- with an infinite GOP that is a permanent black screen with RTP flowing and every host-side signal reporting success. Separately it allocated once per FU-A fragment, ~260 for a 300 KB IDR, per viewer, per frame. | stock payloader **18404 ns/frame, 36398 packets**, `ceil(S/1186)` allocations per fragmented NAL | local packetizer **18032 ns/frame, 36398 packets**, one allocation per fragmented NAL -- **1.02x** wall time | VERIFIED (`cargo test --lib packetizer::bench -- --ignored`, release, 2000 frames at a 1188 B MTU, one 300 KB IDR per 59 16 KB P-frames; both packetizers asserted to produce the same packet count). Noisy: several other workstreams' `rustc` processes were on the machine. | yes | **The speed win is 2 %, and that is the honest number** -- the memcpy of the frame body dominates and both pay it. The value is the correctness fix plus allocator traffic: a 300 KB IDR stops putting ~260 allocations into one tight loop on a tokio worker that is also driving socket writes, multiplied by every connected viewer. Resolves `major-webrtc-sps-pps-silently-dropped-when-stap-a-exceeds-mtu` and `minor-webrtc-fua-fragmentation-allocates-and-copies-every-frame-per-viewer`. |
+| 179 | webrtc / codec | `streamer/negotiate.rs`: the offer is parsed for `profile-level-id` and `packetization-mode`, High > Main > Baseline is chosen from what the client advertised, and the result is written into `cfg.h264_profile` **before** `start_on_monitor` so the encoder is built for it. The answer's level is derived from the negotiated geometry (Annex A `MaxFS`/`MaxMBPS`) and applied by rewriting the answer SDP. | `Config::default()` set `H264Profile::Baseline` and nothing outside the developer probe harness ever wrote the field, so every session paid CAVLC instead of CABAC and no 8x8 transform -- typically 5-15 % of the bitrate at equal quality, and screen content with flat regions and sharp text is exactly where the 8x8 transform helps most. On a constrained link bytes are queueing delay. | every session Baseline; `profile-level-id` always ending `1f` (level 3.1 = 1280x720@30) regardless of what was being sent | a Chrome-shaped offer negotiates **High**; a 1080p60 session advertises **level 4.2**, 1440p60 **5.1**, 4K60 **5.2** | COMPILE-CHECKED and unit-tested (9 tests in `negotiate.rs`); the bitrate saving is **not** measured here -- it needs an A/B at fixed quality with a real client | yes | The level had to be applied by rewriting the answer: webrtc-rs answers with the *remote* codec parameters (`update_from_remote_description` pushes the offer's `RTCRtpCodecParameters` into `negotiated_video_codecs`, and `get_codecs_by_kind` hands those straight back), so a level registered in the media engine never reaches the wire. Only done when the offer carries `level-asymmetry-allowed=1`, which RFC 6184 8.2.2 makes the peer's explicit permission. Baseline is registered alongside the choice as a floor. Encoder-side capability probing (`NV_ENC_CAPS_SUPPORT_CABAC`, `SUPPORT_ADAPTIVE_TRANSFORM`) is W3b's half and is the remaining risk on old hardware. Resolves `major-webrtc-h264-profile-hardcoded-baseline-never-negotiated`. |
+| 180 | webrtc / sockets | `streamer/sockets.rs` plus a per-session muxed ICE socket on the LAN tier: `SO_SNDBUF`/`SO_RCVBUF` at 1 MB, Windows `SIO_UDP_CONNRESET` disabled, macOS `SO_NET_SERVICE_TYPE = NET_SERVICE_TYPE_VI` plus `IP_TOS` AF41, and Windows qWAVE `QOSAddSocketToFlow(QOSTrafficTypeAudioVideo)` once the candidate pair is nominated. | A grep for `CONNRESET`, `SO_SNDBUF`, `IP_TOS` or `socket2` over `webrtc-ice-0.17.1` and `webrtc-util-0.17.1` returns nothing: ICE sockets are created with OS defaults and never touched. On Wi-Fi that queues video in the AP's best-effort class alongside every background download, and on Windows one ICMP port-unreachable can fail the next `recv_from`. | OS defaults on every socket; no DSCP marking anywhere | 1 MB buffers and `SIO_UDP_CONNRESET=off` on every LAN session, and a qWAVE flow per nominated pair | COMPILE-CHECKED and unit-tested (the options are asserted to apply on a bound socket); the **effect** is UNVERIFIED -- separating AC_VI from AC_BE needs two stations on one WMM-honouring AP and a monitor-mode capture, which is not available here | yes | Gated to `SessionLocality::SameNetwork` because `UDPNetwork::Muxed` skips server-reflexive gathering outright (`agent_gather.rs`, `UDPNetwork::Muxed(_) => continue`) -- and a same-subnet peer is already offered no STUN server, so nothing is lost. Relay gathering builds its own sockets and is unaffected. **Windows deliberately does not `setsockopt(IP_TOS)`**: it is ignored unless `DisableUserTOSSetting` is cleared in the registry, which this app has no business doing to a user's machine. `QOSSetFlow(QOSSetOutgoingDSCPValue)` needs Administrators; the traffic-type route does not, which is why it is the one used. Resolves `major-webrtc-ice-sockets-get-no-socket-options`. |
+| 181 | session / join | The WHEP handshake and the display+pipeline work run under one `tokio::join!`. `handle_whep_offer` splits into `prepare_whep` (peer connection, tracks, audio m-lines, `set_remote_description`, `create_answer`, ICE gathering) and `activate_whep` (everything that needs a running pipeline). | Nothing in the handshake needs the pipeline until the RTP writer is spawned: the tracks, the SDP and the gather depend only on the offer, the negotiated codec and the ICE server list. Registering the pipeline-dependent handlers after the answer exists is safe because the answer is not returned until `activate_whep` finishes, and the peer cannot connect before it has one. | serial: `display=706-1299ms pipeline=713-1018ms handshake=13-20ms` (six 20 s self-test runs, Win 11 26200 / RTX 3080 Ti, loopback, 1280x720) | the handshake term leaves time-to-first-frame entirely; on LAN that is 13-20 ms of ~1600 ms (~1 %) | COMPILE-CHECKED (282 lib tests pass); the relayed case is UNVERIFIED -- neither dev box has a TURN path | yes | The LAN win is ~1 % and does not on its own justify the restructure; the case that does is the relayed one, where the host gather runs to its 1500 ms cap against a 1500-2100 ms display term, i.e. most of the gather. Both halves unwind independently: a handshake failure stops the capture and removes the display, a display failure calls `PendingWhep::abandon`, which closes the peer connection and the mux read worker instead of leaking them. Resolves `major-session-join-is-a-fully-serial-multi-second-chain` (item 2) and `minor-webrtc-handshake-does-not-overlap-display-creation`. |
+| 182 | session / robustness | `streamer/lock.rs`: a `LockExt::lock_recover()` that recovers a poisoned `std::sync::Mutex` instead of unwrapping, at all 56 shared-state sites in `session.rs`, `server.rs`, `webrtc_session.rs` and `cloud.rs`, logging the first recovery once. | Every one of those locks guards the same few `Arc<Mutex<..>>` values, shared across every adapter's server and the cloud relay thread, so one panic that unwinds while any guard is live poisons the host for **all** devices. axum catches panics per task, so the symptom is not a crash but every request returning 500 and the device list going inert, with nothing in the log to explain it. | one panic in a guarded scope = every later `/whep`, `/reconfig`, `/leave` and UI command panics, permanently, until restart | the guard is recovered, one `teprintln!` names it, and the host keeps serving | VERIFIED (unit test: a thread panics holding a lock, `lock().is_err()` confirms the poisoning, `lock_recover()` returns the data and the lock stays usable) | yes | Recovering is correct here: the guarded data is plain maps, counters and epochs, and a torn update is far less harmful than a dead host. Resolves `minor-session-mutex-poisoning-cascades-across-every-session`. |
+| 183 | bwe | The bitrate driver holds its loss and RTT arms when the RTCP receiver report has not moved since the last 120 ms poll, instead of re-running the controller on the same numbers. | `fraction_lost` and `round_trip_time` come from the remote's receiver reports, which browsers emit about once a second; the loop runs at 8 Hz. Seven polls in eight re-read the same two values, and feeding an unchanged reading back in lets one loss event be acted on up to eight times -- the mechanism behind the ratcheting the cut rate-limit was added to stop. | up to 8 controller actions per independent loss observation | one; transport-wide feedback is unaffected because it is consumed on read, so a `Some` there is always new | COMPILE-CHECKED | yes | A run of 16 unchanged polls now logs once, so a real client's RR cadence is observable rather than assumed. The poll stays at 120 ms because `bytes_sent` genuinely moves at that rate and `measured_send_bps` is derived from it. Resolves `speculative-webrtc-get_stats-polled-8-times-a-second-per-session`. |
+| 184 | session / http | The client page is substituted for `__SAME_DEVICE_FLAG__` once per variant into a `OnceLock` at first use, instead of `String::replace` over the largest asset in the tree on every `GET /`. | Every other static route already serves a `&'static str` with no copy. The page is fetched once per join so this was never large, but it is on the join path and a client in a reload loop paid it repeatedly. | one full scan and one allocation of the whole page per request | one per variant, for the life of the process | COMPILE-CHECKED | yes | Recorded as clarity rather than sold as a performance fix, which is what the finding itself asked for. Resolves `speculative-session-index-html-reallocated-on-every-page-load`. |
+| 185 | cloud | The relay's "session taken" condition is a typed `RegisterRejected` error read back with `downcast_ref`, not `e.to_string().contains(SESSION_TAKEN)`. | The control flow depended on string formatting that nothing enforced: any future `format!` that echoed a relay message into an error would rotate a working join code out from under the user, and the code on screen would silently stop matching the one the client has. | a substring match on a formatted message | a typed condition, with a unit test that an unrelated error whose text contains the same substring does **not** rotate | VERIFIED (3 unit tests) | yes | The backoff-reset asymmetry around it is deliberate and is preserved. Resolves `minor-cloud-session-taken-is-a-substring-match`. |
+| 186 | session / display | `VirtualDisplayController::created_geometry` (default `None`) lets a backend report the size it actually landed on, and the server skips the forced `set_display_mode` and its settle poll when that already matches the request. | `create_display` returned a display id and nothing else, so the server always followed a create with a forced mode set -- an extra reconfiguration on a path that had already done several, and one guaranteed to fail on a backend that negotiates its geometry rather than being commanded. The macOS AirPlay tier computes the closest mode from the ladder macOS published and then discards the answer. | one `set_display_mode` plus one `wait_for_display_settle` on every new-display join, on every backend | skipped on a backend that reports a matching geometry | COMPILE-CHECKED and unit-tested (4 tests, including that a portrait request is compared in monitor coordinates and that a commanded backend keeps the old behaviour) | yes | `None` is deliberately still the answer on Windows: the IDD registers a mode list and the OS picks from it, so the backend genuinely does not know which. The tier that benefits is macOS AirPlay, which no machine here can run. Resolves the server-side half of `minor-session-create-display-cannot-report-the-geometry-it-landed-on`. |
+| 187 | session / ice | `stunUrls` becomes a real setting: a `SharedStunConfig` in `AppState` read from the config store at `setup` (so the desktop app, `serve` and the CLI all see one value), a `ScreenExtend stun show|set|clear` verb, and a `stunUrls` entry in the frontend config type defaulting to today's URL. | `DEFAULT_STUN_URL` was a compile-time constant and the only writer outside `Config::default` was `--stun` in the developer probe harness, which is not wired into the shipping binary. A same-subnet peer is no longer offered STUN at all, so the common case costs nothing -- but a cross-network or unclassified join still contacted a Google endpoint with no setting and no way to point it at a private server. | `stun:stun.l.google.com:19302`, always, unchangeable | configurable; empty means no STUN at all, which is a legitimate setting for a LAN-only host | COMPILE-CHECKED | yes | Read through the store rather than a new Tauri command on purpose: it needs no `bindings.ts` regeneration and keeps one source of truth with the CLI, which already reads and writes the same file. Resolves `minor-session-stun-list-has-no-configuration-surface`. |
+| 189 | net (macOS) | `watch_for_network_changes` blocks on the kernel routing socket (`PF_ROUTE`, which carries `RTM_NEWADDR`/`RTM_DELADDR`/`RTM_IFINFO`) with a 250 ms debounce and a 30 s backstop, instead of re-running the whole enumeration once a second; a second call no longer starts a second identical watcher thread (`macos_utils/networking.rs`) | Every second the watcher ran `getifaddrs`, a `SIOCGIFMEDIA` ioctl per interface, `if_nametoindex`, an `is_hosted_network` CoreWLAN call and a `wifi_ssid` CoreWLAN call — two XPC round trips to `airportd` per poll — and compared the result to the previous one. Nothing about that work is needed when nothing has changed, and the 1 s granularity is also 1 s of dead time before `sync_streamers` can rebind after a Wi-Fi switch. | **30 full enumerations per 30 s at idle** (`macos_utils::networking::tests::measure_adapter_watch_cost`, 10.15.8, one reported adapter) | **0 per 30 s at idle**; a real change wakes the thread immediately instead of up to 1 s later | VERIFIED (10.15.8) | yes | `PF_ROUTE` predates macOS and needs no framework, no run loop and no entitlement, which is why it was chosen over `SCDynamicStoreSetNotificationKeys` — the latter needs a CFRunLoop thread and a SystemConfiguration link for the same events. The socket's payload is never parsed for meaning: the enumeration remains the source of truth and the socket only decides when to run it. |
+| 190 | virtual display (macOS) | `activate_mode`'s settle wait is a condvar fed by `CGDisplayRegisterReconfigurationCallback`, registered from a thread that runs a CFRunLoop, instead of a 5 ms/25 ms sleep-poll (`macos_utils/virtual_display.rs`) | The callback fires exactly when WindowServer finishes reconfiguring a display, so the wait can report the true settle time instead of rounding it up to the next poll. The callback is delivered on the *registering thread's* run loop, and the join path is a `spawn_blocking` worker with none — hence the dedicated thread. | poll: 5 ms for the first 250 ms, then 25 ms, inside `DISPLAY_CORRELATION_LOCK` | event-driven, with a 100 ms re-read as the ceiling on a missed event | VERIFIED (registration); UNVERIFIED (the saving) | yes | A generation counter is read *before* the geometry read, so a reconfiguration that lands between the two cannot be lost. Correctness never depends on the callback: the wait re-reads on a bounded timeout either way, so a machine where it never fires is no slower than the poll it replaced. `the_reconfiguration_watcher_reports_whether_it_registered` asserts the probe answers and caches. |
+| 191 | virtual display (macOS) | The descriptor's `setSerialNum:` is FNV-1a over the display's name (`"ScreenExtend - <device>"`) instead of a process-local counter starting at 1; the registry's termination-handler key is a separate process-unique token (`macos_utils/virtual_display.rs`) | macOS keys per-display state — arrangement position, colour profile, resolution preference — on vendor/product/serial. Vendor and product are the same constants for every display, so the serial was the whole identity, and it restarted at 1 on every launch: the first device to join after a restart inherited whatever the previous run's first device had left behind, and a returning device never got its own back. | serial 1, 2, 3… per process; the same serial for different devices across restarts | the same device name always maps to the same serial, and two different names never collide | COMPILE-CHECKED | yes | The termination handler needs to name exactly one registry entry and two clients can carry the same device name, so it keeps a counter of its own. The declared physical size and the placeholder vendor/product ID were *not* changed — see the rejection below. |
+| 192 | net | `Config.bind_ip` widened from `Ipv4Addr` to `IpAddr`; macOS `sync_streamers` serves global-unicast and unique-local IPv6 alongside IPv4 (v4 first); `url_host` brackets IPv6 literals per RFC 3986; link-local is reported rather than silently dropped (`streamer/config.rs`, `streamer/server.rs`, `macos_utils/mod.rs`, `windows_utils/mod.rs`, `cli.rs`) | On an IPv6-only network every address the enumeration found failed `parse::<Ipv4Addr>()` and was dropped with `.ok()`, so `desired` was empty, no axum server was ever started, and the dashboard showed addresses nothing was listening on. | IPv6-only network: zero listeners, zero diagnostics | the v6 addresses a browser can reach are bound and served; the ones it cannot (`fe80::/10`, which needs a zone index no URL carries) are named in the log with the reason | COMPILE-CHECKED (macOS); COMPILE-CHECKED-by-inspection (Windows, one line) | yes | The dev box's only v6 address is `fe80::844:907:64ca:8224`, i.e. exactly the case that still cannot be served, so an end-to-end v6 join was not reachable here. `collect_local_ips` already parsed `IpAddr`, so the WHEP locality detection needed no change. The desktop UI's QR builder is still v4-only — see the UI-visible recommendations. |
+| 193 | hosted network (macOS) | The liveness watcher promotes the status when a session appears whose client IP shares the /24 the AP handed out, and after 60 s with nothing associated logs the three usual causes in order (`macos_utils/hosted_network.rs`, plus `streamer/session.rs::client_ips`) | "Hosted network started" has only ever been an assertion about our own API call. An AP that is up, holds an address, and is refused by every phone in the room looked identical in the log to one that works. | AP up with nothing associated: indistinguishable from a working AP | promotion on the first client from our own subnet; a named diagnostic at 60 s otherwise | COMPILE-CHECKED | yes | `HostedNetworkStatus.associated_peer` is the field that separates advertised from verified. The `NotStarted`/`Advertised`/`Verified` tri-state in `AppState` itself is deliberately not done — see the UI-visible recommendations. |
+| 194 | airplay (macOS) | Type-`0x05` stream reports are parsed (`binary_plist_len` locates the plist inside the payload) and their numeric fields logged; the header capture stamp is read as a sender-epoch NTP fixed point and reported as spread rather than as an absolute latency (`macos_utils/airplay/mirror.rs`) | Both are plaintext, both already arrive, and both were counted and dropped. The stream report is macOS's own view of the link; the stamp is the only handle anything in this tree has on WindowServer's compose-to-consumer path. | 5 of 128 header bytes read; the whole 25 KiB report discarded | `encoderCurrentFPS`, `rttAvg`, `lossAvg`, `queuedFramesAvg`, `txCapacityAvg`, `txUsageAvg`, `sentFramesAvg` logged; compose-to-consumer spread p50 **26.96 ms** / p90 **43.90 ms** / p99 **67.43 ms** over 66 frames | VERIFIED (10.15.8) | yes | The report did not parse before because it is a ~181-byte plist followed by a 25,000-byte trailer; a binary plist's 32-byte trailer is self-describing, so the one end position whose trailer is internally consistent is the real one. See the close-out section for what the stamp turned out to be and why only the spread is reported. |
+| 195 | net (macOS) | The watcher reports the associated Wi-Fi channel and whether `awdl0` is up, once, at start; a channel in {6, 44, 149} is called out by name (`macos_utils/networking.rs`) | AWDL's three social channels are where every nearby Apple device parks its radio for AirDrop and Handoff discovery, and a single-radio Mac retunes to them periodically — a published jitter source that the *user* can act on and that will otherwise be blamed on the stream. | the channel and `awdl0`'s state were never recorded, so no field report could distinguish this cause | one line at startup; on this box, "Wi-Fi channel 36, awdl0 up" | VERIFIED (10.15.8: channel 36, `awdl0` up, so the non-social branch fires) | yes | Reported, not acted on: the host AP's own channel choice already avoids all three (row from W6's earlier work), and whether *sitting* on a social channel is better or worse for jitter is the open A/B in `docs/manual-tests/macos-hosted-network.md` §4. |
+| 204 | whep / ice | Trickle ICE, host half: `POST /whep` returns `Location: /whep/{id}`, `PATCH /whep/{id}` takes an `application/trickle-ice-sdpfrag` body and feeds each candidate to the live peer connection, `DELETE /whep/{id}` tears the resource down, and `/net-config` advertises `trickleIce: true`. | `/whep` was a single POST carrying the complete offer, so the client could not start negotiating and add candidates later: the offer it posted was the only one the host would ever see. The client therefore could not post until its own gathering finished -- with TURN configured that is a round trip to the relay before the offer even leaves, and on a network where no candidate arrives it is the full deadline. | no trickle verb; the client's gather is on the critical path of every join | the host accepts candidates after the answer; the session is addressable by a minted id held as a `Weak`, so the registry can never keep a peer connection alive | COMPILE-CHECKED and unit-tested (5 tests: mid and m-line index, a second `m=` section, `a=end-of-candidates`, a bare `candidate:` prefix, and a fragment for a session that is over). The end-to-end effect is UNVERIFIED until the client adopts it. | yes | Backward compatible in both directions on purpose: a client that ignores `Location` behaves exactly as today, and the cloud relay never sets it because it has no URL space of its own -- so a relayed client correctly keeps the gather-then-post shape. The client half is `findings/major-client-can-now-trickle-ice-and-stop-waiting-to-gather.md`, tagged W11, with the wire contract written out. Resolves the host half of `major-whep-no-trickle-ice`. |
+| 205 | session / transport | `platform::link_medium_for_local_ip` resolves the local end of the nominated ICE pair to `wired` / `wireless` / `other` and logs it once per session. Windows reads `MSFT_NetAdapter.NdisPhysicalMedium` (14 = 802.3, 9/1 = 802.11); macOS uses `getifaddrs` for the interface name and then `SIOCGIFMEDIA`. | `detect_session_locality` classified a session only as SameNetwork / CrossNetwork / Unknown, so the host could not tell a USB-tethered phone -- which is an ordinary Ethernet interface, and which every competitor in this category treats as its flagship low-latency tier -- from Wi-Fi. Luna Display's own 50-sample bench reports 11.3 ms mean over USB against 22.4 ms over Wi-Fi. | the transport the pair actually rides was invisible | named in the log, off a `spawn_blocking`, once per session | COMPILE-CHECKED. The wired-vs-wireless **latency comparison** is UNVERIFIED and needs a 240 fps camera and an Android phone -- the script is `docs/manual-tests/transport.md` §1, and "not measurably better than clean 5 GHz" is an outcome worth recording | yes | No policy is driven off it yet, deliberately: a tethered client is on the same subnet, so it already classifies `SameNetwork` and already gets `PacingMode::Off`. What it buys today is that the wired route is documented in `README.md` and observable in the log. Resolves `minor-session-usb-tether-is-an-undocumented-low-latency-tier`. |
+| 206 | session / display | `DISPLAY_CORRELATION_LOCK` is released as soon as the backend names its own display, and the wait for it is logged when it exceeds 1 ms. | The lock exists because a new virtual display is correlated with its OS device name by diffing `monitor_device_names()` before and after, and two concurrent creations would confuse the diff. But on the fast path -- where `display_device_name(id)` answers directly -- the `before` snapshot is never read, and the lock was still held for the whole create-and-attach window. Two devices joining together serialised: the second waited out the first's entire window, up to `DISPLAY_ATTACH_TIMEOUT` = 5 s, before its own began. | the lock spans create + name + up to a 5 s attach poll, on every backend | released immediately on the direct-name path; the wait behind another join is now a log line rather than an inference | COMPILE-CHECKED | yes | W9 landed the Windows half in parallel (row 196): `WindowsVirtualDisplay::display_device_name` now correlates through `QueryDisplayConfig`, returning `None` on an ambiguous match — the EDID monitor-name descriptor is 13 bytes, so every `ScreenExtend - <device>` truncates to a shared prefix — and dropping to the diff when it cannot be sure. The two changes compose: the direct-name path is now reachable on Windows, and this is what makes the lock go away when it succeeds. Resolves the server-side half of `minor-session-display-correlation-lock-serializes-all-joins-for-up-to-5s`. |
+| 215 | input | The 50 ms age gate is source-aware: a stale `POINTER_MOVE_BATCH` or `POINTER_MOVE` from a mouse is still dropped, one from a pen or touch never is. | Only where a cursor *is* is observable, so a 50 ms-old position is worse than nothing. A pen or touch sample is not redundant with its neighbours -- it is the shape of the line -- so dropping one leaves a permanent straight segment where the user drew a curve, and no later event repairs it. | every supersedable event dropped for age regardless of `source` | mouse unchanged; pen/touch batches and moves are never age-dropped (`ink_is_never_dropped_for_age_but_a_cursor_is`) | VERIFIED (unit); UNVERIFIED (no pen client on this hardware) | yes | The gate has never fired in practice on either dev box. If a pen backlog ever does become real, the right answer is to inject the batch and skip its *intermediate* samples, not discard the message -- the endpoints are what the stroke needs. |
+| 208 | input | `protocol::parse` returns `Result<Parsed, ParseError>` naming opcode, needed length and reason; the transport logs one line per distinct rejection per channel and counts every one in `input_parse_errors`. `Phase::from_opcode` returns `Option` instead of falling through to `Move`. | Every failure mode -- unknown opcode, truncation, bad UTF-8, a length prefix past the end -- collapsed to one `None` with no log, no counter and no reply. A client whose cached `input.js` had drifted from the host produced a session where input silently did nothing, and nothing anywhere explained why. | 0 diagnostics of any kind | one log line per distinct error per channel, `input_parse_errors` in `status --json`, five typed variants asserted by `every_rejection_names_its_reason` | VERIFIED (unit) | yes | The dedup is a `HashSet<ParseError>` in the handler state, so a drifted client flooding the same malformed frame produces one line, not thousands. |
+| 209 | input | Pointer, batch, wheel and mouse-delta frames may carry a `u16` sequence in the optional tail past the client stamp; the injector drops a *supersedable* fast event whose sequence is behind the highest injected (wrapping-aware) and counts it in `input_reorder_drops`. | The fast channel is unordered with `maxRetransmits: 0` and the host merges two queues with a `crossbeam::select!` that picks randomly, so two moves can reach the injector swapped and the older one walks the cursor backwards for a frame. The age gate bounds how *stale* a replayed move is and says nothing about order. | no sequence anywhere in the input protocol | 2 bytes on the frames that need it, one wrapping comparison; an absent tail means the session is simply not reorder-gated | VERIFIED (unit: `the_fast_channel_sequence_number_is_optional_on_every_frame_that_carries_one`, `sequence_comparison_survives_the_u16_wrap`); UNVERIFIED (no induced-reorder link) | yes | Host-side only and backward compatible by construction. The client half is W11's -- see the return note for the exact layout. Buttons and keys are never gated, only positional data. |
+| 210 | input (Windows) | Synthetic pen events carry the client's own `pointerId` instead of the literal `1`. | Each session builds its own `Injector` and therefore its own `CreateSyntheticPointerDevice(PT_PEN, 1, ...)`, and both injected `pointerId: 1`. Whether Windows disambiguates two synthetic pen contacts sharing an id across two device handles is undocumented. | every pen contact on every session injected as pointer 1 | the client's id, guarded so 0 becomes 1 (Windows treats 0 as no pointer); the touch path has always done this | COMPILE-CHECKED; UNVERIFIED (needs two pen-capable clients) | yes | Same shape as the touch path, which keys its `contacts` map on the client's id and passes it straight through. |
+| 211 | telemetry | The summary line reports delivered frames per second between consecutive summaries, not only a running total. | A capture path silently delivering 45 fps against a 60 fps target looked identical in the log to one keeping up. | `frames=<running total>` | `frames=<total> fps=<rate>` | VERIFIED (probe run) | yes | Computed from the frame counter and the host clock at each summary, so it costs one atomic load per 5 s. |
+| 212 | capture (Windows) | DXGI `AccumulatedFrames` past the first is counted into `frames_dropped_capture`; `ProtectedContentMaskedOut` is reported once per capture. | `AccumulatedFrames` is documented as the number of frames the OS accumulated since the application processed the last desktop image, so everything past the first is a present the client never saw -- free drop telemetry, read only as a `> 1` early-out inside the dirty-region check. | both fields read and discarded | `frames_dropped_capture` in `status --json` and the summary line; a DRM black rectangle now has an explanation in the log | VERIFIED (probe run, counter reachable) | yes | The two W2 findings asking for a per-stage breakdown were already resolved by the merged W1/W3a telemetry (`FrameTiming`, `Stages`, p50/p90/p99/max histograms, all three Windows paths including the NVENC ring, plus packetize and socket_write in the transport). These were the two gaps that remained. |
+| 213 | audio | `AudioParams` carries the session's `SessionLocality`, and a `CrossNetwork` session starts with `FLAG_REDUNDANT` on rather than waiting for the video BWE to observe loss. | The redundancy policy was driven only off `fraction_lost`, which is the right signal but a lagging one: it can only move after loss has already happened. A relayed session is *known* to be relayed before the first packet is sent -- `AppState::locality_for` decides it from the peer IP before the handshake. | a relayed client's opening packets were unprotected until the first observed loss | defensive from packet one on `CrossNetwork`; `SameNetwork` and `Unknown` unchanged | VERIFIED (unit: `a_relayed_session_starts_defensive_and_a_lan_one_does_not`); UNVERIFIED (no relayed link on this hardware) | yes | The client's declared capability still outranks everything: one that cannot parse the format is never sent it, whatever the link is doing. |
+| 214 | audio | `OpusApi::version()`'s null-pointer fallback is no longer a string the library itself can return. | The log had read `opus: libopus unknown` for months and the code's own fallback was `"unknown"`, so the two were indistinguishable and the finding assumed a null pointer. | ambiguous | measured: the Windows DLL genuinely answers `libopus unknown` (upstream's own fallback for a build with no `package_version`, which a shallow checkout does not generate) and the macOS dylib answers `libopus 1.5.x-screenextend-src` | VERIFIED (both bundled artifacts probed directly) | yes | `PROVENANCE.md` claimed the dylib reported `libopus unknown` as well. It does not. Two platforms reporting different strings for one source tree is exactly why the host must print what the library says rather than a fallback the library can also produce. |
+| 196 | vdisplay (Windows) | `WindowsVirtualDisplay::display_device_name` correlates a new display to its GDI device name with `QueryDisplayConfig` instead of leaving the trait default of `None`. | The default sent every join down `wait_for_new_monitor`: a 100 ms poll of `EnumDisplayDevices` diffed against a pre-create snapshot, serialised across concurrent joins by `DISPLAY_CORRELATION_LOCK` and bounded only by the 5 s attach timeout -- all of it between the device scanning the QR and a picture appearing. | 100 ms-granularity poll on every join, always | a direct lookup when the monitor's EDID friendly name is unambiguous; `None`, and therefore the old diff, when it is not | COMPILE-CHECKED + unit (`an_ambiguous_friendly_name_resolves_to_nothing`); UNVERIFIED (the `report_display_name_correlation` harness was not run against a full ladder) | yes | The match is by prefix because the EDID monitor-name descriptor is 13 bytes, so `ScreenExtend - iPad` comes back truncated. Ambiguity returns `None` deliberately: a wrong device name points the capture at somebody else's screen, while `None` costs only the poll we already had. |
+| 197 | net (Windows) | The legacy hosted-network capability is `WlanQueryInterface(wlan_intf_opcode_hosted_network_capable)` and its status is `WlanHostedNetworkQueryStatus`, not `netsh` output. | Both were decided by string-matching English phrases in localized `netsh` output, so on a German, French, Japanese or Chinese Windows the probe returned no unconditionally and a successfully started hosted network read back as stopped. | locale-dependent | structured `BOOL` and `WLAN_HOSTED_NETWORK_STATE`; measured on Windows 11 26200: `hosted_network_capable => Some(false)`, `active => Some(false)`, matching what `netsh` prints in English on the same box | VERIFIED (`report_wlan_hosted_network_capability`) | yes | The finding's earlier measurement found `WlanHostedNetworkQueryProperty`/`QueryStatus` ambiguous for *capability*; the interface opcode is the one that is not, and it had not been tried. The `netsh` parse survives only for a machine where the WLAN service declines to answer, and says so in the log. |
+| 198 | vdisplay (Windows) | `DriverClient` resynchronises with `request_state()` when the driver event stream reports a gap, instead of only logging it. A `.v2` pipe name is preferred at connect, so a rebuilt driver can be recognised without ever sending an old one a message it cannot decode. | The cached monitor list is fed by that stream and `refresh_state` reads the same cache, so a dropped `Changed` left `monitors()` disagreeing with the driver with no path to recovery. The wire format is `#[serde(untagged)]` with no version field, but changing it means changing a format shared with a signed third-party binary. | log line, cache stays wrong | `EventOrLag` on the stream and the cache repaired from the driver; `PROTOCOL_VERSION` negotiated by which pipe exists | VERIFIED (unit: `a_lagging_consumer_is_told_how_much_it_missed`, `an_unversioned_driver_still_connects_and_reports_v1`) | yes | Neither half is reachable today -- the driver is the only writer and 64 is more than any burst we generate -- but both are silent-corruption shapes in a component whose symptom is that the virtual display quietly did not appear. |
+| 199 | vdisplay (Windows) | Driver round trips are serialised by their own lock; the state mutex is taken only for the moments that touch its fields. | `Inner::commit` held `WindowsVirtualDisplay::inner` across `RUNTIME.block_on(notify())` -- bounded at 5 s connect plus 2 s write, but bounded is not short -- so a slow driver stalled every *reader* of the monitor list behind it, including the display-name lookup now on the join path. | one blocking mutex across the whole round trip | a `commit` lock for the round trip and `inner` for the field access; id allocation stays atomic because `commit` is held across it | COMPILE-CHECKED; UNVERIFIED (needs a deliberately wedged driver) | yes | `DriverClient::duplicate()` gives an independent client over the same connection, which is what lets the state guard go before the wait. |
+| 200 | probe | `probe::finish` removes the virtual display its `platform::setup` created, on normal exit, on Ctrl+C and from a panic hook. | A failed probe left a display attached and the *next* process saw two monitors and failed with a `GraphicsCaptureItem` conversion error; a minute later the same command worked. One bad run silently changing the next run's numbers is the worst failure a measurement harness can have. | a leftover display poisoned the following run | verified: a probe run followed immediately by `probe --capture` reports one display | VERIFIED (normal and error exit); COMPILE-CHECKED (Ctrl+C, panic hook) | yes | Cleanup is idempotent -- it takes the controller out of a static -- so the handlers can race the normal exit. |
+| 201 | probe | `probe --live --workload <w>` paints the generated frames into a borderless top-most window covering the captured display, so a scripted workload goes through the real capture path. | `--workload` implied `--synthetic-pattern`, which fed the buffer straight to the encoder: no duplicator, no frame pool, no GPU texture, no scaler. The four workloads -- whose whole point is that different content stresses capture and encode differently -- measured only the encode half, and `capture_delivery`/`scale` were empty by construction. | `capture_delivery` and `scale` empty on every workload run | `--live --workload motion --duration 12` at 1920x1080: 817 frames, `capture_delivery` p50/p90/p99 **7.34 / 18.87 / 31.46 ms**, `scale` **0.15 / 0.21 / 0.33 ms**, WGC plus the NVENC zero-copy ring | VERIFIED (Windows dev box) | yes | The `--counter` overlay rides the same window, so the 240 fps camera method in `docs/BASELINE.md` can now be run off the real display instead of the synthetic buffer. |
+| 202 | capture (macOS) | `CGDisplayStreamUpdateGetDropCount` is read on every delivery into an `AtomicU64`, reported at most once a second from a thread of its own, and printed by `probe_main_display`. | `CGDisplayStream.h` documents this counter as useful for determining whether the client is keeping up with all WindowServer updates -- exactly the question three open findings about `queueDepth`, `minimumFrameTime` and WindowServer contention were each guessing at. The update reference was already in hand on every frame and used only to count dirty rectangles. | not read | `drops_captured()` next to `frames_captured()`; one log line a second, only when the number moved | COMPILE-CHECKED (Mac `cargo check`); UNVERIFIED (needs a 30 s animated-screen run on the 10.15.8 box) | yes | Read *before* the dirty-rect early-out: a delivery with no dirty rectangles can still be reporting frames dropped on the way to it. The delivery block is a real-time `UserInteractive` dispatch callback, so it does one relaxed `fetch_add` and nothing else. |
+| 203 | input / compat | `CompatibilityReport` gains `input_backend`, filled on all three platforms from `streamer::input::probe_backend()`; on macOS the tier is re-probed on the injector's existing 500 ms geometry cadence and a missing grant joins `unsupported_apis`. The injector backends' `log::` diagnostics move to the log bus. | Without Accessibility, `CGEventPost` returns `void` and the OS drops every event with no error the process can observe: a client whose remote control is enabled, whose pointer events are being sent and acknowledged, and whose host simply never moves. Input was the only subsystem with no tier at all, and its one warning went to `log::warn!`, which does not reach the Settings terminal. | silent no-op, and a relaunch demanded | a reported tier, an actionable entry in the list the UI already renders, and injection that starts working within half a second of the permission being granted | COMPILE-CHECKED (Mac `cargo check`); UNVERIFIED (needs a Mac with Accessibility revoked) | yes | No new UI: the degraded case rides `unsupported_apis`, which the compatibility surface already renders, and `doctor` prints the tier. `bindings.ts` regenerated. |
+| 220 | net (macOS) | `watch_for_network_changes` blocks on the kernel routing socket (`PF_ROUTE`, which carries `RTM_NEWADDR`/`RTM_DELADDR`/`RTM_IFINFO`) with a 250 ms debounce and a 30 s backstop, instead of re-running the whole enumeration once a second; a second call no longer starts a second identical watcher thread (`macos_utils/networking.rs`) | Every second the watcher ran `getifaddrs`, a `SIOCGIFMEDIA` ioctl per interface, `if_nametoindex`, an `is_hosted_network` CoreWLAN call and a `wifi_ssid` CoreWLAN call — two XPC round trips to `airportd` per poll — and compared the result to the previous one. Nothing about that work is needed when nothing has changed, and the 1 s granularity is also 1 s of dead time before `sync_streamers` can rebind after a Wi-Fi switch. | **30 full enumerations per 30 s at idle** (`macos_utils::networking::tests::measure_adapter_watch_cost`, 10.15.8, one reported adapter) | **0 per 30 s at idle**; a real change wakes the thread immediately instead of up to 1 s later | VERIFIED (10.15.8) | yes | `PF_ROUTE` predates macOS and needs no framework, no run loop and no entitlement, which is why it was chosen over `SCDynamicStoreSetNotificationKeys` — the latter needs a CFRunLoop thread and a SystemConfiguration link for the same events. The socket's payload is never parsed for meaning: the enumeration remains the source of truth and the socket only decides when to run it. |
+| 221 | virtual display (macOS) | `activate_mode`'s settle wait is a condvar fed by `CGDisplayRegisterReconfigurationCallback`, registered from a thread that runs a CFRunLoop, instead of a 5 ms/25 ms sleep-poll (`macos_utils/virtual_display.rs`) | The callback fires exactly when WindowServer finishes reconfiguring a display, so the wait can report the true settle time instead of rounding it up to the next poll. The callback is delivered on the *registering thread's* run loop, and the join path is a `spawn_blocking` worker with none — hence the dedicated thread. | poll: 5 ms for the first 250 ms, then 25 ms, inside `DISPLAY_CORRELATION_LOCK` | event-driven, with a 100 ms re-read as the ceiling on a missed event | VERIFIED (registration); UNVERIFIED (the saving) | yes | A generation counter is read *before* the geometry read, so a reconfiguration that lands between the two cannot be lost. Correctness never depends on the callback: the wait re-reads on a bounded timeout either way, so a machine where it never fires is no slower than the poll it replaced. `the_reconfiguration_watcher_reports_whether_it_registered` asserts the probe answers and caches. |
+| 222 | virtual display (macOS) | The descriptor's `setSerialNum:` is FNV-1a over the display's name (`"ScreenExtend - <device>"`) instead of a process-local counter starting at 1; the registry's termination-handler key is a separate process-unique token (`macos_utils/virtual_display.rs`) | macOS keys per-display state — arrangement position, colour profile, resolution preference — on vendor/product/serial. Vendor and product are the same constants for every display, so the serial was the whole identity, and it restarted at 1 on every launch: the first device to join after a restart inherited whatever the previous run's first device had left behind, and a returning device never got its own back. | serial 1, 2, 3… per process; the same serial for different devices across restarts | the same device name always maps to the same serial, and two different names never collide | COMPILE-CHECKED | yes | The termination handler needs to name exactly one registry entry and two clients can carry the same device name, so it keeps a counter of its own. The declared physical size and the placeholder vendor/product ID were *not* changed — see the rejection below. |
+| 223 | net | `Config.bind_ip` widened from `Ipv4Addr` to `IpAddr`; macOS `sync_streamers` serves global-unicast and unique-local IPv6 alongside IPv4 (v4 first); `url_host` brackets IPv6 literals per RFC 3986; link-local is reported rather than silently dropped (`streamer/config.rs`, `streamer/server.rs`, `macos_utils/mod.rs`, `windows_utils/mod.rs`, `cli.rs`) | On an IPv6-only network every address the enumeration found failed `parse::<Ipv4Addr>()` and was dropped with `.ok()`, so `desired` was empty, no axum server was ever started, and the dashboard showed addresses nothing was listening on. | IPv6-only network: zero listeners, zero diagnostics | the v6 addresses a browser can reach are bound and served; the ones it cannot (`fe80::/10`, which needs a zone index no URL carries) are named in the log with the reason | COMPILE-CHECKED (macOS); COMPILE-CHECKED-by-inspection (Windows, one line) | yes | The dev box's only v6 address is `fe80::844:907:64ca:8224`, i.e. exactly the case that still cannot be served, so an end-to-end v6 join was not reachable here. `collect_local_ips` already parsed `IpAddr`, so the WHEP locality detection needed no change. The desktop UI's QR builder is still v4-only — see the UI-visible recommendations. |
+| 224 | hosted network (macOS) | The liveness watcher promotes the status when a session appears whose client IP shares the /24 the AP handed out, and after 60 s with nothing associated logs the three usual causes in order (`macos_utils/hosted_network.rs`, plus `streamer/session.rs::client_ips`) | "Hosted network started" has only ever been an assertion about our own API call. An AP that is up, holds an address, and is refused by every phone in the room looked identical in the log to one that works. | AP up with nothing associated: indistinguishable from a working AP | promotion on the first client from our own subnet; a named diagnostic at 60 s otherwise | COMPILE-CHECKED | yes | `HostedNetworkStatus.associated_peer` is the field that separates advertised from verified. The `NotStarted`/`Advertised`/`Verified` tri-state in `AppState` itself is deliberately not done — see the UI-visible recommendations. |
+| 225 | airplay (macOS) | Type-`0x05` stream reports are parsed (`binary_plist_len` locates the plist inside the payload) and their numeric fields logged; the header capture stamp is read as a sender-epoch NTP fixed point and reported as spread rather than as an absolute latency (`macos_utils/airplay/mirror.rs`) | Both are plaintext, both already arrive, and both were counted and dropped. The stream report is macOS's own view of the link; the stamp is the only handle anything in this tree has on WindowServer's compose-to-consumer path. | 5 of 128 header bytes read; the whole 25 KiB report discarded | `encoderCurrentFPS`, `rttAvg`, `lossAvg`, `queuedFramesAvg`, `txCapacityAvg`, `txUsageAvg`, `sentFramesAvg` logged; compose-to-consumer spread p50 **26.96 ms** / p90 **43.90 ms** / p99 **67.43 ms** over 66 frames | VERIFIED (10.15.8) | yes | The report did not parse before because it is a ~181-byte plist followed by a 25,000-byte trailer; a binary plist's 32-byte trailer is self-describing, so the one end position whose trailer is internally consistent is the real one. See the close-out section for what the stamp turned out to be and why only the spread is reported. |
+| 226 | net (macOS) | The watcher reports the associated Wi-Fi channel and whether `awdl0` is up, once, at start; a channel in {6, 44, 149} is called out by name (`macos_utils/networking.rs`) | AWDL's three social channels are where every nearby Apple device parks its radio for AirDrop and Handoff discovery, and a single-radio Mac retunes to them periodically — a published jitter source that the *user* can act on and that will otherwise be blamed on the stream. | the channel and `awdl0`'s state were never recorded, so no field report could distinguish this cause | one line at startup; on this box, "Wi-Fi channel 36, awdl0 up" | VERIFIED (10.15.8: channel 36, `awdl0` up, so the non-social branch fires) | yes | Reported, not acted on: the host AP's own channel choice already avoids all three (row from W6's earlier work), and whether *sitting* on a social channel is better or worse for jitter is the open A/B in `docs/manual-tests/macos-hosted-network.md` §4. |
+| 227 | hosted network (macOS) | `wait_for_ipv4` takes the address the interface held *before* the start and refuses it; `measure_hostap_start` is a bounded harness that runs the shipping ladder and stops at the first success, with `SCREENEXTEND_HOSTAP_HOLD_SECS` to hold the AP up for a scan (`macos_utils/hosted_network.rs`) | The verification added in row 224 reads `getifaddrs` on the AP interface. If macOS has not yet torn down the station address, that read answers with the address of the network the Mac just left, and the AP is reported as working on the wrong network. | **VERIFIED (10.15.8, twice)**: at t+2.2 s with `interfaceMode()` already reading HostAP, `interface_ipv4("en3")` returned `172.16.11.81` — the pre-start LAN address | at t+5 s through t+45 s it returns `None`, which is the true answer: the AP holds no address of its own, so nothing is serving DHCP | VERIFIED (10.15.8) | yes | The same run established that `securityType 128` is accepted and reaches AP mode in **2.21 s** on channel 36, while 1024, 512 and 256 are each refused after ~2.1 s — the first new HostAP security constant this project has found, and one the 2012 `[-127, 127]` sweep could not have seen. It also established that the resulting network is unjoinable: see the HostAP section below. |
 
 ## Notes
+
+### What the core close-out could not verify here
+
+Seven of the rows above are COMPILE-CHECKED or unit-tested only, each because the acceptance test
+needs hardware, an OS locale or a link neither dev box has: two simultaneous pen clients, a Mac
+with Accessibility revoked, a localized Windows with a hosted-network-capable driver, a relayed
+audio session, a 30 s animated-screen run on the 10.15.8 box, a deliberately wedged display
+driver, and an induced-reorder link. Each is written up with its exact command and expected
+reading in `docs/manual-tests/core-closeout.md` rather than left to be re-derived.
+
+### Needs a driver rebuild, and what it is worth (core close-out)
+
+The bundled indirect display driver is a locally built fork of MolotovCherry/virtual-display-rs
+at `eae5120a6768...`, shipped signed. Nothing in this repository can rebuild it: there is no
+signing identity here, and an unsigned IDD does not load. Three findings all end at that wall, so
+what each is worth was measured or bounded from the host side instead, and the driver-side work
+is written down here rather than left in a findings file nobody will read again.
+
+**The INF declares `UmdfExtensions = IddCx0102`, so the OS chooses the composing adapter, not
+us.** Microsoft's IddCx 1.4 notes say it plainly: "IddCx versions before IddCx 1.4 used the
+power-on self-test (POST) adapter to render the desktop image passed to the IDD if it was not
+PnpStopped. If the POST adapter was PnpStopped, the system-supplied Windows Advanced
+Rasterization Platform (WARP) was used instead." `IddCxAdapterSetRenderAdapter`, the only way for
+a driver to ask for a different one, is IddCx 1.4 / Windows 10 1903. The project's stated Windows
+floor is 2004 (19041), which carries IddCx 1.5, so targeting 1.2 buys compatibility with
+1709-1809 that is neither claimed nor needed.
+
+*What shipped instead:* the diagnosis half, which needs no driver change. `report_adapter_pairing`
+already named the capture and encode adapters and whether they matched; it now also says, on a
+mismatch, that an IddCx 1.2 driver has no way to avoid it, and it already shouts when the capture
+adapter is a software rasteriser (the WARP case, previously silent). On the dev box the two
+adapters are the same NVIDIA GPU (`same_adapter=true`, LUID 0x17D9A), so the cross-adapter cost
+is **0 here** and this is a hybrid-laptop finding that this hardware cannot exhibit.
+
+*Expected upside of the rebuild:* on a hybrid host where the POST adapter is the iGPU, one
+full-frame cross-adapter copy per frame disappears — at 1920x1080 BGRA that is ~8.3 MB over PCIe
+per frame, roughly 1-3 ms at 60 fps plus its synchronisation. On a host whose POST adapter is
+PnpStopped it is larger and qualitatively different: the desktop for our virtual display is
+rasterised by WARP, on the CPU that is also running the encoder.
+
+*Recommendation:* set `UmdfExtensions = IddCx0104` or higher, guard the call with
+`IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)` so one binary still loads on IddCx 1.3+
+hosts, add a `SetRenderAdapter(Luid)` command to `driver_ipc::DriverCommand`, and have the host
+pass the LUID its encoder already enumerated. The IPC side is ready: the host now negotiates a
+protocol version by pipe name, so a rebuilt driver can be recognised without an old one ever
+being sent a message it cannot decode.
+
+**A mode-list change is a hot-unplug, and `IddCxMonitorUpdateModes` would not be.** The fork's
+`ipc.rs::notify()` says so in its own comment — "updated monitors causes a detach, update, and
+reattach. (Required for windows to see the changes)" — and implements it as
+`IddCxMonitorDeparture` then `IddCxMonitorCreate` + `IddCxMonitorArrival`. The parenthetical is
+wrong: `IddCxMonitorUpdateModes` updates a monitor's reported mode list in place, its minimum
+supported client is Windows 10 / Server 2016, i.e. IddCx 1.0 — *below* the 1.2 the INF already
+declares — and upstream simply never used it. This is why `dpr_mode_ladder` pre-registers the
+whole ladder at create time and why `CLAUDE.md` records that a live display cannot be given new
+modes.
+
+*Measured, median of three trials, Windows 11 26200, bundled driver
+(`report_mode_change_cost`):*
+
+| | median | trials |
+|---|---:|---|
+| in-ladder mode change, resolution unchanged | 111 ms | 89 / 111 / 112 |
+| in-ladder mode change, new resolution | 308 ms | 296 / 308 / 381 |
+| departure alone | 179 ms | 178 / 179 / 187 |
+| remove + recreate + reattach | 491 ms | 459 / 491 / 501 |
+| then set the new mode | 281 ms | 276 / 281 / 333 |
+
+So reaching a geometry inside the registered ladder costs ~308 ms and one outside it ~772 ms —
+2.5x — and the wall clock is the smaller half of the difference: the recreate is a real
+hot-unplug, so Windows reflows every window on the desktop and the capture session is rebuilt.
+Neither of those shows up in a stopwatch and both are what the user sees.
+
+*Recommendation:* add an `UpdateModes { id, modes }` command implemented with
+`IddCxMonitorUpdateModes` against the cached `IDDCX_MONITOR`, leaving the departure/arrival path
+for adds, removes and enable/disable. Then the pre-registered ladder can shrink to the modes a
+join actually wants, which also shortens the list the OS intersects on every
+`EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES`. Note the ordering constraint: the update must land in
+both the target-mode query and `EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION`, which regenerates from the
+synthesised EDID.
+
+**`IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE` is unset, and OS virtual modes are confirmed active.**
+The fork builds `IDDCX_ADAPTER_CAPS` with `Flags` left at `Default::default()`, i.e.
+`IDDCX_ADAPTER_FLAGS_NONE`. Microsoft: "The indirect display model automatically supports OS
+virtual modes, allowing the OS to seamlessly perform mode changes using Desktop Window Manager
+(DWM) scaling on a per frame basis without a display mode change... Setting this flag results in
+a mode change each time the desktop resolution is changed." Measured: a display registered for
+1920x1080 and 1080x1920 only comes up at **1280x720@60**, a resolution that is not in its
+registered list at all, and a refresh-rate change at that resolution is refused with
+`DISP_CHANGE_BADMODE` while the same change at 1920x1080 succeeds.
+
+*Rejected for now, with the reason:* the flag needs IddCx 1.4, so it cannot be set without the
+rebuild above; and the shipped path is not affected, because `streamer/server.rs` drives the
+display to a registered mode with `set_display_mode` on every join and every reconfig. The flag
+would remove the *class* of problem rather than an instance of it. It belongs in the same rebuild
+as the two items above, together with two more worth evaluating there:
+`IDDCX_ADAPTER_FLAGS_PREFER_PRECISE_PRESENT_REGIONS` (IddCx 1.8 — more accurate dirty-region
+tracking at "a small CPU usage overhead", a direct win for dirty-rect-aware capture) and
+`IddCxSetRealtimeGPUPriority` (IddCx 1.9).
+
+### One injector per session, and why it stays that way (core close-out)
+
+`speculative-input-per-session-injector-thread-and-devices.md` proposed hoisting the injector to
+one process-wide thread. The concrete defects it named are all fixed and elsewhere: the discarded
+`JoinHandle` (W1 close-out — `SessionHandle::close` now joins the thread), the synthetic-device
+leak (`Drop for Injector`, row 47), and the hardcoded pen id (row 191). What is left is the hoist
+itself, and it is **not** taken, for two reasons worth writing down rather than rediscovering.
+
+*The measurement it needs cannot be taken here.* Its own acceptance test is four simultaneous
+clients with remote control enabled, all dragging at once, compared against a single-client
+baseline on host CPU, glass-to-glass latency and handle count. No machine on this project can
+produce four real clients. The steady-state cost is meanwhile argued rather than measured, and
+the argument holds: every injector thread sits blocked in `crossbeam::select!` whenever its client
+is idle, so N idle sessions cost N blocked threads and nothing else. The case the finding actually
+worries about — N priority-15 threads each making a syscall per pointer sample, competing with the
+capture and encode threads that decide glass-to-glass — is also smaller than when it was written,
+because a `POINTER_MOVE_BATCH` is now one `SendInput` array call rather than one per sample
+(row 45).
+
+*The hoist does not fix the thing that makes it attractive.* There is one physical cursor and one
+keyboard focus, so two clients dragging at once already fight, today, silently. A process-wide
+injector gives that conflict somewhere to live but still needs an arbitration policy — last writer
+wins, first grabber holds, partition by display — and picking one is a product decision with a UI
+consequence, not a latency change. Deciding it while the UI is frozen would be deciding it badly.
+
+*What would change the answer:* a measurement showing those threads actually displacing the encode
+thread. The four-client procedure is in `docs/manual-tests/core-closeout.md`; run it before
+building anything.
+
+### UI-visible recommendations (core close-out)
+
+**Whether a pointer-locked client may drive the host's real monitors is a product decision, and
+it is not made here.** The technical half is closed: both backends track their own position and
+inject relative motion absolutely, so Windows and macOS now behave identically and the pointer
+curve is applied exactly once. What remains is the clamp target. Today both clamp to
+`self.desktop`, the union of every attached display, so accumulated `MOUSE_DELTA` walks the
+cursor onto screens the client cannot see and can then click on. Clamping to `self.target` is a
+two-line change in one shared place.
+
+It was not made because the arguments are genuinely balanced and neither is a latency question.
+*Confine it:* the product model is "hand someone a URL and a 6-digit OTP", and a user who granted
+remote control of the second screen they can see has not obviously granted operation of the
+desktop they cannot. *Do not confine it:* dragging a window from the virtual display back to the
+real one requires crossing the boundary, and that is a thing people do with a second monitor.
+The shape once decided is to clamp to `self.target` when one is known, with a per-device
+override — `set_device_override` exists and `Device.remoteControl` is already a per-device
+boolean, so the plumbing is there and only a control in the device sheet is missing. That control
+is a UI change, which this engagement freezes, which is the other reason it stops here.
+
+Note the blast radius is bounded by `control_enabled`: this only ever applies to a device the
+user explicitly gave remote control to.
+
+### Considered and rejected on the transport (W1 close-out)
+
+Each of these was a `speculative` finding. None was skipped: each was taken as far as this
+hardware and this dependency tree allow, and what stopped it is recorded with the fact that
+stopped it.
+
+**Forward error correction is not built, because webrtc-rs ships none of it.**
+`interceptor-0.17.1/src/` contains `chain, error, lib, mock, nack, noop, registry, report, stats,
+stream_info, stream_reader, twcc` and nothing else. `rtp-0.17.1/src/codecs/` contains
+`av1, g7xx, h264, h265, opus, vp8, vp9` and nothing else. The single occurrence of `ulpfec` in the
+whole of `webrtc-0.17.1` is a **codec registration** in `register_default_codecs`
+(`api/media_engine/mod.rs:367`) with no packetizer behind it -- registering it would advertise a
+capability we cannot produce a single packet of. So FEC here means writing RFC 5109 or
+FlexFEC-03 from scratch in our own send path, with its own repair SSRC and sequence space, and
+then measuring it on a link neither development machine has: the effect only exists on a relayed
+path or a loaded AP, and the decision criterion is not "does FEC recover packets" (it will) but
+"does glass-to-glass p95 improve given that the overhead comes out of the video budget".
+The finding's own sequencing said to land the cheaper alternatives first and re-ask. **All of them
+have now landed** -- rolling intra refresh (`cfg.intra_refresh = true` on every session), the
+keyframe gate, the send pacer, TWCC + trendline BWE, a smaller RTP MTU on relayed paths, and
+audio `FLAG_REDUNDANT`. The bar for revisiting is therefore: a relayed or lossy-AP session,
+instrumented, that still shows PLI-driven keyframe storms after all six.
+
+**HEVC is not negotiated, because nothing on the host can encode it.** The transport half is
+genuinely small -- `rtp-0.17.1/src/codecs/h265/mod.rs` has a complete RFC 7798 `HevcPayloader`
+(`impl Payloader` at `:198`) and `webrtc-0.17.1` defines `MIME_TYPE_HEVC` -- and Chrome 136+ and
+Safari really do offer an H.265 payload type now. What does not exist is an HEVC encoder: NVENC's
+HEVC GUID is never instantiated and no VideoToolbox HEVC compression session is created, and
+`H264Profile` has no HEVC sibling. Registering `video/H265` in `build_api` before that exists
+would negotiate a codec and then send H.264 bytes on it. Building transport plumbing for a codec
+no encoder can produce is the AMD-AMF shape this codebase already regrets, so what landed instead
+is the **detection**: `negotiate::read_offer` records whether the offer carried an H.265 payload
+type and the join logs it, so the share of clients that could take it becomes a measured number
+rather than a guess. The encoder is the gating item and belongs with W3/W5.
+
+**WebTransport is not built.** The finding's own conclusion, and nothing found since changes it:
+Chrome has not shipped `sendOrder`/`createSendGroup()` (the mechanism the one-stream-per-frame
+design rests on), Chrome has no session `getStats()` so the whole `bitrate.rs` loop would have to
+be rebuilt as in-band probing, RFC 9221 puts a second congestion controller under our own, there
+is no transport-level fragmentation so a 200 KB keyframe means reimplementing RTP without
+NACK/RTX, and there is no WHEP-over-WebTransport spec. The only published comparison
+(arXiv:2505.22132) reports percentages with no absolute milliseconds and no LAN condition. On a
+1 ms LAN, SRTP over UDP is already at the floor. Revisit only when Chrome ships stream
+prioritisation **and** a LAN glass-to-glass comparison beats the WebRTC path *after* the pacer,
+the REMB/TWCC work and reference invalidation -- measuring against the old unpaced, feedback-less
+baseline would flatter it unfairly.
+
+**The per-session injector thread stays per-session.** The part of that finding that was a real
+defect is fixed: `input::spawn`'s `JoinHandle` was discarded, so the thread was detached and its
+lifetime was tied to the peer connection's -- which nothing ever closed. `SessionHandle` now owns
+both the `InjectorTx` and the `JoinHandle`, and `close()` drops the sender and **joins the
+thread**, so the proof that it went away is the join rather than the hope that it did. The
+remaining proposal -- hoist to one process-wide injector with session-tagged events -- is an input
+backend design question (one physical cursor, one keyboard focus, and an arbitration policy for
+two clients dragging at once), not a transport one, and it is retagged to W10. Its measurement
+needs four simultaneous real clients, which no dev box here can produce.
 
 ### Considered and rejected on the macOS capture/encode path (W5)
 
@@ -207,6 +466,99 @@ the only latency-named knob on the WindowServer side of that boundary, which is 
 single term in the host path lives, so the experiment is written up for a modern Mac in
 `docs/manual-tests/macos-capture-encode.md` §10.
 
+### W11 decisions made without consultation
+
+Two pieces of user-visible copy on the client page changed inside a branch whose brief is latency
+and compatibility. Both are kept, and both are recorded here with their exact before and after,
+because copy is appearance and nobody asked for either.
+
+**1. The HTTPS-upsell modal's body paragraph.** The trigger was a typo — "sucre" — but the
+sentence around it was also wrong about *why* the switch matters: the browser withholds WebCodecs
+and `SharedArrayBuffer` from an insecure context, so this is the difference between the fast paths
+and the slow ones, not a vague "quicker and privately".
+
+Before:
+
+> This page is on an insecure (HTTP) connection. Switching to the sucre version ensures data is
+> exchanged quicker and privately. Your browser may warn about the self-signed certificate once,
+> which is expected; choose to More Info/Advanced --> Proceed to site.
+
+After:
+
+> This page is on an insecure (HTTP) connection. Your browser only unlocks the low-latency video
+> and audio paths on a secure one, so switching makes the screen faster as well as private. You
+> will see a one-time warning about the self-signed certificate; that is expected — choose
+> Advanced (or More Info), then continue to the site.
+
+The raw `-->` in the original renders literally in HTML and reads as a broken tag; that is why the
+arrow is gone rather than reworded.
+
+**2. The limited-browser-support modal.** The `httpsFixable` flag on each row became conditional
+(`httpsCouldHelp`) instead of a hard-coded `true`. That is a correctness fix, not a copy change:
+it drove a "Switch to HTTPS" affordance on iPhones whose Safari has never shipped an
+`AudioDecoder` for HTTPS to restore, and on pages that were already secure. The rows themselves
+were briefly split from one to three and have been **restored to the original single row with its
+original wording** — see the finding
+`minor-client-limited-browser-modal-lists-three-audio-rows.md`, now resolved.
+
+Nothing else in `<body>` moved on this branch: no element added, removed, reordered or
+re-classed, all four modals keep their ids, roles and inline `z-index`, and the only stylesheet
+changes are `inset: 0` expanded to its four long-hands (identical rendering, Safari below 14.1)
+and one `-webkit-backdrop-filter` prefix.
+
+### W11 rejections (recorded, not applied)
+
+Each of these was considered against a finding and deliberately not done. They are here so the
+next person does not re-derive them.
+
+- **`getPredictedEvents()` on the pointer batch.** The wire format has a predicted-sample count
+  byte, and the host already knows to drop predicted samples for pen and touch and keep them
+  for the cursor. The client writes 0 there and sends measured samples only. Prediction trades
+  correctness for latency, and the size of both halves of that trade is a per-engine,
+  per-device number that cannot be obtained on either dev box -- a wrong guess puts speculative
+  cursor positions on the host that the next real sample corrects, which is worse than the
+  latency it saves. The byte is in place, so enabling it later is a client-only change.
+- **Chunking a dropped file across SCTP messages.** The right fix for a file above
+  `maxMessageSize`, and it needs a continuation opcode, a transfer id and reassembly on the
+  host -- a protocol change outside this workstream. What landed is the half that can be done
+  client-side: refuse before reading, and say so. A host workstream that wants the rest should
+  start from the free opcode values in `docs/INPUT-PROTOCOL.md`.
+- **Moving the `/reconfig` poll onto the reliable DataChannel.** Would remove one HTTP request
+  per second per device and one of the three liveness mechanisms, and the channel already
+  carries `BYE` for the kick case. It is a host change -- `server.rs` would have to push the
+  epoch rather than answer a poll -- and the client would still need the HTTP path as the
+  fallback for a session with no data channel, so the saving is real but the client cannot make
+  it alone. What landed instead is the device-enumeration half, row 86.
+- **Consolidating the three client liveness signals onto one.** The reconfig poll, the `PONG`
+  and the render/bytes advance all feed one `markAlive()`. That is three mechanisms, but they
+  fail independently — a stalled render does not stop the poll, a dead DataChannel does not stop
+  the HTTP — and the cost of the extra two is a comparison each. Collapsing them would make the
+  session's liveness only as good as its weakest transport for no measurable saving. The
+  redundant *work* was the enumeration and the POST, and that is row 86.
+- **Gating the AudioWorklet's stats `postMessage` behind `DEBUG`.** Stale: those 256 ms messages
+  now drive `adaptSafetyMargin`, so the worklet's underrun count is what grows the jitter margin
+  on a link that needs it. There is no longer an unconsumed message to remove.
+- **A "choose speaker" affordance for `MediaDevices.selectAudioOutput()`.** Firefox 116+ is the
+  only engine with a permission-free output picker, `SEAudio.pickOutput()` implements it, and
+  nothing can call it because it needs transient activation and the page has no control to hang
+  it on. Adding one is a visible change to the client page, which this engagement does not
+  make. Recorded under the UI-visible recommendations below.
+- **A/B-ing `jitterBufferTarget` on the `<video>` fallback.** All three jitter-buffer knobs are
+  inert on the WebCodecs path -- an encoded transform takes the frame from
+  `RtpVideoStreamReceiver2::OnAssembledFrame` *instead of* entering the reference finder and
+  the frame buffer -- so the only place any of them can move a number is the fallback. All
+  three client sites now say so in comments; `webrtc_session.rs`'s
+  `PlayoutDelayExtension::new(0, 0)` is the fourth and belongs to the transport workstream. The
+  measurement itself needs a browser and an injected-jitter link, neither of which exists here.
+  The same branch is why every receive-side timing field in `getStats()` reads zero on the fast
+  path, and why a measurement plan that says "compare `jitterBufferDelay` before and after" is
+  only executable on the fallback.
+
+### W11 UI-visible recommendations (not applied)
+
+- **An output picker on Firefox.** See the rejection above. One small control on the stage or in
+  the join form, wired to `SEAudio.pickOutput()` from a click and gated on `hasSelectOut`, is
+  all it needs; stats byte 75 would then be able to read 4, which today it never can.
 
 
 ### UI-visible recommendation (W7): the screen-recording indicator on macOS 13.0-14.1
@@ -234,6 +586,52 @@ lifetimes and different content filters. Fusing them would couple the audio hub'
 particular device's video pipeline, which is exactly the coupling `AudioHub` exists to avoid — and
 it would buy nothing for the audio-on/video-off case that generates the complaint, since there is
 no video stream to share there.
+
+### `probe --audio` on macOS: the cross-platform number, and the two things it caught (W7)
+
+W8 built `probe --audio` on Windows. Its first run on macOS (10.15.8, legacy driver tier, release
+binary, `say` driving the mix) gives the directly comparable figure:
+
+    macOS  legacy driver tier   capture -> subscriber  p50 1.84 / p90 3.67 / p99 5.24 / max 6.76 ms
+    Win 11 endpoint loopback    capture -> subscriber  p50 9.44 / p90 9.44 / p99 9.44 / max 10.9 ms
+
+    packets=522 (52.2/s), payload avg 77 B, seq gaps 0, discontinuity 1
+    subscriber inter-arrival p50/p90/p99/max = 0.15 / 10.49 / 13.63 / 15.84 ms
+
+The macOS tier is roughly five times better at p50 and twice at p99, which is what a 2.67 ms IO
+cycle buys against Windows' 10 ms engine period. The rate is 52.2 packets/s rather than 200
+because the virtual device runs no IO cycle while nothing is playing — the gaps are host silence
+and cost nothing on the wire (see row 111).
+
+**The libopus CTL readback matches Windows exactly**, which is what
+`major-build-w8-shared-audio-changes-never-gated-on-macos` asked for. macOS loads a *different*
+libopus build (`libopus.dylib`, not `libopus.dll`), so "the CTLs are accepted" was not transferable
+evidence — `ctl_set` `bail!`s on a rejected value and would have failed capture at startup:
+
+    opus: libopus 1.5.x-screenextend-src — application=2051 bitrate=128000 complexity=5
+    signal=3002 vbr=1 vbr_constraint=1 lsb_depth=24 prediction_disabled=0 lookahead=120 samples
+    (2.50 ms), frame 5 ms
+
+Identical field for field, `lookahead=120` included — so the number the client uses to align
+playout is the same on both platforms.
+
+**It caught two things no unit test could.**
+
+1. A regression this workstream introduced. Changing the watchdog's "is a host running?" check from
+   a `pgrep` fork to the single-instance lock was right for the app and wrong for `probe`, which
+   takes no such lock — and the agent is bootstrapped with `RunAtLoad`, so launchd ran it the
+   instant the tier started and it restored the previous default output mid-stream. Fixed by
+   recording the owning pid in `RoutingState` and having `recover()` return early while that
+   process is alive (`kill(pid, 0)`, a signal-existence check, not a fork). Deliberately succeeds
+   only for a process we may signal: a pid now owned by another user is pid reuse, our host really
+   is gone, and recovery should run.
+2. A real device refusal that used to be silent:
+   `output device 43 refused volume/mute mirroring (OSStatus volume=2003332927 mute=0)` —
+   `kAudioHardwareUnknownPropertyError` on volume, mute accepted. That is the `let _ =` this
+   workstream replaced doing its job on the first machine it met.
+
+The buffer-frame-size range for the virtual device is now known too: `[15, 4096]`, 128 requested
+and granted.
 
 ### macOS audio after the W8 merge: `ts_clamped=0`, and the number to quote (W7)
 
@@ -351,6 +749,62 @@ per start and connected to nothing), `Playthrough::gain()` and `ControlHandle::t
 `IoCtx::underruns` is now reported by the control thread every 10 s. `is_fast_path()` went from
 zero callers to being the fast path in row 113.
 
+### W3a after-matrix: the Windows capture path measured against `docs/BASELINE.md`
+
+Same recipe as the baseline — `ScreenExtend probe --whep-selftest --duration 30 --encoder <e>
+--capture-backend <c>`, release build with `--features probe`, real capture of a virtual display
+created for the run at 1280x720@60, WHEP over loopback — on the merged `latency-overhaul` code.
+**Three trials per cell; the figure is the median of the three.** Milliseconds, p50 / p90 / p99 /
+max.
+
+Measurement hygiene: the first pass ran with 10-17 concurrent `rustc`/`cargo` processes from the
+other workstreams and its p50s were unusable. The numbers below are a second pass at a load of
+**4-6**. That is the quietest this laptop got, and not for want of waiting: a poll every 60 s for
+20 minutes never found fewer than 8 concurrent build processes, and the count was 26 by the time
+the poll gave up. The baseline was taken on an idle machine, so these tails are pessimistic
+rather than flattering. Both passes are kept in `scratchpad/runs` and `runs2`; they agreed on
+every count and every path selection, and differed only in the CPU-sensitive percentiles.
+
+| Encoder | Path selected | frames (repeats) | real frames | RTP packets | capture delivery | encode | **capture → socket** |
+|---|---|---|---|---|---|---|---|
+| NVENC ring, **before** | `nvenc-zero-copy-ring` | 211 (144) | 67 | ~1,740 | 0.98 / 4.19 / 6.82 / 6.95 | 0.00 / 1.18 / 1.44 / 15.09 | **1.57 / 8.39 / 16.78 / 18.00** |
+| NVENC ring, **after** | `nvenc-zero-copy-ring` | 327 (122) | 205 | 2,778 | 0.92 / 3.15 / 8.39 / 8.88 | 1.05 / 1.44 / 3.67 / 3.93 | **2.10 / 3.67 / 10.49 / 10.69** |
+| x264, **before** | `software-x264` | 223 (142) | 81 | ~2,520 | 0.98 / 3.93 / 4.72 / 4.99 | 2.10 / 2.62 / 5.24 / 24.57 | **2.36 / 5.24 / 23.07 / 24.82** |
+| x264, **after** | `software-x264` | 304 (136) | 168 | 3,416 | 1.05 / 2.62 / 4.72 / 4.97 | 3.67 / 5.24 / 9.44 / 12.52 | **4.19 / 7.34 / 9.44 / 11.05** |
+| Quick Sync, **before** | `intel-cpu-bridge` | 219 (140) | 79 | ~1,650 | 3.15 / 7.86 / 15.73 / 16.11 | 4.19 / 11.53 / 16.78 / 21.65 | **11.53 / 16.78 / 25.17 / 26.05** |
+| Quick Sync, **after** | **`intel-same-adapter`** | 380 (133) | 247 | 4,010 | 2.36 / 5.77 / 9.44 / 12.45 | 5.24 / 7.86 / 10.49 / 13.05 | **8.39 / 13.63 / 18.87 / 21.17** |
+| any, DXGI, **before** | — | — | — | — | — | — | **unmeasurable** (two undiagnosed failures) |
+| any, DXGI, **after** | `dxgi + zero-copy` | 0 | 0 | 0 | — | — | **still zero, now diagnosed and bounded** |
+
+What the table says:
+
+1. **The tail is where the whole result is.** `capture → socket` p99 fell on every encoder —
+   NVENC 16.78 → 10.49, x264 23.07 → 9.44, Quick Sync 25.17 → 18.87 — and the maxima fell further
+   still: 18.00 → 10.69, 24.82 → 11.05, 26.05 → 21.17. The `encode` maximum on the ring went
+   15.09 → 3.93. Jitter is what a second monitor is felt through, so these are the numbers that
+   matter, and they moved 40-55%.
+2. **Quick Sync moved onto the same-adapter path and improved on every percentile.** That is row
+   98 — the capture device is now created on the encoder's adapter — and it was not a predicted
+   consequence of it. p50 11.53 → 8.39, p90 16.78 → 13.63, p99 25.17 → 18.87, `capture delivery`
+   p99 15.73 → 9.44, and 2.4x the RTP packets. See the update appended to
+   `findings/major-intel-cross-adapter-unimplemented-forces-cpu-bridge.md`.
+3. **Every cell delivers two to three times as many real frames.** "Real frames" is `frames` minus
+   the keepalive repeats: NVENC 67 → 205, x264 81 → 168, Quick Sync 79 → 247. The frame-pool
+   changes (row 96 — drain-to-newest with a matched `Recreate` buffer count) and the
+   unchanged-frame skip (row 102) are what freed that up: the encoder had been spending its budget
+   on frames the compositor had already superseded.
+4. **The p50s rise, and that is the same fact as (3) rather than a regression.** x264's `encode`
+   p50 went 2.10 → 3.67 ms while it encoded 168 real frames instead of 81 — x264's cost scales
+   with how much of the picture actually changed, so more real frames per second is a higher
+   per-frame cost. The ring's `encode` p50 of 0.00 in the baseline was never a real number either:
+   `docs/BASELINE.md` note 6 records that it measured the submit call, not the encode, because
+   the ring decouples the two. Read p90 and above on those rows.
+5. **DXGI is still zero, and that is now a diagnosis rather than a mystery.** Duplication *is*
+   created (`via DuplicateOutput1`) and the session negotiates; the output then returns
+   `ACCESS_LOST` on every acquire until the new cap fires with `duplication was re-established 41
+   times without ever delivering a frame`. Before, that was an unbounded silent spin at three log
+   lines a second. See the DXGI note below.
+
 ### What is left of the DXGI fallback on this hardware, and what that costs (W3a)
 
 DXGI Desktop Duplication is the fallback every Windows 10 and pre-24H2 Windows 11 host used to
@@ -464,6 +918,58 @@ something lowered it first, which nothing here does. The neighbouring `ThreadPow
 information class *is* worth setting and is now set (row 109's sibling commit) — but for a
 different reason: Windows 11 throttles threads of a minimised or occluded window, which is the
 ScreenExtend window's normal state while streaming.
+
+### Frame-pool depth: 3 for the ring, 2 for the inline handler, and the number behind that (W3a)
+
+Row 96 made the depth per-path. The brief asked for 2 vs 3 to be measured on the ring path
+specifically. What the after-matrix gives instead of an A/B is the counter that makes the A/B
+unnecessary:
+
+`frames_dropped_stale` — frames the pool discarded while draining to the newest — reads **5, 0 and
+3** across the three 30 s NVENC-ring trials, against 321-421 delivered frames. At depth 3 the pool
+is essentially never holding a backlog, because the ring's callback does a `CopyResource`, a
+`Flush` and a channel send and then returns: single-digit microseconds, not milliseconds. There is
+no queue for depth 2 to shorten.
+
+What depth 2 would change is the failure case rather than the normal one. With two buffers the
+compositor has exactly one spare while the callback holds the other, so a callback that is late
+once — a scheduler preemption, a GPU hiccup during the staging copy — has nowhere to put the next
+frame and the compositor stalls. With three there is a frame of slack, and the drain makes sure
+that slack costs freshness rather than latency: the extra buffer is discarded, not queued, and the
+discard is counted. That is the trade OBS and Sunshine make in the other direction because their
+consumer *encodes* in the callback and therefore genuinely occupies a buffer for milliseconds —
+which is exactly the inline path here, and exactly why it is set to 2.
+
+So: 2 where the consumer is slow, 3 where it is fast and the extra buffer buys jitter tolerance
+the drain then discards for free. Re-measure if `frames_dropped_stale` ever climbs into the tens
+per second on the ring path, which would mean the callback had stopped being cheap.
+
+### Kept at 4: the encoder-to-viewer broadcast capacity (W3a)
+
+`BROADCAST_CAPACITY = 4` on both producers. A tokio broadcast never back-pressures — a receiver
+more than four frames behind has the oldest value evicted and gets `RecvError::Lagged(n)`. The
+open question was whether 4 is right, with one argument for raising it (a slow write batch should
+not count as lag, and with `maxNumRefFrames = 1` any skip breaks the reference chain) and one for
+lowering it.
+
+Measured: **`frames_dropped_broadcast` is zero in all twelve runs of the after-matrix above** — the
+counter is not printed at all, and the telemetry summary only prints non-zero counters. That spans
+three encoders, frame counts from 289 to 886 per 30 s, and a machine under 10-17 concurrent
+`rustc` processes, which is a much harsher scheduling environment than a real host. The RTP writer
+never fell four frames behind.
+
+Kept at 4, and not only because nothing hit it. Raising it is the wrong direction for this
+workload: a video receiver four frames behind should skip to the newest frame, not work through a
+backlog of stale ones — the same reasoning that made the WGC frame pool drain to newest (row 96).
+A deeper buffer converts a scheduling hiccup from "one dropped frame plus a keyframe request" into
+"four frames of accumulated latency the viewer then has to live with". The consumer side already
+handles the drop correctly: `Lagged` goes through the rate-limited `KeyframeRequester` rather than
+requesting an IDR unconditionally, and it cuts the bitrate at the same time so the keyframe that
+does go out is smaller.
+
+Revisit if `frames_dropped_broadcast` is ever seen non-zero on a real host with several clients —
+that is the case this measurement does not cover, since the self-test has exactly one loopback
+viewer.
 
 ### The classic WGC path still encodes in the frame callback, and why that is different from DXGI
 
@@ -879,13 +1385,49 @@ type, which plausibly reads both from the Internet Sharing preferences and would
 free) and the `enableHostAPMode` / `disableHostAPMode` pair. Both are worth trying on a modern Mac
 before concluding that WEP is the ceiling.
 
-**What could not be established here.** The box has exactly one Wi-Fi interface, `en3`, and it
-carries the SSH session this work runs over; starting an AP on it drops the connection. So no
-`startHostAPMode…` call was ever made: association, the security type the AP advertises, DHCP and
-throughput are all untested, and the security-type ladder in `secured_attempts` is still a set of
-guesses. The one thing the 2012 sweep this code inherited *does* tell us is where not to look
-again: it covered `[-127, 127]`, so every value at or above 128 is unexplored, which is why the
-ladder starts at 1024 and works down.
+**Update (W6/W14 close-out): the AP was started here after all**, by running the test binary
+detached with a watchdog that power-cycles the radio, so the box comes back on its own about ninety
+seconds later. `measure_hostap_start` on 10.15.8 Intel, `en3`, reproduced twice with identical
+numbers:
+
+```
+backend HostApSpi, channel 36 (5 GHz), station address before the start 172.16.11.81
+securityType 1024: accepted=false in 2.13s
+securityType  512: accepted=false in 2.08s
+securityType  256: accepted=false in 2.07s
+securityType  128: accepted=true  in 2.21s, ap_mode=true at 2.21s
+  t+5s … t+45s   mode_is_ap=true  ipv4=None
+```
+
+Three results, and the second is the one that matters.
+
+**`securityType 128` is accepted**, and brings the radio to HostAP mode in 2.21 s. It is the first
+new HostAP security constant this project has found, and it sits outside the `[-127, 127]` window
+the 2012 sweep covered — which is precisely why the shipped ladder starts at 1024 and works
+downward rather than repeating that sweep. The three values above it are each refused, taking about
+2.1 s to say so, so the ladder costs ~6.5 s before it lands.
+
+**Nothing serves DHCP.** With the AP up and `interfaceMode()` reading HostAP for 45 s straight,
+`en3` held no address of its own at any point in the window. So on this floor
+`startHostAPModeWithSSID:securityType:channel:password:error:` brings up a radio and not a network:
+the SSID is visible, and a client that associates gets no lease and cannot reach the host. That is
+a concrete shape for "slow and randomly fails", and it makes `startHostAPMode:` — the no-argument
+variant, which plausibly reads the Internet Sharing preferences and would therefore bring `bootpd`
+with it — the most valuable remaining experiment in this territory.
+`docs/manual-tests/macos-hosted-network.md` §9.
+
+**The station address survives the switch**, which is a bug the measurement caught in the
+verification added alongside it: at t+2.2 s, with the interface already in AP mode, `getifaddrs`
+still reported `172.16.11.81`, the address of the network the Mac had just left. Read naively that
+is "verified, host address 172.16.11.81" — the AP reported as working, on the LAN address.
+`wait_for_ipv4` now takes the pre-start address and refuses it.
+
+**Still not established here:** what security `128` advertises. That needs a scan from a second
+device during the 45 s window; `netsh wlan show networks mode=bssid` from the Windows box did not
+surface the SSID, which is inconclusive rather than negative — Windows serves cached scan results
+and will not force a fresh scan while associated. Since the AP serves no DHCP, a client could not
+join whatever it advertises, so the DHCP question is the blocking one and this is the one behind
+it. Association, throughput and the channel A/B all sit behind the same gate.
 
 ### `refreshDeadline` was probed and deliberately not set
 
@@ -901,8 +1443,8 @@ setting it could be measured. Shipping a value chosen by guesswork into WindowSe
 trade worth making; the probe and the finding are what carry it forward.
 
 `rotation` is more immediately useful and equally unverifiable here: where it exists it should
-replace the transposed-width/height modes this commit registers for orientation flips. Both are
-tracked in `findings/speculative-vdisplay-mac-refresh-deadline-never-set.md`.
+replace the transposed-width/height modes this commit registers for orientation flips. Both stay recorded here;
+the finding file is closed, since neither can be taken further without a Mac at 13.0 or newer.
 ### Rejected: feeding measured loss into `OPUS_SET_PACKET_LOSS_PERC`
 
 `major-audio-core-no-fec-on-an-unreliable-datachannel` proposed driving the encoder's
@@ -919,6 +1461,253 @@ The lever that *is* encoder-wide and does apply is `OPUS_SET_PREDICTION_DISABLED
 frames independent regardless of who is listening. It is wired as a config field defaulting off
 because it costs bitrate at fixed quality and the trade needs a listening test — see
 `docs/manual-tests/windows-audio-tiers.md`.
+
+### What the AirPlay mirror stream was actually carrying (W14 close-out)
+
+The tier's four remaining findings were all "speculative" and all about the same connection: the
+one macOS opens to push H.264 at the fake receiver, which `mirror.rs` frames and discards. Running
+`macos_utils::airplay::tests::live_end_to_end` with `SE_AIRPLAY_TIMING=1 SE_AIRPLAY_MAX_FPS=30` on
+the 10.15.8 box answered all four, and the earlier attempts had failed only because nothing was
+ever drawn on the AirPlay display, so macOS never started its encoder.
+
+**Type-`0x00` payloads are ciphertext.** This was the explicit falsification test the decode
+finding asked for: dump the first bytes of a video payload and look for a NAL start code or an
+AVCC length prefix. Three separate first-32-byte dumps, three different sessions:
+
+```
+0b ac 16 1b 96 f5 7b 83 4a ca df e3 bc 5e 5b 73 ...
+b5 9f 42 cc 13 84 66 a6 f8 71 66 84 4c 71 e2 c8 ...
+bd 7c 59 5d ed 9e 3a db 2c 08 a6 d2 ff f5 81 3a ...
+```
+
+No start code, no length prefix that matches the framed payload length, uniform high entropy. So
+forwarding or decoding the mirror stream needs real FairPlay key recovery — the `ekey`/`eiv` and
+`streamConnectionID` derivation this module deliberately does not implement — exactly as the
+finding assessed. That half is settled by measurement rather than by argument.
+
+**Type-`0x01` payloads are not**, and they are more useful than expected:
+
+```
+01 64 00 29 ff e1 00 1d 27 64 00 29 ac 13 16 50 1e 00 89 f9 70 06 e0 20 20 dd 81 80 02 ee
+```
+
+That is an `AVCDecoderConfigurationRecord` in the clear: configuration version 1, profile `0x64`
+(**High**), level `0x29` (**4.1**), 4-byte NAL length prefixes, one 29-byte SPS. It is the only
+first-party answer anywhere in this project to "what does Apple's own AirPlay encoder emit", and it
+cost nothing to read.
+
+**The header stamp is not a wall clock.** Read little-endian its seconds field was 41457 and then
+41459 two seconds later, while the machine had been up fourteen hours — a monotonic clock whose
+epoch is somewhere inside this boot. Read big-endian the same eight bytes are eleven and a half
+years, which is what makes the byte order decidable without a specification. The previous probe
+compared it against `SystemTime::now()` in NTP form and correctly refused to pick an endianness,
+because neither reading was plausible; it just had no way to say why.
+
+The consequence: the *absolute* compose-to-consumer figure needs AirPlay's own NTP time sync (the
+sender queries a UDP timing port to learn the offset), which this receiver does not implement and
+should not start implementing for a measurement. What does not need the epoch is the spread, since
+both clocks are the same machine's monotonic time and the offset between them is constant. Over 66
+frames at 30 fps with a window being dragged on the AirPlay display:
+
+```
+p50 26.96 ms   p90 43.90 ms   p99 67.43 ms   max 67.43 ms   (excess over the fastest frame)
+```
+
+A second session, 18 frames: p50 52.48, p90 64.34, p99 67.90. At 30 fps a frame period is 33 ms, so
+macOS's own AirPlay path carries one to two frame periods of variability before anything of ours is
+involved. The log line says "excess over the fastest frame in the batch" in full, because a bare
+number here would read as an absolute latency and would be a fabrication.
+
+**`maxFPS` is honoured.** The open question from the discovery report was whether a live AirPlay-tier
+session means the host is encoding its whole desktop at full rate into a socket we discard. It is
+not: at the shipping `maxFPS = 1` the drain reports 1.0 packets/s and 25 KiB/s, and at
+`SE_AIRPLAY_MAX_FPS=30` it reports 14.2 packets/s and 271 KiB/s with `encoderCurrentFPS=30` in the
+sender's own report. The sender tracks what we ask for.
+
+**The stream reports are a second free instrument.** Type-`0x05` is a ~181-byte binary property list
+followed by a 25,000-byte trailer, which is why handing the whole payload to a parser failed. Its
+contents, on this box:
+
+```
+encoderCurrentFPS=30 lossAvg=0.000 queuedFramesAvg=0 rttAvg=0
+sentFramesAvg=0 txCapacityAvg=8000000.000 txUsageAvg=0.000
+```
+
+macOS's own view of its own link, once a second, in the clear. `txCapacityAvg = 8 Mbit/s` is the
+sender's idea of what the path will carry.
+
+### Rejected: relaying macOS's own AirPlay mirror stream instead of capturing and encoding (W14)
+
+The idea was to skip our CGDisplayStream capture *and* our VideoToolbox encode by forwarding the
+H.264 macOS already hands us. Three independent reasons, now with the evidence attached rather than
+inferred:
+
+1. **It requires circumvention we will not ship.** The payloads are AES-CTR ciphertext (measured
+   above). `fairplay.rs` carries four canned handshake replies and no key material; recovering the
+   key means vendoring playfair's derivation tables, which are the part of that project that
+   actually circumvents rather than replays.
+2. **It would not be faster.** The relay swaps `CGDisplayStream -> VideoToolbox -> RTP` for
+   `WindowServer capture -> WindowServer's VideoToolbox -> AES-CTR -> TCP -> our decrypt ->
+   repacketize -> RTP`, and the measurement above says Apple's own path already carries a p99 of
+   ~67 ms of variability before the extra hop. AirPlay's own `POST /stream` advertises
+   `latencyMs: 90` as the sender's budget, so Apple is not targeting anything tighter than we are.
+3. **It gives away every control the overhaul depends on.** No loss-based bitrate driver, no
+   on-demand IDR for a rejoining client, no QP or GOP or profile — the bitstream says High 4.1
+   because that is what macOS chose, not because anything asked.
+
+Plus the structural cap: this tier is below the 10.15 floor and `max_concurrent_displays()` is
+`Some(1)` because macOS owns the display. Not built, and the file recording the decision is folded
+into this section rather than left open.
+
+### Rejected for now: an AWDL transport, with the number that stopped it (W14)
+
+`dnssd.rs` is the only Bonjour binding in the tree and already takes an interface index and a flags
+word, so the question "could ScreenExtend advertise itself somewhere a nearby Apple device sees it
+with Wi-Fi off" costs three registrations to ask.
+`macos_utils::airplay::dnssd::tests::probe_awdl_registration` on 10.15.8:
+
+```
+primary LAN interface, no AWDL:   accepted (index 7,          flags 0x8)
+any interface, IncludeAWDL:       accepted (index 0,          flags 0x108)
+InterfaceIndexP2P, IncludeAWDL:   rejected (index 4294967294, flags 0x108)
+                                  DNSServiceErrorType -65540
+```
+
+So `kDNSServiceFlagsIncludeAWDL` is accepted on the supported floor, and
+`kDNSServiceInterfaceIndexP2P` — the registration that would prove a peer-to-peer-only
+advertisement — is refused outright with `kDNSServiceErr_Unknown`. That is as far as this hardware
+can take it: the decisive observation is `dns-sd -B _screenextend._tcp` on an iPhone with Wi-Fi
+off, and there is no second Apple device here that can be driven non-interactively.
+
+The direction was already doubtful on its own terms — a browser cannot open an AWDL socket, so the
+only shape that could work is binding the existing HTTPS/WebRTC server to the `awdl0` address for
+an Apple client's Safari, and AWDL time-shares the radio with the infrastructure link, which adds
+the jitter the availability-window research describes. The constants, the flags parameter and the
+one-shot reply pump are in the tree, so picking this up later is a caller away rather than a
+rewrite. Nothing passes them.
+
+### The Wi-Fi network name on macOS: not asking for Location, deliberately (W6)
+
+`CWInterface.ssid` is documented to return nil on 10.15+ without Location Services authorization,
+and the finding offered two options: ask for it, or stop pretending and label the adapter honestly.
+
+**Decision: do not ask.** A Location prompt is one of the heaviest consents macOS shows, and asking
+for it to decorate a dashboard row that already carries the adapter's addresses is not a trade
+worth making. The row reads "Wi-Fi" on a machine that has never granted it, on purpose, and
+`wifi_ssid` now says so once in the log so it does not read as a bug next to the Windows dashboard.
+
+Worth recording, because it contradicts the finding's premise: on this 10.15.8 box the SSID *is*
+readable. `macos_utils::networking::tests::report_wifi_naming_and_radio` returns
+`adapter index 7 named "Sreenilayam-5g"`. So the nil case is not universal on 10.15 and the cache
+that was added to stop the name flapping is doing nothing here; the honest statement is that the
+name is available on some 10.15 machines and not others, and the code handles both without asking
+for anything.
+
+### Rejected: changing the virtual display's declared physical size and vendor ID (W6)
+
+`create_cg_virtual_display` declares `sizeInMillimeters` from a fixed 96 DPI — a Windows
+convention, where macOS's reference is 72 pt/in — and a placeholder vendor/product pair
+(`0x3456`/`0x1234`) shared by every display. The serial half of that finding is fixed (row 191).
+The other two are not, and deliberately:
+
+- **The physical size.** Whether it is inert or load-bearing is exactly what cannot be established
+  here: `time_a_retina_join` and every other experiment that creates a display and inspects how
+  macOS scales it needs a console session, and the finding itself says "only after measurement".
+  Changing an EDID field that may feed WindowServer's HiDPI decision, blind, on the one thing this
+  module exists to do, is a regression risk with no measurement to justify it.
+- **The vendor ID.** A distinct one is not something a project can simply choose: PNP vendor IDs
+  are assigned by VESA/UEFI, and inventing one collides with whoever holds it. The serial is what
+  varies per device and it now does.
+
+### The one-hop link, and the channel A/B: both blocked behind the same gate (W6)
+
+Two findings wanted the same session on the same hardware: make the host-AP link a first-class,
+*measured* low-latency mode, and settle whether sitting on an AWDL social channel is better or
+worse for jitter than avoiding one. Both are closed here without their numbers, and the reason is a
+measurement rather than an absence of one.
+
+The comparison each needs is "client associated to the host AP" versus "client and host on the
+router", with p50/p95/p99 glass-to-glass on both. On this floor there is no such thing as the first
+configuration: the AP `startHostAPModeWithSSID:` produces holds no address and serves no DHCP (45 s
+of `ipv4=None`, above), so nothing can associate and get a lease, so neither comparison has a left
+column. This is not the dev box being single-radio — that was worked around by running the
+measurement detached — it is the AP itself being unjoinable. Every downstream measurement in
+`docs/manual-tests/macos-hosted-network.md` §3, §4 and §5 sits behind §9's question: does
+`startHostAPMode:`, with Internet Sharing configured, bring `bootpd` with it.
+
+What did land from those two findings, and does not need the gate: the backend, channel, band and
+security type are logged on every start, `SCREENEXTEND_HOSTAP_CHANNEL` A/Bs a channel without a
+rebuild, `PREFERRED_5GHZ_CHANNELS` excludes 6/44/149 with a unit test pinning it, and the watcher
+now reports the *associated* channel and whether `awdl0` is up so a field report carries the
+condition. The choice to avoid the social channels remains what it was: the conservative default,
+not a measured one, and the comment in the source says so rather than implying a result.
+
+### Two things in the display settle that were deliberately left alone (W6)
+
+The settle finding carried three items. The event-driven wait is row 221; the other two are not
+done, and not by omission.
+
+**`create_display_with_modes` still logs and swallows an `activate_mode` failure.** Returning it
+would turn "the display came up at the wrong geometry" into "the join failed", and the client that
+would then see nothing is one that today gets a working stream at a size it did not ask for. The
+right shape is the finding's own second suggestion — attach it to the session as a warning so the
+server can retry or tell the client — and that is a change to the session state and the client
+protocol, not to this function. The log line already says exactly what happened.
+
+**The settle wait still runs inside `DISPLAY_CORRELATION_LOCK`.** The lock exists to make the
+"which new monitor appeared?" correlation window unambiguous, and once the display id is known the
+geometry wait does not need it — but the lock is `streamer/server.rs`'s, its extent is W1's to
+decide, and shortening it from the platform side would be guessing at an invariant defined
+somewhere else. Now that the wait is event-driven rather than a poll, what it holds the lock for is
+also much shorter than it was.
+
+`time_a_retina_join` was attempted here anyway, because CoreGraphics turned out to be answering
+over ssh in this session — `CGGetActiveDisplayList` returns the real display list, both macOS
+display tests run their assertions rather than skipping, and the AirPlay tier creates and tears
+down real displays. It still hangs: the test was killed by its watchdog after 150 s with no output
+past the test name, exactly as the finding recorded. So the split is sharper than "ssh sees no
+displays" — **read-only CoreGraphics works over ssh; `CGVirtualDisplay`'s `initWithDescriptor:` and
+`applySettings:` block forever without a WindowServer connection.** That is why row 221's saving is
+UNVERIFIED, and it will stay so until someone runs the A/B from a Terminal window inside the
+console session.
+
+### Dyld safety of the W6/W14 close-out
+
+Four link-time symbols are new in this work, and all four are floor-present. Checked against the
+authoritative test `scripts/check-macos-dyld.sh` itself uses — presence in the 10.15 SDK's `.tbd`
+stubs, which are generated from the dylibs that shipped with that SDK:
+
+```
+_CGDisplayRegisterReconfigurationCallback -> MacOSX10.15.sdk/…/CoreGraphics.tbd
+_CGDisplayRemoveReconfigurationCallback   -> MacOSX10.15.sdk/…/CoreGraphics.tbd
+_CFRunLoopRunInMode                       -> MacOSX10.15.sdk/…/CoreFoundation.tbd
+_kCFRunLoopDefaultMode                    -> MacOSX10.15.sdk/…/CoreFoundation.tbd
+```
+
+Everything else the close-out added is `libc` (`PF_ROUTE` sockets, `poll`, `recv`) and already
+linked. The whole-binary run of the script is queued behind the other agents' release builds; the
+symbol check above is the same verdict for the four that changed, and it needs no build.
+
+### W6 / W14 UI-visible recommendations (not applied)
+
+- **The hosted network's `NotStarted` / `Advertised` / `Verified` tri-state in `AppState`.** Both
+  platforms now collect everything the type needs — `hosted_network_status()` on each side carries
+  the backend, SSID, channel, band, security type, host address and (on macOS) the associated peer
+  — and the macOS watcher already promotes on the first client from the AP's own subnet and
+  diagnoses at 60 s. What is not done is replacing `AppState.hosted_network_running: Mutex<bool>`
+  itself and widening `is_hosted_network` to return the state. That is a command-surface change
+  across all three `*_utils` modules, a `bindings.ts` regeneration, and a new thing for the
+  dashboard to display — three visible states where there is one toggle today. It belongs to
+  whoever is allowed to change the UI.
+- **IPv6 join URLs in the desktop dashboard.** `buildQrValues` (`src/lib/utils.ts`) filters
+  adapters with `/^\d{1,3}(\.\d{1,3}){3}$/` and returns nothing for an adapter with only IPv6
+  addresses, so on an IPv6-only network the host now serves but the dashboard shows no QR code.
+  The fix is one predicate and a bracketed URL, and it adds a card to a page this engagement may
+  not change the appearance of. The Rust side already prints the bracketed URL through the log bus
+  and the CLI.
+- **Surfacing the hosted network's channel, band and security type.** They are logged on every
+  start and reachable through `hosted_network_status()`; putting them on the network card would
+  make the "why will my phone not join this" question answerable without the log terminal.
 
 ### What the restored CI deliberately does not do (W13a)
 

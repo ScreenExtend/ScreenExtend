@@ -36,6 +36,12 @@ Bytes 0..17 are frozen. A client older than a field reads the prefix it knows an
 rest; a host older than a field sends a shorter frame, and a client that sees fewer than 19 bytes
 reads no capability bits, which is the correct answer for that host.
 
+`input.js::noteHostCaps` is the client half of that rule — `dv.byteLength >= 19 ?
+dv.getUint16(17, true) : 0` — and it is the only source of `RemoteInput.hostCapabilities()`.
+Nothing on the page may assume an optional mechanism works before the first `PONG` carrying the
+bit lands: a request a host drops is not a mechanism, and a client that believed otherwise
+disarmed the fallback that would have rescued it.
+
 The client keeps the **minimum-RTT** sample, because the least-queued exchange gives the tightest
 midpoint estimate, and ages it out after 30 s so a route change is not remembered forever:
 
@@ -112,6 +118,14 @@ remembered for the whole session.
 Only frames carrying the optional client stamp are measured; an unstamped frame from an older
 client contributes nothing rather than a wrong number.
 
+## Delivered frame rate
+
+The summary line reports `fps=<rate>` between consecutive summaries alongside the running
+`frames=<total>`. A running total cannot distinguish a capture path keeping up at 60 fps from one
+silently delivering 45, which is the failure this exists to make visible; the rate is computed
+from the frame counter and the host clock at each summary, so it costs one atomic load per
+reporting interval and nothing per frame.
+
 ## Degradation counters
 
 `capture_fallback`, `capture_no_first_frame`, `frames_repeated`, `frames_dropped_ring`,
@@ -119,8 +133,9 @@ client contributes nothing rather than a wrong number.
 `nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
 `keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
 `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
-client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
-`input_queue_drops` / `input_stale_drops`.
+client-reported `client_jitter_underruns` / `client_jitter_overruns`, `frames_dropped_capture`,
+and the four input counters `input_queue_drops` / `input_stale_drops` /
+`input_reorder_drops` / `input_parse_errors`.
 
 `capture_no_first_frame` counts the black placeholder frames the macOS encode loop synthesizes when
 capture has produced nothing at all — a still virtual display, or a capture backend that started and
@@ -155,7 +170,19 @@ The process-level `live_transport_sessions` sits alongside the per-session objec
 equal the number of live sessions, and a number that only climbs across joins is a leak. `input_queue_drops` is the fast input queue shedding its oldest entry under
 pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
 rather than injected late — never a key or a button, which are state transitions the host cannot
-recover from.
+recover from, and never a pen or touch sample, which is ink rather than a position.
+`input_reorder_drops` is a fast-channel frame whose sequence was behind one already injected: the
+channel is unordered with no retransmits, so this is reorder, not loss, and it stays at zero until
+a client starts sending the optional sequence (`docs/INPUT-PROTOCOL.md`).
+`input_parse_errors` counts frames the input parser rejected — a client whose cached `input.js`
+has drifted from the host shows up here and nowhere else, alongside one log line per distinct
+error per channel.
+
+`frames_dropped_capture` is presents the OS coalesced away because the host was still busy with
+the previous frame: DXGI's `AccumulatedFrames` past the first, which the dirty-region check read
+as a `> 1` early-out and never counted. It is the Windows counterpart of the macOS
+`CGDisplayStreamUpdateGetDropCount` reading, which reports through the log bus rather than a
+counter because the capture backend is constructed before the session's telemetry exists.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
@@ -205,14 +232,14 @@ Sent on the **reliable** DataChannel once a second, alongside the `PING`. Fixed 
 endian. All durations are **microseconds**; a value of 0 means "not measured", which is what a
 path with no hook for that stage reports.
 
-Version 2 (96 bytes) appends the tier bytes and the degradation field below. Bytes 0..72 are
-byte-identical to v1, which is what lets a host built against v1 read the prefix and ignore the
-rest.
+Version 2 (96 bytes) appends the tier bytes and the degradation field below; version 3
+(104 bytes) appends the two audio-redundancy counters. Bytes 0..72 are byte-identical to v1 and
+0..96 to v2, which is what lets a host built against either read the prefix and ignore the rest.
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | opcode `0x62` |
-| 1 | 1 | version (currently 2; 0 is rejected) |
+| 1 | 1 | version (currently 3; 0 is rejected) |
 | 2 | 1 | video path |
 | 3 | 1 | audio path |
 | 4 | 4 | flags (below) |
@@ -243,6 +270,9 @@ rest.
 | 88 | 4 | audio packets concealed |
 | 92 | 4 | audio output latency, µs (0 = unknown) |
 | | | **96 bytes (v2)** |
+| 96 | 4 | redundant audio copies used — a copy that filled a real hole |
+| 100 | 4 | redundant audio copies discarded — the cost on a link that did not need one |
+| | | **104 bytes (v3)** |
 
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
@@ -253,6 +283,65 @@ nothing are correctly indistinguishable. A frame one byte short of 96 reads as t
 than half-parsed. `serve -v` names the four tiers in words and lists the set degradation bits by
 name; `status --json` carries the raw codes, the decoded names and the audio numbers.
 
+Each tail is read whole or not at all, and independently: a frame one byte short of 104 reads as
+v3-tail-absent with everything before it intact, and a host built against v2 reads a v3 client's
+first 96 bytes and drops the rest. `serve -v` prints `redundant=<used>/<discarded>` only when the
+feature did something; `status --json` always carries both.
+
+### Audio redundancy — the capability, the flag, and the two counters (v3)
+
+The audio DataChannel header is 13 bytes (`streamer/audio/protocol.rs`, the authority): `seq` u32
+LE, `capture_ns` u64 LE, `flags` u8, then the Opus payload. Two flag bits are defined host-side
+today — `FLAG_SILENT` (1 << 0) and `FLAG_DISCONTINUITY` (1 << 1). The client additionally reads a
+third:
+
+```
+FLAG_REDUNDANT   1 << 2      audio-worker.js
+  body, when set:  u16 LE primary length | primary Opus packet | previous frame's Opus packet
+  body, when clear: the Opus packet, as it always was
+```
+
+The trailing copy is the payload for `seq - 1` and nothing else. This is RFC 2198-style
+redundancy without the RTP framing, and it is the only loss-robustness tool this path has: the
+host's encoder is CELT-only at 5 ms, where libopus's in-band FEC is structurally inert.
+
+**The capability is negotiated in the WHEP join body, not in a stats bit.** `audioCapabilities`
+carries `redundancy` alongside `webcodecsOpus` and `worklet`:
+
+```json
+{ "webcodecsOpus": true, "worklet": true, "redundancy": true,
+  "verified": true, "wantsFallbackTrack": true }
+```
+
+`redundancy` describes *this client build* rather than the browser — `audio-worker.js` always
+understands the split — so `detectCapabilities()` returns it as a constant `true`, and
+`index.html` overwrites it with `false` on the Opus-track path, which has no DataChannel to carry
+a redundant body at all. A client older than the field sends nothing and serde defaults it to
+`false`. A host must set `FLAG_REDUNDANT` only against a client that sent `true`: a client that
+cannot split the body decodes the two payloads as one packet.
+
+Both halves are live. `streamer/audio/protocol.rs::build_message` takes an optional previous
+payload and sets the flag; `webrtc_session.rs::redundancy_now()` turns it on from the loss the
+video BWE already measures, and only for a session whose join advertised `redundancy: true`. The
+join body carries two more fields the client is the only side that can answer — `verified` (the
+decoder was actually probed, not sniffed) and `wantsFallbackTrack` (put a spare Opus track in
+the answer, because WHEP cannot add one later) — and the host logs the first and honours the
+second.
+
+Both counters reach the host: `parse_client_stats` reads bytes 96..104 into
+`ClientStats::audio_redundant_{used,discarded}`.
+
+The two counters are what the feature actually did once a host does send it. **used** (offset 96)
+is a copy that filled a hole the client would otherwise have concealed; **discarded** (offset
+100) is a copy whose frame had already arrived, and it is the payload the feature cost. `used`
+climbing while `audio packets concealed` stays flat is redundancy working; `discarded` climbing
+with `used` at zero is payload spent for nothing, which points at the host's loss threshold
+rather than at the client. The client de-duplicates by sequence number, so a copy is never played
+twice — playing it unconditionally would emit the same 5 ms of audio twice, which is worse than
+the loss it was sent to repair. A gap wider than one frame still conceals the part the copy
+cannot reach, and `FLAG_DISCONTINUITY` — the host saying the capture itself broke — suppresses
+both the copy and the concealment, because there is nothing to bridge.
+
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
 
@@ -262,8 +351,9 @@ offset has arrived; before that the client reports 0 there and clears `CLOCK_VAL
 |---:|---|---|
 | 0 | none | none |
 | 1 | WebCodecs → canvas | worklet, SharedArrayBuffer ring |
-| 2 | WebCodecs → video | worklet, `postMessage` ring |
+| 2 | WebCodecs → video | worklet, private ring relayed by the page |
 | 3 | `<video>` element | Opus track (NetEQ) |
+| 4 | | worklet, private ring over a `MessagePort` |
 
 ### Flags
 
@@ -294,6 +384,14 @@ one on the fast path rather than looking identical to it.
 A keyframe tier of 0 with a transport tier of 2 is the Chrome 94–140 case: the legacy transform
 runs instead of libwebrtc's reference finder, so nothing downstream emits a PLI and the client
 has no way at all to ask for an IDR.
+
+**Tier 2 is claimed only against a host that has said it parses `0x64`.** The client reads the
+host-capability bitfield off the `PONG` tail (`docs/INPUT-PROTOCOL.md`) and treats bit 0 as the
+gate: an older host advertises no bits, `RemoteInput.requestKeyframe()` returns false, the tier
+stays 0, and the page keeps the two remedies that are actually available to it — the worker's
+`nokeyframe` give-up after 8 s and the stall demotion to `<video>` after two 2 s ticks. Claiming
+the tier unconditionally disarmed both and left a frozen picture with the host being told the
+client had a working keyframe path.
 
 ### Degradation flags (v2, offset 80)
 
@@ -349,11 +447,27 @@ timestamp several frames now carry, are in `docs/INPUT-PROTOCOL.md`.
 
 `node scripts/test-client-stats.mjs` runs `input.js` under Node with minimal browser stubs,
 drives one PING/PONG exchange and one stats frame, and asserts the bytes against the layout
-above (including the v2 tail and the 72-byte floor an older host reads) plus the clock-offset
-arithmetic. It is not a substitute for a browser — it stubs the
-DOM, and it cannot exercise the workers — but it catches the failure that would otherwise be
-invisible: a `TypeError` inside `sendStats()` silently kills the once-a-second timer, and the
-host would simply see a client that never reports.
+above (including the v2 tail and the 72-byte floor an older host reads), the clock-offset
+arithmetic, and the host-capability gate: a 17-byte `PONG` advertises nothing and
+`requestKeyframe()` must then refuse *and send nothing*, a 19-byte one enables it, and an
+attempt that could not go out must not burn the 200 ms limiter.
+
+`node scripts/test-client-audio.mjs` runs `audio-worker.js` under Node with stub WebCodecs
+classes and feeds it real DataChannel frames: a plain packet, a redundant one with no loss
+(the copy must be discarded, not played — playing it doubles the audio), a redundant one after
+a single loss (the copy is decoded first, at the earlier timestamp), a duplicate, a late
+packet, a discontinuity, and a truncated redundant body.
+
+`node scripts/test-client-ice.mjs` lifts `waitForIceGathering` and its two helpers out of
+`index.html` and drives them against a fake peer connection: the candidate/grace table, that a
+relayed wait is *not* ended by a host or reflexive candidate, the relay grace, gathering
+completing, listener cleanup, and the deadline setting `ICE_GATHERING_DEADLINE`.
+
+Neither is a substitute for a browser — they stub the DOM and cannot exercise the workers — but
+each catches a failure that is otherwise invisible: a `TypeError` inside `sendStats()` silently
+kills the once-a-second timer and the host simply sees a client that never reports, and an ICE
+wait that ends too early ships an offer with no usable candidate and looks exactly like a
+network fault.
 
 The host half is covered by unit tests in `streamer/telemetry.rs` (bucket boundaries,
 percentiles against a known distribution, missing and out-of-order stamps),
