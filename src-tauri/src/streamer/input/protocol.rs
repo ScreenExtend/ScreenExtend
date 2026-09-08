@@ -584,7 +584,10 @@ pub const CLIENT_STATS_LEN: usize = 72;
 /// Wire size of a v2 frame: the v1 prefix plus the tier bytes, the degradation field and the
 /// three audio numbers. Bytes 0..72 are byte-identical to v1.
 pub const CLIENT_STATS_V2_LEN: usize = 96;
-pub const CLIENT_STATS_VERSION: u8 = 2;
+/// Wire size of a v3 frame: the v2 prefix plus the two audio-redundancy counters.
+/// Bytes 0..96 are byte-identical to v2 and 0..72 to v1.
+pub const CLIENT_STATS_V3_LEN: usize = 104;
+pub const CLIENT_STATS_VERSION: u8 = 3;
 
 fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     if b.len() < CLIENT_STATS_LEN {
@@ -598,6 +601,14 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
     // build may send more than 96. Take the tail only if all of it arrived.
     let tail: &[u8] = if b.len() >= CLIENT_STATS_V2_LEN {
         &b[CLIENT_STATS_LEN..CLIENT_STATS_V2_LEN]
+    } else {
+        &[]
+    };
+    // Each tail is read only when the whole of it arrived, and independently: a v3 client
+    // against a host that stopped at v2 loses only these two fields, and a v2 client here
+    // leaves them at 0, which is what "never sent one" and "not measured" both mean.
+    let tail3: &[u8] = if b.len() >= CLIENT_STATS_V3_LEN {
+        &b[CLIENT_STATS_V2_LEN..CLIENT_STATS_V3_LEN]
     } else {
         &[]
     };
@@ -638,6 +649,8 @@ fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
             audio_target_us: tail_u32(tail, 12),
             audio_concealed: tail_u32(tail, 16),
             audio_output_latency_us: tail_u32(tail, 20),
+            audio_redundant_used: tail_u32(tail3, 0),
+            audio_redundant_discarded: tail_u32(tail3, 4),
         },
     )))
 }
@@ -989,6 +1002,35 @@ mod tests {
             InputEvent::ClientStats(c) => {
                 assert_eq!(c.version, 2);
                 assert_eq!(c.video_path, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn the_v3_tail_is_read_whole_or_not_at_all() {
+        let mut b = vec![0u8; CLIENT_STATS_V3_LEN];
+        b[0] = op::STATS;
+        b[1] = 3;
+        b[CLIENT_STATS_V2_LEN..CLIENT_STATS_V2_LEN + 4].copy_from_slice(&17u32.to_le_bytes());
+        b[CLIENT_STATS_V2_LEN + 4..CLIENT_STATS_V3_LEN].copy_from_slice(&265u32.to_le_bytes());
+        match parse(&b).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.audio_redundant_used, 17);
+                assert_eq!(c.audio_redundant_discarded, 265);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // One byte short of the tail reads as absent, never as half-parsed — the same floor
+        // rule the v2 tail follows, and the reason a v2 host can read a v3 client at all.
+        let short = &b[..CLIENT_STATS_V3_LEN - 1];
+        match parse(short).unwrap().ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.audio_redundant_used, 0);
+                assert_eq!(c.audio_redundant_discarded, 0);
+                // Everything before it still parses.
+                assert_eq!(c.version, 3);
             }
             _ => panic!("wrong variant"),
         }

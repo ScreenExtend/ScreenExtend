@@ -3,11 +3,15 @@ import * as React from "react"
 import { cn, useFocus } from "@/lib/utils"
 
 export interface InputProps
-  extends React.InputHTMLAttributes<HTMLInputElement> {hoverLabel: boolean}
+  extends React.InputHTMLAttributes<HTMLInputElement> {hoverLabel?: boolean}
 
 const Input = React.forwardRef<HTMLInputElement, InputProps>(
-  ({ hoverLabel, id, className, placeholder, disabled, ...props }) => {
+  ({ hoverLabel = false, id, className, placeholder, disabled, ...props }, ref) => {
     const { inputRef, setInputFocus } = useFocus<HTMLInputElement>();
+    // The element the caller gets is the same one the floating label focuses. Without
+    // this the component accepted a ref (the `forwardRef` generic promises one) and
+    // silently left it null forever.
+    React.useImperativeHandle(ref, () => inputRef.current as HTMLInputElement, [inputRef]);
     if (hoverLabel) {
       return (
         <div className="relative">
@@ -27,19 +31,17 @@ const Input = React.forwardRef<HTMLInputElement, InputProps>(
       )
     } else {
       return (
-        <>
-          <input
-            id={id}
-            placeholder={placeholder}
-            className={cn(
-              "bg-transparent appearance-none peer flex h-10 w-full border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0 rounded-lg bg-card text-card-foreground shadow-sm",
-              className
-            )}
-            ref={inputRef}
-            disabled={disabled}
-            {...props}
-          />
-        </>
+        <input
+          id={id}
+          placeholder={placeholder}
+          className={cn(
+            "bg-transparent appearance-none peer flex h-10 w-full border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:select-none disabled:opacity-50 focus:border-blue-600 dark:focus:border-blue-500 border-2 focus:outline-none focus:ring-0 rounded-lg bg-card text-card-foreground shadow-sm",
+            className
+          )}
+          ref={inputRef}
+          disabled={disabled}
+          {...props}
+        />
       )
     }
   }
