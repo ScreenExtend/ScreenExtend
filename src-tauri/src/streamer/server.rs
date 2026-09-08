@@ -822,6 +822,7 @@ async fn start_session(
         (Some(hub), Some(overrides)) => Some(webrtc_session::AudioParams {
             fast: req.audio_capabilities.webcodecs_opus && req.audio_capabilities.worklet,
             redundancy: req.audio_capabilities.redundancy,
+            link_loss: None, // wired in by `start_session`, which owns the BWE
             hub: std::sync::Arc::clone(hub),
             overrides: std::sync::Arc::clone(overrides),
             device_key: client_ip.to_string(),
