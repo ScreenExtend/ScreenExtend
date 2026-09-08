@@ -47,9 +47,12 @@ const sheetVariants = cva(
   }
 )
 
-interface SheetContentProps extends React.ComponentPropsWithoutRef<typeof SheetPrimitive.Content>, VariantProps<typeof sheetVariants> {
-  trapFocus?: boolean;
-}
+// Upstream shadcn declares a `trapFocus` prop here that nothing destructures, so it fell
+// through `{...props}` into Radix and out onto the DOM node, where React warns about an
+// unrecognised attribute. Radix's modal Dialog already traps focus, so the prop only ever
+// described what was happening anyway.
+type SheetContentProps = React.ComponentPropsWithoutRef<typeof SheetPrimitive.Content> &
+  VariantProps<typeof sheetVariants>;
 
 const SheetContent = React.forwardRef<
   React.ElementRef<typeof SheetPrimitive.Content>,
