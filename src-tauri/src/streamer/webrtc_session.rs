@@ -50,6 +50,9 @@ const MIN_IDR_REQUEST_GAP: Duration = Duration::from_millis(200);
 
 pub struct InputParams {
     pub device: Option<String>,
+    /// The `os` string the client reported at join, which decides the modifier layout on a
+    /// macOS host. Empty when the client did not say.
+    pub client_os: String,
     pub control_enabled: bool,
     pub control_rx: Option<session::ControlReceiver>,
 }
@@ -394,10 +397,15 @@ pub async fn handle_whep_offer(
 
     let InputParams {
         device: input_device,
+        client_os,
         control_enabled,
         control_rx,
     } = input;
-    let (input_tx, _input_join) = input::spawn(input_device, Arc::clone(&pipeline.telemetry));
+    let client = input::ClientProfile {
+        device_name: input_device,
+        platform: input::ClientPlatform::from_reported(&client_os),
+    };
+    let (input_tx, _input_join) = input::spawn(client, Arc::clone(&pipeline.telemetry));
     {
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));

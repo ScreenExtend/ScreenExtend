@@ -10,6 +10,51 @@ pub mod protocol;
 
 use self::protocol::InputEvent;
 
+/// What the injector needs to know about the client driving it.
+///
+/// The display name is which virtual display its coordinates address; the platform decides the
+/// modifier layout on macOS, and is ignored everywhere else.
+#[derive(Clone, Debug, Default)]
+pub struct ClientProfile {
+    pub device_name: Option<String>,
+    pub platform: ClientPlatform,
+}
+
+/// The client's own operating system, as it reported at join.
+///
+/// Only the Apple/not-Apple distinction is load-bearing today, but the variants are kept whole
+/// because guessing from a boolean is how the original bug happened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientPlatform {
+    Windows,
+    MacOs,
+    IOs,
+    Android,
+    Linux,
+    #[default]
+    Unknown,
+}
+
+impl ClientPlatform {
+    /// Parses the `os` string the join request carries (`detectOs()` in the client page).
+    pub fn from_reported(os: &str) -> Self {
+        match os.trim().to_ascii_lowercase().as_str() {
+            "windows" => Self::Windows,
+            "macos" => Self::MacOs,
+            "ios" => Self::IOs,
+            "android" => Self::Android,
+            "linux" => Self::Linux,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether the keyboard in front of the user is an Apple one, where Command is the command
+    /// modifier and Control is the Emacs-style caret modifier.
+    pub fn is_apple(self) -> bool {
+        matches!(self, Self::MacOs | Self::IOs)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayRect {
     pub left: i32,
@@ -192,10 +237,7 @@ impl InjectorTx {
     }
 }
 
-pub fn spawn(
-    device_name: Option<String>,
-    telemetry: SharedTelemetry,
-) -> (InjectorTx, JoinHandle<()>) {
+pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, JoinHandle<()>) {
     let (fast_tx, fast_rx) = bounded::<Queued>(FAST_CAP);
     let fast_relief = fast_rx.clone();
     let (rel_tx, rel_rx) = unbounded::<Queued>();
@@ -205,7 +247,7 @@ pub fn spawn(
         .name("injector".into())
         .spawn(move || {
             backend::boost_thread();
-            let mut inj = backend::Injector::new(device_name);
+            let mut inj = backend::Injector::new(client);
             tprintln!("injector thread up ({})", backend::NAME);
             let t = thread_telemetry;
             loop {
