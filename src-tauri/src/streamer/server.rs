@@ -1228,6 +1228,7 @@ async fn start_session(
         Some(closed_tx),
         webrtc_session::InputParams {
             device: Some(device_name.clone()),
+            client_os: req.os.trim().to_string(),
             control_enabled,
             control_rx: Some(control_rx),
         },
