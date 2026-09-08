@@ -71,22 +71,23 @@ pub struct CaptureConfig {
 pub const PIXEL_FORMAT_420F: u32 = 0x3432_3066;
 pub const PIXEL_FORMAT_BGRA: u32 = 0x4247_5241;
 
+/// The OS version, for the human-readable half of `CompatibilityReport` only.
+///
+/// **Never gate a capability on this.** Every tier on this path is chosen by probing the thing
+/// itself — `AnyClass::get` for a class, `dlsym` for a function, an attempted session create for an
+/// encoder — because the version number is a proxy for the question and a worse one: it says
+/// nothing about a machine whose hardware, drivers or permissions differ inside the same release.
+///
+/// It reads `NSProcessInfo.operatingSystemVersion` (10.10+, so below the floor) and caches the
+/// answer. It used to fork `sw_vers` on every call, several times a second while the permission
+/// gate was open, and parse its stdout.
 pub fn macos_at_least(major: u32, minor: u32) -> bool {
-    fn product_version() -> Option<(u32, u32)> {
-        let out = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout);
-        let mut it = s.trim().split('.');
-        let maj = it.next()?.parse().ok()?;
-        let min = it.next().unwrap_or("0").parse().unwrap_or(0);
-        Some((maj, min))
-    }
-    match product_version() {
-        Some((maj, min)) => (maj, min) >= (major, minor),
-        None => true,
-    }
+    static VERSION: OnceLock<(u32, u32)> = OnceLock::new();
+    let (maj, min) = *VERSION.get_or_init(|| {
+        let v = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
+        (v.majorVersion.max(0) as u32, v.minorVersion.max(0) as u32)
+    });
+    (maj, min) >= (major, minor)
 }
 
 /// Whether ScreenCaptureKit exists on this machine.
