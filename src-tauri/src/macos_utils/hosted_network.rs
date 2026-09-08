@@ -709,8 +709,18 @@ pub fn start_hosted_network(
 #[specta::specta]
 pub fn stop_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool {
     match state.stop_hosted_network.lock().unwrap().take() {
+        // We started it, so stop it unconditionally — the radio may not have followed.
         Some(stop) => stop(),
-        None => stop_host_ap_mode(),
+        // We did not. Only send the SPI if there is actually an AP to stop; otherwise this is a
+        // private selector aimed at the interface the user is currently associated through.
+        None => {
+            let in_ap_mode = wifi_interface()
+                .map(|i| interface_mode_is_host_ap(&i))
+                .unwrap_or(false);
+            if in_ap_mode {
+                stop_host_ap_mode();
+            }
+        }
     }
     *state.hosted_network_running.lock().unwrap() = false;
 
