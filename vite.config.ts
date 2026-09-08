@@ -101,9 +101,43 @@ function classicWorkers(): Plugin {
   };
 }
 
+// The webfont is declared inside the 50 KB render-blocking stylesheet (`non.geist` is
+// imported from App.tsx), so the browser only starts fetching it after parsing all of
+// that CSS -- and `font-display: swap` means the fallback is painted first and then
+// replaced. A preload link starts the fetch with the rest of the head instead. The
+// filename carries a content hash, so it is read out of the emitted bundle rather than
+// hardcoded; if the font is ever renamed or dropped this simply emits nothing.
+function preloadWebfont(): Plugin {
+  return {
+    name: "screenextend:preload-webfont",
+    apply: "build",
+    enforce: "post",
+    transformIndexHtml(html, ctx) {
+      const font = Object.keys(ctx.bundle ?? {}).find(name => /Geist.*\.woff2$/.test(name));
+      if (!font) return html;
+      return {
+        html,
+        tags: [
+          {
+            tag: "link",
+            attrs: {
+              rel: "preload",
+              href: `/${font}`,
+              as: "font",
+              type: "font/woff2",
+              crossorigin: "",
+            },
+            injectTo: "head",
+          },
+        ],
+      };
+    },
+  };
+}
+
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), classicWorkers()],
+  plugins: [react(), classicWorkers(), preloadWebfont()],
 
   build: {
     target: ["es2020", "chrome87", "safari13"],
