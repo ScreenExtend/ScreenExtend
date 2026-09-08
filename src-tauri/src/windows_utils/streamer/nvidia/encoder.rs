@@ -42,6 +42,14 @@ const ENCODE_EVENT_TIMEOUT_MS: u32 = 2000;
 /// minimum that lets submit(N+1) overlap the hardware's work on N.
 const OUTPUT_BUFFERS: usize = 4;
 
+/// The most long-term reference slots to claim, however many the engine advertises.
+///
+/// Each slot is a picture held in the DPB for as long as the slot lives, so the cost is VRAM and
+/// a slightly wider reference search. Two is enough for the repair pattern LTR exists for here —
+/// one the client is known to hold and one being established — and more only widens the window
+/// in which the encoder may predict from something stale.
+const MAX_LTR_SLOTS: u32 = 2;
+
 pub enum SlotEncodeError {
     Poisoned(anyhow::Error),
     Encode(anyhow::Error),
@@ -250,7 +258,33 @@ pub struct Encoder {
     /// Shared with the pipeline so a `Pipeline::request_idr()` reaches the encoder even on the
     /// ring's idle keepalive path, where nothing else consults the pipeline's atomic.
     shared_idr: Option<Arc<AtomicBool>>,
+    /// How many long-term reference slots the encoder was opened with. 0 when the engine does
+    /// not advertise LTR, which is the signal that the repair API below is inert.
+    ltr_slots: u32,
+    /// The slot the next `mark_ltr` will claim, rotating over `ltr_slots`.
+    next_ltr_slot: u32,
+    /// Set by `mark_ltr`, consumed by the next submitted picture.
+    pending_ltr_mark: Option<u32>,
+    /// Set by `use_ltr`, consumed by the next submitted picture: a bitmap of the LTR slots the
+    /// picture may reference, and nothing else.
+    pending_ltr_use: Option<u32>,
     _lib: libloading::Library,
+}
+
+/// What became of a request to stop referencing a frame the client never received.
+///
+/// The caller needs to distinguish these, because "not supported here" means the only repair
+/// left is a keyframe, and it should stop asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefInvalidation {
+    /// The driver dropped the frame from the reference set. The next P frame will not use it.
+    Applied,
+    /// The engine does not advertise `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, or the encoder
+    /// was opened without long-term references, so there is nothing to invalidate against.
+    Unsupported,
+    /// The driver refused. Most often the frame has already left the DPB, which is not an error
+    /// so much as "too late" — the repair has to be a keyframe.
+    Refused,
 }
 
 unsafe impl Send for Encoder {}
@@ -325,6 +359,10 @@ impl Encoder {
             frame_index: 0,
             idr_requested: false,
             shared_idr: None,
+            ltr_slots: 0,
+            next_ltr_slot: 0,
+            pending_ltr_mark: None,
+            pending_ltr_use: None,
             _lib: lib,
         };
 
@@ -423,6 +461,10 @@ impl Encoder {
             frame_index: 0,
             idr_requested: false,
             shared_idr: None,
+            ltr_slots: 0,
+            next_ltr_slot: 0,
+            pending_ltr_mark: None,
+            pending_ltr_use: None,
             _lib: lib,
         };
 
@@ -686,6 +728,82 @@ impl Encoder {
         force || own || shared
     }
 
+    /// How many long-term reference slots this encoder has. 0 means the repair API is inert and
+    /// the only loss recovery available is a keyframe.
+    pub fn ltr_slots(&self) -> u32 {
+        self.ltr_slots
+    }
+
+    /// Mark the next encoded picture as a long-term reference, and say which slot it takes.
+    ///
+    /// An LTR stays in the DPB until its slot is claimed again, so it is the picture a later
+    /// repair frame can point at once the transport knows the client holds it. The caller owns
+    /// the policy — how often to mark, and which slots it believes the client has — because only
+    /// the transport sees the per-frame receipts. `None` when the engine has no LTR support.
+    ///
+    /// The mark is consumed by the next submitted picture, so it must be set before the submit
+    /// it is meant for and not left standing across frames.
+    pub fn mark_ltr(&mut self) -> Option<u32> {
+        if self.ltr_slots == 0 {
+            return None;
+        }
+        let slot = self.next_ltr_slot;
+        self.next_ltr_slot = (slot + 1) % self.ltr_slots;
+        self.pending_ltr_mark = Some(slot);
+        Some(slot)
+    }
+
+    /// Make the next encoded picture reference only the long-term slots in `bitmap`.
+    ///
+    /// This is the repair: after a loss burst, a P frame predicted from a picture the client is
+    /// known to hold costs a fraction of an IDR and does not reset the rate controller. Bits
+    /// outside the encoder's slot count are ignored rather than rejected, and an empty bitmap is
+    /// a no-op — asking for "reference nothing" would mean an intra frame, which the caller
+    /// should ask for as an IDR instead.
+    pub fn use_ltr(&mut self, bitmap: u32) -> bool {
+        if self.ltr_slots == 0 {
+            return false;
+        }
+        let mask = if self.ltr_slots >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << self.ltr_slots) - 1
+        };
+        let bitmap = bitmap & mask;
+        if bitmap == 0 {
+            return false;
+        }
+        self.pending_ltr_use = Some(bitmap);
+        true
+    }
+
+    /// Drop a frame the client never received from the reference set.
+    ///
+    /// `frame_index` is the value handed to `NV_ENC_PIC_PARAMS::inputTimeStamp`, which this
+    /// encoder sets to its own monotonic frame counter — so the transport identifies a lost
+    /// frame by the same number the pipeline stamped on it. `nvEncInvalidateRefFrames` then
+    /// removes it, and every picture that referenced it, from the DPB, so the next P frame
+    /// predicts from something the client actually has.
+    ///
+    /// Cap-gated on `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, never on a driver version.
+    pub fn invalidate_reference(&mut self, frame_index: u64) -> RefInvalidation {
+        if !self.caps.ref_pic_invalidation || self.ltr_slots == 0 {
+            return RefInvalidation::Unsupported;
+        }
+        let Some(f) = self.fns.nvEncInvalidateRefFrames else {
+            return RefInvalidation::Unsupported;
+        };
+        match unsafe { f(self.encoder, frame_index) } {
+            NVENCSTATUS::NV_ENC_SUCCESS => RefInvalidation::Applied,
+            status => {
+                teprintln!(
+                    "NVENC: nvEncInvalidateRefFrames(frame={frame_index}) returned {status:?};                      the frame has probably already left the DPB, so this loss needs a keyframe"
+                );
+                RefInvalidation::Refused
+            }
+        }
+    }
+
     /// What the driver reported for this engine. Read once at session open.
     pub fn caps(&self) -> EncoderCaps {
         self.caps
@@ -939,9 +1057,10 @@ impl Encoder {
         let ltr = caps.max_ltr_frames >= 2 && caps.multiple_ref_frames;
         if ltr {
             h264.set_enableLTR(1);
-            h264.ltrNumFrames = caps.max_ltr_frames.min(2);
+            h264.ltrNumFrames = caps.max_ltr_frames.min(MAX_LTR_SLOTS);
             h264.ltrTrustMode = 0;
         }
+        self.ltr_slots = if ltr { h264.ltrNumFrames } else { 0 };
 
         h264.set_repeatSPSPPS(1);
         h264.set_enableFillerDataInsertion(0);
@@ -1199,6 +1318,23 @@ impl Encoder {
         if force_idr {
             pic.encodePicFlags = (NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32)
                 | (NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32);
+        }
+
+        // An IDR resets the DPB, so a pending mark or use against it would be meaningless —
+        // take them either way so neither leaks into a later picture, but only apply them to a
+        // P frame.
+        let ltr_mark = self.pending_ltr_mark.take();
+        let ltr_use = self.pending_ltr_use.take();
+        if !force_idr && self.ltr_slots > 0 {
+            let h264 = unsafe { &mut pic.codecPicParams.h264PicParams };
+            if let Some(slot) = ltr_mark {
+                h264.set_ltrMarkFrame(1);
+                h264.ltrMarkFrameIdx = slot;
+            }
+            if let Some(bitmap) = ltr_use {
+                h264.set_ltrUseFrames(1);
+                h264.ltrUseFrameBitmap = bitmap;
+            }
         }
 
         let st = unsafe {

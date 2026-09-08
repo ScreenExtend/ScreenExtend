@@ -282,3 +282,149 @@ fn x264_software_runtime_bitrate_change() {
         "x264 runtime bitrate change OK: high segment {high_bytes}B -> low segment {low_bytes}B"
     );
 }
+
+/// Convert a BGRA frame to NV12 with the same BT.601 limited-range matrix libx264 would use, so
+/// the two paths can be compared on identical pixels rather than on the encoder's guess.
+fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h + w * (h / 2)];
+    let (y_plane, uv_plane) = out.split_at_mut(w * h);
+    for row in 0..h {
+        for col in 0..w {
+            let p = row * w * 4 + col * 4;
+            let (b, g, r) = (bgra[p] as f32, bgra[p + 1] as f32, bgra[p + 2] as f32);
+            y_plane[row * w + col] =
+                (16.0 + 0.257 * r + 0.504 * g + 0.098 * b).clamp(0.0, 255.0) as u8;
+        }
+    }
+    for row in (0..h).step_by(2) {
+        for col in (0..w).step_by(2) {
+            let mut sb = 0.0f32;
+            let mut sg = 0.0f32;
+            let mut sr = 0.0f32;
+            for (dr, dc) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let p = (row + dr) * w * 4 + (col + dc) * 4;
+                sb += bgra[p] as f32;
+                sg += bgra[p + 1] as f32;
+                sr += bgra[p + 2] as f32;
+            }
+            let (r, g, b) = (sr / 4.0, sg / 4.0, sb / 4.0);
+            let i = (row / 2) * w + col;
+            uv_plane[i] = (128.0 - 0.148 * r - 0.291 * g + 0.439 * b).clamp(0.0, 255.0) as u8;
+            uv_plane[i + 1] = (128.0 + 0.439 * r - 0.368 * g - 0.071 * b).clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// NV12 straight from the scaler must produce the same *kind* of stream as the BGRA path.
+///
+/// The whole reason `ReadbackFormat::Nv12` exists is that the GPU's video processor does the
+/// scale and the colour conversion in one blt, so the CPU colour-matrix pass disappears. That is
+/// only worth having if the result is still a stream the client can decode: the BGRA fast path
+/// this replaces produced profile_idc 244 / 4:4:4 and passed its own test for months
+/// (`blocker-x264-bgra-input-emits-444-stream`). So this asserts the SPS, not just that bytes
+/// came out — and asserts it for both entry points, from the same pixels.
+#[test]
+fn x264_nv12_input_matches_the_bgra_path() {
+    const W: u32 = 640;
+    const H: u32 = 360;
+
+    let cfg = || EncoderConfig {
+        width: W,
+        height: H,
+        fps: 60,
+        bitrate_bps: 4_000_000,
+        max_bitrate_bps: 4_000_000,
+        profile: H264Profile::Baseline,
+        qp: None,
+        min_qp: None,
+        intra_refresh: false,
+    };
+
+    let mut bgra_enc = match X264Encoder::new(cfg()) {
+        Ok(e) => e,
+        Err(e) => {
+            super::skip("x264 NV12 input test (libx264 unavailable)", e);
+            return;
+        }
+    };
+    let mut nv12_enc = X264Encoder::new(cfg()).expect("second x264 encoder");
+
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    let mut bgra_total = 0usize;
+    let mut nv12_total = 0usize;
+    let mut nv12_sps = None;
+    let mut nv12_us: Vec<u128> = Vec::new();
+    let mut bgra_us: Vec<u128> = Vec::new();
+
+    for i in 0..30u32 {
+        fill_synthetic_bgra(&mut frame, W, H, i);
+        let nv12 = bgra_to_nv12(&frame, W as usize, H as usize);
+
+        let t = std::time::Instant::now();
+        let a = bgra_enc
+            .encode_bgra(&frame, i == 0)
+            .expect("BGRA-path encode");
+        bgra_us.push(t.elapsed().as_micros());
+
+        let t = std::time::Instant::now();
+        let b = nv12_enc
+            .encode_nv12_padded(&nv12, W, i == 0)
+            .expect("NV12-path encode");
+        nv12_us.push(t.elapsed().as_micros());
+
+        bgra_total += a.len();
+        nv12_total += b.len();
+        if i == 0 {
+            assert!(
+                starts_with_annexb(&b),
+                "the NV12 path must emit Annex-B like the BGRA path"
+            );
+            assert!(
+                is_idr_with_headers(&b),
+                "the first NV12 frame must be an IDR carrying SPS and PPS"
+            );
+            nv12_sps = parse_sps(&b);
+        }
+    }
+
+    let sps = nv12_sps.expect("the NV12 path must emit a parseable SPS");
+    assert_eq!(
+        sps.profile_idc, 66,
+        "NV12 input must still honour the requested Baseline profile, got {sps:?}"
+    );
+    assert_eq!(
+        sps.chroma_format_idc, 1,
+        "NV12 input must produce a 4:2:0 stream, got {sps:?}"
+    );
+
+    // Same content through the same encoder settings: the sizes should be close. A large gap
+    // means one path is coding something different from what it was handed.
+    let ratio = nv12_total as f64 / bgra_total as f64;
+    assert!(
+        (0.5..2.0).contains(&ratio),
+        "NV12 output {nv12_total} B and BGRA output {bgra_total} B differ by more than 2x; \
+         the NV12 planes are probably being read as something else"
+    );
+
+    // Repeating must work off the retained NV12 frame, not a stale I420 one.
+    let repeat = nv12_enc.encode_repeat(true).expect("NV12 repeat encode");
+    assert!(
+        is_idr_with_headers(&repeat),
+        "a forced repeat on the NV12 path must produce an IDR with headers"
+    );
+    assert!(
+        !nal_units(&repeat).is_empty(),
+        "the NV12 repeat must carry NALs"
+    );
+
+    bgra_us.sort_unstable();
+    nv12_us.sort_unstable();
+    let med = |v: &[u128]| v[v.len() / 2];
+    eprintln!(
+        "x264 NV12 input OK: {W}x{H}, sps={sps:?}, bytes bgra={bgra_total} nv12={nv12_total} \
+         (ratio {ratio:.2}), encode median bgra={}us nv12={}us",
+        med(&bgra_us),
+        med(&nv12_us),
+    );
+}

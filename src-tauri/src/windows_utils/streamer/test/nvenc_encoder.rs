@@ -7,7 +7,7 @@
 
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::nvidia::encoder::{
-    fill_synthetic_bgra, Encoder, EncoderConfig,
+    fill_synthetic_bgra, Encoder, EncoderConfig, RefInvalidation,
 };
 
 use super::h264::{is_idr_with_headers, nal_units, parse_sps, starts_with_annexb};
@@ -398,5 +398,114 @@ fn measure_pipelining(w: u32, h: u32) {
         percentile(&pipelined, 50),
         percentile(&pipelined, 95),
         percentile(&pipelined, 99),
+    );
+}
+
+/// The loss-repair API: mark a long-term reference, invalidate a frame the client never got,
+/// then predict the next picture from the LTR instead of paying for an IDR.
+///
+/// This is the encoder half of `major-nvenc-reference-invalidation-now-has-its-transport-input`.
+/// The transport half — resolving a lost RTP sequence number to a frame index — is W1's; what is
+/// asserted here is that the three calls do what their names say on real hardware, and that the
+/// repair frame is cheaper than the IDR it replaces.
+///
+/// The margin here is the pessimistic one and should be read that way. `fill_synthetic_bgra`
+/// redraws the whole picture every frame, so predicting frame 40 from the long-term reference
+/// marked at frame 1 leaves a residual close to an intra frame's worth — measured at 0.83x the
+/// IDR on this RTX 3080 Ti. Real screen content is mostly static between frames, where the same
+/// repair should land near a steady P frame. What this pins is that the mechanism works and does
+/// not cost *more* than the keyframe it exists to avoid.
+#[test]
+fn nvenc_ltr_repair_is_cheaper_than_an_idr() {
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+    const FPS: u32 = 60;
+    const BITRATE: u32 = 10_000_000;
+
+    let mut encoder = match Encoder::new(cfg(W, H, FPS, BITRATE)) {
+        Ok(e) => e,
+        Err(e) => {
+            super::skip("NVENC LTR repair test (no NVIDIA GPU / driver)", e);
+            return;
+        }
+    };
+
+    let caps = encoder.caps();
+    if encoder.ltr_slots() == 0 {
+        super::skip(
+            "NVENC LTR repair test (engine advertises no long-term references)",
+            format!(
+                "max_ltr_frames={}, multi_ref={}",
+                caps.max_ltr_frames, caps.multiple_ref_frames
+            ),
+        );
+        return;
+    }
+
+    let mut frame = vec![0u8; (W * H * 4) as usize];
+    let mut idr_bytes = 0usize;
+    let mut steady_p: Vec<usize> = Vec::new();
+
+    // Frame 0 is the IDR everything is measured against. Frame 1 is marked as the long-term
+    // reference the repair will point at; the rest are ordinary P frames.
+    let ltr_slot = 1u32;
+    for i in 0..40u32 {
+        fill_synthetic_bgra(&mut frame, W, H, i);
+        if i == ltr_slot {
+            let slot = encoder
+                .mark_ltr()
+                .expect("mark_ltr on an LTR-capable engine");
+            assert!(
+                slot < encoder.ltr_slots(),
+                "mark_ltr returned slot {slot} outside the {} it opened with",
+                encoder.ltr_slots()
+            );
+        }
+        let au = encoder.encode_bgra(&frame, i == 0).expect("encode");
+        match i {
+            0 => idr_bytes = au.len(),
+            n if n >= 10 => steady_p.push(au.len()),
+            _ => {}
+        }
+    }
+
+    // Frame 39 is now the reference. Say the client never received it, and repair by predicting
+    // from the long-term reference marked back at frame 1.
+    let invalidated = encoder.invalidate_reference(39);
+    assert_ne!(
+        invalidated,
+        RefInvalidation::Unsupported,
+        "the engine advertised ref-pic invalidation ({}), so the call must not report it \
+         unsupported",
+        caps.ref_pic_invalidation
+    );
+    assert!(
+        encoder.use_ltr(1 << 0),
+        "use_ltr must be accepted on an LTR-capable engine"
+    );
+    fill_synthetic_bgra(&mut frame, W, H, 40);
+    let repair_bytes = encoder
+        .encode_bgra(&frame, false)
+        .expect("repair encode")
+        .len();
+
+    // An empty bitmap is a no-op, not a request for an intra frame.
+    assert!(!encoder.use_ltr(0), "an empty LTR bitmap must be refused");
+
+    steady_p.sort_unstable();
+    let median_p = steady_p[steady_p.len() / 2];
+    eprintln!(
+        "NVENC LTR repair OK: slots={}, invalidate={invalidated:?}, \
+         idr={idr_bytes}B median_p={median_p}B repair={repair_bytes}B \
+         (repair is {:.2}x the IDR, {:.1}x a steady P)",
+        encoder.ltr_slots(),
+        repair_bytes as f64 / idr_bytes as f64,
+        repair_bytes as f64 / median_p as f64,
+    );
+
+    assert!(
+        repair_bytes < idr_bytes,
+        "an LTR repair frame ({repair_bytes} B) that costs more than the IDR it replaces \
+         ({idr_bytes} B) is not a repair"
     );
 }
