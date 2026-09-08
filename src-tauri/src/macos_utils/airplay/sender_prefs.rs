@@ -24,9 +24,9 @@
 //! `CFPreferencesSetAppValue` path for a preference the module has decided not
 //! to write is an ability this module should not have.
 
-use std::ffi::c_void;
-
 use objc2_core_foundation::{CFNumber, CFRetained, CFString};
+
+use super::cf_sys::{CFGetTypeID, CFNumberGetTypeID, CFPreferencesCopyAppValue, CFRelease};
 
 const DOMAIN: &str = "com.apple.coremedia";
 const KEY: &str = "wirelessdisplaymac_set_display_size";
@@ -46,17 +46,6 @@ pub const ADVERTISED_HEIGHT: u32 = 1080;
 /// The only refresh rate reachable on this path: the sender hardcodes 60 when it
 /// builds the timing mode, and nothing emits a refresh-rate override.
 pub const FIXED_REFRESH_HZ: u32 = 60;
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFPreferencesCopyAppValue(
-        key: *const c_void,
-        application_id: *const c_void,
-    ) -> *const c_void;
-    fn CFRelease(cf: *const c_void);
-    fn CFGetTypeID(cf: *const c_void) -> usize;
-    fn CFNumberGetTypeID() -> usize;
-}
 
 fn key() -> CFRetained<CFString> {
     CFString::from_str(KEY)

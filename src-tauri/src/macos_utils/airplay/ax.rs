@@ -18,15 +18,22 @@
 //! milliseconds; we close it again with `AXCancel` so nothing is left open on
 //! the user's screen.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::c_void;
 use std::process::Command;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-type CFTypeRef = *const c_void;
-type CFStringRef = *const c_void;
-type CFArrayRef = *const c_void;
-type AXUIElementRef = *const c_void;
+use super::cf_sys::{
+    cf_string, cf_string_to_string, retained, CFArrayGetCount, CFArrayGetTypeID,
+    CFArrayGetValueAtIndex, CFBooleanGetTypeID, CFBooleanGetValue, CFBundleCopyLocalizedString,
+    CFBundleCreate, CFGetTypeID, CFPreferencesAppSynchronize, CFPreferencesCopyAppValue,
+    CFPreferencesSetAppValue, CFRelease, CFTypeRef, CFURLCreateWithFileSystemPath, CfOwned,
+    K_CF_BOOLEAN_FALSE, K_CF_BOOLEAN_TRUE,
+};
+
+/// An AX element is just a CFType; the alias is for reading, not for safety.
+type AXUIElementRef = CFTypeRef;
+type CFStringRef = CFTypeRef;
 type AXError = i32;
 
 const AX_SUCCESS: AXError = 0;
@@ -35,8 +42,6 @@ const AX_ERROR_NOT_IMPLEMENTED: AXError = -25208;
 const AX_ERROR_ATTRIBUTE_UNSUPPORTED: AXError = -25205;
 const AX_ERROR_CANNOT_COMPLETE: AXError = -25204;
 const AX_ERROR_INVALID_ELEMENT: AXError = -25202;
-
-const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -50,63 +55,12 @@ unsafe extern "C" {
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
 }
 
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRelease(cf: CFTypeRef);
-    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
-    fn CFGetTypeID(cf: CFTypeRef) -> usize;
-    fn CFStringGetTypeID() -> usize;
-    fn CFArrayGetTypeID() -> usize;
-    fn CFStringCreateWithCString(
-        alloc: *const c_void,
-        cstr: *const i8,
-        encoding: u32,
-    ) -> CFStringRef;
-    fn CFStringGetCString(
-        s: CFStringRef,
-        buffer: *mut i8,
-        buffer_size: isize,
-        encoding: u32,
-    ) -> bool;
-    fn CFArrayGetCount(array: CFArrayRef) -> isize;
-    fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: isize) -> CFTypeRef;
-    fn CFURLCreateWithFileSystemPath(
-        allocator: *const c_void,
-        path: CFStringRef,
-        path_style: isize,
-        is_directory: bool,
-    ) -> *const c_void;
-    fn CFBundleCreate(allocator: *const c_void, url: *const c_void) -> *const c_void;
-    fn CFBundleCopyLocalizedString(
-        bundle: *const c_void,
-        key: CFStringRef,
-        value: CFStringRef,
-        table: CFStringRef,
-    ) -> CFStringRef;
-    fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> CFTypeRef;
-    fn CFPreferencesSetAppValue(key: CFStringRef, value: CFTypeRef, application_id: CFStringRef);
-    fn CFPreferencesAppSynchronize(application_id: CFStringRef) -> bool;
-    // Signature must match the other declaration in this crate
-    // (`macos_utils/streamer/encoder.rs`), or the linker sees a clash.
-    fn CFBooleanGetValue(boolean: *const c_void) -> u8;
-}
-
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, keycode: u16, key_down: bool)
         -> *mut c_void;
     fn CGEventPost(tap: u32, event: *mut c_void);
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    #[link_name = "CFBooleanGetTypeID"]
-    fn cf_boolean_type_id() -> usize;
-    #[link_name = "kCFBooleanTrue"]
-    static K_CF_BOOLEAN_TRUE: CFTypeRef;
-    #[link_name = "kCFBooleanFalse"]
-    static K_CF_BOOLEAN_FALSE: CFTypeRef;
 }
 
 /// The user-facing "Show mirroring options in the menu bar when available"
@@ -142,7 +96,7 @@ fn saved_menu_bar_option() -> &'static std::sync::Mutex<Option<PreviousMenuBar>>
 
 /// `Some(on)` when the key is present, `None` when the domain does not carry it.
 fn menu_bar_option() -> Option<bool> {
-    let (Some(k), Some(d)) = (CfStr::new(SHOW_IN_MENU_BAR_KEY), CfStr::new(AIRPLAY_DOMAIN)) else {
+    let (Some(k), Some(d)) = (cf_string(SHOW_IN_MENU_BAR_KEY), cf_string(AIRPLAY_DOMAIN)) else {
         return None;
     };
     unsafe {
@@ -150,14 +104,14 @@ fn menu_bar_option() -> Option<bool> {
         if v.is_null() {
             return None;
         }
-        let on = CFGetTypeID(v) == cf_boolean_type_id() && CFBooleanGetValue(v) != 0;
+        let on = CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v) != 0;
         CFRelease(v);
         Some(on)
     }
 }
 
 fn write_menu_bar_option(value: Option<bool>) -> bool {
-    let (Some(k), Some(d)) = (CfStr::new(SHOW_IN_MENU_BAR_KEY), CfStr::new(AIRPLAY_DOMAIN)) else {
+    let (Some(k), Some(d)) = (cf_string(SHOW_IN_MENU_BAR_KEY), cf_string(AIRPLAY_DOMAIN)) else {
         return false;
     };
     unsafe {
@@ -233,8 +187,8 @@ const DISPLAYS_MENU_BUNDLE: &str = "/System/Library/CoreServices/Menu Extras/Dis
 /// menu itself uses gets the right string in whatever language the menu is
 /// drawn in, without hardcoding English.
 fn menu_string(key: &str) -> Option<String> {
-    let path = CfStr::new(DISPLAYS_MENU_BUNDLE)?;
-    let k = CfStr::new(key)?;
+    let path = cf_string(DISPLAYS_MENU_BUNDLE)?;
+    let k = cf_string(key)?;
     unsafe {
         let url = CFURLCreateWithFileSystemPath(ptr::null(), path.0, 0, true);
         if url.is_null() {
@@ -250,7 +204,7 @@ fn menu_string(key: &str) -> Option<String> {
         if value.is_null() {
             return None;
         }
-        let out = cfstring_to_string(value);
+        let out = cf_string_to_string(value);
         CFRelease(value);
         // CFBundle returns the key itself when the lookup misses.
         out.filter(|v| v != key)
@@ -276,77 +230,19 @@ fn menu_strings() -> &'static MenuStrings {
     })
 }
 
-/// An owned CFString, released on drop.
-struct CfStr(CFStringRef);
-
-impl CfStr {
-    fn new(s: &str) -> Option<Self> {
-        let c = CString::new(s).ok()?;
-        let r = unsafe {
-            CFStringCreateWithCString(ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8)
-        };
-        if r.is_null() {
-            None
-        } else {
-            Some(Self(r))
-        }
-    }
-}
-
-impl Drop for CfStr {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
-        }
-    }
-}
-
-/// An owned CFType returned by an AX copy, released on drop.
-struct CfValue(CFTypeRef);
-
-impl Drop for CfValue {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
-        }
-    }
-}
-
-fn cfstring_to_string(s: CFStringRef) -> Option<String> {
-    if s.is_null() || unsafe { CFGetTypeID(s) } != unsafe { CFStringGetTypeID() } {
-        return None;
-    }
-    let mut buf = vec![0i8; 1024];
-    let ok = unsafe {
-        CFStringGetCString(
-            s,
-            buf.as_mut_ptr(),
-            buf.len() as isize,
-            K_CF_STRING_ENCODING_UTF8,
-        )
-    };
-    if !ok {
-        return None;
-    }
-    unsafe { CStr::from_ptr(buf.as_ptr()) }
-        .to_str()
-        .ok()
-        .map(|s| s.to_string())
-}
-
-fn copy_attr(element: AXUIElementRef, name: &str) -> Option<CfValue> {
-    let key = CfStr::new(name)?;
+fn copy_attr(element: AXUIElementRef, name: &str) -> Option<CfOwned> {
+    let key = cf_string(name)?;
     let mut out: CFTypeRef = ptr::null();
     let err = unsafe { AXUIElementCopyAttributeValue(element, key.0, &mut out) };
     if err != AX_SUCCESS || out.is_null() {
         return None;
     }
-    Some(CfValue(out))
+    Some(CfOwned(out))
 }
 
 fn attr_string(element: AXUIElementRef, name: &str) -> Option<String> {
     let v = copy_attr(element, name)?;
-    cfstring_to_string(v.0)
+    cf_string_to_string(v.0)
 }
 
 /// Whether a menu row can actually be chosen.
@@ -359,7 +255,7 @@ fn is_enabled(element: AXUIElementRef) -> bool {
         // Absent means "not applicable", which for a menu item means selectable.
         return true;
     };
-    unsafe { CFGetTypeID(v.0) != cf_boolean_type_id() || CFBooleanGetValue(v.0) != 0 }
+    unsafe { CFGetTypeID(v.0) != CFBooleanGetTypeID() || CFBooleanGetValue(v.0) != 0 }
 }
 
 /// An element's children, together with the array that owns them.
@@ -371,14 +267,14 @@ fn is_enabled(element: AXUIElementRef) -> bool {
 /// time. Owning it gives the same lifetime with a `Drop`; anything that has to
 /// outlive the array is retained explicitly instead ([`retained`]).
 struct Children {
-    _array: CfValue,
+    _array: CfOwned,
     items: Vec<AXUIElementRef>,
 }
 
 impl Children {
     fn empty() -> Self {
         Self {
-            _array: CfValue(ptr::null()),
+            _array: CfOwned(ptr::null()),
             items: Vec::new(),
         }
     }
@@ -406,19 +302,12 @@ fn children(element: AXUIElementRef) -> Children {
     Children { _array: v, items }
 }
 
-/// Takes ownership of a borrowed element so it can outlive the array it came
-/// out of.
-fn retained(element: AXUIElementRef) -> OwnedElement {
-    unsafe { CFRetain(element) };
-    OwnedElement(element)
-}
-
 fn press(element: AXUIElementRef) -> Result<(), String> {
     perform(element, "AXPress")
 }
 
 fn perform(element: AXUIElementRef, action: &str) -> Result<(), String> {
-    let a = CfStr::new(action).ok_or_else(|| format!("could not build the {action} action"))?;
+    let a = cf_string(action).ok_or_else(|| format!("could not build the {action} action"))?;
     let err = unsafe { AXUIElementPerformAction(element, a.0) };
     match err {
         AX_SUCCESS => Ok(()),
@@ -566,19 +455,9 @@ impl MenuSnapshot {
 
 struct Extra {
     /// The menu-bar extra itself, retained out of its parent's child array.
-    element: OwnedElement,
+    element: CfOwned,
     /// Root application element, released when the Extra is dropped.
-    _app: OwnedElement,
-}
-
-struct OwnedElement(AXUIElementRef);
-
-impl Drop for OwnedElement {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
-        }
-    }
+    _app: CfOwned,
 }
 
 /// Finds the Displays menu extra, adding it to the menu bar if it is missing.
@@ -659,14 +538,14 @@ fn find_displays_extra_once() -> Result<Extra, String> {
             "could not open SystemUIServer (pid {pid}) for Accessibility"
         ));
     }
-    let app = OwnedElement(app);
+    let app = CfOwned(app);
 
     let extras = copy_attr(app.0, "AXExtrasMenuBar").ok_or_else(|| {
         "SystemUIServer exposes no menu-bar extras — is Accessibility granted to ScreenExtend?"
             .to_string()
     })?;
 
-    let mut found: Option<OwnedElement> = None;
+    let mut found: Option<CfOwned> = None;
     for extra in children(extras.0).iter() {
         // The Displays extra is the one whose description names it. It has no
         // AXTitle, so the description is what identifies it before it is opened.
@@ -724,11 +603,7 @@ fn read_menu(extra: &Extra) -> MenuSnapshot {
 /// for a device row that is the name *we* chose when publishing the Bonjour
 /// service, and for a command row it is the string read out of the menu's own
 /// bundle, so neither depends on the user's language.
-fn find_row(
-    extra: &Extra,
-    want_identifier: &str,
-    want_title: Option<&str>,
-) -> Option<OwnedElement> {
+fn find_row(extra: &Extra, want_identifier: &str, want_title: Option<&str>) -> Option<CfOwned> {
     let menus = children(extra.element.0);
     for child in menus.iter() {
         let rows = children(child);
@@ -879,7 +754,7 @@ const ACTION_SETTLE: Duration = Duration::from_millis(250);
 fn press_row_in_menu(
     appear_timeout: Duration,
     budget: Instant,
-    find: impl Fn(&Extra) -> Option<OwnedElement>,
+    find: impl Fn(&Extra) -> Option<CfOwned>,
     missing: impl Fn(&MenuSnapshot) -> String,
 ) -> Result<(), String> {
     let mut last = String::new();
@@ -1047,10 +922,10 @@ pub fn disconnect(budget: Instant) -> Result<(), String> {
 
 /// The 10.15+ fallback: first `connectToAirPlayDevice:` row, and only when the
 /// mirror-mode block below it proves a session is live.
-fn find_stop_row_by_position(extra: &Extra) -> Option<OwnedElement> {
+fn find_stop_row_by_position(extra: &Extra) -> Option<CfOwned> {
     let menus = children(extra.element.0);
     for child in menus.iter() {
-        let mut first_connect: Option<OwnedElement> = None;
+        let mut first_connect: Option<CfOwned> = None;
         let rows = children(child);
         for item in rows.iter() {
             match attr_string(item, "AXIdentifier")
@@ -1075,22 +950,6 @@ fn find_stop_row_by_position(extra: &Extra) -> Option<OwnedElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cfstring_round_trips() {
-        let s = CfStr::new("AXChildren").expect("create");
-        assert_eq!(cfstring_to_string(s.0).as_deref(), Some("AXChildren"));
-    }
-
-    #[test]
-    fn a_nul_in_the_string_is_rejected_rather_than_truncating() {
-        assert!(CfStr::new("bad\0name").is_none());
-    }
-
-    #[test]
-    fn non_string_types_convert_to_none() {
-        assert_eq!(cfstring_to_string(ptr::null()), None);
-    }
 
     #[test]
     fn system_ui_server_is_running_on_a_desktop_session() {
