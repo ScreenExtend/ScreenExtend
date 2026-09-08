@@ -62,7 +62,7 @@ pub enum Error {
 /// Represents a window that can be captured.
 ///
 /// # Example
-/// ```no_run
+/// ```text
 /// use windows_capture::window::Window;
 ///
 /// fn main() -> Result<(), Box<dyn std::error::Error>> {

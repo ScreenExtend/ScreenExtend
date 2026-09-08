@@ -1,3 +1,19 @@
+/// Report a hardware-gated test as skipped instead of returning silently.
+///
+/// `teprintln!` only reaches stderr when the logbus is in verbose mode, which no test turns
+/// on, so a skipped test used to print `ok` and nothing else — six of them covered nothing on
+/// a stock box while showing green. The harness captures this line too, so it needs
+/// `--nocapture` to be seen live; the point is that it exists at all. Set `SE_REQUIRE_HW=1` on
+/// a machine that is supposed to have the hardware and a skip becomes a failure.
+#[track_caller]
+pub(crate) fn skip(what: &str, reason: impl std::fmt::Debug) {
+    let msg = format!("SKIP {what}: {reason:?}");
+    if std::env::var("SE_REQUIRE_HW").as_deref() == Ok("1") {
+        panic!("{msg} — SE_REQUIRE_HW=1 demands this path run");
+    }
+    eprintln!("{msg}");
+}
+
 mod intel_encoder;
 mod intel_layout;
 mod nvenc_layout;

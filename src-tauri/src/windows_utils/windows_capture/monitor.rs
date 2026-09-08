@@ -78,7 +78,7 @@ pub enum Error {
 /// Represents a display monitor.
 ///
 /// # Examples
-/// ```no_run
+/// ```text
 /// use windows_capture::monitor::Monitor;
 ///
 /// // Primary monitor
@@ -86,7 +86,7 @@ pub enum Error {
 /// println!("Primary: {}", primary.name().unwrap());
 /// ```
 ///
-/// ```no_run
+/// ```text
 /// use windows_capture::monitor::Monitor;
 ///
 /// // Enumerate all active monitors
@@ -96,7 +96,7 @@ pub enum Error {
 /// }
 /// ```
 ///
-/// ```no_run
+/// ```text
 /// use windows_capture::monitor::Monitor;
 ///
 /// // Select by one-based index (e.g., 2nd monitor)

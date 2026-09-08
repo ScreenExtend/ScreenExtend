@@ -58,7 +58,7 @@ fn x264_software_encodes_synthetic_frames() {
     }) {
         Ok(e) => e,
         Err(e) => {
-            teprintln!("skipping x264 software smoke test (libx264 unavailable): {e:?}");
+            super::skip("x264 software smoke test (libx264 unavailable)", e);
             return;
         }
     };
@@ -164,7 +164,7 @@ fn x264_software_runtime_bitrate_change() {
     }) {
         Ok(e) => e,
         Err(e) => {
-            teprintln!("skipping x264 runtime-bitrate test (libx264 unavailable): {e:?}");
+            super::skip("x264 runtime-bitrate test (libx264 unavailable)", e);
             return;
         }
     };

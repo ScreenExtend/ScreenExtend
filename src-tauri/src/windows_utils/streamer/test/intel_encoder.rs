@@ -45,7 +45,7 @@ fn intel_quicksync_clamps_extreme_frame_rate() {
     }) {
         Ok(e) => e,
         Err(e) => {
-            teprintln!("skipping extreme-fps clamp test (no HW/runtime): {e:?}");
+            super::skip("Intel extreme-fps clamp test (no HW/runtime)", e);
             return;
         }
     };
@@ -84,7 +84,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
     }) {
         Ok(e) => e,
         Err(e) => {
-            teprintln!("skipping Intel Quick Sync smoke test (no HW/runtime): {e:?}");
+            super::skip("Intel Quick Sync smoke test (no HW/runtime)", e);
             return;
         }
     };
@@ -143,7 +143,7 @@ fn intel_quicksync_fused_downscale() {
     let (device, context) = match create_intel_d3d11_device() {
         Ok(v) => v,
         Err(e) => {
-            teprintln!("skipping fused-downscale test (no Intel device): {e:?}");
+            super::skip("Intel fused-downscale test (no Intel device)", e);
             return;
         }
     };
@@ -166,7 +166,7 @@ fn intel_quicksync_fused_downscale() {
     ) {
         Ok(e) => e,
         Err(e) => {
-            teprintln!("skipping fused-downscale test (encoder init): {e:?}");
+            super::skip("Intel fused-downscale test (encoder init)", e);
             return;
         }
     };
