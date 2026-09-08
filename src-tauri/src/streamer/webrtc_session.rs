@@ -193,8 +193,7 @@ impl AudioParams {
 
     fn audio_enabled_now(&self) -> bool {
         self.overrides
-            .lock()
-            .unwrap()
+            .lock_recover()
             .get(&self.device_key)
             .map(|o| o.audio_enabled)
             .unwrap_or(false)
