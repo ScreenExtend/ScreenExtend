@@ -358,24 +358,27 @@ function onDecodedFrame(frame) {
   framesDecoded++;
   if (inFlight > 0) inFlight--;
   let handedOff = false;
+  // Read the timestamp before presenting: a track generator's writable takes ownership of
+  // the frame, after which touching it is a detached-object error.
+  const ts = frame.timestamp;
   try {
-    if (frame.timestamp >= renderFromTs) {
+    if (ts >= renderFromTs) {
       handedOff = presentFrame(frame);
       framesRendered++;
       // Both tiers hand the frame to the compositor synchronously here, so this instant is
       // as close to the paint as this thread can observe.
       const paintMs = nowAbsMs();
-      const rec = pending.get(frame.timestamp);
+      const rec = pending.get(ts);
       if (rec) {
-        pending.delete(frame.timestamp);
+        pending.delete(ts);
         wArrivalToPaint.push(paintMs - rec.arrival);
         if (rec.submit) wDecode.push(paintMs - rec.submit);
       }
       if (clockValid) {
-        const hostCaptureAbsMs = hostCaptureAbsMsOf(frame.timestamp);
+        const hostCaptureAbsMs = hostCaptureAbsMsOf(ts);
         if (hostCaptureAbsMs !== null) wHostToPaint.push(paintMs - hostCaptureAbsMs);
       }
-      reportAvSync(frame.timestamp);
+      reportAvSync(ts);
       if (!renderedOnce) {
         renderedOnce = true;
         self.postMessage({ type: 'rendered' });
