@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::streamer::platform::{BackendConfig, EncoderBackend};
+use crate::streamer::platform::{BackendConfig, BitrateApplied, EncoderBackend};
 
 pub struct AmfBackend;
 
@@ -13,7 +13,7 @@ impl EncoderBackend for AmfBackend {
         bail!("AMD AMF encoder backend not implemented")
     }
 
-    fn set_bitrate(&mut self, _bps: u32) -> Result<()> {
+    fn set_bitrate(&mut self, _bps: u32) -> Result<BitrateApplied> {
         bail!("AMD AMF encoder backend not implemented")
     }
 }

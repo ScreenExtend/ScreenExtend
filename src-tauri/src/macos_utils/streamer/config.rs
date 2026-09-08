@@ -8,7 +8,10 @@ pub struct EncoderConfig {
     pub bitrate_bps: u32,
     pub max_bitrate_bps: u32,
     pub profile: H264Profile,
+    /// Explicit constant-QP rate control. Disables bitrate adaptation entirely.
     pub qp: Option<u8>,
+    /// Quality ceiling under bitrate control: never spend bits to go below this QP.
+    pub min_qp: Option<u8>,
     pub intra_refresh: bool,
 }
 
@@ -52,6 +55,7 @@ pub fn live_encoder_config(
         max_bitrate_bps: bitrate,
         profile: cfg.h264_profile,
         qp: cfg.qp,
+        min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
     }
 }

@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use super::x264_sys::*;
 use crate::streamer::config::{Config, H264Profile};
+use crate::streamer::platform::BitrateApplied;
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
 
 const PRESET_ULTRAFAST: &[u8] = b"ultrafast\0";
@@ -76,10 +77,21 @@ impl X264Encoder {
 
         // rate control
         let kbps = bitrate_kbps(config.bitrate_bps);
-        p.rc.i_rc_method = X264_RC_ABR;
-        p.rc.i_bitrate = kbps;
-        p.rc.i_vbv_max_bitrate = kbps;
-        p.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, fps);
+        if let Some(q) = config.qp {
+            // Explicit constant QP (the --qp probe flag): bitrate is not a control input.
+            p.rc.i_rc_method = X264_RC_CQP;
+            p.rc.i_qp_constant = q as c_int;
+        } else {
+            p.rc.i_rc_method = X264_RC_ABR;
+            p.rc.i_bitrate = kbps;
+            p.rc.i_vbv_max_bitrate = kbps;
+            p.rc.i_vbv_buffer_size = vbv_buffer_kbit(kbps, fps);
+            // Quality ceiling: never spend bits to go below this QP. `qp_min` only shrinks
+            // the stream, so ABR stays in charge of the top end.
+            if let Some(q) = config.min_qp.filter(|&q| q > 1) {
+                p.rc.i_qp_min = q as c_int;
+            }
+        }
 
         // GOP / recovery
         p.i_keyint_max = X264_KEYINT_MAX_INFINITE;
@@ -187,9 +199,9 @@ impl X264Encoder {
         self.encode_converted(force_idr)
     }
 
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.config.qp.is_some() {
-            return Ok(());
+            return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let kbps = bitrate_kbps(bps);
         self.config.bitrate_bps = bps;
@@ -201,7 +213,7 @@ impl X264Encoder {
         if rv < 0 {
             bail!("x264_encoder_reconfig failed ({rv})");
         }
-        Ok(())
+        Ok(BitrateApplied::Applied)
     }
 
     fn encode_with_bgra_direct(
@@ -477,6 +489,7 @@ pub fn probe_encode(config: &Config, path: &str) -> Result<()> {
         max_bitrate_bps: BITRATE,
         profile: config.h264_profile,
         qp: config.qp,
+        min_qp: config.quality_qp,
         intra_refresh: config.intra_refresh,
     })?;
 

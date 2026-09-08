@@ -62,3 +62,26 @@ fn encoder_config_tolerates_max_fps_below_60() {
     let enc = live_encoder_config(1920, 1080, 30, &cfg);
     assert_eq!(enc.fps, 60);
 }
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn quality_slider_is_a_ceiling_not_a_rate_control_mode() {
+    // The per-device quality slider used to land in `Config::qp`, which put NVENC in CONSTQP
+    // and turned every runtime bitrate change into a silent no-op.
+    let mut cfg = Config::default();
+    cfg.quality_qp = Some(28);
+    let enc = live_encoder_config(1920, 1080, 60, &cfg);
+    assert_eq!(enc.qp, None, "the slider must not select constant-QP");
+    assert_eq!(enc.min_qp, Some(28), "the slider is a quality ceiling");
+    assert!(enc.bitrate_bps > 0, "bitrate control stays active");
+}
+
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn explicit_qp_still_selects_constant_qp() {
+    let mut cfg = Config::default();
+    cfg.qp = Some(26);
+    let enc = live_encoder_config(1920, 1080, 60, &cfg);
+    assert_eq!(enc.qp, Some(26));
+    assert_eq!(enc.min_qp, None);
+}

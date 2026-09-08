@@ -114,7 +114,14 @@ pub struct Config {
     pub h264_profile: H264Profile,
     pub max_fps: u32,
     pub max_bitrate_kbps: Option<u32>,
+    /// Explicit constant-QP rate control (the `--qp` probe flag). This *replaces* bitrate
+    /// control: congestion control cannot move a CONSTQP encoder, so it is a developer knob,
+    /// never something the desktop UI sets.
     pub qp: Option<u8>,
+    /// The per-device quality slider, expressed as a quality **ceiling**: the encoder may not
+    /// spend bits to go below this QP. Rate control stays CBR so the loss-based controller
+    /// keeps the top end.
+    pub quality_qp: Option<u8>,
     pub intra_refresh: bool,
     pub encoder_vendor: EncoderVendor,
     pub disable_gpu_encode: bool,
@@ -164,6 +171,7 @@ impl Default for Config {
             max_fps: 500,
             max_bitrate_kbps: None,
             qp: None,
+            quality_qp: None,
             intra_refresh: false,
             encoder_vendor: EncoderVendor::Auto,
             disable_gpu_encode: false,

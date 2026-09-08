@@ -40,6 +40,7 @@ fn intel_quicksync_clamps_extreme_frame_rate() {
         max_bitrate_bps: 30_000_000,
         profile: H264Profile::Baseline,
         qp: None,
+        min_qp: None,
         intra_refresh: false,
     }) {
         Ok(e) => e,
@@ -78,6 +79,7 @@ fn intel_quicksync_encodes_synthetic_frames() {
         max_bitrate_bps: 6_000_000,
         profile: H264Profile::Baseline,
         qp: None,
+        min_qp: None,
         intra_refresh: true,
     }) {
         Ok(e) => e,
@@ -154,6 +156,7 @@ fn intel_quicksync_fused_downscale() {
             max_bitrate_bps: 8_000_000,
             profile: H264Profile::Baseline,
             qp: None,
+            min_qp: None,
             intra_refresh: true,
         },
         NW,

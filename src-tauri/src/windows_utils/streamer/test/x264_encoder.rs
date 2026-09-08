@@ -53,6 +53,7 @@ fn x264_software_encodes_synthetic_frames() {
         max_bitrate_bps: BITRATE,
         profile: H264Profile::Baseline,
         qp: None,
+        min_qp: None,
         intra_refresh: false,
     }) {
         Ok(e) => e,
@@ -158,6 +159,7 @@ fn x264_software_runtime_bitrate_change() {
         max_bitrate_bps: HIGH,
         profile: H264Profile::Baseline,
         qp: None,
+        min_qp: None,
         intra_refresh: false,
     }) {
         Ok(e) => e,

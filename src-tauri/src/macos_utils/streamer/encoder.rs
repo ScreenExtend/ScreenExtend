@@ -28,6 +28,7 @@ use objc2_video_toolbox::{
 };
 
 use crate::streamer::config::H264Profile;
+use crate::streamer::platform::BitrateApplied;
 
 use super::config::EncoderConfig;
 
@@ -250,6 +251,11 @@ impl Encoder {
             set_optional_i32(s, "kVTCompressionPropertyKey_MinAllowedFrameQP", qp as i32);
             return;
         }
+        // Quality ceiling only: a floor on QP can only shrink the stream, so the loss-based
+        // controller keeps the top end. Pinning MaxAllowedFrameQP too would be constant QP.
+        if let Some(q) = cfg.min_qp.filter(|&q| q > 1) {
+            set_optional_i32(s, "kVTCompressionPropertyKey_MinAllowedFrameQP", q as i32);
+        }
         set_i32(
             s,
             unsafe { kVTCompressionPropertyKey_AverageBitRate },
@@ -328,9 +334,9 @@ impl Encoder {
         Ok(())
     }
 
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.qp_mode {
-            return Ok(());
+            return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let s = self.vt_session();
         set_i32(
@@ -345,7 +351,7 @@ impl Encoder {
             unsafe { kVTCompressionPropertyKey_DataRateLimits },
             &limits,
         );
-        Ok(())
+        Ok(BitrateApplied::Applied)
     }
 
     pub fn low_latency(&self) -> bool {
@@ -726,6 +732,7 @@ mod tests {
             max_bitrate_bps: 6_000_000,
             profile: H264Profile::Baseline,
             qp: None,
+            min_qp: None,
             intra_refresh: false,
         };
         let mut enc = Encoder::new(cfg).expect("encoder creates (HW required)");
@@ -803,6 +810,7 @@ mod tests {
             max_bitrate_bps: 6_000_000,
             profile: H264Profile::Baseline,
             qp: None,
+            min_qp: None,
             intra_refresh: false,
         }
     }

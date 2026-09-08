@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dxgi::{
 use super::super::nvidia::encoder::EncoderConfig;
 use super::intel_sys::*;
 use crate::streamer::config::H264Profile;
+use crate::streamer::platform::BitrateApplied;
 
 const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
 const INTEL_FPS_QUERY_FALLBACK: u32 = 60;
@@ -445,6 +446,13 @@ impl Encoder {
         co2.BRefType = MFX_B_REF_OFF;
         co2.AdaptiveI = MFX_CODINGOPTION_OFF;
         co2.AdaptiveB = MFX_CODINGOPTION_OFF;
+        // Quality ceiling under CBR: a floor on QP can only shrink the stream, so the
+        // loss-based controller keeps the top end.
+        if let Some(q) = self.config.min_qp.filter(|&q| q > 1) {
+            co2.MinQPI = q;
+            co2.MinQPP = q;
+            co2.MinQPB = q;
+        }
         if self.config.intra_refresh {
             co2.IntRefType = MFX_REFRESH_HORIZONTAL;
             co2.IntRefCycleSize = fps.clamp(2, u16::MAX as u32) as u16;
@@ -501,9 +509,9 @@ impl Encoder {
         self.idr_requested = true;
     }
 
-    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
         if self.config.qp.is_some() {
-            return Ok(());
+            return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let kbps = (bps / 1000).clamp(1, 65000) as u16;
         self.config.bitrate_bps = bps;
@@ -521,7 +529,7 @@ impl Encoder {
         )?;
         self.enc_param = par;
         tprintln!("Intel Quick Sync bitrate reconfigured (bitrate_bps={bps})");
-        Ok(())
+        Ok(BitrateApplied::Applied)
     }
 
     pub fn encode_texture(&mut self, src: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<u8>> {
@@ -1121,6 +1129,7 @@ pub fn probe_encode(config: &crate::streamer::config::Config, path: &str) -> Res
         max_bitrate_bps: BITRATE,
         profile: config.h264_profile,
         qp: config.qp,
+        min_qp: config.quality_qp,
         intra_refresh: config.intra_refresh,
     })?;
 
