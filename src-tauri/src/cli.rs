@@ -326,7 +326,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         *state.session_auth.otp.lock().unwrap() =
             crate::streamer::test::whep_selftest::SELFTEST_OTP.to_string();
         Config {
-            bind_ip: std::net::Ipv4Addr::LOCALHOST,
+            bind_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             lan_ip: Some("127.0.0.1".to_string()),
             local_ips: Some(state.local_ips.clone()),
             virtual_display: Some(state.virtual_display.clone()),
