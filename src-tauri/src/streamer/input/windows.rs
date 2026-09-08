@@ -236,7 +236,8 @@ impl Injector {
             InputEvent::Clipboard { op, mime, data } => self.clipboard(*op, mime, data),
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { x, y, items } => self.drop_files(*x, *y, items),
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } => {}
+            // Handled by the transport before dispatch: none of these inject anything.
+            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
         }
     }
 

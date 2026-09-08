@@ -192,6 +192,8 @@ pub enum InputEvent {
     Pong {
         t_ns: u64,
     },
+    /// The client's own view of its half of the path. See `docs/TELEMETRY.md` for the layout.
+    ClientStats(Box<crate::streamer::telemetry::ClientStats>),
 }
 
 #[inline]
@@ -262,6 +264,7 @@ pub fn parse(b: &[u8]) -> Option<(InputEvent, bool)> {
         op::PONG => InputEvent::Pong {
             t_ns: rd_u64(b, 1)?,
         },
+        op::STATS => parse_client_stats(b)?,
         _ => return None,
     };
     Some((ev, is_fast(opcode)))
@@ -454,6 +457,49 @@ fn parse_resize(b: &[u8]) -> Option<InputEvent> {
 /// timestamp on its own timeline at all. The host clock's epoch is this process's start, so
 /// without a measured offset the client has nothing to compare an RTP-recovered capture time
 /// against. Clients older than this field read only the first 9 bytes and ignore the rest.
+/// Wire size of a v1 client stats frame. Anything shorter is rejected; anything longer is a
+/// later version whose extra fields this build ignores.
+pub const CLIENT_STATS_LEN: usize = 72;
+pub const CLIENT_STATS_VERSION: u8 = 1;
+
+fn parse_client_stats(b: &[u8]) -> Option<InputEvent> {
+    if b.len() < CLIENT_STATS_LEN {
+        return None;
+    }
+    let version = b[1];
+    if version == 0 {
+        return None;
+    }
+    Some(InputEvent::ClientStats(Box::new(
+        crate::streamer::telemetry::ClientStats {
+            received_host_ns: crate::streamer::audio::host_now_ns(),
+            version,
+            video_path: b[2],
+            audio_path: b[3],
+            flags: rd_u32(b, 4)?,
+            arrival_to_paint_p50_us: rd_u32(b, 8)?,
+            arrival_to_paint_p90_us: rd_u32(b, 12)?,
+            arrival_to_paint_p99_us: rd_u32(b, 16)?,
+            decode_p50_us: rd_u32(b, 20)?,
+            decode_p90_us: rd_u32(b, 24)?,
+            decode_p99_us: rd_u32(b, 28)?,
+            host_to_paint_p50_us: rd_u32(b, 32)?,
+            host_to_paint_p90_us: rd_u32(b, 36)?,
+            host_to_paint_p99_us: rd_u32(b, 40)?,
+            frames_painted: rd_u32(b, 44)?,
+            frames_dropped: rd_u32(b, 48)?,
+            decode_errors: rd_u32(b, 52)?,
+            keyframe_requests: rd_u32(b, 56)?,
+            audio_underruns: rd_u32(b, 60)?,
+            audio_overruns: rd_u32(b, 64)?,
+            clock_offset_valid: rd_u32(b, 4)?
+                & crate::streamer::telemetry::client_flags::CLOCK_VALID
+                != 0,
+            rtt_us: rd_u32(b, 68)?,
+        },
+    )))
+}
+
 pub fn build_pong(t_ns: u64, host_ns: u64) -> [u8; 17] {
     let mut out = [0u8; 17];
     out[0] = op::PONG;
@@ -620,6 +666,67 @@ mod tests {
             u64::from_le_bytes(pong[9..17].try_into().unwrap()),
             987654321
         );
+    }
+
+    #[test]
+    fn client_stats_round_trip() {
+        use crate::streamer::telemetry::client_flags;
+        let mut b = vec![0u8; CLIENT_STATS_LEN];
+        b[0] = op::STATS;
+        b[1] = CLIENT_STATS_VERSION;
+        b[2] = 1; // webcodecs + canvas
+        b[3] = 2; // worklet over postMessage
+        b[4..8].copy_from_slice(
+            &(client_flags::CROSS_ORIGIN_ISOLATED | client_flags::CLOCK_VALID).to_le_bytes(),
+        );
+        b[8..12].copy_from_slice(&3_500u32.to_le_bytes());
+        b[32..36].copy_from_slice(&41_200u32.to_le_bytes());
+        b[44..48].copy_from_slice(&1799u32.to_le_bytes());
+        b[68..72].copy_from_slice(&4_100u32.to_le_bytes());
+
+        let (ev, hot) = parse(&b).unwrap();
+        assert!(!hot);
+        match ev {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.version, CLIENT_STATS_VERSION);
+                assert_eq!(c.video_path, 1);
+                assert_eq!(c.audio_path, 2);
+                assert!(c.clock_offset_valid);
+                assert!(c.flags & client_flags::SAB_AVAILABLE == 0);
+                assert_eq!(c.arrival_to_paint_p50_us, 3_500);
+                assert_eq!(c.host_to_paint_p50_us, 41_200);
+                assert_eq!(c.frames_painted, 1799);
+                assert_eq!(c.rtt_us, 4_100);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_versionless_stats_frame_is_rejected() {
+        let mut short = vec![0u8; CLIENT_STATS_LEN - 1];
+        short[0] = op::STATS;
+        short[1] = CLIENT_STATS_VERSION;
+        assert!(parse(&short).is_none());
+
+        let mut v0 = vec![0u8; CLIENT_STATS_LEN];
+        v0[0] = op::STATS;
+        assert!(parse(&v0).is_none());
+    }
+
+    #[test]
+    fn a_longer_stats_frame_from_a_newer_client_still_parses() {
+        let mut b = vec![0u8; CLIENT_STATS_LEN + 16];
+        b[0] = op::STATS;
+        b[1] = 2;
+        b[2] = 3;
+        match parse(&b).unwrap().0 {
+            InputEvent::ClientStats(c) => {
+                assert_eq!(c.version, 2);
+                assert_eq!(c.video_path, 3);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

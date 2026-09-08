@@ -732,6 +732,9 @@
                 if (liveWatch) { clearInterval(liveWatch); liveWatch = null; }
                 if (reconfigPoll) { clearTimeout(reconfigPoll); reconfigPoll = null; }
                 if (worker) { worker.terminate(); worker = null; }
+                if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
+                videoWorkerStats = null;
+                stopFallbackFrameStats();
                 try { if (window.SEAudio) SEAudio.teardown(); } catch (_) {}
                 try { if (pc) pc.close(); } catch (_) {}
                 pc = null;
@@ -787,6 +790,133 @@
                     }
                 }
                 return null;
+            }
+
+            // ---------------------------------------------------------------------
+            // Client-side telemetry.
+            //
+            // The host can see its own pipeline as far as the socket and no further. Which
+            // path this device actually ended up on — hardware decode into a canvas, or the
+            // <video> element because WebCodecs was missing; a SharedArrayBuffer audio ring or
+            // the postMessage fallback — is only knowable here, and every one of those is a
+            // silent degradation the host would otherwise never learn about. `SEVideo.getStats`
+            // is the read side; input.js ships the same numbers to the host once a second.
+            const VIDEO_PATH = { none: 0, webcodecsCanvas: 1, webcodecsVideo: 2, videoElement: 3 };
+            const AUDIO_PATH = { none: 0, workletSab: 1, workletPost: 2, opusTrack: 3 };
+
+            let videoWorkerStats = null;
+            const fallbackStats = {
+                // The <video> path has no per-frame hooks except requestVideoFrameCallback,
+                // which reports the RTP timestamp on the browsers that implement it. Where it
+                // is missing this path reports frame counts only, and that gap is itself
+                // visible on the host as an absent percentile.
+                samples: [],
+                painted: 0,
+                rvfcSupported: false,
+            };
+            const FALLBACK_WINDOW = 256;
+
+            function pct(sorted, q) {
+                if (!sorted.length) return 0;
+                return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+            }
+
+            function fallbackPercentiles() {
+                if (!fallbackStats.samples.length) return null;
+                const a = fallbackStats.samples.slice().sort(function (x, y) { return x - y; });
+                return { p50: pct(a, 0.5), p90: pct(a, 0.9), p99: pct(a, 0.99), max: a[a.length - 1], n: a.length };
+            }
+
+            let rvfcHandle = 0;
+            function startFallbackFrameStats() {
+                if (typeof video.requestVideoFrameCallback !== 'function') return;
+                fallbackStats.rvfcSupported = true;
+                const step = function (_now, meta) {
+                    fallbackStats.painted++;
+                    if (hostClockOffsetMs !== null && meta && typeof meta.rtpTimestamp === 'number') {
+                        const hostMs = (meta.rtpTimestamp >>> 0) * 1000 / 90000;
+                        const paintMs = performance.timeOrigin +
+                            (typeof meta.expectedDisplayTime === 'number' ? meta.expectedDisplayTime : performance.now());
+                        const lag = paintMs - (hostMs - hostClockOffsetMs);
+                        // The RTP timestamp is 32 bits and wraps every ~13 h; a sample that
+                        // lands on the far side of a wrap is nonsense, so drop the impossible
+                        // ones rather than poison the window.
+                        if (lag >= 0 && lag < 10000) {
+                            fallbackStats.samples.push(lag);
+                            if (fallbackStats.samples.length > FALLBACK_WINDOW) fallbackStats.samples.shift();
+                        }
+                    }
+                    rvfcHandle = video.requestVideoFrameCallback(step);
+                };
+                rvfcHandle = video.requestVideoFrameCallback(step);
+            }
+
+            function stopFallbackFrameStats() {
+                if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
+                    try { video.cancelVideoFrameCallback(rvfcHandle); } catch (_) {}
+                }
+                rvfcHandle = 0;
+                fallbackStats.samples.length = 0;
+                fallbackStats.painted = 0;
+            }
+
+            function activeVideoPath() {
+                if (usingFallback || !worker) return video.srcObject ? VIDEO_PATH.videoElement : VIDEO_PATH.none;
+                return VIDEO_PATH.webcodecsCanvas;
+            }
+
+            function activeAudioPath() {
+                if (!window.SEAudio) return AUDIO_PATH.none;
+                let info = null;
+                try { info = SEAudio.getSyncInfo(); } catch (_) { return AUDIO_PATH.none; }
+                if (!info || !info.path) return AUDIO_PATH.none;
+                if (info.path !== 'webcodecs') return AUDIO_PATH.opusTrack;
+                return info.transport === 'shared' ? AUDIO_PATH.workletSab : AUDIO_PATH.workletPost;
+            }
+
+            function isFullscreen() {
+                return !!(document.fullscreenElement || document.webkitFullscreenElement);
+            }
+
+            window.SEVideo = {
+                getStats() {
+                    const w = videoWorkerStats;
+                    const fb = fallbackPercentiles();
+                    const audio = (window.SEAudio && SEAudio.getSyncInfo()) || {};
+                    return {
+                        videoPath: activeVideoPath(),
+                        audioPath: activeAudioPath(),
+                        sab: typeof SharedArrayBuffer === 'function',
+                        crossOriginIsolated: !!self.crossOriginIsolated,
+                        wakeLock: !!(noSleep && noSleep.isEnabled),
+                        pointerLock: !!document.pointerLockElement,
+                        keyboardLock: !!(navigator.keyboard && navigator.keyboard.lock),
+                        fullscreen: isFullscreen(),
+                        setSinkId: typeof HTMLMediaElement !== 'undefined' &&
+                            typeof HTMLMediaElement.prototype.setSinkId === 'function',
+                        decoderHardware: !!(w && w.decoderHardware),
+                        clockValid: hostClockOffsetMs !== null,
+                        rttMs: (window.SEClock && SEClock.rttMs) || 0,
+                        arrivalToPaint: w ? w.arrivalToPaint : null,
+                        decode: w ? w.decode : null,
+                        hostToPaint: w ? w.hostToPaint : fb,
+                        framesPainted: w ? w.framesRendered : fallbackStats.painted,
+                        framesDropped: w ? w.framesDropped : 0,
+                        decodeErrors: w ? w.decodeErrors : 0,
+                        keyRequests: w ? w.keyRequests : 0,
+                        audioUnderruns: audio.underruns || 0,
+                        audioOverruns: audio.overruns || 0,
+                        rvfcSupported: fallbackStats.rvfcSupported,
+                    };
+                },
+            };
+
+            let videoStatsPoll = null;
+            function startVideoStatsPoll() {
+                if (videoStatsPoll) clearInterval(videoStatsPoll);
+                videoStatsPoll = setInterval(function () {
+                    if (worker) worker.postMessage({ type: 'videostats' });
+                }, 1000);
             }
 
             if (window.SEClock) {
@@ -864,6 +994,8 @@
                                 handleRenderCount(m.data.n);
                             } else if (m.data.type === 'avsync') {
                                 try { if (window.SEAudio) SEAudio.setVideoDelay(m.data.videoDelayMs); } catch (_) {}
+                            } else if (m.data.type === 'videostats') {
+                                videoWorkerStats = m.data.stats;
                             } else if (m.data.type === 'stats') {
                                 console.log('[webcodecs] stats', m.data);
                             }
@@ -871,6 +1003,7 @@
                         const off = freshCanvas().transferControlToOffscreen();
                         worker.postMessage({ type: 'canvas', canvas: off }, [off]);
                         if (hostClockOffsetMs !== null) worker.postMessage({ type: 'clockoffset', offsetMs: hostClockOffsetMs });
+                        startVideoStatsPoll();
                         if (useScriptTransform) {
                             videoTransceiver.receiver.transform = new RTCRtpScriptTransform(worker, { kind: 'video' });
                         } else {
@@ -936,6 +1069,7 @@
                                 try { if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0.03; } catch (_) {}
                             } catch (_) {}
                             showVideo();
+                            startFallbackFrameStats();
                             tryPlay();
                         }
                     };

@@ -399,7 +399,9 @@ pub async fn handle_whep_offer(
     {
         let input_tx = input_tx.clone();
         let control_rx = Arc::new(Mutex::new(control_rx));
+        let session_telemetry = Arc::clone(&pipeline.telemetry);
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let session_telemetry = Arc::clone(&session_telemetry);
             let label = dc.label().to_string();
             if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
                 return Box::pin(async {});
@@ -426,13 +428,22 @@ pub async fn handle_whep_offer(
                     });
                 }
                 let dc_for_pong = is_reliable.then(|| Arc::clone(&dc));
+                let telemetry_for_stats = Arc::clone(&session_telemetry);
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
                     let tx = tx.clone();
                     let dc_pong = dc_for_pong.clone();
+                    let telemetry = Arc::clone(&telemetry_for_stats);
                     Box::pin(async move {
                         let Some((ev, hot)) = input::protocol::parse(&msg.data) else {
                             return;
                         };
+                        // Both of these are transport business and are answered before the
+                        // remote-control gate: a device with control disabled still needs its
+                        // clock synced and still reports what its own pipeline is doing.
+                        if let input::protocol::InputEvent::ClientStats(stats) = ev {
+                            telemetry.client.set(Some(*stats));
+                            return;
+                        }
                         if let Some(dc_pong) = &dc_pong {
                             if let input::protocol::InputEvent::Ping { t_ns } = ev {
                                 let pong = input::protocol::build_pong(

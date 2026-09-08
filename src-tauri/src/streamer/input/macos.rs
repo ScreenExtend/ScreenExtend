@@ -358,7 +358,8 @@ impl Injector {
             InputEvent::Lifecycle(l) => self.lifecycle(*l),
             InputEvent::Drag { .. } => {}
             InputEvent::Drop { .. } => self.unsupported_drop(),
-            InputEvent::Ping { .. } | InputEvent::Pong { .. } => {}
+            // Handled by the transport before dispatch: none of these inject anything.
+            InputEvent::Ping { .. } | InputEvent::Pong { .. } | InputEvent::ClientStats(_) => {}
         }
     }
 
