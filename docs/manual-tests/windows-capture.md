@@ -276,7 +276,7 @@ cargo run --release --features probe -- probe --capture-backend dxgi --whep-self
 ```
 
 ```
-dxgi: duplication ready on \.\DISPLAYn via DuplicateOutput1 on <adapter> (vendor 0x____, LUID 0x____): WxH, rotation=..., logical=WxH
+dxgi: duplication ready on \\.\DISPLAYn via DuplicateOutput1 on <adapter> (vendor 0x____, LUID 0x____): WxH, rotation=..., logical=WxH
 pipeline: live capture ready -- DXGI duplication (DuplicateOutput1) -> <path>
 ```
 
@@ -291,7 +291,7 @@ enumerated **only** by the NVIDIA adapter and that adapter refuses duplication t
 entry point:
 
 ```
-probe failed: no adapter can duplicate \.\DISPLAY1 (NVIDIA GeForce RTX 3080 Ti Laptop GPU (vendor 0x10DE, LUID 0x17D9A): Error { code: HRESULT(0x887A0004), ... })
+probe failed: no adapter can duplicate \\.\DISPLAY1 (NVIDIA GeForce RTX 3080 Ti Laptop GPU (vendor 0x10DE, LUID 0x17D9A): Error { code: HRESULT(0x887A0004), ... })
 ```
 
 `0x887A0004` is `DXGI_ERROR_UNSUPPORTED`. That machine is WGC-only and that is a legitimate
