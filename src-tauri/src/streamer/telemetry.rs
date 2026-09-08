@@ -92,6 +92,19 @@ pub struct Histogram {
     max_ns: AtomicU64,
 }
 
+/// The derived form would print 512 buckets. Print what a reader wants instead.
+impl std::fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.snapshot();
+        f.debug_struct("Histogram")
+            .field("count", &s.count)
+            .field("p50_ns", &s.p50_ns)
+            .field("p99_ns", &s.p99_ns)
+            .field("max_ns", &s.max_ns)
+            .finish()
+    }
+}
+
 impl Default for Histogram {
     fn default() -> Self {
         Self::new()
@@ -282,8 +295,14 @@ stages! {
     encode => "encode",
     packetize => "packetize",
     socket_write => "socket_write",
+    pace_wait => "pace_wait",
     capture_to_encode_done => "capture_to_encode",
     capture_to_socket => "capture_to_socket",
+    // Input. Recorded per event by `streamer::input`, not per frame, so these three are the
+    // only stages `record_frame` does not feed. See `docs/INPUT-PROTOCOL.md`.
+    input_recv => "input_recv",
+    input_queue => "input_queue",
+    input_inject => "input_inject",
 }
 
 macro_rules! counters {
@@ -307,8 +326,14 @@ counters! {
     capture_fallback => "capture_fallback",
     frames_repeated => "frames_repeated",
     frames_dropped_ring => "frames_dropped_ring",
+    frames_dropped_broadcast => "frames_dropped_broadcast",
+    frames_dropped_stale => "frames_dropped_stale",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
+    keyframe_requests_suppressed => "keyframe_requests_suppressed",
+    client_keyframe_requests => "client_keyframe_requests",
+    delay_overuse_events => "delay_overuse_events",
+    pacer_deadline_misses => "pacer_deadline_misses",
     idrs_sent => "idrs_sent",
     encoder_resets => "encoder_resets",
     encoder_transient_errors => "encoder_transient_errors",
@@ -316,6 +341,8 @@ counters! {
     audio_broadcast_lag_drops => "audio_broadcast_lag_drops",
     client_jitter_underruns => "client_jitter_underruns",
     client_jitter_overruns => "client_jitter_overruns",
+    input_queue_drops => "input_queue_drops",
+    input_stale_drops => "input_stale_drops",
 }
 
 /// What a client last told us about its own half of the path. Written by the `OP::STATS` parser,
@@ -344,6 +371,18 @@ pub struct ClientStats {
     pub audio_overruns: u32,
     pub clock_offset_valid: bool,
     pub rtt_us: u32,
+    // v2 tail. All zero when the client only sent the 72-byte v1 prefix, which is also the
+    // "not measured" value for every one of them, so a v1 client is indistinguishable from a
+    // v2 client that could not measure anything — as it should be.
+    pub transport_tier: u8,
+    pub render_tier: u8,
+    pub key_tier: u8,
+    pub sink_tier: u8,
+    pub suppressed_errors: u32,
+    pub degraded_flags: u32,
+    pub audio_target_us: u32,
+    pub audio_concealed: u32,
+    pub audio_output_latency_us: u32,
 }
 
 pub mod client_flags {
@@ -356,6 +395,83 @@ pub mod client_flags {
     pub const SET_SINK_ID: u32 = 1 << 6;
     pub const DECODER_HARDWARE: u32 = 1 << 7;
     pub const CLOCK_VALID: u32 = 1 << 8;
+}
+
+pub fn transport_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "script-transform",
+        2 => "encoded-streams",
+        _ => "unknown",
+    }
+}
+
+pub fn render_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "offscreen-canvas",
+        2 => "track-generator",
+        3 => "video-element",
+        _ => "unknown",
+    }
+}
+
+/// Tier 0 is the one that matters: the client cannot ask for a keyframe at all.
+pub fn key_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "sendKeyFrameRequest",
+        2 => "out-of-band",
+        _ => "unknown",
+    }
+}
+
+pub fn sink_tier_name(code: u8) -> &'static str {
+    match code {
+        0 => "none",
+        1 => "audiocontext-setsinkid",
+        2 => "media-element-setsinkid",
+        3 => "audio-session",
+        4 => "select-audio-output",
+        _ => "unknown",
+    }
+}
+
+/// Names for the v2 degradation bits, in bit order. Every one was a bare `catch (_) {}` or an
+/// untaken branch on the client before it became a bit here.
+pub const CLIENT_DEGRADED_NAMES: [&str; 22] = [
+    "fullscreen_refused",
+    "pointer_lock_refused",
+    "no_unadjusted_movement",
+    "no_wake_lock_api",
+    "wake_lock_refused",
+    "audio_worklet_failed",
+    "no_opus_decoder",
+    "audio_context_suspended",
+    "output_latency_estimated",
+    "no_audio_output_labels",
+    "no_script_transform",
+    "no_keyframe_request",
+    "no_offscreen_canvas",
+    "demoted_to_video_element",
+    "no_coalesced_events",
+    "ice_gathering_timed_out",
+    "no_h264_fmtp",
+    "no_hardware_decoder",
+    "refresh_rate_estimated",
+    "stepped_down_to_encoded_streams",
+    "no_request_video_frame_callback",
+    "no_keyboard_lock",
+];
+
+/// The degradation bits that are set, by name.
+pub fn client_degraded_list(flags: u32) -> Vec<&'static str> {
+    CLIENT_DEGRADED_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| flags & (1 << i) != 0)
+        .map(|(_, n)| *n)
+        .collect()
 }
 
 pub fn video_path_name(code: u8) -> &'static str {
@@ -388,6 +504,10 @@ pub struct SessionTelemetry {
     pub bytes_sent: AtomicU64,
     pub encoder: Slot<String>,
     pub capture_backend: Slot<String>,
+    /// Which optional knobs of the chosen capture backend this OS build actually exposed. Empty
+    /// where the backend has no such tiering. Reported so a latency number can be read against
+    /// the feature set that produced it rather than against the backend name alone.
+    pub capture_features: Slot<String>,
     pub client: Slot<Option<ClientStats>>,
 }
 
@@ -471,9 +591,15 @@ impl SessionTelemetry {
 
     /// One line, all stages, `p50/p90/p99/max` in ms. Printed on a timer, never per frame.
     pub fn summary_line(&self) -> String {
+        let features = self.capture_features.get();
         let mut s = format!(
-            "telemetry: capture={} encoder={} frames={}",
+            "telemetry: capture={}{} encoder={} frames={}",
             self.capture_backend.get(),
+            if features.is_empty() {
+                String::new()
+            } else {
+                format!("[{features}]")
+            },
             self.encoder.get(),
             self.frames_encoded.load(Ordering::Relaxed),
         );
@@ -507,6 +633,21 @@ impl SessionTelemetry {
                     "unsynced"
                 },
             ));
+            if c.version >= 2 {
+                s.push_str(&format!(
+                    " transport={} render={} key={} sink={}",
+                    transport_tier_name(c.transport_tier),
+                    render_tier_name(c.render_tier),
+                    key_tier_name(c.key_tier),
+                    sink_tier_name(c.sink_tier),
+                ));
+                // A non-zero degradation field is the most useful line a support conversation
+                // can start from, so it is named rather than printed as a hex mask.
+                let degraded = client_degraded_list(c.degraded_flags);
+                if !degraded.is_empty() {
+                    s.push_str(&format!(" degraded={}", degraded.join(",")));
+                }
+            }
         }
         s
     }
@@ -576,10 +717,22 @@ impl SessionTelemetry {
                 "keyframe_requests": c.keyframe_requests,
                 "audio_underruns": c.audio_underruns,
                 "audio_overruns": c.audio_overruns,
+                "transport_tier": transport_tier_name(c.transport_tier),
+                "render_tier": render_tier_name(c.render_tier),
+                "key_tier": key_tier_name(c.key_tier),
+                "sink_tier": sink_tier_name(c.sink_tier),
+                "tier_codes": [c.transport_tier, c.render_tier, c.key_tier, c.sink_tier],
+                "suppressed_errors": c.suppressed_errors,
+                "degraded_flags": c.degraded_flags,
+                "degraded": client_degraded_list(c.degraded_flags),
+                "audio_target_ms": c.audio_target_us as f64 / 1000.0,
+                "audio_concealed": c.audio_concealed,
+                "audio_output_latency_ms": c.audio_output_latency_us as f64 / 1000.0,
             })
         });
         serde_json::json!({
             "capture_backend": self.capture_backend.get(),
+            "capture_features": self.capture_features.get(),
             "encoder": self.encoder.get(),
             "frames_encoded": self.frames_encoded.load(Ordering::Relaxed),
             "bytes_sent": self.bytes_sent.load(Ordering::Relaxed),
@@ -637,7 +790,13 @@ pub fn all() -> Vec<(String, SharedTelemetry)> {
 pub fn snapshot_json() -> serde_json::Value {
     let sessions: serde_json::Map<String, serde_json::Value> =
         all().into_iter().map(|(k, v)| (k, v.to_json())).collect();
-    serde_json::json!({ "sessions": sessions })
+    serde_json::json!({
+        "sessions": sessions,
+        // Peer connections, ICE agents and injector threads that have not been given back.
+        // It should equal the number of live sessions; a number that only climbs across joins
+        // is the leak this counter exists to make falsifiable.
+        "live_transport_sessions": crate::streamer::webrtc_session::live_sessions(),
+    })
 }
 
 /// Interval for the verbose one-line summary. Chosen so a 30 s baseline run yields six lines.
