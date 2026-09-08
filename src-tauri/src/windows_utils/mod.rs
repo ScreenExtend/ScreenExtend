@@ -745,6 +745,22 @@ pub fn sync_streamers(state: &AppState) {
             .flat_map(|adapter| adapter.ip_addresses.iter())
             .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(|addr| (ip.clone(), addr)))
             .collect();
+        // We bind IPv4 only. An adapter that carries addresses but no IPv4 one is invisible to
+        // the streamer, and used to be so without a word.
+        for adapter in adapters.iter() {
+            if !adapter.ip_addresses.is_empty()
+                && !adapter
+                    .ip_addresses
+                    .iter()
+                    .any(|ip| ip.parse::<Ipv4Addr>().is_ok())
+            {
+                tprintln!(
+                    "[streamer] adapter '{}' has only IPv6 addresses ({:?}); no server will be bound on it",
+                    adapter.network_name,
+                    adapter.ip_addresses
+                );
+            }
+        }
         let fresh_local_ips = crate::streamer::server::collect_local_ips(
             adapters
                 .iter()
