@@ -34,6 +34,16 @@ const REDUP_MAX_RETRIES: u32 = 40;
 /// display produces a handful; an unbounded stream of them is a real fault.
 const INVALID_CALL_MAX_RECOVERIES: u32 = 20;
 
+/// How many times duplication may be re-established without a single frame coming out of it.
+///
+/// `redup_failures` only ever counted *failed* re-duplications, and a success reset it to zero, so
+/// an output that hands back `DXGI_ERROR_ACCESS_LOST` on every acquire looped forever: acquire,
+/// lose access, re-duplicate, acquire, lose access. Measured on this project's dev box against a
+/// freshly created IDD virtual display, it did exactly that for the whole run and delivered no
+/// frames at all, while the client sat on a negotiated session showing nothing. A capture that
+/// cannot produce a frame has to say so and stop, not spin.
+const REDUP_WITHOUT_FRAME_MAX: u32 = 40;
+
 /// Holds an acquired duplication frame and releases it on drop.
 ///
 /// `AcquireNextFrame` and `ReleaseFrame` are a strict pair: miss one release and every subsequent
@@ -74,6 +84,9 @@ pub struct Duplicator {
     /// worked and the pipeline can report it.
     api: DuplicationApi,
     redup_failures: u32,
+    /// Successful re-duplications since the last frame actually came out. Reset by `poll` on the
+    /// first acquire that yields a frame; a run of these with no frame is a dead capture.
+    redup_without_frame: u32,
     invalid_call_recoveries: u32,
     /// `LastPresentTime` of the most recent dirty frame, already on the shared host clock.
     /// The compositor's own frame time; without it the pipeline can only measure from the
@@ -124,8 +137,26 @@ fn wide_to_string(wide: &[u16]) -> String {
     String::from_utf16_lossy(&wide[..end])
 }
 
-fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> {
+/// One adapter's view of a display.
+struct OutputCandidate {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput1,
+    desc: DXGI_OUTPUT_DESC,
+    label: String,
+    software: bool,
+}
+
+/// Every adapter that claims `device_name`, in enumeration order.
+///
+/// On a hybrid-graphics laptop the same display is enumerated by more than one adapter, and only
+/// one of them can duplicate it: the desktop for that output is composed on exactly one GPU, and
+/// `DuplicateOutput` on any other returns `DXGI_ERROR_UNSUPPORTED`. Measured on this project's
+/// dev box, where `\\.\DISPLAY1` is listed by the RTX 3080 Ti but composed by the Intel iGPU, and
+/// duplication on the NVIDIA adapter fails with `0x887A0004` however it is asked for. Returning
+/// only the first match is what left that whole hardware class with no working DXGI path.
+fn find_outputs(device_name: &str) -> Result<Vec<OutputCandidate>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let mut found = Vec::new();
     let mut seen = Vec::new();
     for a in 0.. {
         let adapter = match unsafe { factory.EnumAdapters1(a) } {
@@ -142,38 +173,38 @@ fn find_output(device_name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1, DXGI_O
                 Err(_) => continue,
             };
             let name = wide_to_string(&desc.DeviceName);
-            if name == device_name {
-                // Duplication is adapter-local, so this is not a choice — but it is worth
-                // saying which GPU it landed on, and shouting when that GPU is a software
-                // rasteriser. Before IddCx 1.4 the OS composed an indirect display on the POST
-                // adapter, or on WARP when the POST adapter was PnpStopped, and the bundled
-                // driver declares IddCx 1.2. A WARP-composed virtual display means every frame
-                // of it is rendered on the CPU that is also running the encoder.
-                match unsafe { adapter.GetDesc1() } {
-                    Ok(d) => {
-                        let info = AdapterInfo::from_dxgi_desc1(&d);
-                        if info.software {
-                            teprintln!(
-                                "dxgi: output {name} is composed by a SOFTWARE rasteriser -- {}. \
-                                 Expect very high latency and CPU use; the POST adapter is \
-                                 probably stopped",
-                                info.label()
-                            );
-                        } else {
-                            tprintln!("dxgi: output {name} found on adapter {}", info.label());
-                        }
-                    }
-                    Err(_) => tprintln!("dxgi: output {name} found on an undescribed adapter"),
-                }
-                let output1: IDXGIOutput1 = output
-                    .cast()
-                    .context("IDXGIOutput as IDXGIOutput1 (needs DXGI 1.2+)")?;
-                return Ok((adapter, output1, desc));
+            if name != device_name {
+                seen.push(name);
+                continue;
             }
-            seen.push(name);
+            let Ok(output1) = output.cast::<IDXGIOutput1>() else {
+                continue;
+            };
+            // Before IddCx 1.4 the OS composed an indirect display on the POST adapter, or on
+            // WARP when the POST adapter was PnpStopped, and the bundled driver declares
+            // IddCx 1.2. A WARP-composed virtual display means every frame of it is rendered on
+            // the CPU that is also running the encoder, so it is worth shouting about.
+            let (label, software) = match unsafe { adapter.GetDesc1() } {
+                Ok(d) => {
+                    let info = AdapterInfo::from_dxgi_desc1(&d);
+                    (info.label(), info.software)
+                }
+                Err(_) => ("an undescribed adapter".to_string(), false),
+            };
+            found.push(OutputCandidate {
+                adapter: adapter.clone(),
+                output: output1,
+                desc,
+                label,
+                software,
+            });
+            break;
         }
     }
-    bail!("no DXGI output named {device_name} (saw: {seen:?})")
+    if found.is_empty() {
+        bail!("no DXGI output named {device_name} (saw: {seen:?})")
+    }
+    Ok(found)
 }
 
 fn create_device_on(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -402,8 +433,50 @@ fn blit_verts(rotation: DXGI_MODE_ROTATION) -> cursor::QuadVerts {
 
 impl Duplicator {
     pub fn new(device_name: &str, logical_w: u32, logical_h: u32) -> Result<Self> {
-        let (adapter, output, out_desc) = find_output(device_name)?;
-        let (device, context) = create_device_on(&adapter)?;
+        let candidates = find_outputs(device_name)?;
+        let mut errors = Vec::new();
+        let mut chosen: Option<(OutputCandidate, ID3D11Device, ID3D11DeviceContext)> = None;
+        for candidate in candidates {
+            let (device, context) = match create_device_on(&candidate.adapter) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    errors.push(format!("{}: {e:#}", candidate.label));
+                    continue;
+                }
+            };
+            // Duplication is adapter-local: the one adapter that composes this desktop is the
+            // one that can duplicate it, and every other returns DXGI_ERROR_UNSUPPORTED. A
+            // single attempt each, because retrying an unsupported call cannot help; the
+            // retry loop below is for the adapter that does answer.
+            match duplicate_once(&candidate.output, &device) {
+                Ok((dup, _)) => {
+                    drop(dup);
+                    if candidate.software {
+                        teprintln!(
+                            "dxgi: output {device_name} is composed by a SOFTWARE rasteriser -- \
+                             {}. Expect very high latency and CPU use; the POST adapter is \
+                             probably stopped",
+                            candidate.label
+                        );
+                    }
+                    chosen = Some((candidate, device, context));
+                    break;
+                }
+                Err(e) => errors.push(format!("{}: {e:?}", candidate.label)),
+            }
+        }
+        let Some((candidate, device, context)) = chosen else {
+            bail!(
+                "no adapter can duplicate {device_name} ({})",
+                errors.join("; ")
+            )
+        };
+        let OutputCandidate {
+            output,
+            desc: out_desc,
+            label: adapter_label,
+            ..
+        } = candidate;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let (dup, api, phys_w, phys_h, raw_rotation, rotation) = loop {
@@ -446,8 +519,8 @@ impl Duplicator {
         let renderer = QuadRenderer::new(&device, &context)?;
 
         tprintln!(
-            "dxgi: duplication ready on {device_name} via {}: {phys_w}x{phys_h}, \
-             rotation={rotation:?}, logical={logical_w}x{logical_h}",
+            "dxgi: duplication ready on {device_name} via {} on {adapter_label}: \
+             {phys_w}x{phys_h}, rotation={rotation:?}, logical={logical_w}x{logical_h}",
             api.name()
         );
 
@@ -458,6 +531,7 @@ impl Duplicator {
             dup: Some(dup),
             api,
             redup_failures: 0,
+            redup_without_frame: 0,
             invalid_call_recoveries: 0,
             last_present_host_ns: 0,
             rotation,
@@ -517,7 +591,21 @@ impl Duplicator {
                 }
                 self.dup = Some(dup);
                 self.redup_failures = 0;
-                tprintln!("dxgi: duplication re-established");
+                self.redup_without_frame += 1;
+                if self.redup_without_frame > REDUP_WITHOUT_FRAME_MAX {
+                    bail!(
+                        "duplication was re-established {} times without ever delivering a frame;                          this output cannot be captured with DXGI Desktop Duplication",
+                        self.redup_without_frame
+                    );
+                }
+                // One line per re-establishment floods the log bus, and every log line is an IPC
+                // event to the UI. Say it once, then only every tenth, with the running count.
+                if self.redup_without_frame == 1 || self.redup_without_frame.is_multiple_of(10) {
+                    tprintln!(
+                        "dxgi: duplication re-established ({} since the last frame)",
+                        self.redup_without_frame
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -668,6 +756,10 @@ impl Duplicator {
         }
         // Everything past here is inside the acquire; the guard releases on every exit path.
         let _acquired = AcquiredFrame(&dup);
+        // An acquire that returned is proof the duplication is live, so the "re-established and
+        // produced nothing" run ends here.
+        self.redup_without_frame = 0;
+        self.invalid_call_recoveries = 0;
 
         let mut dirty = false;
 
