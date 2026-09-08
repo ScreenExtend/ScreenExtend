@@ -48,6 +48,20 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
         this.overruns = 0;
         this.stableBlocks = 0;
         this.blockCount = 0;
+        // Re-priming means outputting digital silence until the ring refills to the target,
+        // so doing it on a single missed quantum turned one lost 5 ms packet into 10-40 ms
+        // of silence — audibly worse than the gap it was covering. A real stall shows up as
+        // several starved blocks in a row; a jitter blip does not.
+        this.starvedBlocks = 0;
+        this.REPRIME_AFTER_STARVED = 4;
+        // The last quantum actually played, reused as concealment. Repeating it with a fade
+        // is what every codec's own PLC does in the absence of better information, and it is
+        // far less noticeable than a square-edged silence.
+        this.concealL = new Float32Array(128);
+        this.concealR = new Float32Array(128);
+        this.concealFrames = 0;
+        this.concealGain = 1;
+        this.concealed = 0;
         this.port.onmessage = (e) => this.onMessage(e.data);
     }
 
@@ -58,9 +72,18 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
         } else if (d.type === 'target' && typeof d.targetMs === 'number') {
             const frames = Math.round((d.targetMs / 1000) * SR);
             this.commandedTargetFrames = Math.max(0, Math.min(this.capFrames - 1, frames));
+        } else if (d.type === 'discontinuity') {
+            // The host told us the stream itself broke (a device change, a dropped
+            // broadcast slot). Nothing in the ring bridges that, so correct immediately
+            // rather than waiting for a silence boundary.
+            this.concealFrames = 0;
+            this.priming = true;
+            this.corrections++;
         } else if (d.type === 'reset') {
             this.readPos = this.shared ? (Atomics.load(this.ctrl, W) >>> 0) : this.writePos;
             if (this.shared) Atomics.store(this.ctrl, R, this.readPos | 0);
+            this.concealFrames = 0;
+            this.starvedBlocks = 0;
             this.priming = true;
         }
     }
@@ -170,25 +193,62 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
 
         if (avail >= need) {
             this.dequeueInto(outL, outR, need);
+            this.rememberQuantum(outL, outR, need);
+            this.starvedBlocks = 0;
             this.stableBlocks++;
             if (!commanded && this.stableBlocks > 750 && this.targetFrames > this.minTarget) {
                 this.targetFrames = Math.max(this.minTarget, this.targetFrames - Math.round(SR * 0.001));
                 this.stableBlocks = 0;
             }
         } else {
-            if (avail > 0) this.dequeueInto(outL, outR, avail);
-            outL.fill(0, avail);
-            if (outR) outR.fill(0, avail);
+            if (avail > 0) {
+                this.dequeueInto(outL, outR, avail);
+                this.rememberQuantum(outL, outR, avail);
+            }
+            this.conceal(outL, outR, avail, need);
             this.underruns++;
+            this.starvedBlocks++;
             this.stableBlocks = 0;
             if (!commanded && this.targetFrames < this.maxTarget) {
                 this.targetFrames = Math.min(this.maxTarget, this.targetFrames + Math.round(SR * 0.003));
             }
-            this.priming = true; // re-prime to the target
+            // Only a sustained stall is worth the silence a re-prime costs.
+            if (this.starvedBlocks >= this.REPRIME_AFTER_STARVED) this.priming = true;
         }
 
         this.maybePostStats();
         return true;
+    }
+
+    rememberQuantum(outL, outR, n) {
+        if (n <= 0) return;
+        const m = Math.min(n, this.concealL.length);
+        this.concealL.set(outL.subarray(n - m, n), 0);
+        if (outR) this.concealR.set(outR.subarray(n - m, n), 0);
+        else this.concealR.set(this.concealL.subarray(0, m), 0);
+        this.concealFrames = m;
+        this.concealGain = 1;
+    }
+
+    // Fill [from, need) with a fading repeat of the last audio we played. Beyond a couple of
+    // quanta the gain has decayed to nothing, so a genuine stall still ends in silence — it
+    // just gets there without a click.
+    conceal(outL, outR, from, need) {
+        if (this.concealFrames <= 0) {
+            outL.fill(0, from);
+            if (outR) outR.fill(0, from);
+            return;
+        }
+        this.concealed++;
+        let g = this.concealGain;
+        for (let i = from; i < need; i++) {
+            const s = i % this.concealFrames;
+            outL[i] = this.concealL[s] * g;
+            if (outR) outR[i] = this.concealR[s] * g;
+            g *= 0.9993; // ~1/e over three quanta
+        }
+        this.concealGain = g < 0.001 ? 0 : g;
+        if (this.concealGain === 0) this.concealFrames = 0;
     }
 
     maybePostStats() {
@@ -202,6 +262,7 @@ class AudioJitterProcessor extends AudioWorkletProcessor {
             underruns: this.underruns,
             overruns: overruns,
             corrections: this.corrections,
+            concealed: this.concealed,
             shared: this.shared,
         });
     }
