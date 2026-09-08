@@ -101,6 +101,16 @@ impl CursorAnimation {
     pub fn start(display: DisplayId, w: u32, h: u32) -> Self {
         use objc2_core_foundation::CGPoint;
         use objc2_core_graphics::CGDisplayMoveCursorToPoint;
+
+        // Moving the pointer alone is not enough: macOS hides the cursor when there has been no
+        // real HID input, and a hidden cursor composites nothing. The hide/show pair is
+        // reference-counted and forces WindowServer to recomposite the cursor rectangle whether
+        // or not the pointer was visible, which is what actually produces the dirty rects.
+        unsafe extern "C" {
+            fn CGDisplayHideCursor(display: DisplayId) -> i32;
+            fn CGDisplayShowCursor(display: DisplayId) -> i32;
+        }
+
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
@@ -108,7 +118,11 @@ impl CursorAnimation {
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 let x = f64::from(i.wrapping_mul(7) % w.max(2));
                 let y = f64::from(i.wrapping_mul(11) % h.max(2));
-                let _ = unsafe { CGDisplayMoveCursorToPoint(display, CGPoint { x, y }) };
+                unsafe {
+                    let _ = CGDisplayMoveCursorToPoint(display, CGPoint { x, y });
+                    CGDisplayHideCursor(display);
+                    CGDisplayShowCursor(display);
+                }
                 i = i.wrapping_add(1);
                 std::thread::sleep(std::time::Duration::from_micros(2000));
             }
