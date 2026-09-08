@@ -31,7 +31,7 @@ impl Geometry {
             width: width.max(2),
             height: height.max(2),
             refresh_hz: if refresh_hz == 0 { 60 } else { refresh_hz },
-            max_fps: DISCARD_FPS,
+            max_fps: advertised_max_fps(),
         }
     }
 }
@@ -39,6 +39,25 @@ impl Geometry {
 /// The sender never renders anything for us, so one frame a second is plenty to
 /// keep the stream alive.
 const DISCARD_FPS: u32 = 1;
+
+/// The frame rate we ask the sender for.
+///
+/// `SE_AIRPLAY_MAX_FPS` raises it, which is only useful alongside
+/// `SE_AIRPLAY_TIMING`: the mirror header's capture timestamps
+/// ([`super::mirror`]) are the one instrument in the tree for macOS's own
+/// compositor-to-consumer latency, and at one frame a second there is nothing
+/// to build a distribution out of. It costs real host CPU — macOS encodes the
+/// whole desktop for us to throw away — so it is never on by default.
+///
+/// Whether macOS honours the value at all is what the drain loop's packets/s
+/// line reports.
+fn advertised_max_fps() -> u32 {
+    std::env::var("SE_AIRPLAY_MAX_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (1..=240).contains(v))
+        .unwrap_or(DISCARD_FPS)
+}
 
 /// `displays[0].features`. Bits 1|2|3 in the same namespace as the TXT feature
 /// word; not a display-mode selector — there is no such thing on the wire.

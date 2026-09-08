@@ -28,13 +28,19 @@ host's own clock alongside it:
 PONG   0x61
   +1   u64  echoed client stamp, ns (as sent in the PING)
   +9   u64  host_now_ns at the moment the PONG was built
-       17 bytes total
+  +17  u16  host capabilities — docs/INPUT-PROTOCOL.md, "Host capabilities"
+       19 bytes total
 ```
 
-A client older than this reads the first 9 bytes and ignores the rest; a host older than this
-sends 9 bytes and the client simply never gets an offset. The same frame carries the host
-capability bitfield after the two stamps — the layout, and the rule that a short frame means no
-bits, are in `docs/INPUT-PROTOCOL.md`.
+Bytes 0..17 are frozen. A client older than a field reads the prefix it knows and ignores the
+rest; a host older than a field sends a shorter frame, and a client that sees fewer than 19 bytes
+reads no capability bits, which is the correct answer for that host.
+
+`input.js::noteHostCaps` is the client half of that rule — `dv.byteLength >= 19 ?
+dv.getUint16(17, true) : 0` — and it is the only source of `RemoteInput.hostCapabilities()`.
+Nothing on the page may assume an optional mechanism works before the first `PONG` carrying the
+bit lands: a request a host drops is not a mechanism, and a client that believed otherwise
+disarmed the fallback that would have rescued it.
 
 The client keeps the **minimum-RTT** sample, because the least-queued exchange gives the tightest
 midpoint estimate, and ages it out after 30 s so a route change is not remembered forever:
@@ -71,20 +77,83 @@ epochs, meaningless on their own but valid as a *difference*, which is all A/V s
 | `socket_write_done_ns` | After the last RTP packet of the frame is written. |
 
 Derived histograms: `capture_delivery`, `scale`, `encode_queue`, `encode`, `packetize`,
-`socket_write`, `capture_to_encode`, `capture_to_socket`. A stage with `count == 0` did not fire —
-that absence is a finding, not a zero.
+`socket_write`, `pace_wait`, `capture_to_encode`, `capture_to_socket`.
+
+`pace_wait` is the odd one out: it is not derived from a `FrameTiming` pair but recorded
+directly by the RTP writer, and it holds **only the time the send pacer slept** — not the
+writes that sleeping is interleaved with. That separation is the point. Pacing and sending
+both show up inside `socket_write`, and "the pacer is free on this path" has to be
+distinguishable from "the socket is slow". On a `SessionLocality::SameNetwork` session the
+pacer is off and this histogram is all zeroes, which is the correct reading.
+
+A stage with `count == 0` did not fire — that absence is a finding, not a zero.
 
 Histograms are fixed log-scale buckets, 8 per octave (any bucket is under 13% wide), 512 buckets
 of `AtomicU64`. `record` is three relaxed `fetch_add`s and a `fetch_max`: no allocation, no lock,
 no logging, which is what makes it safe on a real-time capture callback. Reported as
 p50/p90/p99/max — never a bare mean, which hides the tail that is actually felt.
 
-### Degradation counters
+### Input stages
 
-`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `nacks_received`,
-`keyframe_requests`, `idrs_sent`, `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`,
-`audio_broadcast_lag_drops`, plus the client-reported `client_jitter_underruns` /
-`client_jitter_overruns`.
+Three more stages ride the same histograms, but they are recorded per *event* by
+`streamer::input`, not per frame, so `record_frame` does not feed them. The wire layouts they
+depend on are in `docs/INPUT-PROTOCOL.md`.
+
+| Stage | Span |
+|---|---|
+| `input_recv` | client send → host receive, minus the best case (see below) |
+| `input_queue` | host receive → the injector thread picking the event up |
+| `input_inject` | host receive → injection returned: the whole host-side cost |
+
+`input_recv` needs a clock offset the host does not have — the client estimates one from
+PING/PONG and never sends the result back — so the host estimates its own. What it can see
+unaided is `host_recv − client_send` for every stamped frame: the true offset plus that frame's
+one-way delay. The *minimum* of that over a rolling 30 s window is therefore the tightest offset
+obtainable from one direction alone, and `input_recv` reports the difference — **excess one-way
+delay**, 0 on the best sample and growing with queueing. It is a relative number by construction,
+which is what a latency budget wants and is all one direction can honestly give. The window is
+the same 30 s the client uses to age out its own best RTT sample, so a route change is not
+remembered for the whole session.
+
+Only frames carrying the optional client stamp are measured; an unstamped frame from an older
+client contributes nothing rather than a wrong number.
+
+## Degradation counters
+
+`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `frames_dropped_broadcast`,
+`nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
+`keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
+`encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
+client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
+`input_queue_drops` / `input_stale_drops`.
+
+`keyframe_requests` counts RTCP PLI and FIR; `client_keyframe_requests` counts the out-of-band
+`KEYFRAME_REQUEST` (`0x64`) a client sends when it has no other way to ask, so the two sources
+stay distinguishable.
+
+Four of these describe the transport's own decisions rather than its failures, and are read as
+pairs:
+
+- `keyframe_requests_suppressed` is how many requests the per-session gate declined. A decoder
+  that has lost its reference chain emits a PLI for every frame in its backlog, and on an
+  infinite-GOP encoder answering each one produces the largest frame the session can send — which
+  is what turns a stumble into a keyframe storm. So a large suppressed/requested ratio is healthy;
+  `idrs_sent` is what the encoder was actually told to do.
+- `frames_dropped_broadcast` is frames the encoder-to-viewer broadcast dropped on a viewer that
+  fell behind. Distinct from `frames_dropped_ring`, which is the capture side.
+- `delay_overuse_events` is intervals where the delay-gradient estimator said a queue was filling.
+  It fires *before* loss, so a non-zero count against a flat loss count is the signal working, not
+  a fault.
+- `pacer_deadline_misses` is packets the pacer released early because holding them any longer
+  would have outlasted the frame interval it was smoothing. A pacer that grows unbounded is worse
+  than no pacer, so this must stay small.
+
+The process-level `live_transport_sessions` sits alongside the per-session objects in
+`snapshot_json`: peer connections, ICE agents and injector threads not yet given back. It should
+equal the number of live sessions, and a number that only climbs across joins is a leak. `input_queue_drops` is the fast input queue shedding its oldest entry under
+pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
+rather than injected late — never a key or a button, which are state transitions the host cannot
+recover from.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
@@ -102,7 +171,7 @@ Version 2 (96 bytes) appends the tier bytes and the degradation field below; ver
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | opcode `0x62` |
-| 1 | 1 | version (currently 2; 0 is rejected) |
+| 1 | 1 | version (currently 3; 0 is rejected) |
 | 2 | 1 | video path |
 | 3 | 1 | audio path |
 | 4 | 4 | flags (below) |
@@ -140,33 +209,65 @@ Version 2 (96 bytes) appends the tier bytes and the degradation field below; ver
 The length is a **floor**, never an equality: a newer client may append fields and an older host
 reads the prefix it understands. A frame shorter than 72 bytes, or carrying version 0, is dropped.
 
-**Neither tail is parsed by the host yet.** `input/protocol.rs::parse_client_stats` reads the
-first 72 bytes and stops, so the tier bytes, the degradation field and the redundancy counters
-reach the host and are discarded. Surfacing them is
-`findings/major-telemetry-client-stats-v2-tail-is-discarded.md`. Until it lands, read them with
-`SEVideo.getStats()` on the device.
+The host reads the tail whenever all 96 bytes arrived and leaves the fields at 0 otherwise, which
+is also what "not measured" means for each of them — so a v1 client and a v2 client that measured
+nothing are correctly indistinguishable. A frame one byte short of 96 reads as tail-absent rather
+than half-parsed. `serve -v` names the four tiers in words and lists the set degradation bits by
+name; `status --json` carries the raw codes, the decoded names and the audio numbers.
 
-### Audio-redundancy fields (v3, offsets 96 and 100)
+**The v3 tail is not parsed host-side.** `parse_client_stats` stops at 96, so bytes 96..104 reach
+the host and are discarded — which is the floor rule working, not a fault. Read them with
+`SEVideo.getStats()` (`audioRedundantUsed` / `audioRedundantDiscarded`) on the device until a host
+build wants them.
 
-The host can append the previous frame's Opus payload to a DataChannel audio packet
-(`FLAG_REDUNDANT`, `streamer/audio/protocol.rs`) when the video BWE reports loss at or above
-`AUDIO_REDUNDANCY_LOSS_THRESHOLD`. It is the only loss-robustness tool on this path — the
-encoder is CELT-only at 5 ms, where libopus's in-band FEC is structurally inert — and the host
-sets the flag only when the client has said it can split the body, because a client that cannot
-would decode the two payloads as one packet.
+### Audio redundancy — the capability, the flag, and the two counters (v3)
 
-**The client advertises it in the WHEP join request, not in a stats bit**: `audioCapabilities`
-carries `redundancy: true` alongside `webcodecsOpus` and `worklet`. It describes the client
-build rather than the browser — `audio-worker.js` always understands the format — and it is sent
-as `false` on any path that has no audio DataChannel. A client older than the field sends
-nothing and serde defaults it to `false`, so the host never sets a flag the client cannot read.
+The audio DataChannel header is 13 bytes (`streamer/audio/protocol.rs`, the authority): `seq` u32
+LE, `capture_ns` u64 LE, `flags` u8, then the Opus payload. Two flag bits are defined host-side
+today — `FLAG_SILENT` (1 << 0) and `FLAG_DISCONTINUITY` (1 << 1). The client additionally reads a
+third:
 
-The two counters are what the feature actually did. **used** is a copy that filled a hole the
-client would otherwise have concealed; **discarded** is a copy whose frame had already arrived,
-and it is the payload the feature cost. `used` climbing while `audio packets concealed` stays
-flat is redundancy working; `discarded` climbing with `used` at zero is payload spent for
-nothing, which points at the host's loss threshold rather than at the client. The client
-de-duplicates by sequence number, so a copy is never played twice.
+```
+FLAG_REDUNDANT   1 << 2      audio-worker.js
+  body, when set:  u16 LE primary length | primary Opus packet | previous frame's Opus packet
+  body, when clear: the Opus packet, as it always was
+```
+
+The trailing copy is the payload for `seq - 1` and nothing else. This is RFC 2198-style
+redundancy without the RTP framing, and it is the only loss-robustness tool this path has: the
+host's encoder is CELT-only at 5 ms, where libopus's in-band FEC is structurally inert.
+
+**The capability is negotiated in the WHEP join body, not in a stats bit.** `audioCapabilities`
+carries `redundancy` alongside `webcodecsOpus` and `worklet`:
+
+```json
+{ "webcodecsOpus": true, "worklet": true, "redundancy": true }
+```
+
+`redundancy` describes *this client build* rather than the browser — `audio-worker.js` always
+understands the split — so `detectCapabilities()` returns it as a constant `true`, and
+`index.html` overwrites it with `false` on the Opus-track path, which has no DataChannel to carry
+a redundant body at all. A client older than the field sends nothing and serde defaults it to
+`false`. A host must set `FLAG_REDUNDANT` only against a client that sent `true`: a client that
+cannot split the body decodes the two payloads as one packet.
+
+**Neither half is implemented on the host yet.** `streamer/audio/protocol.rs` defines no
+`FLAG_REDUNDANT` and `server.rs`'s `AudioCapabilities` deserializes only `webcodecsOpus` and
+`worklet` — the extra field is accepted and ignored, because the struct has no
+`deny_unknown_fields`. So on today's host both counters stay 0 and the flag never appears; the
+client half is in place so the host half can land without a client change, and so an old client
+and a new one are distinguishable at the join rather than by guesswork.
+
+The two counters are what the feature actually did once a host does send it. **used** (offset 96)
+is a copy that filled a hole the client would otherwise have concealed; **discarded** (offset
+100) is a copy whose frame had already arrived, and it is the payload the feature cost. `used`
+climbing while `audio packets concealed` stays flat is redundancy working; `discarded` climbing
+with `used` at zero is payload spent for nothing, which points at the host's loss threshold
+rather than at the client. The client de-duplicates by sequence number, so a copy is never played
+twice — playing it unconditionally would emit the same 5 ms of audio twice, which is worse than
+the loss it was sent to repair. A gap wider than one frame still conceals the part the copy
+cannot reach, and `FLAG_DISCONTINUITY` — the host saying the capture itself broke — suppresses
+both the copy and the concealment, because there is nothing to bridge.
 
 `host capture → paint` is the client half of glass-to-glass. It is only populated once the clock
 offset has arrived; before that the client reports 0 there and clears `CLOCK_VALID`.
@@ -250,10 +351,11 @@ host. The field is a union of the page's own bits and the audio module's.
 
 ### Opcode note
 
-`0x62` is used in both directions. Host → client it is the (currently unused) input-queue stats
-frame built by `protocol::build_stats`, 25 bytes; client → host it is this frame. Direction
-disambiguates: the host parser only ever sees the client's, and the client's `onReliableMessage`
-only handles `PONG` and `BYE`.
+`0x62` is client → host only. It used to be defined in both directions — the host → client twin
+was a 25-byte injector-queue frame built by `protocol::build_stats` that was never sent — and that
+builder is gone: the injector's counters live in `SessionTelemetry` instead, where `status --json`
+reads them beside every other counter. The full input opcode table, and the optional client
+timestamp several frames now carry, are in `docs/INPUT-PROTOCOL.md`.
 
 ## Reading it
 
@@ -306,3 +408,6 @@ client), and the clock conversions in `windows_utils/streamer/clock.rs` and
 3. Fold it in `SessionTelemetry::record_frame`.
 4. Set the stamp on every pipeline that has that stage; the ones that do not will report
    `count == 0`, which is the correct answer.
+
+An event-shaped stage skips steps 1 and 3 — `FrameTiming` and `record_frame` are frame-shaped —
+and calls `telemetry.stages.<name>.record(ns)` directly, the way the three input stages do.

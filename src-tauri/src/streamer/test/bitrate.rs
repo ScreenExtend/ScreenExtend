@@ -100,9 +100,56 @@ fn estimate_probe_is_capped_by_delivered_rate() {
 }
 
 #[test]
-fn estimate_holds_in_neutral_band() {
-    let est = estimate_from_loss(10_000_000, 10_000_000, 0.05);
-    assert_eq!(est, 10_000_000, "moderate loss holds steady");
+fn estimate_reacts_across_the_old_dead_band() {
+    // 2 % to 10 % loss used to be a literal no-op: a visibly broken picture with the rate held
+    // flat. Every sample in that range must now move the estimate down, monotonically.
+    let mut last = u32::MAX;
+    for pct in [2u32, 3, 5, 8, 9] {
+        let est = estimate_from_loss(10_000_000, 10_000_000, pct as f64 / 100.0);
+        assert!(
+            est < 10_000_000,
+            "{pct}% loss must cut the estimate, got {est}"
+        );
+        assert!(est < last, "the response must be monotone in loss");
+        last = est;
+    }
+}
+
+#[test]
+fn the_loss_response_is_continuous_where_the_branches_meet() {
+    // At 10 % the gentle ramp and GCC's own `1 - 0.5 * loss` must agree, or the controller has
+    // a step discontinuity exactly where loss becomes severe.
+    let below = estimate_from_loss(10_000_000, 10_000_000, 0.0999);
+    let at = estimate_from_loss(10_000_000, 10_000_000, 0.10);
+    assert!(
+        (below as i64 - at as i64).abs() < 10_000,
+        "discontinuity at the severe-loss boundary: {below} vs {at}"
+    );
+    assert_eq!(at, 9_500_000, "severe loss still matches GCC");
+}
+
+#[test]
+fn ordinary_wireless_background_loss_still_probes_upward() {
+    // Below 1 % is the background of any wireless link and must not be read as congestion,
+    // or a healthy 5 GHz session never reaches its ceiling.
+    let est = estimate_from_loss(10_000_000, 10_000_000, 0.005);
+    assert!(est > 10_000_000, "0.5% loss must not stop the probe: {est}");
+}
+
+#[test]
+fn a_sub_deadband_cut_compounds_instead_of_stalling() {
+    // The estimator runs on its own value, not the emitted target. A 5 % loss produces a ~2 %
+    // cut, which the controller's 4 % cut deadband would swallow — so if the estimate were
+    // recomputed from the unchanged target each interval, nothing would ever move. Feeding it
+    // its own output is what makes moderate loss actually converge.
+    let mut est = 10_000_000u32;
+    for _ in 0..10 {
+        est = estimate_from_loss(est, est, 0.05);
+    }
+    assert!(
+        est < 8_500_000,
+        "ten intervals of 5% loss must compound well past the deadband, got {est}"
+    );
 }
 
 #[test]
