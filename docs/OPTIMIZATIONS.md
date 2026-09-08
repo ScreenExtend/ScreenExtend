@@ -189,8 +189,8 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 195 | net (macOS) | The watcher reports the associated Wi-Fi channel and whether `awdl0` is up, once, at start; a channel in {6, 44, 149} is called out by name (`macos_utils/networking.rs`) | AWDL's three social channels are where every nearby Apple device parks its radio for AirDrop and Handoff discovery, and a single-radio Mac retunes to them periodically — a published jitter source that the *user* can act on and that will otherwise be blamed on the stream. | the channel and `awdl0`'s state were never recorded, so no field report could distinguish this cause | one line at startup; on this box, "Wi-Fi channel 36, awdl0 up" | VERIFIED (10.15.8: channel 36, `awdl0` up, so the non-social branch fires) | yes | Reported, not acted on: the host AP's own channel choice already avoids all three (row from W6's earlier work), and whether *sitting* on a social channel is better or worse for jitter is the open A/B in `docs/manual-tests/macos-hosted-network.md` §4. |
 | 204 | whep / ice | Trickle ICE, host half: `POST /whep` returns `Location: /whep/{id}`, `PATCH /whep/{id}` takes an `application/trickle-ice-sdpfrag` body and feeds each candidate to the live peer connection, `DELETE /whep/{id}` tears the resource down, and `/net-config` advertises `trickleIce: true`. | `/whep` was a single POST carrying the complete offer, so the client could not start negotiating and add candidates later: the offer it posted was the only one the host would ever see. The client therefore could not post until its own gathering finished -- with TURN configured that is a round trip to the relay before the offer even leaves, and on a network where no candidate arrives it is the full deadline. | no trickle verb; the client's gather is on the critical path of every join | the host accepts candidates after the answer; the session is addressable by a minted id held as a `Weak`, so the registry can never keep a peer connection alive | COMPILE-CHECKED and unit-tested (5 tests: mid and m-line index, a second `m=` section, `a=end-of-candidates`, a bare `candidate:` prefix, and a fragment for a session that is over). The end-to-end effect is UNVERIFIED until the client adopts it. | yes | Backward compatible in both directions on purpose: a client that ignores `Location` behaves exactly as today, and the cloud relay never sets it because it has no URL space of its own -- so a relayed client correctly keeps the gather-then-post shape. The client half is `findings/major-client-can-now-trickle-ice-and-stop-waiting-to-gather.md`, tagged W11, with the wire contract written out. Resolves the host half of `major-whep-no-trickle-ice`. |
 | 205 | session / transport | `platform::link_medium_for_local_ip` resolves the local end of the nominated ICE pair to `wired` / `wireless` / `other` and logs it once per session. Windows reads `MSFT_NetAdapter.NdisPhysicalMedium` (14 = 802.3, 9/1 = 802.11); macOS uses `getifaddrs` for the interface name and then `SIOCGIFMEDIA`. | `detect_session_locality` classified a session only as SameNetwork / CrossNetwork / Unknown, so the host could not tell a USB-tethered phone -- which is an ordinary Ethernet interface, and which every competitor in this category treats as its flagship low-latency tier -- from Wi-Fi. Luna Display's own 50-sample bench reports 11.3 ms mean over USB against 22.4 ms over Wi-Fi. | the transport the pair actually rides was invisible | named in the log, off a `spawn_blocking`, once per session | COMPILE-CHECKED. The wired-vs-wireless **latency comparison** is UNVERIFIED and needs a 240 fps camera and an Android phone -- the script is `docs/manual-tests/transport.md` §1, and "not measurably better than clean 5 GHz" is an outcome worth recording | yes | No policy is driven off it yet, deliberately: a tethered client is on the same subnet, so it already classifies `SameNetwork` and already gets `PacingMode::Off`. What it buys today is that the wired route is documented in `README.md` and observable in the log. Resolves `minor-session-usb-tether-is-an-undocumented-low-latency-tier`. |
-| 206 | session / display | `DISPLAY_CORRELATION_LOCK` is released as soon as the backend names its own display, and the wait for it is logged when it exceeds 1 ms. | The lock exists because a new virtual display is correlated with its OS device name by diffing `monitor_device_names()` before and after, and two concurrent creations would confuse the diff. But on the fast path -- where `display_device_name(id)` answers directly -- the `before` snapshot is never read, and the lock was still held for the whole create-and-attach window. Two devices joining together serialised: the second waited out the first's entire window, up to `DISPLAY_ATTACH_TIMEOUT` = 5 s, before its own began. | the lock spans create + name + up to a 5 s attach poll, on every backend | released immediately on the direct-name path; the wait behind another join is now a log line rather than an inference | COMPILE-CHECKED | yes | **The Windows IDD still takes the slow path**, because `display_device_name` is the trait's default `None` there: the driver hands back its own index and nothing maps that to `\\.\DISPLAY N`. The mechanism that would (`DISPLAYCONFIG_PATH_TARGET_INFO.id` on the IDD adapter -- matching by `monitorFriendlyDeviceName` cannot work, because the EDID product-name descriptor is 13 characters and every ScreenExtend display starts with the same 12) is `windows_utils/virtual_display.rs` and is filed for W9. Resolves the server-side half of `minor-session-display-correlation-lock-serializes-all-joins-for-up-to-5s`. |
-| 207 | input | The 50 ms age gate is source-aware: a stale `POINTER_MOVE_BATCH` or `POINTER_MOVE` from a mouse is still dropped, one from a pen or touch never is. | Only where a cursor *is* is observable, so a 50 ms-old position is worse than nothing. A pen or touch sample is not redundant with its neighbours -- it is the shape of the line -- so dropping one leaves a permanent straight segment where the user drew a curve, and no later event repairs it. | every supersedable event dropped for age regardless of `source` | mouse unchanged; pen/touch batches and moves are never age-dropped (`ink_is_never_dropped_for_age_but_a_cursor_is`) | VERIFIED (unit); UNVERIFIED (no pen client on this hardware) | yes | The gate has never fired in practice on either dev box. If a pen backlog ever does become real, the right answer is to inject the batch and skip its *intermediate* samples, not discard the message -- the endpoints are what the stroke needs. |
+| 206 | session / display | `DISPLAY_CORRELATION_LOCK` is released as soon as the backend names its own display, and the wait for it is logged when it exceeds 1 ms. | The lock exists because a new virtual display is correlated with its OS device name by diffing `monitor_device_names()` before and after, and two concurrent creations would confuse the diff. But on the fast path -- where `display_device_name(id)` answers directly -- the `before` snapshot is never read, and the lock was still held for the whole create-and-attach window. Two devices joining together serialised: the second waited out the first's entire window, up to `DISPLAY_ATTACH_TIMEOUT` = 5 s, before its own began. | the lock spans create + name + up to a 5 s attach poll, on every backend | released immediately on the direct-name path; the wait behind another join is now a log line rather than an inference | COMPILE-CHECKED | yes | W9 landed the Windows half in parallel (row 196): `WindowsVirtualDisplay::display_device_name` now correlates through `QueryDisplayConfig`, returning `None` on an ambiguous match — the EDID monitor-name descriptor is 13 bytes, so every `ScreenExtend - <device>` truncates to a shared prefix — and dropping to the diff when it cannot be sure. The two changes compose: the direct-name path is now reachable on Windows, and this is what makes the lock go away when it succeeds. Resolves the server-side half of `minor-session-display-correlation-lock-serializes-all-joins-for-up-to-5s`. |
+| 215 | input | The 50 ms age gate is source-aware: a stale `POINTER_MOVE_BATCH` or `POINTER_MOVE` from a mouse is still dropped, one from a pen or touch never is. | Only where a cursor *is* is observable, so a 50 ms-old position is worse than nothing. A pen or touch sample is not redundant with its neighbours -- it is the shape of the line -- so dropping one leaves a permanent straight segment where the user drew a curve, and no later event repairs it. | every supersedable event dropped for age regardless of `source` | mouse unchanged; pen/touch batches and moves are never age-dropped (`ink_is_never_dropped_for_age_but_a_cursor_is`) | VERIFIED (unit); UNVERIFIED (no pen client on this hardware) | yes | The gate has never fired in practice on either dev box. If a pen backlog ever does become real, the right answer is to inject the batch and skip its *intermediate* samples, not discard the message -- the endpoints are what the stroke needs. |
 | 208 | input | `protocol::parse` returns `Result<Parsed, ParseError>` naming opcode, needed length and reason; the transport logs one line per distinct rejection per channel and counts every one in `input_parse_errors`. `Phase::from_opcode` returns `Option` instead of falling through to `Move`. | Every failure mode -- unknown opcode, truncation, bad UTF-8, a length prefix past the end -- collapsed to one `None` with no log, no counter and no reply. A client whose cached `input.js` had drifted from the host produced a session where input silently did nothing, and nothing anywhere explained why. | 0 diagnostics of any kind | one log line per distinct error per channel, `input_parse_errors` in `status --json`, five typed variants asserted by `every_rejection_names_its_reason` | VERIFIED (unit) | yes | The dedup is a `HashSet<ParseError>` in the handler state, so a drifted client flooding the same malformed frame produces one line, not thousands. |
 | 209 | input | Pointer, batch, wheel and mouse-delta frames may carry a `u16` sequence in the optional tail past the client stamp; the injector drops a *supersedable* fast event whose sequence is behind the highest injected (wrapping-aware) and counts it in `input_reorder_drops`. | The fast channel is unordered with `maxRetransmits: 0` and the host merges two queues with a `crossbeam::select!` that picks randomly, so two moves can reach the injector swapped and the older one walks the cursor backwards for a frame. The age gate bounds how *stale* a replayed move is and says nothing about order. | no sequence anywhere in the input protocol | 2 bytes on the frames that need it, one wrapping comparison; an absent tail means the session is simply not reorder-gated | VERIFIED (unit: `the_fast_channel_sequence_number_is_optional_on_every_frame_that_carries_one`, `sequence_comparison_survives_the_u16_wrap`); UNVERIFIED (no induced-reorder link) | yes | Host-side only and backward compatible by construction. The client half is W11's -- see the return note for the exact layout. Buttons and keys are never gated, only positional data. |
 | 210 | input (Windows) | Synthetic pen events carry the client's own `pointerId` instead of the literal `1`. | Each session builds its own `Injector` and therefore its own `CreateSyntheticPointerDevice(PT_PEN, 1, ...)`, and both injected `pointerId: 1`. Whether Windows disambiguates two synthetic pen contacts sharing an id across two device handles is undocumented. | every pen contact on every session injected as pointer 1 | the client's id, guarded so 0 becomes 1 (Windows treats 0 as no pointer); the touch path has always done this | COMPILE-CHECKED; UNVERIFIED (needs two pen-capable clients) | yes | Same shape as the touch path, which keys its `contacts` map on the client's id and passes it straight through. |
@@ -208,6 +208,119 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 203 | input / compat | `CompatibilityReport` gains `input_backend`, filled on all three platforms from `streamer::input::probe_backend()`; on macOS the tier is re-probed on the injector's existing 500 ms geometry cadence and a missing grant joins `unsupported_apis`. The injector backends' `log::` diagnostics move to the log bus. | Without Accessibility, `CGEventPost` returns `void` and the OS drops every event with no error the process can observe: a client whose remote control is enabled, whose pointer events are being sent and acknowledged, and whose host simply never moves. Input was the only subsystem with no tier at all, and its one warning went to `log::warn!`, which does not reach the Settings terminal. | silent no-op, and a relaunch demanded | a reported tier, an actionable entry in the list the UI already renders, and injection that starts working within half a second of the permission being granted | COMPILE-CHECKED (Mac `cargo check`); UNVERIFIED (needs a Mac with Accessibility revoked) | yes | No new UI: the degraded case rides `unsupported_apis`, which the compatibility surface already renders, and `doctor` prints the tier. `bindings.ts` regenerated. |
 
 ## Notes
+
+### Needs a driver rebuild, and what it is worth (core close-out)
+
+The bundled indirect display driver is a locally built fork of MolotovCherry/virtual-display-rs
+at `eae5120a6768...`, shipped signed. Nothing in this repository can rebuild it: there is no
+signing identity here, and an unsigned IDD does not load. Three findings all end at that wall, so
+what each is worth was measured or bounded from the host side instead, and the driver-side work
+is written down here rather than left in a findings file nobody will read again.
+
+**The INF declares `UmdfExtensions = IddCx0102`, so the OS chooses the composing adapter, not
+us.** Microsoft's IddCx 1.4 notes say it plainly: "IddCx versions before IddCx 1.4 used the
+power-on self-test (POST) adapter to render the desktop image passed to the IDD if it was not
+PnpStopped. If the POST adapter was PnpStopped, the system-supplied Windows Advanced
+Rasterization Platform (WARP) was used instead." `IddCxAdapterSetRenderAdapter`, the only way for
+a driver to ask for a different one, is IddCx 1.4 / Windows 10 1903. The project's stated Windows
+floor is 2004 (19041), which carries IddCx 1.5, so targeting 1.2 buys compatibility with
+1709-1809 that is neither claimed nor needed.
+
+*What shipped instead:* the diagnosis half, which needs no driver change. `report_adapter_pairing`
+already named the capture and encode adapters and whether they matched; it now also says, on a
+mismatch, that an IddCx 1.2 driver has no way to avoid it, and it already shouts when the capture
+adapter is a software rasteriser (the WARP case, previously silent). On the dev box the two
+adapters are the same NVIDIA GPU (`same_adapter=true`, LUID 0x17D9A), so the cross-adapter cost
+is **0 here** and this is a hybrid-laptop finding that this hardware cannot exhibit.
+
+*Expected upside of the rebuild:* on a hybrid host where the POST adapter is the iGPU, one
+full-frame cross-adapter copy per frame disappears — at 1920x1080 BGRA that is ~8.3 MB over PCIe
+per frame, roughly 1-3 ms at 60 fps plus its synchronisation. On a host whose POST adapter is
+PnpStopped it is larger and qualitatively different: the desktop for our virtual display is
+rasterised by WARP, on the CPU that is also running the encoder.
+
+*Recommendation:* set `UmdfExtensions = IddCx0104` or higher, guard the call with
+`IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)` so one binary still loads on IddCx 1.3+
+hosts, add a `SetRenderAdapter(Luid)` command to `driver_ipc::DriverCommand`, and have the host
+pass the LUID its encoder already enumerated. The IPC side is ready: the host now negotiates a
+protocol version by pipe name, so a rebuilt driver can be recognised without an old one ever
+being sent a message it cannot decode.
+
+**A mode-list change is a hot-unplug, and `IddCxMonitorUpdateModes` would not be.** The fork's
+`ipc.rs::notify()` says so in its own comment — "updated monitors causes a detach, update, and
+reattach. (Required for windows to see the changes)" — and implements it as
+`IddCxMonitorDeparture` then `IddCxMonitorCreate` + `IddCxMonitorArrival`. The parenthetical is
+wrong: `IddCxMonitorUpdateModes` updates a monitor's reported mode list in place, its minimum
+supported client is Windows 10 / Server 2016, i.e. IddCx 1.0 — *below* the 1.2 the INF already
+declares — and upstream simply never used it. This is why `dpr_mode_ladder` pre-registers the
+whole ladder at create time and why `CLAUDE.md` records that a live display cannot be given new
+modes.
+
+*Measured, median of three trials, Windows 11 26200, bundled driver
+(`report_mode_change_cost`):*
+
+| | median | trials |
+|---|---:|---|
+| in-ladder mode change, resolution unchanged | 111 ms | 89 / 111 / 112 |
+| in-ladder mode change, new resolution | 308 ms | 296 / 308 / 381 |
+| departure alone | 179 ms | 178 / 179 / 187 |
+| remove + recreate + reattach | 491 ms | 459 / 491 / 501 |
+| then set the new mode | 281 ms | 276 / 281 / 333 |
+
+So reaching a geometry inside the registered ladder costs ~308 ms and one outside it ~772 ms —
+2.5x — and the wall clock is the smaller half of the difference: the recreate is a real
+hot-unplug, so Windows reflows every window on the desktop and the capture session is rebuilt.
+Neither of those shows up in a stopwatch and both are what the user sees.
+
+*Recommendation:* add an `UpdateModes { id, modes }` command implemented with
+`IddCxMonitorUpdateModes` against the cached `IDDCX_MONITOR`, leaving the departure/arrival path
+for adds, removes and enable/disable. Then the pre-registered ladder can shrink to the modes a
+join actually wants, which also shortens the list the OS intersects on every
+`EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES`. Note the ordering constraint: the update must land in
+both the target-mode query and `EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION`, which regenerates from the
+synthesised EDID.
+
+**`IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE` is unset, and OS virtual modes are confirmed active.**
+The fork builds `IDDCX_ADAPTER_CAPS` with `Flags` left at `Default::default()`, i.e.
+`IDDCX_ADAPTER_FLAGS_NONE`. Microsoft: "The indirect display model automatically supports OS
+virtual modes, allowing the OS to seamlessly perform mode changes using Desktop Window Manager
+(DWM) scaling on a per frame basis without a display mode change... Setting this flag results in
+a mode change each time the desktop resolution is changed." Measured: a display registered for
+1920x1080 and 1080x1920 only comes up at **1280x720@60**, a resolution that is not in its
+registered list at all, and a refresh-rate change at that resolution is refused with
+`DISP_CHANGE_BADMODE` while the same change at 1920x1080 succeeds.
+
+*Rejected for now, with the reason:* the flag needs IddCx 1.4, so it cannot be set without the
+rebuild above; and the shipped path is not affected, because `streamer/server.rs` drives the
+display to a registered mode with `set_display_mode` on every join and every reconfig. The flag
+would remove the *class* of problem rather than an instance of it. It belongs in the same rebuild
+as the two items above, together with two more worth evaluating there:
+`IDDCX_ADAPTER_FLAGS_PREFER_PRECISE_PRESENT_REGIONS` (IddCx 1.8 — more accurate dirty-region
+tracking at "a small CPU usage overhead", a direct win for dirty-rect-aware capture) and
+`IddCxSetRealtimeGPUPriority` (IddCx 1.9).
+
+### UI-visible recommendations (core close-out)
+
+**Whether a pointer-locked client may drive the host's real monitors is a product decision, and
+it is not made here.** The technical half is closed: both backends track their own position and
+inject relative motion absolutely, so Windows and macOS now behave identically and the pointer
+curve is applied exactly once. What remains is the clamp target. Today both clamp to
+`self.desktop`, the union of every attached display, so accumulated `MOUSE_DELTA` walks the
+cursor onto screens the client cannot see and can then click on. Clamping to `self.target` is a
+two-line change in one shared place.
+
+It was not made because the arguments are genuinely balanced and neither is a latency question.
+*Confine it:* the product model is "hand someone a URL and a 6-digit OTP", and a user who granted
+remote control of the second screen they can see has not obviously granted operation of the
+desktop they cannot. *Do not confine it:* dragging a window from the virtual display back to the
+real one requires crossing the boundary, and that is a thing people do with a second monitor.
+The shape once decided is to clamp to `self.target` when one is known, with a per-device
+override — `set_device_override` exists and `Device.remoteControl` is already a per-device
+boolean, so the plumbing is there and only a control in the device sheet is missing. That control
+is a UI change, which this engagement freezes, which is the other reason it stops here.
+
+Note the blast radius is bounded by `control_enabled`: this only ever applies to a device the
+user explicitly gave remote control to.
 
 ### Considered and rejected on the transport (W1 close-out)
 
