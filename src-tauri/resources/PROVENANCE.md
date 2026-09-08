@@ -110,6 +110,28 @@ against the upstream release the next time these are refreshed.
   `"resources/libvpl.dll"` to `bundle.resources` in `tauri.conf.json`, and re-verify on a Gen12
   host that the bundled copy does not displace the driver's.
 
+## NVENC header (`nvenc-headers/nvEncodeAPI.h`) — source only, **not bundled**
+
+- **Upstream:** [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers),
+  `include/ffnvcodec/nvEncodeAPI.h` at tag **`n12.1.14.1`** (commit
+  `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API **12.1**
+  (`NVENCAPI_MAJOR_VERSION 12`, `NVENCAPI_MINOR_VERSION 1`).
+- **License:** MIT, in the header's own copyright block — "permission is hereby granted, free of
+  charge... to deal in the Software without restriction, including... distribute". This is the
+  header FFmpeg itself builds NVENC support against; NVIDIA's own SDK copy carries a more
+  restrictive licence and is deliberately not the source used here.
+- **Used for:** `tools/nvenc_layout_gen.c` compiles against it and emits the assertions in
+  `windows_utils/streamer/test/nvenc_layout.rs`. Nothing links against it and nothing ships it —
+  `nvEncodeAPI64.dll` comes from the NVIDIA driver and is loaded by name at runtime.
+- **Why this version.** The bindings in `nvenc_sys/` were audited against it rather than assumed.
+  Every struct revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8,
+  INITIALIZE_PARAMS 6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
+  REGISTER_RESOURCE 4, EVENT_PARAMS 1); 13.0 raises every one of those by one. The members that
+  looked like SDK-13 additions — `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`,
+  `numStateBuffers`, `outputStatsLevel`, `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` —
+  are all present at 12.1, so there was no version skew to fix.
+- **SHA-256:** `dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425`
+
 ## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
 
 - **Upstream:** [GPUOpen-LibrariesAndSDKs/AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF),

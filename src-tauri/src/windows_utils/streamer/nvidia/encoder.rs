@@ -1745,6 +1745,13 @@ unsafe fn open_session(
                      NVENC sessions as it allows, so this client encodes on Quick Sync or x264 \
                      instead)"
                 }
+                // The one failure a user can act on. `apiVersion` is a floor NVENC refuses to
+                // go below, so this means the installed driver is older than the API these
+                // bindings were generated for — not a broken GPU, and not something a retry or a
+                // different configuration will help.
+                NVENCSTATUS::NV_ENC_ERR_INVALID_VERSION => {
+                    " (this build asks for NVENC API 12.1, which the installed NVIDIA driver                      does not implement; updating the driver is what fixes it)"
+                }
                 _ => "",
             };
             return Err(anyhow!("nvEncOpenEncodeSessionEx failed: {st:?}{detail}"));
