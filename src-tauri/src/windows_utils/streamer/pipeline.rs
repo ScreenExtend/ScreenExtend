@@ -805,6 +805,10 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
     let mut cfg = cfg.clone();
     cfg.synthetic_pattern = false;
     let pipeline = start(&cfg)?;
+    // Without this the probe's own telemetry is unreachable: the registry is keyed by session
+    // and only the HTTP server publishes into it, so a probe run collected numbers nobody
+    // could read.
+    crate::streamer::telemetry::publish("probe-live", Arc::clone(&pipeline.telemetry));
     let mut rx = pipeline.tx.subscribe();
     pipeline.request_idr();
 
@@ -812,8 +816,11 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
     let mut written = 0u64;
     let mut total = 0usize;
     let mut started = false;
+    // A fixed 150 frames is 2.5 s at 60 fps, which is startup transients and little else.
+    let deadline =
+        (cfg.probe_secs > 0).then(|| Instant::now() + Duration::from_secs(cfg.probe_secs));
 
-    while written < FRAMES {
+    while deadline.map_or(written < FRAMES, |d| Instant::now() < d) {
         match rx.blocking_recv() {
             Ok(frame) => {
                 let au = frame.data;
