@@ -114,12 +114,20 @@ client contributes nothing rather than a wrong number.
 
 ## Degradation counters
 
-`capture_fallback`, `frames_repeated`, `frames_dropped_ring`, `frames_dropped_broadcast`,
+`capture_fallback`, `capture_no_first_frame`, `frames_repeated`, `frames_dropped_ring`,
+`frames_dropped_broadcast`, `encoder_output_drops`,
 `nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
 `keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
 `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
 client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
 `input_queue_drops` / `input_stale_drops`.
+
+`capture_no_first_frame` counts the black placeholder frames the macOS encode loop synthesizes when
+capture has produced nothing at all — a still virtual display, or a capture backend that started and
+delivered nothing. Non-zero at the start of a session on an empty display is expected; non-zero on a
+busy one means real capture never began. `encoder_output_drops` counts the times the encoder's
+bounded output channel was full and an access unit was discarded to make room; each one breaks the
+reference chain, so each one also forces an IDR.
 
 `keyframe_requests` counts RTCP PLI and FIR; `client_keyframe_requests` counts the out-of-band
 `KEYFRAME_REQUEST` (`0x64`) a client sends when it has no other way to ask, so the two sources

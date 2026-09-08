@@ -51,3 +51,6 @@ src-tauri/tools/amf_layout_cpp_check.txt
 skills-lock.json
 PLAN.md
 PROMPT.md
+
+# Built by src-tauri/macos/ScreenExtendAudio/scripts/release.sh
+src-tauri/resources/ScreenExtendAudio.pkg
