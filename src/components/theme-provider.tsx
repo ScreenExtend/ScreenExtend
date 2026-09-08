@@ -12,6 +12,20 @@ const stopListening = (unlisten: () => void) => {
 
 export type Theme = "dark" | "light" | "system";
 
+// A synchronous paint hint for the inline script in index.html, which runs long before
+// the store can be read over IPC. `config.json` stays the source of truth: bootstrap
+// overwrites whatever is seeded from here as soon as it has read it.
+const THEME_HINT_KEY = "se-theme";
+
+const readThemeHint = (): Theme | null => {
+  try {
+    const stored = localStorage.getItem(THEME_HINT_KEY);
+    return stored === "dark" || stored === "light" || stored === "system" ? stored : null;
+  } catch {
+    return null;
+  }
+};
+
 type ThemeProviderProps = {
   children: React.ReactNode;
   defaultTheme?: Theme;
@@ -34,7 +48,7 @@ export function ThemeProvider({
   defaultTheme = "system",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<Theme>(defaultTheme);
+  const [theme, setTheme] = useState<Theme>(() => readThemeHint() ?? defaultTheme);
   const { t } = useTranslation();
 
   useEffect(() => {
@@ -46,6 +60,11 @@ export function ThemeProvider({
     if (!root.classList.contains(resolved)) {
       root.classList.remove("light", "dark");
       root.classList.add(resolved);
+    }
+    try {
+      localStorage.setItem(THEME_HINT_KEY, theme);
+    } catch {
+      // a private-mode webview without storage still gets prefers-color-scheme
     }
   }, [theme]);
 

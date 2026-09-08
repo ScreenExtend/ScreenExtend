@@ -112,7 +112,7 @@ backends.
 10     n * 24 bytes of sample: f32 x, y, pressure, tiltX, tiltY, twist
 --- optional tail ---
 N      u64  client stamp of the LAST sample, ns          (N = 10 + n*24)
-N+8    u8   flags (see below)
+N+8    u8   reserved, always 0
 N+9    u8   predicted count: how many TRAILING samples came from getPredictedEvents()
 ```
 
@@ -182,7 +182,10 @@ version bump: an old client reads as "no flags set".
 |---:|---|---|
 | 0 | `UNADJUSTED` | The client holds pointer lock with `unadjustedMovement: true`, so the deltas are raw device counts with no OS pointer curve applied |
 
-Applies to `MOUSE_DELTA` byte 8 and the `POINTER_MOVE_BATCH` tail flags byte. Without it the
+Applies to `MOUSE_DELTA` byte 8 only. The `POINTER_MOVE_BATCH` tail has a byte in the same
+position and it is reserved: `UNADJUSTED` means the client holds pointer lock with raw
+movement, and a locked pointer sends `MOUSE_DELTA` and never a batch, so no bit defined here
+can ever be set on one. The client writes 0 and the host does not read it. Without the flag the
 client's own OS has already curved the deltas, and the host must not curve them a second time —
 which is why both backends now inject relative motion absolutely from a position they track
 themselves, rather than letting the host OS's pointer ballistics compound with the client's.
@@ -228,7 +231,9 @@ knows and ignores the rest, and a host older than a field sends a shorter frame.
 
 ### `STATS` — `0x62`, C→H
 
-96 bytes in v2, 72 in v1. Layout, tier bytes and degradation flags are in `docs/TELEMETRY.md`.
+104 bytes in v3, 96 in v2, 72 in v1 — each tail read whole or not at all, so a host built
+against any of the three reads the prefix it knows. Layout, tier bytes, path codes and
+degradation flags are in `docs/TELEMETRY.md`.
 
 ### The remaining frames
 
