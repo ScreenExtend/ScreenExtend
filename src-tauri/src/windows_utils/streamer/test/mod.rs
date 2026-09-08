@@ -15,6 +15,7 @@ pub(crate) fn skip(what: &str, reason: impl std::fmt::Debug) {
 }
 
 mod amd_layout;
+mod h264;
 mod intel_encoder;
 mod intel_layout;
 mod nvenc_layout;
