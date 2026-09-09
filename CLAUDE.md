@@ -636,7 +636,12 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `app.security.csp`.
 - **Permissions** are a real command surface on macOS (`macos_utils/permissions.rs`:
   Accessibility for remote input, Screen Recording for capture, with check / request / open
-  settings); the Windows and Linux implementations return an empty list.
+  settings); the Windows and Linux implementations return an empty list. **Location Services is
+  deliberately never requested.** macOS treats a Wi-Fi SSID as location data, so `CWInterface.ssid`
+  can return nil without it and the dashboard then labels the adapter "Wi-Fi" — on purpose, not by
+  accident. A Location prompt is one of the heaviest consents macOS shows and the only thing it
+  would buy here is a cosmetic label on a row that already carries the adapter's addresses; do not
+  add it. `macos_utils/networking.rs::wifi_ssid` says so once in the log.
 
 ## Conventions & gotchas
 

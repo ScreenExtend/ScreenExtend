@@ -5,6 +5,11 @@
 Developer ID and notarized, unless SIP is disabled — so an unsigned build is a development
 artifact only, and shipping one is not an option.
 
+The **app bundle** is a separate identity, a separate certificate and a separate procedure:
+`macos-app-signing.md`. The two must not be confused — and a locally signed app must never reuse
+the `app.screenextend.desktop` bundle identifier, or it poisons the release build's TCC rows on
+that machine.
+
 Neither development machine has Apple signing credentials, so **nothing in this repository has been
 signed**. Everything below the signing step has been run; the signing and notarization steps
 themselves have not. This document is what a machine with the credentials needs.

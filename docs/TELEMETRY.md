@@ -187,6 +187,30 @@ counter because the capture backend is constructed before the session's telemetr
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
 
+## Transport-derived signals (not counters)
+
+Two things the transport now knows that are read rather than counted, because they are inputs to a
+decision rather than a tally of what went wrong.
+
+**`SharedFeedback::acked_frame_capture_ns()`** — the host-clock capture instant of the newest
+access unit the client has confirmed receiving **in full**. Transport-wide feedback names every
+sequence number that did and did not arrive, and the writer stamps those sequence numbers itself,
+so `SendHistory` can keep a per-frame tally beside its per-packet ring and `congestion::interpret`
+can vote every reported symbol against the frame its packet belonged to. A frame missing even one
+packet is never acknowledged. The identity is the capture instant because the encoder already
+stamps it on the frame, so nothing new has to be carried to match an acknowledgement back to a
+reference frame. Nothing consumes it yet: it is the input VideoToolbox's
+`kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's reference invalidation both need.
+
+**The session link medium** — `wired` / `wireless` / `other` for the local end of the nominated ICE
+pair, resolved half a second after the connection comes up and printed as
+`session link: local candidate <ip> is on a <medium> adapter`. Windows reads
+`MSFT_NetAdapter.NdisPhysicalMedium`; macOS uses `getifaddrs` then `SIOCGIFMEDIA`. USB tethering and
+RNDIS both report Ethernet, which is the point — it is the only way the host can tell a cabled
+client from a Wi-Fi one, and every competitor in this category treats the wired path as its
+low-latency tier.
+
+
 ## Audio stages
 
 Audio does not travel with a `FrameTiming`; there is one host-wide capture fanned out to every

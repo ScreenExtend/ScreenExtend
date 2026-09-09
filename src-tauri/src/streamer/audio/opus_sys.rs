@@ -194,11 +194,21 @@ impl OpusApi {
         }
     }
 
+    /// What the loaded library says it is.
+    ///
+    /// This is the only identification the log carries for a `libloading`-resolved dependency
+    /// that ships in `resources/`, and Windows and macOS load different binaries behind the
+    /// same FFI. Measured on the bundled artifacts: the Windows DLL answers the literal
+    /// `"libopus unknown"` — upstream's own fallback when the build had no `package_version`,
+    /// which a shallow checkout does not generate — while the macOS dylib, built from the same
+    /// commit by hand, answers `"libopus 1.5.x-screenextend-src"`. Both are the library
+    /// speaking. The null case below is the library declining to speak at all, which upstream
+    /// never does, so it must not be reported with a string the library itself can return.
     pub fn version(&self) -> String {
         unsafe {
             let ptr = (self.get_version)();
             if ptr.is_null() {
-                return "unknown".to_string();
+                return "(library returned no version string)".to_string();
             }
             std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
         }
