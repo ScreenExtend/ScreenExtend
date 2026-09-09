@@ -264,7 +264,16 @@ fn intel_quicksync_fused_downscale() {
             .encode_texture(&tex, false)
             .expect("fused-scale encode");
     }
-    eprintln!("Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass");
+    // The same-adapter path's per-stage split. `major-intel-extra-full-frame-copy-per-frame`
+    // called the full-frame `CopySubresourceRegion` into the VPP input surface a real cost that
+    // nothing measured; this is the measurement. If the copy is a small fraction of the VPP pass
+    // it feeds, oneVPL surface import would be replacing a cheap blit with new FFI on a
+    // 2.9+-only API, which is not a trade worth making.
+    let (get_us, copy_us, vpp_us) = encoder.stage_medians_us();
+    eprintln!(
+        "Intel fused-downscale OK: {NW}x{NH} -> {OW}x{OH} in one VPP pass; per-frame medians \
+         get_surface={get_us}us copy_into_surface={copy_us}us vpp_submit={vpp_us}us"
+    );
 }
 
 /// Three encoders built at once must all get a session.

@@ -927,10 +927,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             dup.context(),
         )?;
 
-        // No scaler at all when the display is already the size the client asked for: the blt
-        // would be an identity pass and the extra surface a wasted allocation.
-        let needs_scaler =
-            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let needs_scaler = needs_scaler(&backend, config.width, config.height, native_w, native_h);
         let scaler = if needs_scaler {
             Some(
                 Scaler::with_format(
@@ -2219,6 +2216,32 @@ fn video_processor_available(device: &ID3D11Device, context: &ID3D11DeviceContex
     device.cast::<ID3D11VideoDevice>().is_ok() && context.cast::<ID3D11VideoContext>().is_ok()
 }
 
+/// Whether to run a `VideoProcessorBlt` before handing the frame to the encoder.
+///
+/// Two independent reasons, and the second is not obvious:
+///
+/// 1. **Scaling.** The display is not the size the client asked for. An equal-size display needs
+///    no blt for this reason, and `Backend::Intel` never does because its VPP fuses the scale
+///    into the encode.
+/// 2. **Converting.** A CPU-bridge backend that wants NV12 gets a scaler even at identity size,
+///    because the blt is not what costs — the *readback* is, and NV12 halves it. Measured at
+///    1920x1080 identity, 60 iterations, median per frame
+///    (`identity_blt_to_nv12_against_a_bgra_readback`):
+///
+///    ```text
+///    bgra8  blt 11 us  readback 2394 us  total 2405 us  8,294,400 bytes
+///    nv12   blt  6 us  readback 1170 us  total 1176 us  3,110,400 bytes
+///    ```
+///
+///    51% off the stage for a 6 us blt, and that is before the encoder-side saving of not
+///    running a colour matrix on the CPU at all. Skipping the "wasted" identity pass was costing
+///    1.2 ms a frame on exactly the configuration a native-resolution client produces.
+fn needs_scaler(backend: &Backend, want_w: u32, want_h: u32, native_w: u32, native_h: u32) -> bool {
+    let scale = backend.wants_prescale() && (want_w != native_w || want_h != native_h);
+    let convert = backend.is_cpu_bridge() && backend.cpu_bridge_format() != ReadbackFormat::Bgra8;
+    scale || convert
+}
+
 /// The scaler's destination format for a given backend.
 ///
 /// Only a CPU-bridge backend reads the scaled surface back, so only it has an opinion. A GPU-path
@@ -2577,9 +2600,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             &ctx.device_context,
         )?;
 
-        // Same as the DXGI path: an equal-size display needs no blt.
-        let needs_scaler =
-            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let needs_scaler = needs_scaler(&backend, config.width, config.height, native_w, native_h);
         let scaler = if needs_scaler {
             match Scaler::with_format(
                 &ctx.device,
