@@ -2,16 +2,17 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{extern_class, extern_methods, sel, AnyThread};
-use objc2_core_foundation::{CGPoint, CGSize};
+use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRunLoop, CGPoint, CGSize};
 use objc2_core_graphics::{
-    CGDisplayCopyAllDisplayModes, CGDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide,
+    CGDirectDisplayID, CGDisplayChangeSummaryFlags, CGDisplayCopyAllDisplayModes, CGDisplayMode,
+    CGDisplayPixelsHigh, CGDisplayPixelsWide, CGDisplayRegisterReconfigurationCallback,
     CGDisplaySetDisplayMode, CGError, CGGetActiveDisplayList, CGMainDisplayID,
 };
 use objc2_foundation::{NSArray, NSString};
@@ -32,6 +33,10 @@ const MODE_SETTLE_TIMEOUT: Duration = Duration::from_millis(1500);
 const FAST_POLL_WINDOW: Duration = Duration::from_millis(250);
 const FAST_POLL: Duration = Duration::from_millis(5);
 const SLOW_POLL: Duration = Duration::from_millis(25);
+/// How long the settle wait sleeps between geometry reads once WindowServer's reconfiguration
+/// events are reaching us. Deliberately much longer than `SLOW_POLL`: the event is what wakes it,
+/// and this is only the ceiling on the cost of one that never arrives.
+const MODE_SETTLE_WAKE: Duration = Duration::from_millis(100);
 const REMOVAL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
 extern_class!(
@@ -266,7 +271,7 @@ fn report_settings_surface() {
 /// dispatch queue for exactly this callback; until now nothing was registered on it, so the
 /// registry kept a live handle to a display that no longer existed and the session kept streaming
 /// a display id that resolved to nothing.
-unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, serial: u32) {
+unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, token: u32) {
     let responds: bool = objc2::msg_send![desc, respondsToSelector: sel!(setTerminationHandler:)];
     if !responds {
         return;
@@ -277,7 +282,7 @@ unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, serial:
             let id = guard
                 .displays
                 .iter()
-                .find(|(_, entry)| entry.serial == serial)
+                .find(|(_, entry)| entry.token == token)
                 .map(|(id, _)| *id);
             id.and_then(|id| guard.displays.remove(&id).map(|_| id))
         };
@@ -295,6 +300,26 @@ unsafe fn install_termination_handler(desc: &CGVirtualDisplayDescriptor, serial:
     // the display's own teardown, so the block is deliberately never freed. It is one small
     // allocation per display created.
     std::mem::forget(handler);
+}
+
+/// The display's serial number, derived from its name so that the same client device gets the same
+/// display identity every time.
+///
+/// macOS keys per-display state — arrangement position, colour profile, resolution preference — on
+/// vendor/product/serial. The serial used to be a process-local counter starting at 1, so the
+/// *first* device to join after every launch inherited whatever arrangement the previous run's
+/// first device had left behind, and a returning device never got its own back. `name` is
+/// `"ScreenExtend - <device name>"`, which is the most stable per-device identity that reaches this
+/// layer.
+///
+/// FNV-1a, folded away from 0 because a serial of 0 reads as "unset".
+fn display_serial(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash | 1
 }
 
 unsafe fn create_cg_virtual_display(
@@ -341,12 +366,14 @@ unsafe fn create_cg_virtual_display(
         width: 25.4 * width as f64 / DEFAULT_PPI,
         height: 25.4 * height as f64 / DEFAULT_PPI,
     });
-    static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
-    let serial = NEXT_SERIAL.fetch_add(1, Ordering::Relaxed);
-    desc.setSerialNum(serial);
+    desc.setSerialNum(display_serial(name));
     desc.setProductID(0x1234);
     desc.setVendorID(0x3456);
-    install_termination_handler(&desc, serial);
+    // Not the descriptor's serial: two clients can carry the same device name, and the termination
+    // handler has to name exactly one registry entry.
+    static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    install_termination_handler(&desc, token);
 
     let display = CGVirtualDisplay::initWithDescriptor(CGVirtualDisplay::alloc(), &desc)
         .ok_or_else(|| {
@@ -371,7 +398,7 @@ unsafe fn create_cg_virtual_display(
         hidpi,
         modes,
     };
-    Ok((display, applied, serial))
+    Ok((display, applied, token))
 }
 
 fn poll_interval(started: Instant) -> Duration {
@@ -379,6 +406,126 @@ fn poll_interval(started: Instant) -> Duration {
         FAST_POLL
     } else {
         SLOW_POLL
+    }
+}
+
+/// Bumped once per completed WindowServer reconfiguration. A generation counter rather than a bare
+/// notify: the waiter reads it *before* it reads the geometry, so a reconfiguration that lands
+/// between the two cannot be lost.
+struct ReconfigureSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+fn reconfigure_signal() -> &'static ReconfigureSignal {
+    static SIGNAL: OnceLock<ReconfigureSignal> = OnceLock::new();
+    SIGNAL.get_or_init(|| ReconfigureSignal {
+        generation: Mutex::new(0),
+        changed: Condvar::new(),
+    })
+}
+
+unsafe extern "C-unwind" fn on_display_reconfigured(
+    _display: CGDirectDisplayID,
+    flags: CGDisplayChangeSummaryFlags,
+    _user_info: *mut std::ffi::c_void,
+) {
+    // The "begin" pass fires before anything has moved. Only the completion pass means the
+    // geometry is readable.
+    if flags.contains(CGDisplayChangeSummaryFlags::BeginConfigurationFlag) {
+        return;
+    }
+    let signal = reconfigure_signal();
+    if let Ok(mut generation) = signal.generation.lock() {
+        *generation += 1;
+    }
+    signal.changed.notify_all();
+}
+
+/// Whether WindowServer's reconfiguration events are reaching us.
+///
+/// `CGDisplayRegisterReconfigurationCallback` is 10.3+, but it delivers on the run loop of the
+/// thread that registered it — and the join path runs on a `spawn_blocking` worker with no run
+/// loop of its own. So the registration lives on a thread that exists to run one. The answer is
+/// only ever an accelerator: `wait_for_settle` re-reads the geometry on a bounded timeout whether
+/// or not an event ever arrives, so a machine where the callback never fires is no slower than the
+/// poll it replaced.
+fn reconfiguration_events_available() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("cg-display-reconfig".to_string())
+            .spawn(move || {
+                let err = unsafe {
+                    CGDisplayRegisterReconfigurationCallback(
+                        Some(on_display_reconfigured),
+                        std::ptr::null_mut(),
+                    )
+                };
+                let _ = tx.send(err == CGError::Success);
+                if err != CGError::Success {
+                    return;
+                }
+                let mode = unsafe { kCFRunLoopDefaultMode };
+                loop {
+                    // A run loop with no sources left returns immediately, so the sleep is what
+                    // keeps an unexpectedly empty one from spinning a core.
+                    CFRunLoop::run_in_mode(mode, 1.0e9, false);
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            })
+            .is_ok();
+        let registered = spawned && rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false);
+        if !registered {
+            teprintln!(
+                "[display] CGDisplayRegisterReconfigurationCallback did not take; falling back to \
+                 polling for mode changes to settle"
+            );
+        }
+        registered
+    })
+}
+
+/// Wait for `display_id` to report `width x height` points.
+///
+/// Event-driven where WindowServer will tell us, with the previous poll cadence as the ceiling on
+/// how long a missed event can cost.
+fn wait_for_settle(display_id: u32, width: u32, height: u32) -> Result<(), String> {
+    let started = Instant::now();
+    let deadline = started + MODE_SETTLE_TIMEOUT;
+    let events = reconfiguration_events_available();
+    let signal = reconfigure_signal();
+
+    loop {
+        let seen = *signal.generation.lock().unwrap();
+
+        let w = unsafe { CGDisplayPixelsWide(display_id) } as u32;
+        let h = unsafe { CGDisplayPixelsHigh(display_id) } as u32;
+        if w == width && h == height {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "display {display_id} did not settle to {width}x{height} (still {w}x{h})"
+            ));
+        }
+
+        if events {
+            // A reconfiguration that completed while we were reading the geometry has already
+            // bumped the counter, so this never sleeps through one.
+            let guard = signal.generation.lock().unwrap();
+            if *guard == seen {
+                let _unused = signal
+                    .changed
+                    .wait_timeout(guard, MODE_SETTLE_WAKE.min(deadline - now))
+                    .unwrap();
+            }
+        } else {
+            std::thread::sleep(poll_interval(started).min(deadline - now));
+        }
     }
 }
 
@@ -437,21 +584,7 @@ pub(crate) fn activate_mode(display_id: u32, width: u32, height: u32) -> Result<
     };
 
     if switched {
-        let settle_started = Instant::now();
-        let deadline = settle_started + MODE_SETTLE_TIMEOUT;
-        loop {
-            let w = unsafe { CGDisplayPixelsWide(display_id) } as u32;
-            let h = unsafe { CGDisplayPixelsHigh(display_id) } as u32;
-            if w == width && h == height {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "display {display_id} did not settle to {width}x{height} (still {w}x{h})"
-                ));
-            }
-            std::thread::sleep(poll_interval(settle_started));
-        }
+        return wait_for_settle(display_id, width, height);
     }
     Ok(())
 }
@@ -463,7 +596,7 @@ struct DisplayEntry {
     /// `applySettings:` can re-register the same set of reachable geometries instead of shrinking
     /// the mode list to the one mode it happens to be changing to.
     ladder: Vec<(u32, u32)>,
-    serial: u32,
+    token: u32,
 }
 
 struct DisplayRegistry {
@@ -745,7 +878,7 @@ impl VirtualDisplayController for MacosVirtualDisplay {
         };
         let hidpi = hidpi_from_ladder(width, extra_modes);
 
-        let (display, applied, serial) = unsafe {
+        let (display, applied, token) = unsafe {
             create_cg_virtual_display(&name, width, height, refresh, hidpi, extra_modes)?
         };
         let id = unsafe { display.displayID() };
@@ -765,7 +898,7 @@ impl VirtualDisplayController for MacosVirtualDisplay {
                 display,
                 applied,
                 ladder: extra_modes.to_vec(),
-                serial,
+                token,
             },
         );
 
@@ -817,10 +950,35 @@ mod tests {
 
     #[test]
     fn a_display_name_resolves_only_to_a_live_display() {
+        // CoreGraphics reports no displays at all to a process outside a logged-in console
+        // session, and ssh is how this crate is usually tested on the 10.15 box. The assertion is
+        // about a live display, so with none present there is nothing to assert.
+        if crate::macos_utils::streamer::display::active_displays().is_empty() {
+            println!("no console session (ssh?); skipping");
+            return;
+        }
         let vd = MacosVirtualDisplay;
         let main = unsafe { CGMainDisplayID() };
         assert_eq!(vd.display_device_name(main), Some(main.to_string()));
         assert_eq!(vd.display_device_name(0xDEAD_BEEF), None);
+    }
+
+    #[test]
+    fn the_same_device_name_always_gets_the_same_display_serial() {
+        let ipad = display_serial("ScreenExtend - Sarvesh's iPad");
+        assert_eq!(ipad, display_serial("ScreenExtend - Sarvesh's iPad"));
+        assert_ne!(ipad, display_serial("ScreenExtend - Pixel 7"));
+        assert_ne!(display_serial(""), 0, "a serial of 0 reads as unset");
+    }
+
+    /// The settle wait is event-driven only where the registration takes. Over ssh it may not, and
+    /// the poll fallback is what then has to keep working — so this asserts that the probe answers
+    /// and caches, not which answer it gives.
+    #[test]
+    fn the_reconfiguration_watcher_reports_whether_it_registered() {
+        let available = reconfiguration_events_available();
+        println!("CGDisplayRegisterReconfigurationCallback registered: {available}");
+        assert_eq!(available, reconfiguration_events_available());
     }
 
     /// A/B of the Retina join sequence on real hardware.
@@ -848,7 +1006,7 @@ mod tests {
         // reach HiDPI, which is what `apply_display_scale(200)` did on every Retina join.
         let started = Instant::now();
         let old = unsafe { create_cg_virtual_display("SE-old", w, h, refresh, 0, &[]) };
-        let Ok((display, applied, serial)) = old else {
+        let Ok((display, applied, token)) = old else {
             println!("could not create a virtual display: {:?}", old.err());
             return;
         };
@@ -859,7 +1017,7 @@ mod tests {
                 display,
                 applied,
                 ladder: Vec::new(),
-                serial,
+                token,
             },
         );
         let _ = activate_mode(id, w, h);
