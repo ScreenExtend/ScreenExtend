@@ -46,7 +46,7 @@ impl Probes {
             audio_backend: "unknown",
             capture_backend: "unknown",
             encoder: EncoderProbe {
-                backend: "unknown",
+                backend: "unknown".to_string(),
                 software_adapter_only: false,
             },
             display_backend: DisplayBackend::IddDriver,
@@ -56,8 +56,9 @@ impl Probes {
 }
 
 struct EncoderProbe {
-    /// The encoder the pipeline would reach for first on this hardware.
-    backend: &'static str,
+    /// The encoder the pipeline would reach for first on this hardware. Owned rather than
+    /// `&'static str` because the AMD arm can name the reason AMF was not available.
+    backend: String,
     /// Every DXGI adapter on this machine is a software rasteriser (WARP / Basic Render Driver).
     software_adapter_only: bool,
 }
@@ -189,11 +190,23 @@ fn probe_audio_backend() -> &'static str {
 }
 
 /// Which encoder the pipeline would reach for. `EncoderVendor::Auto` tries NVENC, then Quick
-/// Sync, then x264, choosing by DXGI adapter description — the same classification used here.
+/// Sync, then AMF, then x264.
+///
+/// Adapters are classified by **PCI vendor id**, not by their description string: descriptions are
+/// localized and OEM-rebranded, and WARP's contains no vendor name at all while reporting
+/// Microsoft's `0x1414`. `select_vendor` stays as the fallback for an adapter whose id is not one
+/// we know, which is the only case a name can still help with.
+///
+/// The AMD arm goes further than the other two and actually asks AMF whether it would open here.
+/// It used to report `"x264 (no AMD hardware encoder)"` unconditionally, which stopped being true
+/// the day the AMF backend landed, and that string is shown in the compatibility card and read by
+/// `doctor --json` — so an AMD user was being told the product could not use their GPU.
 fn probe_encoder() -> EncoderProbe {
     let mut has_nvidia = false;
     let mut has_intel = false;
     let mut has_amd = false;
+    // The first hardware adapter's vendor, which is the one the capture device lands on.
+    let mut first_hardware: Option<Vendor> = None;
     let mut hardware_adapters = 0usize;
     let mut software_adapters = 0usize;
 
@@ -201,7 +214,7 @@ fn probe_encoder() -> EncoderProbe {
         Ok(factory) => factory,
         Err(_) => {
             return EncoderProbe {
-                backend: "x264",
+                backend: "x264".to_string(),
                 software_adapter_only: false,
             }
         }
@@ -230,7 +243,12 @@ fn probe_encoder() -> EncoderProbe {
             continue;
         }
         hardware_adapters += 1;
-        match select_vendor(&name) {
+        let vendor = match Vendor::from_pci_id(desc.VendorId) {
+            Vendor::Unknown => select_vendor(&name),
+            known => known,
+        };
+        first_hardware.get_or_insert(vendor);
+        match vendor {
             Vendor::Nvidia => has_nvidia = true,
             Vendor::Intel => has_intel = true,
             Vendor::Amd => has_amd = true,
@@ -239,19 +257,33 @@ fn probe_encoder() -> EncoderProbe {
     }
 
     let backend = if has_nvidia {
-        "nvenc"
+        "nvenc".to_string()
     } else if has_intel {
-        "quicksync"
+        "quicksync".to_string()
     } else if has_amd {
-        // AMD encode is a stub; those hosts run the CPU encoder.
-        "x264 (no AMD hardware encoder)"
+        amd_backend_name(first_hardware == Some(Vendor::Amd))
     } else {
-        "x264"
+        "x264".to_string()
     };
 
     EncoderProbe {
         backend,
         software_adapter_only: hardware_adapters == 0 && software_adapters > 0,
+    }
+}
+
+/// The AMD arm of [`probe_encoder`], split out so the AMF probe is one call.
+///
+/// `same_adapter` is whether the first hardware adapter — the one the capture device is created
+/// on — is the AMD one. When it is not, `Backend::Amf` refuses ("AMD AMF requires an AMD D3D11
+/// device") and the pipeline falls to `Backend::AmfCpu`, which is a readback per frame and worth
+/// saying out loud.
+fn amd_backend_name(same_adapter: bool) -> String {
+    use super::streamer::amd::encoder::{probe_availability, AmfAvailability};
+    match probe_availability() {
+        AmfAvailability::Hardware if same_adapter => "amf".to_string(),
+        AmfAvailability::Hardware => "amf (cpu bridge)".to_string(),
+        AmfAvailability::Unavailable(reason) => format!("x264 (AMF unavailable: {reason})"),
     }
 }
 

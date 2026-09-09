@@ -1490,6 +1490,55 @@ fn result_codes_classify_into_retry_rebuild_and_give_up() {
     }
 }
 
+/// A NULL out-pointer means "not finished yet"; a real output object carrying no bytes means
+/// "finished, and there was nothing in it". Folding the second into the first is what made an
+/// empty buffer a two-second stall and then a torn-down session, so the distinction is asserted
+/// here — it cannot be exercised on hardware this project has.
+#[test]
+fn an_empty_output_buffer_is_a_consumed_frame_not_nothing_yet() {
+    use enc::{classify_query_output, QueryClass};
+
+    // NULL out-pointer: the encoder has not produced this picture yet. `QueryOutput` can say so
+    // with any of these codes, which is why the pointer and not the code is the signal.
+    for r in [AMF_OK, AMF_REPEAT, AMF_NEED_MORE_INPUT, AMF_EOF] {
+        assert_eq!(
+            classify_query_output(true, true, r),
+            QueryClass::NotReady,
+            "{}",
+            result_name(r)
+        );
+    }
+    // NULL out-pointer with a code that is not benign is a real failure.
+    for r in [AMF_NO_DEVICE, AMF_DIRECTX_FAILED, AMF_FAIL] {
+        assert_eq!(
+            classify_query_output(true, true, r),
+            QueryClass::Error,
+            "{}",
+            result_name(r)
+        );
+    }
+    // A real output object. The reference is ours either way, so an empty one is consumed and
+    // will never come back — the caller must not poll for it.
+    assert_eq!(
+        classify_query_output(false, true, AMF_OK),
+        QueryClass::Empty
+    );
+    assert_eq!(
+        classify_query_output(false, false, AMF_OK),
+        QueryClass::Data
+    );
+    // The result code does not override a delivered object: FFmpeg and OBS both test the
+    // pointer, because AMF returns AMF_REPEAT alongside real data.
+    assert_eq!(
+        classify_query_output(false, false, AMF_REPEAT),
+        QueryClass::Data
+    );
+    assert_eq!(
+        classify_query_output(false, true, AMF_NEED_MORE_INPUT),
+        QueryClass::Empty
+    );
+}
+
 /// `AMFInit` is asked for a **lower** version than the headers we vendor. AMF serves clients
 /// built against older SDKs and rejects newer ones, so pinning high is the one way to lock out
 /// hardware that would otherwise work.
