@@ -150,6 +150,14 @@ struct Session {
     /// The mode macOS chose on its own, before we moved the display onto the
     /// one the client asked for. Restored on teardown — see [`remove_display`].
     granted: (u32, u32),
+    /// The geometry the display actually settled on, in monitor coordinates.
+    ///
+    /// This tier *negotiates* rather than being commanded: the client asks for a size, macOS
+    /// publishes a fixed ladder, and `closest_mode` picks from it. So the answer is knowable here
+    /// and nowhere else, and it used to be computed and dropped — which left the server forcing a
+    /// `CGDisplaySetDisplayMode` to a size that is not on the ladder, on every join by a device
+    /// whose DPR is greater than 1, followed by a settle poll that could only time out.
+    settled: (u32, u32),
     /// What every display was doing before the session, so the Mac's own screen
     /// can be put back after macOS mirrors and un-mirrors it.
     modes_before: topology::ModeSnapshot,
@@ -221,6 +229,16 @@ fn prewarm() {
 fn registry() -> &'static Mutex<SessionRegistry> {
     static REGISTRY: OnceLock<Mutex<SessionRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(SessionRegistry::default()))
+}
+
+/// The geometry an AirPlay display actually settled on, in monitor coordinates.
+///
+/// `None` for a display this backend did not create. Every other virtual-display backend is
+/// *commanded* and genuinely does not know which mode it got — the Windows IDD registers a list
+/// and the OS picks from it — which is why the trait's default answer is `None`. This tier is the
+/// exception: it reads the ladder macOS published, chooses from it, and waits for the result.
+pub fn negotiated_geometry(id: u32) -> Option<(u32, u32)> {
+    registry().lock().ok()?.sessions.get(&id).map(|s| s.settled)
 }
 
 /// True when a display id was created by this backend.
@@ -408,6 +426,7 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
                 name: receiver_name,
                 requested: Geometry::new(width, height, refresh_rate),
                 granted,
+                settled: (w, h),
                 modes_before,
             },
         );
@@ -438,6 +457,16 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
         }
         crate::macos_utils::streamer::display::display_by_name(&id.to_string())
             .map(|id| id.to_string())
+    }
+
+    /// This is the one backend that *negotiates* its geometry instead of being commanded, and
+    /// it already computed the answer: `settle_geometry` picked the closest mode out of the
+    /// ladder CoreDisplay published and stored it. Returning it lets `start_session` skip both
+    /// the forced `set_display_mode` and the settle poll behind it -- a mode set that could not
+    /// have succeeded anyway whenever the client asked for anything off that ladder, which is
+    /// every DPR>1 device.
+    fn created_geometry(&self, id: u32) -> Option<(u32, u32)> {
+        negotiated_geometry(id)
     }
 
     /// macOS drives exactly one AirPlay display, so a second client cannot be
@@ -623,6 +652,15 @@ mod tests {
             !occupied,
             "a test run must not leave an AirPlay session in the registry"
         );
+    }
+
+    #[test]
+    fn a_display_we_did_not_create_has_no_negotiated_geometry() {
+        // The server takes `None` as "this backend cannot say", and falls back to forcing the mode
+        // and polling for it. Answering anything else for a display we do not own would make it
+        // skip that for a display it has no claim over.
+        registry().lock().unwrap().sessions.clear();
+        assert_eq!(negotiated_geometry(0xDEAD_BEEF), None);
     }
 
     #[test]
