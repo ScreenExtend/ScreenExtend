@@ -459,6 +459,16 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
             .map(|id| id.to_string())
     }
 
+    /// This is the one backend that *negotiates* its geometry instead of being commanded, and
+    /// it already computed the answer: `settle_geometry` picked the closest mode out of the
+    /// ladder CoreDisplay published and stored it. Returning it lets `start_session` skip both
+    /// the forced `set_display_mode` and the settle poll behind it -- a mode set that could not
+    /// have succeeded anyway whenever the client asked for anything off that ladder, which is
+    /// every DPR>1 device.
+    fn created_geometry(&self, id: u32) -> Option<(u32, u32)> {
+        negotiated_geometry(id)
+    }
+
     /// macOS drives exactly one AirPlay display, so a second client cannot be
     /// given one while the first is connected.
     fn max_concurrent_displays(&self) -> Option<usize> {

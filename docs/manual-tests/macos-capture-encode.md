@@ -96,6 +96,27 @@ unset — which is why the line prints `unknown` rather than guessing.
   minimum of 640 wide *or* 480 tall; on Intel this should be the one that says
   `hardware=false`).
 
+### The measured floor on the dev box, for comparison
+
+`encoder::tests::hw_capability_probe` walks a ladder of sizes and reports which ones
+a hardware session accepts. On the 10.15.8 2019 Intel box:
+
+| Size | Hardware |
+|---|---|
+| 1280x720, 1024x576, 960x540, 854x480, 768x432, 720x480, **640x360** | OK |
+| 576x324, 512x288, 480x270, 426x240, 320x180 | `OSStatus -12915` |
+
+640x360 succeeding with a height of 360 is the point: the rule is `width ≥ 640` **or**
+`height ≥ 480`, a disjunction, not a pair of minimums. Run the same test on Apple
+silicon and expect every rung to pass — Chromium's measured minimum there is 16x16.
+
+ScreenExtend does **not** upscale a small client to reach the hardware encoder. Spending
+bitrate to save CPU, at the one content size where software H.264 is cheap, is the wrong
+trade; the defect was that it happened silently, and the loud identity line is the fix.
+
+`hw_capability_probe` also reports how many hardware sessions can exist at once. The dev
+box managed **6 of 6**, so the scarce-resource path below is not reachable there.
+
 ### The scarce-resource case
 
 `instance_limited=true` in the catalog line means Apple has told us this encoder is
@@ -110,6 +131,33 @@ a global scarce resource. Reproduce the contention:
 **Fail if** the session silently lands on software with no line naming the reason.
 This is the documented mechanism behind "it only works if I quit everything else",
 and it must be visible in the log.
+
+## 2b. The software-encode setting
+
+Turn on "software encode" in Settings (or run `ScreenExtend serve --software-encode`)
+and join a device. Expect, in this order:
+
+```
+[vt] software encode was requested, so this session forbids the hardware encoder (EnableHardwareAcceleratedVideoEncoder=false)
+[vt] encoder identity: id=… hardware=false gpu_registry_id=none (integrated or software)
+[vt] this session is on the software H.264 encoder because software encode is switched on. Expect higher latency and CPU; that is the setting working.
+```
+
+The third line is the one to check. It is **not** the loud
+`this session is on the SOFTWARE H.264 encoder` warning — that one means the hardware
+encoder was wanted and was not available, and it must never appear for a session that
+asked for software.
+
+**Fail if** `hardware=true` with the setting on. Until this landed, macOS read the flag
+nowhere at all, so that is exactly what happened.
+
+There is deliberately no fallback the other way: with software encode on, the ladder has
+one rung and a failed session create is reported rather than quietly retried on hardware.
+
+**Record**: the three lines above, and whether toggling the setting mid-session swaps the
+encoder or restarts the streamers. Restarting is today's behaviour on both platforms; the
+live swap needs `Config::software_encode_now()`, tracked in
+`findings/minor-session-gpu-toggle-snapshotted.md`.
 
 ## 3. Whether low-latency rate control is on
 
@@ -201,14 +249,56 @@ flight` from the summary. Capture-side, the matching number is on the stop line:
 are starving the stream — check the queue depth. The callback mean is the whole
 per-frame cost this backend pays inside CoreGraphics' delivery queue.
 
+## 7b. Whether this Mac's frame timestamps mean what the header says
+
+```sh
+cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate -- --ignored --nocapture
+```
+
+prints, among other things:
+
+```
+[native] displayTime->callback ms: p50=-15.53 p90=-15.12 p99=-11.97 max=-11.42 (n=193)
+```
+
+That is `displayTime` subtracted from the moment our delivery callback ran. On the
+10.15.8 box every value is **negative and banded on one frame period**: `displayTime` is
+the time WindowServer *scheduled* the frame to be shown, not the moment it was composited.
+Used raw as the capture instant it makes every latency measured from it a frame period
+short, so the code takes the earlier of it and the callback's own arrival.
+
+**Record**: the four percentiles per OS, and whether they are negative. If a newer macOS
+reports positive values, `displayTime` there is a real composite time and is strictly
+better than the callback arrival — the clamp simply stops firing, and the capture term in
+`docs/LATENCY-MAP.md` becomes measurable rather than bounded.
+
+Also record `frames with no displayTime: N/M` from the same run; the dev box drops the
+stamp on 2–3 frames per 200.
+
+ScreenCaptureKit's PTS goes through the same gate and has never been measured on any
+machine this project owns, so on 12.3+ it is worth printing the same histogram for the SCK
+path before trusting it.
+
 ## 8. What latency to expect
 
 Measured on the 10.15.8 Intel dev box (CGDisplayStream + VideoToolbox, no low
 latency, no SCK) — the slowest configuration the code supports. A modern Mac should
 be at or below every one of these.
 
-See `docs/BASELINE.md` for the filled matrix. Take the numbers from the same
-harness so they are comparable:
+`docs/BASELINE.md` now carries the filled matrix. The headline numbers to beat,
+1440x900 @ 60 Hz, medians of three 6 s trials:
+
+| | value |
+|---|---|
+| capture → encoded p50 / p99 / max | **13.61 / 15.06 / 20.64 ms** |
+| frames captured in 6 s | 370–373 (~62 fps) |
+| dropped by WindowServer | **0** on every trial |
+| encoder output drops | **0** |
+| VideoToolbox frames pending at flush | **0** |
+| delivery-callback mean, native / half scale | 311.0 / 88.3 µs |
+| SPS `max_num_reorder_frames` | **0** |
+
+Take the numbers from the same harness so they are comparable:
 
 ```sh
 cargo test --release --lib macos_utils::streamer::pipeline::tests::end_to_end_latency -- --ignored --nocapture
