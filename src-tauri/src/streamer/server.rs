@@ -801,7 +801,7 @@ async fn whep(
     }
     let ice = state.ice_for(state.locality_for(&client_ip));
     let out = process_whep(&state, &client_ip, &body, ice).await;
-    let status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -812,9 +812,15 @@ async fn whep(
             headers.insert("x-device-token", value);
         }
     }
+    // RFC 9725 §4.1: a WHEP resource is created, so the answer that carries its `Location` is a
+    // `201`, not a `200`. Only here — the cloud tunnel has no URL space and sets no `Location`,
+    // and a `201` without one would be a lie. Our own client reads `resp.ok`, which covers both.
     if let Some(resource) = out.resource.as_deref() {
         if let Ok(value) = header::HeaderValue::from_str(&format!("/whep/{resource}")) {
             headers.insert(header::LOCATION, value);
+            if status == StatusCode::OK {
+                status = StatusCode::CREATED;
+            }
         }
     }
     (status, headers, out.body).into_response()
@@ -826,30 +832,53 @@ async fn whep(
 /// gathering has finished or timed out, so the offer it sends is the only one the host will ever
 /// see. With TURN configured that wait runs until a relay candidate arrives; on a network where no
 /// candidate arrives at all it burns the full deadline.
-async fn whep_patch(Path(id): Path<String>, body: Bytes) -> Response {
+///
+/// The resource id is a 128-bit capability, but it is handed out in a `Location` header that
+/// travels in cleartext on the HTTP listener — the listener most LAN joins actually use. So the
+/// id alone is not the authority: the peer that opened the session is checked too, and the
+/// fragment count is bounded, because adding remote candidates is a media-redirection primitive.
+async fn whep_patch(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
     let Ok(text) = std::str::from_utf8(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     if text.len() > MAX_SDP_LEN {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    if webrtc_session::add_trickled_candidates(&id, text).await {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        // Gone rather than Not Found: the id was well-formed, the session is simply over.
-        StatusCode::NOT_FOUND.into_response()
+    let device_key = peer.ip().to_string();
+    match webrtc_session::add_trickled_candidates(&id, &device_key, text).await {
+        webrtc_session::TrickleLookup::Found => StatusCode::NO_CONTENT.into_response(),
+        // Not Found, not Gone: the same answer for "no such id" and "not yours", so a probe
+        // cannot tell them apart. The client stops trickling on exactly `404`
+        // (`static/index.html`, `startTrickle`), which is what makes this the right status to
+        // keep — a session it can no longer reach is one there is nothing to retry into.
+        webrtc_session::TrickleLookup::Unknown => StatusCode::NOT_FOUND.into_response(),
+        webrtc_session::TrickleLookup::Exhausted => StatusCode::TOO_MANY_REQUESTS.into_response(),
     }
 }
 
 /// Tear the resource down, RFC 9725 §4.4. The client already has `/leave`; this exists so the
 /// resource the `Location` header hands out is a real one.
+///
+/// The id is resolved through the same registry `whep_patch` uses rather than trusting the
+/// caller's address: the session is keyed by device, so without the lookup `DELETE /whep/<any
+/// string at all>` would tear down whatever session the caller happened to own.
 async fn whep_delete(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> Response {
-    process_leave(&state, &peer.ip().to_string());
-    StatusCode::NO_CONTENT.into_response()
+    let device_key = peer.ip().to_string();
+    match webrtc_session::trickle_owner(&id, &device_key) {
+        Some(key) => {
+            process_leave(&state, &key);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub async fn process_whep(
@@ -1420,6 +1449,7 @@ async fn start_session(
         display_and_pipeline,
         webrtc_session::prepare_whep(
             req.sdp.clone(),
+            client_ip,
             ice_servers,
             locality,
             video,

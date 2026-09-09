@@ -87,11 +87,21 @@ move is replayed rather than rejected, walking the cursor backwards and then for
 one frame. The 50 ms age gate bounds how stale a replayed move can be and says nothing about
 order, because there was nothing to compare.
 
-The host drops a **supersedable** fast event whose sequence is behind the highest it has already
+The host drops a **droppable** fast event whose sequence is behind the highest it has already
 injected, comparing `(seq - last) as i16 > 0` so the wrap at 65535 is correct, and counts it in
-`input_reorder_drops`. Buttons, keys, clipboard and lifecycle are never gated: a reordered state
-transition is not recoverable and must be injected whatever its sequence says. A `POINTER_LEAVE`
-or `POINTER_OUT` — fast but not supersedable — advances the counter without being droppable.
+`input_reorder_drops`. Only a *newer* sequence advances that high-water mark. Buttons, keys,
+clipboard and lifecycle are never gated: a reordered state transition is not recoverable and must
+be injected whatever its sequence says. A `POINTER_LEAVE` or `POINTER_OUT` — fast but not
+supersedable — advances the counter without being droppable.
+
+**`MOUSE_DELTA` is never dropped for order.** Its position term is a relative *increment* that
+both injector backends accumulate into a position they track themselves, and increments commute —
+applying a reordered one was always exactly correct, and dropping it loses that motion
+permanently, under pointer lock, where the user can least compensate. What a late delta must not
+do is restate a stale button word, which `button_transitions` would read as a press or a release,
+so the injector replaces that word with the newest one it has already injected before dispatching
+it. The age gate is unchanged and still drops a stale delta: 50 ms-old motion is worth less than
+the jump it would cause.
 
 The sequence space is per channel. `parse` decides `fast` from the opcode alone and not from the
 channel a message arrived on, so a fast opcode sent on `reliable` still lands on the lossy
