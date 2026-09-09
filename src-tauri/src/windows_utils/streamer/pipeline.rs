@@ -204,7 +204,7 @@ pub(crate) fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> 
 }
 
 fn effective_vendor(cfg: &Config) -> crate::streamer::config::EncoderVendor {
-    if cfg.disable_gpu_encode {
+    if cfg.software_encode_now() {
         crate::streamer::config::EncoderVendor::Software
     } else {
         cfg.encoder_vendor

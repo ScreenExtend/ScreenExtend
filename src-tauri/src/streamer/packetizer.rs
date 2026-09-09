@@ -1,0 +1,623 @@
+//! RFC 6184 packetization for the per-viewer RTP writer.
+//!
+//! This replaces `rtp::codecs::h264::H264Payloader`, which had two problems the writer could not
+//! work around from outside.
+//!
+//! **It could drop the parameter sets and say nothing.** The stock payloader stashes SPS and PPS
+//! and re-emits them as a STAP-A aggregate in front of the next VCL NAL — but only if the
+//! aggregate fits the MTU. If it does not, the aggregate is not pushed, no error is returned, and
+//! the stashed copies are cleared anyway so they are never retried. With an infinite GOP the
+//! client then has nothing to initialise its decoder from, ever: a black screen with RTP flowing
+//! and every host-side signal reporting success. RFC 6184 never required aggregation, so this
+//! emits them as their own packets when they do not fit together, and FU-A fragments either one
+//! if it does not fit alone.
+//!
+//! **It allocated once per fragment.** `emit` built a fresh `BytesMut` per FU-A fragment plus a
+//! `copy_from_slice`; a 300 KB IDR at a 1188-byte MTU is ~260 allocations landing in one tight
+//! loop on a tokio worker that is also driving socket writes, and the whole thing is redone for
+//! every connected viewer. Here a NAL that must be fragmented gets **one** allocation for the
+//! whole NAL, carved into per-fragment `Bytes` with `split_to`, so the fragments share it by
+//! refcount. A NAL that fits the MTU is a `Bytes::slice` of the frame — no allocation and no copy
+//! at all, which the stock payloader also managed and is worth keeping.
+
+use bytes::{BufMut, Bytes, BytesMut};
+
+const NAL_TYPE_MASK: u8 = 0x1f;
+
+const NAL_AUD: u8 = 9;
+const NAL_FILLER: u8 = 12;
+pub(crate) const NAL_SPS: u8 = 7;
+pub(crate) const NAL_PPS: u8 = 8;
+
+/// STAP-A, RFC 6184 §5.7.1.
+pub(crate) const NAL_STAP_A: u8 = 24;
+/// FU-A, RFC 6184 §5.8.
+const NAL_FU_A: u8 = 28;
+
+/// One byte of STAP-A NAL header plus a 2-byte size prefix per aggregated NAL.
+const STAP_A_OVERHEAD: usize = 1 + 2 + 2;
+/// FU indicator plus FU header.
+const FU_A_HEADER: usize = 2;
+
+/// Packetizes H.264 access units in Annex-B form into RTP payloads.
+///
+/// One per viewer, because the parameter-set stash is a per-stream state machine. It holds no
+/// buffers between calls, so a viewer costs nothing while it is idle.
+#[derive(Default)]
+pub struct H264Packetizer {
+    sps: Option<Bytes>,
+    pps: Option<Bytes>,
+    /// Parameter sets were dropped because the caller's MTU could not carry them even fragmented.
+    /// Only reachable at an absurd MTU; counted rather than assumed impossible.
+    dropped_parameter_sets: u64,
+}
+
+impl H264Packetizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn dropped_parameter_sets(&self) -> u64 {
+        self.dropped_parameter_sets
+    }
+
+    /// Packetize one access unit, appending to `out`.
+    ///
+    /// `frame` must be the whole access unit in Annex-B form. `out` is cleared first and is the
+    /// caller's to reuse across frames, which is what keeps the payload vector off the allocator
+    /// on the steady-state path.
+    pub fn packetize(&mut self, mtu: usize, frame: &Bytes, out: &mut Vec<Bytes>) {
+        out.clear();
+        if mtu <= FU_A_HEADER || frame.is_empty() {
+            return;
+        }
+        // The frame is at least this many packets; reserving up front is the difference between
+        // one growth and eight on a large IDR.
+        out.reserve(frame.len().div_ceil(mtu).max(1));
+
+        let mut emitted_vcl = false;
+        for (start, end) in AnnexBNals::new(frame) {
+            let nal = frame.slice(start..end);
+            let Some(&first) = nal.first() else { continue };
+            match first & NAL_TYPE_MASK {
+                NAL_AUD | NAL_FILLER => continue,
+                NAL_SPS => {
+                    self.sps = Some(nal);
+                    continue;
+                }
+                NAL_PPS => {
+                    self.pps = Some(nal);
+                    continue;
+                }
+                _ => {}
+            }
+            if !emitted_vcl {
+                emitted_vcl = true;
+                self.flush_parameter_sets(mtu, out);
+            }
+            self.emit_nal(mtu, nal, out);
+        }
+        // A parameter-sets-only access unit — some encoders emit one at session start. The stock
+        // payloader returned an empty payload list for it, which the writer could only answer with
+        // another IDR request. Sending them is both correct and what stops that spin.
+        if !emitted_vcl {
+            self.flush_parameter_sets(mtu, out);
+        }
+        self.sps = None;
+        self.pps = None;
+    }
+
+    fn flush_parameter_sets(&mut self, mtu: usize, out: &mut Vec<Bytes>) {
+        let (Some(sps), Some(pps)) = (self.sps.clone(), self.pps.clone()) else {
+            // Only one of the pair, which no conforming encoder emits. Send what there is rather
+            // than dropping it.
+            if let Some(sps) = self.sps.clone() {
+                self.emit_nal(mtu, sps, out);
+            }
+            if let Some(pps) = self.pps.clone() {
+                self.emit_nal(mtu, pps, out);
+            }
+            return;
+        };
+
+        let aggregate_len = STAP_A_OVERHEAD + sps.len() + pps.len();
+        if aggregate_len <= mtu {
+            let mut buf = BytesMut::with_capacity(aggregate_len);
+            // The STAP-A NAL header takes F and NRI from the highest of the aggregated NALs.
+            let nri = (sps[0] & 0x60).max(pps[0] & 0x60);
+            buf.put_u8(nri | NAL_STAP_A);
+            buf.put_u16(sps.len() as u16);
+            buf.put_slice(&sps);
+            buf.put_u16(pps.len() as u16);
+            buf.put_slice(&pps);
+            out.push(buf.freeze());
+            return;
+        }
+
+        // They do not fit together. RFC 6184 has never required aggregation, so send them
+        // separately — fragmenting either one if it needs it.
+        self.emit_nal(mtu, sps, out);
+        self.emit_nal(mtu, pps, out);
+    }
+
+    fn emit_nal(&mut self, mtu: usize, nal: Bytes, out: &mut Vec<Bytes>) {
+        if nal.len() <= mtu {
+            out.push(nal);
+            return;
+        }
+
+        let header = nal[0];
+        let nal_type = header & NAL_TYPE_MASK;
+        let nri = header & 0x60;
+        let body = &nal[1..];
+        let per_fragment = mtu - FU_A_HEADER;
+        if per_fragment == 0 {
+            if matches!(nal_type, NAL_SPS | NAL_PPS) {
+                self.dropped_parameter_sets += 1;
+            }
+            return;
+        }
+
+        let fragments = body.len().div_ceil(per_fragment);
+        // One allocation for the whole NAL. `split_to` hands out views into it, so every fragment
+        // after the first costs a refcount bump instead of a `BytesMut::with_capacity`.
+        let mut buf = BytesMut::with_capacity(body.len() + fragments * FU_A_HEADER);
+        let mut offset = 0usize;
+        let mut index = 0usize;
+        while offset < body.len() {
+            let take = per_fragment.min(body.len() - offset);
+            let start = index == 0;
+            let end = offset + take == body.len();
+            buf.put_u8(nri | NAL_FU_A);
+            buf.put_u8((u8::from(start) << 7) | (u8::from(end) << 6) | nal_type);
+            buf.put_slice(&body[offset..offset + take]);
+            offset += take;
+            index += 1;
+        }
+        for i in 0..fragments {
+            let take = per_fragment.min(body.len() - i * per_fragment);
+            let chunk = buf.split_to(FU_A_HEADER + take);
+            out.push(chunk.freeze());
+        }
+    }
+}
+
+/// Walks Annex-B start codes, yielding `(start, end)` byte ranges of each NAL unit's payload.
+struct AnnexBNals<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> AnnexBNals<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// The next start code at or after `from`, as `(offset of its first zero, its length)`.
+    ///
+    /// One pass, one comparison per byte, counting consecutive zeros — the shape a "does a start
+    /// code begin here?" predicate called at every offset is not. That mattered: the predicate
+    /// version measured **1.65x slower than the payloader it replaced** on a 16 KB P-frame, where
+    /// the scan is the whole cost and the fragmentation is one memcpy. Bounds checks are why: the
+    /// predicate reads up to four bytes per offset with a length test each, while this reads one.
+    fn next_start_code(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from >= buf.len() {
+            return None;
+        }
+        let mut zeros = 0usize;
+        for (offset, &b) in buf[from..].iter().enumerate() {
+            if b == 0 {
+                zeros += 1;
+            } else if b == 1 && zeros >= 2 {
+                let len = if zeros >= 3 { 4 } else { 3 };
+                return Some((from + offset + 1 - len, len));
+            } else {
+                zeros = 0;
+            }
+        }
+        None
+    }
+}
+
+impl Iterator for AnnexBNals<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let buf = self.buf;
+        loop {
+            let (sc_at, sc_len) = Self::next_start_code(buf, self.pos)?;
+            let start = sc_at + sc_len;
+            let end = match Self::next_start_code(buf, start) {
+                Some((next_at, _)) => next_at,
+                None => buf.len(),
+            };
+            self.pos = end;
+            if end > start {
+                return Some((start, end));
+            }
+            // Two start codes back to back. Skip the empty NAL rather than spinning on it.
+            if end >= buf.len() {
+                return None;
+            }
+        }
+    }
+}
+
+/// Whether a payload list actually carries the parameter sets, as a STAP-A aggregate, a bare SPS
+/// or the first fragment of a fragmented one.
+pub fn payloads_carry_parameter_sets(payloads: &[Bytes]) -> bool {
+    payloads.iter().any(|p| match p.first().map(|b| b & 0x1f) {
+        Some(NAL_STAP_A) | Some(NAL_SPS) => true,
+        Some(NAL_FU_A) => p
+            .get(1)
+            .is_some_and(|h| h & 0x80 != 0 && h & NAL_TYPE_MASK == NAL_SPS),
+        _ => false,
+    })
+}
+
+/// Whether an access unit carries a sequence parameter set.
+///
+/// Parameter sets lead a keyframe access unit, at most behind an AUD or an SEI, so a short prefix
+/// scan answers the question and costs nothing on the P-frames that dominate the stream.
+pub fn access_unit_has_sps(data: &[u8]) -> bool {
+    let end = data.len().min(256);
+    let mut i = 0usize;
+    while i + 3 < end {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if data[i + 3] & NAL_TYPE_MASK == NAL_SPS {
+                return true;
+            }
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nal(kind: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 1, 0x60 | kind];
+        v.resize(v.len() + len, 0xAA);
+        v
+    }
+
+    fn frame(parts: &[Vec<u8>]) -> Bytes {
+        let mut v = Vec::new();
+        for p in parts {
+            v.extend_from_slice(p);
+        }
+        Bytes::from(v)
+    }
+
+    /// Reassemble the original NAL payloads from a payload list, the way a depacketizer would.
+    fn reassemble(payloads: &[Bytes]) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut pending: Option<Vec<u8>> = None;
+        for p in payloads {
+            match p[0] & NAL_TYPE_MASK {
+                NAL_STAP_A => {
+                    let mut i = 1usize;
+                    while i + 2 <= p.len() {
+                        let n = u16::from_be_bytes([p[i], p[i + 1]]) as usize;
+                        i += 2;
+                        out.push(p[i..i + n].to_vec());
+                        i += n;
+                    }
+                }
+                NAL_FU_A => {
+                    let fu = p[1];
+                    if fu & 0x80 != 0 {
+                        pending = Some(vec![(p[0] & 0xe0) | (fu & NAL_TYPE_MASK)]);
+                    }
+                    if let Some(acc) = pending.as_mut() {
+                        acc.extend_from_slice(&p[2..]);
+                        if fu & 0x40 != 0 {
+                            out.push(pending.take().unwrap());
+                        }
+                    }
+                }
+                _ => out.push(p.to_vec()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_small_keyframe_aggregates_its_parameter_sets() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(
+            1188,
+            &frame(&[nal(NAL_SPS, 20), nal(NAL_PPS, 4), nal(5, 100)]),
+            &mut out,
+        );
+        assert_eq!(out.len(), 2, "STAP-A then the IDR");
+        assert_eq!(out[0][0] & NAL_TYPE_MASK, NAL_STAP_A);
+        assert!(payloads_carry_parameter_sets(&out));
+        let nals = reassemble(&out);
+        assert_eq!(nals.len(), 3);
+        assert_eq!(nals[0][0] & NAL_TYPE_MASK, NAL_SPS);
+        assert_eq!(nals[1][0] & NAL_TYPE_MASK, NAL_PPS);
+        assert_eq!(nals[2][0] & NAL_TYPE_MASK, 5);
+    }
+
+    #[test]
+    fn parameter_sets_that_do_not_fit_together_are_sent_separately() {
+        // This is the case the stock payloader dropped in silence.
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        let f = frame(&[nal(NAL_SPS, 40), nal(NAL_PPS, 40), nal(5, 30)]);
+        p.packetize(60, &f, &mut out);
+        assert!(
+            payloads_carry_parameter_sets(&out),
+            "SPS must survive an MTU too small for the aggregate"
+        );
+        let nals = reassemble(&out);
+        assert_eq!(nals[0][0] & NAL_TYPE_MASK, NAL_SPS);
+        assert_eq!(nals[0].len(), 41);
+        assert_eq!(nals[1][0] & NAL_TYPE_MASK, NAL_PPS);
+        assert_eq!(nals[1].len(), 41);
+        assert_eq!(p.dropped_parameter_sets(), 0);
+    }
+
+    #[test]
+    fn an_sps_larger_than_the_mtu_is_fragmented_rather_than_dropped() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        let f = frame(&[nal(NAL_SPS, 300), nal(NAL_PPS, 10), nal(5, 10)]);
+        p.packetize(64, &f, &mut out);
+        assert!(payloads_carry_parameter_sets(&out));
+        let nals = reassemble(&out);
+        assert_eq!(nals[0][0] & NAL_TYPE_MASK, NAL_SPS);
+        assert_eq!(nals[0].len(), 301);
+    }
+
+    #[test]
+    fn a_large_nal_round_trips_through_fu_a() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        let f = frame(&[nal(1, 5000)]);
+        p.packetize(1188, &f, &mut out);
+        assert!(out.len() > 4);
+        assert!(out.iter().all(|x| x.len() <= 1188));
+        let nals = reassemble(&out);
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].len(), 5001);
+        assert_eq!(nals[0][0] & NAL_TYPE_MASK, 1);
+        assert!(nals[0][1..].iter().all(|b| *b == 0xAA));
+    }
+
+    #[test]
+    fn every_fu_a_fragment_of_one_nal_shares_a_single_allocation() {
+        // The point of the rewrite: one `BytesMut` carved up, not one per fragment. Two
+        // fragments carved from the same buffer are adjacent in memory.
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(1188, &frame(&[nal(1, 20000)]), &mut out);
+        assert!(out.len() >= 4);
+        let a = out[0].as_ptr() as usize;
+        let b = out[1].as_ptr() as usize;
+        assert_eq!(b - a, out[0].len(), "fragments must be contiguous");
+    }
+
+    #[test]
+    fn a_nal_that_fits_is_a_zero_copy_view_of_the_frame() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        let f = frame(&[nal(1, 100)]);
+        p.packetize(1188, &f, &mut out);
+        assert_eq!(out.len(), 1);
+        let base = f.as_ptr() as usize;
+        let got = out[0].as_ptr() as usize;
+        assert!(
+            got >= base && got < base + f.len(),
+            "payload should point into the frame buffer, not a copy"
+        );
+    }
+
+    #[test]
+    fn aud_and_filler_are_dropped() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(
+            1188,
+            &frame(&[nal(NAL_AUD, 1), nal(1, 10), nal(NAL_FILLER, 50)]),
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0] & NAL_TYPE_MASK, 1);
+    }
+
+    #[test]
+    fn a_parameter_sets_only_access_unit_is_sent_instead_of_stashed() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(1188, &frame(&[nal(NAL_SPS, 20), nal(NAL_PPS, 4)]), &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(payloads_carry_parameter_sets(&out));
+    }
+
+    #[test]
+    fn three_byte_start_codes_are_understood() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        let mut v = vec![0u8, 0, 1, 0x65];
+        v.extend([0xAA; 20]);
+        v.extend([0u8, 0, 1, 0x61]);
+        v.extend([0xAA; 20]);
+        p.packetize(1188, &Bytes::from(v), &mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_or_degenerate_frame_produces_nothing_and_does_not_spin() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(1188, &Bytes::new(), &mut out);
+        assert!(out.is_empty());
+        p.packetize(1188, &Bytes::from_static(&[0, 0, 1]), &mut out);
+        assert!(out.is_empty());
+        p.packetize(1188, &Bytes::from_static(&[0, 0, 1, 0, 0, 1]), &mut out);
+        assert!(out.is_empty());
+        p.packetize(0, &Bytes::from_static(&[0, 0, 1, 0x65, 1]), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn an_idr_with_no_parameter_sets_is_flagged() {
+        let mut p = H264Packetizer::new();
+        let mut out = Vec::new();
+        p.packetize(1188, &frame(&[nal(5, 100)]), &mut out);
+        assert!(!payloads_carry_parameter_sets(&out));
+    }
+
+    #[test]
+    fn a_keyframe_access_unit_is_recognised_by_its_parameter_sets() {
+        assert!(access_unit_has_sps(&frame(&[
+            nal(NAL_AUD, 1),
+            nal(NAL_SPS, 8),
+            nal(NAL_PPS, 8),
+            nal(5, 8)
+        ])));
+        assert!(!access_unit_has_sps(&frame(&[nal(1, 8)])));
+        assert!(!access_unit_has_sps(&[]));
+        assert!(!access_unit_has_sps(&[0, 0, 1]));
+    }
+}
+
+/// A/B against the payloader this replaced, so the claim in `docs/OPTIMIZATIONS.md` has a number.
+///
+/// `cargo test --lib packetizer::bench -- --ignored --nocapture`
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    /// Counts allocations, so "one allocation per fragmented NAL instead of one per fragment" is a
+    /// number rather than an argument. One relaxed increment per allocation.
+    struct Counting;
+
+    static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, l: Layout) {
+            unsafe { System.dealloc(ptr, l) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, l, n) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    fn synthetic_idr(bytes: usize) -> Bytes {
+        let mut v = vec![0u8, 0, 0, 1, 0x67];
+        v.resize(v.len() + 40, 0xAA); // SPS
+        v.extend_from_slice(&[0, 0, 0, 1, 0x68]);
+        v.resize(v.len() + 8, 0xBB); // PPS
+        v.extend_from_slice(&[0, 0, 0, 1, 0x65]);
+        v.resize(v.len() + bytes, 0xCC); // IDR slice
+        Bytes::from(v)
+    }
+
+    fn synthetic_p(bytes: usize) -> Bytes {
+        let mut v = vec![0u8, 0, 0, 1, 0x41];
+        v.resize(v.len() + bytes, 0xDD);
+        Bytes::from(v)
+    }
+
+    #[test]
+    #[ignore]
+    fn compare_with_the_stock_payloader() {
+        use webrtc::rtp::codecs::h264::H264Payloader;
+        use webrtc::rtp::packetizer::Payloader;
+
+        const MTU: usize = 1188;
+        const ITERS: usize = 2_000;
+        // One IDR then 59 P-frames, the shape of a 60 fps second with an infinite GOP and a
+        // keyframe forced at the top.
+        let idr = synthetic_idr(300 * 1024);
+        let p = synthetic_p(16 * 1024);
+
+        // Interleaved rounds, and the **minimum** per implementation rather than a mean. This box
+        // runs several other workstreams' `rustc` processes, and the same binary measured 18404
+        // and 10812 ns/frame for the *same* stock payloader in two runs an hour apart — a 1.7x
+        // spread with nothing changed. The minimum is the round least polluted by contention;
+        // averaging folds the machine's mood into the number. Interleaving stops whichever went
+        // first from paying for warming the frame buffers.
+        const ROUNDS: usize = 7;
+        let mut ours = H264Packetizer::new();
+        let mut theirs = H264Payloader::default();
+        let mut out: Vec<Bytes> = Vec::new();
+        let mut ours_packets = 0usize;
+        let mut theirs_packets = 0usize;
+        let mut ours_ns = f64::MAX;
+        let mut theirs_ns = f64::MAX;
+        let mut ours_allocs = 0u64;
+        let mut theirs_allocs = 0u64;
+
+        for round in 0..ROUNDS {
+            let a0 = ALLOCS.load(Ordering::Relaxed);
+            let t0 = Instant::now();
+            for i in 0..ITERS {
+                let frame = if i % 60 == 0 { &idr } else { &p };
+                ours.packetize(MTU, frame, &mut out);
+                ours_packets += out.len();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+            let allocs = ALLOCS.load(Ordering::Relaxed) - a0;
+
+            let a1 = ALLOCS.load(Ordering::Relaxed);
+            let t1 = Instant::now();
+            for i in 0..ITERS {
+                let frame = if i % 60 == 0 { &idr } else { &p };
+                let payloads = theirs.payload(MTU, frame).expect("payload");
+                theirs_packets += payloads.len();
+            }
+            let their_ns = t1.elapsed().as_nanos() as f64 / ITERS as f64;
+            let their_allocs = ALLOCS.load(Ordering::Relaxed) - a1;
+
+            println!("  round {round}: local {ns:.0} ns/frame, stock {their_ns:.0} ns/frame");
+            if ns < ours_ns {
+                ours_ns = ns;
+            }
+            if their_ns < theirs_ns {
+                theirs_ns = their_ns;
+            }
+            ours_allocs = allocs;
+            theirs_allocs = their_allocs;
+        }
+        ours_packets /= ROUNDS;
+        theirs_packets /= ROUNDS;
+
+        println!(
+            "packetize {ITERS} frames @ {MTU}B MTU (1 IDR per 60), best of {ROUNDS} interleaved rounds:\n  \
+             local  {ours_ns:.0} ns/frame, {ours_packets} packets, {ours_allocs} allocations\n  \
+             stock  {theirs_ns:.0} ns/frame, {theirs_packets} packets, {theirs_allocs} allocations\n  \
+             speedup {:.2}x, allocations {:.1}x fewer",
+            theirs_ns / ours_ns,
+            theirs_allocs as f64 / ours_allocs.max(1) as f64
+        );
+        // The two must agree on how many packets a stream takes, or the comparison is meaningless.
+        assert!(
+            (ours_packets as i64 - theirs_packets as i64).abs() <= ITERS as i64 / 60,
+            "packet counts diverge: {ours_packets} vs {theirs_packets}"
+        );
+        assert!(
+            ours_allocs * 4 < theirs_allocs,
+            "the point of the rewrite is far fewer allocations: {ours_allocs} vs {theirs_allocs}"
+        );
+    }
+}
