@@ -2,10 +2,12 @@ use std::ffi::c_void;
 use std::io::Write as _;
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -20,6 +22,7 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
     DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
 };
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::nvenc_sys::*;
 use crate::streamer::config::{Config, H264Profile};
@@ -28,6 +31,87 @@ use crate::streamer::platform::BitrateApplied;
 pub const KEY_WRITER: u64 = 0;
 pub const KEY_ENCODER: u64 = 1;
 pub const KEY_TIMEOUT_MS: u32 = 1000;
+
+/// How long to wait on a per-picture completion event before declaring the encoder wedged.
+/// NVENC signals within one frame period in normal operation; this is a hang detector, not a
+/// scheduling parameter.
+const ENCODE_EVENT_TIMEOUT_MS: u32 = 2000;
+
+/// Output buffers (and, in async mode, completion events) allocated per encoder. With one, a
+/// submitted picture must be drained before the next can be handed to the hardware; two is the
+/// minimum that lets submit(N+1) overlap the hardware's work on N.
+const OUTPUT_BUFFERS: usize = 4;
+
+/// The most long-term reference slots to claim, however many the engine advertises.
+///
+/// Each slot is a picture held in the DPB for as long as the slot lives, so the cost is VRAM and
+/// a slightly wider reference search. Two is enough for the repair pattern LTR exists for here —
+/// one the client is known to hold and one being established — and more only widens the window
+/// in which the encoder may predict from something stale.
+const MAX_LTR_SLOTS: u32 = 2;
+
+/// Check every driver entry point the encode path will unwrap, once, before anything is opened.
+///
+/// `NV_ENCODE_API_FUNCTION_LIST` is a table of nullable C function pointers, and the code checked
+/// exactly one of them — `nvEncOpenEncodeSessionEx` — while every hot-path call site unwrapped
+/// with `.expect(...)`. On a driver that populates the table partially (a vGPU or virtualised
+/// NVENC is the realistic case) that is a panic on the detached `nvenc-ring-encode` thread, whose
+/// join result is discarded, so the visible symptom is a stream that silently stops. Failing here
+/// instead lets `build_backend` fall through to the next vendor with a reason.
+///
+/// The optional ones are deliberately absent from this list: `nvEncInvalidateRefFrames` and the
+/// async-event pair are feature-gated at their call sites, not required.
+fn require_functions(fns: &NV_ENCODE_API_FUNCTION_LIST) -> Result<()> {
+    let required: [(&str, bool); 13] = [
+        (
+            "nvEncOpenEncodeSessionEx",
+            fns.nvEncOpenEncodeSessionEx.is_some(),
+        ),
+        ("nvEncGetEncodeCaps", fns.nvEncGetEncodeCaps.is_some()),
+        (
+            "nvEncGetEncodePresetConfigEx",
+            fns.nvEncGetEncodePresetConfigEx.is_some(),
+        ),
+        (
+            "nvEncInitializeEncoder",
+            fns.nvEncInitializeEncoder.is_some(),
+        ),
+        ("nvEncRegisterResource", fns.nvEncRegisterResource.is_some()),
+        (
+            "nvEncUnregisterResource",
+            fns.nvEncUnregisterResource.is_some(),
+        ),
+        (
+            "nvEncCreateBitstreamBuffer",
+            fns.nvEncCreateBitstreamBuffer.is_some(),
+        ),
+        (
+            "nvEncDestroyBitstreamBuffer",
+            fns.nvEncDestroyBitstreamBuffer.is_some(),
+        ),
+        ("nvEncMapInputResource", fns.nvEncMapInputResource.is_some()),
+        (
+            "nvEncUnmapInputResource",
+            fns.nvEncUnmapInputResource.is_some(),
+        ),
+        ("nvEncEncodePicture", fns.nvEncEncodePicture.is_some()),
+        ("nvEncLockBitstream", fns.nvEncLockBitstream.is_some()),
+        ("nvEncUnlockBitstream", fns.nvEncUnlockBitstream.is_some()),
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|(_, present)| !present)
+        .map(|(name, _)| *name)
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "NVENC function list is missing {} required entry point(s): {} (driver too old, or a              virtualised NVENC that does not implement the full API)",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
 
 pub enum SlotEncodeError {
     Poisoned(anyhow::Error),
@@ -68,6 +152,149 @@ struct Ring {
     shared_handles: Vec<HANDLE>,
 }
 
+/// What this NVENC engine says it can do, read from the driver with `nvEncGetEncodeCaps`
+/// once per session between `open_session` and `initialize`.
+///
+/// Every optional field in `initialize()` is gated on one of these. The alternative — asking
+/// for a feature and letting `nvEncInitializeEncoder` fail — costs the user the whole NVIDIA
+/// path over one unsupported flag, because `build_backend` cannot tell "this GPU lacks intra
+/// refresh" from "NVENC is unavailable" and falls through to Quick Sync or x264.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncoderCaps {
+    pub width_min: u32,
+    pub width_max: u32,
+    pub height_min: u32,
+    pub height_max: u32,
+    /// Bitmask of `NV_ENC_PARAMS_RC_MODE` values.
+    pub rc_modes: u32,
+    pub cabac: bool,
+    pub adaptive_transform: bool,
+    pub constrained_encoding: bool,
+    pub intra_refresh: bool,
+    pub single_slice_intra_refresh: bool,
+    pub custom_vbv_buf_size: bool,
+    pub dyn_bitrate_change: bool,
+    pub dyn_rcmode_change: bool,
+    pub dynamic_slice_mode: bool,
+    pub subframe_readback: bool,
+    pub async_encode: bool,
+    pub ref_pic_invalidation: bool,
+    pub multiple_ref_frames: bool,
+    pub max_ltr_frames: u32,
+    pub num_encoder_engines: u32,
+    pub level_max: u32,
+}
+
+impl EncoderCaps {
+    fn query(fns: &NV_ENCODE_API_FUNCTION_LIST, encoder: *mut c_void) -> Self {
+        let get = |cap: NV_ENC_CAPS| -> i32 {
+            let Some(f) = fns.nvEncGetEncodeCaps else {
+                return 0;
+            };
+            let mut param: NV_ENC_CAPS_PARAM = unsafe { zeroed() };
+            param.version = NV_ENC_CAPS_PARAM_VER;
+            param.capsToQuery = cap;
+            let mut value: i32 = 0;
+            let st = unsafe { f(encoder, NV_ENC_CODEC_H264_GUID, &mut param, &mut value) };
+            if st == NVENCSTATUS::NV_ENC_SUCCESS {
+                value
+            } else {
+                0
+            }
+        };
+        use NV_ENC_CAPS::*;
+        Self {
+            width_min: get(NV_ENC_CAPS_WIDTH_MIN).max(0) as u32,
+            width_max: get(NV_ENC_CAPS_WIDTH_MAX).max(0) as u32,
+            height_min: get(NV_ENC_CAPS_HEIGHT_MIN).max(0) as u32,
+            height_max: get(NV_ENC_CAPS_HEIGHT_MAX).max(0) as u32,
+            rc_modes: get(NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES).max(0) as u32,
+            cabac: get(NV_ENC_CAPS_SUPPORT_CABAC) != 0,
+            adaptive_transform: get(NV_ENC_CAPS_SUPPORT_ADAPTIVE_TRANSFORM) != 0,
+            constrained_encoding: get(NV_ENC_CAPS_SUPPORT_CONSTRAINED_ENCODING) != 0,
+            intra_refresh: get(NV_ENC_CAPS_SUPPORT_INTRA_REFRESH) != 0,
+            single_slice_intra_refresh: get(NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH) != 0,
+            custom_vbv_buf_size: get(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE) != 0,
+            dyn_bitrate_change: get(NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE) != 0,
+            dyn_rcmode_change: get(NV_ENC_CAPS_SUPPORT_DYN_RCMODE_CHANGE) != 0,
+            dynamic_slice_mode: get(NV_ENC_CAPS_SUPPORT_DYNAMIC_SLICE_MODE) != 0,
+            subframe_readback: get(NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK) != 0,
+            async_encode: get(NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT) != 0,
+            ref_pic_invalidation: get(NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) != 0,
+            multiple_ref_frames: get(NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES) != 0,
+            max_ltr_frames: get(NV_ENC_CAPS_NUM_MAX_LTR_FRAMES).max(0) as u32,
+            num_encoder_engines: get(NV_ENC_CAPS_NUM_ENCODER_ENGINES).max(0) as u32,
+            level_max: get(NV_ENC_CAPS_LEVEL_MAX).max(0) as u32,
+        }
+    }
+
+    fn log(&self) {
+        tprintln!(
+            "NVENC caps: {}x{}..{}x{}, rc_modes=0x{:x}, level_max={}, engines={}, \
+             cabac={}, adaptive_transform={}, constrained={}, intra_refresh={} \
+             (single_slice={}), custom_vbv={}, dyn_bitrate={}, dyn_rcmode={}, \
+             dynamic_slice={}, subframe_readback={}, async={}, ref_pic_invalidation={}, \
+             multi_ref={}, max_ltr_frames={}",
+            self.width_min,
+            self.height_min,
+            self.width_max,
+            self.height_max,
+            self.rc_modes,
+            self.level_max,
+            self.num_encoder_engines,
+            self.cabac,
+            self.adaptive_transform,
+            self.constrained_encoding,
+            self.intra_refresh,
+            self.single_slice_intra_refresh,
+            self.custom_vbv_buf_size,
+            self.dyn_bitrate_change,
+            self.dyn_rcmode_change,
+            self.dynamic_slice_mode,
+            self.subframe_readback,
+            self.async_encode,
+            self.ref_pic_invalidation,
+            self.multiple_ref_frames,
+            self.max_ltr_frames,
+        );
+    }
+
+    fn supports_rc(&self, mode: NV_ENC_PARAMS_RC_MODE) -> bool {
+        // rc_modes is a bitmask of the NV_ENC_PARAMS_RC_MODE values themselves, and a driver
+        // that fails the query reports 0. Treat 0 as "unknown, do not veto".
+        self.rc_modes == 0 || (self.rc_modes & mode as u32) != 0
+    }
+
+    /// The dimensions actually usable, clamped into the reported range. A zero max means the
+    /// query failed, in which case the request stands.
+    fn clamp_dims(&self, w: u32, h: u32) -> (u32, u32) {
+        let w = if self.width_max > 0 {
+            w.clamp(self.width_min.max(1), self.width_max)
+        } else {
+            w
+        };
+        let h = if self.height_max > 0 {
+            h.clamp(self.height_min.max(1), self.height_max)
+        } else {
+            h
+        };
+        (w, h)
+    }
+}
+
+/// One output bitstream buffer and, under async mode, the event NVENC signals when the picture
+/// written into it is complete.
+struct Output {
+    bitstream: NV_ENC_OUTPUT_PTR,
+    event: Option<HANDLE>,
+}
+
+/// A picture handed to the hardware and not yet drained.
+struct InFlight {
+    output: usize,
+    mapped: NV_ENC_INPUT_PTR,
+}
+
 pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -78,13 +305,50 @@ pub struct Encoder {
     input_keyed_mutex: Option<IDXGIKeyedMutex>,
     shared_handle: Option<HANDLE>,
     ring: Option<Ring>,
-    bitstream: NV_ENC_OUTPUT_PTR,
+    outputs: Vec<Output>,
+    inflight: std::collections::VecDeque<InFlight>,
+    next_output: usize,
+    /// The staging buffer the locked bitstream is read into. Kept across frames and only ever
+    /// grown, so the copy out of the driver's write-combined mapping never allocates while the
+    /// bitstream lock is held. Sized to the largest access unit seen so far.
+    au_scratch: Vec<u8>,
+    async_mode: bool,
+    caps: EncoderCaps,
     init_params: NV_ENC_INITIALIZE_PARAMS,
     encode_config: NV_ENC_CONFIG,
     config: EncoderConfig,
     frame_index: u64,
     idr_requested: bool,
+    /// Shared with the pipeline so a `Pipeline::request_idr()` reaches the encoder even on the
+    /// ring's idle keepalive path, where nothing else consults the pipeline's atomic.
+    shared_idr: Option<Arc<AtomicBool>>,
+    /// How many long-term reference slots the encoder was opened with. 0 when the engine does
+    /// not advertise LTR, which is the signal that the repair API below is inert.
+    ltr_slots: u32,
+    /// The slot the next `mark_ltr` will claim, rotating over `ltr_slots`.
+    next_ltr_slot: u32,
+    /// Set by `mark_ltr`, consumed by the next submitted picture.
+    pending_ltr_mark: Option<u32>,
+    /// Set by `use_ltr`, consumed by the next submitted picture: a bitmap of the LTR slots the
+    /// picture may reference, and nothing else.
+    pending_ltr_use: Option<u32>,
     _lib: libloading::Library,
+}
+
+/// What became of a request to stop referencing a frame the client never received.
+///
+/// The caller needs to distinguish these, because "not supported here" means the only repair
+/// left is a keyframe, and it should stop asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefInvalidation {
+    /// The driver dropped the frame from the reference set. The next P frame will not use it.
+    Applied,
+    /// The engine does not advertise `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, or the encoder
+    /// was opened without long-term references, so there is nothing to invalidate against.
+    Unsupported,
+    /// The driver refused. Most often the frame has already left the DPB, which is not an error
+    /// so much as "too late" — the repair has to be a keyframe.
+    Refused,
 }
 
 unsafe impl Send for Encoder {}
@@ -117,11 +381,12 @@ impl Encoder {
                 ptr::null_mut(),
             )?;
         }
-        if fns.nvEncOpenEncodeSessionEx.is_none() {
-            bail!("NVENC function list did not populate (driver too old?)");
-        }
+        require_functions(&fns)?;
 
         let encoder = unsafe { open_session(&fns, device.as_raw())? };
+        let caps = EncoderCaps::query(&fns, encoder);
+        caps.log();
+        let config = clamp_config_to_caps(config, &caps);
 
         let mut input_textures: Vec<ID3D11Texture2D> = Vec::with_capacity(ring);
         for _ in 0..ring {
@@ -144,17 +409,27 @@ impl Encoder {
             input_keyed_mutex: None,
             shared_handle: None,
             ring: None,
-            bitstream: ptr::null_mut(),
+            outputs: Vec::new(),
+            inflight: std::collections::VecDeque::new(),
+            next_output: 0,
+            au_scratch: Vec::new(),
+            async_mode: false,
+            caps,
             init_params: unsafe { zeroed() },
             encode_config: unsafe { zeroed() },
             config,
             frame_index: 0,
             idr_requested: false,
+            shared_idr: None,
+            ltr_slots: 0,
+            next_ltr_slot: 0,
+            pending_ltr_mark: None,
+            pending_ltr_use: None,
             _lib: lib,
         };
 
         unsafe { this.initialize()? };
-        unsafe { this.create_bitstream()? };
+        unsafe { this.create_outputs()? };
 
         let mut registered_inputs: Vec<NV_ENC_REGISTERED_PTR> = Vec::with_capacity(ring);
         let mut keyed_mutexes: Vec<IDXGIKeyedMutex> = Vec::with_capacity(ring);
@@ -216,11 +491,12 @@ impl Encoder {
                 ptr::null_mut(),
             )?;
         }
-        if fns.nvEncOpenEncodeSessionEx.is_none() {
-            bail!("NVENC function list did not populate (driver too old?)");
-        }
+        require_functions(&fns)?;
 
         let encoder = unsafe { open_session(&fns, device.as_raw())? };
+        let caps = EncoderCaps::query(&fns, encoder);
+        caps.log();
+        let config = clamp_config_to_caps(config, &caps);
         let input_texture = create_input_texture(&device, config.width, config.height, shared)?;
 
         let mut this = Self {
@@ -233,19 +509,29 @@ impl Encoder {
             input_keyed_mutex: None,
             shared_handle: None,
             ring: None,
-            bitstream: ptr::null_mut(),
+            outputs: Vec::new(),
+            inflight: std::collections::VecDeque::new(),
+            next_output: 0,
+            au_scratch: Vec::new(),
+            async_mode: false,
+            caps,
             init_params: unsafe { zeroed() },
             encode_config: unsafe { zeroed() },
             config,
             frame_index: 0,
             idr_requested: false,
+            shared_idr: None,
+            ltr_slots: 0,
+            next_ltr_slot: 0,
+            pending_ltr_mark: None,
+            pending_ltr_use: None,
             _lib: lib,
         };
 
         unsafe { this.initialize()? };
         unsafe {
             this.register_input()?;
-            this.create_bitstream()?;
+            this.create_outputs()?;
         }
         if shared {
             this.setup_shared()?;
@@ -319,13 +605,10 @@ impl Encoder {
             .context("ring keyed mutex AcquireSync(encoder)")
             .map_err(SlotEncodeError::Poisoned)?;
 
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let res = unsafe { self.encode_mapped_resource(registered, force_idr) };
         let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
         let out = res.map_err(SlotEncodeError::Encode)?;
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(out)
     }
@@ -347,13 +630,10 @@ impl Encoder {
 
         unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
             .context("ring keepalive keyed mutex AcquireSync(writer)")?;
-        let force_idr = self.idr_requested;
+        let force_idr = self.take_idr_request(false);
         let res = unsafe { self.encode_mapped_resource(registered, force_idr) };
         let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
         let out = res?;
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(out)
     }
@@ -384,11 +664,8 @@ impl Encoder {
             );
         }
 
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let data = unsafe { self.encode_mapped(force_idr)? };
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(data)
     }
@@ -417,11 +694,8 @@ impl Encoder {
                 0,
             );
         }
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let out = unsafe { self.encode_mapped(force_idr)? };
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(out)
     }
@@ -432,19 +706,16 @@ impl Encoder {
         };
         unsafe { mutex.AcquireSync(KEY_ENCODER, KEY_TIMEOUT_MS) }
             .context("keyed mutex AcquireSync(encoder)")?;
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let res = unsafe { self.encode_mapped(force_idr) };
         let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
         let out = res?;
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(out)
     }
 
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let out = if let Some(mutex) = self.input_keyed_mutex.clone() {
             unsafe { mutex.AcquireSync(KEY_WRITER, KEY_TIMEOUT_MS) }
                 .context("repeat keyed mutex AcquireSync(writer)")?;
@@ -454,9 +725,6 @@ impl Encoder {
         } else {
             unsafe { self.encode_mapped(force_idr)? }
         };
-        if force_idr {
-            self.idr_requested = false;
-        }
         self.frame_index += 1;
         Ok(out)
     }
@@ -489,13 +757,177 @@ impl Encoder {
 
         self.encode_config = new_config;
         self.init_params = reconfig.reInitEncodeParams;
-        self.init_params.encodeConfig = &mut self.encode_config;
+        self.init_params.encodeConfig = ptr::null_mut();
         tprintln!("NVENC bitrate reconfigured (bitrate_bps={bps})");
         Ok(BitrateApplied::Applied)
     }
 
     pub fn request_idr(&mut self) {
         self.idr_requested = true;
+    }
+
+    /// Let the pipeline's IDR atomic reach the encoder directly.
+    ///
+    /// The ring's idle keepalive re-encodes the held slot from inside the encode thread; it
+    /// never touches `AsyncNvencRing::stage`, which is the only place that consumed the
+    /// pipeline's `idr_request`. So on a static desktop — a still window, a paused video, a
+    /// locked screen — a PLI produced nothing but another P frame and a joining or damaged
+    /// client stayed black until something on the host screen moved. With the flag attached,
+    /// `take_idr_request` sees it wherever the encode happens.
+    pub fn attach_idr_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.shared_idr = Some(flag);
+    }
+
+    fn take_idr_request(&mut self, force: bool) -> bool {
+        let shared = self
+            .shared_idr
+            .as_ref()
+            .is_some_and(|f| f.swap(false, Ordering::Relaxed));
+        let own = self.idr_requested;
+        self.idr_requested = false;
+        force || own || shared
+    }
+
+    /// How many long-term reference slots this encoder has. 0 means the repair API is inert and
+    /// the only loss recovery available is a keyframe.
+    pub fn ltr_slots(&self) -> u32 {
+        self.ltr_slots
+    }
+
+    /// Mark the next encoded picture as a long-term reference, and say which slot it takes.
+    ///
+    /// An LTR stays in the DPB until its slot is claimed again, so it is the picture a later
+    /// repair frame can point at once the transport knows the client holds it. The caller owns
+    /// the policy — how often to mark, and which slots it believes the client has — because only
+    /// the transport sees the per-frame receipts. `None` when the engine has no LTR support.
+    ///
+    /// The mark is consumed by the next submitted picture, so it must be set before the submit
+    /// it is meant for and not left standing across frames.
+    pub fn mark_ltr(&mut self) -> Option<u32> {
+        if self.ltr_slots == 0 {
+            return None;
+        }
+        let slot = self.next_ltr_slot;
+        self.next_ltr_slot = (slot + 1) % self.ltr_slots;
+        self.pending_ltr_mark = Some(slot);
+        Some(slot)
+    }
+
+    /// Make the next encoded picture reference only the long-term slots in `bitmap`.
+    ///
+    /// This is the repair: after a loss burst, a P frame predicted from a picture the client is
+    /// known to hold costs a fraction of an IDR and does not reset the rate controller. Bits
+    /// outside the encoder's slot count are ignored rather than rejected, and an empty bitmap is
+    /// a no-op — asking for "reference nothing" would mean an intra frame, which the caller
+    /// should ask for as an IDR instead.
+    pub fn use_ltr(&mut self, bitmap: u32) -> bool {
+        if self.ltr_slots == 0 {
+            return false;
+        }
+        let mask = if self.ltr_slots >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << self.ltr_slots) - 1
+        };
+        let bitmap = bitmap & mask;
+        if bitmap == 0 {
+            return false;
+        }
+        self.pending_ltr_use = Some(bitmap);
+        true
+    }
+
+    /// Drop a frame the client never received from the reference set.
+    ///
+    /// `frame_index` is the value handed to `NV_ENC_PIC_PARAMS::inputTimeStamp`, which this
+    /// encoder sets to its own monotonic frame counter — so the transport identifies a lost
+    /// frame by the same number the pipeline stamped on it. `nvEncInvalidateRefFrames` then
+    /// removes it, and every picture that referenced it, from the DPB, so the next P frame
+    /// predicts from something the client actually has.
+    ///
+    /// Cap-gated on `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, never on a driver version.
+    pub fn invalidate_reference(&mut self, frame_index: u64) -> RefInvalidation {
+        if !self.caps.ref_pic_invalidation || self.ltr_slots == 0 {
+            return RefInvalidation::Unsupported;
+        }
+        let Some(f) = self.fns.nvEncInvalidateRefFrames else {
+            return RefInvalidation::Unsupported;
+        };
+        match unsafe { f(self.encoder, frame_index) } {
+            NVENCSTATUS::NV_ENC_SUCCESS => RefInvalidation::Applied,
+            status => {
+                teprintln!(
+                    "NVENC: nvEncInvalidateRefFrames(frame={frame_index}) returned {status:?};                      the frame has probably already left the DPB, so this loss needs a keyframe"
+                );
+                RefInvalidation::Refused
+            }
+        }
+    }
+
+    /// What the driver reported for this engine. Read once at session open.
+    pub fn caps(&self) -> EncoderCaps {
+        self.caps
+    }
+
+    /// How many pictures may be in flight at once. 1 without async support.
+    pub fn pipeline_depth(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Submit one ring slot without waiting for it. Pairs with [`Encoder::complete_slot`].
+    ///
+    /// This is the half of the contract the pipeline needs for real encode pipelining: submit
+    /// N+1 while the hardware is still working on N. The caller owns the pairing of each
+    /// completed access unit with the capture timestamp and `FrameTiming` of the frame that
+    /// produced it, which is why the encoder cannot do the overlap on its own —
+    /// `encode_input_slot` returns *this* frame's bytes, and a depth-2 encoder returning the
+    /// previous frame's bytes under that name would silently corrupt A/V sync.
+    ///
+    /// The slot's keyed mutex stays held at `KEY_ENCODER` until `complete_slot`, so the slot
+    /// must not be recycled in between.
+    pub fn submit_slot(&mut self, slot: usize, force_idr: bool) -> Result<(), SlotEncodeError> {
+        let (mutex, registered) = self.ring_slot(slot)?;
+        unsafe { mutex.AcquireSync(KEY_ENCODER, KEY_TIMEOUT_MS) }
+            .context("ring keyed mutex AcquireSync(encoder)")
+            .map_err(SlotEncodeError::Poisoned)?;
+
+        let force_idr = self.take_idr_request(force_idr);
+        match unsafe { self.submit_registered(registered, force_idr) } {
+            Ok(()) => {
+                self.frame_index += 1;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
+                Err(SlotEncodeError::Encode(e))
+            }
+        }
+    }
+
+    /// Drain the oldest picture submitted by [`Encoder::submit_slot`] and release its slot.
+    pub fn complete_slot(&mut self, slot: usize) -> Result<Vec<u8>, SlotEncodeError> {
+        let (mutex, _) = self.ring_slot(slot)?;
+        let out = unsafe { self.complete_next() };
+        let _ = unsafe { mutex.ReleaseSync(KEY_WRITER) };
+        out.map_err(SlotEncodeError::Encode)
+    }
+
+    fn ring_slot(
+        &self,
+        slot: usize,
+    ) -> Result<(IDXGIKeyedMutex, NV_ENC_REGISTERED_PTR), SlotEncodeError> {
+        let ring = self
+            .ring
+            .as_ref()
+            .ok_or_else(|| anyhow!("ring slot access on a non-ring encoder"))
+            .map_err(SlotEncodeError::Encode)?;
+        let mutex = ring
+            .keyed_mutexes
+            .get(slot)
+            .ok_or_else(|| anyhow!("slot {slot} out of range"))
+            .map_err(SlotEncodeError::Encode)?
+            .clone();
+        Ok((mutex, ring.registered_inputs[slot]))
     }
 
     pub fn sequence_params(&mut self) -> Result<Vec<u8>> {
@@ -538,7 +970,17 @@ impl Encoder {
             .filter(|s| !s.is_empty())
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        bail!("{what} failed: {status:?}{detail}");
+        // `pipeline::is_transient_encode_error` looks for the substring "device busy" to decide
+        // whether to shed the frame and carry on or tear the session down. The AMF backend
+        // already says it in those words for its transient results; NVENC's own name for the
+        // condition is `NV_ENC_ERR_ENCODER_BUSY`, which does not contain the phrase, so every
+        // NVENC busy was being classified as fatal and killing a session that would have
+        // recovered on the next frame.
+        let hint = match status {
+            NVENCSTATUS::NV_ENC_ERR_ENCODER_BUSY => " [transient: device busy]",
+            _ => "",
+        };
+        bail!("{what} failed: {status:?}{detail}{hint}");
     }
 
     unsafe fn initialize(&mut self) -> Result<()> {
@@ -571,6 +1013,24 @@ impl Encoder {
 
         let fps = self.config.fps.max(1);
         config.rcParams.version = NV_ENC_RC_PARAMS_VER;
+        if self.config.qp.is_some()
+            && !self
+                .caps
+                .supports_rc(NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP)
+        {
+            teprintln!("NVENC: this engine does not advertise CONSTQP; falling back to CBR");
+            self.config.qp = None;
+        }
+        if self.config.qp.is_none()
+            && !self
+                .caps
+                .supports_rc(NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR)
+        {
+            bail!(
+                "NVENC engine advertises no CBR rate control (rc_modes=0x{:x})",
+                self.caps.rc_modes
+            );
+        }
         if let Some(q) = self.config.qp {
             let q = q as u32;
             config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
@@ -583,8 +1043,15 @@ impl Encoder {
             config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
             config.rcParams.averageBitRate = self.config.bitrate_bps;
             config.rcParams.maxBitRate = self.config.max_bitrate_bps;
-            config.rcParams.vbvBufferSize = self.config.bitrate_bps / fps;
-            config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+            if self.caps.custom_vbv_buf_size {
+                config.rcParams.vbvBufferSize = self.config.bitrate_bps / fps;
+                config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+                // The VBV is one frame, so an IDR — the only intra content in an infinite GOP —
+                // would otherwise have to blow it or be quantised hard. This is the documented
+                // allowance: a keyframe may spend two frame budgets. Left inherited from the
+                // preset it was an unknown, because nothing read the preset back.
+                config.rcParams.lowDelayKeyFrameScale = 2;
+            }
             // The quality slider is a floor on QP, i.e. a ceiling on quality: it stops the
             // encoder spending the whole CBR budget on an easy picture. It can only make the
             // stream smaller, so it never fights congestion control the way CONSTQP did.
@@ -605,43 +1072,103 @@ impl Encoder {
         config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
         config.rcParams.set_zeroReorderDelay(1);
 
+        let caps = self.caps;
         let h264 = unsafe { &mut config.encodeCodecConfig.h264Config };
         h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-        if self.config.intra_refresh {
-            h264.set_enableIntraRefresh(1);
-            h264.intraRefreshPeriod = (fps * 4).max(2);
-            h264.intraRefreshCnt = (fps / 2).max(1);
+
+        // Rolling intra refresh, not a burst. The old parameters swept `fps/2` rows once every
+        // `fps*4` frames — 30 rows every 4 seconds at 60 fps — which is a refresh that is
+        // absent whenever loss actually happens. A continuously rolling wave
+        // (`cnt = period - 1`) repairs loss with no keyframe and no bitrate spike, which is the
+        // shape Sunshine ships. Requires the single-slice cap because intra refresh
+        // historically forced multiple slices, and we code one slice per picture.
+        let intra_refresh = self.config.intra_refresh && caps.intra_refresh;
+        if self.config.intra_refresh && !caps.intra_refresh {
+            teprintln!(
+                "NVENC: intra refresh requested but not supported by this engine; \
+                        loss recovery stays IDR-on-PLI"
+            );
         }
+        if intra_refresh && !caps.single_slice_intra_refresh {
+            teprintln!(
+                "NVENC: engine needs multiple slices for intra refresh; keeping it off \
+                        rather than changing the slice layout mid-configuration"
+            );
+        }
+        if intra_refresh && caps.single_slice_intra_refresh {
+            h264.set_enableIntraRefresh(1);
+            h264.intraRefreshPeriod = (fps * 5).clamp(2, 1024);
+            h264.intraRefreshCnt = h264.intraRefreshPeriod - 1;
+        }
+        self.config.intra_refresh = h264.enableIntraRefresh() == 1;
+
         h264.sliceMode = 0;
         h264.sliceModeData = 0;
-        h264.maxNumRefFrames = 1;
-        h264.numRefL0 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+
+        // More than one reference frame is the prerequisite for repairing loss with a P frame
+        // that skips the damaged picture instead of a full IDR. With `maxNumRefFrames = 1`
+        // every P frame references its immediate predecessor and one loss breaks the chain
+        // permanently, so the only recovery is an IDR. The DPB cost at these resolutions is a
+        // few MB of VRAM.
+        let refs = if caps.multiple_ref_frames { 4 } else { 1 };
+        h264.maxNumRefFrames = refs;
+        h264.numRefL0 = if refs >= 4 {
+            NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_4
+        } else {
+            NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1
+        };
+        // frameIntervalP = 1 means no B frames, so L1 is never consulted; left at 1.
         h264.numRefL1 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
+
+        // Long-term references, for the NACK-driven repair path: a frame marked LTR stays in
+        // the DPB until replaced, so after a loss burst the encoder can emit a P frame
+        // referencing a picture the client is known to hold. Marking and selection are
+        // per-picture (`ltrMarkFrameIdx` / `ltrUseFrameBitmap`); trust mode is deprecated.
+        let ltr = caps.max_ltr_frames >= 2 && caps.multiple_ref_frames;
+        if ltr {
+            h264.set_enableLTR(1);
+            h264.ltrNumFrames = caps.max_ltr_frames.min(MAX_LTR_SLOTS);
+            h264.ltrTrustMode = 0;
+        }
+        self.ltr_slots = if ltr { h264.ltrNumFrames } else { 0 };
+
         h264.set_repeatSPSPPS(1);
         h264.set_enableFillerDataInsertion(0);
         h264.set_outputBufferingPeriodSEI(0);
         h264.set_outputPictureTimingSEI(0);
         h264.set_outputAUD(0);
 
+        // CABAC and the adaptive 8x8 transform are the whole difference between Main/High and
+        // Baseline here, and they are worth 5-15% bitrate at equal quality on screen content.
+        // Both are optional NVENC features, so both are gated — an engine without CABAC gets
+        // the requested profile with CAVLC rather than losing the NVIDIA path entirely.
+        let cabac = if caps.cabac {
+            NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC
+        } else {
+            NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC
+        };
         match self.config.profile {
             H264Profile::Baseline => {
-                h264.set_enableConstrainedEncoding(1);
+                if caps.constrained_encoding {
+                    h264.set_enableConstrainedEncoding(1);
+                }
                 h264.entropyCodingMode =
                     NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;
                 h264.adaptiveTransformMode =
                     NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
             }
             H264Profile::Main => {
-                h264.entropyCodingMode =
-                    NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+                h264.entropyCodingMode = cabac;
                 h264.adaptiveTransformMode =
                     NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE;
             }
             H264Profile::High => {
-                h264.entropyCodingMode =
-                    NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-                h264.adaptiveTransformMode =
-                    NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+                h264.entropyCodingMode = cabac;
+                h264.adaptiveTransformMode = if caps.adaptive_transform {
+                    NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE
+                } else {
+                    NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE
+                };
             }
         }
 
@@ -654,6 +1181,17 @@ impl Encoder {
         vui.transferCharacteristics =
             NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+        // Without this the SPS says nothing about reordering, so a decoder infers the reorder
+        // depth from the level and holds min(16, MaxDpbMbs/MBs) frames before showing the
+        // first — 33-267 ms at 60 fps. libwebrtc rewrites the SPS on the receive path today, so
+        // on the RTP transport this is insurance; it stops being insurance the moment video
+        // leaves RTP. `frameIntervalP = 1` makes the values NVENC derives (reorder 0) correct.
+        // Sunshine and FFmpeg's NVENC wrapper both set it.
+        vui.bitstreamRestrictionFlag = 1;
+
+        let intra_refresh_period = h264.intraRefreshPeriod;
+        let intra_refresh_cnt = h264.intraRefreshCnt;
+        let entropy = h264.entropyCodingMode;
 
         let mut init: NV_ENC_INITIALIZE_PARAMS = unsafe { zeroed() };
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
@@ -666,11 +1204,31 @@ impl Encoder {
         init.frameRateNum = fps;
         init.frameRateDen = 1;
         init.enablePTD = 1;
-        init.enableEncodeAsync = 0;
+        // Async mode makes `nvEncEncodePicture` a submit rather than a submit-and-wait: the
+        // call returns as soon as the picture is queued and a per-output event says when the
+        // hardware finished it. Windows/WDDM only, hence the cap.
+        //
+        // It is *not* here for throughput. Measured on an Ampere part it is a wash
+        // (`nvenc_pipelined_submit_is_not_faster_than_submit_and_drain`), because the GPU has
+        // one NVENC engine and pictures serialise on it regardless. What it buys is a bounded
+        // wait: `WaitForSingleObject` with a timeout turns a wedged encoder into a named error
+        // after 2 s, where the synchronous `LockBitstream` blocks the encode thread inside the
+        // driver with nothing to interrupt it. `SE_NVENC_NO_ASYNC=1` goes back to that path.
+        self.async_mode = caps.async_encode
+            && self.fns.nvEncRegisterAsyncEvent.is_some()
+            && !async_disabled_by_env();
+        init.enableEncodeAsync = u32::from(self.async_mode);
         init.tuningInfo = tuning;
         init.maxEncodeWidth = self.config.width;
         init.maxEncodeHeight = self.config.height;
         init.encodeConfig = &mut config;
+        // `splitEncodeMode` is deliberately left at `NV_ENC_SPLIT_AUTO_MODE` (the zero from
+        // `zeroed()`), which is the right value: split-frame encoding needs more than one NVENC
+        // engine, P1 enables it implicitly where one exists, and forcing a split on a
+        // single-engine part adds coordination rather than speed. What was missing was not the
+        // setting but the number — `EncoderCaps` now reads `NV_ENC_CAPS_NUM_ENCODER_ENGINES`
+        // and logs it (`engines=1` on this RTX 3080 Ti Laptop), so a report from a multi-engine
+        // part says so and this can be revisited against evidence rather than a guess.
 
         unsafe {
             let f = self
@@ -680,9 +1238,31 @@ impl Encoder {
             self.check(f(self.encoder, &mut init), "nvEncInitializeEncoder")?;
         }
 
+        tprintln!(
+            "NVENC configured: async={}, outputs={}, max_ref_frames={}, ltr={}, \
+             intra_refresh={} (period={}, cnt={}), entropy={:?}, vbv={}B, low_delay_kf_scale={}",
+            self.async_mode,
+            if self.async_mode { OUTPUT_BUFFERS } else { 1 },
+            refs,
+            ltr,
+            self.config.intra_refresh,
+            intra_refresh_period,
+            intra_refresh_cnt,
+            entropy,
+            config.rcParams.vbvBufferSize,
+            config.rcParams.lowDelayKeyFrameScale,
+        );
+
         self.encode_config = config;
         self.init_params = init;
-        self.init_params.encodeConfig = &mut self.encode_config;
+        // Null, not `&mut self.encode_config`. `NV_ENC_INITIALIZE_PARAMS.encodeConfig` is a raw
+        // pointer, and storing one into our own field made `Encoder` self-referential while
+        // `unsafe impl Send` moves it across threads — into `AsyncNvencRing::new`, then into the
+        // encode thread's closure. After each move the pointer named the previous location.
+        // Nothing dereferenced it (the one consumer, `set_bitrate`, overwrites it with a live
+        // stack local first), so this was a landmine rather than live UB; the config lives in
+        // `self.encode_config` and every user points the field at something live before use.
+        self.init_params.encodeConfig = ptr::null_mut();
         Ok(())
     }
 
@@ -712,17 +1292,50 @@ impl Encoder {
         Ok(reg.registeredResource)
     }
 
-    unsafe fn create_bitstream(&mut self) -> Result<()> {
-        let mut create: NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { zeroed() };
-        create.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-        unsafe {
-            let f = self
-                .fns
-                .nvEncCreateBitstreamBuffer
-                .expect("nvEncCreateBitstreamBuffer present");
-            self.check(f(self.encoder, &mut create), "nvEncCreateBitstreamBuffer")?;
+    /// Allocate the output ring: one bitstream buffer per slot and, when the encoder was
+    /// initialized in async mode, one auto-reset event per slot registered with the driver.
+    ///
+    /// Async mode is what turns `nvEncEncodePicture` into a submit: it returns as soon as the
+    /// picture is queued, and the event tells us when the hardware is done, so `LockBitstream`
+    /// with `doNotWait` never blocks. In synchronous mode the driver blocks inside
+    /// `LockBitstream` instead, holding the one output buffer for the whole encode.
+    unsafe fn create_outputs(&mut self) -> Result<()> {
+        let count = if self.async_mode { OUTPUT_BUFFERS } else { 1 };
+        for i in 0..count {
+            let mut create: NV_ENC_CREATE_BITSTREAM_BUFFER = unsafe { zeroed() };
+            create.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+            unsafe {
+                let f = self
+                    .fns
+                    .nvEncCreateBitstreamBuffer
+                    .expect("nvEncCreateBitstreamBuffer present");
+                self.check(f(self.encoder, &mut create), "nvEncCreateBitstreamBuffer")?;
+            }
+
+            let event = if self.async_mode {
+                let handle = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+                    .context("CreateEventW for an NVENC completion event")?;
+                let mut params: NV_ENC_EVENT_PARAMS = unsafe { zeroed() };
+                params.version = NV_ENC_EVENT_PARAMS_VER;
+                params.completionEvent = handle.0;
+                unsafe {
+                    let f = self
+                        .fns
+                        .nvEncRegisterAsyncEvent
+                        .expect("nvEncRegisterAsyncEvent present");
+                    self.check(f(self.encoder, &mut params), "nvEncRegisterAsyncEvent")
+                        .with_context(|| format!("registering completion event {i}"))?;
+                }
+                Some(handle)
+            } else {
+                None
+            };
+
+            self.outputs.push(Output {
+                bitstream: create.bitstreamBuffer,
+                event,
+            });
         }
-        self.bitstream = create.bitstreamBuffer;
         Ok(())
     }
 
@@ -736,6 +1349,29 @@ impl Encoder {
         registered: NV_ENC_REGISTERED_PTR,
         force_idr: bool,
     ) -> Result<Vec<u8>> {
+        unsafe { self.submit_registered(registered, force_idr)? };
+        unsafe { self.complete_next() }
+    }
+
+    /// Hand one registered input resource to the hardware and return without waiting.
+    ///
+    /// The mapped resource and the output slot stay owned by `inflight` until the matching
+    /// `complete_next`, because NVENC reads the input for the whole encode and writes the
+    /// output buffer for the whole encode — neither may be reused or unmapped before then.
+    unsafe fn submit_registered(
+        &mut self,
+        registered: NV_ENC_REGISTERED_PTR,
+        force_idr: bool,
+    ) -> Result<()> {
+        if self.inflight.len() >= self.outputs.len() {
+            bail!(
+                "NVENC submit with {} pictures already in flight and only {} output buffers; \
+                 drain one with complete_next() first",
+                self.inflight.len(),
+                self.outputs.len()
+            );
+        }
+
         let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { zeroed() };
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = registered;
@@ -747,33 +1383,18 @@ impl Encoder {
             self.check(f(self.encoder, &mut map), "nvEncMapInputResource")?;
         }
         let mapped = map.mappedResource;
-        let result = unsafe { self.encode_locked(mapped, force_idr) };
 
-        unsafe {
-            let f = self
-                .fns
-                .nvEncUnmapInputResource
-                .expect("nvEncUnmapInputResource present");
-            let st = f(self.encoder, mapped);
-            if result.is_ok() {
-                self.check(st, "nvEncUnmapInputResource")?;
-            }
-        }
-        result
-    }
+        let out_idx = self.next_output;
+        let output = &self.outputs[out_idx];
 
-    unsafe fn encode_locked(
-        &mut self,
-        mapped: NV_ENC_INPUT_PTR,
-        force_idr: bool,
-    ) -> Result<Vec<u8>> {
         let mut pic: NV_ENC_PIC_PARAMS = unsafe { zeroed() };
         pic.version = NV_ENC_PIC_PARAMS_VER;
         pic.inputWidth = self.config.width;
         pic.inputHeight = self.config.height;
         pic.inputPitch = self.config.width * 4;
         pic.inputBuffer = mapped;
-        pic.outputBitstream = self.bitstream;
+        pic.outputBitstream = output.bitstream;
+        pic.completionEvent = output.event.map(|h| h.0).unwrap_or(ptr::null_mut());
         pic.bufferFmt = NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB;
         pic.pictureStruct = NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp = self.frame_index;
@@ -783,41 +1404,170 @@ impl Encoder {
                 | (NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32);
         }
 
-        unsafe {
+        // An IDR resets the DPB, so a pending mark or use against it would be meaningless —
+        // take them either way so neither leaks into a later picture, but only apply them to a
+        // P frame.
+        let ltr_mark = self.pending_ltr_mark.take();
+        let ltr_use = self.pending_ltr_use.take();
+        if !force_idr && self.ltr_slots > 0 {
+            let h264 = unsafe { &mut pic.codecPicParams.h264PicParams };
+            if let Some(slot) = ltr_mark {
+                h264.set_ltrMarkFrame(1);
+                h264.ltrMarkFrameIdx = slot;
+            }
+            if let Some(bitmap) = ltr_use {
+                h264.set_ltrUseFrames(1);
+                h264.ltrUseFrameBitmap = bitmap;
+            }
+        }
+
+        let st = unsafe {
             let f = self
                 .fns
                 .nvEncEncodePicture
                 .expect("nvEncEncodePicture present");
-            self.check(f(self.encoder, &mut pic), "nvEncEncodePicture")?;
+            f(self.encoder, &mut pic)
+        };
+        if let Err(e) = self.check(st, "nvEncEncodePicture") {
+            unsafe { self.unmap(mapped) };
+            return Err(e);
+        }
+
+        self.next_output = (out_idx + 1) % self.outputs.len();
+        self.inflight.push_back(InFlight {
+            output: out_idx,
+            mapped,
+        });
+        Ok(())
+    }
+
+    /// Drain the oldest submitted picture: wait for its completion event (async) or let the
+    /// driver block inside `LockBitstream` (sync), copy the access unit out, then release the
+    /// output buffer and unmap the input.
+    ///
+    /// The copy is into a reused scratch buffer rather than a fresh `Vec` per frame; NVENC maps
+    /// its bitstream write-combined, so this read is more expensive than its byte count
+    /// suggests and it happens with the buffer locked, delaying the next picture that lands on
+    /// the same slot.
+    unsafe fn complete_next(&mut self) -> Result<Vec<u8>> {
+        let Some(pending) = self.inflight.pop_front() else {
+            bail!("NVENC complete_next with nothing in flight");
+        };
+        let bitstream = self.outputs[pending.output].bitstream;
+        let event = self.outputs[pending.output].event;
+
+        let waited = match event {
+            Some(h) => unsafe { wait_for_event(h) },
+            None => Ok(()),
+        };
+        if let Err(e) = waited {
+            unsafe { self.unmap(pending.mapped) };
+            return Err(e);
         }
 
         let mut lock: NV_ENC_LOCK_BITSTREAM = unsafe { zeroed() };
         lock.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lock.outputBitstream = self.bitstream;
-        unsafe {
+        lock.outputBitstream = bitstream;
+        // With a signalled completion event the data is already there, so the driver must not
+        // be allowed to block again inside the lock.
+        lock.set_doNotWait(u32::from(event.is_some()));
+        let st = unsafe {
             let f = self
                 .fns
                 .nvEncLockBitstream
                 .expect("nvEncLockBitstream present");
-            self.check(f(self.encoder, &mut lock), "nvEncLockBitstream")?;
+            f(self.encoder, &mut lock)
+        };
+        if let Err(e) = self.check(st, "nvEncLockBitstream") {
+            unsafe { self.unmap(pending.mapped) };
+            return Err(e);
         }
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                lock.bitstreamBufferPtr as *const u8,
-                lock.bitstreamSizeInBytes as usize,
-            )
+        // Inside the lock: one read out of the driver's write-combined mapping into a buffer
+        // that is already resident. Nothing else — no allocation, no growth. `au_scratch` is
+        // kept, not handed out, so it stays sized to the largest access unit seen and the
+        // `reserve` cannot fault on the critical path. Copying into a freshly taken (and
+        // therefore empty) `Vec` put exactly that allocation inside the lock, where it delays
+        // the next picture that lands on this output slot.
+        let len = lock.bitstreamSizeInBytes as usize;
+        if self.au_scratch.len() < len {
+            self.au_scratch.resize(len, 0);
         }
-        .to_vec();
-
         unsafe {
+            ptr::copy_nonoverlapping(
+                lock.bitstreamBufferPtr as *const u8,
+                self.au_scratch.as_mut_ptr(),
+                len,
+            );
+        }
+
+        let unlock = unsafe {
             let f = self
                 .fns
                 .nvEncUnlockBitstream
                 .expect("nvEncUnlockBitstream present");
-            self.check(f(self.encoder, self.bitstream), "nvEncUnlockBitstream")?;
+            f(self.encoder, bitstream)
+        };
+        unsafe { self.unmap(pending.mapped) };
+        self.check(unlock, "nvEncUnlockBitstream")?;
+
+        // Outside the lock. Still one allocation per access unit — the callers want an owned
+        // `Vec` that becomes a `Bytes` — but the driver is no longer waiting on it.
+        Ok(self.au_scratch[..len].to_vec())
+    }
+
+    unsafe fn unmap(&self, mapped: NV_ENC_INPUT_PTR) {
+        if let Some(f) = self.fns.nvEncUnmapInputResource {
+            let st = unsafe { f(self.encoder, mapped) };
+            if st != NVENCSTATUS::NV_ENC_SUCCESS {
+                teprintln!("nvEncUnmapInputResource returned {st:?}");
+            }
         }
-        Ok(bytes)
+    }
+}
+
+/// Escape hatch back to the pre-async submit-and-block path: an A/B lever for measuring what
+/// async mode is worth, and the workaround if a driver revision turns out to mishandle
+/// completion events.
+fn async_disabled_by_env() -> bool {
+    std::env::var("SE_NVENC_NO_ASYNC").as_deref() == Ok("1")
+}
+
+/// Block on an NVENC completion event. A timeout here means the hardware never finished the
+/// picture, which is a driver fault or a TDR, not congestion — the caller treats it as an
+/// encode error so the session can shed the frame rather than wait forever.
+unsafe fn wait_for_event(handle: HANDLE) -> Result<()> {
+    let rv = unsafe { WaitForSingleObject(handle, ENCODE_EVENT_TIMEOUT_MS) };
+    match rv {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => bail!(
+            "NVENC completion event not signalled within {ENCODE_EVENT_TIMEOUT_MS} ms \
+             (encoder wedged: GPU hang, TDR or driver fault)"
+        ),
+        other => bail!("WaitForSingleObject on an NVENC completion event returned {other:?}"),
+    }
+}
+
+/// Fold the driver's reported limits into the requested geometry. The client picks its own
+/// viewport, `server.rs` clamps it only to 2..=16384, and nothing before this consulted what
+/// the encoder can actually take.
+fn clamp_config_to_caps(config: EncoderConfig, caps: &EncoderCaps) -> EncoderConfig {
+    let (w, h) = caps.clamp_dims(config.width, config.height);
+    if w != config.width || h != config.height {
+        teprintln!(
+            "NVENC: requested {}x{} is outside this engine's {}x{}..{}x{} range; encoding at {w}x{h}",
+            config.width,
+            config.height,
+            caps.width_min,
+            caps.height_min,
+            caps.width_max,
+            caps.height_max,
+        );
+    }
+    EncoderConfig {
+        width: w,
+        height: h,
+        ..config
     }
 }
 
@@ -848,12 +1598,32 @@ impl Drop for Encoder {
                 }
                 self.registered_input = ptr::null_mut();
             }
-            if !self.bitstream.is_null() {
-                if let Some(f) = self.fns.nvEncDestroyBitstreamBuffer {
-                    let st = f(self.encoder, self.bitstream);
-                    log_drop_status(st, "nvEncDestroyBitstreamBuffer");
+            // Anything still in flight holds a mapped input and an output buffer; the driver
+            // must be told to forget them before either can be destroyed.
+            while let Some(pending) = self.inflight.pop_front() {
+                if let Some(f) = self.fns.nvEncUnmapInputResource {
+                    log_drop_status(f(self.encoder, pending.mapped), "nvEncUnmapInputResource");
                 }
-                self.bitstream = ptr::null_mut();
+            }
+            for out in std::mem::take(&mut self.outputs) {
+                if let Some(h) = out.event {
+                    // Unregister before closing: the driver keeps the handle otherwise.
+                    if let Some(f) = self.fns.nvEncUnregisterAsyncEvent {
+                        let mut params: NV_ENC_EVENT_PARAMS = zeroed();
+                        params.version = NV_ENC_EVENT_PARAMS_VER;
+                        params.completionEvent = h.0;
+                        log_drop_status(f(self.encoder, &mut params), "nvEncUnregisterAsyncEvent");
+                    }
+                    let _ = CloseHandle(h);
+                }
+                if !out.bitstream.is_null() {
+                    if let Some(f) = self.fns.nvEncDestroyBitstreamBuffer {
+                        log_drop_status(
+                            f(self.encoder, out.bitstream),
+                            "nvEncDestroyBitstreamBuffer",
+                        );
+                    }
+                }
             }
             if !self.encoder.is_null() {
                 if let Some(f) = self.fns.nvEncDestroyEncoder {
@@ -972,7 +1742,36 @@ unsafe fn open_session(
             if let Some(d) = fns.nvEncDestroyEncoder {
                 let _ = d(encoder);
             }
-            return Err(anyhow!("nvEncOpenEncodeSessionEx failed: {st:?}"));
+            // Name the session cap when that is what happened. Consumer drivers allow a fixed
+            // number of concurrent NVENC sessions per system, and ScreenExtend opens one per
+            // streaming session — so the Nth client is an ordinary condition, not a broken
+            // machine. `build_backend` degrades to Quick Sync or x264 either way; the point of
+            // saying so is that the log otherwise reads as "NVENC unavailable" on a host with a
+            // perfectly good NVENC.
+            //
+            // `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY` is the status the driver actually returns for
+            // this, which its name does not suggest. Measured on the dev box (RTX 3080 Ti
+            // Laptop, driver 580.97) by opening sessions until refusal: the 9th failed, so the
+            // cap here is 8. `OUT_OF_MEMORY` covers the branches that report it that way
+            // instead. Probed by attempting, never by counting — the limit varies by driver
+            // branch and by whatever else on the machine is encoding.
+            let detail = match st {
+                NVENCSTATUS::NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY
+                | NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => {
+                    " (the driver's concurrent-session limit: this system already holds as many \
+                     NVENC sessions as it allows, so this client encodes on Quick Sync or x264 \
+                     instead)"
+                }
+                // The one failure a user can act on. `apiVersion` is a floor NVENC refuses to
+                // go below, so this means the installed driver is older than the API these
+                // bindings were generated for — not a broken GPU, and not something a retry or a
+                // different configuration will help.
+                NVENCSTATUS::NV_ENC_ERR_INVALID_VERSION => {
+                    " (this build asks for NVENC API 12.1, which the installed NVIDIA driver                      does not implement; updating the driver is what fixes it)"
+                }
+                _ => "",
+            };
+            return Err(anyhow!("nvEncOpenEncodeSessionEx failed: {st:?}{detail}"));
         }
     }
     Ok(encoder)
