@@ -2241,6 +2241,29 @@ mod tests {
         assert!(!add_trickled_candidates("deadbeef", "a=end-of-candidates").await);
     }
 
+    /// The body `trickleFragment()` in `static/index.html` actually writes, byte for byte: the
+    /// client batches every pending candidate under one `m=` section because the page is
+    /// `max-bundle`, and closes the last fragment with `a=end-of-candidates`. Asserted here so
+    /// the two halves cannot drift — `scripts/test-client-ice.mjs` asserts the same shape from
+    /// the other side.
+    #[test]
+    fn the_client_fragment_shape_parses_whole() {
+        let body = "a=ice-ufrag:UF01\r\n\
+                    m=video 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                    a=mid:0\r\n\
+                    a=candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host\r\n\
+                    a=candidate:2 1 udp 41885439 203.0.113.7 40000 typ relay raddr 0.0.0.0 rport 0\r\n\
+                    a=end-of-candidates\r\n";
+        let f = parse_trickle_fragment(body);
+        assert_eq!(f.ufrag.as_deref(), Some("UF01"));
+        assert_eq!(f.candidates.len(), 2);
+        for c in &f.candidates {
+            assert_eq!(c.1.as_deref(), Some("0"), "every candidate rides mid 0");
+            assert_eq!(c.2, Some(0), "one m= section means m-line index 0");
+        }
+        assert!(f.end_of_candidates);
+    }
+
     #[test]
     fn every_registered_payload_type_is_distinct() {
         for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
