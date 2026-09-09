@@ -653,7 +653,13 @@ pub fn reload_config_into_state(_app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub use desktop::{reload_config_into_state, route};
+pub use desktop::{reload_config_into_state, route, saved_stun_urls};
+
+/// The saved STUN list, on a build with no desktop router. Nothing reads it there.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn saved_stun_urls(_app: &tauri::AppHandle) -> Option<Vec<String>> {
+    None
+}
 
 #[cfg(any(windows, target_os = "macos"))]
 mod desktop {
@@ -724,6 +730,19 @@ mod desktop {
                 exit(1);
             }
         }
+    }
+
+    /// The saved `stunUrls` setting, for the per-OS `setup` command.
+    ///
+    /// Read through the same store the CLI writes, so `ScreenExtend stun set` and the headless
+    /// `serve` and the desktop app all see one value. Returns `None` when the key is absent, which
+    /// is every install predating the setting and means "keep the built-in default"; `Some(vec![])`
+    /// is the distinct, deliberate "no STUN at all".
+    pub fn saved_stun_urls(app: &tauri::AppHandle) -> Option<Vec<String>> {
+        let store = app.store(CONFIG_STORE).ok()?;
+        let raw = get_nested(&store, "stunUrls")?;
+        let raw = raw.as_str()?.to_string();
+        Some(crate::streamer::session::parse_stun_urls(&raw))
     }
 
     fn get_nested(store: &Cfg, key: &str) -> Option<Value> {
@@ -999,6 +1018,7 @@ mod desktop {
             "network" => run_network(app, m),
             "config" => run_config(app, m),
             "turn" => run_turn(app, m),
+            "stun" => run_stun(app, m),
             "account" => run_account(app, m),
             "autostart" => run_autostart(app, m),
             "drivers" => run_drivers(app, m),
@@ -2168,6 +2188,71 @@ mod desktop {
     }
 
     // turn
+
+    fn run_stun(app: &tauri::AppHandle, m: &Matches) -> ! {
+        use crate::streamer::config::DEFAULT_STUN_URL;
+
+        let Some((name, sm)) = sub(m) else {
+            eprintln!("usage: ScreenExtend stun <show|set|clear>");
+            exit(2);
+        };
+        let store = open_store(app);
+        match name {
+            "show" => {
+                let saved = cfg_str(&store, "stunUrls");
+                let urls = saved
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_STUN_URL.to_string());
+                let parsed = crate::streamer::session::parse_stun_urls(&urls);
+                if wants_json(sm) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "urls": parsed,
+                            "configured": saved.is_some(),
+                            "default": DEFAULT_STUN_URL,
+                        })
+                    );
+                } else if parsed.is_empty() {
+                    println!("STUN: disabled (host candidates only on every path)");
+                } else {
+                    println!("STUN: {}", parsed.join(", "));
+                    if saved.is_none() {
+                        println!("      (built-in default; nothing configured)");
+                    }
+                }
+                exit(0);
+            }
+            "set" => {
+                let Some(urls) = arg_str(sm, "urls") else {
+                    eprintln!("usage: ScreenExtend stun set <urls>");
+                    exit(2);
+                };
+                store.set("stunUrls", Value::String(urls.trim().to_string()));
+                if let Err(e) = store.save() {
+                    eprintln!("error: failed to save config: {e}");
+                    exit(1);
+                }
+                println!("STUN servers saved. They apply the next time the host starts.");
+                exit(0);
+            }
+            "clear" => {
+                // The empty string, not a removed key: "no STUN at all" is a setting, and a
+                // same-subnet-only host has no use for a reflexive candidate.
+                store.set("stunUrls", Value::String(String::new()));
+                if let Err(e) = store.save() {
+                    eprintln!("error: failed to save config: {e}");
+                    exit(1);
+                }
+                println!("STUN disabled. Cross-network joins will need a TURN relay.");
+                exit(0);
+            }
+            other => {
+                eprintln!("error: unknown `stun` subcommand `{other}`");
+                exit(2);
+            }
+        }
+    }
 
     fn run_turn(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
