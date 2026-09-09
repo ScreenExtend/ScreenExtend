@@ -87,6 +87,23 @@ const METRICS = {
     source:
       "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
   },
+  // `videotoolbox encode OK: ... vt_encode_p95=<n>us ...` — macOS's `encode_synthetic`.
+  // This is what makes a macOS perf-gate row possible at all: until it printed a timing, the
+  // gate's Windows-only matrix was a data problem rather than a platform judgement. No display
+  // and no Screen Recording grant needed, which is why the encoder module is the one a hosted
+  // runner can measure.
+  vt_p95_encode_us: {
+    pattern: /\bvt_encode_p95=(\d+)us/,
+    unit: "us",
+    source:
+      "cargo test --release --lib macos_utils::streamer::encoder -- --ignored --nocapture",
+  },
+  vt_p50_encode_us: {
+    pattern: /\bvt_encode_p50=(\d+)us/,
+    unit: "us",
+    source:
+      "cargo test --release --lib macos_utils::streamer::encoder -- --ignored --nocapture",
+  },
 };
 
 function die(msg) {

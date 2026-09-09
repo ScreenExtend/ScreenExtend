@@ -765,10 +765,13 @@ mod tests {
     /// cargo test --lib macos_utils::networking::tests::probe_siocgifmedia_request_numbers -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "probes a real kernel over real interfaces; run with --ignored --nocapture"]
     fn probe_siocgifmedia_request_numbers() {
         let Some(sock) = IoctlSocket::open() else {
-            println!("no AF_INET socket available; nothing to probe");
+            crate::test_support::skip_because(
+                "SIOCGIFMEDIA request-number probe",
+                "no AF_INET socket available",
+            );
             return;
         };
         for name in interface_names() {
