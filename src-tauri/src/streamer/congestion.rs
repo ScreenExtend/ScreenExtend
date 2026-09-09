@@ -148,7 +148,7 @@ impl SendHistory {
     /// A frame with even one lost packet is never acknowledged: the point of the signal is that
     /// the encoder may keep referencing that picture, and a decoder missing a slice of it cannot.
     /// Decided frames are dropped either way, so a lossy stretch does not accumulate tallies.
-    fn take_intact_frame(&mut self) -> Option<(u32, u64)> {
+    fn take_decided_frames(&mut self, lost_out: &mut Vec<u64>) -> Option<(u32, u64)> {
         let mut newest: Option<(u32, u64)> = None;
         while let Some(front) = self.frames.front().copied() {
             if !front.decided() {
@@ -157,6 +157,8 @@ impl SendHistory {
             self.frames.pop_front();
             if front.intact() {
                 newest = Some((front.ordinal, front.capture_ns));
+            } else {
+                lost_out.push(front.capture_ns);
             }
         }
         newest
@@ -182,7 +184,7 @@ impl SendHistory {
 }
 
 /// What one `TransportLayerCc` report said.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeedbackSummary {
     /// Packets the report covered and we had a send time for.
     pub matched: u32,
@@ -195,6 +197,10 @@ pub struct FeedbackSummary {
     /// Host-clock capture time of the newest access unit the client received in full, when this
     /// report completed one. The encoder can use it as a long-term reference acknowledgement.
     pub acked_capture_ns: Option<u64>,
+    /// Host-clock capture times of access units this report proved incomplete. Each one is a
+    /// picture the encoder must stop referencing, or every frame predicted from it is undecodable
+    /// on this client.
+    pub lost_capture_ns: Vec<u64>,
 }
 
 impl FeedbackSummary {
@@ -320,7 +326,7 @@ pub fn interpret(
         history.note(frame, received);
     }
     summary.acked_capture_ns = history
-        .take_intact_frame()
+        .take_decided_frames(&mut summary.lost_capture_ns)
         .map(|(_, capture_ns)| capture_ns);
 
     history.retire_through(
@@ -895,7 +901,7 @@ mod tests {
             reported: 10,
             lost: 2,
             received_bps: 5_000_000,
-            acked_capture_ns: None,
+            ..Default::default()
         });
         let (loss, n) = f.take_loss().unwrap();
         assert!((loss - 0.2).abs() < 1e-9);
@@ -928,6 +934,11 @@ mod tests {
 
     /// The acknowledgement signal, exercised through `SendHistory` directly: `interpret` needs a
     /// real `TransportLayerCc`, and what matters here is the tally, not the wire format.
+    fn take_intact(h: &mut SendHistory) -> Option<(u32, u64)> {
+        let mut lost = Vec::new();
+        h.take_decided_frames(&mut lost)
+    }
+
     #[test]
     fn a_frame_is_acknowledged_only_when_every_one_of_its_packets_arrived() {
         let e = Instant::now();
@@ -939,19 +950,19 @@ mod tests {
         for _ in 0..3 {
             h.record(1200, e, 2, 2_000);
         }
-        assert_eq!(h.take_intact_frame(), None, "nothing decided yet");
+        assert_eq!(take_intact(&mut h), None, "nothing decided yet");
 
         h.note(1, true);
         h.note(1, true);
-        assert_eq!(h.take_intact_frame(), None, "two of three is not the frame");
+        assert_eq!(take_intact(&mut h), None, "two of three is not the frame");
         h.note(1, true);
-        assert_eq!(h.take_intact_frame(), Some((1, 1_000)));
+        assert_eq!(take_intact(&mut h), Some((1, 1_000)));
 
         h.note(2, true);
         h.note(2, false);
         h.note(2, true);
         assert_eq!(
-            h.take_intact_frame(),
+            take_intact(&mut h),
             None,
             "a frame missing a packet must never be acknowledged"
         );
@@ -967,8 +978,8 @@ mod tests {
         for frame in 1..=3u32 {
             h.note(frame, true);
         }
-        assert_eq!(h.take_intact_frame(), Some((3, 3_000)));
-        assert_eq!(h.take_intact_frame(), None, "the tallies were consumed");
+        assert_eq!(take_intact(&mut h), Some((3, 3_000)));
+        assert_eq!(take_intact(&mut h), None, "the tallies were consumed");
     }
 
     #[test]
@@ -991,5 +1002,19 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(f.acked_frame_capture_ns(), Some(9_000));
+    }
+
+    #[test]
+    fn a_frame_the_client_did_not_receive_whole_is_reported_as_lost() {
+        let e = Instant::now();
+        let mut h = SendHistory::new(e);
+        for _ in 0..2 {
+            h.record(1200, e, 7, 7_000);
+        }
+        h.note(7, true);
+        h.note(7, false);
+        let mut lost = Vec::new();
+        assert_eq!(h.take_decided_frames(&mut lost), None);
+        assert_eq!(lost, vec![7_000], "the encoder must stop referencing it");
     }
 }
