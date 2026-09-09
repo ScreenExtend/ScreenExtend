@@ -572,7 +572,10 @@ mod tests {
     #[test]
     fn baseline_of_the_live_system_is_not_empty() {
         if !has_a_console_session() {
-            println!("no console session (ssh?); skipping");
+            crate::test_support::skip_because(
+                "airplay display baseline",
+                "CoreGraphics reports no displays outside a console session (ssh?)",
+            );
             return;
         }
         assert!(!baseline().0.is_empty());

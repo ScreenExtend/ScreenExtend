@@ -954,7 +954,10 @@ mod tests {
         // session, and ssh is how this crate is usually tested on the 10.15 box. The assertion is
         // about a live display, so with none present there is nothing to assert.
         if crate::macos_utils::streamer::display::active_displays().is_empty() {
-            println!("no console session (ssh?); skipping");
+            crate::test_support::skip_because(
+                "macos display name correlation",
+                "CoreGraphics reports no displays outside a console session (ssh?)",
+            );
             return;
         }
         let vd = MacosVirtualDisplay;
