@@ -21,18 +21,20 @@ Everything below is new or newly conditional. If your time is short, test in thi
    relays the request to the host as `KEYFRAME_REQUEST` (`0x64`) — but only to a host that has
    said on the `PONG` that it parses it. Highest-risk device: **Chrome/Edge/Samsung Internet
    below 141**, which has no `sendKeyFrameRequest` at all. §2.
-2. **The join chain.** The microphone prompt no longer gates ICE; ICE waits for a relay
-   candidate only when the session is actually relayed; the WHEP POST has a deadline; the
-   transform watchdog is armed when packets start rather than when the page loads. Highest-risk
-   devices: **a cross-network join through TURN** and **any slow phone**. §3.
+2. **The join chain.** The microphone prompt no longer gates ICE; against a host that accepts
+   trickled candidates the offer no longer waits for gathering **at all**, and where it does wait
+   it waits for a relay candidate only when the session is actually relayed; the WHEP POST has a
+   deadline; the transform watchdog is armed when packets start rather than when the page loads.
+   Highest-risk devices: **a cross-network join through TURN** and **any slow phone**. §3.
 3. **Audio.** The WebCodecs path is claimed only after a real Opus frame has been decoded *and*
    `copyTo`'d, and it can now step down mid-session. Highest-risk devices: **Safari 26 and
    Firefox 130**, the two engines that only just shipped `AudioDecoder` and so are the ones the
    old constructor sniff got wrong. §5.
 4. **Input.** Coordinates come from the letterboxed picture rect, pointer lock survives an
-   options bag that throws, and the keyboard lock is requested after fullscreen is re-entered.
+   options bag that throws, the keyboard lock is requested after fullscreen is re-entered, and
+   every frame on the unordered `fast` channel now carries a sequence the host reorder-gates on.
    Highest-risk device: **a phone in portrait against a 16:9 host**, where the letterbox is
-   largest. §6.
+   largest; and any link with real reorder, where the gate is what is being tested. §6.
 5. **Presentation.** Frames now count as rendered only when something painted them. A black
    canvas that used to satisfy every watchdog now demotes. Highest-risk device: **anything with
    an unusual GPU or a blocked OffscreenCanvas**. §4, §9.
@@ -138,7 +140,9 @@ Time from pressing Connect to the first frame, with a stopwatch, three runs, tak
 | First join on a device that has never granted the microphone | **There must be no microphone prompt before the picture.** If one appears at all it should be after the stream is live. This was a 12-second cap in front of ICE. |
 | Rejoin on a LAN with no TURN configured | ICE should not cost seconds. `degraded` bit 15 set means gathering ran to its deadline rather than settling — on a LAN that points at a network problem, not at this code. |
 | Join from a 90, 120 or 144 Hz device | **The session must not renegotiate about a second after it goes live.** Watch the host log for a second `creating virtual display` for the same client. The measured rate should already be in the first join: check the host's device panel shows the right refresh rate immediately. |
-| Join with TURN configured, from another network | Gathering waits for a relay candidate plus a 400 ms grace. Expect this to be the slowest case and note the number. **It must connect at all** — before this pass the relay flag was never passed to the wait, so a cross-network join shipped an offer with no relay candidate and could only ever end in "Connection failed." If it fails, check the offer in the console for an `a=candidate:` line with `typ relay`. |
+| Join with TURN configured, from another network | Two shapes, and which one you get is the point. Against a host that serves `/net-config` directly (a LAN address reached from another subnet, or a VPN), the page **trickles**: the offer is posted with no candidates at all and the relay candidate follows over `PATCH /whep/{id}`, so the TURN allocation is off the critical path entirely and `degraded` bit 22 is **clear**. Over the **cloud relay**, `/net-config` is not the host's, so the page keeps the old shape — gathering waits for a relay candidate plus a 400 ms grace, bit 22 is **set**, and this is the slowest case; note the number. **It must connect either way.** If it fails, check the offer in the console for an `a=candidate:` line with `typ relay`, and the host log for `trickle: added N remote candidate(s)`. |
+| Trickle, on any join to a host reached directly | Watch the host log with `serve -v`. Expect `trickle: added N remote candidate(s)` within a few hundred ms of the join, ending with `client finished gathering`. `degraded` bit 22 clear. In the browser's network panel there should be one or two `PATCH /whep/<hex>` requests returning **204**. A `404` means the session was already gone; anything else, or no PATCH at all against a host whose `/net-config` says `"trickleIce": true`, is a finding. |
+| Trickle behind a proxy that strips `Location` | Only reachable artificially (a reverse proxy, or devtools' request blocking on the response header). The page must **rejoin once** with a gathered offer — one extra `POST /whep` and then a working picture — not fail. `degraded` bit 22 set. A second rejoin, or a loop, means the `trickleOff` latch is not holding. |
 | Join against a host that accepts the TCP connection and never answers | Simulate it by suspending the host process (`Ctrl+Break` in its console, or the debugger) between pressing Connect and the answer. The page must reach the normal **"Disconnected"** state within about ten seconds, not sit on a spinner forever. On the *reconfigure* path (change the scale from the host's device panel while suspended) the same applies within fifteen: a frozen frame with no spinner and no status was the old behaviour. |
 | Join twice quickly, or force a watchdog while joining | Reload the page during the join, or let the 2.5 s transform watchdog fire on a slow link. Watch the host log: there must be **one** `POST /whep` per join attempt that survives. Two peer connections for one device — a second `creating virtual display` line with no intervening leave — means the generation guard on `start()` is not holding. |
 
@@ -188,6 +192,7 @@ host.
 |---|---|---|
 | Letterbox coordinates | Use a device whose aspect ratio differs from the host display (a phone in portrait against a 16:9 desktop). Tap a specific icon near the top of the picture. | The click lands on that icon. Before this change it landed high by half the bar. Also tap **inside the black bar**: nothing should happen on the host. |
 | Coalesced samples | Drag slowly in a drawing app on the host, from a touchscreen | A smooth line, not a polyline of straight segments. `degraded` bit 14 means the browser has no `getCoalescedEvents` and one sample per frame is expected. |
+| Reorder gating | Induce reorder and loss on the link (`clumsy` on Windows with "out of order" at 10 %, or join through a TURN relay), then move the mouse in a steady circle for 30 s | The cursor must not stutter backwards. On the host, `input_reorder_drops` in `ScreenExtend status --json` should be **non-zero** — that counter is the gate working. It staying at 0 under induced reorder means the client is not stamping the sequence: check the host advertises capability bit 5 (a 19-byte `PONG`) and that a `POINTER_MOVE` on the wire is 50 bytes, not 48. |
 | Pointer lock, raw movement | On a laptop client, enter fullscreen and move the mouse across the whole host desktop | The cursor should feel like the host's own, not double-accelerated. `pointerLockUnadjusted: true` in `getStats()` confirms raw deltas; `degraded` bit 2 means the platform refused and the two curves are compounding. |
 | Keyboard lock | In fullscreen on Chrome, press Escape | The key reaches the host rather than leaving fullscreen. `keyboardLock: false` is expected on Safari and Firefox, which have no such API. |
 | Fullscreen on iPhone | Join with fullscreen mode on | `fullscreen: false` and `degraded` bit 0, and the picture fills the viewport. iPhone Safari cannot make an element fullscreen at all; this is designed behaviour. |
@@ -237,6 +242,8 @@ How to force each one, so you can see the floor rather than trust it:
 | Fullscreen | the picture fills the viewport, no fullscreen element | iPhone Safari (which cannot make an element fullscreen at all) | The stage fills the screen, browser chrome stays | `fullscreen` false with `degraded` bit 0 |
 | `getCoalescedEvents` | one sample per frame | Older Safari | A drawn line becomes a polyline of straight segments | `degraded` bit 14 |
 | Clock offset from `PONG` | offset 0, so host-relative numbers are a difference and not an absolute | An older host that sends a 9- or 17-byte `PONG`; or Safari below 15, where `performance.timeOrigin` is missing | Everything works; `hostToPaint` reads 0 | `clockValid` false. `hostToPaint.p50` of 0 **with** `clockValid` true would be the bug |
+| **Trickle ICE** (`PATCH /whep/{id}`) | gather, then post the whole offer | Join over the cloud relay, or against a host whose `/net-config` does not say `trickleIce` | The join is slower by however long gathering takes — on a relayed session that is a whole TURN allocation | `degraded` bit 22. Clear = the offer went out immediately and the candidates followed by PATCH; set = the old shape. Bit 15 beside it says the wait ran all the way to its deadline |
+| Fast-channel input sequence | no reorder gate: the host injects every move it receives | An older host (a 17-byte `PONG`, or one with capability bit 5 clear) | The cursor can stutter backwards for a frame under reorder | `input_reorder_drops` on the host stays 0 and a `POINTER_MOVE` is 48 bytes rather than 50 |
 
 Four rungs this pass added or repaired, worth forcing once each:
 
