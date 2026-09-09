@@ -6,6 +6,14 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>ScreenExtend streams this Mac's audio output to devices you connect, when you enable System Audio for a device.</string>
 
+    <!-- On a dual-GPU Mac, an app that touches Metal or OpenGL without this key forces the
+         discrete GPU on for its entire lifetime, whether or not it is streaming. With it, macOS
+         starts us on the integrated GPU and switches only when something actually demands the
+         discrete one. The encoder asks for the GPU that drives the captured display by registry
+         id, which is the other half of the same decision. -->
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

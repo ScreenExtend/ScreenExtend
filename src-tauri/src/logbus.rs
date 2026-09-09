@@ -25,8 +25,10 @@ const MAX_BATCH: usize = 64;
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 /// Whether anything is reading the `LogLine` stream. The Settings log panel is the only
-/// consumer and it reads the backlog on mount, so the first `get_log_backlog` call is the
-/// signal that arms the stream. Until then the writer thread never touches Tauri's event bus.
+/// consumer; it arms this on mount and disarms it on unmount through `set_log_streaming`.
+/// `get_log_backlog` also arms it, so a caller that reads the backlog and subscribes without
+/// saying so still gets its events. Tauri 2 exposes no way to ask how many JS listeners an
+/// event has, which is why the panel has to tell us.
 static STREAMING: AtomicBool = AtomicBool::new(false);
 
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -159,6 +161,15 @@ pub fn attach(app: AppHandle) {
 pub fn get_log_backlog() -> Vec<String> {
     STREAMING.store(true, Ordering::Relaxed);
     bus().backlog.lock().unwrap().iter().cloned().collect()
+}
+
+/// Arm or disarm the `LogLine` event stream. Called by the Settings log panel on mount and,
+/// crucially, on unmount: without the second call the panel being opened once kept the writer
+/// thread emitting batched IPC events for the rest of the process's life.
+#[tauri::command]
+#[specta::specta]
+pub fn set_log_streaming(on: bool) {
+    STREAMING.store(on, Ordering::Relaxed);
 }
 
 #[macro_export]
