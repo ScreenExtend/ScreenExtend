@@ -433,6 +433,44 @@ The DXGI fallback line must not appear anywhere in the log.
 
 ---
 
+## 9. Stale virtual-display device nodes and what they cost (10 min, Administrator)
+
+Windows keeps a device node for every display the IDD driver has ever created, and nothing removes
+them. D-1 measured attach time going from **0.58 s to 1.9 s** on a box that had accumulated them,
+so this is worth a number before anyone optimises the attach path itself.
+
+Count them (elevated PowerShell, `Root\\VirtualDisplayDriver` is the hardware id from
+`VirtualDisplayDriver.inf`):
+
+```powershell
+$all = pnputil /enum-devices /class Display
+$all | Select-String -Pattern 'Instance ID:\s+(ROOT\\DISPLAY\\.*)' -AllMatches
+# or, showing present vs not-present directly:
+Get-PnpDevice -Class Display |
+  Where-Object { $_.HardwareID -contains 'Root\\VirtualDisplayDriver' } |
+  Group-Object Status | Format-Table Name, Count
+```
+
+Measure, clear, measure again:
+
+1. Note attach time from a cold join (`ScreenExtend serve -v`, the `virtual display ... created`
+   line), three joins, take the median.
+2. Remove the not-present nodes, **as Administrator**:
+
+   ```powershell
+   Get-PnpDevice -Class Display |
+     Where-Object { $_.HardwareID -contains 'Root\\VirtualDisplayDriver' -and $_.Status -ne 'OK' } |
+     ForEach-Object { pnputil /remove-device $_.InstanceId }
+   ```
+
+   `pnputil /remove-device` needs elevation and refuses politely without it. Do **not** remove
+   nodes whose `Status` is `OK` — that is a display in use.
+3. Repeat step 1.
+
+Report the two medians and the node count before/after. If the difference is real, a `doctor`
+warning becomes worth building (see the note in `docs/OPTIMIZATIONS.md`); if it is noise, say so
+and the idea can be closed.
+
 ## What to report back
 
 1. The `wgc: feature set ...` line, verbatim, per machine.

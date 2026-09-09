@@ -44,6 +44,52 @@ const INVALID_CALL_MAX_RECOVERIES: u32 = 20;
 /// cannot produce a frame has to say so and stop, not spin.
 const REDUP_WITHOUT_FRAME_MAX: u32 = 40;
 
+/// The "re-established but starving" watchdog, kept apart from the D3D calls so it can be tested.
+///
+/// The reset used to happen on any acquire that *returned*, on the reasoning that a returning
+/// acquire proves the duplication is live. Measurement disproved it: an IDD virtual display in
+/// this state re-established **1,190 times in 30 s and delivered 0 frames**, and because each
+/// cycle contained a returning acquire the counter was reset to 1 every time and the ceiling was
+/// never reached. The client held a negotiated session showing nothing, indefinitely.
+///
+/// So the reset is tied to a frame actually being handed onward, which is the only event that
+/// proves the output can be captured at all.
+#[derive(Default)]
+struct RedupWatchdog {
+    /// Re-establishments since the last *delivered* frame.
+    since_frame: u32,
+}
+
+impl RedupWatchdog {
+    /// A frame reached the pipeline: the run ends.
+    fn on_frame_delivered(&mut self) {
+        self.since_frame = 0;
+    }
+
+    /// Duplication was re-established. `Err` once the output has proved it cannot be captured.
+    fn on_reestablished(&mut self) -> Result<()> {
+        self.since_frame += 1;
+        if self.since_frame > REDUP_WITHOUT_FRAME_MAX {
+            bail!(
+                "duplication was re-established {} times without ever delivering a \
+                 frame; this output cannot be captured with DXGI Desktop Duplication",
+                self.since_frame
+            );
+        }
+        Ok(())
+    }
+
+    /// One line per re-establishment floods the log bus, and every log line is an IPC event to
+    /// the UI. Say it once, then only every tenth, with the running count.
+    fn should_log(&self) -> bool {
+        self.since_frame == 1 || self.since_frame.is_multiple_of(10)
+    }
+
+    fn count(&self) -> u32 {
+        self.since_frame
+    }
+}
+
 /// Holds an acquired duplication frame and releases it on drop.
 ///
 /// `AcquireNextFrame` and `ReleaseFrame` are a strict pair: miss one release and every subsequent
@@ -84,9 +130,9 @@ pub struct Duplicator {
     /// worked and the pipeline can report it.
     api: DuplicationApi,
     redup_failures: u32,
-    /// Successful re-duplications since the last frame actually came out. Reset by `poll` on the
-    /// first acquire that yields a frame; a run of these with no frame is a dead capture.
-    redup_without_frame: u32,
+    /// Successful re-duplications since a frame was last *delivered*. A run of these with no
+    /// delivered frame is a dead capture, however healthy each individual acquire looks.
+    redup: RedupWatchdog,
     invalid_call_recoveries: u32,
     /// `LastPresentTime` of the most recent dirty frame, already on the shared host clock.
     /// The compositor's own frame time; without it the pipeline can only measure from the
@@ -541,7 +587,7 @@ impl Duplicator {
             dup: Some(dup),
             api,
             redup_failures: 0,
-            redup_without_frame: 0,
+            redup: RedupWatchdog::default(),
             invalid_call_recoveries: 0,
             last_present_host_ns: 0,
             accumulated_extra: 0,
@@ -603,20 +649,11 @@ impl Duplicator {
                 }
                 self.dup = Some(dup);
                 self.redup_failures = 0;
-                self.redup_without_frame += 1;
-                if self.redup_without_frame > REDUP_WITHOUT_FRAME_MAX {
-                    bail!(
-                        "duplication was re-established {} times without ever delivering a \
-                         frame; this output cannot be captured with DXGI Desktop Duplication",
-                        self.redup_without_frame
-                    );
-                }
-                // One line per re-establishment floods the log bus, and every log line is an IPC
-                // event to the UI. Say it once, then only every tenth, with the running count.
-                if self.redup_without_frame == 1 || self.redup_without_frame.is_multiple_of(10) {
+                self.redup.on_reestablished()?;
+                if self.redup.should_log() {
                     tprintln!(
-                        "dxgi: duplication re-established ({} since the last frame)",
-                        self.redup_without_frame
+                        "dxgi: duplication re-established ({} since the last delivered frame)",
+                        self.redup.count()
                     );
                 }
                 Ok(())
@@ -774,9 +811,9 @@ impl Duplicator {
         }
         // Everything past here is inside the acquire; the guard releases on every exit path.
         let _acquired = AcquiredFrame(&dup);
-        // An acquire that returned is proof the duplication is live, so the "re-established and
-        // produced nothing" run ends here.
-        self.redup_without_frame = 0;
+        // `invalid_call_recoveries` genuinely is answered by a returning acquire: it counts
+        // DXGI_ERROR_INVALID_CALL, and getting a frame handle back proves the acquire/release
+        // pairing recovered. `redup` is not — see `RedupWatchdog` — and is reset at delivery.
         self.invalid_call_recoveries = 0;
 
         self.accumulated_extra += u64::from(info.AccumulatedFrames.saturating_sub(1));
@@ -853,6 +890,8 @@ impl Duplicator {
         }
 
         Ok(if dirty && self.have_desktop {
+            // The one event that proves this output can be captured.
+            self.redup.on_frame_delivered();
             PollStatus::Dirty
         } else {
             PollStatus::Timeout
@@ -1128,4 +1167,60 @@ fn write_bmp(path: &str, w: u32, h: u32, data: &[u8], pitch: u32) -> Result<()> 
         out.write_all(&data[start..start + row])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_starving_duplication_gives_up_instead_of_spinning() {
+        let mut w = RedupWatchdog::default();
+        // The measured mode: every acquire returns, none of them yields a frame, so nothing ever
+        // calls `on_frame_delivered`.
+        for i in 1..=REDUP_WITHOUT_FRAME_MAX {
+            assert!(
+                w.on_reestablished().is_ok(),
+                "re-establishment {i} should still be within the budget"
+            );
+        }
+        let err = w
+            .on_reestablished()
+            .expect_err("the re-establishment past the ceiling must fail the capture");
+        let msg = format!("{err}");
+        assert!(msg.contains("without ever delivering a"), "{msg}");
+        assert!(
+            msg.contains(&(REDUP_WITHOUT_FRAME_MAX + 1).to_string()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_delivered_frame_is_what_clears_the_run() {
+        let mut w = RedupWatchdog::default();
+        for _ in 0..REDUP_WITHOUT_FRAME_MAX {
+            w.on_reestablished().unwrap();
+        }
+        assert_eq!(w.count(), REDUP_WITHOUT_FRAME_MAX);
+        w.on_frame_delivered();
+        assert_eq!(w.count(), 0);
+        // And the budget is whole again, which is what makes an intermittent output survive.
+        for _ in 0..REDUP_WITHOUT_FRAME_MAX {
+            w.on_reestablished().unwrap();
+        }
+        assert!(w.on_reestablished().is_err());
+    }
+
+    #[test]
+    fn the_log_cadence_is_first_then_every_tenth() {
+        let mut w = RedupWatchdog::default();
+        let mut logged = Vec::new();
+        for _ in 0..REDUP_WITHOUT_FRAME_MAX {
+            w.on_reestablished().unwrap();
+            if w.should_log() {
+                logged.push(w.count());
+            }
+        }
+        assert_eq!(logged, vec![1, 10, 20, 30, 40]);
+    }
 }

@@ -158,9 +158,15 @@ case, `REDUP_WITHOUT_FRAME_MAX = 40` in `windows_utils/streamer/dxgi/mod.rs`, ne
 `redup_without_frame` is reset by any acquire that *returns* and this failure mode returns from the
 acquire before losing access. The counter therefore reads `1 since the last frame` 1 190 times in a
 row instead of reaching 40 and stopping the capture with the explanatory error it was written to
-produce. A user on such a machine gets a negotiated session that shows nothing, forever. The fix is
-to count re-establishments that were not followed by a **delivered frame** rather than by a
-successful acquire.
+produce. A user on such a machine gets a negotiated session that shows nothing, forever.
+
+**Fixed after measurement at PLACEHOLDER**: the counter now resets only where a frame is actually handed
+onward (`poll` returning `PollStatus::Dirty`), not where an acquire returns. The logic moved into a
+`RedupWatchdog` helper with no D3D in it, so the starving mode is a unit test rather than something
+only that one machine can show: `a_starving_duplication_gives_up_instead_of_spinning` drives 41
+re-establishments with no delivered frame and asserts the `bail!`. Ledger row 307. Still
+COMPILE-CHECKED — the box that reproduces the mode is the one in `guides/windows-legacy.md`
+task 3.4.
 
 Both DXGI cells stay unmeasurable here. `guides/windows-legacy.md` (tasks 3.3, 3.4, 3.11) is the
 machine that closes them.
