@@ -17,6 +17,7 @@ const STATIC = process.argv[2];
 
 const HARNESSES = [
   ['input.js wire format + telemetry', 'test-client-stats.mjs'],
+  ['input.js golden vectors, cross-checked by the Rust parser', 'test-client-input.mjs'],
   ['audio-worker.js decode, redundancy and the sequence gate', 'test-client-audio.mjs'],
   ['audio-worklet.js jitter buffer and the planar ring ABI', 'test-client-worklet.mjs'],
   ['transform-worker.js WebCodecs video path and A/V sync', 'test-client-transform.mjs'],
