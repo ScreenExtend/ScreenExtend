@@ -1,5 +1,9 @@
 # Baseline measurements
 
+**The "after" side of every table here is `docs/RESULTS.md`**, which also re-built `ddf9d76` and ran
+it back to back with the final commit on the same machine, so the comparison is controlled rather
+than separated by weeks.
+
 Numbers captured **before** any optimization, so every later claim has something to reference.
 All latencies are per-stage timestamps off the shared host clock (`streamer::audio::host_now_ns`)
 unless marked as camera-measured glass-to-glass. Distributions are p50 / p90 / p99 / max — never
@@ -70,8 +74,13 @@ window covering the captured display, so the content is repeatable *and* goes th
 
 Debug build, so the absolute numbers are not comparable with the release rows above — the point
 of the row is that `capture delivery` and `scale` have values at all, where every previous
-workload run reported them empty. Re-run the other three workloads on a release build to extend
-the table.
+workload run reported them empty.
+
+**Closed.** All five workloads were re-run on a **release** build at `79915fbb`, 30 s each, and the
+table lives in `docs/RESULTS.md`, "The workload sweep `BASELINE.md` left open". Summary: content
+changes the bitrate by 200× (0.32 MB `static` to 63 MB `mixed`) and `capture → encode-out` by under
+3.5 ms at every percentile — 4 457–4 519 real frames per 30 s on every workload, against the 49–51
+this document's `live` rows managed on an unscripted desktop.
 
 ### Virtual-display mode changes (`report_selected_refresh_rate` / `report_mode_change_cost`)
 
@@ -250,13 +259,13 @@ Recorded honestly rather than left blank.
 
 | Cell | Why |
 |---|---|
-| **Every DXGI cell** | Two separate defects, both found by trying: `DuplicateOutput` returns `DXGI_ERROR_UNSUPPORTED` on the primary display of this hybrid laptop (`findings/blocker-dxgi-duplicateoutput-unsupported-on-hybrid-graphics.md`), and against a fresh virtual display `AcquireNextFrame` dies with `DXGI_ERROR_INVALID_CALL` after repeated re-duplication (`findings/blocker-dxgi-acquirenextframe-invalid-call-on-a-fresh-virtual-display.md`). Combined with `findings/blocker-wgc-min-update-interval-forces-dxgi.md`, a Windows 10 hybrid laptop has **no** working capture path. |
+| **Every DXGI cell** | Two separate defects, both found by trying: `DuplicateOutput` returns `DXGI_ERROR_UNSUPPORTED` on the primary display of this hybrid laptop (`findings/blocker-dxgi-duplicateoutput-unsupported-on-hybrid-graphics.md`), and against a fresh virtual display `AcquireNextFrame` dies with `DXGI_ERROR_INVALID_CALL` after repeated re-duplication (`findings/blocker-dxgi-acquirenextframe-invalid-call-on-a-fresh-virtual-display.md`). Combined with `findings/blocker-wgc-min-update-interval-forces-dxgi.md`, a Windows 10 hybrid laptop has **no** working capture path. **Re-confirmed at `79915fbb`**, with the second defect now presenting differently: the capture survives instead of dying, and starves — 1 190 re-establishments and 0 frames in 30 s. See `docs/RESULTS.md`, "DXGI Desktop Duplication on this box". |
 | **Client arrival → paint, and glass-to-glass** | Needs a real browser, and browser automation was out of scope for this run. The apparatus is in place and tested (`node scripts/test-client-stats.mjs`, 21 assertions): the client reports its own per-frame stages over `OP::STATS` and the host stores them per session. The numbers arrive the moment a device joins. |
 | **Every macOS cell, at the time this baseline was taken** | The self-test created the virtual display, started CGDisplayStream, initialized VideoToolbox and then sent nothing at all: with a static screen the capture backend never delivered a first frame, and the keepalive can only repeat a frame it already has. `probe --live` on the same box wrote 2 frames in 5 s for the same reason. **Both causes are now fixed** — the first frame of a session is exempt from the dirty-rect skip, and the encode loop synthesizes a black IDR after 750 ms of nothing — so the macOS matrix below is no longer empty. It is dated to the commit that filled it rather than to this document's baseline commit, and says so. The macOS `probe_live` still drives the encoder directly rather than through the pipeline, so it collects no stage timings. |
 | **AMD** | No AMD GPU on either machine. See `docs/manual-tests/amd-amf.md`. |
 | **Quick Sync at other geometries** | The 1280x720 encoder initializes and encodes; the extreme-fps and fused-downscale configurations report "no Intel hardware oneVPL implementation" from the *same* adapter — `findings/major-intel-quicksync-partly-unavailable-on-this-box.md`. |
-| **Audio stages** | The Windows capture timestamp now comes from the endpoint hardware rather than encode time, but verifying it needs a client with system audio enabled; COMPILE-CHECKED, not measured. |
-| **macOS WindowServer drop count** | `CGDisplayStreamUpdateGetDropCount` is now read on every delivery and `probe_main_display` prints it, which is the instrument the three open CGDisplayStream questions (`queueDepth`, `minimumFrameTime`, WindowServer contention) each need. Taking the number requires a 30 s run against an *animated* screen on the 10.15.8 box, and the expected signature is documented with the IOSurface use-count finding: near zero, then a spike, then near zero. COMPILE-CHECKED here; the run has not been done. |
+| **Audio stages** | The Windows capture timestamp now comes from the endpoint hardware rather than encode time, but verifying it needs a client with system audio enabled; COMPILE-CHECKED, not measured. **Closed for the host half** by `probe --audio`, which drives the shipping `AudioHub` and needs no client: Windows endpoint tier `capture → subscriber` 9.44 / 9.44 / 10.49 / 11.89 ms idle and 9.44 / 9.44 / 10.49 / 14.19 ms with audio playing, 200.0 packets/s in every run; macOS legacy driver tier 2.36 / 4.19 / 4.72 / 5.24 ms at 198.4 packets/s. Three 30–40 s trials each, `docs/RESULTS.md`. The *client* half — jitter buffer, concealment, redundancy — still needs a browser. |
+| **macOS WindowServer drop count** | `CGDisplayStreamUpdateGetDropCount` is now read on every delivery and `probe_main_display` prints it, which is the instrument the three open CGDisplayStream questions (`queueDepth`, `minimumFrameTime`, WindowServer contention) each need. Taking the number requires a 30 s run against an *animated* screen on the 10.15.8 box, and the expected signature is documented with the IOSurface use-count finding: near zero, then a spike, then near zero. COMPILE-CHECKED here; the run has not been done. **Partly closed:** `cgds::tests::capture_rate` and `pipeline::tests::end_to_end_latency` were re-run three times each at `79915fbb` and report `windowserver_drops = 0` in every trial at both capture sizes (`docs/RESULTS.md`, macOS section) — but the screen was the SSH-idle console, not a deliberately animated one, so the *spike* half of the expected signature is still unobserved. |
 | **Reordered input** | `input_reorder_drops` cannot move until a client sends the optional fast-channel sequence (`findings/minor-client-input-does-not-send-the-fast-channel-sequence.md`), and confirming it needs an induced-reorder link (`clumsy`, or a TURN relay path). The host-side comparison is unit-tested across the `u16` wrap. |
 
 ## Competitor baselines
@@ -324,3 +333,14 @@ probe that exits without tearing down leaves its virtual display attached briefl
 the following run's WGC capture — `findings/minor-probe-leaves-its-virtual-display-behind-and-breaks-the-next-run.md`.
 That is how the `live-nvidia-wgc` row above had to be re-measured, and the only reason the
 interference was noticed.
+
+**A second, permanent form of the same trap was found while producing `docs/RESULTS.md`, and it
+bounds how many self-test cells one session can produce.** From roughly the sixth virtual display
+of a boot onward, on this box, IDD display attach goes from 575–584 ms to 1 829–2 018 ms and stays
+there, and WGC stops supplying `SystemRelativeTime` for all but one to three frames per run — which
+silently reduces `capture_delivery` and `capture_to_socket` to percentiles over a handful of
+samples. Eight not-present `Generic Monitor (VirtuDisplay+)` device nodes (UID256–UID263) accumulate
+in the PnP tree; clearing them needs Administrator (`pnputil /remove-device`) or a reboot, and idle
+time does not fix it. **Take at most five self-test cells per boot, and check the `display=` term of
+the `join stages` line before trusting a capture-relative column.** `probe --live` is unaffected:
+it captures the primary display and creates no virtual display.
