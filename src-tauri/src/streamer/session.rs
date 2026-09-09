@@ -816,4 +816,176 @@ mod tests {
         assert!(lim.locked_for("1.1.1.1").is_none());
         assert!(lim.global_paused().is_none());
     }
+
+    // ---- device trust: keyed on the minted token, never the IP -----------------------
+
+    #[test]
+    fn a_minted_device_token_is_128_bits_of_lowercase_hex() {
+        // The token is the whole device-trust key: a short or predictable one is an auto-join
+        // for anyone who guesses it.
+        let a = mint_device_token();
+        let b = mint_device_token();
+        assert_eq!(a.len(), 32, "128 bits as hex");
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b, "two mints must not collide");
+    }
+
+    #[test]
+    fn approval_is_by_token_and_an_empty_token_is_never_approved() {
+        // The IP is a display hint. A device that presents no token has never completed an OTP
+        // join, so it must go through one — an empty token matching an empty entry would hand
+        // every unknown device an auto-join.
+        let approved = new_shared_approved_devices();
+        let token = mint_device_token();
+        assert!(!is_device_approved(&approved, &token));
+        approved.lock().unwrap().insert(token.clone());
+        assert!(is_device_approved(&approved, &token));
+        assert!(!is_device_approved(&approved, ""));
+        approved.lock().unwrap().insert(String::new());
+        assert!(
+            !is_device_approved(&approved, ""),
+            "an empty token is never approved"
+        );
+    }
+
+    #[test]
+    fn a_ban_holds_by_token_or_by_ip_but_never_on_an_empty_token() {
+        // Bans are the one place the IP still counts: a device that has not joined has no token
+        // to ban, and the host must still be able to keep it out.
+        let banned = new_shared_banned_devices();
+        let token = mint_device_token();
+        assert!(!is_device_banned(&banned, &token, "10.0.0.9"));
+        banned.lock().unwrap().insert(token.clone());
+        assert!(is_device_banned(&banned, &token, "10.0.0.9"));
+        assert!(!is_device_banned(&banned, "other", "10.0.0.10"));
+        banned.lock().unwrap().insert("10.0.0.9".to_string());
+        assert!(
+            is_device_banned(&banned, "other", "10.0.0.9"),
+            "an IP ban still holds for a device with a different token"
+        );
+        assert!(!is_device_banned(&banned, "", "10.0.0.10"));
+    }
+
+    // ---- epoch bookkeeping: how a live settings change reaches the client -------------
+
+    #[test]
+    fn an_unknown_device_reads_epoch_zero_rather_than_failing() {
+        // The client adopts whatever the first `/reconfig` returns, so a device the host has no
+        // state for must read a stable 0 and not a value that moves on its own.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 0);
+        assert_eq!(kick_epoch(&sessions, "10.0.0.1"), 0);
+        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 0);
+    }
+
+    #[test]
+    fn each_bump_is_visible_exactly_once_and_only_to_that_device() {
+        // The client compares the epoch it holds against the one it polls. A bump that moved two
+        // devices would rebuild a session nobody changed; a bump that never landed leaves a
+        // device on the old settings forever.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        bump_reconfig_epoch(&sessions, "10.0.0.1");
+        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 1);
+        assert_eq!(
+            reconfig_epoch(&sessions, "10.0.0.2"),
+            0,
+            "a bump is per device"
+        );
+        for expected in 2..=5 {
+            bump_reconfig_epoch(&sessions, "10.0.0.1");
+            assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), expected);
+        }
+    }
+
+    #[test]
+    fn the_two_epochs_are_independent() {
+        // A settings change must not read as a kick: the client tears the session down and shows
+        // "you have been removed" on a kick, and silently rebuilds on a reconfig.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        bump_reconfig_epoch(&sessions, "10.0.0.1");
+        bump_reconfig_epoch(&sessions, "10.0.0.1");
+        assert_eq!(
+            kick_epoch(&sessions, "10.0.0.1"),
+            0,
+            "a reconfig is not a kick"
+        );
+        bump_kick_epoch(&sessions, "10.0.0.1");
+        assert_eq!(kick_epoch(&sessions, "10.0.0.1"), 1);
+        assert_eq!(
+            reconfig_epoch(&sessions, "10.0.0.1"),
+            2,
+            "a kick is not a reconfig"
+        );
+    }
+
+    #[test]
+    fn a_bump_creates_the_session_entry_rather_than_being_dropped() {
+        // Settings can be changed before the device has ever connected — the CLI's `devices set`
+        // writes through the same path — and a bump that landed nowhere would be silently lost.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        bump_kick_epoch(&sessions, "10.0.0.7");
+        assert!(sessions.lock().unwrap().contains_key("10.0.0.7"));
+        assert_eq!(kick_epoch(&sessions, "10.0.0.7"), 1);
+    }
+
+    // ---- session sequence numbers: which capture owns the display ---------------------
+
+    #[test]
+    fn a_stale_session_never_stops_the_capture_that_replaced_it() {
+        // A rejoin mints a new sequence; the old session's teardown then runs and must not stop
+        // the capture the new one just started. That is what the conditional take is for.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let first = next_session_seq(&sessions, "10.0.0.3");
+        let second = next_session_seq(&sessions, "10.0.0.3");
+        assert!(second > first, "each session gets a fresh sequence");
+        assert!(!is_current_session(&sessions, "10.0.0.3", first));
+        assert!(is_current_session(&sessions, "10.0.0.3", second));
+
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stopped);
+        set_active_capture(
+            &sessions,
+            "10.0.0.3",
+            second,
+            Box::new(move || flag.store(true, Ordering::SeqCst)),
+        );
+        assert!(
+            take_active_capture_if(&sessions, "10.0.0.3", first).is_none(),
+            "the stale session must not claim the live capture"
+        );
+        assert!(take_active_capture_if(&sessions, "10.0.0.3", second).is_some());
+        assert!(!stopped.load(Ordering::SeqCst), "taking is not stopping");
+    }
+
+    // ---- disconnect grace --------------------------------------------------------------
+
+    #[test]
+    fn the_disconnect_grace_default_sits_inside_its_own_range() {
+        // The UI and the CLI both clamp to this range; a default outside it would be unreachable
+        // from either. Compared through a runtime binding so clippy sees a comparison rather
+        // than a constant it can fold — the point is that the three constants agree, and a
+        // future edit that broke it would be a compile-time-visible fact only by accident.
+        let (lo, hi) = (MIN_DISCONNECT_GRACE_SECS, MAX_DISCONNECT_GRACE_SECS);
+        assert!((lo..=hi).contains(&DEFAULT_DISCONNECT_GRACE_SECS));
+        let grace = new_shared_disconnect_grace();
+        assert_eq!(grace.load(Ordering::Relaxed), DEFAULT_DISCONNECT_GRACE_SECS);
+    }
+
+    // ---- display geometry --------------------------------------------------------------
+
+    #[test]
+    fn display_params_report_what_was_recorded() {
+        let d = LiveDisplay {
+            display_id: 4,
+            device_name: "4".into(),
+            width: 1920,
+            height: 1080,
+            refresh: 120,
+            scale: 150,
+            portrait: false,
+        };
+        assert_eq!(d.display_params(), (1920, 1080, 120, 150, false));
+    }
 }

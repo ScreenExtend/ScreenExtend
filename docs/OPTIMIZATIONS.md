@@ -277,6 +277,123 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 296 | macos encode | `EncoderConfig.software_encode` reads `Config::software_encode_now()` — the shared `Arc<AtomicBool>` where a host exists, the snapshot only in the probe harness | The flag was copied by value when the streamer was built, so the atomic the Settings toggle writes was never read again by that session. Every neighbouring field in the same struct literal is a cloned `Arc`; this one was the odd one out. | flipping the setting took effect by draining every streamer and rebuilding it | read at encoder-selection time, so the next session picks the other encoder without the drain | VERIFIED (10.15.8: gates green, 375 tests pass; a unit test asserts a live handle beats a stale snapshot in both directions). The end-to-end swap is COMPILE-CHECKED — proving it needs a Mac whose hardware encoder is distinguishable in the log from the software one, which 10.15.8's is | yes | Closes `minor-session-gpu-toggle-snapshotted` on both platforms; the Windows half landed with W1/W3. `None` stays right for the standalone harness, where `--software-encode` is the only source of truth. |
 | 297 | net (macOS) | One `SIOCGIFMEDIA` in `macos_utils/networking.rs`, `0xc02c6938` derived from `size_of::<ifmediareq>()` on the `packed(4)` struct, used by both call sites; `SIOCGIFMEDIA_LITERAL` (`0xc0286938`) and the duplicate unpacked `IfMediaReq` are deleted, and `IoctlSocket::media` is now the module's only caller | A Phase A-7 merge put two independently-written `SIOCGIFMEDIA` callers in one module with **different request numbers**: `_IOWR` folds `sizeof` into the number, so 40 and 44 are different ioctls to the kernel and at most one could be the implemented one. The finding assumed a 64-bit process should ask with 48. It should not: `<net/if.h>` wraps `struct ifmediareq` in `#pragma pack(4)`, so `ifm_ulist` sits at offset 36 unpadded and the struct is **44** bytes — `<sys/sockio.h>`'s `_IOWR('i', 56, struct ifmediareq)` is `0xc02c6938`, exactly what W6's constant already computed. | two constants, `0xc0286938` and `0xc02c6938`, and two structs (48-byte and 44-byte) for one call | one constant, one struct, one `media()` helper | **VERIFIED (10.15.8)**. Probe of all three numbers, first in C against the SDK headers and then through the shipping Rust struct (`probe_siocgifmedia_request_numbers`, `#[ignore]`d): **40 → rc 0** and **44 → rc 0** on en3 (Wi-Fi, `ifm_current` `0x80` = `IFM_IEEE80211`, status `0x3`), en0/en1 (Ethernet, `0x100020` = `IFM_ETHER`, status `0x1`), bridge0, p2p0, awdl0; **48 → -1 `ENOTSUP` (102) on every interface**. lo0 and utun0-2 answer -1 to all three — they genuinely have no medium. End to end: `serve` enumerates `Sreenilayam-5g` 172.16.11.81 and `link_medium_for_local_ip` returns `Wireless`. Gates green, 366 tests pass | yes | The finding's premise was half wrong in an informative way: **both** 40 and 44 are implemented, because XNU keeps a 32-bit compat form of the call whose `ifm_ulist` is 4 bytes wide. The two layouts agree over their first 36 bytes — name plus five ints — so every field this module reads landed correctly under either, which is why neither caller was ever observed failing and why the disagreement was invisible. 44 is still the only correct choice from a 64-bit process, and it is the one that stops being cosmetic the moment anyone sets `ifm_count` to fetch the media list: under the 40-byte form the kernel would read `ifm_ulist` as a truncated 4-byte user address. `an_ifmediareq_matches_the_kernels_64_bit_layout` pins the size, the `ifm_ulist` offset and the request number so a `repr` edit cannot quietly re-address the ioctl. Resolves `major-net-mac-two-disagreeing-siocgifmedia-constants` (W1/W6). |
 
+## Tests
+
+Coverage added by W15, and the coverage deliberately not added. The audit this works from is
+`docs/discovery/N-tests.md`; the census it opens with was 261 distinct `#[test]` in the crate,
+138 of them compiled and run on Windows, with a whole-suite wall time of 1.16 s — which was
+itself the tell that nothing touching hardware was running.
+
+Windows `cargo test --lib` at the end of this workstream: **369 passed, 13 ignored**, 45 s.
+macOS: **398 passed, 26 ignored**. Seven Node harnesses cover the client page
+(`pnpm test:client`).
+
+### The convention every gated test now follows
+
+A test may not return green having verified nothing. Three shapes are allowed and no others:
+
+1. It runs. 
+2. It is `#[ignore = "<reason>"]`, so the harness prints the reason next to `ignored`.
+3. It calls `crate::test_support::skip(what, reason)`, which prints `SKIP <what>: <reason>` on
+   plain stderr and **panics instead** when `SE_REQUIRE_HW=1` — so a machine that is supposed to
+   have the hardware can be made strict without a second suite.
+
+What this replaced: six hardware-gated tests returning at their first line through `teprintln!`,
+which is swallowed because `logbus::VERBOSE` is false under `cargo test`; three more returning
+with no message at all; and 22 bare `#[ignore]`s whose reason existed only in a doc comment. The
+count of bare `#[ignore]`s outside `macos_utils/streamer/` (W5's, still moving when this landed)
+is now **zero**, and `test_support::show_measurements()` routes `tprintln!` to stderr so the
+numbers the encode tests compute are no longer discarded at exit.
+
+The convention paid immediately: the new Windows capture harness reports
+
+```
+SKIP windows capture latency (Desktop Duplication unavailable): no adapter can duplicate
+\\.\DISPLAY1 (NVIDIA GeForce RTX 3080 Ti Laptop GPU ... HRESULT(0x887A0004))
+```
+
+on the dev box, where the pre-existing `dxgi_duplication_probe` panics with the same cause. One
+of those two outcomes is a machine fact and the other is a test failure; before this they were
+indistinguishable from `ok`.
+
+### What was covered
+
+| area | file | what it asserts | status |
+|---|---|---|---|
+| encoder ladder (Windows) | `windows_utils/streamer/test/vendor.rs` | `encoder_ladder` extracted out of `build_backend` as a pure function; every ladder ends in x264, `Auto` is NVENC→Intel→AMF→x264, an explicit vendor never falls through to a *different* GPU, no rung repeats, and `capture_gpu_preference` agrees with each ladder's first rung. Plus `Vendor::from_pci_id` (WARP's `0x1414` and AMD's CPU id `0x1022` must both read Unknown) and `select_vendor` over real adapter description strings. | VERIFIED |
+| capture→encoded (Windows) | `windows_utils/streamer/test/capture_latency.rs` | The counterpart to the macOS `end_to_end_latency`, which had none. Paints its own `WorkloadWindow` so the display is guaranteed to change, duplicates through the real `Duplicator`, encodes through the real `build_backend` ladder, and prints `capture_to_encoded=p50/p90/p99/max` ms + `capture_encode_p95=<n>us`. | `#[ignore]`d; **unrunnable on this box** — see the DXGI note above |
+| WebRTC answer | `streamer/webrtc_session.rs` | Two in-process peer connections negotiate for real and the answer goes through `whep_selftest::answer_sdp_checks`, so the MediaEngine registration (codecs, fmtp, the five rtcp-fb entries, RTX) is asserted rather than compared against a captured string. Each H.264 profile negotiates its own level-id; no codec shares an RTX payload type; `is_private_ip` in both families; the /24 check is IPv4-only; `summarize_sdp_candidates` over host-only, relay, trickled and malformed candidates. | VERIFIED, both OSes, no display or network |
+| the shared host clock | `streamer/audio/tests.rs` | `host_ns_to_rtp90k` — exact at whole ticks, truncating rather than rounding (which is what keeps it monotonic), a 10 000-step monotonicity walk, and the 32-bit wrap at ~13.25 h of host uptime still yielding the true elapsed ticks under wrapping arithmetic. That last property is what `transform-worker.js`'s unwrap depends on. | VERIFIED |
+| cloud relay wire format | `streamer/cloud.rs` | Every JSON key of every host→relay frame, every relay→host frame parsing including a minimal one that exercises the serde defaults, `session_taken` matching the constant the reconnect loop keys on, and the session-id alphabet excluding `0`/`1`/`I`/`O`. `next_backoff_secs` extracted so 1/2/4/8/16/30 is asserted without waiting — and it no longer overflows. | VERIFIED |
+| TLS | `streamer/tls.rs` | `generate_or_load_dev_cert` split into `read_cached_cert` + `generate_self_signed`, so the cache round trip runs in a temp dir rather than the app data dir. Half a cache is not a cache; the key is `0600` on unix; **rustls accepts what we generate**; an operator pair needs both halves and is not reported as self-signed. `TlsMaterial`'s `Debug` is hand-written and redacts `key_pem`. | VERIFIED |
+| session epochs & device trust | `streamer/session.rs` | An unknown device reads epoch 0; each bump is visible exactly once and only to that device; reconfig and kick are independent; a bump before the device connects creates the entry. A minted token is 128 bits of hex; an empty token is never approved; an IP ban still holds. A stale session never stops the capture that replaced it. | VERIFIED |
+| macOS audio tiering | `macos_utils/audio/{mod,test/tiering}.rs` | Probing split from ranking: `AudioProbes` is what the machine answered, `rank_backend`/`rank_capable_backends` are pure. The full eight-row truth table runs on **any** Mac, so the 14.2 and 13.0 branches are asserted on the 10.15 floor for the first time. Includes the 13.x-with-Screen-Recording-denied case, where SCK is chosen, fails, and the driver must still be behind it. | VERIFIED (10.15.8) |
+| libx264 ABI | `windows_utils/streamer/test/x264_layout.rs` | A guard canary behind `x264_param_t` catches a binding one field short of libx264's — the case where `x264_param_default_preset` writes past our allocation. A round trip through `x264_encoder_parameters` with values unlike any default catches a displaced field, which is otherwise silent and reads as an encoder ignoring the bitrate controller. | VERIFIED |
+| libopus ABI | `streamer/audio/opus_abi.rs` | Every CTL request number proved by writing a distinctive value and reading it back through its paired getter; every error constant by the string `opus_strerror` returns (with `-9999` as the control); `RESTRICTED_LOWDELAY` being CELT-only by the TOC byte of a real packet — which is also the evidence behind not advertising in-band FEC. | VERIFIED, both OSes |
+| oneVPL ABI | `windows_utils/streamer/test/intel_layout.rs` | `align_of` on all 13 structs, gated on `target_pointer_width = "64"`. A struct can size and offset correctly and still misplace the next element of an array; `mfxVideoParam.ExtParam` is an array of pointers. | VERIFIED |
+| client jitter buffer | `scripts/test-client-worklet.mjs` | `audio-worker.js` writes into a `SharedArrayBuffer` and `audio-worklet.js` reads out of the same one, so the planar ring layout — described identically in three files and checked by nothing — is a real cross-file contract test. Plus the power-of-two capacity, overruns, priming, concealment decaying rather than clicking, drift trimmed only at a silence boundary, the mode mismatch in both directions, and the MessageChannel handoff. | VERIFIED |
+| client video path | `scripts/test-client-transform.mjs` | The RTP timestamp inverting back to a host capture time **across the 32-bit wrap** — get it wrong and the reported display lag moves by thirteen hours. Plus the resume-keyframe gate surviving that same wrap, backpressure tripping on decodes-without-outputs while `decodeQueueSize` reads zero, every keyframe tier being withdrawable, the codec hint, the refused size hint, and a contextless canvas claiming no render tier. | VERIFIED |
+| client reconfig/kick | `scripts/test-client-reconfig.mjs` | The other half of the epoch mechanism: first read adopts without rebuilding, an unchanged epoch is a no-op, a bump rebuilds once, the 15 s watchdog un-freezes a stuck rebuild, a kick stops everything, a refused poll is counted where a 500 is not, and the poll never overlaps itself. | VERIFIED |
+| input wire format, both sides | `scripts/test-client-input.mjs` + `streamer/input/protocol.rs` | One fixture, `streamer/input/client-frames.json`, written by the shipped `input.js` under Node and parsed by the shipped Rust parser. The JS side asserts every field at the offsets `docs/INPUT-PROTOCOL.md` documents; the Rust side asserts the decoded event. Neither can drift alone, which is what the format being tested on one side and written on the other could not catch. Includes the rule that a frame at or above its fixed length is *valid* when truncated — the stamp, flags byte and fast-channel sequence are tails an older client does not send. | VERIFIED |
+| client sequence gate | `scripts/test-client-audio.mjs` | The five `seqgate_*` tests moved off a `SeqGate` struct that existed only inside `streamer/audio/tests.rs` and onto the shipped `audio-worker.js`. Both sides of the half-range boundary are now covered, which is where the deleted mirror had already drifted. | VERIFIED |
+
+### Recorded rejections
+
+**A 5 % p99 perf gate, on this machine.** The brief asked for one; W13a had measured and chosen
+20 %. Measured again here on an **idle** dev box — five consecutive runs of the same release
+binary — the x264 p95 was 4157 / 4243 / 4244 / 4261 / 4490 µs, an **8.0 % spread with nothing
+changed in the code**; under load the same binary has ranged 4405–9067 µs. So 5 % fails on noise
+even at rest. What landed instead: `scripts/perf-gate.mjs` now honours a **per-key** tolerance,
+`dev-windows-rtx3080ti` carries **10 %** (the tightest honest gate for a quiescent machine, and
+half what it had), and W13a's 20 % stays the default for shared CI VMs. Recorded in
+`ci/perf-baseline.json`'s readme and in the key's own note.
+
+**Header-derived layout tests for libx264 and libopus.** W3b settled the generator method for
+NVENC and AMF, and extending it to these two would have been the wrong answer. `x264.h` is
+GPL-2.0-or-later where the two vendored header sets are MIT; and more importantly both libraries
+are *loaded at runtime by this app*, so the shipped artifact is a better witness than any header:
+a header describes *a* libx264, and the one that matters is whichever `libx264-164.dll` the
+machine has. The rule is written down in `resources/PROVENANCE.md` — **generate where the
+artifact cannot be questioned at runtime, interrogate where it can.** oneVPL is neither, because
+its dispatcher ships with the Intel driver and is not bundled at all.
+
+**Source-scraping tests, replaced rather than kept.** `ax.rs`'s two `include_str!` tests asserted
+on the text of their own file, which a rename breaks falsely and a comment breaks silently. Both
+are gone: the row wait is now `wait_for_row()`, which takes the lookup as a closure so four real
+tests run the waiting itself, and dismissal is a `DismissPlan` enum with **no variant** for
+pressing the menu-bar extra — so the rule the scrape defended is a compile-time fact rather than
+a substring search. `topology.rs`'s `no_airplay_display_is_found_when_none_is_attached` promised
+a check its `if let` never performed in exactly the case it named, and now states both halves.
+
+**A JS test runner as a devDependency.** The finding proposed `vitest`. Not needed: the six
+harnesses load the shipped `.js` under `node:vm` with hand-written browser stubs, run with plain
+`node`, and add nothing to `package.json` but a `test:client` script. `src-tauri/src/streamer/static/`
+is byte-identical.
+
+### Closed after W5 merged
+
+| area | file | what it asserts | status |
+|---|---|---|---|
+| macOS capture ladder | `macos_utils/streamer/mod.rs` | `capture_ladder(sck_available)` lifted out of `start_capture`, the same probing/ranking split that made the audio tiering testable. CGDisplayStream is always the last rung — deprecated, obsoleted in the macOS 15 SDK, and the only capture API on the 10.15 floor; ScreenCaptureKit leads only where its classes exist; no rung repeats; the live probe agrees with the table. The 12.3+ branch had no coverage at all on the 10.15 dev box before this. | VERIFIED (10.15.8) |
+| VideoToolbox encode timing | `macos_utils/streamer/encoder.rs` | `encode_synthetic` times every `submit` and prints `vt_encode_p50/p95/p99/max`. `submit` is the right thing to watch because the encode itself is asynchronous: this is the cost the capture thread pays per frame, and a regression in it stalls capture whatever happens afterwards. | VERIFIED |
+| the perf gate covers macOS | `scripts/perf-gate.mjs`, `.github/workflows/ci.yml` | `vt_p95_encode_us` / `vt_p50_encode_us`, and the `perf-gate` matrix becomes `[windows-latest, macos-13, macos-15]` with the measure step choosing its command by `RUNNER_OS`. macos-13 is Intel and macos-15 Apple Silicon, so they are separate keys. Neither run needs a display or a Screen Recording grant, which is what makes the encoder module the measurable one on a hosted runner. | wired; both keys unseeded, which the gate reports and passes |
+
+Bare `#[ignore]`s in the crate: **zero**, on both platforms. The CI `cargo test` step no longer
+excludes `a_display_name_resolves_only_to_a_live_display` by name — it gates itself through
+`test_support::skip` now, and excluding a test by name hides it from the report entirely, which
+is the opposite of the convention.
+
+### Still open, and why
+
+- **The Windows capture→encoded baseline.** The harness exists and is wired into the gate; the
+  numbers need a machine where Desktop Duplication works. `docs/manual-tests/latency-harnesses.md`
+  has the command, and the dev-box failure written down so it is not rediscovered.
+- **The three macOS perf-gate keys.** `dev-windows-rtx3080ti` is the only seeded one; `ci-*` keys
+  seed themselves from their first run's artifact. That is the designed path, not an omission.
+- **The React desktop UI** still has no tests. Out of this workstream's scope and largely covered
+  by `tsc` plus the Safari 13.1 floor check; a component-level runner is a separate decision.
+
+
 ## Notes
 
 ### Ledger hygiene: rows 220-226 removed as duplicates

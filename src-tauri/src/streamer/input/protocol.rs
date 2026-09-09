@@ -1431,4 +1431,249 @@ mod tests {
         assert_eq!(build_bye(bye::HOST_EXIT), [op::BYE, bye::HOST_EXIT]);
         assert!(parse(&build_bye(bye::HOST_EXIT)).is_err());
     }
+
+    // ---- golden vectors: the same bytes the shipped client produced --------------------
+    //
+    // `client-frames.json` is written by `node scripts/test-client-input.mjs --write` from the
+    // real `input.js` under Node. That harness asserts the bytes against
+    // `docs/INPUT-PROTOCOL.md`; this asserts that the parser turns them into the events the
+    // host acts on. Both sides check the same file, so neither can drift on its own — which is
+    // the gap the audit named: the format was tested here and written there, with nothing
+    // between them.
+    //
+    // Regenerate after any deliberate change to what the client emits, and read the diff: a
+    // changed vector is a wire-format change and every shipped client is on the old one.
+
+    const CLIENT_FRAMES: &str = include_str!("client-frames.json");
+
+    /// One `{ "name", "channel", "hex" }` entry, without pulling serde_json into the test.
+    fn golden_vectors() -> Vec<(String, String, Vec<u8>)> {
+        fn field<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+            let at = obj.find(&format!("\"{key}\""))? + key.len() + 2;
+            let rest = &obj[at..];
+            let open = rest.find('"')? + 1;
+            let close = open + rest[open..].find('"')?;
+            Some(&rest[open..close])
+        }
+
+        let vectors_at = CLIENT_FRAMES
+            .find("\"vectors\"")
+            .expect("client-frames.json has no `vectors`");
+        let mut out = Vec::new();
+        for chunk in CLIENT_FRAMES[vectors_at..].split('{').skip(1) {
+            let obj = &chunk[..chunk.find('}').unwrap_or(chunk.len())];
+            let (Some(name), Some(channel), Some(hex)) =
+                (field(obj, "name"), field(obj, "channel"), field(obj, "hex"))
+            else {
+                continue;
+            };
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                .collect();
+            out.push((name.to_string(), channel.to_string(), bytes));
+        }
+        assert!(
+            !out.is_empty(),
+            "no vectors parsed out of client-frames.json"
+        );
+        out
+    }
+
+    fn vector(name: &str) -> (String, Vec<u8>) {
+        golden_vectors()
+            .into_iter()
+            .find(|(n, ..)| n == name)
+            .map(|(_, ch, b)| (ch, b))
+            .unwrap_or_else(|| panic!("no golden vector named {name}"))
+    }
+
+    #[test]
+    fn every_golden_vector_parses() {
+        // The blunt half: nothing the shipped client sends may come back as a parse error, and
+        // the routing decision has to agree with the channel it went out on. A fast opcode on
+        // the reliable channel is legal — the host routes on the opcode — but a *reliable*
+        // opcode on the fast channel would mean the client is putting ordered input on a lossy
+        // link, which no vector should show.
+        for (name, channel, bytes) in golden_vectors() {
+            let parsed = parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            if channel == "fast" {
+                assert!(
+                    parsed.fast,
+                    "{name} went on the fast channel but is not fast"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pen_pointer_down_carries_its_tilt_and_pressure() {
+        let (channel, bytes) = vector("pointer_down_pen");
+        assert_eq!(channel, "reliable");
+        let parsed = parse(&bytes).expect("pointer_down_pen");
+        assert!(!parsed.fast, "a DOWN must not go on the lossy queue");
+        match parsed.ev {
+            InputEvent::Pointer {
+                source,
+                id,
+                pressure,
+                tilt_x,
+                tilt_y,
+                twist,
+                buttons,
+                phase,
+                x,
+                y,
+                ..
+            } => {
+                assert_eq!(source, 2, "pen");
+                assert_eq!(id, 7);
+                assert_eq!(phase, Phase::Down);
+                assert_eq!(buttons, 1);
+                assert!((pressure - 0.5).abs() < 1e-4, "pressure {pressure}");
+                assert!((tilt_x + 20.0).abs() < 1e-3, "tiltX {tilt_x}");
+                assert!((tilt_y - 30.0).abs() < 1e-3, "tiltY {tilt_y}");
+                assert!((twist - 90.0).abs() < 1e-3, "twist {twist}");
+                // Normalised, not CSS pixels: the host scales them by the virtual display's own
+                // size, which is not the client's.
+                assert!(
+                    (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y),
+                    "{x},{y}"
+                );
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_pointer_opcode_is_the_phase() {
+        for (name, want) in [
+            ("pointer_down_pen", Phase::Down),
+            ("pointer_up_pen", Phase::Up),
+            ("pointer_cancel_touch", Phase::Cancel),
+        ] {
+            let (_, bytes) = vector(name);
+            match parse(&bytes).expect(name).ev {
+                InputEvent::Pointer { phase, .. } => assert_eq!(phase, want, "{name}"),
+                other => panic!("{name} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_wheel_in_line_mode_keeps_its_mode_byte() {
+        // The mode decides whether the host multiplies by a line height or takes the delta as
+        // pixels. Losing it turns a three-line scroll into a three-pixel one.
+        let (_, bytes) = vector("wheel_lines");
+        let parsed = parse(&bytes).expect("wheel_lines");
+        assert!(parsed.fast, "wheel is a fast opcode");
+        match parsed.ev {
+            InputEvent::Wheel {
+                dx, dy, dz, mode, ..
+            } => {
+                assert!((dx + 12.5).abs() < 1e-4, "dx {dx}");
+                assert!((dy - 120.0).abs() < 1e-3, "dy {dy}");
+                assert!(dz.abs() < 1e-6, "dz {dz}");
+                assert_eq!(mode, 1, "line mode");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_key_frame_carries_both_strings_and_the_modifier_state() {
+        let (_, bytes) = vector("key_down_shift_a");
+        match parse(&bytes).expect("key_down_shift_a").ev {
+            InputEvent::Key {
+                down,
+                repeat,
+                mods,
+                code,
+                key,
+            } => {
+                assert!(down);
+                assert!(!repeat);
+                assert_ne!(mods, 0, "shift was held and must reach the host");
+                assert_eq!(code.as_str(), "KeyA");
+                assert_eq!(key.as_str(), "a");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let (_, bytes) = vector("key_up_a");
+        match parse(&bytes).expect("key_up_a").ev {
+            InputEvent::Key { down, code, .. } => {
+                assert!(!down);
+                assert_eq!(code.as_str(), "KeyA");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_locked_mouse_delta_is_relative_and_signed() {
+        // Signed: a leftward move is a negative dx, and reading it unsigned sends the cursor
+        // 65 531 pixels the other way.
+        let (_, bytes) = vector("mouse_delta_locked");
+        let parsed = parse(&bytes).expect("mouse_delta_locked");
+        assert!(parsed.fast);
+        match parsed.ev {
+            InputEvent::MouseDelta {
+                dx,
+                dy,
+                buttons,
+                unadjusted,
+            } => {
+                assert_eq!(dx, -5);
+                assert_eq!(dy, 3);
+                assert_eq!(buttons, 2);
+                assert!(!unadjusted, "the client had no unadjustedMovement grant");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ping_carries_the_clients_own_monotonic_stamp() {
+        let (_, bytes) = vector("ping");
+        match parse(&bytes).expect("ping").ev {
+            InputEvent::Ping { t_ns } => assert_eq!(t_ns, 12_345_000_000),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn losing_focus_is_a_lifecycle_event() {
+        let (_, bytes) = vector("focus_lost");
+        match parse(&bytes).expect("focus_lost").ev {
+            InputEvent::Lifecycle(Lifecycle::Focus(false)) => {}
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_golden_vector_cut_below_its_fixed_length_is_refused() {
+        // The fixture doubles as a corpus of the shapes that actually occur off the wire, and a
+        // short SCTP message is something a peer can send. Anything below the frame's fixed part
+        // has to be an error rather than a read past the end.
+        //
+        // At or above it is *not* an error, deliberately: the optional stamp, flags byte and
+        // fast-channel sequence are all tails an older client simply does not send, so a
+        // MOUSE_DELTA cut to its 8 fixed bytes is a valid frame from a client that predates the
+        // flags byte. That is the compatibility rule, not a gap in the check.
+        for (name, _, bytes) in golden_vectors() {
+            let fixed = fixed_len(bytes[0]).unwrap_or_else(|| panic!("{name}: unknown opcode"));
+            for cut in 0..fixed {
+                if let Ok(p) = parse(&bytes[..cut]) {
+                    panic!(
+                        "{name} truncated to {cut} of its {fixed} fixed bytes parsed as {:?}",
+                        p.ev
+                    );
+                }
+            }
+            // No claim about `fixed` itself: for the variable-length frames it is only the
+            // header before the length-prefixed strings, so `KEY` cut to 5 bytes is correctly a
+            // `BadLength`. What has to hold is that nothing *below* it is ever read.
+        }
+    }
 }

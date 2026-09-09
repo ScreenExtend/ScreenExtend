@@ -539,7 +539,7 @@ mod bench {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "benchmark against the stock payloader, not an assertion; run with --ignored --nocapture"]
     fn compare_with_the_stock_payloader() {
         use webrtc::rtp::codecs::h264::H264Payloader;
         use webrtc::rtp::packetizer::Payloader;
