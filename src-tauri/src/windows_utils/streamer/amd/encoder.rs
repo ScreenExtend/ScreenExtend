@@ -191,6 +191,8 @@ struct LtrState {
     mark_next: Option<i64>,
     /// Restricts the next frame's prediction to these LTR indices, then cleared.
     force_reference: Option<i64>,
+    /// The slot `mark_ltr` will claim next, rotating over `max_frames`.
+    next_slot: i64,
     last_marked: Option<i64>,
     last_referenced: Option<i64>,
 }
@@ -289,6 +291,9 @@ pub struct Encoder {
     component: *mut AMFComponent,
 
     ring: Vec<ID3D11Texture2D>,
+    /// How many textures `build_ring` makes. [`NUM_IN_FLIGHT`] for a self-driven encoder; the
+    /// pipeline's async ring asks for its own K and then owns slot selection.
+    ring_len: usize,
     ring_next: usize,
     last_slot: Option<usize>,
     ring_format: DXGI_FORMAT,
@@ -307,6 +312,10 @@ pub struct Encoder {
     /// `_IDR` marks a stream-startable unit; a plain `_I` does not.
     last_output_idr: bool,
     ltr: LtrState,
+    /// The pipeline's IDR atomic, so a PLI reaches the encoder wherever the encode happens —
+    /// including the ring's idle keepalive, which never goes through the capture-side stage.
+    /// Same mechanism and same reason as `nvidia/encoder.rs`'s `shared_idr`.
+    shared_idr: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     warned_input_full: bool,
     warned_empty_output: bool,
 
@@ -314,6 +323,11 @@ pub struct Encoder {
     /// happens while the driver still owns the mapping, so it must not allocate; the `Vec` the
     /// pipeline wants is built afterwards. Mirrors `nvidia/encoder.rs`'s `au_scratch`.
     au_scratch: Vec<u8>,
+
+    /// Whether the SPS AMF emits already carries the VUI we want. Decided once, from the SPS in
+    /// `ExtraData`, so the per-frame path is a bool rather than a bitstream parse — and so the
+    /// day a driver fixes AMF issue #398 this backend stops rewriting on its own.
+    patch_sps_vui: bool,
 
     /// Declared **last** so it drops last: dropping the `Library` unmaps the code every vtable
     /// above points into. Same rule as `nvidia/encoder.rs`'s trailing `_lib`.
@@ -329,7 +343,7 @@ impl Encoder {
     /// whose PCI vendor id is AMD's. Used by the probe harness and the CPU-bridge fallback.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let (device, context) = create_amd_d3d11_device()?;
-        Self::build(config, device, context, 0)
+        Self::build(config, device, context, 0, NUM_IN_FLIGHT)
     }
 
     /// Builds an encoder on the **capture** device, which is what makes
@@ -342,19 +356,26 @@ impl Encoder {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> Result<Self> {
-        Self::new_on_device_with_ltr(config, device, context, 0)
+        Self::new_on_device_with_ltr(config, device, context, 0, NUM_IN_FLIGHT)
     }
 
-    /// As [`Self::new_on_device`], reserving `max_ltr_frames` long-term references.
+    /// As [`Self::new_on_device`], with `slots` input textures and up to `max_ltr_frames`
+    /// long-term references.
     ///
-    /// Non-zero switches the encoder from ULL's rolling intra-refresh to user-controlled LTR:
-    /// the two are mutually exclusive. Leave it at 0 until the WebRTC session can report which
-    /// frames the client acknowledged.
+    /// A non-zero LTR budget switches the encoder from ULL's rolling intra-refresh to
+    /// user-controlled LTR: the two are mutually exclusive, so only a caller that will actually
+    /// act on receipts — the pipeline's async ring, driving `streamer::repair::RepairState` —
+    /// should ask for it. `open` clamps the request to what the adapter reports and
+    /// `configure_and_init` reads back what AMF granted.
+    ///
+    /// `slots` is [`NUM_IN_FLIGHT`] for an encoder that picks its own slot; the async ring asks
+    /// for its own K and then owns slot selection through [`Self::encode_slot`].
     pub fn new_on_device_with_ltr(
         config: EncoderConfig,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         max_ltr_frames: i64,
+        slots: usize,
     ) -> Result<Self> {
         if super::super::device_vendor(device) != Vendor::Amd {
             bail!(
@@ -367,6 +388,7 @@ impl Encoder {
             device.clone(),
             context.clone(),
             max_ltr_frames.clamp(0, MAX_LTR_FRAMES_SUPPORTED),
+            slots.max(1),
         )
     }
 
@@ -375,8 +397,10 @@ impl Encoder {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
         max_ltr_frames: i64,
+        slots: usize,
     ) -> Result<Self> {
         let mut this = Self::open(config, device, context, max_ltr_frames)?;
+        this.ring_len = slots.max(1);
 
         this.build_ring(PREFERRED_INPUT_FORMAT)?;
         this.configure_and_init()?;
@@ -455,6 +479,7 @@ impl Encoder {
             amf_context,
             component: ptr::null_mut(),
             ring: Vec::new(),
+            ring_len: NUM_IN_FLIGHT,
             ring_next: 0,
             last_slot: None,
             ring_format: PREFERRED_INPUT_FORMAT,
@@ -472,9 +497,11 @@ impl Encoder {
                 max_frames: max_ltr_frames,
                 ..LtrState::default()
             },
+            shared_idr: None,
             warned_input_full: false,
             warned_empty_output: false,
             au_scratch: Vec::new(),
+            patch_sps_vui: false,
             amf,
         };
 
@@ -608,6 +635,92 @@ impl Encoder {
 
     pub fn request_idr(&mut self) {
         self.idr_requested = true;
+    }
+
+    /// Let the pipeline's IDR atomic reach the encoder directly.
+    ///
+    /// The async ring's idle keepalive re-encodes the held slot from inside the encode thread and
+    /// never touches the capture-side stage, which is the only other consumer of the pipeline's
+    /// `idr_request`. Without this, a PLI on a static desktop produces another P frame and a
+    /// joining client stays black until something on the host screen moves.
+    pub fn attach_idr_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.shared_idr = Some(flag);
+    }
+
+    fn take_idr_request(&mut self, force: bool) -> bool {
+        let shared = self
+            .shared_idr
+            .as_ref()
+            .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed));
+        let own = self.idr_requested;
+        self.idr_requested = false;
+        force || own || shared
+    }
+
+    /// The input textures, for a caller that stages into them itself.
+    ///
+    /// AMF's ring lives on the **capture** device, so — unlike the NVENC cross-adapter ring —
+    /// there is no shared handle to open and no keyed mutex to acquire. Slot ownership is
+    /// entirely the caller's: hand a slot to `encode_slot` only when nothing else is writing it.
+    pub fn ring_textures(&self) -> Vec<ID3D11Texture2D> {
+        self.ring.clone()
+    }
+
+    /// Encode the texture already staged in `slot`. Pairs with [`Self::ring_textures`].
+    pub fn encode_slot(&mut self, slot: usize, force_idr: bool) -> Result<Vec<u8>> {
+        self.submit_slot(slot, force_idr)
+    }
+
+    /// Re-encode `slot` for a static desktop: zero copies, one encode.
+    pub fn encode_repeat_slot(&mut self, slot: usize) -> Result<Vec<u8>> {
+        self.submit_slot(slot, false)
+    }
+
+    /// The index the *next* submitted picture will carry, for the repair map.
+    pub fn next_frame_index(&self) -> u64 {
+        self.frame_index
+    }
+
+    /// How many long-term reference slots this encoder has. 0 means the repair API is inert and
+    /// the only loss recovery available is a keyframe — which is the shipped default, because
+    /// AMF turns off ULL's free rolling intra-refresh as soon as the client controls LTR.
+    pub fn ltr_slots(&self) -> u32 {
+        self.ltr.max_frames.max(0) as u32
+    }
+
+    /// Mark the next encoded picture as a long-term reference, and say which slot it takes.
+    ///
+    /// The caller owns the policy — how often to mark, and which slots it believes the client
+    /// holds — because only the transport sees the per-frame receipts. `None` when this adapter
+    /// gave us no slots.
+    pub fn mark_ltr(&mut self) -> Option<u32> {
+        if !self.ltr_enabled() {
+            return None;
+        }
+        let slot = self.ltr.next_slot;
+        self.ltr.next_slot = (slot + 1) % self.ltr.max_frames;
+        self.ltr.mark_next = Some(slot);
+        Some(slot as u32)
+    }
+
+    /// Make the next encoded picture reference only the long-term slots in `bitmap`.
+    ///
+    /// This is the repair: after a loss burst, a P frame predicted from a picture the client is
+    /// known to hold costs a fraction of an IDR and does not reset the rate controller. Bits
+    /// outside the encoder's slot count are ignored rather than rejected, and an empty bitmap is
+    /// a no-op — "reference nothing" is an intra frame, which the caller should ask for as an
+    /// IDR instead.
+    pub fn use_ltr(&mut self, bitmap: u32) -> bool {
+        if !self.ltr_enabled() {
+            return false;
+        }
+        let mask = (1u32 << self.ltr.max_frames.min(31)) - 1;
+        let bitmap = bitmap & mask;
+        if bitmap == 0 {
+            return false;
+        }
+        self.ltr.force_reference = Some(bitmap as i64);
+        true
     }
 
     pub fn ltr_enabled(&self) -> bool {
@@ -831,7 +944,7 @@ impl Encoder {
     // -------------------------------------------------------------------------------------
 
     fn submit_slot(&mut self, slot: usize, force_idr: bool) -> Result<Vec<u8>> {
-        let force_idr = force_idr || self.idr_requested;
+        let force_idr = self.take_idr_request(force_idr);
         let texture = self
             .ring
             .get(slot)
@@ -1104,6 +1217,16 @@ impl Encoder {
         // Release the driver's buffer before building the owned `Vec` the callers want.
         drop(buffer);
         drop(data);
+
+        // Only an access unit carrying parameter sets can need this, which is only a forced IDR
+        // (`HeaderInsertionSpacing = 0`, so AMF never sprays them), and the scan stops at the
+        // first slice NAL — so on a P frame it reads one NAL header.
+        if self.patch_sps_vui {
+            let full_range = self.full_range_input();
+            if let Some(patched) = super::sps::patch_annexb(&self.au_scratch[..len], full_range) {
+                return Ok(QueryOutcome::Au(patched));
+            }
+        }
         Ok(QueryOutcome::Au(self.au_scratch[..len].to_vec()))
     }
 
@@ -1347,7 +1470,7 @@ impl Encoder {
         // `FullRangeColor` is the only colour property AMF actually writes into an AVC
         // bitstream — the two below are set anyway in case a future driver honours them, and
         // their failure is logged once rather than fatal.
-        let full_range = self.surface_format != AMF_SURFACE_NV12;
+        let full_range = self.full_range_input();
         self.set_gated_bool(
             &mut report,
             prop::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR,
@@ -1503,10 +1626,47 @@ impl Encoder {
                 std::slice::from_raw_parts(native as *const u8, size).to_vec()
             }
         };
-        tprintln!(
-            "AMF SPS/PPS ready (extradata_bytes={})",
-            self.extradata.len()
-        );
+        // Decide the VUI question once, here, from the SPS AMF itself produced.
+        //
+        // AMF is reported never to write `OutColorProfile` / `OutColorPrimaries` /
+        // `OutColorTransferChar` / `OutMatrixCoeff` into an AVC bitstream (issues #398, #277,
+        // #540), and it never writes `bitstream_restriction_flag` at all — which is what tells a
+        // decoder `max_num_reorder_frames = 0`. Without it a decoder infers the reorder depth
+        // from the level and holds frames before showing the first. We packetize by hand, so the
+        // SPS is ours to fix; `sps::patch_annexb` is a no-op the moment a driver starts writing
+        // it correctly, which is the read-back this is gated on rather than a version check.
+        let full_range = self.full_range_input();
+        match super::sps::patch_annexb(&self.extradata, full_range) {
+            Some(patched) => {
+                self.patch_sps_vui = true;
+                self.extradata = patched;
+                tprintln!(
+                    "AMF SPS/PPS ready (extradata_bytes={}); SPS VUI rewritten for BT.709 \
+                     {} range and max_num_reorder_frames=0 (AMF issue #398)",
+                    self.extradata.len(),
+                    if full_range { "full" } else { "limited" }
+                );
+            }
+            None => {
+                self.patch_sps_vui = false;
+                tprintln!(
+                    "AMF SPS/PPS ready (extradata_bytes={}); this driver already writes the \
+                     colour description and the bitstream restriction, so the SPS is left alone",
+                    self.extradata.len()
+                );
+            }
+        }
+    }
+
+    /// Whether the samples reaching the encoder are full-range.
+    ///
+    /// Packed BGRA off the capture is full range; NV12 out of the scaler comes from the D3D11
+    /// video processor, whose default output is BT.709 **limited**. Signalling full range over
+    /// limited-range samples is the washed-out picture this is here to avoid, so it is the
+    /// format's answer rather than a constant — the same rule `apply_properties` uses for
+    /// `InputFullRangeColor`.
+    fn full_range_input(&self) -> bool {
+        self.surface_format != AMF_SURFACE_NV12
     }
 
     fn probe_caps(&self) -> AmfCaps {
@@ -1602,8 +1762,8 @@ impl Encoder {
     // -------------------------------------------------------------------------------------
 
     fn build_ring(&mut self, format: DXGI_FORMAT) -> Result<()> {
-        let mut ring = Vec::with_capacity(NUM_IN_FLIGHT);
-        for _ in 0..NUM_IN_FLIGHT {
+        let mut ring = Vec::with_capacity(self.ring_len);
+        for _ in 0..self.ring_len {
             ring.push(create_input_texture(
                 &self.device,
                 self.config.width,

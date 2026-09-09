@@ -26,7 +26,10 @@ pub(crate) fn show_measurements() {
 }
 
 mod amd_layout;
-mod h264;
+// Visible to the rest of `streamer`: `amd::sps`'s tests read their own output back with a
+// parser written separately from the writer, which is the only way that assertion means
+// anything.
+pub(super) mod h264;
 mod intel_encoder;
 mod intel_layout;
 mod nvenc_encoder;
