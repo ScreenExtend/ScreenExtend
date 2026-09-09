@@ -240,7 +240,6 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         let frame_duration = Duration::from_nanos(1_000_000_000 / SP_FPS as u64);
         let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
         telemetry.capture_backend.set("synthetic".into());
-        telemetry.encoder.set("nvenc".into());
         let pipeline = Pipeline {
             tx: tx.clone(),
             frame_duration,
@@ -265,8 +264,9 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             min_qp: cfg.quality_qp,
             intra_refresh: cfg.intra_refresh,
         };
+        let vendor = effective_vendor(cfg);
         std::thread::Builder::new()
-            .name("nvenc-encode".to_string())
+            .name("synthetic-encode".to_string())
             .spawn(move || {
                 synthetic_pattern_loop(
                     tx,
@@ -274,6 +274,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                     repair,
                     target_bitrate,
                     enc,
+                    vendor,
                     wake_rx,
                     telemetry,
                     workload,
@@ -2879,6 +2880,58 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     }
 }
 
+/// A `Backend` on the encoder's **own** D3D11 device, for a path that has no capture device.
+///
+/// The synthetic-pattern probe holds a CPU frame buffer and no captured texture, so every arm
+/// here is an own-device constructor and every encode goes through `Backend::encode_cpu`. The
+/// vendor order matches `build_backend`'s — NVENC, Quick Sync, AMF, x264 — and each explicitly
+/// named vendor still falls through to x264 with the hardware error attached, so a probe on a
+/// machine without that vendor prints why rather than stopping.
+fn build_own_device_backend(
+    config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
+) -> Result<Backend> {
+    use crate::streamer::config::EncoderVendor;
+
+    let try_nvenc = || -> Result<Backend> {
+        Encoder::new(config).map(|encoder| Backend::Nvenc {
+            encoder,
+            path: EncodePath::CpuBridge,
+        })
+    };
+    let try_intel = || -> Result<Backend> {
+        IntelEncoder::new(config).map(|e| Backend::IntelCpu { encoder: e })
+    };
+    let try_amf =
+        || -> Result<Backend> { AmfEncoder::new(config).map(|e| Backend::AmfCpu { encoder: e }) };
+    let try_x264 = || -> Result<Backend> {
+        X264Encoder::new(config)
+            .map(|e| Backend::X264 { encoder: e })
+            .map_err(|e| e.context("software x264 fallback unavailable"))
+    };
+
+    let hardware = match vendor {
+        EncoderVendor::Software => return try_x264(),
+        EncoderVendor::Nvidia => try_nvenc(),
+        EncoderVendor::Intel => try_intel(),
+        EncoderVendor::Amd => try_amf(),
+        EncoderVendor::Auto => try_nvenc()
+            .or_else(|nv| {
+                teprintln!("synthetic encode: NVENC unavailable ({nv:?}); trying Intel Quick Sync");
+                try_intel().map_err(|ie| nv.context(format!("Intel fallback also failed: {ie:?}")))
+            })
+            .or_else(|hw| {
+                teprintln!("synthetic encode: Quick Sync unavailable ({hw:?}); trying AMD AMF");
+                try_amf().map_err(|ae| hw.context(format!("AMD fallback also failed: {ae:?}")))
+            }),
+    };
+
+    hardware.or_else(|hw| {
+        teprintln!("synthetic encode: no hardware encoder ({hw:?}); falling back to software x264");
+        try_x264().map_err(|xe| hw.context(format!("software fallback also failed: {xe:?}")))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn synthetic_pattern_loop(
     tx: broadcast::Sender<EncodedFrame>,
@@ -2889,6 +2942,7 @@ fn synthetic_pattern_loop(
 
     target_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
     wake_rx: crossbeam_channel::Receiver<()>,
     telemetry: SharedTelemetry,
     workload: crate::streamer::synthetic::Workload,
@@ -2897,14 +2951,19 @@ fn synthetic_pattern_loop(
     let _thread_tuning = tuning::tune_current_thread();
     let counter_epoch = Instant::now();
 
-    let mut encoder = match Encoder::new(config) {
-        Ok(e) => e,
+    let mut backend = match build_own_device_backend(config, vendor) {
+        Ok(b) => b,
         Err(e) => {
-            teprintln!("encode thread: failed to create NVENC encoder ({e:?}); pipeline stopped");
+            teprintln!(
+                "encode thread: no encoder for --encoder {vendor:?} ({e:?}); pipeline stopped"
+            );
             return;
         }
     };
-    tuning::raise_d3d11_gpu_priority(encoder.device());
+    if let Some(device) = backend.device() {
+        tuning::raise_d3d11_gpu_priority(device);
+    }
+    telemetry.encoder.set(backend.name().into());
     let mut current_bitrate = config.bitrate_bps;
     let mut bitrate_warned = false;
 
@@ -2915,14 +2974,15 @@ fn synthetic_pattern_loop(
 
     tprintln!(
         "pipeline: synthetic pattern encode loop started ({SP_WIDTH}x{SP_HEIGHT}@{SP_FPS}, \
-         workload={}, counter={counter})",
+         encoder={}, workload={}, counter={counter})",
+        backend.name(),
         workload.name()
     );
 
     loop {
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 && pending != current_bitrate {
-            match encoder.set_bitrate(pending) {
+            match backend.set_bitrate(pending) {
                 Ok(BitrateApplied::Applied) => {
                     tprintln!("adapting bitrate: {current_bitrate} -> {pending} bps");
                     current_bitrate = pending;
@@ -2957,7 +3017,11 @@ fn synthetic_pattern_loop(
 
         let mut timing = FrameTiming::entering_capture();
         timing.mark_encode_submit();
-        match encoder.encode_bgra(&frame_buf, force_idr) {
+        // Every own-device backend takes the frame the same way: a full-width BGRA upload.
+        // `encode_cpu(.., width * 4, Bgra8, ..)` is byte-for-byte what `encode_bgra` did on the
+        // NVENC arm, with the row pitch spelled out instead of implied.
+        match backend.encode_cpu(&frame_buf, SP_WIDTH * 4, ReadbackFormat::Bgra8, force_idr) {
+            Ok(au) if au.is_empty() => {}
             Ok(au) => {
                 timing.mark_encode_done();
                 telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
