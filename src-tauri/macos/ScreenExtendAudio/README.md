@@ -95,13 +95,23 @@ Verified on the development Mac (macOS 10.15.8, Intel, SIP disabled):
 * the unsigned `.pkg` installs, `postinstall` restarts `coreaudiod`, and the device appears in the
   HAL within a second — no reboot;
 * the plug-in loads, unlinks a stale layout-1 segment, creates the layout-2 one, and logs its
-  geometry; the user can map it `O_RDWR`, so the fast transport is available.
+  geometry; the user can map it `O_RDWR`, so the fast transport is available;
+* **sample flow through `OnProcessMixedOutput` works.** 2,083,840 samples through the shared ring
+  with `readPos` tracking `writePos` at a backlog of 0 and `overruns` 0, and the capture-time
+  anchor published. End to end through the shipped `start_capture()` path, driven by `say`:
+  capture → Opus packet p50 −0.57 ms / p90 3.59 / p99 4.54, an IO cycle of 128 frames (2.67 ms),
+  and 0 of 3277 `capture_ns` deltas anything other than exactly 5.000 ms — no regressions, no
+  sequence gaps. Reproduce from `src-tauri/` with
+  `cargo test --lib legacy_live -- --ignored --nocapture`; the numbers and the log lines that
+  prove each tier are in [`docs/manual-tests/macos-audio.md`](../../../docs/manual-tests/macos-audio.md).
 
 Not verified anywhere yet:
 
 * **signing and notarization** — no Apple Developer identity on either development machine, so the
-  driver has only ever been ad-hoc signed and has only ever loaded with SIP disabled;
-* **sample flow** through `OnProcessMixedOutput` — macOS grants audio IO only to the console
-  session, and both development machines reach this Mac over SSH, where even the built-in output
-  device runs zero IO cycles. `tools/hal_render.c` plus `tools/shmcheck.c watch` is the check to
-  run from a console session; the procedure is in the manual test above.
+  driver has only ever been ad-hoc signed and has only ever loaded with SIP disabled. Everything
+  below that step has been run; see
+  [`docs/manual-tests/macos-audio-driver-signing.md`](../../../docs/manual-tests/macos-audio-driver-signing.md).
+* **arm64** — a 10.15 SDK cannot target it, so the universal build needs CI or a newer Mac.
+* **non-stereo mixes** — `OnProcessMixedOutput` downmixes anything that is not 2-channel with the
+  same BS.775 coefficients as the Rust siblings, but the device advertises stereo, so that branch
+  has never actually run.
