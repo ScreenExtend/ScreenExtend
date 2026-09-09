@@ -22,3 +22,8 @@ src-tauri/resources/nvenc-headers/** text eol=lf
 # on every checkout or the verification job fails on the developer's machine.
 src-tauri/binaries/SHA256SUMS   text eol=lf
 src-tauri/resources/SHA256SUMS  text eol=lf
+
+# The trickle-ICE golden vector is the exact `application/trickle-ice-sdpfrag` body the client
+# writes, CRLF and all (RFC 4566 §5). Git's auto text detection would rewrite the endings on a
+# Windows checkout and the fixture would stop being the bytes that go on the wire.
+src-tauri/src/streamer/test/*.sdpfrag  binary

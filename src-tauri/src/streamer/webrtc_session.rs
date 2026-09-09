@@ -774,16 +774,16 @@ pub struct PendingWhep {
 }
 
 impl PendingWhep {
-    /// Give everything back when the other half of the join failed.
-    ///
-    /// Without this a display or pipeline failure would leak exactly what the peer connection used
-    /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
-    /// read worker.
     /// The WHEP resource id, which the `Location` header points at.
     pub fn resource_id(&self) -> &str {
         &self.resource_id
     }
 
+    /// Give everything back when the other half of the join failed.
+    ///
+    /// Without this a display or pipeline failure would leak exactly what the peer connection used
+    /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
+    /// read worker.
     pub async fn abandon(mut self) {
         unregister_trickle(&self.resource_id);
         if let Err(e) = self.pc.close().await {
@@ -804,6 +804,7 @@ impl PendingWhep {
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_whep(
     offer_sdp: String,
+    device_key: &str,
     ice_servers: Vec<RTCIceServer>,
     locality: SessionLocality,
     video: negotiate::NegotiatedVideo,
@@ -975,7 +976,7 @@ pub async fn prepare_whep(
     // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
     // not been given, and a failed negotiation must not leave an entry behind.
     let resource_id = mint_resource_id();
-    register_trickle(&resource_id, &pc);
+    register_trickle(&resource_id, device_key, &pc);
 
     Ok(PendingWhep {
         pc,
@@ -1609,6 +1610,7 @@ pub async fn activate_whep(
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_whep_offer(
     offer_sdp: String,
+    device_key: &str,
     pipeline: &Pipeline,
     ice_servers: Vec<RTCIceServer>,
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1620,6 +1622,7 @@ pub async fn handle_whep_offer(
 ) -> Result<(String, SessionHandle)> {
     let pending = prepare_whep(
         offer_sdp,
+        device_key,
         ice_servers,
         locality,
         video,
@@ -2314,7 +2317,83 @@ mod tests {
 
     #[tokio::test]
     async fn trickling_to_a_session_that_does_not_exist_is_reported_not_ignored() {
-        assert!(!add_trickled_candidates("deadbeef", "a=end-of-candidates").await);
+        assert_eq!(
+            add_trickled_candidates("deadbeef", "10.0.0.1", "a=end-of-candidates").await,
+            TrickleLookup::Unknown
+        );
+    }
+
+    #[test]
+    fn a_resource_answers_only_to_the_peer_that_opened_it_and_only_while_it_lives() {
+        // The registry is the whole of the authority check, so it is asserted without a peer
+        // connection: `trickle_owner` is what `DELETE` resolves through, and `PATCH` applies the
+        // same two tests before it touches ICE.
+        let id = "0123456789abcdef0123456789abcdef";
+        {
+            let mut guard = TRICKLE_SESSIONS.lock_recover();
+            let map = guard.get_or_insert_with(Default::default);
+            map.insert(
+                id.to_string(),
+                TrickleEntry {
+                    // A dangling `Weak` is exactly the state a finished session leaves behind.
+                    pc: std::sync::Weak::new(),
+                    device_key: "192.168.1.7".to_string(),
+                    fragments: 0,
+                },
+            );
+        }
+        assert_eq!(
+            trickle_owner(id, "192.168.1.8"),
+            None,
+            "another peer must not resolve someone else's resource"
+        );
+        assert_eq!(
+            trickle_owner("ffffffffffffffffffffffffffffffff", "192.168.1.7"),
+            None,
+            "an id that was never minted must not resolve"
+        );
+        assert_eq!(
+            trickle_owner(id, "192.168.1.7"),
+            None,
+            "a resource whose session is gone must not resolve, even to its own peer"
+        );
+        unregister_trickle(id);
+        assert!(TRICKLE_SESSIONS
+            .lock_recover()
+            .as_ref()
+            .is_none_or(|m| !m.contains_key(id)));
+    }
+
+    /// The body `trickleFragment()` in `static/index.html` actually writes, byte for byte.
+    ///
+    /// Not a copy of it: `scripts/test-client-ice.mjs` lifts the shipped function out of the page
+    /// and emits its output to this fixture, and fails if the file no longer matches, so a change
+    /// to the client body either updates these bytes — and this test then parses the new ones —
+    /// or is caught there. A literal here could do neither.
+    #[test]
+    fn the_client_fragment_shape_parses_whole() {
+        let body = include_str!("test/trickle-fragment.sdpfrag");
+        let f = parse_trickle_fragment(body);
+        assert_eq!(f.ufrag.as_deref(), Some("UF01"));
+        assert_eq!(f.candidates.len(), 2);
+        for c in &f.candidates {
+            assert_eq!(c.1.as_deref(), Some("0"), "every candidate rides mid 0");
+            assert_eq!(c.2, Some(0), "one m= section means m-line index 0");
+        }
+        assert!(f.end_of_candidates);
+        assert!(
+            f.candidates.iter().any(|c| c.0.contains("typ relay")),
+            "the fixture must carry the relay candidate, which is the one trickle exists for"
+        );
+        // SDP is CRLF (RFC 4566 §5) and the client writes it that way. The parser tolerates bare
+        // LF, so a checkout that rewrote the endings would still pass every assertion above while
+        // no longer being the bytes that go on the wire — which is the one thing a golden vector
+        // exists to pin.
+        assert_eq!(
+            body.matches('\n').count(),
+            body.matches("\r\n").count(),
+            "the fixture must keep its CRLF endings; see .gitattributes"
+        );
     }
 
     #[test]
@@ -2332,35 +2411,83 @@ mod tests {
     }
 }
 
+/// The most candidate lines one fragment may carry. Our own client batches 24; a body at the
+/// 64 KiB `MAX_SDP_LEN` could otherwise hold several hundred, each awaited individually.
+const MAX_TRICKLE_CANDIDATES: usize = 64;
+/// The most fragments one session may ever be sent. Gathering on any real client is over inside a
+/// few seconds and a handful of fragments; this is the ceiling that stops the route being an
+/// unbounded `add_ice_candidate` driver.
+const MAX_TRICKLE_FRAGMENTS: u32 = 128;
+
+struct TrickleEntry {
+    /// `Weak`, so a session that ends drops out of here without anything having to remember to
+    /// remove it — and so this map can never be the thing that keeps a peer connection alive.
+    pc: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
+    /// The device key the join came in on. The resource id is a 128-bit capability, but it is
+    /// handed out in a `Location` header that travels in cleartext on the HTTP listener, which is
+    /// the listener most LAN joins use — so the id alone is not the authority.
+    device_key: String,
+    /// Fragments accepted so far, against `MAX_TRICKLE_FRAGMENTS`.
+    fragments: u32,
+}
+
 /// Live sessions addressable by their WHEP resource id, for trickle ICE.
-///
-/// `Weak`, so a session that ends drops out of here without anything having to remember to remove
-/// it — and so this map can never be the thing that keeps a peer connection alive.
-static TRICKLE_SESSIONS: Mutex<
-    Option<
-        std::collections::HashMap<
-            String,
-            std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
-        >,
-    >,
-> = Mutex::new(None);
+static TRICKLE_SESSIONS: Mutex<Option<std::collections::HashMap<String, TrickleEntry>>> =
+    Mutex::new(None);
+
+/// What a `PATCH`/`DELETE` on a WHEP resource resolved to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrickleLookup {
+    /// The id is live and belongs to this peer.
+    Found,
+    /// No such id, or it belongs to someone else. Deliberately the same answer for both, so a
+    /// probe cannot tell a wrong id from a wrong source.
+    Unknown,
+    /// The session's fragment budget is spent.
+    Exhausted,
+}
 
 fn mint_resource_id() -> String {
     let bytes: [u8; 16] = rand::random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn register_trickle(id: &str, pc: &Arc<webrtc::peer_connection::RTCPeerConnection>) {
+fn register_trickle(
+    id: &str,
+    device_key: &str,
+    pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
+) {
     let mut guard = TRICKLE_SESSIONS.lock_recover();
     let map = guard.get_or_insert_with(Default::default);
-    map.retain(|_, weak| weak.strong_count() > 0);
-    map.insert(id.to_string(), Arc::downgrade(pc));
+    map.retain(|_, e| e.pc.strong_count() > 0);
+    map.insert(
+        id.to_string(),
+        TrickleEntry {
+            pc: Arc::downgrade(pc),
+            device_key: device_key.to_string(),
+            fragments: 0,
+        },
+    );
 }
 
 fn unregister_trickle(id: &str) {
     if let Some(map) = TRICKLE_SESSIONS.lock_recover().as_mut() {
         map.remove(id);
     }
+}
+
+/// The device key a live resource belongs to, when it belongs to `device_key`.
+///
+/// `DELETE` needs this because the session is keyed by the device, not by the resource: without
+/// it the handler can only trust the caller's own address, which makes the id — the whole point of
+/// RFC 9725 §4.4 — carry no authority at all.
+pub fn trickle_owner(id: &str, device_key: &str) -> Option<String> {
+    let guard = TRICKLE_SESSIONS.lock_recover();
+    let e = guard.as_ref()?.get(id)?;
+    if e.pc.strong_count() == 0 || e.device_key != device_key {
+        return None;
+    }
+    Some(e.device_key.clone())
 }
 
 /// One `a=candidate:` line's worth of trickled ICE, as RFC 9725 sends it.
@@ -2406,21 +2533,42 @@ pub fn parse_trickle_fragment(body: &str) -> TrickleFragment {
     out
 }
 
-/// Feed trickled candidates to a live session. Returns whether the session was found.
-pub async fn add_trickled_candidates(id: &str, body: &str) -> bool {
+/// Feed trickled candidates to a live session.
+///
+/// The resource must be live *and* belong to `device_key`, and the session's fragment budget must
+/// not be spent — the id is a capability, but it rides a cleartext header on the HTTP listener, so
+/// it is not the only thing standing between an observer and a media-redirection primitive.
+pub async fn add_trickled_candidates(id: &str, device_key: &str, body: &str) -> TrickleLookup {
     use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
+    // The budget is charged under the same lock that resolves the session, so concurrent
+    // fragments cannot both read the last one.
     let pc = {
-        let guard = TRICKLE_SESSIONS.lock_recover();
-        guard
-            .as_ref()
-            .and_then(|m| m.get(id).and_then(|w| w.upgrade()))
-    };
-    let Some(pc) = pc else {
-        return false;
+        let mut guard = TRICKLE_SESSIONS.lock_recover();
+        let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(id)) else {
+            return TrickleLookup::Unknown;
+        };
+        if entry.device_key != device_key {
+            return TrickleLookup::Unknown;
+        }
+        let Some(pc) = entry.pc.upgrade() else {
+            return TrickleLookup::Unknown;
+        };
+        if entry.fragments >= MAX_TRICKLE_FRAGMENTS {
+            return TrickleLookup::Exhausted;
+        }
+        entry.fragments += 1;
+        pc
     };
 
-    let frag = parse_trickle_fragment(body);
+    let mut frag = parse_trickle_fragment(body);
+    if frag.candidates.len() > MAX_TRICKLE_CANDIDATES {
+        teprintln!(
+            "trickle: fragment carried {} candidates; keeping the first {MAX_TRICKLE_CANDIDATES}",
+            frag.candidates.len()
+        );
+        frag.candidates.truncate(MAX_TRICKLE_CANDIDATES);
+    }
     let mut added = 0usize;
     for (candidate, sdp_mid, sdp_mline_index) in frag.candidates {
         let init = RTCIceCandidateInit {
@@ -2434,6 +2582,21 @@ pub async fn add_trickled_candidates(id: &str, body: &str) -> bool {
             Err(e) => teprintln!("trickle: rejected a candidate ({e})"),
         }
     }
+    if frag.end_of_candidates {
+        // An empty candidate string is how webrtc-rs spells `add_remote_candidate(None)`, which
+        // is what tells the ICE agent remote gathering is over so it can fail the checklist
+        // early instead of waiting out its own timers. Parsing the attribute and only logging it
+        // left the agent none the wiser.
+        if let Err(e) = pc
+            .add_ice_candidate(RTCIceCandidateInit {
+                candidate: String::new(),
+                ..Default::default()
+            })
+            .await
+        {
+            teprintln!("trickle: end-of-candidates rejected ({e})");
+        }
+    }
     if added > 0 || frag.end_of_candidates {
         tprintln!(
             "trickle: added {added} remote candidate(s){}",
@@ -2444,5 +2607,5 @@ pub async fn add_trickled_candidates(id: &str, body: &str) -> bool {
             }
         );
     }
-    true
+    TrickleLookup::Found
 }
