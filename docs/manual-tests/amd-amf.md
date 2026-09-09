@@ -51,19 +51,24 @@ Then, on the same box, the tests that need no hardware:
 ```powershell
 cd src-tauri
 cargo test --lib windows_utils::streamer::test::amd_layout
+cargo test --lib windows_utils::streamer::amd::sps
 ```
 
-13 tests, all passing. On this machine `amf_loader_handles_a_missing_runtime` takes its *other*
-branch — the DLL is present, so it asserts `AMFQueryVersion` returns non-zero. That is the first
-real signal that the FFI works.
+14 and 8 tests, all passing. On this machine `amf_loader_handles_a_missing_runtime` takes its
+*other* branch — the DLL is present, so it asserts `AMFQueryVersion` returns non-zero. That is
+the first real signal that the FFI works.
 
 ---
 
 ## 2. Does AMF exist, and is it hardware? (5 min)
 
+The harness is reached as the `probe` subcommand, and the **output path goes immediately after
+the mode flag** — a path that follows another flag is not picked up and the run silently writes
+to `out.h264`.
+
 ```powershell
 cd src-tauri
-cargo run --release -- --probe-encode --encoder amd out_amd.h264
+cargo run --release -- probe --encode out_amd.h264 --encoder amd
 ```
 
 Expected log lines, in order:
@@ -76,12 +81,23 @@ AMF AVC caps: accel=hardware(VCN/VCE), max_bitrate=..., streams=..., hw_instance
               max_profile=..., max_level=..., max_refs=..., b_frames=..., pre_analysis=...,
               query_timeout=..., slice_output=..., color_conversion=..., throughput=.../... MB,
               input=...x......x..., bgra_native=Some(...), nv12_native=Some(...)
+AMF optional properties: LowLatencyInternal=1, RateControlPreanalysisEnable=0, ...
+AMF SPS/PPS ready (extradata_bytes=...); SPS VUI rewritten for BT.709 full range and ...
 AMD AMF H.264 encoder initialized (D3D11 / ULTRA_LOW_LATENCY): 1920x1080@60, ...
 ```
 
-**Paste the whole `AMF AVC caps:` line.** It answers, on hardware, every open question the
-research could not: whether `QueryTimeout` is honoured, whether slice output exists, whether
-BGRA and NV12 are `native` inputs, and how much VCN throughput other apps have already taken.
+**Paste the whole `AMF AVC caps:` line and the whole `AMF optional properties:` line.** Between
+them they answer, on hardware, every open question the research could not: whether
+`QueryTimeout` is honoured, whether slice output exists, whether BGRA and NV12 are `native`
+inputs, how much VCN throughput other apps have already taken, and — property by property —
+which optional knobs this driver and VCN generation actually have.
+
+Reading the properties line: `name=v` was written and read back as asked; `name=v(asked w)` means
+the driver kept its own value; `rejected(CODE)` is a name the runtime knows but would not take;
+`unknown` is one `HasProperty` denied; `unknown-but-set:` is `HasProperty` denying a name the
+write then accepted, which is the one thing that tells us what AMF's `HasProperty` really means.
+**If any entry reads `unknown-but-set:`, say so** — that is a finding about the runtime, not
+about us.
 
 Failure modes and what they mean:
 
@@ -121,8 +137,10 @@ record it, do not "fix" it.
   `probe_ultra_low_latency` in `amd/encoder.rs` to return `false` and re-run — you should get the
   `rejected by this driver/GPU` line and a working `LOW_LATENCY` encode.
 - AMF vs x264: `--encoder amd` forces AMF (falling back to x264 only on failure);
-  `--encoder software` forces x264; `--encoder auto` is the shipping chain
-  (NVENC then Intel then AMF then x264).
+  `--encoder software` forces x264; `--encoder auto` is the shipping chain. Both `probe` and
+  `serve` take `--encoder` with the same five values; `serve --software-encode` is the alias for
+  `--encoder software` and wins if both are given, because it is also what the desktop UI's
+  GPU-encode toggle sets. `auto` is NVENC then Intel then AMF then x264.
 
 ---
 
@@ -145,17 +163,41 @@ Assert:
   scaler comes from the D3D11 video processor in BT.709 **limited**, so `tv`. Signalling full
   range over limited-range samples is a washed-out picture, so a mismatch between the log line
   and this field is a real bug, not a cosmetic one.
-- `color_space`, `color_primaries` and `color_transfer` are very likely **absent**, and that is
-  the known AMF driver bug (GPUOpen AMF issues #398, #277, #540: `OutColorProfile`,
-  `OutColorPrimaries`, `OutColorTransferChar` and `OutMatrixCoeff` never reach the bitstream on
-  any codec; `FullRangeColor` is the only one that works). The encoder sets all five anyway, so
-  if a future driver starts honouring them these fields appear on their own. Record what this
-  driver does either way — that is the whole point of asking.
+- `color_space`, `color_primaries` and `color_transfer` must all read **bt709**, and they come
+  from *us*, not from AMF. The known AMF driver bug (GPUOpen issues #398, #277, #540:
+  `OutColorProfile`, `OutColorPrimaries`, `OutColorTransferChar` and `OutMatrixCoeff` never reach
+  the bitstream on any codec) is why `amd/sps.rs` rewrites the SPS VUI on the way out. Which of
+  the two happened is in the log, and **this is the line to paste**:
+
+  ```
+  AMF SPS/PPS ready (extradata_bytes=...); SPS VUI rewritten for BT.709 full range and
+  max_num_reorder_frames=0 (AMF issue #398)
+  ```
+
+  or, if this driver has fixed it:
+
+  ```
+  AMF SPS/PPS ready (extradata_bytes=...); this driver already writes the colour description and
+  the bitstream restriction, so the SPS is left alone
+  ```
+
+  Either way the ffprobe fields must be right. If the rewrite ran and they are still absent, the
+  rewriter is wrong; if the log says the driver already writes them, AMD have fixed #398 and that
+  is worth reporting on its own.
+- The **reorder claim** is the other half, and it is what a decoder uses to decide how many
+  frames to buffer before showing the first. There is no ffprobe field for it, so parse the SPS:
+
+  ```powershell
+  # in another shell, against the same file
+  cd src-tauri; cargo test --lib windows_utils::streamer::amd::sps -- --nocapture
+  ```
+
+  passes here without hardware; on the box, the assertion that matters is that `ffplay` starts
+  showing pictures immediately rather than after a visible pause.
 - Then compare against an NVENC capture of the same content on an NVIDIA box:
   `ffprobe -show_entries stream=color_range,color_space,color_primaries,color_transfer` on both,
-  and render both in the client page on the *same* device. If they look different, the fix is
-  ours and cheap (we hand-packetize H.264, so the SPS VUI can be patched on the way out); if they
-  look the same, the browser is inferring BT.709 for HD and nothing needs doing. **Record which.**
+  and render both in the client page on the *same* device. They should now match. **Record
+  whether they do.**
 - `ffplay` shows the moving cyan box on a scrolling gradient, not garbage.
 
 Then confirm the first access unit carries SPS and PPS in band:
@@ -168,32 +210,42 @@ ffprobe -v error -show_packets -of csv out_amd.h264 | Select-Object -First 3
 
 ## 5. Encode latency (10 min)
 
-Live capture, so the per-60-frame timing log runs:
+Live capture, on the real host path:
 
 ```powershell
 cargo run --release -- serve -v --encoder amd
 ```
 
-Join from the phone, leave it up for **five minutes**, and watch:
+Join from the phone and leave it up for **five minutes**. The per-stage numbers come from the
+telemetry summary, which `-v` prints every 5 s per active session and which
+`ScreenExtend status --json` reports from another shell:
 
 ```
-encode-path latency: path=amd-amf-same-adapter, avg_ms=..., max_ms=...
+[<client-ip>] telemetry: capture=wgc[...] encoder=amd-amf-ring frames=... fps=...
+  capture_delivery=p50/p90/p99/max scale=... encode_queue=... encode=... packetize=...
+  socket_write=... capture_to_encode=... capture_to_socket=... | frames_repeated=... idrs_sent=...
 ```
 
-Targets, from the NVENC band on comparable hardware:
+(The `encode-path latency:` line some older notes mention exists only on the DXGI arm; a WGC
+session never prints it.)
 
-| Resolution | avg | max |
+Targets, from the NVENC band on comparable hardware, reading the `encode` and
+`capture_to_socket` columns:
+
+| Resolution | encode p50 | capture_to_socket p99 |
 |---|---|---|
-| 1080p60 | single-digit ms | under about 2x avg |
-| 1440p60 | low teens | under about 2x avg |
-| 4K60 | teens | under about 2x avg |
+| 1080p60 | single-digit ms | under about 2x the p90 |
+| 1440p60 | low teens | under about 2x the p90 |
+| 4K60 | teens | under about 2x the p90 |
 
-**Watch the max, not the average.** A creeping max over five minutes is a VBV or buffering
-regression and is where latency bugs hide. Paste the first and last timing lines of the run.
+**Watch the tail, not the median.** A creeping p99 over five minutes is a VBV or buffering
+regression and is where latency bugs hide. Paste the first and last telemetry lines of the run.
 
-Also confirm `path=amd-amf-same-adapter`. If it says `amd-amf-cpu-bridge`, the capture device
-was not the AMD adapter — paste the `capture device adapter:` line, because on an all-AMD box
-that should not happen.
+Also confirm `encoder=amd-amf-ring`. Two other values are possible and both mean something:
+`amd-amf-same-adapter` is the inline (non-ring) path, so the ring failed to build and the reason
+is in the log; `amd-amf-cpu-bridge` means the capture device was not the AMD adapter at all —
+paste the `adapters: capture=… encode=… same_adapter=…` line, because on an all-AMD box that
+should not happen.
 
 And confirm this line **never** appears:
 
@@ -219,7 +271,7 @@ active player, `video_decoder` should name a hardware decoder rather than `FFmpe
 ## 7. Adaptive bitrate and on-demand IDR (5 min)
 
 ```powershell
-cargo run --release -- --probe-bitrate --encoder amd
+cargo run --release -- probe --bitrate --encoder amd
 ```
 
 The byte rate must follow the stepped target within a few frames, with **no resolution change**
@@ -271,11 +323,14 @@ Encode the same 300-frame synthetic clip twice at a fixed 10 Mbps, once with the
 once with the refresh explicitly off, and compare size and quality:
 
 ```powershell
+# The output path goes immediately after --encode, or the run writes to the default out.h264 and
+# the two files below are the same file.
+#
 # ULL's default: the backend leaves IntraRefreshMBsNumberPerSlot alone, so the usage's 255 stands.
-ScreenExtend probe --probe-encode --encoder amd --intra-refresh on  out_amd_refresh.h264
+ScreenExtend probe --encode out_amd_refresh.h264   --encoder amd --intra-refresh on
 # Explicitly off: the backend writes IntraRefreshMBsNumberPerSlot = 0, which is the only way to
 # turn the usage's default off.
-ScreenExtend probe --probe-encode --encoder amd --intra-refresh off out_amd_norefresh.h264
+ScreenExtend probe --encode out_amd_norefresh.h264 --encoder amd --intra-refresh off
 
 ffprobe -v error -show_entries format=size -of csv=p=0 out_amd_refresh.h264
 ffprobe -v error -show_entries format=size -of csv=p=0 out_amd_norefresh.h264
@@ -322,16 +377,68 @@ and **no** subsequent `AMF input is BGRA rather than NV12` line. Then confirm:
 
 ---
 
+---
+
+## 12. The decoupled ring and LTR repair (10 min)
+
+Both landed `COMPILE-CHECKED` and neither has ever run. They are the two things on this page most
+likely to be wrong in an interesting way.
+
+**The ring.** With `serve -v --encoder amd` and a client joined, the log must say:
+
+```
+pipeline: live capture ready -- amd-amf-ring RING (K=3) decoupled path (WxH@fps)
+```
+
+and the telemetry line must read `encoder=amd-amf-ring`. What it buys is capture/encode overlap:
+before it, every AMD frame was encoded *inside* the WGC callback. The number that shows it is
+`encode` p50 in the telemetry line — on the NVENC ring it reads **0.00 ms**, because the measured
+span is only the submit. If AMF's `encode` p50 is still several milliseconds, the ring is built
+but `QueryOutput` is blocking inside the submit, which is expected (AMF has no async submit) and
+worth recording as the difference between the two engines.
+
+Also confirm, over five minutes: `frames_dropped_ring` stays 0 (it counts frames dropped for want
+of a free slot — if it climbs, the encoder is not keeping up and K=3 is too small),
+`frames_dropped_broadcast` stays 0, and `frames_repeated` is roughly two thirds of `frames`
+(a static desktop is mostly repeats, and the repeat path is the ring's keepalive here, not
+`spawn_repeater`).
+
+**The IDR-on-a-static-desktop case specifically.** Leave the host screen completely still, then
+reload the client page. Exactly one IDR must appear (`idrs_sent` increments by 1) within about a
+frame. This was a *blocker* on the NVENC ring — 2 IDRs in 30 s before it was fixed — and the AMD
+ring uses the same shared `idr_request` atomic through `attach_idr_flag`.
+
+**LTR.** At session start the log says one of:
+
+```
+amd-amf-ring: N long-term reference slot(s); a lost frame can be repaired without an IDR
+AMF LTR: not enabled — this adapter reports max_refs=1 (need > 1); ...
+AMF LTR: not enabled — this runtime has no MaxOfLTRFrames property; ...
+AMF LTR: asked for 2 slot(s), the encoder reports 0; using 0
+```
+
+**Paste whichever appears.** If LTR is on, the trade is that ULL's rolling intra-refresh is off
+(AMF disables it under user-controlled LTR), so step 10's SSIM comparison and this are the two
+halves of one decision. Then induce loss — a congested Wi-Fi link, or a client on a busy network
+— and compare IDRs per minute with a run where LTR reported 0 slots. The NVENC-side reference is
+a repair frame at **23,698 B against a 28,423 B IDR**; the number that matters is how many IDRs a
+lossy minute stops producing, not the per-frame size.
+
+---
+
 ## What to report back
 
-1. The `AMF AVC caps:` line, verbatim.
+1. The `AMF AVC caps:` line and the `AMF optional properties:` line, verbatim.
 2. The tier from step 3 (ULL / LL / x264) and which message proved it.
 3. `has_b_frames`, the `pict_type` set, the IDR count, and `color_range`.
-4. First and last `encode-path latency:` lines of the five-minute run.
+4. First and last telemetry lines of the five-minute run, and the `encoder=` value.
 5. Glass-to-glass median and worst, AMF vs x264 on the same box.
-6. Anything in the log you did not expect — especially `AMF optional property not applied:`
-   lines, which tell us which knobs this driver and VCN generation actually have.
+6. Anything in the log you did not expect — especially any `unknown-but-set:` entry in the
+   optional-properties line, which tells us what AMF's `HasProperty` really means.
 7. Step 10's SSIM/PSNR delta and file sizes, and whether the refresh wave is visible.
 8. Step 11's retune line, the post-retune encode latency against step 5, and `color_range`.
-9. Whether the four `Out*` colour properties reached the bitstream on this driver, and whether an
-   AMD stream and an NVENC stream of the same content look different in the client page.
+9. The `AMF SPS/PPS ready` line — whether this driver writes the VUI itself or we rewrote it —
+   and whether an AMD stream and an NVENC stream of the same content now look the same in the
+   client page.
+10. Step 12: the ring line, `encode` p50, `frames_dropped_ring`, the one-IDR-on-a-still-desktop
+    result, and the LTR line.
