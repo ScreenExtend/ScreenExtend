@@ -26,9 +26,25 @@ const IFRTYPE_FUNCTIONAL_WIFI_INFRA: i32 = 3;
 const fn iowr(num: u64, size: usize) -> u64 {
     0xc000_0000 | (((size as u64) & 0x1fff) << 16) | ((b'i' as u64) << 8) | num
 }
+
+/// `SIOCGIFMEDIA` — the ioctl `ifconfig` uses to print `media: autoselect`. Not in `libc`, so the
+/// `_IOWR('i', 56, struct ifmediareq)` of `<sys/sockio.h>` is recomputed here from the struct, and
+/// `an_ifmediareq_matches_the_kernels_64_bit_layout` pins the result to the header's number.
+///
+/// The size in the request number is load-bearing, and 44 is the only value that is both correct
+/// and future-proof. `<net/if.h>` wraps `struct ifmediareq` in `#pragma pack(4)`, so the 64-bit
+/// `ifm_ulist` sits at offset 36 with no padding and the struct is 44 bytes, not the 48 an
+/// 8-aligned pointer would give. XNU also keeps a 32-bit compat form of the same call whose
+/// pointer is 4 bytes wide, encoding 40 — and because the two layouts agree over their first 36
+/// bytes, every field this module reads lands in the right place under either. Probed on 10.15.8
+/// (`docs/OPTIMIZATIONS.md`): 40 and 44 both return 0 on en0/en1/en3, 48 is `ENOTSUP` everywhere.
+/// Asking with 40 from a 64-bit process is nonetheless the wrong half of that pair, and would
+/// truncate `ifm_ulist` the moment anyone sets `ifm_count` to fetch the media list.
 const SIOCGIFMEDIA: u64 = iowr(56, size_of::<ifmediareq>());
 const SIOCGIFFUNCTIONALTYPE: u64 = iowr(173, size_of::<ifreq>());
 
+/// `packed(4)` mirrors the `#pragma pack(4)` around the header's definition; it is what makes the
+/// struct 44 bytes rather than 48, and therefore what makes [`SIOCGIFMEDIA`] come out right.
 #[repr(C, packed(4))]
 struct ifmediareq {
     ifm_name: [libc::c_char; libc::IFNAMSIZ],
@@ -82,13 +98,20 @@ impl IoctlSocket {
         (fd >= 0).then_some(Self(fd))
     }
 
-    fn media_status(&self, name: &str) -> Option<i32> {
+    /// The module's only `SIOCGIFMEDIA` call. `ifm_count` stays zero, so the kernel has no media
+    /// list to copy out and never dereferences `ifm_ulist`. `None` covers the interfaces that have
+    /// no medium at all — loopback and the `utun`s answer `ENOTSUP` here.
+    fn media(&self, name: &str) -> Option<ifmediareq> {
         unsafe {
             let mut req: ifmediareq = std::mem::zeroed();
             name_into(&mut req.ifm_name, name);
             let ret = libc::ioctl(self.0, SIOCGIFMEDIA as _, &mut req as *mut _);
-            (ret >= 0).then_some(req.ifm_status)
+            (ret >= 0).then_some(req)
         }
+    }
+
+    fn media_status(&self, name: &str) -> Option<i32> {
+        self.media(name).map(|req| req.ifm_status)
     }
 
     fn functional_type(&self, name: &str) -> Option<i32> {
@@ -514,35 +537,10 @@ fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
     }
 }
 
-/// `SIOCGIFMEDIA` — the ioctl `ifconfig` itself uses to print `media: autoselect`. Present since
-/// well before the 10.15 floor; the constant is not in `libc`, so it is spelled out here.
-///
-/// Deliberately a second constant rather than a reuse of the `SIOCGIFMEDIA` computed at the top
-/// of this file, and deliberately not reconciled with it during the merge that first put the two
-/// in one module. They do not agree: `_IOWR` encodes the request size, this literal encodes 40,
-/// and `iowr(56, size_of::<ifmediareq>())` encodes 44 because that struct is `packed(4)` while
-/// the header's is not. A 64-bit userland process should be asking with 48 (`0xc0306938`), which
-/// is neither. Each call site keeps the number it was written and tested against until somebody
-/// can check on hardware which of the three the kernel actually answers; collapsing them here
-/// would silently change one caller's behaviour on the strength of an argument nobody has run.
-/// See `findings/major-net-mac-two-disagreeing-siocgifmedia-constants.md`.
-const SIOCGIFMEDIA_LITERAL: libc::c_ulong = 0xc0286938;
-
 /// `IFM_ETHER` / `IFM_IEEE80211` occupy the type field, `IFM_NMASK`, of `ifm_current`.
 const IFM_NMASK: u32 = 0xf0;
 const IFM_ETHER: u32 = 0x00000020;
 const IFM_IEEE80211: u32 = 0x00000080;
-
-#[repr(C)]
-struct IfMediaReq {
-    ifm_name: [libc::c_char; libc::IFNAMSIZ],
-    ifm_current: libc::c_int,
-    ifm_mask: libc::c_int,
-    ifm_status: libc::c_int,
-    ifm_active: libc::c_int,
-    ifm_count: libc::c_int,
-    ifm_ulist: *mut libc::c_int,
-}
 
 /// Which physical medium a local IP is reached over.
 ///
@@ -592,20 +590,11 @@ pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::L
     }
     let name = name?;
 
-    let sock = unsafe { libc::socket(AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return None;
-    }
-    let mut req: IfMediaReq = unsafe { std::mem::zeroed() };
-    for (i, b) in name.as_bytes().iter().take(libc::IFNAMSIZ - 1).enumerate() {
-        req.ifm_name[i] = *b as libc::c_char;
-    }
-    let rc = unsafe { libc::ioctl(sock, SIOCGIFMEDIA_LITERAL, &mut req as *mut IfMediaReq) };
-    unsafe { libc::close(sock) };
-    if rc != 0 {
-        // A virtual or tunnel interface has no media type at all, which is not a failure.
+    let sock = IoctlSocket::open()?;
+    // A virtual or tunnel interface has no media type at all, which is not a failure.
+    let Some(req) = sock.media(&name) else {
         return Some(LinkMedium::Other);
-    }
+    };
     Some(match (req.ifm_current as u32) & IFM_NMASK {
         IFM_ETHER => LinkMedium::Wired,
         IFM_IEEE80211 => LinkMedium::Wireless,
@@ -724,5 +713,95 @@ mod tests {
         };
         println!("associated channel: {channel:?}");
         report_radio_conditions();
+    }
+
+    /// `_IOWR` folds `sizeof` into the request number, so this struct's layout *is* the ioctl's
+    /// identity and a drifting `repr` would quietly address a different call. `<net/if.h>` puts
+    /// `struct ifmediareq` inside `#pragma pack(4)`: 16 bytes of name, five 4-byte ints, then an
+    /// 8-byte `ifm_ulist` at offset 36 with no padding before it and none after.
+    #[test]
+    fn an_ifmediareq_matches_the_kernels_64_bit_layout() {
+        assert_eq!(size_of::<ifmediareq>(), 44, "sizeof(struct ifmediareq)");
+        assert_eq!(
+            std::mem::offset_of!(ifmediareq, ifm_ulist),
+            36,
+            "offsetof(struct ifmediareq, ifm_ulist)"
+        );
+        assert_eq!(
+            SIOCGIFMEDIA, 0xc02c_6938,
+            "_IOWR('i', 56, struct ifmediareq) per <sys/sockio.h>"
+        );
+    }
+
+    fn interface_names() -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        unsafe {
+            let mut ifap: *mut ifaddrs = std::ptr::null_mut();
+            if getifaddrs(&mut ifap) != 0 {
+                return names;
+            }
+            let mut cur = ifap;
+            while !cur.is_null() {
+                let entry = &*cur;
+                let name = CStr::from_ptr(entry.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+                cur = entry.ifa_next;
+            }
+            freeifaddrs(ifap);
+        }
+        names
+    }
+
+    /// Asks every interface the three request numbers `_IOWR('i', 56, …)` can produce, so the
+    /// choice of [`SIOCGIFMEDIA`] stays an observation rather than an argument: 40 is XNU's 32-bit
+    /// compat form, 44 is the header's, and 48 is what an unpacked 8-aligned `ifm_ulist` would
+    /// give. Needs a real kernel and real interfaces, hence ignored by default.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::networking::tests::probe_siocgifmedia_request_numbers -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn probe_siocgifmedia_request_numbers() {
+        let Some(sock) = IoctlSocket::open() else {
+            println!("no AF_INET socket available; nothing to probe");
+            return;
+        };
+        for name in interface_names() {
+            println!("== {name} ==");
+            for number in [0xc028_6938u64, 0xc02c_6938, 0xc030_6938] {
+                let mut req: ifmediareq = unsafe { std::mem::zeroed() };
+                name_into(&mut req.ifm_name, &name);
+                let rc = unsafe { libc::ioctl(sock.0, number as _, &mut req as *mut _) };
+                let size = (number >> 16) & 0x1fff;
+                if rc >= 0 {
+                    let (current, active, status) =
+                        (req.ifm_current, req.ifm_active, req.ifm_status);
+                    println!(
+                        "  {number:#x} (size {size}) -> 0, current {current:#x} \
+                         active {active:#x} status {status:#x}"
+                    );
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    println!("  {number:#x} (size {size}) -> -1, {err}");
+                }
+            }
+        }
+
+        // And the same constant through the two call sites that use it, so the numbers above are
+        // tied to what the app actually reports rather than to a bare ioctl.
+        for adapter in enumerate_adapters(None) {
+            for ip in &adapter.ip_addresses {
+                println!(
+                    "{ip} on {:?} -> {:?}",
+                    adapter.network_name,
+                    link_medium_for_local_ip(ip)
+                );
+            }
+        }
     }
 }

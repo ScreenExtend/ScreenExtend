@@ -6,11 +6,36 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVPixelBuffer;
 use objc2_io_surface::IOSurfaceRef;
 
+/// A capture surface held past the delivery callback, with its **use count** held too.
+///
+/// `CGDisplayStream.h` is explicit about the contract: *"If you intend to hold on to the
+/// IOSurface beyond the lifetime of the handler call, you must `CFRetain()` the IOSurface until
+/// you are done with it and you must call `IOSurfaceIncrementUseCount()` to let the
+/// CGDisplayStream know that the frame is not ready for re-use."* The two counters are
+/// independent — Apple says so, and `CVPixelBufferCreateWithIOSurface` documents only that it
+/// *retains* the surface. A retain alone keeps the object alive while WindowServer happily
+/// composites new pixels into the buffer VideoToolbox is reading, which is tearing and stale
+/// bands rather than a clean stall.
+pub struct HeldSurface(CFRetained<IOSurfaceRef>);
+
+impl HeldSurface {
+    pub fn hold(surface: CFRetained<IOSurfaceRef>) -> Self {
+        surface.increment_use_count();
+        Self(surface)
+    }
+}
+
+impl Drop for HeldSurface {
+    fn drop(&mut self) {
+        self.0.decrement_use_count();
+    }
+}
+
 pub enum Backing {
     Empty,
     PixelBuffer {
         pixbuf: CFRetained<CVPixelBuffer>,
-        _surface: CFRetained<IOSurfaceRef>,
+        _surface: HeldSurface,
     },
 }
 
@@ -20,9 +45,21 @@ pub struct Frame {
     pub arrived_mach: u64,
     pub captured_at: std::time::Instant,
     /// The OS's own frame time on the shared host clock — CGDisplayStream's `displayTime`,
-    /// ScreenCaptureKit's PTS. 0 when the backend supplied none. It is the only stamp that says
-    /// when the pixels existed rather than when our callback saw them.
+    /// ScreenCaptureKit's PTS — when that time is in the past, and the callback's own arrival
+    /// otherwise. Never 0 for a delivered frame.
+    ///
+    /// The clamp is not defensive coding. Measured on 10.15.8 at 60 Hz, CGDisplayStream's
+    /// `displayTime` is ahead of the delivery callback on *every* frame, by −15.5 ms at p50 and
+    /// −11.4 ms at its closest: it is the presentation time WindowServer scheduled the frame for,
+    /// not the moment it was composited. Header wording agrees — "when the frame was to be
+    /// displayed". Used raw it makes `capture_to_encode` a frame period shorter than the truth,
+    /// and on a fast host it can go negative.
     pub os_time_ns: u64,
+    /// The OS stamp exactly as the backend reported it, unclamped, and 0 when it reported none.
+    /// Telemetry must not use this; it exists so `capture_rate` can report the
+    /// `displayTime -> callback` distribution, which is how the clamp above was found and is the
+    /// one number that says whether a given Mac's stamp means what its header says.
+    pub os_time_raw_ns: u64,
     pub backing: Backing,
 }
 
@@ -89,6 +126,16 @@ impl FrameSource {
         self.wake_rx.recv_timeout(timeout).is_ok()
     }
 
+    /// Consume a pending wake token.
+    ///
+    /// The channel is a `bounded(1)` counter, and a frame can be taken by `try_take_latest`
+    /// without its token ever being received — after a timed-out `wait`, say. The token then
+    /// makes the *next* `wait` return immediately with nothing to take, which spins the loop and,
+    /// when an IDR is pending, spends the wake on a duplicate encode of the previous frame.
+    pub fn drain_wake(&self) {
+        let _ = self.wake_rx.try_recv();
+    }
+
     pub fn wake_sender(&self) -> Sender<()> {
         self.sink.wake_tx.clone()
     }
@@ -105,6 +152,7 @@ mod tests {
             arrived_mach: tag,
             captured_at: std::time::Instant::now(),
             os_time_ns: 0,
+            os_time_raw_ns: 0,
             backing: Backing::Empty,
         }
     }
