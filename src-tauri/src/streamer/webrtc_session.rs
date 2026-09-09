@@ -675,6 +675,15 @@ impl SessionHandle {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The tracks, the sender and the answer that come out of a successful negotiation.
+type NegotiatedMedia = (
+    Arc<TrackLocalStaticRTP>,
+    Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
+    Option<Arc<TrackLocalStaticSample>>,
+    Option<Arc<RTCDataChannel>>,
+    String,
+);
+
 /// A negotiated WHEP session whose pipeline does not exist yet.
 ///
 /// Everything up to and including the answer depends only on the offer, the codec choice and the
@@ -789,83 +798,109 @@ pub async fn prepare_whep(
     // offer, because an extension the peer did not offer cannot be negotiated into the answer.
     let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01");
 
-    let track = Arc::new(TrackLocalStaticRTP::new(
-        RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            clock_rate: 90000,
-            channels: 0,
-            sdp_fmtp_line: h264_fmtp(profile_plid(profile)),
-            rtcp_feedback: vec![],
-        },
-        "video".to_owned(),
-        "webrtc-streamer".to_owned(),
-    ));
+    // Everything from here to the answer can fail — `set_remote_description` on a malformed
+    // offer most realistically — and each failure used to return with the peer connection, its
+    // ICE agent, that agent's sockets and the mux read worker still alive, and `LIVE_SESSIONS`
+    // still counting them. A client retrying a bad SDP leaked one of each per attempt.
+    let prepared: Result<NegotiatedMedia> = async {
+        let track = Arc::new(TrackLocalStaticRTP::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: h264_fmtp(profile_plid(profile)),
+                rtcp_feedback: vec![],
+            },
+            "video".to_owned(),
+            "webrtc-streamer".to_owned(),
+        ));
 
-    let rtp_sender = pc
-        .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
-        .await
-        .context("add_track")?;
+        let rtp_sender = pc
+            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .context("add_track")?;
 
-    let (audio_track, audio_dc) = match audio {
-        Some(a) => add_audio_tracks(&pc, a.fast, a.fallback_track).await?,
-        None => (None, None),
-    };
+        let (audio_track, audio_dc) = match audio {
+            Some(a) => add_audio_tracks(&pc, a.fast, a.fallback_track).await?,
+            None => (None, None),
+        };
 
-    tprintln!(
-        "ICE candidates in remote offer (browser): {}",
-        summarize_sdp_candidates(&offer_sdp)
-    );
-    let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer SDP")?;
-    pc.set_remote_description(offer)
-        .await
-        .context("set_remote_description(offer)")?;
-
-    // No IDR here. The track has no binding until the connection comes up, and a write to an
-    // unbound track is silently discarded — see the `Connected` arm above.
-
-    let answer = pc.create_answer(None).await.context("create_answer")?;
-
-    let mut gather_complete = pc.gathering_complete_promise().await;
-    pc.set_local_description(answer)
-        .await
-        .context("set_local_description(answer)")?;
-    // A same-subnet peer needs nothing but host candidates, and host gathering finishes in
-    // single-digit milliseconds. Waiting the WAN-shaped 1.5 s for a reflexive candidate nobody
-    // will use is pure time-to-first-frame, paid on every LAN join.
-    let gather_max_wait = match locality {
-        SessionLocality::SameNetwork => Duration::from_millis(GATHER_MAX_WAIT_LAN_MS),
-        _ => Duration::from_millis(GATHER_MAX_WAIT_MS),
-    };
-    match tokio::time::timeout(gather_max_wait, gather_complete.recv()).await {
-        Ok(_) => {}
-        Err(_) => tprintln!(
-            "ICE gathering still in progress after {gather_max_wait:?}; returning answer with candidates gathered so far"
-        ),
-    }
-
-    let local = pc
-        .local_description()
-        .await
-        .ok_or_else(|| anyhow!("no local description after gathering"))?;
-
-    tprintln!(
-        "ICE candidates in local answer (host): {}",
-        summarize_sdp_candidates(&local.sdp)
-    );
-
-    // webrtc-rs answers with the offer's own codec parameters, so without this the answer keeps
-    // whatever level the browser named — Chrome always says 3.1, i.e. 1280x720@30 — no matter what
-    // resolution the session actually negotiated.
-    let answer_sdp = if video.may_raise_level {
         tprintln!(
-            "answering H.264 {profile:?} at level 0x{:02x} (client allowed level asymmetry)",
-            video.level_idc
+            "ICE candidates in remote offer (browser): {}",
+            summarize_sdp_candidates(&offer_sdp)
         );
-        negotiate::apply_level_to_answer(&local.sdp, video.level_idc)
-    } else {
-        local.sdp
+        let offer = RTCSessionDescription::offer(offer_sdp).context("parse offer SDP")?;
+        pc.set_remote_description(offer)
+            .await
+            .context("set_remote_description(offer)")?;
+
+        // No IDR here. The track has no binding until the connection comes up, and a write to an
+        // unbound track is silently discarded — see the `Connected` arm above.
+
+        let answer = pc.create_answer(None).await.context("create_answer")?;
+
+        let mut gather_complete = pc.gathering_complete_promise().await;
+        pc.set_local_description(answer)
+            .await
+            .context("set_local_description(answer)")?;
+        // A same-subnet peer needs nothing but host candidates, and host gathering finishes in
+        // single-digit milliseconds. Waiting the WAN-shaped 1.5 s for a reflexive candidate nobody
+        // will use is pure time-to-first-frame, paid on every LAN join.
+        let gather_max_wait = match locality {
+            SessionLocality::SameNetwork => Duration::from_millis(GATHER_MAX_WAIT_LAN_MS),
+            _ => Duration::from_millis(GATHER_MAX_WAIT_MS),
+        };
+        match tokio::time::timeout(gather_max_wait, gather_complete.recv()).await {
+            Ok(_) => {}
+            Err(_) => tprintln!(
+                "ICE gathering still in progress after {gather_max_wait:?}; returning answer with candidates gathered so far"
+            ),
+        }
+
+        let local = pc
+            .local_description()
+            .await
+            .ok_or_else(|| anyhow!("no local description after gathering"))?;
+
+        tprintln!(
+            "ICE candidates in local answer (host): {}",
+            summarize_sdp_candidates(&local.sdp)
+        );
+
+        // webrtc-rs answers with the offer's own codec parameters, so without this the answer keeps
+        // whatever level the browser named — Chrome always says 3.1, i.e. 1280x720@30 — no matter what
+        // resolution the session actually negotiated.
+        let answer_sdp = if video.may_raise_level {
+            tprintln!(
+                "answering H.264 {profile:?} at level 0x{:02x} (client allowed level asymmetry)",
+                video.level_idc
+            );
+            negotiate::apply_level_to_answer(&local.sdp, video.level_idc)
+        } else {
+            local.sdp
+        };
+
+        Ok((track, rtp_sender, audio_track, audio_dc, answer_sdp))
+    }
+    .await;
+
+    let (track, rtp_sender, audio_track, audio_dc, answer_sdp) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(ce) = pc.close().await {
+                teprintln!("closing peer connection after a failed negotiation: {ce}");
+            }
+            if let Some(ms) = media_socket {
+                use webrtc::ice::udp_mux::UDPMux;
+                let _ = ms.mux.close().await;
+            }
+            LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            return Err(e);
+        }
     };
 
+    // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
+    // not been given, and a failed negotiation must not leave an entry behind.
     let resource_id = mint_resource_id();
     register_trickle(&resource_id, &pc);
 
