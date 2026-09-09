@@ -214,7 +214,7 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 225 | airplay (macOS) | Type-`0x05` stream reports are parsed (`binary_plist_len` locates the plist inside the payload) and their numeric fields logged; the header capture stamp is read as a sender-epoch NTP fixed point and reported as spread rather than as an absolute latency (`macos_utils/airplay/mirror.rs`) | Both are plaintext, both already arrive, and both were counted and dropped. The stream report is macOS's own view of the link; the stamp is the only handle anything in this tree has on WindowServer's compose-to-consumer path. | 5 of 128 header bytes read; the whole 25 KiB report discarded | `encoderCurrentFPS`, `rttAvg`, `lossAvg`, `queuedFramesAvg`, `txCapacityAvg`, `txUsageAvg`, `sentFramesAvg` logged; compose-to-consumer spread p50 **26.96 ms** / p90 **43.90 ms** / p99 **67.43 ms** over 66 frames | VERIFIED (10.15.8) | yes | The report did not parse before because it is a ~181-byte plist followed by a 25,000-byte trailer; a binary plist's 32-byte trailer is self-describing, so the one end position whose trailer is internally consistent is the real one. See the close-out section for what the stamp turned out to be and why only the spread is reported. |
 | 226 | net (macOS) | The watcher reports the associated Wi-Fi channel and whether `awdl0` is up, once, at start; a channel in {6, 44, 149} is called out by name (`macos_utils/networking.rs`) | AWDL's three social channels are where every nearby Apple device parks its radio for AirDrop and Handoff discovery, and a single-radio Mac retunes to them periodically — a published jitter source that the *user* can act on and that will otherwise be blamed on the stream. | the channel and `awdl0`'s state were never recorded, so no field report could distinguish this cause | one line at startup; on this box, "Wi-Fi channel 36, awdl0 up" | VERIFIED (10.15.8: channel 36, `awdl0` up, so the non-social branch fires) | yes | Reported, not acted on: the host AP's own channel choice already avoids all three (row from W6's earlier work), and whether *sitting* on a social channel is better or worse for jitter is the open A/B in `docs/manual-tests/macos-hosted-network.md` §4. |
 | 227 | hosted network (macOS) | `wait_for_ipv4` takes the address the interface held *before* the start and refuses it; `measure_hostap_start` is a bounded harness that runs the shipping ladder and stops at the first success, with `SCREENEXTEND_HOSTAP_HOLD_SECS` to hold the AP up for a scan (`macos_utils/hosted_network.rs`) | The verification added in row 224 reads `getifaddrs` on the AP interface. If macOS has not yet torn down the station address, that read answers with the address of the network the Mac just left, and the AP is reported as working on the wrong network. | **VERIFIED (10.15.8, twice)**: at t+2.2 s with `interfaceMode()` already reading HostAP, `interface_ipv4("en3")` returned `172.16.11.81` — the pre-start LAN address | at t+5 s through t+45 s it returns `None`, which is the true answer: the AP holds no address of its own, so nothing is serving DHCP | VERIFIED (10.15.8) | yes | The same run established that `securityType 128` is accepted and reaches AP mode in **2.21 s** on channel 36, while 1024, 512 and 256 are each refused after ~2.1 s — the first new HostAP security constant this project has found, and one the 2012 `[-127, 127]` sweep could not have seen. It also established that the resulting network is unjoinable: see the HostAP section below. |
-| 228 | build (macOS) | `src-tauri/.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET = "10.15"` (W13a) | rustc defaults x86_64-apple-darwin to 10.12, so the shipped binary`s load command contradicted `minimumSystemVersion: "10.15"` in `tauri.macos.conf.json` and clang`s availability machinery was calibrated three releases too low. | `LC_VERSION_MIN_MACOSX version 10.12, sdk 11.1` (release binary at `80e28c7a`, and again at Phase A `46ba59e7`) | `LC_BUILD_VERSION platform 1, minos 10.15, sdk 11.1` -- the load command changes form as well as value. `check-macos-dyld.sh` still passes with **0 offenders**; `undefined 551 / ok 551`, and **weak imports fell 1 -> 0**, so raising the floor bound one previously-weak import strongly rather than adding any. | VERIFIED (10.15.8 Intel, `cargo build --release` from `src-tauri/`, 66m20s) | yes | Measured on the Phase A-3 converged tree. Verified beforehand that `MACOSX_DEPLOYMENT_TARGET` was unset in the environment, since cargo`s `[env]` does not override an already-set variable without `force = true`. arm64 cannot be checked here (the 10.15 SDK cannot target it); rustc is expected to clamp it up to 11.0 on its own. |
+| 228 | build (macOS) | `src-tauri/.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET = "10.15"` (W13a) | rustc defaults x86_64-apple-darwin to 10.12, so the shipped binary's load command contradicted `minimumSystemVersion: "10.15"` in `tauri.macos.conf.json` and clang's availability machinery was calibrated three releases too low. | `LC_VERSION_MIN_MACOSX version 10.12, sdk 11.1` (release binary at `80e28c7a`, and again at Phase A `46ba59e7`) | `LC_BUILD_VERSION platform 1, minos 10.15, sdk 11.1` -- the load command changes form as well as value. `check-macos-dyld.sh` still passes with **0 offenders**; `undefined 551 / ok 551`, and **weak imports fell 1 -> 0**, so raising the floor bound one previously-weak import strongly rather than adding any. | VERIFIED (10.15.8 Intel, `cargo build --release` from `src-tauri/`, 66m20s) | yes | Measured on the Phase A-3 converged tree. Verified beforehand that `MACOSX_DEPLOYMENT_TARGET` was unset in the environment, since cargo's `[env]` does not override an already-set variable without `force = true`. arm64 cannot be checked here (the 10.15 SDK cannot target it); rustc is expected to clamp it up to 11.0 on its own. |
 | 229 | bwe / encode | `SendHistory` keeps a per-frame tally beside its per-packet ring, `interpret` votes every reported symbol against the access unit its packet belonged to, and a frame every one of whose packets arrived is published as `SharedFeedback::acked_frame_capture_ns()`. | The macOS VideoToolbox and NVENC long-term-reference paths both need the same input and neither has it: which frames has the client received *in full*? The finding assumed the signal would have to be synthesised over the control DataChannel because "RTCP does not acknowledge frames". Transport-wide feedback does — it names every sequence number that did and did not arrive, and since the writer stamps those sequence numbers itself it already knows which packet belonged to which frame. | no frame-level acknowledgement of any kind; loss recovery is a forced IDR, the largest frame the encoder emits, sent on a link that has just demonstrated it could not carry the last burst | the newest intact frame, by its host-clock capture instant, at the browser's TWCC cadence — no client change, no new opcode, no round trip beyond the one TWCC already pays | VERIFIED (3 unit tests: a frame missing one packet is never acknowledged, only the newest intact frame is reported and decided tallies do not pile up, and the published value never walks backwards on a reordered report) | yes | The identity is the capture instant because the encoder already stamped it on the frame, so nothing new has to be carried to match an acknowledgement back to a reference. **Nothing consumes it yet, deliberately**: setting `EnableLTR` and feeding `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` is W5's, NVENC reference invalidation is W3's. A frame with even one lost packet is never acknowledged — the encoder may keep referencing that picture and a decoder missing a slice of it cannot. Resolves the transport half of `major-vt-ltr-frames-would-replace-idr-on-every-pli`. |
 | 230 | config | `Config` carries `gpu_encode_toggle: Option<Arc<AtomicBool>>` and `software_encode_now()` beside the `bool` snapshot; the Windows pipeline reads it at encoder-selection time. | `disable_gpu_encode` was read out of the shared atomic once, at streamer-construction time, and stored as a plain `bool` — the one field in that struct literal that was not a cloned `Arc`. The toggle did take effect, but only by draining every streamer and rebuilding the whole server, which every connected device sees. | flipping "GPU video encoding" restarts the server | the handle is live where a host exists; the probe harness still falls back to the snapshot `--software-encode` sets | VERIFIED (2 unit tests: the harness falls back to its snapshot, and a live handle beats a stale snapshot in both directions) | yes | Additive on purpose, so the macOS pipeline compiles unchanged and W5 can switch it over without a cross-OS flag day. Resolves the `streamer/config.rs` half of `minor-session-gpu-toggle-snapshotted`; reading it at encoder-selection time on macOS is the remaining half. |
 | 231 | session / reconfig | A scale-only device override applies to the live display through `server::apply_scale_live` instead of bumping the reconfig epoch. | The client answers an epoch bump by tearing the whole session down — peer connection, encoder, capture session, injector thread — and paying the full join cost, measured at display 706-1299 ms plus pipeline 713-1018 ms. For orientation, refresh rate, video scale, video quality and DPR that is unavoidable today because each is an encoder-session parameter fixed at init. The display scale is not one of them: it changes the extended desktop's DPI, not the captured geometry. | dragging the scale slider costs a full rejoin, ~1.6 s of black | the host applies it and the client is never told | COMPILE-CHECKED | yes | `apply_scale_live` also writes the landed scale back into the session's `LiveDisplay`, so a later reconfig compares against what is on screen rather than a stale record. Resolves item 4 of `major-session-join-is-a-fully-serial-multi-second-chain`. |
@@ -274,38 +274,38 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
-### The macOS audio driver  does reach the shipped app (closed)
+### The macOS audio driver `.pkg` does reach the shipped app (closed)
 
- was re-filed against
- at , which contains  only as far as .
+`major-build-macos-audio-driver-pkg-not-in-bundle-resources.md` was re-filed against
+`w7-macos-audio` at `de5b099f2`, which contains `latency-overhaul` only as far as `caca8b76`.
 w13b-code landed after that point and is what closed it. Verified end to end on the merged
-tree rather than by reading one side:
+tree rather than by reading one side of it:
 
--  stages the notarized package at .
--  maps it with :
-  .
-- Both runtime call sites ( and ) resolve
-   against , which is
-   on macOS -- exactly the destination above.
--  asserts the file exists at
-   after the build, so a regression
+- `scripts/release.sh` stages the notarized package at `src-tauri/resources/ScreenExtendAudio.pkg`.
+- `tauri.macos.conf.json` maps it with `bundle.macOS.files`:
+  `"Resources/resources/ScreenExtendAudio.pkg": "resources/ScreenExtendAudio.pkg"`.
+- Both runtime call sites (`macos_utils/mod.rs` and `cli.rs`) resolve
+  `"resources/ScreenExtendAudio.pkg"` against `BaseDirectory::Resource`, which is
+  `Contents/Resources` on macOS — exactly the destination above.
+- `build-release.yml` asserts the file exists at
+  `$app/Contents/Resources/resources/ScreenExtendAudio.pkg` after the build, so a regression
   fails the release job rather than shipping an app whose driver install cannot start.
 
-One inaccuracy fixed while checking:  told the operator the path had to be listed
-in , which is not the key w13b used.
+One inaccuracy fixed while checking: `release.sh` told the operator the path had to be listed
+in `bundle.resources`, which is not the key w13b used.
 
-### Decision: mac-closeout`s AirPlay NTP instrumentation supersedes the core-closeout mirror`s
+### Decision: mac-closeout's AirPlay NTP instrumentation supersedes the core-closeout mirror's
 
-Two branches instrumented the AirPlay mirror stream`s plaintext timestamps independently, and
+Two branches instrumented the AirPlay mirror stream's plaintext timestamps independently, and
 both were written before either could see the other. The Mac mirror worktree `_wt/core-closeout`
 carried `ntp_now` / `ntp_delta_ns` / `plausible` (660 lines of `airplay/mirror.rs`);
 `mac-closeout` carried `ntp_fixed_to_ns` / `plausible_sender_seconds` (871 lines) and is the one
 that reached `latency-overhaul`.
 
-The orchestrator`s decision is that mac-closeout`s version stands. It is the larger and the
+The orchestrator's decision is that mac-closeout's version stands. It is the larger and the
 more careful of the two: `plausible_sender_seconds` validates the sender clock as an uptime
-against a 400-day ceiling, which is what actually decides the stamp`s byte order from a single
-sample, where the mirror`s `plausible` only bounded a latency window.
+against a 400-day ceiling, which is what actually decides the stamp's byte order from a single
+sample, where the mirror's `plausible` only bounded a latency window.
 
 The mirror branch was diffed against the survivor before being dropped, and one piece of
 coverage was genuinely missing rather than merely differently spelled: every surviving
