@@ -17,10 +17,15 @@ const chan = (label) => ({
   onmessage: null,
   onopen: null,
   onclose: null,
-  send(buf) { sent.push({ label, bytes: new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length) }); },
+  // Copied, not viewed: input.js reuses one ArrayBuffer per frame type, so two views over it
+  // would both read whatever the newer send wrote — which is exactly what a test comparing two
+  // frames of the same kind needs not to happen.
+  send(buf) { sent.push({ label, bytes: new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length).slice() }); },
   close() {},
 });
 const channels = {};
+const pumps = [];
+const pump = () => { const q = pumps.splice(0); for (const f of q) f(); };
 
 const listeners = [];
 const el = () => ({
@@ -38,7 +43,16 @@ const ctx = {
   setTimeout: () => 0,
   clearTimeout() {},
   TextEncoder,
-  MessageChannel: class { constructor() { this.port1 = { postMessage() {} }; this.port2 = {}; } },
+  // input.js flushes its move queues over a MessageChannel task rather than a timer. The stub
+  // records the post instead of dropping it, so a test can deliver it deliberately: without
+  // that the coalescing gates latch shut after the first move and nothing else ever sends.
+  MessageChannel: class {
+    constructor() {
+      const ch = this;
+      this.port2 = {};
+      this.port1 = { postMessage() { pumps.push(() => { if (ch.port2.onmessage) ch.port2.onmessage(); }); } };
+    }
+  },
   // input.js decides at load whether to read coalesced samples from the prototype, so the
   // stub has to exist before the module runs or the batch path is unreachable here.
   PointerEvent: class { getCoalescedEvents() { return []; } },
@@ -258,7 +272,7 @@ const keyEvent = {
 // under the stubs it is the latter, so drive whichever one is installed.
 const firePointerMove = (ev) => fire(listeners.some((l) => l[0] === 'pointerrawupdate') ? 'pointerrawupdate' : 'pointermove', ev);
 const lastOf = (op) => { for (let i = sent.length - 1; i >= 0; i--) if (sent[i].bytes[0] === op) return sent[i]; return null; };
-const OPI = { POINTER_DOWN: 0x01, WHEEL: 0x10, KEY: 0x20, MOUSE_DELTA: 0x54 };
+const OPI = { POINTER_DOWN: 0x01, POINTER_MOVE: 0x03, WHEEL: 0x10, KEY: 0x20, MOUSE_DELTA: 0x54 };
 
 sent.length = 0;
 fire('pointerdown', pointerEvent());
@@ -343,6 +357,106 @@ else {
   else if (stampAt(batch, tail) !== Math.round(6200 * 1e6)) fail('batch stamp is ' + stampAt(batch, tail));
   else if (batch.bytes[tail + 9] !== 0) fail('batch claims ' + batch.bytes[tail + 9] + ' predicted samples; this client sends none');
   else ok('POINTER_MOVE_BATCH appends stamp + flags + predicted count past the samples');
+}
+
+
+// ── The fast-channel sequence (docs/INPUT-PROTOCOL.md, "The optional fast-channel sequence") ──
+// It rides past the stamp, so it can only appear when the stamp does, and only on `fast`. The
+// host finds it by offset, which is why a client that sent it without the stamp — or on the
+// reliable channel, where the host never looks — would be writing bytes into the wrong place.
+const INPUT_SEQUENCE_BIT = 1 << 5;
+const seqAt = (s, off) => {
+  const d = new DataView(s.bytes.buffer, s.bytes.byteOffset, s.bytes.byteLength);
+  return d.getUint16(off, true);
+};
+
+// Still only INPUT_TIMESTAMP | INPUT_EVENT_FLAGS from the PONG above: no sequence yet.
+pump();
+sent.length = 0;
+now = 6300;
+ctx.document.pointerLockElement = {};
+firePointerMove(pointerEvent({ movementX: 1, movementY: 1 }));
+ctx.document.pointerLockElement = null;
+fire('wheel', wheelEvent);
+const preDelta = lastOf(OPI.MOUSE_DELTA), preWheel = lastOf(OPI.WHEEL);
+if (!preDelta || preDelta.bytes.length !== 17) fail('MOUSE_DELTA is ' + (preDelta && preDelta.bytes.length) + ' bytes without INPUT_SEQUENCE, expected 17');
+else ok('MOUSE_DELTA stays 17 bytes until the host asks for a sequence');
+if (!preWheel || preWheel.bytes.length !== 23) fail('WHEEL is ' + (preWheel && preWheel.bytes.length) + ' bytes without INPUT_SEQUENCE, expected 23');
+else ok('WHEEL stays 23 bytes until the host asks for a sequence');
+
+now = 6400;
+const pongSeq = new ArrayBuffer(19);
+const ps = new DataView(pongSeq);
+ps.setUint8(0, OP.PONG);
+ps.setBigUint64(1, BigInt(Math.round(6395 * 1e6)), true);
+ps.setBigUint64(9, BigInt(Math.round(9400 * 1e6)), true);
+ps.setUint16(17, KEYFRAME_REQUEST_BIT | INPUT_TIMESTAMP_BIT | INPUT_EVENT_FLAGS_BIT | INPUT_SEQUENCE_BIT, true);
+channels.reliable.onmessage({ data: pongSeq });
+if (!ctx.RemoteInput.hostCapability('INPUT_SEQUENCE')) fail('bit 5 did not decode as INPUT_SEQUENCE');
+else ok('bit 5 decodes as INPUT_SEQUENCE');
+
+// One counter, shared by every fast frame and advancing by exactly one per frame. The wheel is
+// the frame with no coalescing gate in front of it, so three in a row is a clean read.
+pump();
+sent.length = 0;
+now = 6500;
+fire('wheel', wheelEvent);
+fire('wheel', wheelEvent);
+fire('wheel', wheelEvent);
+const wheels = sent.filter((s) => s.bytes[0] === OPI.WHEEL);
+if (wheels.length !== 3) fail('expected three WHEEL frames, got ' + wheels.length);
+else if (wheels[0].bytes.length !== 25) fail('sequenced WHEEL is ' + wheels[0].bytes.length + ' bytes, expected 25');
+else {
+  ok('a sequenced WHEEL is 25 bytes with the sequence at offset 23');
+  const s0 = seqAt(wheels[0], 23), s1 = seqAt(wheels[1], 23), s2 = seqAt(wheels[2], 23);
+  if (!(s1 === ((s0 + 1) & 0xffff) && s2 === ((s1 + 1) & 0xffff))) {
+    fail('the counter went ' + s0 + ', ' + s1 + ', ' + s2 + ' — it must advance once per fast frame');
+  } else ok('the counter advances by one per fast frame');
+}
+
+pump();
+sent.length = 0;
+ctx.document.pointerLockElement = {};
+firePointerMove(pointerEvent({ movementX: 4, movementY: 4 }));
+ctx.document.pointerLockElement = null;
+const md3 = lastOf(OPI.MOUSE_DELTA);
+if (!md3 || md3.bytes.length !== 19) fail('sequenced MOUSE_DELTA is ' + (md3 && md3.bytes.length) + ' bytes, expected 19');
+else if (md3.bytes[8] !== 0) fail('the flags byte moved when the sequence was appended');
+else ok('a sequenced MOUSE_DELTA is 19 bytes with the sequence at offset 17');
+
+pump();
+sent.length = 0;
+firePointerMove(pointerEvent({ clientX: 100, clientY: 100 }));
+const m1 = lastOf(OPI.POINTER_MOVE);
+if (!m1 || m1.bytes.length !== 50) fail('sequenced POINTER_MOVE is ' + (m1 && m1.bytes.length) + ' bytes, expected 50');
+else if (m1.label !== 'fast') fail('POINTER_MOVE went out on ' + m1.label);
+else ok('a sequenced POINTER_MOVE is 50 bytes on the fast channel with the sequence at offset 48');
+
+// A reliable frame carries no sequence: POINTER_DOWN goes on `reliable`, where the host does
+// not look for one, and writing it there would put two bytes past the stamp for nothing.
+sent.length = 0;
+fire('pointerdown', pointerEvent());
+const down = lastOf(OPI.POINTER_DOWN);
+if (!down || down.bytes.length !== 48) fail('POINTER_DOWN is ' + (down && down.bytes.length) + ' bytes; a reliable frame carries no sequence');
+else if (down.label !== 'reliable') fail('POINTER_DOWN went out on ' + down.label);
+else ok('POINTER_DOWN stays 48 bytes: reliable frames carry no sequence');
+
+// The batch tail is stamp + reserved + predicted, and the sequence sits past all three.
+sent.length = 0;
+now = 6600;
+fire('pointerdown', touch(600, 300));
+firePointerMove(withCoalesced(touch(610, 310), [[605, 305], [610, 310]]));
+firePointerMove(withCoalesced(touch(620, 320), [[615, 315], [620, 320]]));
+fire('pointerup', touch(620, 320));
+const batch2 = lastOf(0x09);
+if (!batch2) fail('no POINTER_MOVE_BATCH was sent with INPUT_SEQUENCE set');
+else {
+  const bd = new DataView(batch2.bytes.buffer, batch2.bytes.byteOffset, batch2.bytes.byteLength);
+  const n = bd.getUint16(8, true);
+  const tail = 10 + n * 24;
+  if (batch2.bytes.length !== tail + 12) fail('sequenced batch is ' + batch2.bytes.length + ' bytes for ' + n + ' samples, expected ' + (tail + 12));
+  else if (batch2.bytes[tail + 9] !== 0) fail('the predicted count moved when the sequence was appended');
+  else ok('POINTER_MOVE_BATCH appends the sequence at 10 + n*24 + 10, past the whole stamp tail');
 }
 
 if (!process.exitCode) console.log('\nall client stats assertions passed');
