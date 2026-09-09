@@ -33,7 +33,7 @@ use crate::windows_utils::streamer::capture::{monitor_dimensions, monitor_rect, 
 use crate::windows_utils::streamer::dxgi::{Duplicator, PollStatus};
 use crate::windows_utils::streamer::nvidia::encoder::EncoderConfig;
 use crate::windows_utils::streamer::pipeline::build_backend;
-use crate::windows_utils::streamer::scaler::TextureReader;
+use crate::windows_utils::streamer::scaler::{ReadbackFormat, TextureReader};
 use crate::windows_utils::streamer::workload_window::WorkloadWindow;
 
 use super::{show_measurements, skip};
@@ -172,8 +172,10 @@ fn windows_capture_to_encoded_latency() {
 
         let encode_start = Instant::now();
         let encoded = match reader.as_mut() {
+            // `TextureReader` reads the captured texture's own format, which is BGRA — not
+            // whatever the backend would have asked a scaler for.
             Some(reader) => match reader.read_back(&tex) {
-                Ok((data, pitch)) => backend.encode_cpu(data, pitch, idr),
+                Ok((data, pitch)) => backend.encode_cpu(data, pitch, ReadbackFormat::Bgra8, idr),
                 Err(e) => Err(e),
             },
             None => backend.encode_gpu(&tex, None, idr),

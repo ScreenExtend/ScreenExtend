@@ -5,8 +5,10 @@ pub(crate) use crate::test_support::{show_measurements, skip};
 
 mod amd_layout;
 mod capture_latency;
+mod h264;
 mod intel_encoder;
 mod intel_layout;
+mod nvenc_encoder;
 mod nvenc_layout;
 mod pipeline;
 mod scaler;
