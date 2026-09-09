@@ -23,7 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 
-# Testing files
+# Local scratch and tool state
 testwaior - Copy/
 .claude/
 
@@ -47,7 +47,7 @@ src-tauri/tools/amf_layout_generated.txt
 src-tauri/tools/amf_layout_cpp_check.txt
 src-tauri/tools/nvenc_layout_generated.txt
 
-# Temporary agent files
+# Scratch files that are never part of a build
 .agents/
 skills-lock.json
 PLAN.md
