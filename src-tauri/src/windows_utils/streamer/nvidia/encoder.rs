@@ -1212,6 +1212,13 @@ impl Encoder {
         init.maxEncodeWidth = self.config.width;
         init.maxEncodeHeight = self.config.height;
         init.encodeConfig = &mut config;
+        // `splitEncodeMode` is deliberately left at `NV_ENC_SPLIT_AUTO_MODE` (the zero from
+        // `zeroed()`), which is the right value: split-frame encoding needs more than one NVENC
+        // engine, P1 enables it implicitly where one exists, and forcing a split on a
+        // single-engine part adds coordination rather than speed. What was missing was not the
+        // setting but the number — `EncoderCaps` now reads `NV_ENC_CAPS_NUM_ENCODER_ENGINES`
+        // and logs it (`engines=1` on this RTX 3080 Ti Laptop), so a report from a multi-engine
+        // part says so and this can be revisited against evidence rather than a guess.
 
         unsafe {
             let f = self
