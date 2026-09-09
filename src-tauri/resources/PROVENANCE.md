@@ -125,6 +125,57 @@ was, was to run `strings` on it. That is recorded here so the next person does n
   bundling x264.
 - **SHA-256:** `87bf8a8331691b32cf6c8e9b282c9c2a825ed0b83eba0f24e539f667c042684e`
 
+## Intel oneVPL dispatcher (`libvpl.dll`) — **deliberately not bundled**
+
+- **Upstream:** [intel/libvpl](https://github.com/intel/libvpl), MIT.
+- **Used for:** `windows_utils/streamer/intel/intel_sys.rs` loads it by name to reach the Quick
+  Sync encoder. Without a dispatcher there is no Quick Sync at all and the host falls to x264.
+- **Why nothing is shipped here.** Three reasons, in order of weight:
+  1. Intel's own guidance is that Xe (Gen12) and later driver packages install the dispatcher.
+     Measured on the Windows dev box (Intel UHD Graphics, DCH driver):
+     `C:\Windows\System32\libvpl.dll`, oneVPL Dispatcher **2.7.0** (ProductVersion 2022.2),
+     CompanyName Intel, Authenticode-valid under *Microsoft Windows Hardware Compatibility
+     Publisher*, SHA-256
+     `803a53d4a8062838a7fa85bc7385a036121162fb969d2f501803d1b01e863815`.
+  2. Pre-Gen12 hosts, the ones Intel says must ship their own dispatcher, run **Media SDK**
+     behind it — API 1.x. This encoder requires oneVPL **2.x** for internal surface allocation
+     (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`) and
+     `create_session` rejects a 1.x runtime at session creation. Shipping a dispatcher for those
+     hosts would buy a cleaner error message, not a working encoder.
+  3. There is no official prebuilt Windows binary to vendor: `intel/libvpl` releases are source
+     only (checked through v2.17.0 — no assets). The only `libvpl.dll` on a real machine is the
+     driver's, and copying a WHQL-signed driver component into our own signed installer is not a
+     provenance chain this file could honestly record.
+- **Consequences for the loader.** Because the driver's copy is the one matched to the runtime
+  the same package installed, `open_dispatcher` searches the **OS path first**, then the exe
+  directory, then `resources/`. An app-side copy must never shadow the driver's.
+- **If this is ever revisited:** build from an `intel/libvpl` release tag with MSVC, record the
+  tag, the commit, the compiler and the SHA-256 here and in `SHA256SUMS`, add
+  `"resources/libvpl.dll"` to `bundle.resources` in `tauri.conf.json`, and re-verify on a Gen12
+  host that the bundled copy does not displace the driver's.
+
+## NVENC header (`nvenc-headers/nvEncodeAPI.h`) — source only, **not bundled**
+
+- **Upstream:** [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers),
+  `include/ffnvcodec/nvEncodeAPI.h` at tag **`n12.1.14.1`** (commit
+  `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API **12.1**
+  (`NVENCAPI_MAJOR_VERSION 12`, `NVENCAPI_MINOR_VERSION 1`).
+- **License:** MIT, in the header's own copyright block — "permission is hereby granted, free of
+  charge... to deal in the Software without restriction, including... distribute". This is the
+  header FFmpeg itself builds NVENC support against; NVIDIA's own SDK copy carries a more
+  restrictive licence and is deliberately not the source used here.
+- **Used for:** `tools/nvenc_layout_gen.c` compiles against it and emits the assertions in
+  `windows_utils/streamer/test/nvenc_layout.rs`. Nothing links against it and nothing ships it —
+  `nvEncodeAPI64.dll` comes from the NVIDIA driver and is loaded by name at runtime.
+- **Why this version.** The bindings in `nvenc_sys/` were audited against it rather than assumed.
+  Every struct revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8,
+  INITIALIZE_PARAMS 6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
+  REGISTER_RESOURCE 4, EVENT_PARAMS 1); 13.0 raises every one of those by one. The members that
+  looked like SDK-13 additions — `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`,
+  `numStateBuffers`, `outputStatsLevel`, `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` —
+  are all present at 12.1, so there was no version skew to fix.
+- **SHA-256:** `dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425`
+
 ## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
 
 - **Upstream:** [GPUOpen-LibrariesAndSDKs/AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF),

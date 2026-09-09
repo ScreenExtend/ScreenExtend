@@ -33,3 +33,6 @@ a469ff33875484b5762199da757819056ff4a7535bfdcec1f4cf2ffc403b98f2 *amf-headers/co
 ae8c5fee671f02b90d3ccab312cfa6f74424351f070a7dd4ed7aba437fd55c30 *amf-headers/core/Trace.h
 5d15e778f3b846fa6eb95737e7222e0726b09615eb6270aac12bd2caa7137234 *amf-headers/core/Variant.h
 739f6559891d627fc373bfd63c4bcc3c8a432766703928d94cc1b92bc7bcfdf3 *amf-headers/core/Version.h
+
+# NVENC header (source only, not bundled) — see PROVENANCE.md
+dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425 *nvenc-headers/nvEncodeAPI.h
