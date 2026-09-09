@@ -69,10 +69,11 @@ pub fn live_encoder_config(
         min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
         gpu_registry_id: None,
-        // A snapshot, matching the field it reads. When `Config::software_encode_now()` lands
-        // this becomes that call and the toggle starts working on a live session instead of
-        // needing every streamer rebuilt.
-        software_encode: cfg.disable_gpu_encode,
+        // The live handle where a host exists, the snapshot where one does not — the probe
+        // harness has no `AppState`, and `--software-encode` is the source of truth there. Read
+        // here, at encoder-selection time, so the Settings toggle changes the *next* session's
+        // encoder without every streamer having to be drained and rebuilt.
+        software_encode: cfg.software_encode_now(),
     }
 }
 
@@ -97,6 +98,24 @@ mod tests {
         let mut cfg = Config::default();
         assert!(!live_encoder_config(1920, 1080, 60, &cfg).software_encode);
         cfg.disable_gpu_encode = true;
+        assert!(live_encoder_config(1920, 1080, 60, &cfg).software_encode);
+    }
+
+    #[test]
+    fn a_live_toggle_beats_the_snapshot_the_config_was_built_with() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // The defect this closes: the flag was copied by value when the streamer was built, so a
+        // user flipping the setting changed an atomic nothing downstream ever read again.
+        let flag = Arc::new(AtomicBool::new(false));
+        let cfg = Config {
+            disable_gpu_encode: true,
+            gpu_encode_toggle: Some(Arc::clone(&flag)),
+            ..Config::default()
+        };
+        assert!(!live_encoder_config(1920, 1080, 60, &cfg).software_encode);
+        flag.store(true, Ordering::Relaxed);
         assert!(live_encoder_config(1920, 1080, 60, &cfg).software_encode);
     }
 
