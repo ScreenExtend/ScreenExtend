@@ -1,0 +1,59 @@
+{
+  "readme": [
+    "Golden vectors for the client -> host input protocol. GENERATED, do not hand-edit.",
+    "",
+    "Produced by `node scripts/test-client-input.mjs --write` from the shipped input.js, and",
+    "parsed by `streamer::input::protocol`'s `client_golden_vectors_still_parse`. A change to",
+    "the bytes on either side fails against this file rather than silently diverging.",
+    "",
+    "`hex` is the whole DataChannel message. `channel` is which of the three it went out on.",
+    "docs/INPUT-PROTOCOL.md is the prose."
+  ],
+  "vectors": [
+    {
+      "name": "pointer_down_pen",
+      "channel": "reliable",
+      "hex": "0102070000000000003f0000003f0000003f0000a0c10000f0410000b4429a99193b610bb63b0100"
+    },
+    {
+      "name": "pointer_up_pen",
+      "channel": "reliable",
+      "hex": "0202070000000000003f0000003f00000000000000000000000000000000cdcc4c3a610bb63a0000"
+    },
+    {
+      "name": "pointer_cancel_touch",
+      "channel": "reliable",
+      "hex": "0401070000000000a03de4380e3e00000000000000000000000000000000cdcc4c3a610bb63a0000"
+    },
+    {
+      "name": "wheel_lines",
+      "channel": "fast",
+      "hex": "1000000048c10000f0420000000001"
+    },
+    {
+      "name": "key_down_shift_a",
+      "channel": "reliable",
+      "hex": "20010100044b6579410161"
+    },
+    {
+      "name": "key_up_a",
+      "channel": "reliable",
+      "hex": "20000000044b6579410161"
+    },
+    {
+      "name": "ping",
+      "channel": "reliable",
+      "hex": "6040c0d1df02000000"
+    },
+    {
+      "name": "focus_lost",
+      "channel": "reliable",
+      "hex": "5000"
+    },
+    {
+      "name": "mouse_delta_locked",
+      "channel": "fast",
+      "hex": "5400fbff0300020000"
+    }
+  ]
+}
