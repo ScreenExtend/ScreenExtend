@@ -12,8 +12,8 @@ use super::CaptureError;
 ///
 /// The type stays because it is threaded through `start_capture` and both backends, and because a
 /// Metal texture cache is what a source-rect crop or a host-side downscale would need if one is
-/// ever wanted. Whether WindowServer's own downscale costs anything is
-/// `findings/speculative-cgds-windowserver-does-the-downscale-with-no-source-rect.md`.
+/// ever wanted — neither backend passes a source rect today, so WindowServer does the downscale
+/// and what that costs has never been measured.
 pub struct Gpu {
     _private: (),
 }

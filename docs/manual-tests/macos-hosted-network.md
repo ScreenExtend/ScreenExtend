@@ -166,12 +166,10 @@ Deliberately break it: block the client, or stop `bootpd`, and confirm the app r
 to 11 rather than 6 — 6, 44 and 149 are AWDL's social channels, where every nearby
 Apple device parks its radio for AirDrop and Handoff discovery.
 
-That change is **not settled**, and
-[`findings/minor-net-hostap-avoid-awdl-social-channels.md`](../../findings/minor-net-hostap-avoid-awdl-social-channels.md)
-explains why the two effects point in opposite directions: sharing a social channel
-means contending with every AWDL peer in the room, but the *stutter* people measure
-comes from the radio leaving the link channel, so sitting on a social channel might
-make the hop free.
+That change is **not settled**, because the two effects point in opposite directions:
+sharing a social channel means contending with every AWDL peer in the room, but the
+*stutter* people measure comes from the radio leaving the link channel, so sitting on a
+social channel might make the hop free.
 
 `SCREENEXTEND_HOSTAP_CHANNEL=<n>` forces a channel without a rebuild. A/B it:
 
@@ -198,9 +196,9 @@ the median and tens to hundreds at p99. Measure it:
 3. Then run the glass-to-glass harness (`docs/TELEMETRY.md`) for five minutes in each
    configuration and compare p50/p95/p99 plus `getStats` jitter and `framesDropped`.
 
-If p99 does not improve,
-[`findings/major-net-direct-link-lowlatency-mode.md`](../../findings/major-net-direct-link-lowlatency-mode.md)
-is wrong and should be closed.
+If p99 does not improve, the premise is wrong: record the numbers in
+`docs/OPTIMIZATIONS.md` and delete this section rather than leaving it as a standing
+suggestion.
 
 ## 6. The IBSS tier
 

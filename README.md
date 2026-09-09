@@ -23,15 +23,15 @@ Install ScreenExtend on the **host** (the computer that needs more screen). On W
 
 Every client gets its own display and its own encoder, so several devices can hang off one host and be arranged like any other monitors (the **Display Settings** button opens your OS arrangement pane).
 
-**Edit Device** allows customization of comprehensive settings: scale, pixel ratio, orientation, refresh rate, video scale and quality, remote control, audio, audio output. **Settings** holds the session code, the offline hosted network, disconnect grace period, TURN server, ports, software-encode override, and logs.
+**Edit Device** allows customization of comprehensive settings: scale, pixel ratio, orientation, refresh rate, video scale and quality, remote control, audio, audio output. **Settings** holds the session code, the offline hosted network, disconnect grace period, STUN and TURN servers, ports, software-encode override, the log terminal, and a `config.json` editor for everything the panels do not surface.
 
 ## What it does
 
-- **GPU capture and encode.** Desktop capture straight into NVENC / Quick Sync / VideoToolbox, out over WebRTC. Settings changes renegotiate in place instead of tearing down the session.
+- **GPU capture and encode.** Desktop capture straight into NVENC / Quick Sync / VideoToolbox, out over WebRTC. A settings change keeps the virtual display — the desktop windows stay where they are — and renegotiates the stream around it.
 - **Remote control.** A joined device drives the host's keyboard, mouse, and clipboard. This setting can be turned off.
 - **OTP-based security.** A session ID plus a one-time code gate devices from joining, rate-limited per device and globally. Devices that make it in get a trust token and rejoin without retyping. Revoke or ban them from Edit Device.
-- **System audio (Windows / macOS).** Off by default, opt-in per device. Low-delay Opus over the same encrypted transport as the video, with a custom-coded jitter buffer. Windows uses WASAPI loopback; macOS uses Core Audio process tap on 14.2+ and ScreenCaptureKit on 13+. Below 13 macOS has no system-audio API at all, so ScreenExtend carries its own virtual output device for 10.15–12.x — it is bundled but not yet signed, installed or loaded by anyone, so treat that tier as unfinished.
-- **No router needed.** The host can create its own ad-hoc Wi-Fi network to work offline. It also watches network adapters and rebuilds join URLs as required.
+- **System audio (Windows / macOS).** Off by default, opt-in per device. Low-delay Opus over the same encrypted transport as the video, with a custom-coded jitter buffer. Windows uses WASAPI loopback; macOS uses Core Audio process tap on 14.2+ and ScreenCaptureKit on 13+. Below 13 macOS has no system-audio API at all, so ScreenExtend carries its own virtual output device for 10.15–12.x. That tier works end to end — it has been measured capturing the system mix on 10.15 — but it has never been signed or notarized, so today it only loads on a Mac with SIP disabled.
+- **No router needed.** The host can bring up its own Wi-Fi access point to work offline (Windows hosted network; CoreWLAN HostAP mode on macOS). It also watches network adapters and rebuilds join URLs as required.
 - **Encrypted media, opt-in encrypted signaling.** Audio and video always ride DTLS-SRTP. The LAN join page is plain HTTP by default so a QR scan doesn't hit a certificate warning; the page then offers the HTTPS endpoint (self-signed, generated at runtime), which is both private and faster.
 
 ## How it works
@@ -143,9 +143,11 @@ Installers and the executable are emitted under `target/release/bundle/` inside 
 
 `docs/dev-workflow.md` has the working conventions: the gates to run before a commit (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and `pnpm lint`/`pnpm build`/`node scripts/check-legacy-webkit.mjs` when the frontend changed), and the invariants that are easy to break silently — the macOS 10.15 link-time floor, the Safari 13.1 floor in the desktop UI, and the rule that the client page has no build step and no dependencies.
 
+`CLAUDE.md` is the map of the codebase. The rest of `docs/` is the engineering record: `INVENTORY.md` (what every component is), `CAPABILITY-TIERS.md` (every runtime-probed tier and how it is probed), `TELEMETRY.md` and `INPUT-PROTOCOL.md` (the host↔client wire formats), `OPTIMIZATIONS.md` (every change attempted, kept or reverted, with its measurements), and `manual-tests/` (the checks neither development machine can run).
+
 ### Releases
 
-Every push and pull request runs `.github/workflows/ci.yml`: eslint and the frontend build on Linux, `cargo fmt`/`clippy -D warnings`/`test` on Windows and on macOS 13, 14 and 15, a runtime smoke on those macOS runners for the capture and audio tiers the dev machines are too old to reach, a 10.15 dyld-floor audit of the release binary, and verification of the vendored blob checksums. Pushing an `app-v*` tag builds Windows x64 and macOS Intel + Apple Silicon and drafts a release. Prebuilt installers live on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
+Every push and pull request runs `.github/workflows/ci.yml`: eslint, the frontend build and four static checks on Linux (the Safari 13.1 floor of the built UI, the generated Rust↔TS bindings against the macro lists that produce them, the four copies of the version string, and the client page's wire-format helpers); `cargo fmt`/`clippy -D warnings`/`test` on Windows and on macOS 13, 14 and 15; a runtime smoke on those macOS runners for the capture and audio tiers the dev machines are too old to reach; a 10.15 dyld-floor audit of the release binary; verification of the vendored blob checksums; and a Windows encoder perf gate against `ci/perf-baseline.json`. Pushing an `app-v*` tag builds Windows x64 and macOS Intel + Apple Silicon and drafts a release. Prebuilt installers live on the [Releases page](https://github.com/ScreenExtend/ScreenExtend/releases).
 
 ## Contributing
 
