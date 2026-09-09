@@ -555,7 +555,7 @@ mod test {
     /// Dumps what `QueryDisplayConfig` says about every active display, which is the input the
     /// `display_device_name` correlation runs on. Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of QueryDisplayConfig output; run with --ignored --nocapture"]
     fn report_active_display_paths() {
         for p in active_display_paths() {
             println!("{} <- EDID friendly name {:?}", p.gdi_name, p.friendly);
@@ -567,7 +567,7 @@ mod test {
     /// falls back to. Needs the driver installed; creates three real displays for a few seconds.
     /// Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "requires the virtual display driver installed; creates three real displays; run with --ignored --nocapture"]
     fn report_display_name_correlation() {
         let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
             println!("driver unavailable; skipping");
@@ -640,7 +640,7 @@ mod test {
     /// used it. This harness is the before half of that comparison. Needs the driver installed;
     /// creates a real display for a few seconds. Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "requires the virtual display driver installed; creates a real display; run with --ignored --nocapture"]
     fn report_mode_change_cost() {
         use crate::windows_utils::streamer::capture::{monitor_device_names, set_display_mode};
 
@@ -743,7 +743,7 @@ mod test {
 
     /// Reports which display backend this machine probes to. Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of the probed display backend; run with --ignored --nocapture"]
     fn report_display_backend() {
         println!(
             "pipe {} exists: {}",
@@ -771,7 +771,7 @@ mod test {
     ///   - at 1920x1080, which we did register with [60, 120], the rate change is accepted and
     ///     `EnumDisplaySettingsW` reads back 1920x1080@120.
     #[test]
-    #[ignore]
+    #[ignore = "requires the virtual display driver installed; creates a real display; run with --ignored --nocapture"]
     fn report_selected_refresh_rate() {
         let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
             println!("driver unavailable; skipping");

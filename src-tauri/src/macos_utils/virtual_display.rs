@@ -992,7 +992,7 @@ mod tests {
     /// cargo test --lib macos_utils::virtual_display::tests::time_a_retina_join -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "creates a real Retina virtual display; needs a console session (it hangs over SSH); run with --ignored --nocapture"]
     fn time_a_retina_join() {
         if !cg_virtual_display_available() {
             println!("CGVirtualDisplay is not available on this Mac");
