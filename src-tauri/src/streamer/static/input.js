@@ -98,10 +98,10 @@
   // length, so the tail costs nothing on a host that does not want it — see the stamp block
   // further down. v1 lengths: pointer 40, wheel 15, mouse delta 8 (byte 8 was always a pad),
   // batch 10 + n*24.
-  const POINTER_LEN = 40, WHEEL_LEN = 15, DELTA_LEN = 9, STAMP_LEN = 8;
-  const moveBuf = new ArrayBuffer(POINTER_LEN + STAMP_LEN), moveView = new DataView(moveBuf);
-  const wheelBuf = new ArrayBuffer(WHEEL_LEN + STAMP_LEN), wheelView = new DataView(wheelBuf);
-  const deltaBuf = new ArrayBuffer(DELTA_LEN + STAMP_LEN), deltaView = new DataView(deltaBuf);
+  const POINTER_LEN = 40, WHEEL_LEN = 15, DELTA_LEN = 9, STAMP_LEN = 8, SEQ_LEN = 2;
+  const moveBuf = new ArrayBuffer(POINTER_LEN + STAMP_LEN + SEQ_LEN), moveView = new DataView(moveBuf);
+  const wheelBuf = new ArrayBuffer(WHEEL_LEN + STAMP_LEN + SEQ_LEN), wheelView = new DataView(wheelBuf);
+  const deltaBuf = new ArrayBuffer(DELTA_LEN + STAMP_LEN + SEQ_LEN), deltaView = new DataView(deltaBuf);
   const resizeBuf = new ArrayBuffer(9), resizeView = new DataView(resizeBuf);
   const lifeBuf = new ArrayBuffer(2), lifeView = new DataView(lifeBuf);
   const pingBuf = new ArrayBuffer(9), pingView = new DataView(pingBuf);
@@ -109,7 +109,7 @@
   const keyScratch = new Uint8Array(1024), keyView = new DataView(keyScratch.buffer);
   const BATCH_MAX = 40;
   const BATCH_TAIL = STAMP_LEN + 2;
-  const batchBuf = new ArrayBuffer(10 + BATCH_MAX * 24 + BATCH_TAIL), batchView = new DataView(batchBuf);
+  const batchBuf = new ArrayBuffer(10 + BATCH_MAX * 24 + BATCH_TAIL + SEQ_LEN), batchView = new DataView(batchBuf);
 
   function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
   function clampI16(v) { return v < -32768 ? -32768 : v > 32767 ? 32767 : (v | 0); }
@@ -129,6 +129,21 @@
   function wantEvFlags() { return (hostCaps & HOST_CAP.INPUT_EVENT_FLAGS) !== 0; }
   function nowNs() { return Math.round(performance.now() * 1e6); }
   function evFlags() { return lockIsUnadjusted ? EVFLAG_UNADJUSTED : 0; }
+
+  // The fast channel is `ordered: false, maxRetransmits: 0` and the host merges its two internal
+  // queues with a select that picks randomly among ready operations, so a move can arrive behind
+  // one that superseded it and walk the cursor backwards for a frame. One counter per page,
+  // incremented once per frame that actually goes out on `fast`, gives the host something to
+  // compare; it drops a supersedable event whose sequence is behind the highest it has injected.
+  //
+  // It sits past the stamp, so it can only ride when the stamp does — the host finds it by
+  // offset, not by a length field. Never reset: the host's own high-water mark is per session and
+  // starts at "none", so a counter that only ever moves forward is right on both sides of a
+  // reconnect, while one that restarted at 0 against a host that had not would be rejected for
+  // half the sequence space.
+  let fastSeq = 0;
+  function wantSeq() { return wantStamp() && (hostCaps & HOST_CAP.INPUT_SEQUENCE) !== 0; }
+  function nextSeq() { const s = fastSeq; fastSeq = (fastSeq + 1) & 0xffff; return s; }
 
   function channelFor(op) {
     switch (op) {
@@ -200,7 +215,16 @@
     moveView.setFloat32(34, (e.height || 0) / (picH || cssH || 1), true);
     moveView.setUint16(38, e.buttons || 0, true);
     let len = POINTER_LEN;
-    if (wantStamp()) { setU64(moveView, POINTER_LEN, nowNs()); len += STAMP_LEN; }
+    if (wantStamp()) {
+      setU64(moveView, POINTER_LEN, nowNs());
+      len += STAMP_LEN;
+      // Only on the fast channel: a reliable frame is in order by construction and the host
+      // never looks for a sequence on one.
+      if (wantSeq() && fast && (ch || channelFor(op)) === fast) {
+        moveView.setUint16(len, nextSeq(), true);
+        len += SEQ_LEN;
+      }
+    }
     if (ch) rawSend(ch, moveBuf, len); else send(op, moveBuf, len);
   }
 
@@ -235,6 +259,7 @@
         setU64(batchView, o, nowNs()); o += STAMP_LEN;
         batchView.setUint8(o++, 0);
         batchView.setUint8(o++, 0);
+        if (wantSeq()) { batchView.setUint16(o, nextSeq(), true); o += SEQ_LEN; }
       }
       send(OP.POINTER_MOVE_BATCH, batchBuf, o);
     }
@@ -254,7 +279,11 @@
     wheelView.setFloat32(10, e.deltaZ || 0, true);
     wheelView.setUint8(14, e.deltaMode || 0);
     let len = WHEEL_LEN;
-    if (wantStamp()) { setU64(wheelView, WHEEL_LEN, nowNs()); len += STAMP_LEN; }
+    if (wantStamp()) {
+      setU64(wheelView, WHEEL_LEN, nowNs());
+      len += STAMP_LEN;
+      if (wantSeq()) { wheelView.setUint16(len, nextSeq(), true); len += SEQ_LEN; }
+    }
     send(OP.WHEEL, wheelBuf, len);
   }
   function sendMouseDelta(dx, dy, buttons) {
@@ -269,7 +298,11 @@
     // apply a second one.
     deltaView.setUint8(8, wantEvFlags() ? evFlags() : 0);
     let len = DELTA_LEN;
-    if (wantStamp()) { setU64(deltaView, DELTA_LEN, nowNs()); len += STAMP_LEN; }
+    if (wantStamp()) {
+      setU64(deltaView, DELTA_LEN, nowNs());
+      len += STAMP_LEN;
+      if (wantSeq()) { deltaView.setUint16(len, nextSeq(), true); len += SEQ_LEN; }
+    }
     send(OP.MOUSE_DELTA, deltaBuf, len);
   }
 
@@ -514,6 +547,7 @@
     UNRELIABLE_MOVE_CHANNEL: 1 << 2,
     INPUT_TIMESTAMP: 1 << 3,
     INPUT_EVENT_FLAGS: 1 << 4,
+    INPUT_SEQUENCE: 1 << 5,
   };
   let hostCaps = 0;
   const capSubs = [];

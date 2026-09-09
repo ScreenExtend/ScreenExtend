@@ -453,6 +453,17 @@ host. The field is a union of the page's own bits and the audio module's.
 | 19 | stepped down from `RTCRtpScriptTransform` to `createEncodedStreams` |
 | 20 | `requestVideoFrameCallback` unavailable |
 | 21 | Keyboard Lock unavailable |
+| 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
+
+Bit 22 is set when `/net-config` did not say `trickleIce: true` (an older host, or the cloud
+relay, which tunnels `/whep` but not `/net-config`), and in the cases the client cannot detect
+before it posts: an answer with no `Location` header, a `PATCH` refused with 403/405/415/501, two
+consecutive `PATCH` failures, or a first `PATCH` still unacknowledged after 2 s. In all of those
+the page latches trickle off and rejoins once with a gathered offer. The bit says the join paid
+the gather wait, which is the thing worth seeing on a slow join — bit 15 then says whether that
+wait ran all the way to its deadline. `no_trickle_ice` is its name in
+`CLIENT_DEGRADED_NAMES`, so it reaches the host's `degraded=…` summary line like every other
+bit.
 
 ### Opcode note
 
@@ -481,7 +492,10 @@ drives one PING/PONG exchange and one stats frame, and asserts the bytes against
 above (including the v2 tail and the 72-byte floor an older host reads), the clock-offset
 arithmetic, and the host-capability gate: a 17-byte `PONG` advertises nothing and
 `requestKeyframe()` must then refuse *and send nothing*, a 19-byte one enables it, and an
-attempt that could not go out must not burn the 200 ms limiter.
+attempt that could not go out must not burn the 200 ms limiter. It also asserts the optional
+input tails: the stamp on each frame that carries one, the `MOUSE_DELTA` flags byte, and the
+fast-channel sequence — its four offsets, that it advances by exactly one per fast frame, that a
+reliable frame carries none, and that nothing at all changes until capability bit 5 arrives.
 
 `node scripts/test-client-audio.mjs` runs `audio-worker.js` under Node with stub WebCodecs
 classes and feeds it real DataChannel frames: a plain packet, a redundant one with no loss
@@ -492,7 +506,11 @@ packet, a discontinuity, and a truncated redundant body.
 `node scripts/test-client-ice.mjs` lifts `waitForIceGathering` and its two helpers out of
 `index.html` and drives them against a fake peer connection: the candidate/grace table, that a
 relayed wait is *not* ended by a host or reflexive candidate, the relay grace, gathering
-completing, listener cleanup, and the deadline setting `ICE_GATHERING_DEADLINE`.
+completing, listener cleanup, and the deadline setting `ICE_GATHERING_DEADLINE`. It lifts the
+trickle sender out of the same file and drives that too: the `trickle-ice-sdpfrag` body, that
+nothing is PATCHed before the answer names a resource, that a candidate the offer already carried
+is not sent twice, `a=end-of-candidates`, a 404 stopping the sender rather than retrying into a
+dead session, and a burst larger than one batch going out in order.
 
 Neither is a substitute for a browser — they stub the DOM and cannot exercise the workers — but
 each catches a failure that is otherwise invisible: a `TypeError` inside `sendStats()` silently
