@@ -274,6 +274,26 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
+### The macOS audio driver  does reach the shipped app (closed)
+
+ was re-filed against
+ at , which contains  only as far as .
+w13b-code landed after that point and is what closed it. Verified end to end on the merged
+tree rather than by reading one side:
+
+-  stages the notarized package at .
+-  maps it with :
+  .
+- Both runtime call sites ( and ) resolve
+   against , which is
+   on macOS -- exactly the destination above.
+-  asserts the file exists at
+   after the build, so a regression
+  fails the release job rather than shipping an app whose driver install cannot start.
+
+One inaccuracy fixed while checking:  told the operator the path had to be listed
+in , which is not the key w13b used.
+
 ### Decision: mac-closeout`s AirPlay NTP instrumentation supersedes the core-closeout mirror`s
 
 Two branches instrumented the AirPlay mirror stream`s plaintext timestamps independently, and
