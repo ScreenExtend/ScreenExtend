@@ -155,9 +155,9 @@ There is deliberately no fallback the other way: with software encode on, the la
 one rung and a failed session create is reported rather than quietly retried on hardware.
 
 **Record**: the three lines above, and whether toggling the setting mid-session swaps the
-encoder or restarts the streamers. Restarting is today's behaviour on both platforms; the
-live swap needs `Config::software_encode_now()`, tracked in
-`findings/minor-session-gpu-toggle-snapshotted.md`.
+encoder or restarts the streamers. Restarting is today's behaviour on both platforms; a
+live swap would need the pipeline to read the toggle per frame
+(`Config::software_encode_now()`) instead of snapshotting it at session start.
 
 ## 3. Whether low-latency rate control is on
 

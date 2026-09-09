@@ -500,6 +500,14 @@ have different owners, threads and failure modes: display creation vs. display *
 Every place the discovery reports found `CLAUDE.md` disagreeing with the code. The code wins in
 all of them. Grouped by how much they would mislead a reader.
 
+> **All thirty have since been applied.** `CLAUDE.md` was rewritten against the tree in the
+> hygiene sweep, and several of the underlying defects were fixed in code rather than documented
+> (the four `CompatibilityReport` backend fields, the tracked `docs/`, the off-thread log bus, the
+> `AudioHub`'s removed bridge thread, the `hostap.m` file that nothing compiled, the
+> `:focus-visible` fallback, `serve`'s control server and HTTPS URL, and a `cargo test` that is
+> green again). The list is kept as the audit record of what was wrong and why — **read it as
+> history, not as a to-do list**, and check the code before acting on any entry.
+
 ### Factually wrong
 
 1. **Version.** `CLAUDE.md:546` says *"Current version: **0.5.4**"*. All four required files say
