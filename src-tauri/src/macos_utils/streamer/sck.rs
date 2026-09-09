@@ -804,12 +804,17 @@ fn publish_sample(sample: &CMSampleBuffer, ctx: &OutputCtx) {
             return;
         }
         ctx.frames.fetch_add(1, Ordering::Relaxed);
+        let arrived_mach = mach_now();
         ctx.sink.publish(Frame {
             width: ctx.width,
             height: ctx.height,
-            arrived_mach: mach_now(),
+            arrived_mach,
             captured_at: Instant::now(),
-            os_time_ns: sample_host_ns(sample),
+            os_time_ns: super::clock::os_frame_time_or(
+                super::clock::mach_ticks_to_host_ns(arrived_mach),
+                sample_host_ns(sample),
+            ),
+            os_time_raw_ns: sample_host_ns(sample),
             backing: Backing::PixelBuffer {
                 pixbuf,
                 _surface: HeldSurface::hold(surface),
