@@ -163,14 +163,6 @@ pub fn start_audio_capture(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BackendConfig {
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub bitrate_bps: u32,
-}
-
 /// What an encoder did with a runtime bitrate request. A silent `Ok(())` for a request the
 /// encoder ignored made the pipeline log "adapting bitrate" for a change that never happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,14 +170,4 @@ pub enum BitrateApplied {
     Applied,
     /// The encoder is in explicit constant-QP mode, so bitrate is not a control input.
     IgnoredConstantQp,
-}
-
-pub trait EncoderBackend: Send {
-    fn new(config: BackendConfig) -> Result<Self>
-    where
-        Self: Sized;
-
-    fn encode(&mut self, force_idr: bool) -> Result<Vec<u8>>;
-
-    fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied>;
 }

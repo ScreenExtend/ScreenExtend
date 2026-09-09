@@ -51,3 +51,50 @@ headers move, and treat a diff in the numbers as a required review item.
 
 Generated artifacts (`*.exe`, `*.obj`, `amf_layout_generated.txt`, `amf_layout_cpp_check.txt`) are
 gitignored.
+
+## `nvenc_layout_gen.c` — the NVENC ABI generator
+
+`windows_utils/streamer/nvidia/nvenc_sys` is bindgen output plus a **hand-written** `version.rs`,
+and `test/nvenc_layout.rs` used to assert the Rust structs against constants from the same
+bindgen run. Self-referential: it caught a hand edit to the Rust and nothing else, and in
+particular it could not catch bindings generated against one SDK header while `version.rs`
+transcribed the struct revisions of another. A wrong `NV_ENC_*_VER` word is not a compile error —
+`nvEncInitializeEncoder` returns `NV_ENC_ERR_INVALID_VERSION`, `build_backend` catches it, and
+the NVIDIA path silently degrades to Quick Sync or x264 on a machine with a working NVENC.
+
+`nvenc_layout_gen.c` compiles against the vendored `../resources/nvenc-headers/nvEncodeAPI.h`
+(FFmpeg/nv-codec-headers `n12.1.14.1`, MIT) and prints ready-to-paste Rust assertions: the API
+and struct version words, sizes and alignments, every field offset the encoder writes or reads,
+every `NV_ENCODE_API_FUNCTION_LIST` offset (the driver fills that table, so a wrong offset is a
+call through the wrong function pointer), the enum values and capability ids, and the GUIDs —
+which bindgen mis-generates (rust-bindgen#1888) and `nvenc_sys/guid.rs` therefore transcribes by
+hand.
+
+MSVC, not MinGW: `nvEncodeAPI64.dll` is MSVC-built, and the two compilers do not pack the
+`unsigned int x : 1` runs in `NV_ENC_CONFIG_H264` and `NV_ENC_PIC_PARAMS_H264` the same way.
+
+### Running it
+
+```bat
+cd src-tauri	ools
+nvenc_layout_build.bat
+```
+
+That enters the x64 environment via `vcvars64.bat`, builds the program and writes
+`nvenc_layout_generated.txt`. Or by hand:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio2\BuildTools\VC\Auxiliary\Buildcvars64.bat"
+cl /nologo /TC /W3 /I ..esources
+venc-headers nvenc_layout_gen.c /Fe:nvenc_layout_gen.exe
+nvenc_layout_gen.exe > nvenc_layout_generated.txt
+```
+
+Then paste the sections over the corresponding `abi_*` bodies in
+`src-tauri/src/windows_utils/streamer/test/nvenc_layout.rs`, in order. The generator emits C's
+bare enum-constant names; the glob `use` lines at the top of that file are what make the paste
+literal. Same rules as the AMF generator: not from `build.rs`, and a diff in the numbers after a
+header bump is a required review item.
+
+What neither generator can check is whether the *driver* agrees. Only running the encoder does
+that — `test/nvenc_encoder.rs`.
