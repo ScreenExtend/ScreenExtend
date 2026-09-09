@@ -570,7 +570,10 @@ mod test {
     #[ignore = "requires the virtual display driver installed; creates three real displays; run with --ignored --nocapture"]
     fn report_display_name_correlation() {
         let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
-            println!("driver unavailable; skipping");
+            crate::test_support::skip_because(
+                "windows virtual display",
+                "the virtual display driver is not installed",
+            );
             return;
         };
         let names = [
@@ -645,7 +648,10 @@ mod test {
         use crate::windows_utils::streamer::capture::{monitor_device_names, set_display_mode};
 
         let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
-            println!("driver unavailable; skipping");
+            crate::test_support::skip_because(
+                "windows virtual display",
+                "the virtual display driver is not installed",
+            );
             return;
         };
         let before = monitor_device_names();
@@ -774,7 +780,10 @@ mod test {
     #[ignore = "requires the virtual display driver installed; creates a real display; run with --ignored --nocapture"]
     fn report_selected_refresh_rate() {
         let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
-            println!("driver unavailable; skipping");
+            crate::test_support::skip_because(
+                "windows virtual display",
+                "the virtual display driver is not installed",
+            );
             return;
         };
         let before = crate::windows_utils::streamer::capture::monitor_device_names();
