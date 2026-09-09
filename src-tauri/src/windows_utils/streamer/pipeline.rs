@@ -2543,8 +2543,10 @@ fn spawn_repeater(
                         Err(_) => break,
                     };
                     match core.encode_repeat() {
-                        Ok(Some(au)) => au,
-                        Ok(None) => continue,
+                        // An empty access unit is a dropped frame, not a frame to send; see
+                        // `on_frame_arrived`.
+                        Ok(Some(au)) if !au.is_empty() => au,
+                        Ok(Some(_)) | Ok(None) => continue,
                         Err(e) => {
                             teprintln!("idle repeat encode failed: {e:?}");
                             continue;
@@ -2849,6 +2851,13 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             Err(e) => return Err(e),
         };
         self.busy_streak = 0;
+        // An encoder that consumed the picture and produced no bytes has dropped a frame, not
+        // produced an empty one. Only the AMF backend can reach this (a zero-length output
+        // buffer, see `amd::encoder::classify_query_output`); broadcasting it would put a
+        // payloadless access unit through the packetizer.
+        if au.is_empty() {
+            return Ok(());
+        }
 
         self.last_frame_at
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);

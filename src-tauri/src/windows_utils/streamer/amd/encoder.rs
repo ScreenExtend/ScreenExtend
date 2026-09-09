@@ -196,6 +196,60 @@ struct LtrState {
 }
 
 // ===========================================================================================
+// QueryOutput classification
+// ===========================================================================================
+
+/// What one `AMFComponent::QueryOutput` produced, as a fact about the call rather than as bytes.
+///
+/// The distinction that matters is between a **NULL out-pointer** — the encoder has not finished
+/// this picture and will hand it over later — and a **non-NULL** `AMFData` whose buffer is empty.
+/// The second one has already been consumed: the reference is ours, we drop it, and no further
+/// `QueryOutput` will produce it again. Treating the two the same is a two-second poll to
+/// `SUBMIT_DEADLINE` followed by "encoder stalled" and a torn-down session, when the honest
+/// outcome is one dropped frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryClass {
+    /// NULL out-pointer with a benign result code. Poll again.
+    NotReady,
+    /// A real output object carrying no bytes. Consumed; do not wait for it.
+    Empty,
+    /// A real output object with an access unit in it.
+    Data,
+    /// NULL out-pointer with a result code that is not benign.
+    Error,
+}
+
+/// The pure half of `Encoder::query_once`, so the classification can be tested on a machine with
+/// no AMD hardware — which is every machine on this project.
+///
+/// `AMF_EOF` counts as `NotReady` on a NULL pointer: the only caller that can see it is the
+/// teardown drain, which tests the result code itself.
+pub(crate) fn classify_query_output(
+    data_null: bool,
+    buffer_empty: bool,
+    r: AMF_RESULT,
+) -> QueryClass {
+    if data_null {
+        return match r {
+            AMF_OK | AMF_REPEAT | AMF_NEED_MORE_INPUT | AMF_EOF => QueryClass::NotReady,
+            _ => QueryClass::Error,
+        };
+    }
+    if buffer_empty {
+        QueryClass::Empty
+    } else {
+        QueryClass::Data
+    }
+}
+
+/// [`QueryClass`] plus the bytes, for the caller that has to act on it.
+enum QueryOutcome {
+    NotReady,
+    Empty,
+    Au(Vec<u8>),
+}
+
+// ===========================================================================================
 // RAII for AMF refcounts
 // ===========================================================================================
 
@@ -254,6 +308,12 @@ pub struct Encoder {
     last_output_idr: bool,
     ltr: LtrState,
     warned_input_full: bool,
+    warned_empty_output: bool,
+
+    /// Retained, grown-only copy target for the access unit. The copy out of AMF's buffer
+    /// happens while the driver still owns the mapping, so it must not allocate; the `Vec` the
+    /// pipeline wants is built afterwards. Mirrors `nvidia/encoder.rs`'s `au_scratch`.
+    au_scratch: Vec<u8>,
 
     /// Declared **last** so it drops last: dropping the `Library` unmaps the code every vtable
     /// above points into. Same rule as `nvidia/encoder.rs`'s trailing `_lib`.
@@ -413,6 +473,8 @@ impl Encoder {
                 ..LtrState::default()
             },
             warned_input_full: false,
+            warned_empty_output: false,
+            au_scratch: Vec::new(),
             amf,
         };
 
@@ -897,10 +959,15 @@ impl Encoder {
                              discipline; draining output and retrying (this should not happen)"
                         );
                     }
-                    if let Some(bytes) = self.query_once()? {
-                        carry.extend_from_slice(&bytes);
-                    } else if !self.query_timeout_supported {
-                        std::thread::sleep(POLL_SLEEP);
+                    match self.query_once()? {
+                        QueryOutcome::Au(bytes) => carry.extend_from_slice(&bytes),
+                        // An output came back and was consumed, so the queue has moved even
+                        // though it carried nothing: retry the submit at once rather than sleep.
+                        QueryOutcome::Empty => self.note_empty_output(),
+                        QueryOutcome::NotReady if !self.query_timeout_supported => {
+                            std::thread::sleep(POLL_SLEEP)
+                        }
+                        QueryOutcome::NotReady => {}
                     }
                     if Instant::now() >= deadline {
                         bail!("AMF SubmitInput stalled on AMF_INPUT_FULL for {SUBMIT_DEADLINE:?}");
@@ -913,12 +980,23 @@ impl Encoder {
         }
 
         loop {
-            if let Some(bytes) = self.query_once()? {
-                if carry.is_empty() {
-                    return Ok(bytes);
+            match self.query_once()? {
+                QueryOutcome::Au(bytes) => {
+                    if carry.is_empty() {
+                        return Ok(bytes);
+                    }
+                    carry.extend_from_slice(&bytes);
+                    return Ok(carry);
                 }
-                carry.extend_from_slice(&bytes);
-                return Ok(carry);
+                // The encoder handed back a real output object with no bytes in it. That output
+                // is consumed and will never be produced again, so waiting for it is a
+                // two-second freeze followed by a torn-down session. Take the frame loss
+                // instead: an empty access unit, which the pipeline drops.
+                QueryOutcome::Empty => {
+                    self.note_empty_output();
+                    return Ok(carry);
+                }
+                QueryOutcome::NotReady => {}
             }
             if Instant::now() >= deadline {
                 bail!(
@@ -933,21 +1011,33 @@ impl Encoder {
         }
     }
 
-    /// One `QueryOutput`. Returns the access unit, or `None` for "nothing yet", recording
-    /// whether it was an IDR in `last_output_idr`.
+    /// An output object that carried no bytes. Logged once per encoder, because if a driver ever
+    /// does this it will do it often and this is a per-frame path.
+    fn note_empty_output(&mut self) {
+        if !self.warned_empty_output {
+            self.warned_empty_output = true;
+            teprintln!(
+                "AMF QueryOutput returned an output buffer of zero bytes; treating it as a \
+                 dropped frame rather than waiting {SUBMIT_DEADLINE:?} for an output that has \
+                 already been consumed"
+            );
+        }
+    }
+
+    /// One `QueryOutput`, classified.
     ///
     /// "Nothing yet" is decided by the NULL out-pointer, not by a result code: `QueryOutput` can
     /// return `AMF_OK` with a null `ppData`, and neither `AMF_REPEAT` nor `AMF_NEED_MORE_INPUT`
-    /// is a reliable signal. Both FFmpeg and OBS test the pointer.
-    fn query_once(&mut self) -> Result<Option<Vec<u8>>> {
+    /// is a reliable signal. Both FFmpeg and OBS test the pointer. A **non**-null pointer whose
+    /// buffer is empty is a different thing entirely — see [`classify_query_output`].
+    fn query_once(&mut self) -> Result<QueryOutcome> {
         let mut raw: *mut AMFData = ptr::null_mut();
         // SAFETY: vtable slot 23 (AMFComponent::QueryOutput) on a live initialised component.
         let r = unsafe { ((*(*self.component).pVtbl).QueryOutput)(self.component, &mut raw) };
 
         if raw.is_null() {
-            return match r {
-                AMF_OK | AMF_REPEAT | AMF_NEED_MORE_INPUT => Ok(None),
-                AMF_EOF => Ok(None),
+            return match classify_query_output(true, true, r) {
+                QueryClass::NotReady => Ok(QueryOutcome::NotReady),
                 _ => Err(self.amf_error("AMFComponent::QueryOutput", r)),
             };
         }
@@ -961,18 +1051,25 @@ impl Encoder {
 
         // SAFETY: vtable slots 25 (GetNative) and 24 (GetSize) on a live buffer. The native
         // pointer is host memory holding the Annex-B access unit and stays valid until the
-        // buffer is released, which `Owned` does at the end of this scope.
-        let bytes = unsafe {
+        // buffer is released, which `Owned` does at the end of this scope. The copy goes into a
+        // retained, grown-only scratch buffer, so the only work done while the driver still owns
+        // the mapping is the memcpy — the `Vec` the callers want is built after the release.
+        // Same shape as `nvidia/encoder.rs`'s `au_scratch`, for the same reason.
+        let len = unsafe {
             let native = ((*(*buffer.as_ptr()).pVtbl).GetNative)(buffer.as_ptr());
             let size = ((*(*buffer.as_ptr()).pVtbl).GetSize)(buffer.as_ptr());
             if native.is_null() || size == 0 {
-                Vec::new()
+                0
             } else {
-                std::slice::from_raw_parts(native as *const u8, size).to_vec()
+                if self.au_scratch.len() < size {
+                    self.au_scratch.resize(size, 0);
+                }
+                ptr::copy_nonoverlapping(native as *const u8, self.au_scratch.as_mut_ptr(), size);
+                size
             }
         };
-        if bytes.is_empty() {
-            return Ok(None);
+        if classify_query_output(false, len == 0, r) == QueryClass::Empty {
+            return Ok(QueryOutcome::Empty);
         }
 
         // SAFETY: the buffer's first 13 vtable slots are the AMFPropertyStorage prefix.
@@ -1004,7 +1101,10 @@ impl Encoder {
         }
 
         self.last_output_idr = is_idr;
-        Ok(Some(bytes))
+        // Release the driver's buffer before building the owned `Vec` the callers want.
+        drop(buffer);
+        drop(data);
+        Ok(QueryOutcome::Au(self.au_scratch[..len].to_vec()))
     }
 
     // -------------------------------------------------------------------------------------
@@ -1063,6 +1163,25 @@ impl Encoder {
             );
             self.usage = usage_readback as AMF_VIDEO_ENCODER_USAGE;
         }
+
+        // Same treatment for the LTR budget: believing we have slots the driver did not give us
+        // would make every "repair" frame reference a picture that was never a long-term
+        // reference, which is worse than the IDR it replaced.
+        if self.ltr.max_frames > 0 {
+            let granted = self
+                .get_i64(prop::AMF_VIDEO_ENCODER_MAX_LTR_FRAMES)
+                .unwrap_or(0)
+                .clamp(0, MAX_LTR_FRAMES_SUPPORTED);
+            if granted != self.ltr.max_frames {
+                teprintln!(
+                    "AMF LTR: asked for {} slot(s), the encoder reports {}; using {}",
+                    self.ltr.max_frames,
+                    granted,
+                    granted
+                );
+                self.ltr.max_frames = granted;
+            }
+        }
         Ok(())
     }
 
@@ -1086,6 +1205,8 @@ impl Encoder {
         let cfg = &self.config;
         let fps = cfg.fps.max(1) as i64;
         let bitrate = cfg.bitrate_bps.max(1) as i64;
+        // Every optional property's gate result and read-back, printed as one line at the end.
+        let mut report: Vec<String> = Vec::with_capacity(16);
 
         // 1. USAGE first. Everything below depends on it having already re-defaulted the encoder.
         self.set_i64(prop::AMF_VIDEO_ENCODER_USAGE, usage as i64)
@@ -1161,21 +1282,33 @@ impl Encoder {
         // to having B-frames at all — VCN 1.0–2.x, RDNA1 included, do not.
         self.set_i64(prop::AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0)?;
         if self.caps.b_frames {
-            let _ = self.set_i64(prop::AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES, 0);
+            self.set_gated_i64(
+                &mut report,
+                prop::AMF_VIDEO_ENCODER_MAX_CONSECUTIVE_BPICTURES,
+                0,
+            );
         }
 
         // 15. ULL sets this itself; writing it explicitly is belt and braces and not every
         // driver has the property.
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
+        self.set_gated_bool(&mut report, prop::AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
 
-        // 16..19. Every form of lookahead and per-frame analysis, off.
-        self.set_i64(
+        // 16..19. Every form of lookahead and per-frame analysis, off. All four are gated rather
+        // than fatal: a runtime that has never heard of pre-analysis is not a reason to lose the
+        // whole AMD path, and the read-back says which of them this VCN generation really has.
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_PREENCODE_ENABLE,
             AMF_VIDEO_ENCODER_PREENCODE_DISABLED as i64,
-        )?;
-        self.set_bool(prop::AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, false)?;
-        self.set_bool(prop::AMF_VIDEO_ENCODER_ENABLE_VBAQ, false)?;
-        self.set_optional_bool(
+        );
+        self.set_gated_bool(
+            &mut report,
+            prop::AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE,
+            false,
+        );
+        self.set_gated_bool(&mut report, prop::AMF_VIDEO_ENCODER_ENABLE_VBAQ, false);
+        self.set_gated_bool(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_HIGH_MOTION_QUALITY_BOOST_ENABLE,
             false,
         );
@@ -1191,8 +1324,9 @@ impl Encoder {
         // slice per frame: more slices only pay off with OUTPUT_MODE = SLICE, which needs the
         // RTP packetizer to emit partial access units.
         self.set_bool(prop::AMF_VIDEO_ENCODER_DE_BLOCKING_FILTER, true)?;
-        self.set_i64(prop::AMF_VIDEO_ENCODER_SLICES_PER_FRAME, 1)?;
-        self.set_optional_i64(
+        self.set_gated_i64(&mut report, prop::AMF_VIDEO_ENCODER_SLICES_PER_FRAME, 1);
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_OUTPUT_MODE,
             AMF_VIDEO_ENCODER_OUTPUT_MODE_FRAME as i64,
         );
@@ -1214,21 +1348,33 @@ impl Encoder {
         // bitstream — the two below are set anyway in case a future driver honours them, and
         // their failure is logged once rather than fatal.
         let full_range = self.surface_format != AMF_SURFACE_NV12;
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR, full_range);
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, full_range);
-        self.set_optional_i64(
+        self.set_gated_bool(
+            &mut report,
+            prop::AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR,
+            full_range,
+        );
+        self.set_gated_bool(
+            &mut report,
+            prop::AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR,
+            full_range,
+        );
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
             COLOR_PRIMARIES_BT709,
         );
-        self.set_optional_i64(
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
             TRANSFER_CHARACTERISTIC_BT709,
         );
-        self.set_optional_i64(
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF,
             MATRIX_COEFF_BT709,
         );
-        self.set_optional_i64(
+        self.set_gated_i64(
+            &mut report,
             prop::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE,
             if full_range {
                 COLOR_PROFILE_FULL_709
@@ -1239,29 +1385,54 @@ impl Encoder {
 
         // 27. SmartAccess Video parallelises *throughput* across VCN instances; splitting one
         // low-latency stream across engines adds coordination, not speed.
-        self.set_optional_bool(prop::AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO, false);
+        self.set_gated_bool(
+            &mut report,
+            prop::AMF_VIDEO_ENCODER_ENABLE_SMART_ACCESS_VIDEO,
+            false,
+        );
 
         // 28. The default 16-deep input queue is a latency reservoir we never want to fill. With
         // one-in-flight it stays empty anyway, but a hard 1 turns AMF_INPUT_FULL into a real
         // signal instead of a 16-frame cushion. It may be read-only; failure is fine.
-        self.set_optional_i64(prop::AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE, 1);
+        self.set_gated_i64(&mut report, prop::AMF_VIDEO_ENCODER_INPUT_QUEUE_SIZE, 1);
 
         // 29. Intra-refresh: leave ULL's default (255 MBs/slot) alone, and write 0 only when the
-        // config explicitly disables it. MaxNumRefFrames is deliberately never set — forcing 1
-        // reference would switch intra-refresh off, because the docs make it conditional on
-        // MaxOfReferenceFrames > 1.
-        if !cfg.intra_refresh {
-            self.set_optional_i64(prop::AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT, 0);
+        // config explicitly disables it or when LTR is on, because AMF turns the rolling refresh
+        // off under user-controlled LTR anyway ("With user control of LTR, B-pictures and
+        // Intra-refresh features are not supported") and writing the 0 makes that visible in the
+        // read-back rather than leaving a 255 nobody honours. MaxNumRefFrames is deliberately
+        // never set — forcing 1 reference would switch intra-refresh off, because the docs make
+        // it conditional on MaxOfReferenceFrames > 1.
+        if !cfg.intra_refresh || self.ltr.max_frames > 0 {
+            self.set_gated_i64(
+                &mut report,
+                prop::AMF_VIDEO_ENCODER_INTRA_REFRESH_NUM_MBS_PER_SLOT,
+                0,
+            );
         }
 
-        // 30. LTR is mutually exclusive with intra-refresh and stays off by default.
+        // 30. LTR is mutually exclusive with intra-refresh and is off unless the caller has a
+        // repair loop to drive it. `open` has already checked the capability; this write is
+        // gated too, and `configure_and_init` reads the count back afterwards, so what the
+        // encoder believes about its slots is what AMF accepted.
         if self.ltr.max_frames > 0 {
-            self.set_i64(prop::AMF_VIDEO_ENCODER_MAX_LTR_FRAMES, self.ltr.max_frames)?;
+            self.set_gated_i64(
+                &mut report,
+                prop::AMF_VIDEO_ENCODER_MAX_LTR_FRAMES,
+                self.ltr.max_frames,
+            );
         }
 
         // 31. QueryTimeout, last of the static block and *before* Init: set afterwards it
         // returns AMF_OK, echoes back, and silently does nothing.
-        self.set_optional_i64(prop::AMF_VIDEO_ENCODER_QUERY_TIMEOUT, 1);
+        self.set_gated_i64(&mut report, prop::AMF_VIDEO_ENCODER_QUERY_TIMEOUT, 1);
+
+        // One line, because on a machine none of us can reach the log line is the diagnosis.
+        // `name=v` is applied and read back as asked; `name=v(asked w)` means the driver kept its
+        // own value; `rejected(CODE)` is a name the runtime knows but would not take; `unknown`
+        // is one `HasProperty` denied; `unknown-but-set:` is `HasProperty` denying a name the
+        // write then accepted, which is how we learn what `HasProperty` really means here.
+        tprintln!("AMF optional properties: {}", report.join(", "));
 
         Ok(())
     }
@@ -1493,10 +1664,14 @@ impl Encoder {
     // Property helpers
     // -------------------------------------------------------------------------------------
 
-    fn set_var(&self, name: &[u16], value: AMFVariantStruct) -> Result<()> {
+    fn set_raw(&self, name: &[u16], value: AMFVariantStruct) -> AMF_RESULT {
         // SAFETY: the component's first 13 vtable slots are the AMFPropertyStorage prefix, and
         // `name` is a NUL-terminated static.
-        let r = unsafe { set_property(as_property_storage(self.component), name, value) };
+        unsafe { set_property(as_property_storage(self.component), name, value) }
+    }
+
+    fn set_var(&self, name: &[u16], value: AMFVariantStruct) -> Result<()> {
+        let r = self.set_raw(name, value);
         if r == AMF_OK {
             Ok(())
         } else {
@@ -1512,19 +1687,59 @@ impl Encoder {
         self.set_var(name, AMFVariantStruct::bool(v))
     }
 
-    /// A knob that varies by driver and GPU generation. `AMF_NOT_FOUND` / `AMF_NOT_SUPPORTED`
-    /// here means "this build of the runtime or this VCN does not have it", which is a log line,
-    /// never a failure.
-    fn set_optional_i64(&self, name: &[u16], v: i64) {
-        if let Err(e) = self.set_i64(name, v) {
-            tprintln!("AMF optional property not applied: {e:#}");
+    /// Whether this build of the runtime knows a property at all.
+    fn knows(&self, name: &[u16]) -> bool {
+        // SAFETY: as `set_raw`; `HasProperty` is vtable slot 5 of the same prefix.
+        unsafe { has_property(as_property_storage(self.component), name) }
+    }
+
+    /// A knob that varies by driver and GPU generation, written through both halves of the gate
+    /// `amd.md` §1 describes: `HasProperty` first, then `SetProperty`'s own return code.
+    ///
+    /// `HasProperty` is *reported*, not obeyed. It is the cheap "does this build of the runtime
+    /// know the name" probe, but no machine on this project can confirm what AMF's
+    /// implementation counts as "has" — a declared property with a default, or one that has been
+    /// written — so a `false` still gets the write, and the report says the write worked anyway.
+    /// A refused optional write is free on AMF (`AMF_NOT_FOUND` / `AMF_NOT_SUPPORTED` and
+    /// nothing else happens), unlike NVENC where asking for an unsupported feature costs the
+    /// whole vendor path.
+    ///
+    /// Every outcome lands in `report` and is printed as one consolidated line, because on a
+    /// machine none of us can reach the log line is the diagnosis. `want` is what we asked for,
+    /// as an integer, so a driver that silently keeps its own value is visible rather than
+    /// assumed.
+    fn set_gated(
+        &self,
+        report: &mut Vec<String>,
+        name: &[u16],
+        value: AMFVariantStruct,
+        want: i64,
+    ) {
+        let label = wide_to_string(name);
+        let known = self.knows(name);
+        let r = self.set_raw(name, value);
+        if r != AMF_OK {
+            report.push(format!(
+                "{label}={}{}",
+                if known { "rejected" } else { "unknown" },
+                format_args!("({})", result_name(r))
+            ));
+            return;
+        }
+        let prefix = if known { "" } else { "unknown-but-set:" };
+        match self.get_i64(name) {
+            Some(read) if read == want => report.push(format!("{label}={prefix}{read}")),
+            Some(read) => report.push(format!("{label}={prefix}{read}(asked {want})")),
+            None => report.push(format!("{label}={prefix}set,unreadable")),
         }
     }
 
-    fn set_optional_bool(&self, name: &[u16], v: bool) {
-        if let Err(e) = self.set_bool(name, v) {
-            tprintln!("AMF optional property not applied: {e:#}");
-        }
+    fn set_gated_i64(&self, report: &mut Vec<String>, name: &[u16], v: i64) {
+        self.set_gated(report, name, AMFVariantStruct::int64(v), v);
+    }
+
+    fn set_gated_bool(&self, report: &mut Vec<String>, name: &[u16], v: bool) {
+        self.set_gated(report, name, AMFVariantStruct::bool(v), i64::from(v));
     }
 
     fn get_i64(&self, name: &[u16]) -> Option<i64> {
