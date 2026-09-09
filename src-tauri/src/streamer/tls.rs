@@ -168,3 +168,96 @@ fn subject_alt_names(extra_sans: &[String]) -> Vec<String> {
     }
     sans
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_san_list_always_carries_the_two_the_client_can_reach_it_by() {
+        // Every join lands on either the loopback name or an adapter address, so both have to be
+        // in the certificate or the HTTPS upsell produces a name-mismatch warning instead of the
+        // self-signed one the client page knows how to explain.
+        let sans = subject_alt_names(&[]);
+        assert!(sans.contains(&"localhost".to_string()));
+        assert!(sans.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn adapter_addresses_are_added_once_and_empties_are_ignored() {
+        let sans = subject_alt_names(&[
+            "192.168.1.20".to_string(),
+            "192.168.1.20".to_string(),
+            String::new(),
+            "10.0.0.5".to_string(),
+        ]);
+        assert_eq!(
+            sans,
+            vec!["localhost", "127.0.0.1", "192.168.1.20", "10.0.0.5"]
+        );
+    }
+
+    #[test]
+    fn a_duplicate_of_a_built_in_name_does_not_repeat_it() {
+        assert_eq!(
+            subject_alt_names(&["127.0.0.1".to_string()]),
+            vec!["localhost", "127.0.0.1"]
+        );
+    }
+
+    #[test]
+    fn one_half_of_an_operator_certificate_is_an_error_not_a_silent_self_signed_fallback() {
+        // Falling back would mean an operator who typo'd one path gets a self-signed cert and a
+        // browser warning, with the log claiming TLS is configured.
+        assert!(load_or_generate(Some("cert.pem"), None, &[])
+            .map(|_| ())
+            .is_err());
+        assert!(load_or_generate(None, Some("key.pem"), &[])
+            .map(|_| ())
+            .is_err());
+    }
+
+    #[test]
+    fn a_missing_operator_certificate_names_the_path_it_could_not_read() {
+        let err = match load_or_generate(
+            Some("definitely-not-here-cert.pem"),
+            Some("definitely-not-here-key.pem"),
+            &[],
+        ) {
+            Ok(_) => panic!("a missing certificate must not load"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("definitely-not-here-cert.pem"),
+            "the error must name the file: {err:#}"
+        );
+    }
+
+    /// The generated material has to be something `rustls` will actually load, which is the one
+    /// property the rest of the module cannot check for itself.
+    #[test]
+    fn a_generated_dev_certificate_is_loadable_and_is_reused_from_cache() {
+        let dir = std::env::temp_dir().join(format!("se-tls-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cert = dir.join(DEV_CERT_FILE);
+        let key = dir.join(DEV_KEY_FILE);
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+
+        let sans = subject_alt_names(&["192.168.1.20".to_string()]);
+        let params = rcgen::CertificateParams::new(sans).expect("params");
+        let key_pair = rcgen::KeyPair::generate().expect("key pair");
+        let generated = params.self_signed(&key_pair).expect("self-signed");
+        let cert_pem = generated.pem().into_bytes();
+        let key_pem = key_pair.serialize_pem().into_bytes();
+
+        assert!(cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(String::from_utf8_lossy(&key_pem).contains("PRIVATE KEY"));
+
+        cache_dev_cert(&cert, &cert_pem, &key, &key_pem).expect("cache");
+        assert_eq!(std::fs::read(&cert).unwrap(), cert_pem);
+        assert_eq!(std::fs::read(&key).unwrap(), key_pem);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

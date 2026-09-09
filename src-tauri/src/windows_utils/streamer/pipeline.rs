@@ -27,7 +27,8 @@ use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo}
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{
-    Encoder, EncoderConfig, SlotEncodeError, KEY_ENCODER, KEY_TIMEOUT_MS, KEY_WRITER,
+    Encoder, EncoderConfig, RefInvalidation, SlotEncodeError, KEY_ENCODER, KEY_TIMEOUT_MS,
+    KEY_WRITER,
 };
 use super::scaler::{ReadbackFormat, Scaler, TextureReader};
 use super::tuning;
@@ -62,6 +63,11 @@ pub struct Pipeline {
     wake: crossbeam_channel::Sender<()>,
     pub max_bitrate_bps: u32,
     pub h264_profile: H264Profile,
+    /// Loss recovery that is not a keyframe. The transport writes receipts into it from
+    /// transport-wide feedback; the encode thread reads them at its next submit. Inert — and the
+    /// transport falls back to its keyframe request — on any encoder with no long-term reference
+    /// slots, which `RepairState::set_ltr_slots(0)` is how a backend says.
+    pub repair: Arc<crate::streamer::repair::RepairState>,
 }
 
 impl Pipeline {
@@ -73,6 +79,18 @@ impl Pipeline {
     pub fn set_target_bitrate(&self, bps: u32) {
         self.target_bitrate.store(bps, Ordering::Relaxed);
         let _ = self.wake.try_send(());
+    }
+
+    /// Ask for a repair frame instead of a keyframe, if the client is known to hold a reference.
+    ///
+    /// Returns whether the request was taken; `false` means the caller must fall back to
+    /// `request_idr`, which is what every session did before this existed.
+    pub fn request_repair(&self) -> bool {
+        if !self.repair.request_repair() {
+            return false;
+        }
+        let _ = self.wake.try_send(());
+        true
     }
 }
 
@@ -204,7 +222,7 @@ pub(crate) fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> 
 }
 
 fn effective_vendor(cfg: &Config) -> crate::streamer::config::EncoderVendor {
-    if cfg.disable_gpu_encode {
+    if cfg.software_encode_now() {
         crate::streamer::config::EncoderVendor::Software
     } else {
         cfg.encoder_vendor
@@ -214,6 +232,7 @@ fn effective_vendor(cfg: &Config) -> crate::streamer::config::EncoderVendor {
 pub fn start(cfg: &Config) -> Result<Pipeline> {
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
+    let repair = Arc::new(crate::streamer::repair::RepairState::new());
     let target_bitrate = Arc::new(AtomicU32::new(0));
     let telemetry = SessionTelemetry::new_shared();
 
@@ -231,6 +250,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             wake,
             max_bitrate_bps: SP_BITRATE_BPS,
             h264_profile: cfg.h264_profile,
+            repair: Arc::clone(&repair),
         };
         let workload = cfg.workload;
         let counter = cfg.counter;
@@ -251,6 +271,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                 synthetic_pattern_loop(
                     tx,
                     idr_request,
+                    repair,
                     target_bitrate,
                     enc,
                     wake_rx,
@@ -276,6 +297,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             &info,
             tx,
             idr_request,
+            repair,
             target_bitrate,
             telemetry,
         )?;
@@ -288,6 +310,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         &info,
         tx.clone(),
         Arc::clone(&idr_request),
+        Arc::clone(&repair),
         Arc::clone(&target_bitrate),
         Arc::clone(&telemetry),
     ) {
@@ -319,6 +342,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                 &info,
                 tx,
                 idr_request,
+                repair,
                 target_bitrate,
                 telemetry,
             )
@@ -370,6 +394,7 @@ impl SessionCapture {
 pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCapture> {
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
+    let repair = Arc::new(crate::streamer::repair::RepairState::new());
     let target_bitrate = Arc::new(AtomicU32::new(0));
     let telemetry = SessionTelemetry::new_shared();
 
@@ -384,6 +409,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
             &info,
             tx,
             idr_request,
+            repair,
             target_bitrate,
             telemetry,
         )?;
@@ -399,6 +425,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         &info,
         tx.clone(),
         Arc::clone(&idr_request),
+        Arc::clone(&repair),
         Arc::clone(&target_bitrate),
         Arc::clone(&telemetry),
     ) {
@@ -421,6 +448,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
                 &info,
                 tx,
                 idr_request,
+                repair,
                 target_bitrate,
                 telemetry,
             )
@@ -440,6 +468,7 @@ fn start_live_capture(
     info: &MonitorInfo,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
+    repair: Arc<crate::streamer::repair::RepairState>,
     target_bitrate: Arc<AtomicU32>,
     telemetry: SharedTelemetry,
 ) -> Result<(Pipeline, CaptureControl<LiveCapture, anyhow::Error>)> {
@@ -460,6 +489,7 @@ fn start_live_capture(
         wake,
         max_bitrate_bps: config.max_bitrate_bps,
         h264_profile: cfg.h264_profile,
+        repair: Arc::clone(&repair),
     };
 
     // Every one of these is applied only where the OS exposes the property; the ones it does not
@@ -480,6 +510,7 @@ fn start_live_capture(
             native_h: info.height,
             tx,
             idr_request,
+            repair,
             target_bitrate,
             wake_rx,
             telemetry,
@@ -524,6 +555,7 @@ fn start_dxgi_capture(
     info: &MonitorInfo,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
+    repair: Arc<crate::streamer::repair::RepairState>,
     target_bitrate: Arc<AtomicU32>,
     telemetry: SharedTelemetry,
 ) -> Result<(Pipeline, DxgiControl)> {
@@ -542,6 +574,7 @@ fn start_dxgi_capture(
         wake,
         max_bitrate_bps: config.max_bitrate_bps,
         h264_profile: cfg.h264_profile,
+        repair: Arc::clone(&repair),
     };
 
     tprintln!(
@@ -569,6 +602,7 @@ fn start_dxgi_capture(
         frame_duration,
         tx,
         idr_request,
+        repair,
         target_bitrate,
         wake_rx,
         stop: Arc::clone(&stop),
@@ -869,6 +903,7 @@ struct DxgiThreadArgs {
     frame_duration: Duration,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
+    repair: Arc<crate::streamer::repair::RepairState>,
     target_bitrate: Arc<AtomicU32>,
     wake_rx: crossbeam_channel::Receiver<()>,
     stop: Arc<AtomicBool>,
@@ -885,6 +920,11 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
         frame_duration,
         tx,
         idr_request,
+        // The repair tier is wired into the NVENC zero-copy ring only, which is the default path
+        // on any NVIDIA host. DXGI duplication is the fallback and keeps keyframe-only recovery;
+        // leaving the slot count at zero is how it says so, and the transport reads that and goes
+        // on asking for keyframes.
+        repair: _,
         target_bitrate,
         wake_rx,
         stop,
@@ -1260,6 +1300,8 @@ struct CaptureFlags {
     native_h: u32,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
+    repair: Arc<crate::streamer::repair::RepairState>,
+
     target_bitrate: Arc<AtomicU32>,
     wake_rx: crossbeam_channel::Receiver<()>,
     telemetry: SharedTelemetry,
@@ -1764,6 +1806,7 @@ impl AsyncNvencRing {
         initial_bitrate: u32,
         last_frame_at: Arc<AtomicU64>,
         idr_request: Arc<AtomicBool>,
+        repair: Arc<crate::streamer::repair::RepairState>,
         wake_rx: crossbeam_channel::Receiver<()>,
         frame_duration: Duration,
         epoch: Instant,
@@ -1795,6 +1838,7 @@ impl AsyncNvencRing {
                 target_bitrate,
                 initial_bitrate,
                 idr_request: Arc::clone(&idr_request),
+                repair: Arc::clone(&repair),
                 wake_rx,
                 frame_duration,
                 stop: Arc::clone(&stop),
@@ -1961,6 +2005,7 @@ struct RingEncodeArgs {
     target_bitrate: Arc<AtomicU32>,
     initial_bitrate: u32,
     idr_request: Arc<AtomicBool>,
+    repair: Arc<crate::streamer::repair::RepairState>,
     wake_rx: crossbeam_channel::Receiver<()>,
     frame_duration: Duration,
     stop: Arc<AtomicBool>,
@@ -2031,6 +2076,7 @@ fn ring_encode_thread(args: RingEncodeArgs) {
         target_bitrate,
         initial_bitrate,
         idr_request,
+        repair,
         wake_rx,
         frame_duration,
         stop,
@@ -2039,6 +2085,18 @@ fn ring_encode_thread(args: RingEncodeArgs) {
     } = args;
 
     let _thread_tuning = tuning::tune_current_thread();
+    // Tell the transport what loss recovery is available here. Zero slots leaves
+    // `RepairState::can_repair` false for the session, so the transport keeps asking for
+    // keyframes exactly as it did before this existed.
+    repair.set_ltr_slots(encoder.ltr_slots());
+    if encoder.ltr_slots() > 0 {
+        tprintln!(
+            "NVENC: {} long-term reference slot(s); a lost frame can be repaired without an IDR",
+            encoder.ltr_slots()
+        );
+    }
+    // Reused, because the encode thread does not allocate per frame.
+    let mut lost_frames: Vec<u64> = Vec::with_capacity(8);
     let mut current_bitrate = initial_bitrate;
     let mut bitrate_warned = false;
     const KEEPALIVE: Duration = Duration::from_millis(200);
@@ -2132,9 +2190,34 @@ fn ring_encode_thread(args: RingEncodeArgs) {
             &mut current_bitrate,
             &mut bitrate_warned,
         );
+        // Everything the transport learned since the last submit, applied to this picture. The
+        // order matters: drop what the client never received *before* deciding what to predict
+        // from, or the repair frame can reference a picture that is on its way out of the DPB.
+        repair.take_lost(&mut lost_frames);
+        for lost in lost_frames.drain(..) {
+            if encoder.invalidate_reference(lost) == RefInvalidation::Unsupported {
+                // The engine cannot do this at all; stop the transport asking.
+                repair.set_ltr_slots(0);
+                break;
+            }
+        }
+        let action = repair.take_action();
+        if action.use_ltr_bitmap != 0 {
+            encoder.use_ltr(action.use_ltr_bitmap);
+        }
+        if action.mark_ltr {
+            if let Some(slot) = encoder.mark_ltr() {
+                repair.note_marked(slot, encoder.next_frame_index());
+            }
+        }
+        let submitted_index = encoder.next_frame_index();
         match encoder.encode_input_slot(msg.slot, msg.force_idr) {
             Ok(au) => {
                 timing.mark_encode_done();
+                repair.note_encoded(
+                    crate::streamer::audio::host_instant_to_ns(msg.capture),
+                    submitted_index,
+                );
                 telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(EncodedFrame {
                     data: Bytes::from(au),
@@ -2498,6 +2581,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             native_h,
             tx,
             idr_request,
+            repair,
             target_bitrate,
             wake_rx,
             telemetry,
@@ -2548,6 +2632,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                         config.bitrate_bps,
                         Arc::clone(&last_frame_at),
                         Arc::clone(&idr_request),
+                        Arc::clone(&repair),
                         wake_rx,
                         frame_duration,
                         epoch,
@@ -2789,6 +2874,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 fn synthetic_pattern_loop(
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
+    // The synthetic probe path encodes a generated pattern with no client attached, so there are
+    // no receipts to act on and the slot count stays zero.
+    _repair: Arc<crate::streamer::repair::RepairState>,
+
     target_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
     wake_rx: crossbeam_channel::Receiver<()>,
