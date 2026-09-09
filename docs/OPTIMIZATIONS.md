@@ -268,6 +268,27 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 
 ## Notes
 
+### Decision: mac-closeout`s AirPlay NTP instrumentation supersedes the core-closeout mirror`s
+
+Two branches instrumented the AirPlay mirror stream`s plaintext timestamps independently, and
+both were written before either could see the other. The Mac mirror worktree `_wt/core-closeout`
+carried `ntp_now` / `ntp_delta_ns` / `plausible` (660 lines of `airplay/mirror.rs`);
+`mac-closeout` carried `ntp_fixed_to_ns` / `plausible_sender_seconds` (871 lines) and is the one
+that reached `latency-overhaul`.
+
+The orchestrator`s decision is that mac-closeout`s version stands. It is the larger and the
+more careful of the two: `plausible_sender_seconds` validates the sender clock as an uptime
+against a 400-day ceiling, which is what actually decides the stamp`s byte order from a single
+sample, where the mirror`s `plausible` only bounded a latency window.
+
+The mirror branch was diffed against the survivor before being dropped, and one piece of
+coverage was genuinely missing rather than merely differently spelled: every surviving
+assertion about the fixed-point conversion used a whole second (`1 << 32`), whose low 32 bits
+are zero, so nothing exercised the fractional half. That assertion is ported as
+`a_sub_second_ntp_value_converts_through_its_fraction`. Nothing else in the mirror was unique.
+
+Dropped with the branch: commits `5d44688df` and `497d13e70` on the Mac.
+
 ### What the core close-out could not verify here
 
 Seven of the rows above are COMPILE-CHECKED or unit-tested only, each because the acceptance test
