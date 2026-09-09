@@ -26,8 +26,10 @@ pub(crate) fn show_measurements() {
 }
 
 mod amd_layout;
+mod h264;
 mod intel_encoder;
 mod intel_layout;
+mod nvenc_encoder;
 mod nvenc_layout;
 mod pipeline;
 mod scaler;
