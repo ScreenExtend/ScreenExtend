@@ -44,6 +44,25 @@ jobs:
       - name: install frontend dependencies
         run: pnpm install
 
+      # The 10.15-12.x system-audio tier ships as a signed, notarized AudioServerPlugIn
+      # package that `install_audio_driver` resolves out of the app bundle. It is gitignored,
+      # so it has to be built here; without it the bundler copies nothing and the shipped app
+      # offers an Install button that can only fail.
+      #
+      # Each credentialed step inside release.sh skips itself, loudly, when its identity is
+      # absent -- so a fork without these secrets still produces an app, just one whose audio
+      # package is unsigned and therefore refused by Gatekeeper on the user's machine.
+      - name: build the macOS audio driver package
+        if: matrix.platform == 'macos-latest'
+        env:
+          SE_SIGN_IDENTITY: ${{ secrets.SE_SIGN_IDENTITY }}
+          SE_INSTALLER_IDENTITY: ${{ secrets.SE_INSTALLER_IDENTITY }}
+          SE_NOTARY_PROFILE: ${{ secrets.SE_NOTARY_PROFILE }}
+          SE_ARCHS: 'x86_64 arm64'
+        run: |
+          bash src-tauri/macos/ScreenExtendAudio/scripts/release.sh
+          ls -l src-tauri/resources/ScreenExtendAudio.pkg
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -62,6 +81,71 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Everything below runs before `finalize-release`, which is what publishes the draft, so
+      # a failure here leaves the release unpublished rather than shipping a broken bundle.
+
+      # `src-tauri/Info.plist` reaches the bundle by a Tauri convention (a file of that exact
+      # name beside the config is merged into the generated Contents/Info.plist) and, since
+      # this change, by an explicit `bundle.macOS.infoPlist` too. Nothing asserted either, and
+      # the failure mode is silent until it is fatal: a missing NSAudioCaptureUsageDescription
+      # is a hard process kill the first time a user enables System Audio.
+      #
+      # NSSupportsAutomaticGraphicsSwitching is the same file's other load-bearing key: without
+      # it a dual-GPU Mac pins the discrete GPU on for the app's whole lifetime (QA1734).
+      - name: bundled Info.plist carries the keys the app cannot run without
+        if: matrix.platform == 'macos-latest'
+        run: |
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+                     -maxdepth 1 -name 'ScreenExtend.app' | head -1)
+          if [ -z "$app" ]; then echo "::error::no ScreenExtend.app was produced"; exit 1; fi
+          plist="$app/Contents/Info.plist"
+          for key in NSAudioCaptureUsageDescription NSAppTransportSecurity \
+                     NSSupportsAutomaticGraphicsSwitching LSMinimumSystemVersion; do
+            if ! /usr/libexec/PlistBuddy -c "Print :$key" "$plist" >/dev/null 2>&1; then
+              echo "::error::$key is missing from the bundled Info.plist"
+              exit 1
+            fi
+          done
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist"
+          if [ ! -f "$app/Contents/Resources/resources/ScreenExtendAudio.pkg" ]; then
+            echo "::error::the audio driver package is not in the bundle; the 10.15-12.x \
+                  system-audio tier would be unreachable in this release"
+            exit 1
+          fi
+
+      # TCC keys a grant on (service, bundle id) plus a `csreq` blob captured at grant time, so
+      # an identity that drifts between releases shows the user a ticked Screen Recording box
+      # over a grant that no longer applies -- and on macOS 15 an ad-hoc identity reads as
+      # denied however the user answered. The expected requirement is checked in beside the
+      # resource provenance; see docs/manual-tests/macos-app-signing.md for how to re-seed it.
+      - name: macOS code identity is stable and Developer ID
+        if: matrix.platform == 'macos-latest'
+        run: |
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos \
+                     -maxdepth 1 -name 'ScreenExtend.app' | head -1)
+          codesign -dv --verbose=4 "$app" 2>&1 | tee /tmp/codesign.txt
+          if grep -qi 'Signature=adhoc' /tmp/codesign.txt; then
+            echo "::error::the app is ad-hoc signed; TCC grants cannot survive a rebuild"
+            exit 1
+          fi
+          if ! grep -q 'TeamIdentifier=' /tmp/codesign.txt \
+             || grep -q 'TeamIdentifier=not set' /tmp/codesign.txt; then
+            echo "::error::the app carries no Team ID"
+            exit 1
+          fi
+          codesign -d -r- "$app" 2>&1 | sed -n 's/^designated => //p' > /tmp/dr.txt
+          echo "designated requirement:"; cat /tmp/dr.txt
+          expected=src-tauri/resources/EXPECTED_DESIGNATED_REQUIREMENT.txt
+          if [ -s "$expected" ]; then
+            if ! diff -u "$expected" /tmp/dr.txt; then
+              echo "::error::the designated requirement changed; every existing TCC grant \
+                    will stop matching. If this is intentional, update $expected."
+              exit 1
+            fi
+          else
+            echo "::warning::$expected is absent; seed it with the requirement printed                   above (docs/manual-tests/macos-app-signing.md) so the next release is gated"
+          fi
 
       # The release is a draft until `finalize-release` publishes it, and that job needs this
       # one, so failing here leaves the draft unpublished. One link-time reference to an API

@@ -304,11 +304,22 @@ function GlobalState({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!loaded) return;
-    const stored = localStorage.getItem("disconnectGraceSecs");
-    const seconds = Number(stored);
-    if (stored !== null && Number.isFinite(seconds) && seconds >= 0) {
-      void commands.setDisconnectGrace(seconds).catch(e => console.error("setDisconnectGrace on load failed", e));
-    }
+    void (async () => {
+      // One-time migration: this used to live in localStorage, which `ScreenExtend serve`
+      // cannot read, so a configured grace was silently ignored by the headless host.
+      const legacy = localStorage.getItem("disconnectGraceSecs");
+      if (legacy !== null) {
+        const migrated = Number(legacy);
+        if (Number.isFinite(migrated) && migrated >= 0) {
+          await updateConfig({ disconnectGraceSecs: Math.round(migrated) });
+        }
+        localStorage.removeItem("disconnectGraceSecs");
+      }
+      const seconds = (await getConfig())?.disconnectGraceSecs;
+      if (typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0) {
+        await commands.setDisconnectGrace(seconds);
+      }
+    })().catch(e => console.error("applying the saved disconnect grace failed", e));
   }, [loaded]);
 
   useEffect(() => {

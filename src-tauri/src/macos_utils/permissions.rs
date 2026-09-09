@@ -192,6 +192,12 @@ static SCREEN_REQUESTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// `AXUIElementSetMessagingTimeout` on the system-wide element sets the default for
 /// *every* accessibility message this process sends, not just this one — a second
 /// reason to keep this call off the hot path and out of the primary read.
+///
+/// The timeout is therefore restored before returning. There is no getter, but Apple
+/// documents 0 as "use the system default", so setting it back to 0 is the restore.
+/// Without it a single permission read left remote input (`streamer/input/macos.rs`) and
+/// the AirPlay menu-extra walk (`airplay/ax.rs`) on a 0.5 s ceiling for the rest of the
+/// process's life, having never asked for one.
 fn accessibility_api_probe() -> Option<AxSecondary> {
     unsafe {
         let el = AXUIElementCreateSystemWide();
@@ -205,6 +211,7 @@ fn accessibility_api_probe() -> Option<AxSecondary> {
         if !value.is_null() {
             CFRelease(value);
         }
+        AXUIElementSetMessagingTimeout(el, 0.0);
         CFRelease(el);
         Some(match err {
             AX_ERROR_API_DISABLED => AxSecondary::ApiDisabled,
@@ -644,9 +651,9 @@ pub fn identity_report() -> IdentityReport {
 // Commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-#[specta::specta]
-pub fn check_permissions() -> Vec<PermissionStatus> {
+/// The probe itself, for callers that are already off the main thread — `ScreenExtend
+/// doctor`, and the async command below.
+pub fn probe_permissions() -> Vec<PermissionStatus> {
     let (ax_state, ax_relaunch, ax_detail) = accessibility_status();
     let (sr_state, sr_relaunch, sr_detail) = screen_recording_status();
     vec![
@@ -674,14 +681,44 @@ pub fn check_permissions() -> Vec<PermissionStatus> {
     ]
 }
 
+/// Warm the window-list probe so its cold cost — 37 ms on 10.15.8, CoreGraphics
+/// establishing its WindowServer connection — is paid on a background thread at startup
+/// rather than inside the first `check_permissions`, which lands mid-launch.
+pub fn prime() {
+    std::thread::Builder::new()
+        .name("se-perm-warm".into())
+        .spawn(|| {
+            let _ = window_name_probe();
+        })
+        .ok();
+}
+
+/// A plain `fn` command runs on the main thread. Nothing here needs to: the window-list
+/// read is CoreGraphics IPC and `AXIsProcessTrusted` is a syscall, so both belong on a
+/// blocking thread even at well under a millisecond apiece.
 #[tauri::command]
 #[specta::specta]
-pub fn request_permission(key: String) -> bool {
-    match key.as_str() {
+pub async fn check_permissions() -> Vec<PermissionStatus> {
+    tauri::async_runtime::spawn_blocking(probe_permissions)
+        .await
+        .unwrap_or_else(|e| {
+            teprintln!("[permissions] the permission probe thread failed: {e}");
+            probe_permissions()
+        })
+}
+
+/// `CGRequestScreenCaptureAccess` blocks until the user dismisses the OS prompt, which is
+/// seconds of a frozen window if it runs on the main thread.
+#[tauri::command]
+#[specta::specta]
+pub async fn request_permission(key: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || match key.as_str() {
         KEY_ACCESSIBILITY => prompt_accessibility(),
         KEY_SCREEN_RECORDING => request_screen_recording(),
         _ => false,
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 const SETTINGS_PANE_MODERN: &str =

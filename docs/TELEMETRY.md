@@ -180,9 +180,16 @@ error per channel.
 
 `frames_dropped_capture` is presents the OS coalesced away because the host was still busy with
 the previous frame: DXGI's `AccumulatedFrames` past the first, which the dirty-region check read
-as a `> 1` early-out and never counted. It is the Windows counterpart of the macOS
-`CGDisplayStreamUpdateGetDropCount` reading, which reports through the log bus rather than a
-counter because the capture backend is constructed before the session's telemetry exists.
+as a `> 1` early-out and never counted. **macOS feeds the same counter**, from
+`CGDisplayStreamUpdateGetDropCount` on every CGDisplayStream delivery — read before the
+dirty-rect early-out, because a delivery with nothing dirty can still be reporting frames dropped
+on the way to it. The two platforms are therefore comparable in this cell, which was the point of
+not filing the macOS number under `frames_dropped_ring` (ours, between capture and encode).
+
+The macOS backend also logs it: once a second while it changes, and once on the stop line beside
+the frame count and the mean time spent in the delivery callback. The log is not redundant with
+the counter — a capture backend is constructed before the session's telemetry exists, so the very
+first drops of a session reach the log and nothing else.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.

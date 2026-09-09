@@ -1,14 +1,23 @@
 use crate::PermissionStatus;
 
+/// Nothing on Linux is gated behind a user-granted permission, so the list is empty and the
+/// probe costs nothing. It exists so the command surface matches macOS.
+pub fn probe_permissions() -> Vec<PermissionStatus> {
+    Vec::new()
+}
+
+/// Counterpart to the macOS warm-up; there is no probe here to warm.
+pub fn prime() {}
+
 #[tauri::command]
 #[specta::specta]
-pub fn check_permissions() -> Vec<PermissionStatus> {
-    Vec::new()
+pub async fn check_permissions() -> Vec<PermissionStatus> {
+    probe_permissions()
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn request_permission(_key: String) -> bool {
+pub async fn request_permission(_key: String) -> bool {
     true
 }
 
