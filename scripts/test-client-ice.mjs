@@ -45,6 +45,8 @@ const source = [
   takeConst('ICE_HOST_GRACE_MS'),
   takeConst('ICE_RELAY_GRACE_MS'),
   takeConst('TRICKLE_MAX_BATCH'),
+  takeConst('TRICKLE_FIRST_ACK_MS'),
+  takeFunction('trickleIsFatal'),
   takeFunction('iceCandidateType'),
   takeFunction('iceGraceFor'),
   takeFunction('waitForIceGathering'),
@@ -56,6 +58,7 @@ const source = [
   // `const` is lexically scoped to the script and never reaches the context object.
   'this.__grace = { host: ICE_HOST_GRACE_MS, relay: ICE_RELAY_GRACE_MS };',
   'this.__maxBatch = TRICKLE_MAX_BATCH;',
+  'this.__firstAckMs = TRICKLE_FIRST_ACK_MS;',
 ].join('\n');
 
 let deadlineBits = 0;
@@ -73,6 +76,9 @@ const ctx = {
   noteSuppressed() { suppressed++; },
   fetch(url, opts) {
     patches.push({ url, opts });
+    // A request that is accepted by the socket and then never answered — the case the
+    // first-ack deadline exists for. A promise that never settles is exactly that.
+    if (ctx.__hangFetch) return new Promise(() => {});
     const status = nextPatchStatus;
     return Promise.resolve({ status, ok: status >= 200 && status < 300 });
   },
@@ -288,24 +294,99 @@ async function trickle() {
     t.stop();
   }
 
-  // A transient failure retries once and then gives up rather than spinning.
+  // A transient failure retries once; a second failure is the endpoint, and because the offer
+  // that went out carries no candidates at all, that has to reach the page rather than be a
+  // silent drop.
   {
     patches.length = 0;
     nextPatchStatus = 500;
+    let deadReason = null;
     const pc = fakePc();
-    const t = ctx.startTrickle(pc);
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; });
     t.open('/whep/abc', '');
     pc.emitCandidate('relay');
     for (let i = 0; i < 6; i++) await settle();
     if (patches.length !== 2) fail('a failed PATCH was retried ' + (patches.length - 1) + ' times, expected exactly 1');
     else if (patches[1].opts.body.indexOf('typ relay') < 0) fail('the retry did not carry the candidate back');
     else ok('a failed PATCH puts its candidates back and retries once');
+    if (!deadReason) fail('a second failure did not report the sender dead');
+    else ok('a second failure in a row reports the sender dead: ' + deadReason);
     const after = patches.length;
     pc.emitCandidate('host');
     for (let i = 0; i < 4; i++) await settle();
-    if (patches.length > after + 1) fail('a second failure kept retrying (' + patches.length + ' PATCHes)');
-    else ok('a second failure in a row is the endpoint, so the sender stops retrying');
+    if (patches.length > after) fail('the sender kept PATCHing after reporting dead (' + patches.length + ')');
+    else ok('a dead sender stops rather than spinning against the endpoint');
+    if (pc.listenerCount() !== 0) fail('a dead sender stayed subscribed');
+    else ok('a dead sender unsubscribes');
     nextPatchStatus = 204;
+    t.stop();
+  }
+
+  // A status that means "this verb will never work here" does not wait for a second try.
+  for (const status of [403, 405, 415, 501]) {
+    if (!ctx.trickleIsFatal(status)) { fail(status + ' is not treated as fatal'); continue; }
+    patches.length = 0;
+    nextPatchStatus = status;
+    let deadReason = null;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; });
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    for (let i = 0; i < 4; i++) await settle();
+    if (patches.length !== 1) fail(status + ' was retried instead of failing at once');
+    else if (!deadReason) fail(status + ' did not report the sender dead');
+    else ok('PATCH ' + status + ' fails at once rather than retrying a verb the endpoint refuses');
+    nextPatchStatus = 204;
+    t.stop();
+  }
+  if (ctx.trickleIsFatal(404) || ctx.trickleIsFatal(500) || ctx.trickleIsFatal(204)) {
+    fail('a non-fatal status was classed as fatal');
+  } else ok('404, 500 and 204 are not fatal statuses');
+
+  // A PATCH that is never answered at all: nothing above can fire, so the deadline is the only
+  // thing that notices.
+  {
+    patches.length = 0;
+    let deadReason = null;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; });
+    ctx.__hangFetch = true;
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    await sleep(ctx.__firstAckMs + 200);
+    if (!deadReason) fail('a black-holed PATCH was never noticed');
+    else ok('a PATCH that never settles is reported dead after the first-ack deadline');
+    ctx.__hangFetch = false;
+    t.stop();
+  }
+
+  // Nothing was ever attempted — a network with no candidates at all — so there is nothing to
+  // blame on the endpoint and no rejoin to ask for.
+  {
+    let deadReason = null;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; });
+    t.open('/whep/abc', '');
+    await sleep(ctx.__firstAckMs + 200);
+    if (deadReason) fail('a session that produced no candidates was blamed on the endpoint');
+    else ok('no candidates means no PATCH and no failure to report');
+    t.stop();
+  }
+
+  // A duplicate sitting behind a fresh candidate is still filtered.
+  {
+    patches.length = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    const inOffer = 'candidate:9 1 udp 2 10.9.9.9 5000 typ host';
+    pc.emit({ candidate: cand('candidate:8 1 udp 2 10.8.8.8 5000 typ srflx') });
+    pc.emit({ candidate: cand(inOffer) });
+    t.open('/whep/abc', 'v=0\r\na=' + inOffer + '\r\n');
+    await settle();
+    if (patches.length !== 1) fail('expected one PATCH, got ' + patches.length);
+    else if (patches[0].opts.body.indexOf('10.9.9.9') >= 0) fail('a duplicate behind a fresh candidate was trickled');
+    else if (patches[0].opts.body.indexOf('10.8.8.8') < 0) fail('the fresh candidate was dropped by the filter');
+    else ok('the duplicate filter covers the whole batch, not just its head');
     t.stop();
   }
 
