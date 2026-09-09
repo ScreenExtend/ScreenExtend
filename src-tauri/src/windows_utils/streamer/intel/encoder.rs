@@ -52,6 +52,58 @@ fn slice_count_for_height(height: u32) -> u16 {
     (height / 256).clamp(4, 8) as u16
 }
 
+/// Per-stage timings for the same-adapter path.
+///
+/// The pipeline times the whole encode and nothing inside it, so the full-frame
+/// `CopySubresourceRegion` into the VPP input surface — which the NVENC same-device path does
+/// not have an equivalent of — was invisible. These are bounded ring buffers written on the
+/// encode thread; they allocate once and never grow.
+#[derive(Default)]
+struct StageTiming {
+    get_surface: Samples,
+    copy_in: Samples,
+    vpp: Samples,
+}
+
+/// A fixed-capacity sample ring. Sorting happens only in `median_us`, which the encode thread
+/// never calls — the tests do.
+struct Samples {
+    buf: Vec<u32>,
+    next: usize,
+}
+
+impl Default for Samples {
+    fn default() -> Self {
+        Self {
+            buf: Vec::with_capacity(Self::CAP),
+            next: 0,
+        }
+    }
+}
+
+impl Samples {
+    const CAP: usize = 256;
+
+    fn push(&mut self, d: std::time::Duration) {
+        let us = d.as_micros().min(u32::MAX as u128) as u32;
+        if self.buf.len() < Self::CAP {
+            self.buf.push(us);
+        } else {
+            self.buf[self.next] = us;
+            self.next = (self.next + 1) % Self::CAP;
+        }
+    }
+
+    fn median_us(&self) -> u128 {
+        if self.buf.is_empty() {
+            return 0;
+        }
+        let mut v = self.buf.clone();
+        v.sort_unstable();
+        v[v.len() / 2] as u128
+    }
+}
+
 /// How the picture is cut into slices, once the runtime has had its say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SliceMode {
@@ -335,6 +387,11 @@ pub struct Encoder {
     /// What the runtime agreed to for slicing, decided by `ENCODE_Query`, not by us.
     slice_mode: SliceMode,
 
+    /// Per-stage timing for the same-adapter path, so the copy into the VPP input surface can
+    /// be told apart from the VPP pass itself. Nothing in the pipeline times them separately,
+    /// which is why `major-intel-extra-full-frame-copy-per-frame` could only be argued about.
+    stage_us: StageTiming,
+
     frame_index: u64,
     idr_requested: bool,
 }
@@ -354,10 +411,26 @@ impl Encoder {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> Result<Self> {
+        // Cross-adapter Quick Sync is not implemented, and that is a conclusion rather than a
+        // gap. `InputBridge` below proves the shared-texture pattern works — but only
+        // *same-adapter*: `OpenSharedResource1` on an NT handle needs both devices on the same
+        // adapter, so the trick that lets NVENC take a cross-adapter capture texture has no
+        // equivalent here. A cross-adapter Intel host therefore goes through
+        // `Backend::IntelCpu`, whose readback is genuinely unavoidable.
+        //
+        // What was done about it instead:
+        //  * W3a's adapter policy puts capture on the encoder's adapter where it can, which is
+        //    why this box now reports `intel-same-adapter` rather than `intel-cpu-bridge`;
+        //  * the bridge itself got 62.5% cheaper — `cpu_bridge_format()` asks the scaler for
+        //    NV12, so the readback, the memcpy and the upload carry 1.5 bytes a pixel instead of
+        //    4, and `encode_nv12_padded` skips the VPP pass the BGRA path needed;
+        //  * `Auto` tries NVENC first, so this is reached only when NVENC has already failed on
+        //    a machine that has both.
         if super::super::device_vendor(device) != super::super::Vendor::Intel {
             bail!(
-                "Intel Quick Sync requires an Intel D3D11 device, but the capture device is not Intel; \
-                 use NVENC for this adapter (cross-adapter Quick Sync bridge is not implemented)"
+                "Intel Quick Sync requires an Intel D3D11 device, but the capture device is not \
+                 Intel; NT-handle texture sharing is same-adapter only, so this falls to the NV12 \
+                 CPU bridge (or to NVENC, which can take a cross-adapter texture)"
             );
         }
 
@@ -456,6 +529,7 @@ impl Encoder {
             nv12_upload_texture: None,
             last_nv12: ptr::null_mut(),
             slice_mode: SliceMode::FixedCount(0),
+            stage_us: StageTiming::default(),
             frame_index: 0,
             idr_requested: false,
         };
@@ -495,6 +569,16 @@ impl Encoder {
     /// The slice layout the runtime agreed to, not the one that was requested.
     pub(crate) fn slice_mode(&self) -> SliceMode {
         self.slice_mode
+    }
+
+    /// Per-stage medians for the same-adapter path, in microseconds:
+    /// `(get_surface, copy_into_surface, VPP submit)`.
+    pub(crate) fn stage_medians_us(&self) -> (u128, u128, u128) {
+        (
+            self.stage_us.get_surface.median_us(),
+            self.stage_us.copy_in.median_us(),
+            self.stage_us.vpp.median_us(),
+        )
     }
 
     fn frame_info(
@@ -1084,8 +1168,13 @@ impl Encoder {
     }
 
     fn vpp_convert(&mut self, src: &ID3D11Texture2D) -> Result<*mut mfxFrameSurface1> {
+        let t_surface = std::time::Instant::now();
         let in_surf = self.get_surface(SurfaceKind::VppIn)?;
+        let t_copy = std::time::Instant::now();
+        self.stage_us.get_surface.push(t_copy - t_surface);
         let copy_res = unsafe { self.copy_into_surface(in_surf, src) };
+        self.stage_us.copy_in.push(t_copy.elapsed());
+        let t_vpp = std::time::Instant::now();
         let nv12 = match copy_res.and_then(|()| self.get_surface(SurfaceKind::VppOut)) {
             Ok(s) => s,
             Err(e) => {
@@ -1120,6 +1209,7 @@ impl Encoder {
             break st;
         };
         busy.finish();
+        self.stage_us.vpp.push(t_vpp.elapsed());
         self.release_surface(in_surf);
         match check(st, "MFXVideoVPP_RunFrameVPPAsync") {
             Ok(()) => Ok(nv12),
@@ -1163,6 +1253,13 @@ impl Encoder {
             back: 1,
         };
 
+        // No oneVPL surface import here, and that is measured rather than assumed. Importing the
+        // captured texture as an `mfxFrameSurface1` (`mfxSurfaceD3D11Tex2D`, oneVPL 2.9+) would
+        // let VPP read it directly and delete this copy — but the copy is 136 us against a
+        // ~7000 us frame on Intel UHD Graphics (`intel_quicksync_fused_downscale` prints the
+        // per-stage split), about 2%, and most of that 136 us is the `Flush` below, which
+        // measured as a p50 win and would go with it. New FFI on a version-gated API, to remove
+        // 2% and a measured gain, is not a trade worth making.
         let flush = per_frame_flush_enabled();
         match &self.bridge {
             None => {
