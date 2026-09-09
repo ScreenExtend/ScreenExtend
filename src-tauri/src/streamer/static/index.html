@@ -1141,6 +1141,7 @@
                 let flushing = false;
                 let posted = '';
                 let sentCount = 0;
+                let failStreak = 0;
 
                 function onCandidate(ev) {
                     if (closed) return;
@@ -1167,6 +1168,17 @@
                     const batch = queue.splice(0, TRICKLE_MAX_BATCH);
                     const done = ended && !queue.length;
                     const ufrag = (batch.length && batch[0].usernameFragment) || localIceUfrag(peer);
+                    let requeued = false;
+                    // One retry, then give up. A candidate lost to a transient failure can be the
+                    // relay one, and PATCH is the only way it ever reaches the host — but a second
+                    // failure in a row is the endpoint, not the packet, and retrying into it
+                    // forever would be a spin.
+                    function requeue() {
+                        noteSuppressed();
+                        if (failStreak++ > 0) return;
+                        requeued = true;
+                        for (let i = batch.length - 1; i >= 0; i--) queue.unshift(batch[i]);
+                    }
                     flushing = true;
                     fetch(url, {
                         method: 'PATCH',
@@ -1176,13 +1188,13 @@
                         // 404 is the session being over, not a transport failure: there is
                         // nothing left to send it to.
                         if (r.status === 404) { stop(); return; }
-                        if (r.ok) sentCount += batch.length;
-                        else noteSuppressed();
+                        if (r.ok) { sentCount += batch.length; failStreak = 0; return; }
+                        requeue();
                     }, function () {
-                        noteSuppressed();
+                        requeue();
                     }).then(function () {
                         flushing = false;
-                        if (done) stop(); else flush();
+                        if (done && !requeued) stop(); else flush();
                     });
                 }
 
