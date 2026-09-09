@@ -2036,3 +2036,15 @@ Anyone touching `src/` should do that run before declaring a pass finished.
   20.97 / 31.46 / 37.75 / 42.21 ms on `intel-same-adapter`; real frames per 30 s 31–51 → 2 183–4 492;
   under contention the max is unchanged (21.49 → 21.17 ms) while the rate drops 150 → 102 fps and a
   concurrent compile slows 2.6 %.
+
+### 15.1 Post-report fix from the owner's first launch
+
+Running the freshly built NSIS installer on the Windows box removed the virtual display driver
+(the installer's pre-existing pre-uninstall hook runs `removedrivers` on a non-update install)
+and the first launch then showed **"Unsupported Operating System — Virtual Display Driver: Not
+installed"** with only an Exit button. Two defects, both fixed after this report was written
+(ledger row 308): the Windows compatibility probe reported the missing driver as `blocking`
+(now `installable`, and the bootstrap routes it to the elevated driver install + retry that
+every first launch used before the probe existed), and `doctor`'s certificate check asked
+`certutil` for the wrong subject and always reported the signing certificate absent. Both are in
+the final commit and the rebuilt bundles.
