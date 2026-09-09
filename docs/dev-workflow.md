@@ -52,9 +52,34 @@ Windows, from `src-tauri/`: `cargo fmt --check`, `cargo clippy --all-targets -- 
 `cargo test`; from the root when `src/` or `src/lib/bindings.ts` changed: `pnpm lint`,
 `pnpm build`, `node scripts/check-legacy-webkit.mjs`.
 
+From the root when anything under `src-tauri/src/streamer/static/` changed: `pnpm test:client`.
+That runs the six dependency-free Node harnesses over the shipped client page — the input wire
+format and telemetry frame, the Opus decode worker and its sequence gate, the jitter buffer plus
+the planar ring ABI it shares with the worker, the WebCodecs video path and the RTP-to-host-clock
+inversion A/V sync rides on, ICE gathering, and the `/reconfig` epochs. They load the real `.js`
+under `node:vm` with browser stubs, so there is no runner and no devDependency, and the served
+files stay byte-identical. `node scripts/check-legacy-webkit.mjs` covers the same directory for
+the *syntax* floor; these cover the behaviour.
+
 Mac, over SSH from `src-tauri/`: the same three cargo gates, plus
 `scripts/check-macos-dyld.sh target/release/ScreenExtend /Library/Developer/CommandLineTools/SDKs/MacOSX10.15.sdk`
 after any macOS change that touches FFI (it fails on any link-time symbol newer than 10.15).
+
+### Tests that need something the gates do not have
+
+`cargo test` deliberately runs nothing that needs a desktop session, a GPU or a real display, so
+several harnesses are `#[ignore]`d and one class of test skips at runtime. Two rules keep that
+honest, and both are enforced by convention rather than by a lint:
+
+- An `#[ignore]` carries a **reason string**, so the harness prints why rather than a bare
+  `ignored`. There are none without one outside `macos_utils/streamer/`.
+- A test that gives up on a runtime condition calls `crate::test_support::skip(what, reason)`,
+  which prints `SKIP <what>: <reason>` and **panics instead** under `SE_REQUIRE_HW=1`. A test may
+  never return green having verified nothing.
+
+`docs/manual-tests/latency-harnesses.md` is the index of the `#[ignore]`d measuring runs on both
+OSes — what each one needs, what it prints, and which metric `scripts/perf-gate.mjs` parses out
+of it.
 
 Commits are small and single-purpose; a performance commit states its measured before/after.
 Commit messages end with:
