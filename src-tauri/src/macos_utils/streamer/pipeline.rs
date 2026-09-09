@@ -165,8 +165,8 @@ fn spawn_pipeline(
         // on a later submit and the encoder simply never predicts from an unacknowledged one.
         // There is no "mark this picture", no slot number and no explicit invalidation, so
         // `RepairAction`'s `mark_ltr` / `use_ltr_bitmap` have nothing to map onto — the adapter is
-        // the acknowledgement direction plus `ForceLTRRefresh` for `request_repair`, written up in
-        // `findings/major-vt-ltr-frames-would-replace-idr-on-every-pli.md`.
+        // the acknowledgement direction plus `ForceLTRRefresh` for `request_repair`, specified in
+        // `docs/OPTIMIZATIONS.md` and deferred for want of a Mac that reports `EnableLTR`.
         //
         // The state still has to exist regardless: the transport writes feedback receipts into it
         // unconditionally, and `Encoder::supports_ltr()` already reports per session whether this

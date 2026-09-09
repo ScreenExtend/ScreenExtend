@@ -105,8 +105,9 @@ moved *by Finder*.
    `macos.executable` path under `/private/var/folders/…/AppTranslocation/…`.
 5. Expect: the permission the user grants applies to a path that will not exist next
    launch, so grants do not stick. Record whether the app says anything useful about
-   this. It currently does not offer to move itself to /Applications —
-   see `findings/major-build-mac-release-must-be-developer-id-signed-with-stable-designated-requirement.md`.
+   this. It currently does not offer to move itself to /Applications. The real fix is a
+   Developer ID signature with a stable designated requirement, which is also what stops
+   translocation happening at all.
 6. **Fail if** `doctor` reports `translocated: false` for a launch that is visibly
    running from `/AppTranslocation/`.
 
@@ -147,8 +148,8 @@ keeps showing a checkmark.
 6. **Fail if** the client keeps receiving frames showing only wallpaper and the menu
    bar with no error anywhere. Frame delivery is not proof of authorization —
    an unauthorized process still gets `FrameComplete` frames.
-7. Known gap: there is no re-probe *while* a session streams, only at pipeline
-   start. See `findings/major-permissions-no-periodic-reprobe-while-a-session-streams.md`.
+7. Known gap: there is no re-probe *while* a session streams, only at pipeline start, so
+   a grant revoked mid-session is never noticed by the host.
 
 ## 8. Accessibility is optional
 

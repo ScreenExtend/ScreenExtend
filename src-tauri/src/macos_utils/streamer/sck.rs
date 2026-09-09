@@ -1,6 +1,6 @@
-//! ScreenCaptureKit backend (primary, macOS 12.3+) — PRD §5.
+//! ScreenCaptureKit backend (primary, macOS 12.3+).
 //!
-//! ## Why this file links and loads on macOS 10.15 (resolves TODO 5.1 by construction)
+//! ## Why this file links and loads on macOS 10.15
 //!
 //! ScreenCaptureKit only exists on macOS 12.3+. A *link-time* dependency on
 //! `ScreenCaptureKit.framework` (i.e. `objc2-screen-capture-kit`, an
@@ -21,7 +21,7 @@
 //! 10.15 by construction. This is the same philosophy as
 //! [`hosted_network.rs`] (private CoreWLAN selectors via `msg_send!`) and the
 //! VideoToolbox encoder (version-gated constants via `dlsym`). It makes the
-//! historical "weak-link / dlopen ScreenCaptureKit" build task (TODO 5.1) moot:
+//! historical "weak-link / dlopen ScreenCaptureKit" build task moot:
 //! a no-link runtime path is strictly safer than `-weak_framework`.
 //!
 //! ## When this code runs
@@ -31,30 +31,30 @@
 //! runs. As a belt-and-suspenders guard, [`SckBackend::start`] re-checks each SCK
 //! class via `AnyClass::get` and bails to a [`CaptureError`] if absent.
 //!
-//! ## The flow (PRD §5)
-//!   §5.1 `+[SCShareableContent getShareableContentWithCompletionHandler:]` →
-//!        resolve the `SCDisplay` whose `displayID == self.display_id`. The async
-//!        completion handler is bridged to sync at startup with a channel + a
-//!        bounded wait (→ [`CaptureError`] on timeout).
-//!   §5.2 `-[SCContentFilter initWithDisplay:excludingWindows:]` (whole display,
-//!        empty exclusion array).
-//!   §5.3 `SCStreamConfiguration`: native `width`/`height`, `420f`,
-//!        `minimumFrameInterval` slightly *shorter* than a frame period,
-//!        `queueDepth = 8` (Apple's own documented default), `showsCursor = true`
-//!        (window-server composites the cursor into the frame — same low-latency
-//!        cursor path as the CGDisplayStream backend), `capturesAudio = false`,
-//!        and the same 709 colour handling the CGDisplayStream backend forces.
-//!   §5.4 an `SCStreamOutput` delegate built with [`ClassBuilder`]; its
-//!        `stream:didOutputSampleBuffer:ofType:` is the hot path.
-//!   §5.5 frame-status filter — forward only `SCFrameStatusComplete` (read from
-//!        the sample's `SCStreamFrameInfo` attachment).
-//!   §1.5 dirty-rect skipping — if the `SCStreamFrameInfoDirtyRects` attachment is
-//!        present and empty (zero rects changed), the frame is skipped (no
-//!        publish), avoiding a needless encode of an unchanged screen.
-//!   §5.6 zero-copy: wrap the sample's `IOSurface` in a `CVPixelBuffer` exactly
-//!        like [`super::cgds::handle_frame`] and publish a [`Frame`].
-//!   §5.7 the output is attached on a `UserInteractive` serial dispatch queue,
-//!        then `-[SCStream startCaptureWithCompletionHandler:]`.
+//! ## The flow
+//!   1. `+[SCShareableContent getShareableContentWithCompletionHandler:]` →
+//!      resolve the `SCDisplay` whose `displayID == self.display_id`. The async
+//!      completion handler is bridged to sync at startup with a channel + a
+//!      bounded wait (→ [`CaptureError`] on timeout).
+//!   2. `-[SCContentFilter initWithDisplay:excludingWindows:]` (whole display,
+//!      empty exclusion array).
+//!   3. `SCStreamConfiguration`: native `width`/`height`, `420f`,
+//!      `minimumFrameInterval` slightly *shorter* than a frame period,
+//!      `queueDepth = 8` (Apple's own documented default), `showsCursor = true`
+//!      (window-server composites the cursor into the frame — same low-latency
+//!      cursor path as the CGDisplayStream backend), `capturesAudio = false`,
+//!      and the same 709 colour handling the CGDisplayStream backend forces.
+//!   4. an `SCStreamOutput` delegate built with [`ClassBuilder`]; its
+//!      `stream:didOutputSampleBuffer:ofType:` is the hot path.
+//!   5. frame-status filter — forward only `SCFrameStatusComplete` (read from
+//!      the sample's `SCStreamFrameInfo` attachment).
+//!   6. dirty-rect skipping — if the `SCStreamFrameInfoDirtyRects` attachment is
+//!      present and empty (zero rects changed), the frame is skipped (no
+//!      publish), avoiding a needless encode of an unchanged screen.
+//!   7. zero-copy: wrap the sample's `IOSurface` in a `CVPixelBuffer` exactly
+//!      like [`super::cgds::handle_frame`] and publish a [`Frame`].
+//!   8. the output is attached on a `UserInteractive` serial dispatch queue,
+//!      then `-[SCStream startCaptureWithCompletionHandler:]`.
 //!
 //! All retained objc2 objects (stream, delegate, content, queue) are held in
 //! [`SckBackend`] for the session, mirroring how `cgds` keeps its stream/queue.
@@ -296,10 +296,10 @@ impl CaptureBackend for SckBackend {
         let cls_config = sck_class(c"SCStreamConfiguration")?;
         let cls_stream = sck_class(c"SCStream")?;
 
-        // ---- §5.1 Resolve the SCDisplay (async → sync bridge) ----
+        // ---- step 1: Resolve the SCDisplay (async → sync bridge) ----
         let display = resolve_display(cls_content, self.display_id)?;
 
-        // ---- §5.2 SCContentFilter for the whole display, no exclusions ----
+        // ---- step 2: SCContentFilter for the whole display, no exclusions ----
         // We drive `alloc`/`init` through raw `*mut AnyObject` and wrap the final
         // +1 object in `Retained::from_raw`, rather than letting `msg_send!`'s
         // typed retain-semantics machinery run (it needs a concrete `Message`
@@ -316,7 +316,7 @@ impl CaptureBackend for SckBackend {
             retain_new(f).ok_or(CaptureError::StreamCreateFailed)?
         };
 
-        // ---- §5.3 SCStreamConfiguration ----
+        // ---- step 3: SCStreamConfiguration ----
         let config = unsafe {
             let alloc: *mut AnyObject = msg_send![cls_config, alloc];
             let c: *mut AnyObject = msg_send![alloc, init];
@@ -324,7 +324,7 @@ impl CaptureBackend for SckBackend {
         };
         configure_stream(&config, &self.cfg);
 
-        // ---- §5.4 Build + populate the delegate ----
+        // ---- step 4: Build + populate the delegate ----
         let status_key = sck_optional_cfstring(c"SCStreamFrameInfoStatus");
         let dirty_rects_key = sck_optional_cfstring(c"SCStreamFrameInfoDirtyRects");
         if status_key.is_none() {
@@ -354,7 +354,7 @@ impl CaptureBackend for SckBackend {
             d
         };
 
-        // ---- §5.4 Create the stream (delegate doubles as the SCStreamDelegate) ----
+        // ---- step 4: Create the stream (delegate doubles as the SCStreamDelegate) ----
         let stream = unsafe {
             let alloc: *mut AnyObject = msg_send![cls_stream, alloc];
             let s: *mut AnyObject = msg_send![
@@ -366,7 +366,7 @@ impl CaptureBackend for SckBackend {
             retain_new(s).ok_or(CaptureError::StreamCreateFailed)?
         };
 
-        // ---- §5.7 UserInteractive serial delivery queue (same pattern as cgds) ----
+        // ---- step 8: UserInteractive serial delivery queue (same pattern as cgds) ----
         let ui_target = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
             DispatchQoS::UserInteractive,
         ));
@@ -390,7 +390,7 @@ impl CaptureBackend for SckBackend {
             return Err(CaptureError::StreamCreateFailed);
         }
 
-        // ---- §5.7 startCaptureWithCompletionHandler: (bridged to sync) ----
+        // ---- step 8: startCaptureWithCompletionHandler: (bridged to sync) ----
         let (tx, rx) = mpsc::channel::<Option<String>>();
         let handler = RcBlock::new(move |error: *mut AnyObject| {
             let msg = if error.is_null() {
@@ -523,7 +523,7 @@ unsafe fn get_ctx_ivar(delegate: &AnyObject) -> *mut OutputCtx {
     unsafe { (*slot).cast::<OutputCtx>() }
 }
 
-/// §5.1 — resolve the `SCDisplay` whose `displayID == display_id`, bridging the
+/// step 1 — resolve the `SCDisplay` whose `displayID == display_id`, bridging the
 /// async `getShareableContentWithCompletionHandler:` to a synchronous result.
 fn resolve_display(
     cls_content: &AnyClass,
@@ -601,7 +601,7 @@ unsafe fn find_display(content: &AnyObject, display_id: DisplayId) -> Option<Ret
 /// the latest-wins slot plus the encode loop's keepalive frame.
 const QUEUE_DEPTH: isize = 8;
 
-/// §5.3 — apply the low-latency SCStreamConfiguration knobs via objc2 setters.
+/// step 3 — apply the low-latency SCStreamConfiguration knobs via objc2 setters.
 fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
     let fps = cfg.fps.max(1);
     // Nine tenths of a frame period, not one.
@@ -660,7 +660,7 @@ fn set_optional_constant(config: &AnyObject, selector: Sel, symbol: &CStr) {
     }
 }
 
-/// The hot path (§5.5/§1.5/§5.6). C-ABI IMP for
+/// The hot path (steps 5-7). C-ABI IMP for
 /// `-[ScreenExtendSckOutput stream:didOutputSampleBuffer:ofType:]`.
 ///
 /// `extern "C-unwind"` so a (caught) Rust panic does not become UB crossing the
@@ -697,18 +697,18 @@ extern "C-unwind" fn did_output_sample_buffer(
     // SAFETY: valid CMSampleBuffer for the callback's duration.
     let sample_ref = unsafe { sample.as_ref() };
 
-    // ---- §5.5 frame-status gate + §1.5 dirty-rect skip ----
+    // ---- step 5: frame-status gate + step 6 dirty-rect skip ----
     if !frame_should_publish(sample_ref, ctx) {
         return;
     }
 
-    // ---- §5.6 zero-copy IOSurface → CVPixelBuffer, publish ----
+    // ---- step 7: zero-copy IOSurface → CVPixelBuffer, publish ----
     publish_sample(sample_ref, ctx);
 }
 
 /// Read the `SCStreamFrameInfo` attachment and decide whether to forward the
 /// frame: forward only `SCFrameStatusComplete`, and skip when the dirty-rects
-/// attachment is present but empty (nothing changed — §1.5).
+/// attachment is present but empty (nothing changed — step 6).
 fn frame_should_publish(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool {
     // CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false).
     let attachments: CFRetained<CFArray> = match unsafe { sample.sample_attachments_array(false) } {
@@ -749,7 +749,7 @@ fn frame_should_publish(sample: &CMSampleBuffer, ctx: &OutputCtx) -> bool {
         return true;
     }
 
-    // §1.5: dirty-rect skip. If the attachment exists and is an *empty* array,
+    // step 6: dirty-rect skip. If the attachment exists and is an *empty* array,
     // nothing changed on screen — skip the encode. If the key is absent (older
     // SCK) or the array is non-empty, fall through and publish.
     if let Some(dirty_key) = ctx.dirty_rects_key {
