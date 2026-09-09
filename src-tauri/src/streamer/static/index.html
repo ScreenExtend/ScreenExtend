@@ -216,6 +216,7 @@
                 TRANSFORM_FELL_BACK_TO_LEGACY: 1 << 19,
                 RVFC_UNAVAILABLE: 1 << 20,
                 KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
+                TRICKLE_ICE_UNAVAILABLE: 1 << 22,
             };
             let degradeFlags = 0;
             let suppressedErrors = 0;
@@ -988,6 +989,28 @@
                 return { iceServers: [], locality: 'unknown' };
             }
 
+            // `/net-config` is read by the HTTPS upsell and by the join, so it is fetched once
+            // and shared. Priming it at load is what keeps it off the join path: by the time
+            // Connect is pressed the answer is already here, and the trickle decision costs a
+            // property read rather than a round trip.
+            let netConfigPromise = null;
+            function getNetConfig() {
+                if (!netConfigPromise) {
+                    netConfigPromise = fetch('/net-config').then(function (r) {
+                        return r.ok ? r.json() : null;
+                    }).then(function (j) {
+                        return (j && typeof j === 'object') ? j : {};
+                    }, function () {
+                        noteSuppressed();
+                        return {};
+                    });
+                }
+                return netConfigPromise;
+            }
+            // Guarded because this is module scope: a browser with no `fetch` cannot reach any
+            // fast path on this page anyway, but a throw here would take the join form with it.
+            if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
+
             // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
             // waiting for one is only right when nothing else can carry the session. The host
             // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
@@ -1066,6 +1089,117 @@
                 });
             }
 
+            // Trickle ICE, RFC 9725 §4.6. The wait above is the whole reason a relayed join is
+            // slow: the offer is a single POST, so every candidate the session will ever use has
+            // to be in it, and a TURN allocation is a full round trip. A host that answers with a
+            // `Location` takes the rest by PATCH, so the offer can leave the moment it exists.
+            //
+            // Both halves are probed and neither is assumed. `/net-config`'s `trickleIce` decides
+            // whether to skip the wait; the `Location` header on the answer decides whether
+            // anything is actually sent. A host without either keeps the gather-then-post shape
+            // byte for byte, which is what every shipped host does.
+            const TRICKLE_MAX_BATCH = 24;
+            let trickleOff = false;
+            let trickleSender = null;
+
+            function localIceUfrag(peer) {
+                try {
+                    const d = peer.localDescription;
+                    const m = /a=ice-ufrag:(\S+)/.exec((d && d.sdp) || '');
+                    return (m && m[1]) || '';
+                } catch (_) { noteSuppressed(); return ''; }
+            }
+
+            // An `application/trickle-ice-sdpfrag` body: a partial SDP, no library needed. One
+            // `m=` section for the batch — the page is `max-bundle`, so every candidate belongs
+            // to the first media section — and the mid beside it, which is what the host prefers
+            // over the m-line index it counts.
+            function trickleFragment(ufrag, cands, end) {
+                let body = '';
+                if (ufrag) body += 'a=ice-ufrag:' + ufrag + '\r\n';
+                if (cands.length) {
+                    body += 'm=video 9 UDP/TLS/RTP/SAVPF 0\r\n';
+                    const mid = cands[0].sdpMid;
+                    if (mid) body += 'a=mid:' + mid + '\r\n';
+                    for (let i = 0; i < cands.length; i++) {
+                        const line = cands[i].candidate;
+                        body += 'a=' + (line.indexOf('candidate:') === 0 ? line : 'candidate:' + line) + '\r\n';
+                    }
+                }
+                if (end) body += 'a=end-of-candidates\r\n';
+                return body;
+            }
+
+            // Buffers from the moment the offer exists, because gathering starts there and the
+            // resource URL only arrives with the answer: a candidate produced in between is one
+            // the host would otherwise never see.
+            function startTrickle(peer) {
+                const queue = [];
+                let url = null;
+                let ended = false;
+                let closed = false;
+                let flushing = false;
+                let posted = '';
+                let sentCount = 0;
+
+                function onCandidate(ev) {
+                    if (closed) return;
+                    const c = ev.candidate;
+                    if (!c || !c.candidate) ended = true;
+                    else queue.push(c);
+                    flush();
+                }
+
+                function stop() {
+                    if (closed) return;
+                    closed = true;
+                    queue.length = 0;
+                    try { peer.removeEventListener('icecandidate', onCandidate); } catch (_) { noteSuppressed(); }
+                }
+
+                function flush() {
+                    if (closed || !url || flushing) return;
+                    // A candidate the offer already carried would be added a second time and
+                    // the host has no way to tell the copy apart, so it would build a duplicate
+                    // pair for it.
+                    while (queue.length && posted.indexOf(queue[0].candidate) >= 0) queue.shift();
+                    if (!queue.length && !ended) return;
+                    const batch = queue.splice(0, TRICKLE_MAX_BATCH);
+                    const done = ended && !queue.length;
+                    const ufrag = (batch.length && batch[0].usernameFragment) || localIceUfrag(peer);
+                    flushing = true;
+                    fetch(url, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/trickle-ice-sdpfrag' },
+                        body: trickleFragment(ufrag, batch, done),
+                    }).then(function (r) {
+                        // 404 is the session being over, not a transport failure: there is
+                        // nothing left to send it to.
+                        if (r.status === 404) { stop(); return; }
+                        if (r.ok) sentCount += batch.length;
+                        else noteSuppressed();
+                    }, function () {
+                        noteSuppressed();
+                    }).then(function () {
+                        flushing = false;
+                        if (done) stop(); else flush();
+                    });
+                }
+
+                peer.addEventListener('icecandidate', onCandidate);
+                return {
+                    // `offerSdp` is the offer as it went out, not `localDescription` as it reads
+                    // later — that one keeps growing as candidates are gathered.
+                    open: function (resourceUrl, offerSdp) {
+                        url = resourceUrl;
+                        posted = offerSdp || '';
+                        flush();
+                    },
+                    stop: stop,
+                    count: function () { return sentCount; },
+                };
+            }
+
             function tryPlay() {
                 const p = video.play();
                 if (p && p.catch) {
@@ -1095,6 +1229,7 @@
                 if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
                 videoWorkerStats = null;
                 stopFallbackFrameStats();
+                if (trickleSender) { trickleSender.stop(); trickleSender = null; }
                 try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
@@ -1480,10 +1615,16 @@
                 // After teardownSession, so this call owns the newest generation.
                 const gen = ++startGen;
                 const stale = () => gen !== startGen;
+                let localTrickle = null;
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const useScriptTransform = useScriptTransformNow();
+                    // Primed at load, so this is normally already resolved. Read before the ICE
+                    // config so both are in hand before the peer connection exists.
+                    const netConfig = await getNetConfig();
+                    if (stale()) return;
+                    const canTrickle = !trickleOff && netConfig.trickleIce === true;
                     const iceConfig = await getIceConfig();
                     if (stale()) return;
                     const iceServers = iceConfig.iceServers;
@@ -1787,8 +1928,19 @@
                     if (stale()) return;
                     await pc.setLocalDescription(offer);
                     if (stale()) return;
-                    await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
-                    if (stale()) return;
+                    if (canTrickle) {
+                        // No wait at all: the offer goes out with whatever `setLocalDescription`
+                        // had — usually nothing — and every candidate follows over PATCH. This is
+                        // the whole win on a relayed join, where the wait was a TURN allocation
+                        // the POST had no reason to be behind.
+                        localTrickle = startTrickle(pc);
+                        trickleSender = localTrickle;
+                    } else {
+                        degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                        await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
+                        if (stale()) return;
+                    }
+                    const offerSdp = pc.localDescription.sdp;
 
                     let storedToken = '';
                     try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
@@ -1805,7 +1957,7 @@
                             width: joinData.width,
                             height: joinData.height,
                             dpr: getDpr(),
-                            sdp: pc.localDescription.sdp,
+                            sdp: offerSdp,
                             audioCapabilities: audioCaps,
                         }),
                     };
@@ -1834,6 +1986,26 @@
                     if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    let resourceUrl = null;
+                    try { resourceUrl = resp.headers.get('Location'); } catch (_) { noteSuppressed(); }
+                    if (localTrickle) {
+                        if (resourceUrl) {
+                            localTrickle.open(resourceUrl, offerSdp);
+                        } else {
+                            // The host said it takes trickled candidates and then handed back no
+                            // resource — a proxy that strips the header, or the cloud relay,
+                            // which tunnels /whep but has no URL space of its own. The offer that
+                            // went out carries no candidates, so there is nothing to salvage:
+                            // join again with a gathered one. `trickleOff` is never cleared, so
+                            // this costs one round trip per page load and never repeats.
+                            trickleOff = true;
+                            degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                            console.warn('[ice] the host advertised trickle and returned no resource; rejoining with a gathered offer');
+                            teardownSession();
+                            start(preferWebCodecs);
+                            return;
+                        }
+                    }
                     const issuedToken = resp.headers.get('X-Device-Token');
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     const answerSdp = await resp.text();
@@ -1864,6 +2036,9 @@
                     }
                 } catch (err) {
                     console.error(err);
+                    // Stopping is idempotent, and this one belongs to the connection that just
+                    // failed whether or not a newer start() has taken over.
+                    if (localTrickle) localTrickle.stop();
                     // A newer start() already owns pc and worker; this one's failure is about a
                     // connection nobody is using any more.
                     if (stale()) { noteSuppressed(); return; }
@@ -1882,8 +2057,7 @@
             async function httpsUrl() {
                 let httpsPort = 8443;
                 try {
-                    const r = await fetch('/net-config');
-                    if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
+                    httpsPort = (await getNetConfig()).httpsPort || httpsPort;
                 } catch (_) { noteSuppressed(); }
                 const u = new URL(location.href);
                 u.protocol = 'https:';

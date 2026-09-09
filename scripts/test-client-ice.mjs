@@ -44,24 +44,38 @@ function takeFunction(name) {
 const source = [
   takeConst('ICE_HOST_GRACE_MS'),
   takeConst('ICE_RELAY_GRACE_MS'),
+  takeConst('TRICKLE_MAX_BATCH'),
   takeFunction('iceCandidateType'),
   takeFunction('iceGraceFor'),
   takeFunction('waitForIceGathering'),
   takeFunction('hasTurnServer'),
   takeFunction('relayNeeded'),
+  takeFunction('localIceUfrag'),
+  takeFunction('trickleFragment'),
+  takeFunction('startTrickle'),
   // `const` is lexically scoped to the script and never reaches the context object.
   'this.__grace = { host: ICE_HOST_GRACE_MS, relay: ICE_RELAY_GRACE_MS };',
+  'this.__maxBatch = TRICKLE_MAX_BATCH;',
 ].join('\n');
 
 let deadlineBits = 0;
+let suppressed = 0;
+const patches = [];
+let nextPatchStatus = 204;
 const ctx = {
   console,
   setTimeout,
   clearTimeout,
   Promise,
   RegExp,
-  DEG: { ICE_GATHERING_DEADLINE: 1 << 15 },
+  DEG: { ICE_GATHERING_DEADLINE: 1 << 15, TRICKLE_ICE_UNAVAILABLE: 1 << 22 },
   degrade(bit) { deadlineBits |= bit; },
+  noteSuppressed() { suppressed++; },
+  fetch(url, opts) {
+    patches.push({ url, opts });
+    const status = nextPatchStatus;
+    return Promise.resolve({ status, ok: status >= 200 && status < 300 });
+  },
 };
 vm.createContext(ctx);
 vm.runInContext(source, ctx, { filename: 'index.html:ice' });
@@ -126,8 +140,11 @@ function fakePc() {
     addEventListener(t, fn) { (subs[t] = subs[t] || []).push(fn); },
     removeEventListener(t, fn) { subs[t] = (subs[t] || []).filter((f) => f !== fn); },
     emitCandidate(type) {
-      const c = { type, candidate: 'candidate:1 1 udp 1 10.0.0.1 1 typ ' + type };
-      (subs.icecandidate || []).slice().forEach((fn) => fn({ candidate: c }));
+      const c = { type, candidate: 'candidate:1 1 udp 1 10.0.0.1 1 typ ' + type, sdpMid: '0', sdpMLineIndex: 0 };
+      this.emit({ candidate: c });
+    },
+    emit(ev) {
+      (subs.icecandidate || []).slice().forEach((fn) => fn(ev));
     },
     complete() {
       this.iceGatheringState = 'complete';
@@ -143,6 +160,148 @@ async function timed(fn) {
   const t0 = Date.now();
   await fn();
   return Date.now() - t0;
+}
+
+// --- trickle ICE, RFC 9725 §4.6 --------------------------------------------------------------
+// The half that replaces the wait above: the offer leaves immediately and the candidates follow
+// over PATCH. What has to hold is that nothing is sent before the host names a resource, that a
+// candidate the offer already carried is not sent twice, and that the body is the sdpfrag the
+// host's parser reads.
+
+function settle() { return new Promise((r) => setTimeout(r, 0)); }
+
+function cand(text, mid) {
+  return { candidate: text, sdpMid: mid === undefined ? '0' : mid, sdpMLineIndex: 0, usernameFragment: 'UF01' };
+}
+
+async function trickle() {
+  // The fragment body.
+  {
+    const body = ctx.trickleFragment('ABCD', [cand('candidate:1 1 udp 2 10.0.0.1 5000 typ host')], false);
+    const lines = body.split('\r\n').filter((l) => l.length);
+    const want = [
+      'a=ice-ufrag:ABCD',
+      'm=video 9 UDP/TLS/RTP/SAVPF 0',
+      'a=mid:0',
+      'a=candidate:1 1 udp 2 10.0.0.1 5000 typ host',
+    ];
+    if (lines.join('|') !== want.join('|')) fail('fragment body is ' + JSON.stringify(lines));
+    else ok('a fragment is ufrag, one m= section, the mid and the candidate');
+  }
+  {
+    // The host tolerates a bare `candidate:` prefix, but the attribute name must still be there.
+    const body = ctx.trickleFragment('', [cand('1 1 udp 2 10.0.0.1 5000 typ host')], true);
+    if (body.indexOf('a=candidate:1 1 udp') < 0) fail('a candidate with no prefix was not normalised');
+    else ok('a candidate line with no "candidate:" prefix gets one');
+    if (body.indexOf('a=ice-ufrag') >= 0) fail('an empty ufrag was written anyway');
+    else ok('an unknown ufrag is simply omitted');
+    if (body.indexOf('a=end-of-candidates') < 0) fail('end-of-candidates was not written');
+    else ok('the last fragment carries a=end-of-candidates');
+  }
+  {
+    const body = ctx.trickleFragment('U', [], true);
+    if (body.indexOf('m=') >= 0) fail('an empty batch still wrote an m= section');
+    else ok('a bare end-of-candidates fragment has no m= section');
+  }
+
+  // localIceUfrag reads the offer, for an engine with no usernameFragment on the candidate.
+  if (ctx.localIceUfrag({ localDescription: { sdp: 'v=0\r\na=ice-ufrag:ZZZZ\r\n' } }) !== 'ZZZZ') {
+    fail('the ufrag was not read out of the local description');
+  } else ok('the ufrag falls back to the one in the local offer');
+  if (ctx.localIceUfrag({ localDescription: null }) !== '') fail('a missing local description was not tolerated');
+  else ok('no local description yields no ufrag');
+
+  // Nothing may go out before the answer names a resource.
+  {
+    patches.length = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    pc.emitCandidate('host');
+    await settle();
+    if (patches.length) fail('a candidate was PATCHed before the host named a resource');
+    else ok('candidates are buffered until the answer carries a Location');
+    t.open('/whep/abc', 'v=0\r\n');
+    await settle();
+    if (patches.length !== 1) fail('the buffered candidate was not flushed on open (' + patches.length + ' PATCHes)');
+    else if (patches[0].url !== '/whep/abc') fail('PATCH went to ' + patches[0].url);
+    else if (patches[0].opts.method !== 'PATCH') fail('the method was ' + patches[0].opts.method);
+    else if (patches[0].opts.headers['Content-Type'] !== 'application/trickle-ice-sdpfrag') {
+      fail('content type was ' + patches[0].opts.headers['Content-Type']);
+    } else ok('opening the resource flushes the buffer as one PATCH of trickle-ice-sdpfrag');
+    if (t.count() !== 1) fail('the sent count is ' + t.count());
+    else ok('a 204 counts the candidate as sent');
+    t.stop();
+    if (pc.listenerCount() !== 0) fail('stop() left ' + pc.listenerCount() + ' listeners behind');
+    else ok('stop() removes the candidate listener');
+  }
+
+  // A candidate the offer already carried must not be sent again.
+  {
+    patches.length = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    const inOffer = 'candidate:1 1 udp 2 10.0.0.1 5000 typ host';
+    pc.emit({ candidate: cand(inOffer) });
+    pc.emit({ candidate: cand('candidate:2 1 udp 2 10.0.0.2 5001 typ srflx') });
+    t.open('/whep/abc', 'v=0\r\na=' + inOffer + '\r\n');
+    await settle();
+    if (patches.length !== 1) fail('expected one PATCH, got ' + patches.length);
+    else if (patches[0].opts.body.indexOf('10.0.0.1') >= 0) fail('a candidate already in the offer was trickled again');
+    else if (patches[0].opts.body.indexOf('10.0.0.2') < 0) fail('the new candidate was not trickled');
+    else ok('a candidate the offer already carried is not sent a second time');
+    t.stop();
+  }
+
+  // A null candidate is the end of gathering, and it closes the sender.
+  {
+    patches.length = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    t.open('/whep/abc', '');
+    pc.emit({ candidate: null });
+    await settle();
+    if (patches.length !== 1) fail('the end of gathering sent ' + patches.length + ' PATCHes');
+    else if (patches[0].opts.body.indexOf('a=end-of-candidates') < 0) fail('the last PATCH did not say end-of-candidates');
+    else ok('a null candidate PATCHes a=end-of-candidates');
+    if (pc.listenerCount() !== 0) fail('the sender stayed subscribed after end-of-candidates');
+    else ok('the sender unsubscribes once gathering is over');
+  }
+
+  // A 404 is the session being over: stop, do not retry.
+  {
+    patches.length = 0;
+    nextPatchStatus = 404;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    t.open('/whep/gone', '');
+    pc.emitCandidate('host');
+    await settle();
+    await settle();
+    const after = patches.length;
+    pc.emitCandidate('srflx');
+    await settle();
+    if (patches.length !== after) fail('a candidate was PATCHed after a 404');
+    else ok('a 404 stops the sender rather than retrying into a dead session');
+    if (t.count() !== 0) fail('a 404 was counted as a sent candidate');
+    else ok('a 404 counts nothing as sent');
+    nextPatchStatus = 204;
+    t.stop();
+  }
+
+  // More candidates than one batch holds go out in order, one request at a time.
+  {
+    patches.length = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    const n = ctx.__maxBatch + 3;
+    for (let i = 0; i < n; i++) pc.emit({ candidate: cand('candidate:' + i + ' 1 udp 2 10.1.0.' + i + ' 5000 typ host') });
+    t.open('/whep/abc', '');
+    for (let i = 0; i < 6; i++) await settle();
+    if (patches.length !== 2) fail(n + ' candidates went out in ' + patches.length + ' PATCHes, expected 2');
+    else if (t.count() !== n) fail('the sent count is ' + t.count() + ', expected ' + n);
+    else ok('a burst larger than one batch is split and every candidate still goes out');
+    t.stop();
+  }
 }
 
 async function run() {
@@ -209,6 +368,8 @@ async function run() {
     if (took > 100) fail('an already-complete gathering state still waited ' + took + ' ms');
     else ok('an already-complete gathering state resolves without waiting');
   }
+
+  await trickle();
 
   if (failures) {
     console.log('\n' + failures + ' ICE assertion(s) failed');
