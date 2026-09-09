@@ -456,7 +456,7 @@ pub fn sink_tier_name(code: u8) -> &'static str {
 
 /// Names for the v2 degradation bits, in bit order. Every one was a bare `catch (_) {}` or an
 /// untaken branch on the client before it became a bit here.
-pub const CLIENT_DEGRADED_NAMES: [&str; 22] = [
+pub const CLIENT_DEGRADED_NAMES: [&str; 23] = [
     "fullscreen_refused",
     "pointer_lock_refused",
     "no_unadjusted_movement",
@@ -479,6 +479,7 @@ pub const CLIENT_DEGRADED_NAMES: [&str; 22] = [
     "stepped_down_to_encoded_streams",
     "no_request_video_frame_callback",
     "no_keyboard_lock",
+    "no_trickle_ice",
 ];
 
 /// The degradation bits that are set, by name.
