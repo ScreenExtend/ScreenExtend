@@ -28,6 +28,7 @@ src-tauri/                  Rust core (crate `screenextend`, lib `screenextend_l
   src/lib.rs                Tauri app: command/event registry, setup, lifecycle
   src/logbus.rs             tprintln!/teprintln! log bus (writer thread + backlog + LogLine event)
   src/single_instance.rs    lockfile + loopback control server (focus/quit/stats/ping/reload/logs)
+  src/test_support.rs       cfg(test) only: the skip convention, percentiles, measurement output
   src/streamer/             OS-independent streaming core + the client web page
   src/windows_utils/        Windows backend
   src/macos_utils/          macOS backend
@@ -75,11 +76,41 @@ block for `scripts/**/*.mjs`. Type-aware linting is on (`parserOptions.project`)
 `@typescript-eslint/no-floating-promises` needs. It passes with 0 errors and ~27 non-blocking
 warnings. TypeScript strictness is additionally enforced by `tsc` in `pnpm build`.
 
-Tests are inline `#[cfg(test)]` modules, several of them collected in per-module `test/`
+### Tests
+
+Rust tests are inline `#[cfg(test)]` modules, several of them collected in per-module `test/`
 subdirectories (`streamer/test/`, `windows_utils/streamer/test/`, `windows_utils/audio/test/`,
-`macos_utils/audio/test/`, `macos_utils/audio/legacy/test/`). Many are hardware- or OS-gated and
-no-op off their platform; the ones that need real hardware or a console session are `#[ignore]`d
-and named in `docs/manual-tests/`.
+`macos_utils/audio/test/`, `macos_utils/audio/legacy/test/`). Many are hardware- or OS-gated.
+
+**A test that verified nothing must say so.** That is the one rule `src-tauri/src/test_support.rs`
+exists to enforce, after an audit found six hardware-gated tests reporting `ok` having returned at
+their first line — on exactly the machine where a green tick is most misleading. So:
+
+- A runtime-gated early return goes through `crate::test_support::skip(what, reason)` (or
+  `skip_because` for a plain sentence), which prints `SKIP <what>: <reason>` on **stderr** — not
+  `teprintln!`, which nothing under `cargo test` makes visible.
+- `SE_REQUIRE_HW=1` turns every such skip into a panic, so a machine that is supposed to have the
+  capability can be made strict without a second suite.
+- A test that cannot run unattended is `#[ignore = "<reason>"]`, so the harness prints the reason
+  rather than a bare `ignored`. **Do not exclude a test by name in CI** (`--skip`): that hides it
+  from the report, which is the failure mode the convention exists to prevent.
+- `test_support::show_measurements()` routes the log bus to stderr for tests that report timings
+  with `tprintln!`, and `percentiles()` prints them in the shape `scripts/perf-gate.mjs` parses.
+
+The client page has its own suite, `pnpm test:client` (`scripts/test-client.mjs`), which runs
+seven dependency-free Node harnesses over the shipped `.js` files with `vm` and minimal browser
+stubs: the input wire format and telemetry frame, golden input vectors the Rust parser reads back,
+the Opus decode worker, the jitter buffer and the planar ring ABI, the WebCodecs video path and
+the RTP→host-clock inversion, ICE gathering, and the `/reconfig` epochs. No runner and no
+devDependency, and `src-tauri/src/streamer/static/` stays byte-identical.
+
+The `#[ignore]`d latency harnesses are documented in `docs/manual-tests/latency-harnesses.md` —
+`cargo test` never runs them, so without that note the numbers are never produced. The perf gate
+(`ci/perf-baseline.json` + `scripts/perf-gate.mjs`) keys baselines by machine class, takes the
+**lowest** of several runs per metric, and lets a key carry its own `tolerance` overriding the
+20 % default; the dev box's key is at 10 % because an idle machine is a tighter instrument than a
+shared runner. An unseeded key is not a failure — the gate reports it, uploads the observed
+numbers and passes, which is how a new runner tells you what to paste back.
 
 ### Checkers
 
@@ -96,9 +127,7 @@ Four static checks, all runnable locally in seconds, all run by CI:
 - `bash scripts/check-macos-dyld.sh <binary> <sdk> [--floor 10.15]` — fails on any link-time
   symbol newer than the floor. `scripts/macos-dyld-allowlist.txt` holds the reviewed exceptions.
 
-`scripts/perf-gate.mjs` compares encoder timings against `ci/perf-baseline.json`;
-`scripts/test-client-{stats,ice,audio}.mjs` exercise the client page's wire-format helpers in
-node, without a browser.
+`scripts/perf-gate.mjs` and the `scripts/test-client-*.mjs` harnesses are covered under "Tests".
 
 ### Docs
 
@@ -794,10 +823,11 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
 - **CI** (`.github/workflows/ci.yml`) runs on **every push to any branch** and on pull requests,
   so it runs whenever the repository owner pushes. Jobs:
   - `frontend` (ubuntu) — `pnpm lint`, `pnpm build`, `check-legacy-webkit.mjs`,
-    `test-client-stats.mjs`, `check-bindings.mjs`, `check-versions.mjs`.
+    `pnpm test:client`, `check-bindings.mjs`, `check-versions.mjs`.
   - `rust` (windows-latest, macos-13, macos-14, macos-15) — `pnpm build` first because
     `tauri_build` embeds `../dist` at compile time, then `cargo fmt --check`,
-    `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+    `cargo clippy --all-targets -- -D warnings`, and a plain `cargo test` with **no `--skip`**:
+    a test that cannot run on the runner gates itself through `test_support::skip`.
   - `macos-smoke` (macos-13/14/15) — the runners are the only machines on this project where
     12.3+/13+/14.2+ code can execute at all. Builds the host binary, asserts `doctor --json`
     reports the probed backends and that the **audio tier matches the runner's macOS**
