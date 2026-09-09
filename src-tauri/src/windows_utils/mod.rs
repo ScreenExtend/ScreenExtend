@@ -24,7 +24,7 @@ use device_reporter::TauriDeviceReporter;
 use elevated_command::Command;
 use networking::NetworkInfo;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command as StdCommand;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -879,7 +879,7 @@ pub fn sync_streamers(state: &AppState) {
 
         let handle = axum_server::Handle::new();
         let config = Config {
-            bind_ip: addr,
+            bind_ip: IpAddr::V4(addr),
             lan_ip: Some(ip.clone()),
             local_ips: Some(state.local_ips.clone()),
             port: http_port,

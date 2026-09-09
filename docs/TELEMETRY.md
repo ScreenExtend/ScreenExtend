@@ -118,6 +118,14 @@ remembered for the whole session.
 Only frames carrying the optional client stamp are measured; an unstamped frame from an older
 client contributes nothing rather than a wrong number.
 
+## Delivered frame rate
+
+The summary line reports `fps=<rate>` between consecutive summaries alongside the running
+`frames=<total>`. A running total cannot distinguish a capture path keeping up at 60 fps from one
+silently delivering 45, which is the failure this exists to make visible; the rate is computed
+from the frame counter and the host clock at each summary, so it costs one atomic load per
+reporting interval and nothing per frame.
+
 ## Degradation counters
 
 `capture_fallback`, `capture_no_first_frame`, `frames_repeated`, `frames_dropped_ring`,
@@ -125,8 +133,9 @@ client contributes nothing rather than a wrong number.
 `nacks_received`, `keyframe_requests`, `client_keyframe_requests`,
 `keyframe_requests_suppressed`, `delay_overuse_events`, `pacer_deadline_misses`, `idrs_sent`,
 `encoder_resets`, `encoder_transient_errors`, `bitrate_cuts`, `audio_broadcast_lag_drops`, the
-client-reported `client_jitter_underruns` / `client_jitter_overruns`, and the two input drops
-`input_queue_drops` / `input_stale_drops`.
+client-reported `client_jitter_underruns` / `client_jitter_overruns`, `frames_dropped_capture`,
+and the four input counters `input_queue_drops` / `input_stale_drops` /
+`input_reorder_drops` / `input_parse_errors`.
 
 `capture_no_first_frame` counts the black placeholder frames the macOS encode loop synthesizes when
 capture has produced nothing at all — a still virtual display, or a capture backend that started and
@@ -161,10 +170,46 @@ The process-level `live_transport_sessions` sits alongside the per-session objec
 equal the number of live sessions, and a number that only climbs across joins is a leak. `input_queue_drops` is the fast input queue shedding its oldest entry under
 pressure; `input_stale_drops` is a positional event that waited more than 50 ms and was skipped
 rather than injected late — never a key or a button, which are state transitions the host cannot
-recover from.
+recover from, and never a pen or touch sample, which is ink rather than a position.
+`input_reorder_drops` is a fast-channel frame whose sequence was behind one already injected: the
+channel is unordered with no retransmits, so this is reorder, not loss, and it stays at zero until
+a client starts sending the optional sequence (`docs/INPUT-PROTOCOL.md`).
+`input_parse_errors` counts frames the input parser rejected — a client whose cached `input.js`
+has drifted from the host shows up here and nowhere else, alongside one log line per distinct
+error per channel.
+
+`frames_dropped_capture` is presents the OS coalesced away because the host was still busy with
+the previous frame: DXGI's `AccumulatedFrames` past the first, which the dirty-region check read
+as a `> 1` early-out and never counted. It is the Windows counterpart of the macOS
+`CGDisplayStreamUpdateGetDropCount` reading, which reports through the log bus rather than a
+counter because the capture backend is constructed before the session's telemetry exists.
 
 NACKs are counted and never logged: a lossy link produces them continuously and every logbus line
 is a JSON IPC event to the desktop UI.
+
+## Transport-derived signals (not counters)
+
+Two things the transport now knows that are read rather than counted, because they are inputs to a
+decision rather than a tally of what went wrong.
+
+**`SharedFeedback::acked_frame_capture_ns()`** — the host-clock capture instant of the newest
+access unit the client has confirmed receiving **in full**. Transport-wide feedback names every
+sequence number that did and did not arrive, and the writer stamps those sequence numbers itself,
+so `SendHistory` can keep a per-frame tally beside its per-packet ring and `congestion::interpret`
+can vote every reported symbol against the frame its packet belonged to. A frame missing even one
+packet is never acknowledged. The identity is the capture instant because the encoder already
+stamps it on the frame, so nothing new has to be carried to match an acknowledgement back to a
+reference frame. Nothing consumes it yet: it is the input VideoToolbox's
+`kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's reference invalidation both need.
+
+**The session link medium** — `wired` / `wireless` / `other` for the local end of the nominated ICE
+pair, resolved half a second after the connection comes up and printed as
+`session link: local candidate <ip> is on a <medium> adapter`. Windows reads
+`MSFT_NetAdapter.NdisPhysicalMedium`; macOS uses `getifaddrs` then `SIOCGIFMEDIA`. USB tethering and
+RNDIS both report Ethernet, which is the point — it is the only way the host can tell a cabled
+client from a Wi-Fi one, and every competitor in this category treats the wired path as its
+low-latency tier.
+
 
 ## Audio stages
 
