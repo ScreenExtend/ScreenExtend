@@ -1,6167 +1,1335 @@
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+//! NVENC ABI assertions — generated, do not hand-edit the `abi_*` bodies.
+//!
+//! The previous version of this file asserted the Rust structs' `size_of` and `offset_of`
+//! against constants emitted by the same bindgen run that produced those structs. That is
+//! self-referential: it detects a hand edit to the Rust and nothing else. In particular it could
+//! not detect the thing it most needed to — bindings generated against one SDK header while
+//! `nvenc_sys/version.rs`, which is hand-written, encodes the struct revision words of another.
+//!
+//! A wrong revision word is not a compile error and not a crash. `nvEncInitializeEncoder`
+//! returns `NV_ENC_ERR_INVALID_VERSION`, `build_backend` catches it, and the whole NVIDIA path
+//! degrades to Quick Sync or x264 — on a machine with a working NVENC in it. The same is true of
+//! a wrong GUID (the driver reports an unsupported parameter set, not a bad GUID) and of a wrong
+//! `NV_ENCODE_API_FUNCTION_LIST` offset, which is a call through the wrong function pointer.
+//!
+//! So every number below was measured by a C compiler reading the real header.
+//!
+//! ## Provenance
+//!
+//! * Header: `src-tauri/resources/nvenc-headers/nvEncodeAPI.h` — FFmpeg/nv-codec-headers at tag
+//!   `n12.1.14.1` (commit `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API
+//!   **12.1**. MIT, redistributable; SHA-256 pinned in `src-tauri/resources/SHA256SUMS` and
+//!   recorded in `resources/PROVENANCE.md`.
+//! * The bindings in `nvenc_sys/` were audited against it rather than assumed: every struct
+//!   revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8, INITIALIZE_PARAMS
+//!   6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
+//!   REGISTER_RESOURCE 4, EVENT_PARAMS 1), and the members that looked like SDK-13 additions —
+//!   `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`, `numStateBuffers`, `outputStatsLevel`,
+//!   `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` — are all present at 12.1. 13.0 raises
+//!   every one of those revisions by one, so the bindings are 12.1 throughout and internally
+//!   consistent.
+//! * Generator: `src-tauri/tools/nvenc_layout_gen.c`, compiled in C mode (`cl /TC`).
+//! * Toolchain: MSVC Build Tools 2022 x64, entered via `VC\Auxiliary\Buildcvars64.bat`.
+//!   MinGW is the wrong tool: `nvEncodeAPI64.dll` is MSVC-built, and the two compilers do not
+//!   pack the `unsigned int x : 1` runs in `NV_ENC_CONFIG_H264` and `NV_ENC_PIC_PARAMS_H264` the
+//!   same way.
+//!
+//! ## Regenerating
+//!
+//! ```text
+//! cd src-tauri\tools
+//! nvenc_layout_build.bat        :: vcvars64 + cl /TC, writes nvenc_layout_generated.txt
+//! ```
+//!
+//! then paste `nvenc_layout_generated.txt` over the bodies below, in order. Do **not** run the
+//! generator from `build.rs`: the usual dev box for this repo is a macOS 10.15 machine with no
+//! `cl.exe`, and the generated Rust is the checked-in product. A diff in these numbers after a
+//! header bump is a required review item.
+//!
+//! What this file cannot check is whether the driver agrees — only running the encoder does
+//! that, which is `test/nvenc_encoder.rs`.
 
-use crate::windows_utils::streamer::nvidia::nvenc_sys::nvEncodeAPI::*;
+use std::mem::{align_of, offset_of, size_of};
+
+use crate::windows_utils::streamer::nvidia::nvenc_sys::*;
+// The generator emits C's bare enum-constant names, because that is what the header calls them.
+// bindgen puts each one inside its enum type, so these globs are what make the generated body a
+// literal paste rather than a translation. No two of these enums share a variant name.
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NVENCSTATUS::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_BUFFER_FORMAT::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_BUFFER_USAGE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_CAPS::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_DEVICE_TYPE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_H264_ENTROPY_CODING_MODE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_INPUT_RESOURCE_TYPE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_MULTI_PASS::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_NUM_REF_FRAMES::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_PARAMS_RC_MODE::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_PIC_FLAGS::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_PIC_STRUCT::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_TUNING_INFO::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_VUI_COLOR_PRIMARIES::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_VUI_MATRIX_COEFFS::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_VUI_TRANSFER_CHARACTERISTIC::*;
+use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_VUI_VIDEO_FORMAT::*;
+
+/// Compare a `GUID` field by field, so a failure names which of the four parts moved.
+#[track_caller]
+fn assert_guid(g: GUID, d1: u32, d2: u16, d3: u16, d4: [u8; 8], what: &str) {
+    assert_eq!(g.Data1, d1, "{what}.Data1");
+    assert_eq!(g.Data2, d2, "{what}.Data2");
+    assert_eq!(g.Data3, d3, "{what}.Data3");
+    assert_eq!(g.Data4, d4, "{what}.Data4");
+}
 
 #[test]
-fn bindgen_test_layout__GUID() {
-    const UNINIT: ::core::mem::MaybeUninit<_GUID> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_api_version_matches_nvencodeapi_h() {
+    // `NVENCAPI_VERSION` is sent to the driver as `apiVersion` and is folded into
+    // every struct version word, so it is the root of everything below.
+    assert_eq!(NVENCAPI_MAJOR_VERSION, 12, "NVENCAPI_MAJOR_VERSION");
+    assert_eq!(NVENCAPI_MINOR_VERSION, 1, "NVENCAPI_MINOR_VERSION");
+    assert_eq!(NVENCAPI_VERSION, 0x0100000C, "NVENCAPI_VERSION");
+}
+
+#[test]
+fn abi_struct_version_words_match_nvencodeapi_h() {
+    // Hand-written in `version.rs`, which is why these are worth checking against a
+    // compiler rather than against the file that declares them.
     assert_eq!(
-        ::core::mem::size_of::<_GUID>(),
-        16usize,
-        concat!("Size of: ", stringify!(_GUID))
+        NV_ENCODE_API_FUNCTION_LIST_VER, 0x7102000C,
+        "NV_ENCODE_API_FUNCTION_LIST_VER"
     );
     assert_eq!(
-        ::core::mem::align_of::<_GUID>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_GUID))
+        NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, 0x7101000C,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).Data1) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_GUID),
-            "::",
-            stringify!(Data1)
-        )
+        NV_ENC_INITIALIZE_PARAMS_VER, 0xF106000C,
+        "NV_ENC_INITIALIZE_PARAMS_VER"
+    );
+    assert_eq!(NV_ENC_CONFIG_VER, 0xF108000C, "NV_ENC_CONFIG_VER");
+    assert_eq!(NV_ENC_RC_PARAMS_VER, 0x7101000C, "NV_ENC_RC_PARAMS_VER");
+    assert_eq!(
+        NV_ENC_PRESET_CONFIG_VER, 0xF104000C,
+        "NV_ENC_PRESET_CONFIG_VER"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).Data2) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_GUID),
-            "::",
-            stringify!(Data2)
-        )
+        NV_ENC_RECONFIGURE_PARAMS_VER, 0xF101000C,
+        "NV_ENC_RECONFIGURE_PARAMS_VER"
+    );
+    assert_eq!(NV_ENC_PIC_PARAMS_VER, 0xF106000C, "NV_ENC_PIC_PARAMS_VER");
+    assert_eq!(
+        NV_ENC_LOCK_BITSTREAM_VER, 0xF101000C,
+        "NV_ENC_LOCK_BITSTREAM_VER"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).Data3) as usize - ptr as usize },
-        6usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_GUID),
-            "::",
-            stringify!(Data3)
-        )
+        NV_ENC_MAP_INPUT_RESOURCE_VER, 0x7104000C,
+        "NV_ENC_MAP_INPUT_RESOURCE_VER"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).Data4) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_GUID),
-            "::",
-            stringify!(Data4)
-        )
+        NV_ENC_REGISTER_RESOURCE_VER, 0x7104000C,
+        "NV_ENC_REGISTER_RESOURCE_VER"
+    );
+    assert_eq!(
+        NV_ENC_CREATE_BITSTREAM_BUFFER_VER, 0x7101000C,
+        "NV_ENC_CREATE_BITSTREAM_BUFFER_VER"
+    );
+    assert_eq!(
+        NV_ENC_EVENT_PARAMS_VER, 0x7101000C,
+        "NV_ENC_EVENT_PARAMS_VER"
+    );
+    assert_eq!(NV_ENC_CAPS_PARAM_VER, 0x7101000C, "NV_ENC_CAPS_PARAM_VER");
+    assert_eq!(
+        NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER, 0x7101000C,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER"
     );
 }
+
 #[test]
-fn bindgen_test_layout_tagRECT() {
-    const UNINIT: ::core::mem::MaybeUninit<tagRECT> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_struct_sizes_match_nvencodeapi_h() {
     assert_eq!(
-        ::core::mem::size_of::<tagRECT>(),
-        16usize,
-        concat!("Size of: ", stringify!(tagRECT))
+        size_of::<NV_ENCODE_API_FUNCTION_LIST>(),
+        2552,
+        "NV_ENCODE_API_FUNCTION_LIST"
     );
     assert_eq!(
-        ::core::mem::align_of::<tagRECT>(),
-        4usize,
-        concat!("Alignment of ", stringify!(tagRECT))
+        align_of::<NV_ENCODE_API_FUNCTION_LIST>(),
+        8,
+        "NV_ENCODE_API_FUNCTION_LIST"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).left) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(tagRECT),
-            "::",
-            stringify!(left)
-        )
+        size_of::<NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS>(),
+        1552,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).top) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(tagRECT),
-            "::",
-            stringify!(top)
-        )
+        align_of::<NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS>(),
+        8,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).right) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(tagRECT),
-            "::",
-            stringify!(right)
-        )
+        size_of::<NV_ENC_INITIALIZE_PARAMS>(),
+        1808,
+        "NV_ENC_INITIALIZE_PARAMS"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bottom) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(tagRECT),
-            "::",
-            stringify!(bottom)
-        )
+        align_of::<NV_ENC_INITIALIZE_PARAMS>(),
+        8,
+        "NV_ENC_INITIALIZE_PARAMS"
+    );
+    assert_eq!(size_of::<NV_ENC_CONFIG>(), 3584, "NV_ENC_CONFIG");
+    assert_eq!(align_of::<NV_ENC_CONFIG>(), 8, "NV_ENC_CONFIG");
+    assert_eq!(size_of::<NV_ENC_RC_PARAMS>(), 128, "NV_ENC_RC_PARAMS");
+    assert_eq!(align_of::<NV_ENC_RC_PARAMS>(), 4, "NV_ENC_RC_PARAMS");
+    assert_eq!(size_of::<NV_ENC_QP>(), 12, "NV_ENC_QP");
+    assert_eq!(align_of::<NV_ENC_QP>(), 4, "NV_ENC_QP");
+    assert_eq!(
+        size_of::<NV_ENC_CODEC_CONFIG>(),
+        1792,
+        "NV_ENC_CODEC_CONFIG"
+    );
+    assert_eq!(align_of::<NV_ENC_CODEC_CONFIG>(), 8, "NV_ENC_CODEC_CONFIG");
+    assert_eq!(size_of::<NV_ENC_CONFIG_H264>(), 1792, "NV_ENC_CONFIG_H264");
+    assert_eq!(align_of::<NV_ENC_CONFIG_H264>(), 8, "NV_ENC_CONFIG_H264");
+    assert_eq!(
+        size_of::<NV_ENC_CONFIG_H264_VUI_PARAMETERS>(),
+        112,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_CONFIG_H264_VUI_PARAMETERS>(),
+        4,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_PRESET_CONFIG>(),
+        5128,
+        "NV_ENC_PRESET_CONFIG"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_PRESET_CONFIG>(),
+        8,
+        "NV_ENC_PRESET_CONFIG"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_RECONFIGURE_PARAMS>(),
+        1824,
+        "NV_ENC_RECONFIGURE_PARAMS"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_RECONFIGURE_PARAMS>(),
+        8,
+        "NV_ENC_RECONFIGURE_PARAMS"
+    );
+    assert_eq!(size_of::<NV_ENC_PIC_PARAMS>(), 3360, "NV_ENC_PIC_PARAMS");
+    assert_eq!(align_of::<NV_ENC_PIC_PARAMS>(), 8, "NV_ENC_PIC_PARAMS");
+    assert_eq!(
+        size_of::<NV_ENC_CODEC_PIC_PARAMS>(),
+        1552,
+        "NV_ENC_CODEC_PIC_PARAMS"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_CODEC_PIC_PARAMS>(),
+        8,
+        "NV_ENC_CODEC_PIC_PARAMS"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_PIC_PARAMS_H264>(),
+        1536,
+        "NV_ENC_PIC_PARAMS_H264"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_PIC_PARAMS_H264>(),
+        8,
+        "NV_ENC_PIC_PARAMS_H264"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_LOCK_BITSTREAM>(),
+        1552,
+        "NV_ENC_LOCK_BITSTREAM"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_LOCK_BITSTREAM>(),
+        8,
+        "NV_ENC_LOCK_BITSTREAM"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_MAP_INPUT_RESOURCE>(),
+        1544,
+        "NV_ENC_MAP_INPUT_RESOURCE"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_MAP_INPUT_RESOURCE>(),
+        8,
+        "NV_ENC_MAP_INPUT_RESOURCE"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_REGISTER_RESOURCE>(),
+        1536,
+        "NV_ENC_REGISTER_RESOURCE"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_REGISTER_RESOURCE>(),
+        8,
+        "NV_ENC_REGISTER_RESOURCE"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_CREATE_BITSTREAM_BUFFER>(),
+        776,
+        "NV_ENC_CREATE_BITSTREAM_BUFFER"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_CREATE_BITSTREAM_BUFFER>(),
+        8,
+        "NV_ENC_CREATE_BITSTREAM_BUFFER"
+    );
+    assert_eq!(
+        size_of::<NV_ENC_EVENT_PARAMS>(),
+        1544,
+        "NV_ENC_EVENT_PARAMS"
+    );
+    assert_eq!(align_of::<NV_ENC_EVENT_PARAMS>(), 8, "NV_ENC_EVENT_PARAMS");
+    assert_eq!(size_of::<NV_ENC_CAPS_PARAM>(), 256, "NV_ENC_CAPS_PARAM");
+    assert_eq!(align_of::<NV_ENC_CAPS_PARAM>(), 4, "NV_ENC_CAPS_PARAM");
+    assert_eq!(
+        size_of::<NV_ENC_SEQUENCE_PARAM_PAYLOAD>(),
+        1544,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD"
+    );
+    assert_eq!(
+        align_of::<NV_ENC_SEQUENCE_PARAM_PAYLOAD>(),
+        8,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_CAPS_PARAM() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CAPS_PARAM> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_function_list_offsets_match_nvencodeapi_h() {
+    // The driver writes this table. An offset that disagrees means every call after
+    // it goes through the wrong pointer.
     assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CAPS_PARAM>(),
-        256usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CAPS_PARAM))
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, version),
+        0,
+        "NV_ENCODE_API_FUNCTION_LIST.version"
     );
     assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CAPS_PARAM>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CAPS_PARAM))
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, reserved),
+        4,
+        "NV_ENCODE_API_FUNCTION_LIST.reserved"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CAPS_PARAM),
-            "::",
-            stringify!(version)
-        )
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncOpenEncodeSession),
+        8,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncOpenEncodeSession"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).capsToQuery) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CAPS_PARAM),
-            "::",
-            stringify!(capsToQuery)
-        )
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodeGUIDCount),
+        16,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodeGUIDCount"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CAPS_PARAM),
-            "::",
-            stringify!(reserved)
-        )
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodeGUIDs),
+        40,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodeGUIDs"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetInputFormatCount),
+        48,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetInputFormatCount"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetInputFormats),
+        56,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetInputFormats"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodeCaps),
+        64,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodeCaps"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodePresetCount),
+        72,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodePresetCount"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodePresetGUIDs),
+        80,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodePresetGUIDs"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodePresetConfig),
+        88,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodePresetConfig"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncInitializeEncoder),
+        96,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncInitializeEncoder"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncCreateInputBuffer),
+        104,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncCreateInputBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncDestroyInputBuffer),
+        112,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncDestroyInputBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncCreateBitstreamBuffer),
+        120,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncCreateBitstreamBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncDestroyBitstreamBuffer),
+        128,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncDestroyBitstreamBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncEncodePicture),
+        136,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncEncodePicture"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncLockBitstream),
+        144,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncLockBitstream"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnlockBitstream),
+        152,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncUnlockBitstream"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncLockInputBuffer),
+        160,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncLockInputBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnlockInputBuffer),
+        168,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncUnlockInputBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodeStats),
+        176,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodeStats"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetSequenceParams),
+        184,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetSequenceParams"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncRegisterAsyncEvent),
+        192,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncRegisterAsyncEvent"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnregisterAsyncEvent),
+        200,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncUnregisterAsyncEvent"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncMapInputResource),
+        208,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncMapInputResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnmapInputResource),
+        216,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncUnmapInputResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncDestroyEncoder),
+        224,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncDestroyEncoder"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncInvalidateRefFrames),
+        232,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncInvalidateRefFrames"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncOpenEncodeSessionEx),
+        240,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncOpenEncodeSessionEx"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncRegisterResource),
+        248,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncRegisterResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncUnregisterResource),
+        256,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncUnregisterResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncReconfigureEncoder),
+        264,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncReconfigureEncoder"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncCreateMVBuffer),
+        280,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncCreateMVBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncDestroyMVBuffer),
+        288,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncDestroyMVBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncRunMotionEstimationOnly),
+        296,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncRunMotionEstimationOnly"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetLastErrorString),
+        304,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetLastErrorString"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncSetIOCudaStreams),
+        312,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncSetIOCudaStreams"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetEncodePresetConfigEx),
+        320,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetEncodePresetConfigEx"
+    );
+    assert_eq!(
+        offset_of!(NV_ENCODE_API_FUNCTION_LIST, nvEncGetSequenceParamEx),
+        328,
+        "NV_ENCODE_API_FUNCTION_LIST.nvEncGetSequenceParamEx"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_RESTORE_ENCODER_STATE_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_RESTORE_ENCODER_STATE_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_field_offsets_match_nvencodeapi_h() {
     assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_RESTORE_ENCODER_STATE_PARAMS>(),
-        800usize,
-        concat!(
-            "Size of: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS)
-        )
+        offset_of!(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, version),
+        0,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS.version"
     );
     assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_RESTORE_ENCODER_STATE_PARAMS>(),
-        8usize,
-        concat!(
-            "Alignment of ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS)
-        )
+        offset_of!(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, deviceType),
+        4,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS.deviceType"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(version)
-        )
+        offset_of!(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, device),
+        8,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS.device"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferIdx) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(bufferIdx)
-        )
+        offset_of!(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, apiVersion),
+        24,
+        "NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS.apiVersion"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).state) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(state)
-        )
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, version),
+        0,
+        "NV_ENC_INITIALIZE_PARAMS.version"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputBitstream) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(outputBitstream)
-        )
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, encodeGUID),
+        4,
+        "NV_ENC_INITIALIZE_PARAMS.encodeGUID"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).completionEvent) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(completionEvent)
-        )
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, presetGUID),
+        20,
+        "NV_ENC_INITIALIZE_PARAMS.presetGUID"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, encodeWidth),
+        36,
+        "NV_ENC_INITIALIZE_PARAMS.encodeWidth"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        288usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RESTORE_ENCODER_STATE_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, encodeHeight),
+        40,
+        "NV_ENC_INITIALIZE_PARAMS.encodeHeight"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, darWidth),
+        44,
+        "NV_ENC_INITIALIZE_PARAMS.darWidth"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, darHeight),
+        48,
+        "NV_ENC_INITIALIZE_PARAMS.darHeight"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, frameRateNum),
+        52,
+        "NV_ENC_INITIALIZE_PARAMS.frameRateNum"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, frameRateDen),
+        56,
+        "NV_ENC_INITIALIZE_PARAMS.frameRateDen"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, enableEncodeAsync),
+        60,
+        "NV_ENC_INITIALIZE_PARAMS.enableEncodeAsync"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, enablePTD),
+        64,
+        "NV_ENC_INITIALIZE_PARAMS.enablePTD"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, encodeConfig),
+        88,
+        "NV_ENC_INITIALIZE_PARAMS.encodeConfig"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, maxEncodeWidth),
+        96,
+        "NV_ENC_INITIALIZE_PARAMS.maxEncodeWidth"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, maxEncodeHeight),
+        100,
+        "NV_ENC_INITIALIZE_PARAMS.maxEncodeHeight"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, tuningInfo),
+        136,
+        "NV_ENC_INITIALIZE_PARAMS.tuningInfo"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_INITIALIZE_PARAMS, bufferFormat),
+        140,
+        "NV_ENC_INITIALIZE_PARAMS.bufferFormat"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, version),
+        0,
+        "NV_ENC_CONFIG.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, profileGUID),
+        4,
+        "NV_ENC_CONFIG.profileGUID"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, gopLength),
+        20,
+        "NV_ENC_CONFIG.gopLength"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, frameIntervalP),
+        24,
+        "NV_ENC_CONFIG.frameIntervalP"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, rcParams),
+        40,
+        "NV_ENC_CONFIG.rcParams"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG, encodeCodecConfig),
+        168,
+        "NV_ENC_CONFIG.encodeCodecConfig"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, version),
+        0,
+        "NV_ENC_RC_PARAMS.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, rateControlMode),
+        4,
+        "NV_ENC_RC_PARAMS.rateControlMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, constQP),
+        8,
+        "NV_ENC_RC_PARAMS.constQP"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, averageBitRate),
+        20,
+        "NV_ENC_RC_PARAMS.averageBitRate"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, maxBitRate),
+        24,
+        "NV_ENC_RC_PARAMS.maxBitRate"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, vbvBufferSize),
+        28,
+        "NV_ENC_RC_PARAMS.vbvBufferSize"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, vbvInitialDelay),
+        32,
+        "NV_ENC_RC_PARAMS.vbvInitialDelay"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, minQP),
+        40,
+        "NV_ENC_RC_PARAMS.minQP"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, maxQP),
+        52,
+        "NV_ENC_RC_PARAMS.maxQP"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, targetQuality),
+        88,
+        "NV_ENC_RC_PARAMS.targetQuality"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, lookaheadDepth),
+        90,
+        "NV_ENC_RC_PARAMS.lookaheadDepth"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, lowDelayKeyFrameScale),
+        92,
+        "NV_ENC_RC_PARAMS.lowDelayKeyFrameScale"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RC_PARAMS, multiPass),
+        100,
+        "NV_ENC_RC_PARAMS.multiPass"
+    );
+    assert_eq!(offset_of!(NV_ENC_QP, qpInterP), 0, "NV_ENC_QP.qpInterP");
+    assert_eq!(offset_of!(NV_ENC_QP, qpInterB), 4, "NV_ENC_QP.qpInterB");
+    assert_eq!(offset_of!(NV_ENC_QP, qpIntra), 8, "NV_ENC_QP.qpIntra");
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, idrPeriod),
+        8,
+        "NV_ENC_CONFIG_H264.idrPeriod"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, intraRefreshPeriod),
+        52,
+        "NV_ENC_CONFIG_H264.intraRefreshPeriod"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, intraRefreshCnt),
+        56,
+        "NV_ENC_CONFIG_H264.intraRefreshCnt"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, maxNumRefFrames),
+        60,
+        "NV_ENC_CONFIG_H264.maxNumRefFrames"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, sliceMode),
+        64,
+        "NV_ENC_CONFIG_H264.sliceMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, sliceModeData),
+        68,
+        "NV_ENC_CONFIG_H264.sliceModeData"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, h264VUIParameters),
+        72,
+        "NV_ENC_CONFIG_H264.h264VUIParameters"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, ltrNumFrames),
+        184,
+        "NV_ENC_CONFIG_H264.ltrNumFrames"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, ltrTrustMode),
+        188,
+        "NV_ENC_CONFIG_H264.ltrTrustMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, entropyCodingMode),
+        44,
+        "NV_ENC_CONFIG_H264.entropyCodingMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, adaptiveTransformMode),
+        32,
+        "NV_ENC_CONFIG_H264.adaptiveTransformMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, numRefL0),
+        204,
+        "NV_ENC_CONFIG_H264.numRefL0"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264, numRefL1),
+        208,
+        "NV_ENC_CONFIG_H264.numRefL1"
+    );
+    assert_eq!(
+        offset_of!(
+            NV_ENC_CONFIG_H264_VUI_PARAMETERS,
+            videoSignalTypePresentFlag
+        ),
+        8,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.videoSignalTypePresentFlag"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, videoFormat),
+        12,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.videoFormat"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, videoFullRangeFlag),
+        16,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.videoFullRangeFlag"
+    );
+    assert_eq!(
+        offset_of!(
+            NV_ENC_CONFIG_H264_VUI_PARAMETERS,
+            colourDescriptionPresentFlag
+        ),
+        20,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.colourDescriptionPresentFlag"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, colourPrimaries),
+        24,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.colourPrimaries"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, transferCharacteristics),
+        28,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.transferCharacteristics"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, colourMatrix),
+        32,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.colourMatrix"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CONFIG_H264_VUI_PARAMETERS, bitstreamRestrictionFlag),
+        48,
+        "NV_ENC_CONFIG_H264_VUI_PARAMETERS.bitstreamRestrictionFlag"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, version),
+        0,
+        "NV_ENC_PIC_PARAMS.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, inputWidth),
+        4,
+        "NV_ENC_PIC_PARAMS.inputWidth"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, inputHeight),
+        8,
+        "NV_ENC_PIC_PARAMS.inputHeight"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, inputPitch),
+        12,
+        "NV_ENC_PIC_PARAMS.inputPitch"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, encodePicFlags),
+        16,
+        "NV_ENC_PIC_PARAMS.encodePicFlags"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, inputBuffer),
+        40,
+        "NV_ENC_PIC_PARAMS.inputBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, outputBitstream),
+        48,
+        "NV_ENC_PIC_PARAMS.outputBitstream"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, completionEvent),
+        56,
+        "NV_ENC_PIC_PARAMS.completionEvent"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, bufferFmt),
+        64,
+        "NV_ENC_PIC_PARAMS.bufferFmt"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, pictureStruct),
+        68,
+        "NV_ENC_PIC_PARAMS.pictureStruct"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, inputTimeStamp),
+        24,
+        "NV_ENC_PIC_PARAMS.inputTimeStamp"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, frameIdx),
+        20,
+        "NV_ENC_PIC_PARAMS.frameIdx"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS, codecPicParams),
+        80,
+        "NV_ENC_PIC_PARAMS.codecPicParams"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS_H264, ltrMarkFrameIdx),
+        56,
+        "NV_ENC_PIC_PARAMS_H264.ltrMarkFrameIdx"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS_H264, ltrUseFrameBitmap),
+        60,
+        "NV_ENC_PIC_PARAMS_H264.ltrUseFrameBitmap"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS_H264, ltrUsageMode),
+        64,
+        "NV_ENC_PIC_PARAMS_H264.ltrUsageMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS_H264, sliceMode),
+        48,
+        "NV_ENC_PIC_PARAMS_H264.sliceMode"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PIC_PARAMS_H264, sliceModeData),
+        52,
+        "NV_ENC_PIC_PARAMS_H264.sliceModeData"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, version),
+        0,
+        "NV_ENC_LOCK_BITSTREAM.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, outputBitstream),
+        8,
+        "NV_ENC_LOCK_BITSTREAM.outputBitstream"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, bitstreamBufferPtr),
+        56,
+        "NV_ENC_LOCK_BITSTREAM.bitstreamBufferPtr"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, bitstreamSizeInBytes),
+        36,
+        "NV_ENC_LOCK_BITSTREAM.bitstreamSizeInBytes"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, outputTimeStamp),
+        40,
+        "NV_ENC_LOCK_BITSTREAM.outputTimeStamp"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_LOCK_BITSTREAM, pictureType),
+        64,
+        "NV_ENC_LOCK_BITSTREAM.pictureType"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_MAP_INPUT_RESOURCE, version),
+        0,
+        "NV_ENC_MAP_INPUT_RESOURCE.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_MAP_INPUT_RESOURCE, registeredResource),
+        16,
+        "NV_ENC_MAP_INPUT_RESOURCE.registeredResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_MAP_INPUT_RESOURCE, mappedResource),
+        24,
+        "NV_ENC_MAP_INPUT_RESOURCE.mappedResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_MAP_INPUT_RESOURCE, mappedBufferFmt),
+        32,
+        "NV_ENC_MAP_INPUT_RESOURCE.mappedBufferFmt"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, version),
+        0,
+        "NV_ENC_REGISTER_RESOURCE.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, resourceType),
+        4,
+        "NV_ENC_REGISTER_RESOURCE.resourceType"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, width),
+        8,
+        "NV_ENC_REGISTER_RESOURCE.width"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, height),
+        12,
+        "NV_ENC_REGISTER_RESOURCE.height"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, pitch),
+        16,
+        "NV_ENC_REGISTER_RESOURCE.pitch"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, resourceToRegister),
+        24,
+        "NV_ENC_REGISTER_RESOURCE.resourceToRegister"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, registeredResource),
+        32,
+        "NV_ENC_REGISTER_RESOURCE.registeredResource"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, bufferFormat),
+        40,
+        "NV_ENC_REGISTER_RESOURCE.bufferFormat"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_REGISTER_RESOURCE, bufferUsage),
+        44,
+        "NV_ENC_REGISTER_RESOURCE.bufferUsage"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CREATE_BITSTREAM_BUFFER, version),
+        0,
+        "NV_ENC_CREATE_BITSTREAM_BUFFER.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CREATE_BITSTREAM_BUFFER, bitstreamBuffer),
+        16,
+        "NV_ENC_CREATE_BITSTREAM_BUFFER.bitstreamBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_EVENT_PARAMS, version),
+        0,
+        "NV_ENC_EVENT_PARAMS.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_EVENT_PARAMS, completionEvent),
+        8,
+        "NV_ENC_EVENT_PARAMS.completionEvent"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CAPS_PARAM, version),
+        0,
+        "NV_ENC_CAPS_PARAM.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_CAPS_PARAM, capsToQuery),
+        4,
+        "NV_ENC_CAPS_PARAM.capsToQuery"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_SEQUENCE_PARAM_PAYLOAD, version),
+        0,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_SEQUENCE_PARAM_PAYLOAD, inBufferSize),
+        4,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD.inBufferSize"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_SEQUENCE_PARAM_PAYLOAD, spsppsBuffer),
+        16,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD.spsppsBuffer"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_SEQUENCE_PARAM_PAYLOAD, outSPSPPSPayloadSize),
+        24,
+        "NV_ENC_SEQUENCE_PARAM_PAYLOAD.outSPSPPSPayloadSize"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RECONFIGURE_PARAMS, version),
+        0,
+        "NV_ENC_RECONFIGURE_PARAMS.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_RECONFIGURE_PARAMS, reInitEncodeParams),
+        8,
+        "NV_ENC_RECONFIGURE_PARAMS.reInitEncodeParams"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PRESET_CONFIG, version),
+        0,
+        "NV_ENC_PRESET_CONFIG.version"
+    );
+    assert_eq!(
+        offset_of!(NV_ENC_PRESET_CONFIG, presetCfg),
+        8,
+        "NV_ENC_PRESET_CONFIG.presetCfg"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_OUTPUT_STATS_BLOCK() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_OUTPUT_STATS_BLOCK> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_enum_values_match_nvencodeapi_h() {
     assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_OUTPUT_STATS_BLOCK>(),
-        64usize,
-        concat!("Size of: ", stringify!(_NV_ENC_OUTPUT_STATS_BLOCK))
+        NV_ENC_DEVICE_TYPE_DIRECTX as i64, 0,
+        "NV_ENC_DEVICE_TYPE_DIRECTX"
     );
     assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_OUTPUT_STATS_BLOCK>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_OUTPUT_STATS_BLOCK))
+        NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX as i64, 0,
+        "NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX"
+    );
+    assert_eq!(NV_ENC_INPUT_IMAGE as i64, 0, "NV_ENC_INPUT_IMAGE");
+    assert_eq!(
+        NV_ENC_BUFFER_FORMAT_ARGB as i64, 16777216,
+        "NV_ENC_BUFFER_FORMAT_ARGB"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_BLOCK),
-            "::",
-            stringify!(version)
-        )
+        NV_ENC_BUFFER_FORMAT_ABGR as i64, 268435456,
+        "NV_ENC_BUFFER_FORMAT_ABGR"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).QP) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_BLOCK),
-            "::",
-            stringify!(QP)
-        )
+        NV_ENC_BUFFER_FORMAT_NV12 as i64, 1,
+        "NV_ENC_BUFFER_FORMAT_NV12"
+    );
+    assert_eq!(NV_ENC_PIC_STRUCT_FRAME as i64, 1, "NV_ENC_PIC_STRUCT_FRAME");
+    assert_eq!(
+        NV_ENC_PIC_FLAG_FORCEINTRA as i64, 1,
+        "NV_ENC_PIC_FLAG_FORCEINTRA"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        5usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_BLOCK),
-            "::",
-            stringify!(reserved)
-        )
+        NV_ENC_PIC_FLAG_FORCEIDR as i64, 2,
+        "NV_ENC_PIC_FLAG_FORCEIDR"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitcount) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_BLOCK),
-            "::",
-            stringify!(bitcount)
-        )
+        NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as i64, 4,
+        "NV_ENC_PIC_FLAG_OUTPUT_SPSPPS"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_BLOCK),
-            "::",
-            stringify!(reserved1)
-        )
+        NV_ENC_PARAMS_RC_CONSTQP as i64, 0,
+        "NV_ENC_PARAMS_RC_CONSTQP"
+    );
+    assert_eq!(NV_ENC_PARAMS_RC_VBR as i64, 1, "NV_ENC_PARAMS_RC_VBR");
+    assert_eq!(NV_ENC_PARAMS_RC_CBR as i64, 2, "NV_ENC_PARAMS_RC_CBR");
+    assert_eq!(
+        NV_ENC_MULTI_PASS_DISABLED as i64, 0,
+        "NV_ENC_MULTI_PASS_DISABLED"
+    );
+    assert_eq!(
+        NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY as i64, 3,
+        "NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY"
+    );
+    assert_eq!(
+        NV_ENC_H264_ENTROPY_CODING_MODE_CABAC as i64, 1,
+        "NV_ENC_H264_ENTROPY_CODING_MODE_CABAC"
+    );
+    assert_eq!(
+        NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC as i64, 2,
+        "NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC"
+    );
+    assert_eq!(
+        NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE as i64, 2,
+        "NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE"
+    );
+    assert_eq!(
+        NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE as i64, 1,
+        "NV_ENC_H264_ADAPTIVE_TRANSFORM_DISABLE"
+    );
+    assert_eq!(NV_ENC_NUM_REF_FRAMES_1 as i64, 1, "NV_ENC_NUM_REF_FRAMES_1");
+    assert_eq!(NV_ENC_NUM_REF_FRAMES_4 as i64, 4, "NV_ENC_NUM_REF_FRAMES_4");
+    assert_eq!(
+        NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED as i64, 5,
+        "NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED"
+    );
+    assert_eq!(
+        NV_ENC_VUI_COLOR_PRIMARIES_BT709 as i64, 1,
+        "NV_ENC_VUI_COLOR_PRIMARIES_BT709"
+    );
+    assert_eq!(
+        NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709 as i64, 1,
+        "NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709"
+    );
+    assert_eq!(
+        NV_ENC_VUI_MATRIX_COEFFS_BT709 as i64, 1,
+        "NV_ENC_VUI_MATRIX_COEFFS_BT709"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_OUTPUT_STATS_ROW() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_OUTPUT_STATS_ROW> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_capability_ids_match_nvencodeapi_h() {
+    // `EncoderCaps::query` asks by id. A wrong id silently reads a different
+    // capability, and every gate built on it is then answering the wrong question.
     assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_OUTPUT_STATS_ROW>(),
-        64usize,
-        concat!("Size of: ", stringify!(_NV_ENC_OUTPUT_STATS_ROW))
+        NV_ENC_CAPS_NUM_MAX_BFRAMES as i64, 0,
+        "NV_ENC_CAPS_NUM_MAX_BFRAMES"
     );
     assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_OUTPUT_STATS_ROW>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_OUTPUT_STATS_ROW))
+        NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES as i64, 1,
+        "NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_ROW),
-            "::",
-            stringify!(version)
-        )
+        NV_ENC_CAPS_SUPPORT_FIELD_ENCODING as i64, 2,
+        "NV_ENC_CAPS_SUPPORT_FIELD_ENCODING"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).QP) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_ROW),
-            "::",
-            stringify!(QP)
-        )
+        NV_ENC_CAPS_SUPPORT_MONOCHROME as i64, 3,
+        "NV_ENC_CAPS_SUPPORT_MONOCHROME"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        5usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_ROW),
-            "::",
-            stringify!(reserved)
-        )
+        NV_ENC_CAPS_SUPPORT_INTRA_REFRESH as i64, 25,
+        "NV_ENC_CAPS_SUPPORT_INTRA_REFRESH"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitcount) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_ROW),
-            "::",
-            stringify!(bitcount)
-        )
+        NV_ENC_CAPS_SUPPORT_CONSTRAINED_ENCODING as i64, 24,
+        "NV_ENC_CAPS_SUPPORT_CONSTRAINED_ENCODING"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_STATS_ROW),
-            "::",
-            stringify!(reserved1)
-        )
+        NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE as i64, 26,
+        "NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_DYNAMIC_SLICE_MODE as i64, 27,
+        "NV_ENC_CAPS_SUPPORT_DYNAMIC_SLICE_MODE"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION as i64, 28,
+        "NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION"
+    );
+    assert_eq!(NV_ENC_CAPS_WIDTH_MIN as i64, 45, "NV_ENC_CAPS_WIDTH_MIN");
+    assert_eq!(NV_ENC_CAPS_WIDTH_MAX as i64, 16, "NV_ENC_CAPS_WIDTH_MAX");
+    assert_eq!(NV_ENC_CAPS_HEIGHT_MIN as i64, 46, "NV_ENC_CAPS_HEIGHT_MIN");
+    assert_eq!(NV_ENC_CAPS_HEIGHT_MAX as i64, 17, "NV_ENC_CAPS_HEIGHT_MAX");
+    assert_eq!(NV_ENC_CAPS_LEVEL_MAX as i64, 13, "NV_ENC_CAPS_LEVEL_MAX");
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_CABAC as i64, 7,
+        "NV_ENC_CAPS_SUPPORT_CABAC"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_ADAPTIVE_TRANSFORM as i64, 8,
+        "NV_ENC_CAPS_SUPPORT_ADAPTIVE_TRANSFORM"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_NUM_ENCODER_ENGINES as i64, 49,
+        "NV_ENC_CAPS_NUM_ENCODER_ENGINES"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK as i64, 23,
+        "NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT as i64, 30,
+        "NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_NUM_MAX_LTR_FRAMES as i64, 40,
+        "NV_ENC_CAPS_NUM_MAX_LTR_FRAMES"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES as i64, 47,
+        "NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH as i64, 50,
+        "NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH"
+    );
+    assert_eq!(
+        NV_ENC_CAPS_EXPOSED_COUNT as i64, 55,
+        "NV_ENC_CAPS_EXPOSED_COUNT"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_ENCODE_OUT_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_ENCODE_OUT_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
+fn abi_status_codes_match_nvencodeapi_h() {
+    assert_eq!(NV_ENC_SUCCESS as i64, 0, "NV_ENC_SUCCESS");
     assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_ENCODE_OUT_PARAMS>(),
-        256usize,
-        concat!("Size of: ", stringify!(_NV_ENC_ENCODE_OUT_PARAMS))
+        NV_ENC_ERR_OUT_OF_MEMORY as i64, 10,
+        "NV_ENC_ERR_OUT_OF_MEMORY"
     );
     assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_ENCODE_OUT_PARAMS>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_ENCODE_OUT_PARAMS))
+        NV_ENC_ERR_INVALID_VERSION as i64, 15,
+        "NV_ENC_ERR_INVALID_VERSION"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_ENCODE_OUT_PARAMS),
-            "::",
-            stringify!(version)
-        )
+        NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY as i64, 21,
+        "NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamSizeInBytes) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_ENCODE_OUT_PARAMS),
-            "::",
-            stringify!(bitstreamSizeInBytes)
-        )
+        NV_ENC_ERR_ENCODER_BUSY as i64, 18,
+        "NV_ENC_ERR_ENCODER_BUSY"
     );
     assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_ENCODE_OUT_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
+        NV_ENC_ERR_NEED_MORE_INPUT as i64, 17,
+        "NV_ENC_ERR_NEED_MORE_INPUT"
     );
 }
+
 #[test]
-fn bindgen_test_layout__NV_ENC_LOOKAHEAD_PIC_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_LOOKAHEAD_PIC_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_LOOKAHEAD_PIC_PARAMS>(),
-        792usize,
-        concat!("Size of: ", stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_LOOKAHEAD_PIC_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputBuffer) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS),
-            "::",
-            stringify!(inputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pictureType) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS),
-            "::",
-            stringify!(pictureType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        280usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOOKAHEAD_PIC_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CREATE_INPUT_BUFFER() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CREATE_INPUT_BUFFER> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CREATE_INPUT_BUFFER>(),
-        776usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CREATE_INPUT_BUFFER))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CREATE_INPUT_BUFFER>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CREATE_INPUT_BUFFER))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).width) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(width)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).height) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(height)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).memoryHeap) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(memoryHeap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferFmt) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(bufferFmt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputBuffer) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(inputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pSysMemBuffer) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(pSysMemBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        272usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_INPUT_BUFFER),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CREATE_BITSTREAM_BUFFER() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CREATE_BITSTREAM_BUFFER> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CREATE_BITSTREAM_BUFFER>(),
-        776usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CREATE_BITSTREAM_BUFFER>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).size) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(size)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).memoryHeap) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(memoryHeap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamBuffer) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(bitstreamBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamBufferPtr) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(bitstreamBufferPtr)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        264usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_BITSTREAM_BUFFER),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_MVECTOR() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_MVECTOR> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_MVECTOR>(),
-        4usize,
-        concat!("Size of: ", stringify!(_NV_ENC_MVECTOR))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_MVECTOR>(),
-        2usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_MVECTOR))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvx) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MVECTOR),
-            "::",
-            stringify!(mvx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvy) as usize - ptr as usize },
-        2usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MVECTOR),
-            "::",
-            stringify!(mvy)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_H264_MV_DATA() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_H264_MV_DATA> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_H264_MV_DATA>(),
-        24usize,
-        concat!("Size of: ", stringify!(_NV_ENC_H264_MV_DATA))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_H264_MV_DATA>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_H264_MV_DATA))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mv) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_H264_MV_DATA),
-            "::",
-            stringify!(mv)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mbType) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_H264_MV_DATA),
-            "::",
-            stringify!(mbType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).partitionType) as usize - ptr as usize },
-        17usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_H264_MV_DATA),
-            "::",
-            stringify!(partitionType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        18usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_H264_MV_DATA),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mbCost) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_H264_MV_DATA),
-            "::",
-            stringify!(mbCost)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_HEVC_MV_DATA() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_HEVC_MV_DATA> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_HEVC_MV_DATA>(),
-        20usize,
-        concat!("Size of: ", stringify!(_NV_ENC_HEVC_MV_DATA))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_HEVC_MV_DATA>(),
-        2usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_HEVC_MV_DATA))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mv) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_HEVC_MV_DATA),
-            "::",
-            stringify!(mv)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cuType) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_HEVC_MV_DATA),
-            "::",
-            stringify!(cuType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cuSize) as usize - ptr as usize },
-        17usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_HEVC_MV_DATA),
-            "::",
-            stringify!(cuSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).partitionMode) as usize - ptr as usize },
-        18usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_HEVC_MV_DATA),
-            "::",
-            stringify!(partitionMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).lastCUInCTB) as usize - ptr as usize },
-        19usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_HEVC_MV_DATA),
-            "::",
-            stringify!(lastCUInCTB)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CREATE_MV_BUFFER() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CREATE_MV_BUFFER> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CREATE_MV_BUFFER>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CREATE_MV_BUFFER))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CREATE_MV_BUFFER>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CREATE_MV_BUFFER))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_MV_BUFFER),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvBuffer) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_MV_BUFFER),
-            "::",
-            stringify!(mvBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_MV_BUFFER),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1040usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CREATE_MV_BUFFER),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_QP() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_QP> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_QP>(),
-        12usize,
-        concat!("Size of: ", stringify!(_NV_ENC_QP))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_QP>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_QP))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpInterP) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_QP),
-            "::",
-            stringify!(qpInterP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpInterB) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_QP),
-            "::",
-            stringify!(qpInterB)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpIntra) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_QP),
-            "::",
-            stringify!(qpIntra)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_RC_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_RC_PARAMS> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_RC_PARAMS>(),
-        128usize,
-        concat!("Size of: ", stringify!(_NV_ENC_RC_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_RC_PARAMS>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_RC_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).rateControlMode) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(rateControlMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).constQP) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(constQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).averageBitRate) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(averageBitRate)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxBitRate) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(maxBitRate)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).vbvBufferSize) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(vbvBufferSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).vbvInitialDelay) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(vbvInitialDelay)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).minQP) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(minQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxQP) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(maxQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).initialRCQP) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(initialRCQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporallayerIdxMask) as usize - ptr as usize },
-        76usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(temporallayerIdxMask)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporalLayerQP) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(temporalLayerQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).targetQuality) as usize - ptr as usize },
-        88usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(targetQuality)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).targetQualityLSB) as usize - ptr as usize },
-        89usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(targetQualityLSB)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).lookaheadDepth) as usize - ptr as usize },
-        90usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(lookaheadDepth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).lowDelayKeyFrameScale) as usize - ptr as usize },
-        92usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(lowDelayKeyFrameScale)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).yDcQPIndexOffset) as usize - ptr as usize },
-        93usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(yDcQPIndexOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).uDcQPIndexOffset) as usize - ptr as usize },
-        94usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(uDcQPIndexOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).vDcQPIndexOffset) as usize - ptr as usize },
-        95usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(vDcQPIndexOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpMapMode) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(qpMapMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).multiPass) as usize - ptr as usize },
-        100usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(multiPass)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).alphaLayerBitrateRatio) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(alphaLayerBitrateRatio)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cbQPIndexOffset) as usize - ptr as usize },
-        108usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(cbQPIndexOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).crQPIndexOffset) as usize - ptr as usize },
-        109usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(crQPIndexOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        110usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        112usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RC_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CLOCK_TIMESTAMP_SET() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CLOCK_TIMESTAMP_SET> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CLOCK_TIMESTAMP_SET>(),
-        8usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CLOCK_TIMESTAMP_SET))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CLOCK_TIMESTAMP_SET>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CLOCK_TIMESTAMP_SET))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timeOffset) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CLOCK_TIMESTAMP_SET),
-            "::",
-            stringify!(timeOffset)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_TIME_CODE() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_TIME_CODE> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_TIME_CODE>(),
-        28usize,
-        concat!("Size of: ", stringify!(_NV_ENC_TIME_CODE))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_TIME_CODE>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_TIME_CODE))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).displayPicStruct) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_TIME_CODE),
-            "::",
-            stringify!(displayPicStruct)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).clockTimestamp) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_TIME_CODE),
-            "::",
-            stringify!(clockTimestamp)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_H264_VUI_PARAMETERS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_H264_VUI_PARAMETERS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_H264_VUI_PARAMETERS>(),
-        112usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_H264_VUI_PARAMETERS>(),
-        4usize,
-        concat!(
-            "Alignment of ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).overscanInfoPresentFlag) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(overscanInfoPresentFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).overscanInfo) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(overscanInfo)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).videoSignalTypePresentFlag) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(videoSignalTypePresentFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).videoFormat) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(videoFormat)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).videoFullRangeFlag) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(videoFullRangeFlag)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).colourDescriptionPresentFlag) as usize - ptr as usize
-        },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(colourDescriptionPresentFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).colourPrimaries) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(colourPrimaries)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).transferCharacteristics) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(transferCharacteristics)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).colourMatrix) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(colourMatrix)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaSampleLocationFlag) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(chromaSampleLocationFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaSampleLocationTop) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(chromaSampleLocationTop)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaSampleLocationBot) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(chromaSampleLocationBot)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamRestrictionFlag) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(bitstreamRestrictionFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timingInfoPresentFlag) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(timingInfoPresentFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numUnitInTicks) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(numUnitInTicks)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timeScale) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(timeScale)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_VUI_PARAMETERS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE() {
-    const UNINIT: ::core::mem::MaybeUninit<_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE>(),
-        16usize,
-        concat!(
-            "Size of: ",
-            stringify!(_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE)
-        )
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE>(),
-        4usize,
-        concat!(
-            "Alignment of ",
-            stringify!(_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NVENC_EXTERNAL_ME_HINT() {
-    assert_eq!(
-        ::core::mem::size_of::<_NVENC_EXTERNAL_ME_HINT>(),
-        4usize,
-        concat!("Size of: ", stringify!(_NVENC_EXTERNAL_ME_HINT))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NVENC_EXTERNAL_ME_HINT>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NVENC_EXTERNAL_ME_HINT))
-    );
-}
-#[test]
-fn bindgen_test_layout__NVENC_EXTERNAL_ME_SB_HINT() {
-    assert_eq!(
-        ::core::mem::size_of::<_NVENC_EXTERNAL_ME_SB_HINT>(),
-        6usize,
-        concat!("Size of: ", stringify!(_NVENC_EXTERNAL_ME_SB_HINT))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NVENC_EXTERNAL_ME_SB_HINT>(),
-        2usize,
-        concat!("Alignment of ", stringify!(_NVENC_EXTERNAL_ME_SB_HINT))
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_H264() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_H264> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_H264>(),
-        1792usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_H264))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_H264>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG_H264))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).level) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(level)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).idrPeriod) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(idrPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).separateColourPlaneFlag) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(separateColourPlaneFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).disableDeblockingFilterIDC) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(disableDeblockingFilterIDC)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numTemporalLayers) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(numTemporalLayers)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).spsId) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(spsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ppsId) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(ppsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).adaptiveTransformMode) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(adaptiveTransformMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).fmoMode) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(fmoMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bdirectMode) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(bdirectMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).entropyCodingMode) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(entropyCodingMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).stereoMode) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(stereoMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshPeriod) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(intraRefreshPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshCnt) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(intraRefreshCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxNumRefFrames) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(maxNumRefFrames)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceMode) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(sliceMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceModeData) as usize - ptr as usize },
-        68usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(sliceModeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).h264VUIParameters) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(h264VUIParameters)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrNumFrames) as usize - ptr as usize },
-        184usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(ltrNumFrames)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrTrustMode) as usize - ptr as usize },
-        188usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(ltrTrustMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaFormatIDC) as usize - ptr as usize },
-        192usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(chromaFormatIDC)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxTemporalLayers) as usize - ptr as usize },
-        196usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(maxTemporalLayers)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).useBFramesAsRef) as usize - ptr as usize },
-        200usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(useBFramesAsRef)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numRefL0) as usize - ptr as usize },
-        204usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(numRefL0)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numRefL1) as usize - ptr as usize },
-        208usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(numRefL1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        212usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1280usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_HEVC() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_HEVC> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_HEVC>(),
-        1560usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_HEVC))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_HEVC>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG_HEVC))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).level) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(level)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tier) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(tier)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).minCUSize) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(minCUSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxCUSize) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(maxCUSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).idrPeriod) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(idrPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshPeriod) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(intraRefreshPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshCnt) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(intraRefreshCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxNumRefFramesInDPB) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(maxNumRefFramesInDPB)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrNumFrames) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(ltrNumFrames)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).vpsId) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(vpsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).spsId) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(spsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ppsId) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(ppsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceMode) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(sliceMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceModeData) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(sliceModeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxTemporalLayersMinus1) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(maxTemporalLayersMinus1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).hevcVUIParameters) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(hevcVUIParameters)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrTrustMode) as usize - ptr as usize },
-        176usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(ltrTrustMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).useBFramesAsRef) as usize - ptr as usize },
-        180usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(useBFramesAsRef)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numRefL0) as usize - ptr as usize },
-        184usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(numRefL0)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numRefL1) as usize - ptr as usize },
-        188usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(numRefL1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        192usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1048usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_FILM_GRAIN_PARAMS_AV1() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_FILM_GRAIN_PARAMS_AV1> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_FILM_GRAIN_PARAMS_AV1>(),
-        156usize,
-        concat!("Size of: ", stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_FILM_GRAIN_PARAMS_AV1>(),
-        4usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointYValue) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointYValue)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointYScaling) as usize - ptr as usize },
-        18usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointYScaling)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointCbValue) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointCbValue)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointCbScaling) as usize - ptr as usize },
-        42usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointCbScaling)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointCrValue) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointCrValue)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pointCrScaling) as usize - ptr as usize },
-        62usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(pointCrScaling)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).arCoeffsYPlus128) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(arCoeffsYPlus128)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).arCoeffsCbPlus128) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(arCoeffsCbPlus128)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).arCoeffsCrPlus128) as usize - ptr as usize },
-        121usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(arCoeffsCrPlus128)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        146usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cbMult) as usize - ptr as usize },
-        148usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(cbMult)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cbLumaMult) as usize - ptr as usize },
-        149usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(cbLumaMult)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).cbOffset) as usize - ptr as usize },
-        150usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(cbOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).crMult) as usize - ptr as usize },
-        152usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(crMult)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).crLumaMult) as usize - ptr as usize },
-        153usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(crLumaMult)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).crOffset) as usize - ptr as usize },
-        154usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FILM_GRAIN_PARAMS_AV1),
-            "::",
-            stringify!(crOffset)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_AV1() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_AV1> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_AV1>(),
-        1552usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_AV1))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_AV1>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG_AV1))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).level) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(level)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tier) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(tier)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).minPartSize) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(minPartSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxPartSize) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(maxPartSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).idrPeriod) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(idrPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshPeriod) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(intraRefreshPeriod)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraRefreshCnt) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(intraRefreshCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxNumRefFramesInDPB) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(maxNumRefFramesInDPB)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numTileColumns) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(numTileColumns)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numTileRows) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(numTileRows)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tileWidths) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(tileWidths)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tileHeights) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(tileHeights)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxTemporalLayersMinus1) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(maxTemporalLayersMinus1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).colorPrimaries) as usize - ptr as usize },
-        68usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(colorPrimaries)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).transferCharacteristics) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(transferCharacteristics)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).matrixCoefficients) as usize - ptr as usize },
-        76usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(matrixCoefficients)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).colorRange) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(colorRange)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaSamplePosition) as usize - ptr as usize },
-        84usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(chromaSamplePosition)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).useBFramesAsRef) as usize - ptr as usize },
-        88usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(useBFramesAsRef)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).filmGrainParams) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(filmGrainParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numFwdRefs) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(numFwdRefs)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numBwdRefs) as usize - ptr as usize },
-        108usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(numBwdRefs)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        112usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1056usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_AV1),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_H264_MEONLY() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_H264_MEONLY> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_H264_MEONLY>(),
-        1536usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_H264_MEONLY))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_H264_MEONLY>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG_H264_MEONLY))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_MEONLY),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1024usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_H264_MEONLY),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG_HEVC_MEONLY() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG_HEVC_MEONLY> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG_HEVC_MEONLY>(),
-        1536usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG_HEVC_MEONLY))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG_HEVC_MEONLY>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG_HEVC_MEONLY))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC_MEONLY),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        1024usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG_HEVC_MEONLY),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CODEC_CONFIG() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CODEC_CONFIG> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CODEC_CONFIG>(),
-        1792usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CODEC_CONFIG))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CODEC_CONFIG>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CODEC_CONFIG))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).h264Config) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(h264Config)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).hevcConfig) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(hevcConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).av1Config) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(av1Config)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).h264MeOnlyConfig) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(h264MeOnlyConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).hevcMeOnlyConfig) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(hevcMeOnlyConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_CONFIG),
-            "::",
-            stringify!(reserved)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CONFIG() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CONFIG> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CONFIG>(),
-        3584usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CONFIG))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CONFIG>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CONFIG))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).profileGUID) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(profileGUID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).gopLength) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(gopLength)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameIntervalP) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(frameIntervalP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).monoChromeEncoding) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(monoChromeEncoding)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameFieldMode) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(frameFieldMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvPrecision) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(mvPrecision)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).rcParams) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(rcParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodeCodecConfig) as usize - ptr as usize },
-        168usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(encodeCodecConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        1960usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        3072usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CONFIG),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_INITIALIZE_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_INITIALIZE_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_INITIALIZE_PARAMS>(),
-        1808usize,
-        concat!("Size of: ", stringify!(_NV_ENC_INITIALIZE_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_INITIALIZE_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_INITIALIZE_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodeGUID) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(encodeGUID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).presetGUID) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(presetGUID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodeWidth) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(encodeWidth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodeHeight) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(encodeHeight)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).darWidth) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(darWidth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).darHeight) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(darHeight)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameRateNum) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(frameRateNum)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameRateDen) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(frameRateDen)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).enableEncodeAsync) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(enableEncodeAsync)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).enablePTD) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(enablePTD)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).privDataSize) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(privDataSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).privData) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(privData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodeConfig) as usize - ptr as usize },
-        88usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(encodeConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxEncodeWidth) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(maxEncodeWidth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxEncodeHeight) as usize - ptr as usize },
-        100usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(maxEncodeHeight)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).maxMEHintCountsPerBlock) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(maxMEHintCountsPerBlock)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tuningInfo) as usize - ptr as usize },
-        136usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(tuningInfo)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferFormat) as usize - ptr as usize },
-        140usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(bufferFormat)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numStateBuffers) as usize - ptr as usize },
-        144usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(numStateBuffers)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputStatsLevel) as usize - ptr as usize },
-        148usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(outputStatsLevel)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        152usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1296usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INITIALIZE_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_RECONFIGURE_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_RECONFIGURE_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_RECONFIGURE_PARAMS>(),
-        1824usize,
-        concat!("Size of: ", stringify!(_NV_ENC_RECONFIGURE_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_RECONFIGURE_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_RECONFIGURE_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RECONFIGURE_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reInitEncodeParams) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_RECONFIGURE_PARAMS),
-            "::",
-            stringify!(reInitEncodeParams)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PRESET_CONFIG() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PRESET_CONFIG> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PRESET_CONFIG>(),
-        5128usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PRESET_CONFIG))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PRESET_CONFIG>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PRESET_CONFIG))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PRESET_CONFIG),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).presetCfg) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PRESET_CONFIG),
-            "::",
-            stringify!(presetCfg)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        3592usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PRESET_CONFIG),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        4616usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PRESET_CONFIG),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS_MVC() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS_MVC> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS_MVC>(),
-        128usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS_MVC))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS_MVC>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS_MVC))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).viewID) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(viewID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporalID) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(temporalID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).priorityID) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(priorityID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_MVC),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS_H264_EXT() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS_H264_EXT> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS_H264_EXT>(),
-        128usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS_H264_EXT))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS_H264_EXT>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS_H264_EXT))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvcPicParams) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264_EXT),
-            "::",
-            stringify!(mvcPicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264_EXT),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_SEI_PAYLOAD() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_SEI_PAYLOAD> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_SEI_PAYLOAD>(),
-        16usize,
-        concat!("Size of: ", stringify!(_NV_ENC_SEI_PAYLOAD))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_SEI_PAYLOAD>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_SEI_PAYLOAD))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).payloadSize) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEI_PAYLOAD),
-            "::",
-            stringify!(payloadSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).payloadType) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEI_PAYLOAD),
-            "::",
-            stringify!(payloadType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).payload) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEI_PAYLOAD),
-            "::",
-            stringify!(payload)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS_H264() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS_H264> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS_H264>(),
-        1536usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS_H264))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS_H264>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS_H264))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).displayPOCSyntax) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(displayPOCSyntax)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved3) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(reserved3)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).refPicFlag) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(refPicFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).colourPlaneId) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(colourPlaneId)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).forceIntraRefreshWithFrameCnt) as usize - ptr as usize
-        },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(forceIntraRefreshWithFrameCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceTypeData) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(sliceTypeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceTypeArrayCnt) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(sliceTypeArrayCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).seiPayloadArrayCnt) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(seiPayloadArrayCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).seiPayloadArray) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(seiPayloadArray)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceMode) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(sliceMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceModeData) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(sliceModeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrMarkFrameIdx) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(ltrMarkFrameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrUseFrameBitmap) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(ltrUseFrameBitmap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrUsageMode) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(ltrUsageMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).forceIntraSliceCount) as usize - ptr as usize },
-        68usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(forceIntraSliceCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).forceIntraSliceIdx) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(forceIntraSliceIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).h264ExtPicParams) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(h264ExtPicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timeCode) as usize - ptr as usize },
-        208usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(timeCode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        236usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1048usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_H264),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS_HEVC() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS_HEVC> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS_HEVC>(),
-        1536usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS_HEVC))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS_HEVC>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS_HEVC))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).displayPOCSyntax) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(displayPOCSyntax)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).refPicFlag) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(refPicFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporalId) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(temporalId)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).forceIntraRefreshWithFrameCnt) as usize - ptr as usize
-        },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(forceIntraRefreshWithFrameCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceTypeData) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(sliceTypeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceTypeArrayCnt) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(sliceTypeArrayCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceMode) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(sliceMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceModeData) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(sliceModeData)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrMarkFrameIdx) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(ltrMarkFrameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrUseFrameBitmap) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(ltrUseFrameBitmap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrUsageMode) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(ltrUsageMode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).seiPayloadArrayCnt) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(seiPayloadArrayCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).seiPayloadArray) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(seiPayloadArray)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).timeCode) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(timeCode)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        100usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved3) as usize - ptr as usize },
-        1048usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_HEVC),
-            "::",
-            stringify!(reserved3)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS_AV1() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS_AV1> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS_AV1>(),
-        1552usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS_AV1))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS_AV1>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS_AV1))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).displayPOCSyntax) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(displayPOCSyntax)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).refPicFlag) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(refPicFlag)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporalId) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(temporalId)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).forceIntraRefreshWithFrameCnt) as usize - ptr as usize
-        },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(forceIntraRefreshWithFrameCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numTileColumns) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(numTileColumns)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numTileRows) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(numTileRows)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tileWidths) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(tileWidths)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).tileHeights) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(tileHeights)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).obuPayloadArrayCnt) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(obuPayloadArrayCnt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        52usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).obuPayloadArray) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(obuPayloadArray)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).filmGrainParams) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(filmGrainParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved3) as usize - ptr as usize },
-        1064usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS_AV1),
-            "::",
-            stringify!(reserved3)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_CODEC_PIC_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_CODEC_PIC_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_CODEC_PIC_PARAMS>(),
-        1552usize,
-        concat!("Size of: ", stringify!(_NV_ENC_CODEC_PIC_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_CODEC_PIC_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_CODEC_PIC_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).h264PicParams) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_PIC_PARAMS),
-            "::",
-            stringify!(h264PicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).hevcPicParams) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_PIC_PARAMS),
-            "::",
-            stringify!(hevcPicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).av1PicParams) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_PIC_PARAMS),
-            "::",
-            stringify!(av1PicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_CODEC_PIC_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_PIC_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_PIC_PARAMS> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_PIC_PARAMS>(),
-        3360usize,
-        concat!("Size of: ", stringify!(_NV_ENC_PIC_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_PIC_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_PIC_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputWidth) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputWidth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputHeight) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputHeight)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputPitch) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputPitch)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).encodePicFlags) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(encodePicFlags)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameIdx) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(frameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputTimeStamp) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputTimeStamp)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputDuration) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputDuration)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputBuffer) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(inputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputBitstream) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(outputBitstream)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).completionEvent) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(completionEvent)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferFmt) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(bufferFmt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pictureStruct) as usize - ptr as usize },
-        68usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(pictureStruct)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pictureType) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(pictureType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).codecPicParams) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(codecPicParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meHintCountsPerBlock) as usize - ptr as usize },
-        1632usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(meHintCountsPerBlock)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meExternalHints) as usize - ptr as usize },
-        1664usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(meExternalHints)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        1672usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1696usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpDeltaMap) as usize - ptr as usize },
-        1712usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(qpDeltaMap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).qpDeltaMapSize) as usize - ptr as usize },
-        1720usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(qpDeltaMapSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reservedBitFields) as usize - ptr as usize },
-        1724usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(reservedBitFields)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meHintRefPicDist) as usize - ptr as usize },
-        1728usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(meHintRefPicDist)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).alphaBuffer) as usize - ptr as usize },
-        1736usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(alphaBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meExternalSbHints) as usize - ptr as usize },
-        1744usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(meExternalSbHints)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meSbHintsCount) as usize - ptr as usize },
-        1752usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(meSbHintsCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).stateBufferIdx) as usize - ptr as usize },
-        1756usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(stateBufferIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputReconBuffer) as usize - ptr as usize },
-        1760usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(outputReconBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved3) as usize - ptr as usize },
-        1768usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(reserved3)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved4) as usize - ptr as usize },
-        2904usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_PIC_PARAMS),
-            "::",
-            stringify!(reserved4)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_MEONLY_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_MEONLY_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_MEONLY_PARAMS>(),
-        1552usize,
-        concat!("Size of: ", stringify!(_NV_ENC_MEONLY_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_MEONLY_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_MEONLY_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputWidth) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(inputWidth)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputHeight) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(inputHeight)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputBuffer) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(inputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).referenceFrame) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(referenceFrame)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mvBuffer) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(mvBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferFmt) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(bufferFmt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).completionEvent) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(completionEvent)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).viewID) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(viewID)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meHintCountsPerBlock) as usize - ptr as usize },
-        60usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(meHintCountsPerBlock)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).meExternalHints) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(meExternalHints)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1080usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MEONLY_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_LOCK_BITSTREAM() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_LOCK_BITSTREAM> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_LOCK_BITSTREAM>(),
-        1552usize,
-        concat!("Size of: ", stringify!(_NV_ENC_LOCK_BITSTREAM))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_LOCK_BITSTREAM>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_LOCK_BITSTREAM))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputBitstream) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(outputBitstream)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceOffsets) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(sliceOffsets)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameIdx) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(frameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).hwEncodeStatus) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(hwEncodeStatus)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).numSlices) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(numSlices)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamSizeInBytes) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(bitstreamSizeInBytes)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputTimeStamp) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(outputTimeStamp)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputDuration) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(outputDuration)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitstreamBufferPtr) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(bitstreamBufferPtr)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pictureType) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(pictureType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pictureStruct) as usize - ptr as usize },
-        68usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(pictureStruct)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameAvgQP) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(frameAvgQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameSatd) as usize - ptr as usize },
-        76usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(frameSatd)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrFrameIdx) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(ltrFrameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrFrameBitmap) as usize - ptr as usize },
-        84usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(ltrFrameBitmap)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).temporalId) as usize - ptr as usize },
-        88usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(temporalId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraMBCount) as usize - ptr as usize },
-        92usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(intraMBCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).interMBCount) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(interMBCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).averageMVX) as usize - ptr as usize },
-        100usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(averageMVX)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).averageMVY) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(averageMVY)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).alphaLayerSizeInBytes) as usize - ptr as usize },
-        108usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(alphaLayerSizeInBytes)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputStatsPtrSize) as usize - ptr as usize },
-        112usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(outputStatsPtrSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputStatsPtr) as usize - ptr as usize },
-        120usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(outputStatsPtr)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameIdxDisplay) as usize - ptr as usize },
-        128usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(frameIdxDisplay)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        132usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1016usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reservedInternal) as usize - ptr as usize },
-        1520usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_BITSTREAM),
-            "::",
-            stringify!(reservedInternal)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_LOCK_INPUT_BUFFER() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_LOCK_INPUT_BUFFER> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_LOCK_INPUT_BUFFER>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_LOCK_INPUT_BUFFER))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_LOCK_INPUT_BUFFER>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_LOCK_INPUT_BUFFER))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputBuffer) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(inputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferDataPtr) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(bufferDataPtr)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pitch) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(pitch)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1032usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_LOCK_INPUT_BUFFER),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_MAP_INPUT_RESOURCE() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_MAP_INPUT_RESOURCE> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_MAP_INPUT_RESOURCE>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_MAP_INPUT_RESOURCE))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_MAP_INPUT_RESOURCE>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_MAP_INPUT_RESOURCE))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).subResourceIndex) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(subResourceIndex)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputResource) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(inputResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).registeredResource) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(registeredResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mappedResource) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(mappedResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).mappedBufferFmt) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(mappedBufferFmt)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1040usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_MAP_INPUT_RESOURCE),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_INPUT_RESOURCE_OPENGL_TEX() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_INPUT_RESOURCE_OPENGL_TEX> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_INPUT_RESOURCE_OPENGL_TEX>(),
-        8usize,
-        concat!("Size of: ", stringify!(_NV_ENC_INPUT_RESOURCE_OPENGL_TEX))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_INPUT_RESOURCE_OPENGL_TEX>(),
-        4usize,
-        concat!(
-            "Alignment of ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_OPENGL_TEX)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).texture) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_OPENGL_TEX),
-            "::",
-            stringify!(texture)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).target) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_OPENGL_TEX),
-            "::",
-            stringify!(target)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_FENCE_POINT_D3D12() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_FENCE_POINT_D3D12> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_FENCE_POINT_D3D12>(),
-        64usize,
-        concat!("Size of: ", stringify!(_NV_ENC_FENCE_POINT_D3D12))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_FENCE_POINT_D3D12>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_FENCE_POINT_D3D12))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pFence) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(pFence)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).waitValue) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(waitValue)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).signalValue) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(signalValue)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        36usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_FENCE_POINT_D3D12),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_INPUT_RESOURCE_D3D12() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_INPUT_RESOURCE_D3D12> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_INPUT_RESOURCE_D3D12>(),
-        272usize,
-        concat!("Size of: ", stringify!(_NV_ENC_INPUT_RESOURCE_D3D12))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_INPUT_RESOURCE_D3D12>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_INPUT_RESOURCE_D3D12))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pInputBuffer) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(pInputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inputFencePoint) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(inputFencePoint)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        144usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_INPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_OUTPUT_RESOURCE_D3D12() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_OUTPUT_RESOURCE_D3D12> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_OUTPUT_RESOURCE_D3D12>(),
-        272usize,
-        concat!("Size of: ", stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_OUTPUT_RESOURCE_D3D12>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pOutputBuffer) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(pOutputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputFencePoint) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(outputFencePoint)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        144usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OUTPUT_RESOURCE_D3D12),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_REGISTER_RESOURCE() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_REGISTER_RESOURCE> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_REGISTER_RESOURCE>(),
-        1536usize,
-        concat!("Size of: ", stringify!(_NV_ENC_REGISTER_RESOURCE))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_REGISTER_RESOURCE>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_REGISTER_RESOURCE))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).resourceType) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(resourceType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).width) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(width)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).height) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(height)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pitch) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(pitch)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).subResourceIndex) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(subResourceIndex)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).resourceToRegister) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(resourceToRegister)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).registeredResource) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(registeredResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferFormat) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(bufferFormat)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bufferUsage) as usize - ptr as usize },
-        44usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(bufferUsage)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).pInputFencePoint) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(pInputFencePoint)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).chromaOffset) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(chromaOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1048usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_REGISTER_RESOURCE),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_STAT() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_STAT> = ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_STAT>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_STAT))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_STAT>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_STAT))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outputBitStream) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(outputBitStream)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).bitStreamSize) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(bitStreamSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).picType) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(picType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).lastValidByteOffset) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(lastValidByteOffset)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).sliceOffsets) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(sliceOffsets)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).picIdx) as usize - ptr as usize },
-        92usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(picIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).frameAvgQP) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(frameAvgQP)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ltrFrameIdx) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(ltrFrameIdx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).intraMBCount) as usize - ptr as usize },
-        108usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(intraMBCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).interMBCount) as usize - ptr as usize },
-        112usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(interMBCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).averageMVX) as usize - ptr as usize },
-        116usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(averageMVX)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).averageMVY) as usize - ptr as usize },
-        120usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(averageMVY)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        124usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1032usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_STAT),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_SEQUENCE_PARAM_PAYLOAD() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_SEQUENCE_PARAM_PAYLOAD> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_SEQUENCE_PARAM_PAYLOAD>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_SEQUENCE_PARAM_PAYLOAD>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).inBufferSize) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(inBufferSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).spsId) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(spsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).ppsId) as usize - ptr as usize },
-        12usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(ppsId)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).spsppsBuffer) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(spsppsBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).outSPSPPSPayloadSize) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(outSPSPPSPayloadSize)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1032usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_SEQUENCE_PARAM_PAYLOAD),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_EVENT_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_EVENT_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_EVENT_PARAMS>(),
-        1544usize,
-        concat!("Size of: ", stringify!(_NV_ENC_EVENT_PARAMS))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_EVENT_PARAMS>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENC_EVENT_PARAMS))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_EVENT_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_EVENT_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).completionEvent) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_EVENT_PARAMS),
-            "::",
-            stringify!(completionEvent)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_EVENT_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1032usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_EVENT_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS>(),
-        1552usize,
-        concat!(
-            "Size of: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS)
-        )
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS>(),
-        8usize,
-        concat!(
-            "Alignment of ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).deviceType) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(deviceType)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).device) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(device)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).apiVersion) as usize - ptr as usize },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(apiVersion)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        28usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        1040usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS),
-            "::",
-            stringify!(reserved2)
-        )
-    );
-}
-#[test]
-fn bindgen_test_layout__NV_ENCODE_API_FUNCTION_LIST() {
-    const UNINIT: ::core::mem::MaybeUninit<_NV_ENCODE_API_FUNCTION_LIST> =
-        ::core::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::core::mem::size_of::<_NV_ENCODE_API_FUNCTION_LIST>(),
-        2552usize,
-        concat!("Size of: ", stringify!(_NV_ENCODE_API_FUNCTION_LIST))
-    );
-    assert_eq!(
-        ::core::mem::align_of::<_NV_ENCODE_API_FUNCTION_LIST>(),
-        8usize,
-        concat!("Alignment of ", stringify!(_NV_ENCODE_API_FUNCTION_LIST))
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).version) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(version)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved) as usize - ptr as usize },
-        4usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(reserved)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncOpenEncodeSession) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncOpenEncodeSession)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodeGUIDCount) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeGUIDCount)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).nvEncGetEncodeProfileGUIDCount) as usize - ptr as usize
-        },
-        24usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeProfileGUIDCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodeProfileGUIDs) as usize - ptr as usize },
-        32usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeProfileGUIDs)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodeGUIDs) as usize - ptr as usize },
-        40usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeGUIDs)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetInputFormatCount) as usize - ptr as usize },
-        48usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetInputFormatCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetInputFormats) as usize - ptr as usize },
-        56usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetInputFormats)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodeCaps) as usize - ptr as usize },
-        64usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeCaps)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodePresetCount) as usize - ptr as usize },
-        72usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodePresetCount)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodePresetGUIDs) as usize - ptr as usize },
-        80usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodePresetGUIDs)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodePresetConfig) as usize - ptr as usize },
-        88usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodePresetConfig)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncInitializeEncoder) as usize - ptr as usize },
-        96usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncInitializeEncoder)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncCreateInputBuffer) as usize - ptr as usize },
-        104usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncCreateInputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncDestroyInputBuffer) as usize - ptr as usize },
-        112usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncDestroyInputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncCreateBitstreamBuffer) as usize - ptr as usize },
-        120usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncCreateBitstreamBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).nvEncDestroyBitstreamBuffer) as usize - ptr as usize
-        },
-        128usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncDestroyBitstreamBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncEncodePicture) as usize - ptr as usize },
-        136usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncEncodePicture)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncLockBitstream) as usize - ptr as usize },
-        144usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncLockBitstream)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncUnlockBitstream) as usize - ptr as usize },
-        152usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncUnlockBitstream)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncLockInputBuffer) as usize - ptr as usize },
-        160usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncLockInputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncUnlockInputBuffer) as usize - ptr as usize },
-        168usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncUnlockInputBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetEncodeStats) as usize - ptr as usize },
-        176usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodeStats)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetSequenceParams) as usize - ptr as usize },
-        184usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetSequenceParams)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncRegisterAsyncEvent) as usize - ptr as usize },
-        192usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncRegisterAsyncEvent)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncUnregisterAsyncEvent) as usize - ptr as usize },
-        200usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncUnregisterAsyncEvent)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncMapInputResource) as usize - ptr as usize },
-        208usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncMapInputResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncUnmapInputResource) as usize - ptr as usize },
-        216usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncUnmapInputResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncDestroyEncoder) as usize - ptr as usize },
-        224usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncDestroyEncoder)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncInvalidateRefFrames) as usize - ptr as usize },
-        232usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncInvalidateRefFrames)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncOpenEncodeSessionEx) as usize - ptr as usize },
-        240usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncOpenEncodeSessionEx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncRegisterResource) as usize - ptr as usize },
-        248usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncRegisterResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncUnregisterResource) as usize - ptr as usize },
-        256usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncUnregisterResource)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncReconfigureEncoder) as usize - ptr as usize },
-        264usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncReconfigureEncoder)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved1) as usize - ptr as usize },
-        272usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(reserved1)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncCreateMVBuffer) as usize - ptr as usize },
-        280usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncCreateMVBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncDestroyMVBuffer) as usize - ptr as usize },
-        288usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncDestroyMVBuffer)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).nvEncRunMotionEstimationOnly) as usize - ptr as usize
-        },
-        296usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncRunMotionEstimationOnly)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetLastErrorString) as usize - ptr as usize },
-        304usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetLastErrorString)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncSetIOCudaStreams) as usize - ptr as usize },
-        312usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncSetIOCudaStreams)
-        )
-    );
-    assert_eq!(
-        unsafe {
-            ::core::ptr::addr_of!((*ptr).nvEncGetEncodePresetConfigEx) as usize - ptr as usize
-        },
-        320usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetEncodePresetConfigEx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncGetSequenceParamEx) as usize - ptr as usize },
-        328usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncGetSequenceParamEx)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncRestoreEncoderState) as usize - ptr as usize },
-        336usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncRestoreEncoderState)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).nvEncLookaheadPicture) as usize - ptr as usize },
-        344usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(nvEncLookaheadPicture)
-        )
-    );
-    assert_eq!(
-        unsafe { ::core::ptr::addr_of!((*ptr).reserved2) as usize - ptr as usize },
-        352usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(_NV_ENCODE_API_FUNCTION_LIST),
-            "::",
-            stringify!(reserved2)
-        )
+fn abi_guids_match_nvencodeapi_h() {
+    // bindgen mis-generates these (rust-bindgen#1888), so `nvenc_sys/guid.rs`
+    // transcribes them by hand — exactly the place a typo would survive review.
+    assert_guid(
+        NV_ENC_CODEC_H264_GUID,
+        0x6BC82762,
+        0x4E63,
+        0x4CA4,
+        [170, 133, 30, 80, 243, 33, 246, 191],
+        "NV_ENC_CODEC_H264_GUID",
+    );
+    assert_guid(
+        NV_ENC_H264_PROFILE_BASELINE_GUID,
+        0x0727BCAA,
+        0x78C4,
+        0x4C83,
+        [140, 47, 239, 61, 255, 38, 124, 106],
+        "NV_ENC_H264_PROFILE_BASELINE_GUID",
+    );
+    assert_guid(
+        NV_ENC_H264_PROFILE_MAIN_GUID,
+        0x60B5C1D4,
+        0x67FE,
+        0x4790,
+        [148, 213, 196, 114, 109, 123, 110, 109],
+        "NV_ENC_H264_PROFILE_MAIN_GUID",
+    );
+    assert_guid(
+        NV_ENC_H264_PROFILE_HIGH_GUID,
+        0xE7CBC309,
+        0x4F7A,
+        0x4B89,
+        [175, 42, 213, 55, 201, 43, 227, 16],
+        "NV_ENC_H264_PROFILE_HIGH_GUID",
+    );
+    assert_guid(
+        NV_ENC_PRESET_P1_GUID,
+        0xFC0A8D3E,
+        0x45F8,
+        0x4CF8,
+        [128, 199, 41, 136, 113, 89, 14, 191],
+        "NV_ENC_PRESET_P1_GUID",
+    );
+    assert_guid(
+        NV_ENC_PRESET_P4_GUID,
+        0x90A7B826,
+        0xDF06,
+        0x4862,
+        [185, 210, 205, 109, 115, 160, 134, 129],
+        "NV_ENC_PRESET_P4_GUID",
+    );
+    assert_guid(
+        NV_ENC_PRESET_P7_GUID,
+        0x84848C12,
+        0x6F71,
+        0x4C13,
+        [147, 27, 83, 226, 131, 245, 121, 116],
+        "NV_ENC_PRESET_P7_GUID",
     );
 }
