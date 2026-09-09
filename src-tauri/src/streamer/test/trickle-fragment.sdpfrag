@@ -1,0 +1,6 @@
+a=ice-ufrag:UF01
+m=video 9 UDP/TLS/RTP/SAVPF 0
+a=mid:0
+a=candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host
+a=candidate:2 1 udp 41885439 203.0.113.7 40000 typ relay raddr 0.0.0.0 rport 0
+a=end-of-candidates
