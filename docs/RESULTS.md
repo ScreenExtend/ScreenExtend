@@ -520,8 +520,8 @@ arrival→paint and host-capture→paint over `OP::STATS` and the host stores it
 | Duet Display | 95 USB / 108 Wi-Fi at 60 fps | *adversarial* bench | [Astropad](https://astropad.com/blog/comparing-latency-luna-display/) |
 | **Generic WebRTC remote control (Hopp)** | **98** (good net, 1080p) after tuning libwebrtc, from 159 | published measurement | [gethopp](https://www.gethopp.app/blog/latency-exploration) |
 | Miracast / Wi-Fi Display | 80–100 optimized; **spec ceiling 250** | certification spec | [Wi-Fi Alliance overview](https://tools.barco.com/kb-downloads/4814/Wi-Fi_CERTIFIED_Miracast_Technical_Overview_20170725.pdf) |
-| **ScreenExtend — host half only** | **8.39 p50 / 9.44 p90 / 12.58 p99** (1080p, real content, NVENC) | measured here, this document | — |
-| ScreenExtend — host half, macOS 10.15 Intel 2013 | 14.01 p50 / 28.07 p99 | measured here | — |
+| **ScreenExtend — host half only** | **8.39 p50 / 9.44 p90 / 12.58 p99** — capture → encode-out, 1080p, real content, NVENC. Packetize + socket write add 0.22 ms at p50 and 1.57 ms at p99 on the self-test. | measured here, this document | — |
+| ScreenExtend — host half, macOS 10.15 Intel 2013 | 14.01 p50 / 28.07 p99, capture → encoded | measured here | — |
 
 The two that matter for positioning are **Luna Display** — the same job, a tablet as a second
 display over Wi-Fi, 22.4 ms glass-to-glass — and **Hopp**, the same transport, a browser WebRTC
