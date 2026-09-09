@@ -829,6 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_second_ntp_value_converts_through_its_fraction() {
+        // The whole-second case above leaves the low 32 bits zero, so it cannot catch a fault
+        // in the fractional half of the fixed-point conversion. 20 ms is entirely fraction.
+        let twenty_ms = (20u64 << 32) / 1000;
+        let ns = ntp_fixed_to_ns(twenty_ms);
+        assert!(
+            (19_000_000..=21_000_000).contains(&ns),
+            "20 ms of NTP fixed point converted to {ns} ns"
+        );
+        // A difference taken between two stamps is the same conversion applied to the
+        // difference, so the round trip has to hold there too.
+        let now = 41457u64 << 32;
+        assert_eq!(ntp_fixed_to_ns(now + twenty_ms) - ntp_fixed_to_ns(now), ns);
+    }
+
+    #[test]
     fn a_property_list_is_found_inside_a_larger_payload() {
         let mut dict = plist::Dictionary::new();
         dict.insert("rttAvg".to_string(), plist::Value::Real(0.0031));

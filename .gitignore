@@ -40,11 +40,12 @@ AUDIT.md
 # Personal git workflow
 SSH-GIT.md
 
-# Build artifacts of the AMF layout generator (src-tauri/tools/README.md)
+# Build artifacts of the layout generators (src-tauri/tools/README.md)
 src-tauri/tools/*.exe
 src-tauri/tools/*.obj
 src-tauri/tools/amf_layout_generated.txt
 src-tauri/tools/amf_layout_cpp_check.txt
+src-tauri/tools/nvenc_layout_generated.txt
 
 # Temporary agent files
 .agents/

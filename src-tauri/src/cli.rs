@@ -97,7 +97,7 @@ SUBCOMMANDS:
     autostart enable | disable | status
     drivers install | remove          Install/remove the virtual display driver
     doctor                Check system requirements and permissions
-    logs                  Print the in-process log backlog
+    logs                  Print the running host's log backlog
     update check | install
     display-settings      Open the OS display settings (arrange displays)
     stop                  Ask a running instance to quit
@@ -105,8 +105,11 @@ SUBCOMMANDS:
 SERVE OPTIONS:
     --http-port <n>       Override the HTTP port
     --https-port <n>      Override the HTTPS port
-    --session-id <id>     Use a specific session id (default: random)
-    --otp <code>          Use a specific OTP (default: random)
+    --session-id <id>     Use a specific session id (default: random). `-` reads stdin;
+                          SCREENEXTEND_SESSION_ID is read when the flag is absent.
+    --otp <code>          Use a specific OTP (default: random). `-` reads stdin.
+    --otp-file <path>     Read the OTP from a file. Prefer this or SCREENEXTEND_OTP:
+                          a command line is readable by every process on the machine.
     --no-cloud            Do not register a public "Anywhere (Internet)" session
     --no-qr               Do not render QR codes in the terminal
     --software-encode     Force CPU (software) video encoding
@@ -147,17 +150,17 @@ pub fn fast_path() {
     let Some(first) = raw.first().map(String::as_str) else {
         return;
     };
-    // `probe` has its own help and its own flags; the global scan for -h/--help would
-    // otherwise swallow `probe --help` and print the shipped command list instead.
-    if first == "probe" {
-        return;
-    }
-    if first == "help" || raw.iter().any(|a| a == "-h" || a == "--help") {
+    // Only the first token counts. Scanning the whole vector meant `config set key -h` printed
+    // the global help and exited 0 instead of storing `-h`, which a script cannot tell from
+    // success — and every value-taking flag had the same hole. Per-subcommand help still works:
+    // `tauri-plugin-cli` injects `help`/`version` into each declared subcommand, and `probe`
+    // parses its own.
+    if first == "help" || first == "-h" || first == "--help" {
         attach_console();
         print_help();
         exit(0);
     }
-    if first == "version" || raw.iter().any(|a| a == "-V" || a == "--version") {
+    if first == "version" || first == "-V" || first == "--version" {
         attach_console();
         print_version();
         exit(0);
@@ -642,8 +645,15 @@ fn route(_app: &tauri::AppHandle) -> Outcome {
     Outcome::LaunchGui
 }
 
+/// The `RELOAD` control verb's handler. There is no config replay on the Linux scaffold, so it
+/// reports success and does nothing.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn reload_config_into_state(_app: &tauri::AppHandle) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(any(windows, target_os = "macos"))]
-pub use desktop::{route, saved_stun_urls};
+pub use desktop::{reload_config_into_state, route, saved_stun_urls};
 
 /// The saved STUN list, on a build with no desktop router. Nothing reads it there.
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -661,6 +671,9 @@ mod desktop {
     use tauri::{Listener, Manager};
     use tauri_plugin_cli::{CliExt, Matches};
     use tauri_plugin_store::{Store, StoreExt};
+
+    #[cfg(target_os = "macos")]
+    use tauri::path::BaseDirectory;
 
     use crate::single_instance;
     use crate::streamer::session::{
@@ -792,17 +805,139 @@ mod desktop {
 
     // host / instance detection
 
+    /// Is a host process up?
+    ///
+    /// The control socket is asked first, because the lock test is destructive: taking the
+    /// exclusive lock and dropping it races a starting GUI, which is not holding it between
+    /// `acquire_lock` and `std::mem::forget` — a concurrent `status` could win the lock there
+    /// and make the real instance believe it is the second one. The lock is still the
+    /// authority, so it is the fallback when no control file answers.
     fn host_running(app: &tauri::AppHandle) -> bool {
         let Ok(dir) = app.path().app_local_data_dir() else {
             return false;
         };
-        let lock_path = dir.join(single_instance::LOCK_FILE);
-        match single_instance::acquire_lock(&lock_path) {
-            Some(file) => {
+        let ctrl_path = dir.join(single_instance::CTRL_FILE);
+        if let Some(reply) =
+            single_instance::query_running_instance(&ctrl_path, single_instance::Command::Ping)
+        {
+            if reply.trim() == "OK" {
+                return true;
+            }
+        }
+        match single_instance::acquire_lock(&dir.join(single_instance::LOCK_FILE)) {
+            single_instance::LockOutcome::Acquired(file) => {
                 drop(file);
                 false
             }
-            None => true,
+            single_instance::LockOutcome::HeldByOther => true,
+            single_instance::LockOutcome::Unavailable(e) => {
+                eprintln!("warning: could not test the single-instance lock: {e}");
+                false
+            }
+        }
+    }
+
+    // driver state
+
+    /// What `status` and `doctor` report about the drivers this host depends on.
+    ///
+    /// Read-only and unelevated on both platforms: Windows probes the display driver's named
+    /// pipe and asks `certutil` whether the signing certificate is still trusted, macOS reads
+    /// the legacy audio driver's health and whether the installer package made it into the
+    /// bundle. `status`'s own help text has promised driver state since it was written.
+    struct DriverState {
+        rows: Vec<(&'static str, String)>,
+        json: Value,
+    }
+
+    #[cfg(windows)]
+    fn windows_certificate_trusted() -> Option<bool> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new("certutil")
+            .args(["-store", "root", "ScreenExtend"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        Some(out.status.success())
+    }
+
+    fn driver_state(_app: &tauri::AppHandle) -> DriverState {
+        #[cfg(windows)]
+        {
+            let backend = platform::virtual_display::probe_display_backend();
+            let display = match backend {
+                platform::virtual_display::DisplayBackend::IddDriver => {
+                    "installed and answering".to_string()
+                }
+                platform::virtual_display::DisplayBackend::DriverNotInstalled => {
+                    "NOT INSTALLED — run `ScreenExtend drivers install` (Administrator)".to_string()
+                }
+                platform::virtual_display::DisplayBackend::DriverNotResponding => {
+                    "installed but not answering its pipe".to_string()
+                }
+            };
+            let cert = windows_certificate_trusted();
+            let cert_text = match cert {
+                Some(true) => "trusted in the machine root store".to_string(),
+                Some(false) => {
+                    "NOT in the root store — the driver will fail to load after a reboot"
+                        .to_string()
+                }
+                None => "could not query (certutil unavailable)".to_string(),
+            };
+            DriverState {
+                rows: vec![
+                    ("Virtual display driver", display),
+                    ("Signing certificate", cert_text),
+                ],
+                json: serde_json::json!({
+                    "virtualDisplay": backend.as_str(),
+                    "signingCertificate": match cert {
+                        Some(true) => "trusted",
+                        Some(false) => "absent",
+                        None => "unknown",
+                    },
+                }),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let status = platform::audio_driver_status();
+            let audio = match status.as_str() {
+                "ready" => "installed and healthy".to_string(),
+                "needs_install" => {
+                    "not installed — System Audio on 10.15-12.x needs it".to_string()
+                }
+                "installed_but_unhealthy" => {
+                    "installed but not answering; reinstall it".to_string()
+                }
+                other => other.to_string(),
+            };
+            // A build whose bundle is missing the package can only ever fail the install, so
+            // say so here rather than letting the user discover it from a generic error.
+            let pkg = _app
+                .path()
+                .resolve("resources/ScreenExtendAudio.pkg", BaseDirectory::Resource)
+                .ok();
+            let pkg_present = pkg.as_deref().is_some_and(|p| p.exists());
+            let pkg_text = match (&pkg, pkg_present) {
+                (Some(p), true) => format!("bundled ({})", p.display()),
+                (Some(p), false) => {
+                    format!("MISSING from this build ({})", p.display())
+                }
+                (None, _) => "could not resolve the bundle resource path".to_string(),
+            };
+            DriverState {
+                rows: vec![
+                    ("System audio driver", audio),
+                    ("Audio installer package", pkg_text),
+                ],
+                json: serde_json::json!({
+                    "systemAudio": status,
+                    "installerPackageBundled": pkg_present,
+                }),
+            }
         }
     }
 
@@ -857,6 +992,19 @@ mod desktop {
             }
         };
 
+        // `fast_path` only claims help/version when they are the *first* token, so
+        // `serve --help` reaches the plugin. clap reports those as a match with no subcommand
+        // and a `help`/`version` arg; without this they would fall through to `LaunchGui` and
+        // open a window instead of printing anything.
+        if let Some(text) = matches.args.get("help").and_then(|d| d.value.as_str()) {
+            println!("{text}");
+            exit(0);
+        }
+        if matches.args.contains_key("version") {
+            print_version();
+            exit(0);
+        }
+
         let Some((name, m)) = sub(&matches) else {
             return Outcome::LaunchGui;
         };
@@ -875,7 +1023,7 @@ mod desktop {
             "autostart" => run_autostart(app, m),
             "drivers" => run_drivers(app, m),
             "doctor" => run_doctor(app, m),
-            "logs" => run_logs(m),
+            "logs" => run_logs(app, m),
             "update" => run_update(app, m),
             "stop" => run_stop(app),
             "display-settings" => run_display_settings(),
@@ -903,10 +1051,17 @@ mod desktop {
         let _ = std::fs::create_dir_all(&lock_dir);
         let lock_path = lock_dir.join(single_instance::LOCK_FILE);
         match single_instance::acquire_lock(&lock_path) {
-            Some(file) => std::mem::forget(file), // hold for the process lifetime
-            None => {
+            single_instance::LockOutcome::Acquired(file) => std::mem::forget(file), // process lifetime
+            single_instance::LockOutcome::HeldByOther => {
                 eprintln!(
                     "ScreenExtend is already running. Quit it first, or run `ScreenExtend stop`."
+                );
+                exit(1);
+            }
+            single_instance::LockOutcome::Unavailable(e) => {
+                eprintln!(
+                    "error: could not take the single-instance lock at {}: {e}",
+                    lock_path.display()
                 );
                 exit(1);
             }
@@ -921,6 +1076,7 @@ mod desktop {
         }
         let state = app.state::<platform::AppState>();
         crate::streamer::input::prime();
+        platform::permissions::prime();
 
         let store = app.store(CONFIG_STORE).ok();
         let http = arg_u16(m, "http-port")
@@ -953,23 +1109,25 @@ mod desktop {
         }
 
         if let Some(store) = store.as_deref() {
-            let urls = cfg_str(store, "turnConfig.urls").unwrap_or_default();
-            if !urls.is_empty() {
-                platform::set_turn_config(
-                    app.state(),
-                    urls,
-                    cfg_str(store, "turnConfig.username").unwrap_or_default(),
-                    cfg_str(store, "turnConfig.credential").unwrap_or_default(),
-                );
-            }
-            let grace =
-                cfg_u64(store, "disconnectGraceSecs").unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS);
-            platform::set_disconnect_grace(app.state(), grace as u32);
-            apply_saved_devices(app, store);
+            apply_saved_config(app, store);
         }
 
-        let session_id = arg_str(m, "session-id").unwrap_or_else(generate_session_id);
-        let otp = arg_str(m, "otp").unwrap_or_else(generate_otp);
+        let session_id = match read_credential(m, "session-id", "SCREENEXTEND_SESSION_ID", None) {
+            Ok(Some(id)) => id,
+            Ok(None) => generate_session_id(),
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit(2);
+            }
+        };
+        let otp = match read_credential(m, "otp", "SCREENEXTEND_OTP", Some("otp-file")) {
+            Ok(Some(code)) => code,
+            Ok(None) => generate_otp(),
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit(2);
+            }
+        };
         platform::set_session_credentials(app.state(), session_id.clone(), otp.clone());
 
         platform::networking::watch_for_network_changes(app.clone());
@@ -985,7 +1143,7 @@ mod desktop {
 
         install_device_listeners(app);
 
-        print_serve_banner(http, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
+        print_serve_banner(http, https, &session_id, &otp, cloud, !arg_flag(m, "no-qr"));
 
         // Only in verbose mode: the summary is one logbus line per active session every 5 s, and
         // every logbus line is a JSON IPC event, so it stays off unless somebody is watching.
@@ -1010,6 +1168,7 @@ mod desktop {
                     let _ = tx.send(());
                 }
             },
+            reload_config_into_state,
         ) {
             eprintln!(
                 "warning: control server unavailable, `ScreenExtend stop` will not work: {e}"
@@ -1036,6 +1195,178 @@ mod desktop {
         exit(0);
     }
 
+    /// Read a join credential without requiring it on the command line.
+    ///
+    /// Precedence: the flag, then the `--*-file` path if one is declared for this credential,
+    /// then the environment variable. `-` as the flag's value means "read one line from stdin".
+    /// argv is readable by every process on the machine and lands in shell history, and the OTP
+    /// is the only gate on a join once the session id is known — so a value that arrives that
+    /// way is used but warned about.
+    fn read_credential(
+        m: &Matches,
+        flag: &str,
+        env_key: &str,
+        file_flag: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        if let Some(value) = arg_str(m, flag) {
+            if value == "-" {
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| format!("could not read --{flag} from stdin: {e}"))?;
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    return Err(format!("--{flag} - was given but stdin was empty"));
+                }
+                return Ok(Some(line));
+            }
+            eprintln!(
+                "warning: --{flag} on the command line is visible to every process on this \
+                 machine and is written to shell history. Prefer {env_key}, --{flag} - (stdin){}.",
+                file_flag.map(|f| format!(", or --{f}")).unwrap_or_default()
+            );
+            return Ok(Some(value));
+        }
+        if let Some(path) = file_flag.and_then(|f| arg_str(m, f)) {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("could not read the credential file {path}: {e}"))?;
+            let value = text.trim().to_string();
+            if value.is_empty() {
+                return Err(format!("the credential file {path} is empty"));
+            }
+            return Ok(Some(value));
+        }
+        match std::env::var(env_key) {
+            Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Everything in `config.json` that can be pushed into a live `AppState`.
+    ///
+    /// `serve` runs this at startup and the `RELOAD` control verb runs it again, so a change
+    /// made by `devices set` / `turn set` / `config set` from another shell reaches a host that
+    /// is already streaming. Server ports and the encoder choice are deliberately absent: they
+    /// are read once when the servers and pipelines are built.
+    fn apply_saved_config(app: &tauri::AppHandle, store: &Cfg) {
+        platform::set_turn_config(
+            app.state(),
+            cfg_str(store, "turnConfig.urls").unwrap_or_default(),
+            cfg_str(store, "turnConfig.username").unwrap_or_default(),
+            cfg_str(store, "turnConfig.credential").unwrap_or_default(),
+        );
+        let grace = cfg_u64(store, "disconnectGraceSecs").unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS);
+        platform::set_disconnect_grace(app.state(), grace as u32);
+        platform::set_legacy_volume_key_proxy(
+            cfg_bool(store, "legacyVolumeKeyProxy").unwrap_or(false),
+        );
+        apply_saved_devices(app, store);
+        apply_saved_trust(app, store);
+    }
+
+    /// Replay the ban and auto-join sets from `knownDevices[]`.
+    ///
+    /// Trust is keyed on the per-device token, not the IP (`streamer/session.rs`). Without this
+    /// a headless host started from the same `config.json` as the GUI is *less* restrictive
+    /// than the GUI: every previously banned device is un-banned and can rejoin with the OTP,
+    /// and every approved device has to retype it.
+    fn apply_saved_trust(app: &tauri::AppHandle, store: &Cfg) {
+        let Some(known) = get_nested(store, "knownDevices").and_then(|v| match v {
+            Value::Array(a) => Some(a),
+            _ => None,
+        }) else {
+            return;
+        };
+        let entries = parse_saved_trust(&known);
+        let banned = entries.iter().filter(|e| e.banned).count();
+        let approved = entries.len() - banned;
+        for entry in entries {
+            platform::set_device_banned(app.state(), entry.token.clone(), entry.ip, entry.banned);
+            // A banned device is never also auto-join approved; the GUI models the two as
+            // exclusive and the join path checks the ban first either way.
+            platform::set_device_approved(app.state(), entry.token, !entry.banned);
+        }
+        if banned > 0 || approved > 0 {
+            tprintln!("replayed device trust: {approved} approved, {banned} banned");
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SavedTrust {
+        token: String,
+        ip: String,
+        banned: bool,
+    }
+
+    /// Split out from `apply_saved_trust` so the shape of `knownDevices[]` is testable without
+    /// an `AppHandle`. An entry with neither a token nor an IP addresses nothing and is skipped.
+    fn parse_saved_trust(known: &[Value]) -> Vec<SavedTrust> {
+        known
+            .iter()
+            .filter_map(|device| {
+                let field = |key: &str| {
+                    device
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let token = field("token");
+                let ip = field("ip");
+                if token.is_empty() && ip.is_empty() {
+                    return None;
+                }
+                Some(SavedTrust {
+                    token,
+                    ip,
+                    banned: device
+                        .get("banned")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                })
+            })
+            .collect()
+    }
+
+    /// Re-read `config.json` from disk and replay it. This is what the `RELOAD` control verb
+    /// runs inside the host process, on behalf of a CLI process that has just written the file.
+    pub fn reload_config_into_state(app: &tauri::AppHandle) -> Result<(), String> {
+        let store = app
+            .store(CONFIG_STORE)
+            .map_err(|e| format!("cannot open config store: {e}"))?;
+        store
+            .reload()
+            .map_err(|e| format!("cannot re-read config store: {e}"))?;
+        apply_saved_config(app, &store);
+        tprintln!("[control] configuration reloaded from disk");
+        Ok(())
+    }
+
+    /// Ask a running host to re-read its configuration. `true` when it confirmed.
+    fn request_reload(app: &tauri::AppHandle) -> bool {
+        let Ok(dir) = app.path().app_local_data_dir() else {
+            return false;
+        };
+        single_instance::query_running_instance(
+            &dir.join(single_instance::CTRL_FILE),
+            single_instance::Command::Reload,
+        )
+        .is_some_and(|reply| reply.trim() == "OK")
+    }
+
+    /// Print the "applied" / "restart to apply" line after a command that wrote the store.
+    fn report_live_apply(app: &tauri::AppHandle) {
+        if !host_running(app) {
+            return;
+        }
+        if request_reload(app) {
+            println!("(The running host reloaded its configuration.)");
+        } else {
+            println!("(A host is running but did not answer — restart it to apply.)");
+        }
+    }
+
     fn apply_saved_devices(app: &tauri::AppHandle, store: &Cfg) {
         let Some(devices) = get_nested(store, "devices").and_then(|v| match v {
             Value::Array(a) => Some(a),
@@ -1043,44 +1374,83 @@ mod desktop {
         }) else {
             return;
         };
-        for device in devices {
-            let Some(ip) = device.get("ip").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let num = |key: &str, default: u32| {
-                device
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(default)
-            };
-            let orientation = device
-                .get("orientation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Landscape")
-                .to_string();
-            let control = device
-                .get("remoteControl")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let audio = device
-                .get("systemAudio")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let dpr = device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        for d in parse_saved_devices(&devices) {
             platform::set_device_override(
                 app.state(),
-                ip.to_string(),
-                num("scale", 100),
-                orientation,
-                num("refreshRate", 60),
-                num("videoScale", 100),
-                num("videoQuality", 15),
-                control,
-                dpr,
-                audio,
+                d.ip.clone(),
+                d.scale,
+                d.orientation,
+                d.refresh_rate,
+                d.video_scale,
+                d.video_quality,
+                d.control,
+                d.dpr,
+                d.audio,
             );
+            // Without this a device pinned to a specific host output in the GUI reverts to the
+            // default output under `serve`, which is audible rather than theoretical.
+            if let Some(output) = d.audio_output {
+                platform::set_device_audio_output(app.state(), d.ip, output);
+            }
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SavedDevice {
+        ip: String,
+        scale: u32,
+        orientation: String,
+        refresh_rate: u32,
+        video_scale: u32,
+        video_quality: u32,
+        control: bool,
+        dpr: f64,
+        audio: bool,
+        audio_output: Option<String>,
+    }
+
+    /// Split out from `apply_saved_devices` so the defaults for a partially written
+    /// `devices[]` entry are testable without an `AppHandle`. The host clamps every value
+    /// again on its side, so this only fills gaps.
+    fn parse_saved_devices(devices: &[Value]) -> Vec<SavedDevice> {
+        devices
+            .iter()
+            .filter_map(|device| {
+                let ip = device.get("ip").and_then(|v| v.as_str())?.to_string();
+                let num = |key: &str, default: u32| {
+                    device
+                        .get(key)
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32)
+                        .unwrap_or(default)
+                };
+                Some(SavedDevice {
+                    ip,
+                    scale: num("scale", 100),
+                    orientation: device
+                        .get("orientation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Landscape")
+                        .to_string(),
+                    refresh_rate: num("refreshRate", 60),
+                    video_scale: num("videoScale", 100),
+                    video_quality: num("videoQuality", 15),
+                    control: device
+                        .get("remoteControl")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    dpr: device.get("dpr").and_then(|v| v.as_f64()).unwrap_or(1.0),
+                    audio: device
+                        .get("systemAudio")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    audio_output: device
+                        .get("audioOutputDeviceId")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect()
     }
 
     fn install_device_listeners(app: &tauri::AppHandle) {
@@ -1100,7 +1470,14 @@ mod desktop {
         });
     }
 
-    fn print_serve_banner(http_port: u16, session_id: &str, otp: &str, cloud: bool, qr: bool) {
+    fn print_serve_banner(
+        http_port: u16,
+        https_port: u16,
+        session_id: &str,
+        otp: &str,
+        cloud: bool,
+        qr: bool,
+    ) {
         println!("\n──────────────────────────────────────────");
         println!("Session:  {session_id}");
         println!("OTP:      {otp}");
@@ -1111,8 +1488,23 @@ mod desktop {
         if lan.is_empty() {
             println!("\nNo local networks found yet — connect to Wi-Fi/Ethernet, or start a hosted network.");
         }
-        for (title, url) in lan {
-            print_join(&title, &url, qr);
+        for (title, url) in &lan {
+            print_join(title, url, qr);
+        }
+        // The HTTPS endpoint is served on every adapter too and is the one that gets a secure
+        // context (SharedArrayBuffer audio, clipboard), but it carries a self-signed
+        // certificate — so it is printed as text and never as a QR, which would put a scanner
+        // straight into a certificate warning.
+        if !lan.is_empty() {
+            println!("\nHTTPS (self-signed certificate; accept the warning once):");
+            for (title, url) in &lan {
+                let secure = url.replacen("http://", "https://", 1).replacen(
+                    &format!(":{http_port}/"),
+                    &format!(":{https_port}/"),
+                    1,
+                );
+                println!("  {title}: {secure}");
+            }
         }
         if cloud {
             print_join("Anywhere (Internet)", &cloud_url(session_id), qr);
@@ -1232,7 +1624,10 @@ mod desktop {
         let telemetry = if running { live_telemetry(app) } else { None };
         let session_id = arg_str(m, "session-id");
         let http = cfg_u64(&store, "serverPorts.http").unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
+        let https =
+            cfg_u64(&store, "serverPorts.https").unwrap_or(DEFAULT_HTTPS_PORT as u64) as u16;
         let adapters = platform::networking::cli_adapters();
+        let drivers = driver_state(app);
 
         if wants_json(m) {
             let networks: Vec<Value> = adapters
@@ -1255,6 +1650,7 @@ mod desktop {
                 "turnConfigured": !cfg_str(&store, "turnConfig.urls").unwrap_or_default().is_empty(),
                 "hostedNetworkName": cfg_str(&store, "hostedNetworkCredentials.name"),
                 "networks": networks,
+                "drivers": drivers.json,
                 "telemetry": telemetry,
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -1294,6 +1690,11 @@ mod desktop {
             println!("  Hosted network:    {hn}");
         }
 
+        println!("\nDrivers:");
+        for (label, value) in &drivers.rows {
+            println!("  {label:<24} {value}");
+        }
+
         println!("\nNetworks:");
         if adapters.is_empty() {
             println!("  (none active)");
@@ -1302,7 +1703,12 @@ mod desktop {
             let ipv4 = adapter.ip_addresses.iter().find(|ip| is_ipv4(ip));
             match (ipv4, &session_id) {
                 (Some(ip), Some(id)) => {
-                    println!("  {}: http://{ip}:{http}/?id={id}", adapter.network_name)
+                    println!("  {}: http://{ip}:{http}/?id={id}", adapter.network_name);
+                    println!(
+                        "  {:width$}  https://{ip}:{https}/?id={id} (self-signed)",
+                        "",
+                        width = adapter.network_name.len()
+                    );
                 }
                 (Some(ip), None) => println!("  {}: {ip}", adapter.network_name),
                 (None, _) => println!("  {}: (no IPv4)", adapter.network_name),
@@ -1400,8 +1806,12 @@ mod desktop {
                 for (title, url) in entries {
                     print_join(&title, &url, render);
                 }
+                // The env-var form is what is printed, because `--otp` on a command line is
+                // readable by every process on the machine and is written to shell history.
                 println!(
-                    "\nThis is a one-off credential for display. Start the host with:\n  ScreenExtend serve --session-id {session_id} --otp {otp}"
+                    "\nThis is a one-off credential for display. Start the host with:\n  \
+                     SCREENEXTEND_SESSION_ID={session_id} SCREENEXTEND_OTP={otp} ScreenExtend serve\n\
+                     (PowerShell: $env:SCREENEXTEND_SESSION_ID='{session_id}'; $env:SCREENEXTEND_OTP='{otp}'; ScreenExtend serve)"
                 );
                 exit(0);
             }
@@ -1518,9 +1928,7 @@ mod desktop {
                     exit(1);
                 }
                 println!("Saved override for {ip}: {device}");
-                if host_running(app) {
-                    println!("(A host is running — restart it or reconnect the device to apply.)");
-                }
+                report_live_apply(app);
                 exit(0);
             }
             "reset" => {
@@ -1545,6 +1953,7 @@ mod desktop {
                     println!("No saved override for {ip}.");
                 } else {
                     println!("Cleared saved override for {ip}.");
+                    report_live_apply(app);
                 }
                 exit(0);
             }
@@ -1763,6 +2172,12 @@ mod desktop {
                     "set {key} = {}",
                     get_nested(&store, &key).unwrap_or(Value::Null)
                 );
+                report_live_apply(app);
+                // The reload replays everything that can reach a live `AppState`; these two
+                // are read once, when the servers and the pipelines are built.
+                if key.starts_with("serverPorts") || key == "disableGpuEncode" {
+                    println!("(This one is read at startup — restart the host to apply it.)");
+                }
                 exit(0);
             }
             other => {
@@ -1888,7 +2303,8 @@ mod desktop {
                     eprintln!("error: failed to save config: {e}");
                     exit(1);
                 }
-                println!("TURN relay saved. It applies the next time the host starts.");
+                println!("TURN relay saved.");
+                report_live_apply(app);
                 exit(0);
             }
             "clear" => {
@@ -1901,6 +2317,7 @@ mod desktop {
                     exit(1);
                 }
                 println!("TURN relay cleared.");
+                report_live_apply(app);
                 exit(0);
             }
             other => {
@@ -2095,9 +2512,9 @@ mod desktop {
     }
 
     fn run_doctor(app: &tauri::AppHandle, m: &Matches) -> ! {
-        let _ = app;
         let report = platform::compatibility::check_system_requirements();
-        let permissions = platform::permissions::check_permissions();
+        let permissions = platform::permissions::probe_permissions();
+        let drivers = driver_state(app);
         let permission_missing = permissions
             .iter()
             .any(|p| p.required && p.state == "denied");
@@ -2106,6 +2523,18 @@ mod desktop {
         let probes = platform::permissions::raw_probes();
         #[cfg(target_os = "macos")]
         let identity = platform::permissions::identity_report();
+        // Only on the AirPlay tier, and only there because that backend drives the real
+        // Displays picker: when it fails, it fails by macOS quietly not creating a display,
+        // and "does the picker list us at all?" is the one question a user could otherwise
+        // never answer. `probe()` carries its own deadline.
+        #[cfg(target_os = "macos")]
+        let airplay = if platform::virtual_display::probe_display_backend()
+            == platform::virtual_display::DisplayBackend::AirPlayFallback
+        {
+            Some(platform::airplay::probe())
+        } else {
+            None
+        };
 
         if wants_json(m) {
             #[allow(unused_mut)]
@@ -2126,6 +2555,7 @@ mod desktop {
                     "key": p.key, "name": p.name, "state": p.state, "required": p.required,
                     "relaunchRequired": p.relaunch_required, "description": p.description, "detail": p.detail,
                 })).collect::<Vec<_>>(),
+                "drivers": drivers.json,
             });
             #[cfg(target_os = "macos")]
             {
@@ -2157,6 +2587,12 @@ mod desktop {
                         "tccutil reset Accessibility app.screenextend.desktop",
                     ],
                 });
+                if let Some(result) = &airplay {
+                    out["macos"]["airplayPicker"] = match result {
+                        Ok(devices) => serde_json::json!({ "devices": devices }),
+                        Err(e) => serde_json::json!({ "error": e }),
+                    };
+                }
             }
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
             exit(doctor_code(report.os_supported, permission_missing));
@@ -2185,6 +2621,10 @@ mod desktop {
             for api in &report.unsupported_apis {
                 println!("  [{}] {} — {}", api.severity, api.name, api.description);
             }
+        }
+        println!("\nDrivers:");
+        for (label, value) in &drivers.rows {
+            println!("  {label:<24} {value}");
         }
         if permissions.is_empty() {
             println!("\nPermissions: none are required on this platform.");
@@ -2256,6 +2696,26 @@ mod desktop {
                 tribool(probes.sck),
                 probes.sck_us
             );
+            if let Some(result) = &airplay {
+                println!("\nAirPlay Displays picker (this Mac is on the AirPlay display tier):");
+                match result {
+                    Ok(devices) if devices.is_empty() => {
+                        println!("  the picker lists no AirPlay devices at all")
+                    }
+                    Ok(devices) => {
+                        for name in devices {
+                            println!("  {name}");
+                        }
+                        if !devices.iter().any(|d| d == "ScreenExtend") {
+                            println!(
+                                "  ScreenExtend is NOT listed - the receiver is not being \
+                                 discovered, so no display can be created"
+                            );
+                        }
+                    }
+                    Err(e) => println!("  could not read the picker: {e}"),
+                }
+            }
             println!(
                 "\nIf System Settings shows the toggle on but a probe above says denied, the grant \
                  is bound to\na different code identity. Reset it and grant again:\n  \
@@ -2279,15 +2739,39 @@ mod desktop {
 
     // logs
 
-    fn run_logs(m: &Matches) -> ! {
-        let lines = crate::logbus::get_log_backlog();
+    /// Print the running host's log backlog.
+    ///
+    /// This process's own ring is empty by construction — it started a moment ago — so the
+    /// lines have to come from the host over the single-instance control socket. Without a
+    /// host there is nothing to print and that is an error, not an empty success.
+    fn run_logs(app: &tauri::AppHandle, m: &Matches) -> ! {
         let take = arg_str(m, "lines")
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(usize::MAX);
-        let start = lines.len().saturating_sub(take);
+
+        let Ok(dir) = app.path().app_local_data_dir() else {
+            eprintln!("error: could not resolve app data directory");
+            exit(1);
+        };
+        let reply = single_instance::query_running_instance(
+            &dir.join(single_instance::CTRL_FILE),
+            single_instance::Command::Logs,
+        );
+        let Some(reply) = reply else {
+            eprintln!(
+                "No running ScreenExtend instance to read logs from.\n\
+                 The backlog lives in the host process; start one with `ScreenExtend serve` \
+                 or open the app."
+            );
+            exit(1);
+        };
+
+        let lines: Vec<&str> = reply.lines().collect();
         if lines.is_empty() {
-            println!("(no logs in this process — the backlog lives in the running host; try `ScreenExtend serve`)");
+            println!("(the running host has not logged anything yet)");
+            exit(0);
         }
+        let start = lines.len().saturating_sub(take);
         for line in &lines[start..] {
             println!("{line}");
         }
@@ -2405,5 +2889,78 @@ mod desktop {
         }
         eprintln!("Could not open display settings.");
         exit(1);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `serve` used to replay only the display overrides, so a headless host started from
+        /// the same `config.json` as the GUI un-banned every banned device.
+        #[test]
+        fn saved_trust_keys_on_the_token_and_skips_entries_that_address_nothing() {
+            let known = serde_json::json!([
+                { "token": "tok-banned", "ip": "192.168.1.9", "banned": true },
+                { "token": "tok-ok", "ip": "192.168.1.10" },
+                { "token": "  ", "ip": "" },
+                { "ip": "192.168.1.11", "banned": true }
+            ]);
+            let parsed = parse_saved_trust(known.as_array().unwrap());
+            assert_eq!(
+                parsed,
+                vec![
+                    SavedTrust {
+                        token: "tok-banned".into(),
+                        ip: "192.168.1.9".into(),
+                        banned: true
+                    },
+                    SavedTrust {
+                        token: "tok-ok".into(),
+                        ip: "192.168.1.10".into(),
+                        banned: false
+                    },
+                    SavedTrust {
+                        token: String::new(),
+                        ip: "192.168.1.11".into(),
+                        banned: true
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn saved_devices_fill_gaps_and_carry_the_audio_output_pin() {
+            let devices = serde_json::json!([
+                { "ip": "10.0.0.5" },
+                {
+                    "ip": "10.0.0.6", "scale": 150, "orientation": "Portrait",
+                    "refreshRate": 120, "videoScale": 80, "videoQuality": 20,
+                    "remoteControl": false, "systemAudio": true, "dpr": 2.0,
+                    "audioOutputDeviceId": "speaker-1"
+                },
+                { "name": "no ip at all" }
+            ]);
+            let parsed = parse_saved_devices(devices.as_array().unwrap());
+            assert_eq!(parsed.len(), 2, "an entry with no ip addresses nothing");
+            assert_eq!(
+                parsed[0],
+                SavedDevice {
+                    ip: "10.0.0.5".into(),
+                    scale: 100,
+                    orientation: "Landscape".into(),
+                    refresh_rate: 60,
+                    video_scale: 100,
+                    video_quality: 15,
+                    control: true,
+                    dpr: 1.0,
+                    audio: false,
+                    audio_output: None,
+                }
+            );
+            assert_eq!(parsed[1].refresh_rate, 120);
+            assert!(!parsed[1].control);
+            assert!(parsed[1].audio);
+            assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
+        }
     }
 }

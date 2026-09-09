@@ -8,15 +8,54 @@ against the upstream release the next time these are refreshed.
 
 ## Virtual Display Driver (`VirtualDisplayDriver.{dll,cat,inf}`)
 
-- **Upstream:** [MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs)
-  — a Windows indirect-display driver (IDD) creating virtual monitors. Credited
-  in the project README.
-- **Used for:** creating a real virtual display per connected client.
-- **Version/tag:** confirm against the upstream release; the driver package
-  (`.inf`/`.cat`/`.dll`) is published on the upstream GitHub Releases.
-- **License:** confirm against the upstream `LICENSE` (virtual-display-rs).
-- **Signing:** the `.cat` catalog is signed; `ScreenExtend.cer` (below) is the
-  certificate that must be trusted for Windows to load the driver.
+**This is not an upstream artifact.** It is a locally built, rebranded fork, and until this
+section was rewritten nothing in the tree said so — the only way to learn what the binary
+was, was to run `strings` on it. That is recorded here so the next person does not have to.
+
+- **Upstream base:** [MolotovCherry/virtual-display-rs](https://github.com/MolotovCherry/virtual-display-rs),
+  a Windows indirect-display driver (IDD) creating virtual monitors. Credited in the project
+  README.
+- **Upstream commit built:** `eae5120a676831ebb96a78125f7e84532bcaf152` (2024-07-08). The DLL
+  reports it itself: `Initialized Virtual Display Driver v1.0.0 @ eae5120`.
+- **Fork repository:** **not published.** The branding patch below exists only in a private
+  working tree, so nobody but the original author can reproduce this binary. Publishing that
+  fork is the outstanding action; two queued driver improvements
+  (choosing the render adapter, and mode changes that do not unplug the monitor) are blocked
+  on it in practice.
+- **Build machine:** the DLL embeds `C:\Users\sarve\.cargo\registry\...` paths, i.e. it was
+  compiled on this project's Windows dev box, not by CI. Dependency versions visible in the
+  binary include `tokio 1.38.0` and `serde_json 1.0.120`, which dates the build to mid-2024.
+  The exact Rust toolchain and WDK/EWDK version used were **not recorded** and cannot be
+  recovered from the artifact; capture them the next time it is rebuilt.
+- **Build command:** unrecorded. Upstream builds with `cargo make` against the WDK; confirm
+  and write the exact invocation here on the next rebuild.
+- **Branding delta from upstream** (read out of the shipped `.inf`, which is UTF-16LE):
+  - `ManufacturerName="ScreenExtend"`, `DeviceName="ScreenExtend Display Driver"`
+  - `DriverVer = 07/18/2024,1.0.0.0`
+  - the IPC pipe name is **unchanged** at `\\.\pipe\virtualdisplaydriver`, which is what
+    `windows_utils/driver_ipc` connects to and what `probe_display_backend()` tests for.
+- **Capability ceiling, from the same `.inf`** — this is the one fact that is otherwise only
+  discoverable by disassembly:
+  - `UmdfExtensions = IddCx0102` — IddCx **1.2**, i.e. Windows 10 1709. Anything the driver
+    could gain from a later IddCx level (adapter selection among them) needs a rebuild
+    against a newer WDK, not a configuration change.
+  - `UmdfLibraryVersion = 2.15.0`, `UmdfKernelModeClientPolicy = AllowKernelModeClients`,
+    `UmdfHostProcessSharing = ProcessSharingDisabled`
+  - `HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "VirtualDisplayDriverGroup"` — Microsoft advises
+    dropping `DeviceGroupId` for low-lock-contention IDDs. Advisory for a console IDD like
+    this one, but it belongs in the same review.
+  - `Class = Display`, `ClassGUID = {4D36E968-E325-11CE-BFC1-08002BE10318}`,
+    `%DeviceName%=VirtualDisplay_Install, Root\VirtualDisplayDriver` — the hardware id the
+    `nefconc` calls in `cli.rs`/`lib.rs` pass.
+- **License:** upstream `virtual-display-rs` terms apply to the fork; confirm against its
+  `LICENSE` at commit `eae5120`.
+- **Signing:** the `.cat` catalog is signed with the key behind `ScreenExtend.cer` (below),
+  **not** with any upstream key. The signing procedure was not recorded either; the
+  certificate has to be installed into `root` and `TrustedPublisher` for Windows to load the
+  driver, which is what `ScreenExtend drivers install` does through `certutil`.
+- **Reproducing it:** a second machine following this section will not produce a
+  byte-identical DLL — embedded paths and timestamps differ — so the check is behavioural,
+  plus a matching `Initialized Virtual Display Driver ... @ <commit>` string.
 
 | File | SHA-256 |
 | --- | --- |
@@ -85,6 +124,57 @@ against the upstream release the next time these are refreshed.
 - **License:** GPL-2.0-or-later (x264). Note the licensing implications of
   bundling x264.
 - **SHA-256:** `87bf8a8331691b32cf6c8e9b282c9c2a825ed0b83eba0f24e539f667c042684e`
+
+## Intel oneVPL dispatcher (`libvpl.dll`) — **deliberately not bundled**
+
+- **Upstream:** [intel/libvpl](https://github.com/intel/libvpl), MIT.
+- **Used for:** `windows_utils/streamer/intel/intel_sys.rs` loads it by name to reach the Quick
+  Sync encoder. Without a dispatcher there is no Quick Sync at all and the host falls to x264.
+- **Why nothing is shipped here.** Three reasons, in order of weight:
+  1. Intel's own guidance is that Xe (Gen12) and later driver packages install the dispatcher.
+     Measured on the Windows dev box (Intel UHD Graphics, DCH driver):
+     `C:\Windows\System32\libvpl.dll`, oneVPL Dispatcher **2.7.0** (ProductVersion 2022.2),
+     CompanyName Intel, Authenticode-valid under *Microsoft Windows Hardware Compatibility
+     Publisher*, SHA-256
+     `803a53d4a8062838a7fa85bc7385a036121162fb969d2f501803d1b01e863815`.
+  2. Pre-Gen12 hosts, the ones Intel says must ship their own dispatcher, run **Media SDK**
+     behind it — API 1.x. This encoder requires oneVPL **2.x** for internal surface allocation
+     (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`) and
+     `create_session` rejects a 1.x runtime at session creation. Shipping a dispatcher for those
+     hosts would buy a cleaner error message, not a working encoder.
+  3. There is no official prebuilt Windows binary to vendor: `intel/libvpl` releases are source
+     only (checked through v2.17.0 — no assets). The only `libvpl.dll` on a real machine is the
+     driver's, and copying a WHQL-signed driver component into our own signed installer is not a
+     provenance chain this file could honestly record.
+- **Consequences for the loader.** Because the driver's copy is the one matched to the runtime
+  the same package installed, `open_dispatcher` searches the **OS path first**, then the exe
+  directory, then `resources/`. An app-side copy must never shadow the driver's.
+- **If this is ever revisited:** build from an `intel/libvpl` release tag with MSVC, record the
+  tag, the commit, the compiler and the SHA-256 here and in `SHA256SUMS`, add
+  `"resources/libvpl.dll"` to `bundle.resources` in `tauri.conf.json`, and re-verify on a Gen12
+  host that the bundled copy does not displace the driver's.
+
+## NVENC header (`nvenc-headers/nvEncodeAPI.h`) — source only, **not bundled**
+
+- **Upstream:** [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers),
+  `include/ffnvcodec/nvEncodeAPI.h` at tag **`n12.1.14.1`** (commit
+  `e1ff958747e9e08247cea31b6e629d61ece824c0`), which is NVENC API **12.1**
+  (`NVENCAPI_MAJOR_VERSION 12`, `NVENCAPI_MINOR_VERSION 1`).
+- **License:** MIT, in the header's own copyright block — "permission is hereby granted, free of
+  charge... to deal in the Software without restriction, including... distribute". This is the
+  header FFmpeg itself builds NVENC support against; NVIDIA's own SDK copy carries a more
+  restrictive licence and is deliberately not the source used here.
+- **Used for:** `tools/nvenc_layout_gen.c` compiles against it and emits the assertions in
+  `windows_utils/streamer/test/nvenc_layout.rs`. Nothing links against it and nothing ships it —
+  `nvEncodeAPI64.dll` comes from the NVIDIA driver and is loaded by name at runtime.
+- **Why this version.** The bindings in `nvenc_sys/` were audited against it rather than assumed.
+  Every struct revision in the hand-written `version.rs` matches 12.1 exactly (CONFIG 8,
+  INITIALIZE_PARAMS 6, RECONFIGURE_PARAMS 1, PRESET_CONFIG 4, PIC_PARAMS 6, LOCK_BITSTREAM 1,
+  REGISTER_RESOURCE 4, EVENT_PARAMS 1); 13.0 raises every one of those by one. The members that
+  looked like SDK-13 additions — `nvEncRestoreEncoderState`, `nvEncLookaheadPicture`,
+  `numStateBuffers`, `outputStatsLevel`, `splitEncodeMode`, `NV_ENC_CAPS_EXPOSED_COUNT = 55` —
+  are all present at 12.1, so there was no version skew to fix.
+- **SHA-256:** `dbdaa8bcbc2b9325bd24bc68b36170a8432411518040e8d4c8421608cf217425`
 
 ## AMD AMF headers (`amf-headers/`) — source only, **not bundled**
 

@@ -15,7 +15,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1,
     DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
@@ -26,12 +28,195 @@ use super::intel_sys::*;
 use crate::streamer::config::H264Profile;
 use crate::streamer::platform::BitrateApplied;
 
-const DEVICE_BUSY_MAX_RETRIES: u32 = 30;
+/// How long a `MFX_WRN_DEVICE_BUSY` retry loop may run before giving the frame up.
+///
+/// A wall-clock budget, not a retry count: the old `30` retries meant something different
+/// depending on how long each sleep actually took, and at a 15.6 ms timer tick it meant almost
+/// half a second. 50 ms is three frames at 60 fps — past that the frame is stale anyway and the
+/// caller is better off shedding it than delivering it late.
+const DEVICE_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 const INTEL_FPS_QUERY_FALLBACK: u32 = 60;
+
+/// Slice size to ask oneVPL for, in bytes: one RTP payload.
+///
+/// 1200 is the conservative IPv6-safe payload the WebRTC packetizer works to, minus room for
+/// the RTP header and the FU-A/STAP-A indicator. Slices at this size mean one lost packet
+/// damages one slice, and the packetizer stops fragmenting slices across packets at all.
+const SLICE_BYTE_TARGET: u32 = 1150;
+
+/// The fallback slice layout when `MaxSliceSize` is refused: roughly one slice per 256 rows,
+/// bounded to 4..=8. It is a guess, but a bounded one — a single slice per picture makes any
+/// loss cost the whole frame, and more than eight costs header overhead for no extra resilience
+/// at these resolutions.
+fn slice_count_for_height(height: u32) -> u16 {
+    (height / 256).clamp(4, 8) as u16
+}
+
+/// Per-stage timings for the same-adapter path.
+///
+/// The pipeline times the whole encode and nothing inside it, so the full-frame
+/// `CopySubresourceRegion` into the VPP input surface — which the NVENC same-device path does
+/// not have an equivalent of — was invisible. These are bounded ring buffers written on the
+/// encode thread; they allocate once and never grow.
+#[derive(Default)]
+struct StageTiming {
+    get_surface: Samples,
+    copy_in: Samples,
+    vpp: Samples,
+}
+
+/// A fixed-capacity sample ring. Sorting happens only in `median_us`, which the encode thread
+/// never calls — the tests do.
+struct Samples {
+    buf: Vec<u32>,
+    next: usize,
+}
+
+impl Default for Samples {
+    fn default() -> Self {
+        Self {
+            buf: Vec::with_capacity(Self::CAP),
+            next: 0,
+        }
+    }
+}
+
+impl Samples {
+    const CAP: usize = 256;
+
+    fn push(&mut self, d: std::time::Duration) {
+        let us = d.as_micros().min(u32::MAX as u128) as u32;
+        if self.buf.len() < Self::CAP {
+            self.buf.push(us);
+        } else {
+            self.buf[self.next] = us;
+            self.next = (self.next + 1) % Self::CAP;
+        }
+    }
+
+    fn median_us(&self) -> u128 {
+        if self.buf.is_empty() {
+            return 0;
+        }
+        let mut v = self.buf.clone();
+        v.sort_unstable();
+        v[v.len() / 2] as u128
+    }
+}
+
+/// How the picture is cut into slices, once the runtime has had its say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SliceMode {
+    /// `mfxExtCodingOption2::MaxSliceSize` honoured: slices are bounded in bytes.
+    MaxBytes(u32),
+    /// `MaxSliceSize` refused; `mfxInfoMFX::NumSlice` slices per picture instead.
+    FixedCount(u16),
+}
 const KEY_WRITER: u64 = 0;
 const KEY_ENCODER: u64 = 1;
 const KEY_TIMEOUT_MS: u32 = 1000;
 const DXGI_SHARED_RESOURCE_RW: u32 = 0x8000_0000 | 0x1; // `DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE`
+
+/// The wait between `MFX_WRN_DEVICE_BUSY` retries.
+///
+/// This was `std::thread::sleep(1ms)`, which on Windows is bounded below by the current timer
+/// resolution — up to ~15.6 ms without a process-wide `timeBeginPeriod(1)`, which nothing in
+/// `tuning.rs` sets. Thirty of those is up to ~450 ms of blocked encode thread before the bail,
+/// for a condition that usually clears in microseconds. Spin first, then yield the rest of the
+/// timeslice, and only sleep once it is clear the GPU is genuinely backed up.
+struct DeviceBusyBackoff {
+    attempts: u32,
+    what: &'static str,
+    started: std::time::Instant,
+}
+
+impl DeviceBusyBackoff {
+    const SPIN_ATTEMPTS: u32 = 64;
+    const YIELD_ATTEMPTS: u32 = 256;
+
+    fn new(what: &'static str) -> Self {
+        Self {
+            attempts: 0,
+            what,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Wait once. `Err` when the budget is exhausted.
+    fn wait(&mut self) -> Result<()> {
+        self.attempts += 1;
+        let elapsed = self.started.elapsed();
+        if elapsed >= DEVICE_BUSY_BUDGET {
+            bail!(
+                "{}: device busy for {:.1} ms over {} retries",
+                self.what,
+                elapsed.as_secs_f64() * 1e3,
+                self.attempts
+            );
+        }
+        if self.attempts <= Self::SPIN_ATTEMPTS {
+            std::hint::spin_loop();
+        } else if self.attempts <= Self::YIELD_ATTEMPTS {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        Ok(())
+    }
+
+    /// Report only when the wait was long enough to have cost a frame. Silence was the old
+    /// behaviour and it made a contended iGPU indistinguishable from a fast one.
+    fn finish(self) {
+        if self.attempts > Self::SPIN_ATTEMPTS {
+            let ms = self.started.elapsed().as_secs_f64() * 1e3;
+            if ms >= 1.0 {
+                teprintln!(
+                    "oneVPL: {} waited {ms:.1} ms on MFX_WRN_DEVICE_BUSY ({} retries)",
+                    self.what,
+                    self.attempts
+                );
+            }
+        }
+    }
+}
+
+/// Whether to `Flush()` the encoder context after copying into the VPP input surface.
+///
+/// On by default, and measured: dropping it was tried and put back. The reasoning for dropping
+/// it was that both the copy and the oneVPL VPP submit go to the same immediate context, so the
+/// flush adds no ordering and only splits the command list. True, but it misses that this
+/// pipeline is synchronous per frame — `encode_surface` runs `SyncOperation` before returning —
+/// so submitting the copy early lets the GPU start it while the CPU is still setting up the VPP
+/// call. That overlap is worth more than the submit costs. Five release trials, 1280x720 on
+/// Intel UHD Graphics, medians of p50/p95/p99 in microseconds:
+///
+///   flush on   6971 / 7834 / 11900
+///   flush off  7393 / 7843 / 11850
+///
+/// `SE_INTEL_NO_PER_FRAME_FLUSH=1` turns it off, so the trade can be re-measured on a part where
+/// submits are more expensive without rebuilding.
+fn per_frame_flush_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SE_INTEL_NO_PER_FRAME_FLUSH").as_deref() != Ok("1"))
+}
+
+/// Make a D3D11 immediate context safe to touch from more than one thread.
+///
+/// `SetMultithreadProtected` was called on the encoder context alone, behind an `if let Ok` with
+/// a discarded result — so a failed cast protected nothing and said nothing, while
+/// `unsafe impl Send for Encoder` moved the whole thing across threads regardless.
+fn set_multithread_protected(context: &ID3D11DeviceContext, what: &str) -> Result<()> {
+    let mt: ID3D11Multithread = context
+        .cast()
+        .with_context(|| format!("{what}: context does not expose ID3D11Multithread"))?;
+    // Returns the *previous* setting, not a status; there is no HRESULT to check, so the read
+    // back below is the only way to know it took.
+    let _previous = unsafe { mt.SetMultithreadProtected(true) };
+    if !unsafe { mt.GetMultithreadProtected() }.as_bool() {
+        bail!("{what}: SetMultithreadProtected(true) did not take");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum SurfaceKind {
@@ -166,8 +351,26 @@ pub struct Encoder {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     bridge: Option<InputBridge>,
+    /// The dispatcher loader owns the enumerated implementations and must outlive the session;
+    /// it is released with `MFXUnload` after `MFXClose`. It used to be dropped on the floor on
+    /// the success path, leaking one loader plus its implementation descriptions per encoder
+    /// construction — and an encoder is built per streaming session.
+    loader: mfxLoader,
     enc_param: mfxVideoParam,
     enc_frame_info: mfxFrameInfo,
+
+    /// The three ext buffers, owned so they can be re-attached to `Reset`.
+    ///
+    /// oneVPL applies whatever ext buffers are present at `Reset`; ones omitted revert to the
+    /// runtime's defaults. `set_bitrate` used to `Reset` with `NumExtParam = 0`, so the first
+    /// bitrate change — seconds into a session, from the loss-based driver — restored HRD
+    /// conformance, PicTiming SEI, the default `MaxDecFrameBuffering`, B-pyramid, and dropped
+    /// `RepeatPPS`, the per-frame size caps and intra refresh. The low-latency configuration
+    /// lasted until the first congestion event and never came back.
+    ext_co: Box<mfxExtCodingOption>,
+    ext_co2: Box<mfxExtCodingOption2>,
+    ext_co3: Box<mfxExtCodingOption3>,
+    ext_ptrs: Vec<*mut mfxExtBuffer>,
 
     bitstream_buf: Vec<u8>,
     config: EncoderConfig,
@@ -178,7 +381,16 @@ pub struct Encoder {
     src_h: u32,
 
     upload_texture: Option<ID3D11Texture2D>,
+    nv12_upload_texture: Option<ID3D11Texture2D>,
     last_nv12: *mut mfxFrameSurface1,
+
+    /// What the runtime agreed to for slicing, decided by `ENCODE_Query`, not by us.
+    slice_mode: SliceMode,
+
+    /// Per-stage timing for the same-adapter path, so the copy into the VPP input surface can
+    /// be told apart from the VPP pass itself. Nothing in the pipeline times them separately,
+    /// which is why `major-intel-extra-full-frame-copy-per-frame` could only be argued about.
+    stage_us: StageTiming,
 
     frame_index: u64,
     idr_requested: bool,
@@ -199,14 +411,38 @@ impl Encoder {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> Result<Self> {
+        // Cross-adapter Quick Sync is not implemented, and that is a conclusion rather than a
+        // gap. `InputBridge` below proves the shared-texture pattern works — but only
+        // *same-adapter*: `OpenSharedResource1` on an NT handle needs both devices on the same
+        // adapter, so the trick that lets NVENC take a cross-adapter capture texture has no
+        // equivalent here. A cross-adapter Intel host therefore goes through
+        // `Backend::IntelCpu`, whose readback is genuinely unavoidable.
+        //
+        // What was done about it instead:
+        //  * W3a's adapter policy puts capture on the encoder's adapter where it can, which is
+        //    why this box now reports `intel-same-adapter` rather than `intel-cpu-bridge`;
+        //  * the bridge itself got 62.5% cheaper — `cpu_bridge_format()` asks the scaler for
+        //    NV12, so the readback, the memcpy and the upload carry 1.5 bytes a pixel instead of
+        //    4, and `encode_nv12_padded` skips the VPP pass the BGRA path needed;
+        //  * `Auto` tries NVENC first, so this is reached only when NVENC has already failed on
+        //    a machine that has both.
         if super::super::device_vendor(device) != super::super::Vendor::Intel {
             bail!(
-                "Intel Quick Sync requires an Intel D3D11 device, but the capture device is not Intel; \
-                 use NVENC for this adapter (cross-adapter Quick Sync bridge is not implemented)"
+                "Intel Quick Sync requires an Intel D3D11 device, but the capture device is not \
+                 Intel; NT-handle texture sharing is same-adapter only, so this falls to the NV12 \
+                 CPU bridge (or to NVENC, which can take a cross-adapter texture)"
             );
         }
 
-        let (src_w, src_h) = (native_w.max(config.width), native_h.max(config.height));
+        // The VPP input crop *and* the `D3D11_BOX` copied out of the captured texture, so it is
+        // the source's extent and nothing else. This used to be
+        // `max(native, config)`, which is the same thing whenever the request is a downscale
+        // (the only case `ScalePercent`'s 10..100 can produce today) and a box larger than the
+        // source the moment it is not: `CopySubresourceRegion` rejects an out-of-range source
+        // box, D3D11 drops the call with no HRESULT to check, and the VPP surface keeps stale or
+        // zeroed content — a frozen or black picture with no error anywhere. Scaling in either
+        // direction is the VPP output stage's job; the input side describes what was captured.
+        let (src_w, src_h) = (native_w, native_h);
 
         let creation_flags = unsafe { device.GetCreationFlags() };
         let capture_has_video = creation_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0 != 0;
@@ -218,6 +454,12 @@ impl Encoder {
             )?;
             let bridge = InputBridge::new(&enc_device, device, context, src_w, src_h)
                 .context("building the same-adapter Quick Sync input bridge")?;
+            // The bridge drives the *capture* device's immediate context from the encode
+            // thread. A D3D11 immediate context is not free-threaded, so the capture device
+            // needs the protection too — not just the encoder's, which is all this used to set.
+            // Failing to get it is a correctness problem, not a performance one, so it is a
+            // hard error here rather than a swallowed `let _ =`.
+            set_multithread_protected(context, "capture device (Quick Sync input bridge)")?;
             tprintln!(
                 "Intel Quick Sync: capture device lacks VIDEO_SUPPORT; routing through a dedicated \
                  Intel device via a same-adapter shared-texture bridge ({src_w}x{src_h})"
@@ -227,11 +469,9 @@ impl Encoder {
 
         let vpl = Vpl::load()?;
 
-        if let Ok(mt) = enc_context.cast::<ID3D11Multithread>() {
-            let _ = unsafe { mt.SetMultithreadProtected(true) };
-        }
+        set_multithread_protected(&enc_context, "Quick Sync encode device")?;
 
-        let session = create_session(&vpl)?;
+        let (session, loader) = create_session(&vpl)?;
 
         check_strict(
             unsafe {
@@ -245,6 +485,7 @@ impl Encoder {
         )
         .inspect_err(|_| unsafe {
             (vpl.MFXClose)(session);
+            (vpl.MFXUnload)(loader);
         })?;
 
         let requested_fps = config.fps.max(1);
@@ -271,8 +512,13 @@ impl Encoder {
             device: enc_device,
             context: enc_context,
             bridge,
+            loader,
             enc_param: unsafe { std::mem::zeroed() },
             enc_frame_info: unsafe { std::mem::zeroed() },
+            ext_co: Box::new(unsafe { std::mem::zeroed() }),
+            ext_co2: Box::new(unsafe { std::mem::zeroed() }),
+            ext_co3: Box::new(unsafe { std::mem::zeroed() }),
+            ext_ptrs: Vec::new(),
             bitstream_buf: Vec::new(),
             config,
             coded_w,
@@ -280,33 +526,34 @@ impl Encoder {
             src_w,
             src_h,
             upload_texture: None,
+            nv12_upload_texture: None,
             last_nv12: ptr::null_mut(),
+            slice_mode: SliceMode::FixedCount(0),
+            stage_us: StageTiming::default(),
             frame_index: 0,
             idr_requested: false,
         };
 
-        if let Err(e) = this.init_vpp() {
-            unsafe { (this.vpl.MFXClose)(this.session) };
-            return Err(e);
-        }
-        if let Err(e) = this.init_encode() {
-            unsafe {
-                (this.vpl.MFXVideoVPP_Close)(this.session);
-                (this.vpl.MFXClose)(this.session);
-            }
-            return Err(e);
-        }
+        // Dropping `this` runs `Drop for Encoder`, which closes the encode and VPP components,
+        // the session and the loader. Closing them here as well double-closed the session
+        // (harmless-looking, since every return value was discarded, but a second `MFXClose` on
+        // a freed handle is the runtime's problem to survive, and the loader would now be
+        // unloaded twice).
+        this.init_vpp()?;
+        this.init_encode()?;
 
+        // Requested geometry only. What the runtime actually agreed to is the "oneVPL effective"
+        // line `init_encode` prints from `GetVideoParam`; this one used to assert `low_power=on,
+        // async_depth=1, gop_ref_dist=1` and an `rc=cbr` that was never read back.
         tprintln!(
-            "Intel Quick Sync (oneVPL) H.264 encoder initialized (D3D11 / ULL): {}x{} (coded {}x{})@{}, \
-             bitrate_bps={}, rc={}, qp={:?}, profile={:?}, intra_refresh={}, low_power=on, async_depth=1, gop_ref_dist=1",
+            "Intel Quick Sync (oneVPL) H.264 encoder initialized (D3D11 / ULL): {}x{} \
+             (coded {}x{})@{}, requested bitrate_bps={}, qp={:?}, profile={:?}, intra_refresh={}",
             this.config.width,
             this.config.height,
             this.coded_w,
             this.coded_h,
             fps,
             this.config.bitrate_bps,
-            if this.config.qp.is_some() { "cqp" } else { "cbr" },
             this.config.qp,
             this.config.profile,
             this.config.intra_refresh,
@@ -317,6 +564,21 @@ impl Encoder {
 
     pub fn device(&self) -> &ID3D11Device {
         &self.device
+    }
+
+    /// The slice layout the runtime agreed to, not the one that was requested.
+    pub(crate) fn slice_mode(&self) -> SliceMode {
+        self.slice_mode
+    }
+
+    /// Per-stage medians for the same-adapter path, in microseconds:
+    /// `(get_surface, copy_into_surface, VPP submit)`.
+    pub(crate) fn stage_medians_us(&self) -> (u128, u128, u128) {
+        (
+            self.stage_us.get_surface.median_us(),
+            self.stage_us.copy_in.median_us(),
+            self.stage_us.vpp.median_us(),
+        )
     }
 
     fn frame_info(
@@ -395,8 +657,7 @@ impl Encoder {
 
         let target_kbps = (self.config.bitrate_bps / 1000).clamp(1, 65000) as u16;
         let max_kbps = (self.config.max_bitrate_bps / 1000).clamp(target_kbps as u32, 65000) as u16;
-        let buffer_size_kb =
-            ((self.coded_w as u32 * self.coded_h as u32 * 4) / 1024).clamp(512, 65000) as u16;
+        let buffer_size_kb = vbv_kb(self.config.bitrate_bps, fps);
 
         let mut mfx: mfxInfoMFX = unsafe { std::mem::zeroed() };
         mfx.FrameInfo = self.enc_frame_info;
@@ -411,7 +672,10 @@ impl Encoder {
         mfx.GopPicSize = 0xFFFF;
         mfx.GopRefDist = 1;
         mfx.IdrInterval = 0;
-        mfx.NumSlice = (self.config.height / 256).clamp(4, 8) as u16;
+        // Ask for MTU-sized slices; fall back to the height heuristic if the runtime refuses.
+        // `MaxSliceSize` overrides every slice-count control when it is honoured, which is why
+        // `NumSlice` is left at 0 for the first Query — sending both is ambiguous.
+        mfx.NumSlice = 0;
         mfx.NumRefFrame = 1;
         mfx.BufferSizeInKB = buffer_size_kb;
 
@@ -422,7 +686,13 @@ impl Encoder {
             mfx.TargetKbps = q;
             mfx.MaxKbps = q;
         } else {
-            mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+            // VCM, not CBR. oneVPL documents `LowDelayBRC`, `MaxFrameSizeI` and `MaxFrameSizeP`
+            // as applying to VBR/QVBR/VCM only — under CBR, which is what this branch used to
+            // select, all three are no-ops, so the Quick Sync path has had no working per-frame
+            // size cap at all. The `ENCODE_Query` below asks the runtime before committing, and
+            // falls back to CBR (dropping the three dead fields) if VCM is refused, which it is
+            // on some generations under `LowPower = ON`.
+            mfx.RateControlMethod = MFX_RATECONTROL_VCM;
             mfx.TargetKbps = target_kbps;
             mfx.MaxKbps = max_kbps;
             mfx.InitialDelayInKB = 0;
@@ -446,6 +716,12 @@ impl Encoder {
         co2.BRefType = MFX_B_REF_OFF;
         co2.AdaptiveI = MFX_CODINGOPTION_OFF;
         co2.AdaptiveB = MFX_CODINGOPTION_OFF;
+        // Slices sized to the network, not to a fraction of the picture height. One lost packet
+        // then damages one slice instead of a band whose size depends on the resolution, and the
+        // RTP layer stops fragmenting slices across packets. Not universally supported —
+        // `LowPower = ON` selects the VDEnc fixed-function path, which has more parameter
+        // restrictions than PAK — so the `ENCODE_Query` below decides whether it survives.
+        co2.MaxSliceSize = SLICE_BYTE_TARGET;
         // Quality ceiling under CBR: a floor on QP can only shrink the stream, so the
         // loss-based controller keeps the top end.
         if let Some(q) = self.config.min_qp.filter(|&q| q > 1) {
@@ -477,31 +753,156 @@ impl Encoder {
             co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
         }
 
-        let mut ext: [*mut mfxExtBuffer; 3] = [
-            &mut co as *mut _ as *mut mfxExtBuffer,
-            &mut co2 as *mut _ as *mut mfxExtBuffer,
-            &mut co3 as *mut _ as *mut mfxExtBuffer,
-        ];
-        par.ExtParam = ext.as_mut_ptr();
-        par.NumExtParam = ext.len() as u16;
+        // Boxed so the pointers stay valid across every later move of `Encoder`, and owned so
+        // `set_bitrate` can hand the same array to `Reset`.
+        *self.ext_co = co;
+        *self.ext_co2 = co2;
+        *self.ext_co3 = co3;
+        self.rebuild_ext_ptrs();
+        self.attach_ext(&mut par);
 
-        check(
+        // Ask before committing. `Query` is the API whose job is to report which requested
+        // parameters the runtime altered or dropped, and it was not called anywhere in this
+        // file — so VCM, LowDelayBRC, the frame-size caps and LowPower were all asserted.
+        //
+        // In and out must be distinct allocations: the runtime writes the corrected parameters
+        // into `out` while reading `in`, and aliasing them (which `query_fps_supported` gets
+        // away with because it attaches no ext buffers) faults once ext buffers are involved.
+        // `out`'s ext buffers carry headers only, per the API contract.
+        let mut out_co: mfxExtCodingOption = unsafe { std::mem::zeroed() };
+        out_co.Header = self.ext_co.Header;
+        let mut out_co2: mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+        out_co2.Header = self.ext_co2.Header;
+        let mut out_co3: mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+        out_co3.Header = self.ext_co3.Header;
+        let mut out_ptrs: [*mut mfxExtBuffer; 3] = [
+            &mut out_co as *mut _ as *mut mfxExtBuffer,
+            &mut out_co2 as *mut _ as *mut mfxExtBuffer,
+            &mut out_co3 as *mut _ as *mut mfxExtBuffer,
+        ];
+        let mut out = par;
+        out.ExtParam = out_ptrs.as_mut_ptr();
+        out.NumExtParam = out_ptrs.len() as u16;
+
+        let query_status =
+            unsafe { (self.vpl.MFXVideoENCODE_Query)(self.session, &mut par, &mut out) };
+        if query_status < MFX_ERR_NONE {
+            bail!(
+                "MFXVideoENCODE_Query rejected the encode parameters: {} (mfxStatus={query_status})",
+                status_name(query_status)
+            );
+        }
+        if query_status > MFX_ERR_NONE {
+            tprintln!(
+                "oneVPL: ENCODE_Query returned {} ({query_status}); the runtime changed something",
+                warning_name(query_status)
+            );
+        }
+
+        // `MaxSliceSize` is the one control that, where it exists, makes slice boundaries follow
+        // the network's MTU rather than the picture's height. `Query` zeroes it (or shrinks it)
+        // when the runtime will not honour it — on `LowPower = ON` parts that is common — and
+        // then the picture would be coded as a single slice, which is worse for loss than the
+        // heuristic it replaced. So: keep it if it survived, otherwise restore the heuristic.
+        let effective_max_slice = out_co2.MaxSliceSize;
+        self.slice_mode = if effective_max_slice == SLICE_BYTE_TARGET {
+            SliceMode::MaxBytes(effective_max_slice)
+        } else {
+            self.ext_co2.MaxSliceSize = 0;
+            let n = slice_count_for_height(self.config.height);
+            par.info.mfx.NumSlice = n;
+            self.attach_ext(&mut par);
+            SliceMode::FixedCount(n)
+        };
+
+        // `Query` writes the values it will honour into `out`, so a rate control it refused
+        // comes back as something else. Drop the fields that only exist for the mode we asked
+        // for, rather than leaving them set and claiming a cap that is not applied.
+        let effective_rc = unsafe { out.info.mfx.RateControlMethod };
+        if self.config.qp.is_none() && effective_rc != MFX_RATECONTROL_VCM {
+            teprintln!(
+                "oneVPL: VCM refused (runtime chose rc={effective_rc}); falling back to CBR \
+                 without LowDelayBRC or the per-frame size caps, which do not apply under CBR"
+            );
+            par.info.mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+            par.info.mfx.TargetKbps = target_kbps;
+            par.info.mfx.MaxKbps = max_kbps;
+            par.info.mfx.BufferSizeInKB = buffer_size_kb;
+            self.ext_co3.LowDelayBRC = MFX_CODINGOPTION_UNKNOWN;
+            self.ext_co3.MaxFrameSizeI = 0;
+            self.ext_co3.MaxFrameSizeP = 0;
+            self.attach_ext(&mut par);
+        }
+
+        check_no_software_fallback(
             unsafe { (self.vpl.MFXVideoENCODE_Init)(self.session, &mut par) },
             "MFXVideoENCODE_Init",
         )?;
 
-        par.ExtParam = ptr::null_mut();
-        par.NumExtParam = 0;
+        // Read back *with* the ext buffers attached, so CO2/CO3 report their effective values.
+        // Reading back with `NumExtParam = 0`, as this used to, returns only the base
+        // `mfxInfoMFX` — which is why nobody could tell whether the ULL configuration took.
+        self.attach_ext(&mut par);
         check(
             unsafe { (self.vpl.MFXVideoENCODE_GetVideoParam)(self.session, &mut par) },
             "MFXVideoENCODE_GetVideoParam",
         )?;
 
-        let eff_buf_kb = unsafe { par.info.mfx.BufferSizeInKB }.max(buffer_size_kb);
-        self.bitstream_buf = vec![0u8; (eff_buf_kb as usize) * 1024];
+        let eff = unsafe { par.info.mfx };
+        // Two different needs that were conflated into one number: the CPB the rate controller
+        // may bank into, which must be about one frame, and the output allocation, which must
+        // hold the largest access unit. `BufferSizeInKB` is the former; the latter gets its own
+        // floor so a large IDR still fits.
+        let out_kb = eff.BufferSizeInKB.max(buffer_size_kb).max(512);
+        self.bitstream_buf = vec![0u8; (out_kb as usize) * 1024];
         self.enc_param = par;
-        self.enc_frame_info = unsafe { par.info.mfx.FrameInfo };
+        self.enc_frame_info = eff.FrameInfo;
+
+        // Effective, not requested. The old line printed `self.config` and asserted
+        // "low_power=on, async_depth=1, gop_ref_dist=1" without ever reading any of them back.
+        tprintln!(
+            "oneVPL effective: rc={}, target_kbps={}, max_kbps={}, buffer_kb={} (requested {}), \
+             initial_delay_kb={}, low_power={}, target_usage={}, gop_ref_dist={}, num_ref={}, \
+             num_slice={}, slices={:?}, async_depth={}, low_delay_brc={}, max_frame_i={}, \
+             max_frame_p={}, max_dec_frame_buffering={}, repeat_pps={}, nal_hrd={}, \
+             int_ref_type={}, int_ref_cycle={}, out_buf_kb={}",
+            eff.RateControlMethod,
+            eff.TargetKbps,
+            eff.MaxKbps,
+            eff.BufferSizeInKB,
+            buffer_size_kb,
+            eff.InitialDelayInKB,
+            eff.LowPower,
+            eff.TargetUsage,
+            eff.GopRefDist,
+            eff.NumRefFrame,
+            eff.NumSlice,
+            self.slice_mode,
+            par.AsyncDepth,
+            self.ext_co3.LowDelayBRC,
+            self.ext_co3.MaxFrameSizeI,
+            self.ext_co3.MaxFrameSizeP,
+            self.ext_co.MaxDecFrameBuffering,
+            self.ext_co2.RepeatPPS,
+            self.ext_co.NalHrdConformance,
+            self.ext_co2.IntRefType,
+            self.ext_co2.IntRefCycleSize,
+            out_kb,
+        );
         Ok(())
+    }
+
+    fn rebuild_ext_ptrs(&mut self) {
+        self.ext_ptrs = vec![
+            &mut *self.ext_co as *mut _ as *mut mfxExtBuffer,
+            &mut *self.ext_co2 as *mut _ as *mut mfxExtBuffer,
+            &mut *self.ext_co3 as *mut _ as *mut mfxExtBuffer,
+        ];
+    }
+
+    fn attach_ext(&mut self, par: &mut mfxVideoParam) {
+        par.ExtParam = self.ext_ptrs.as_mut_ptr();
+        par.NumExtParam = self.ext_ptrs.len() as u16;
     }
 
     #[allow(dead_code)]
@@ -514,21 +915,37 @@ impl Encoder {
             return Ok(BitrateApplied::IgnoredConstantQp);
         }
         let kbps = (bps / 1000).clamp(1, 65000) as u16;
+        let fps = self.config.fps.max(1);
         self.config.bitrate_bps = bps;
         self.config.max_bitrate_bps = bps;
 
+        // The rate-control fields are the *only* thing that may differ between Init and Reset.
+        // Everything else, ext buffers included, is re-sent exactly as Init received it —
+        // omitting them at Reset is what silently reverted the whole low-latency posture on the
+        // first congestion event.
         let mut par = self.enc_param;
         par.info.mfx.TargetKbps = kbps;
         par.info.mfx.MaxKbps = kbps;
-        par.ExtParam = ptr::null_mut();
-        par.NumExtParam = 0;
+        par.info.mfx.BufferSizeInKB = vbv_kb(bps, fps);
+        if self.ext_co3.LowDelayBRC == MFX_CODINGOPTION_ON {
+            let avg_frame_bytes = (bps / 8 / fps).max(1);
+            self.ext_co3.WinBRCMaxAvgKbps = kbps;
+            self.ext_co3.MaxFrameSizeP = avg_frame_bytes.saturating_mul(2);
+            self.ext_co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
+        }
+        self.attach_ext(&mut par);
 
         check(
             unsafe { (self.vpl.MFXVideoENCODE_Reset)(self.session, &mut par) },
             "MFXVideoENCODE_Reset",
         )?;
         self.enc_param = par;
-        tprintln!("Intel Quick Sync bitrate reconfigured (bitrate_bps={bps})");
+        tprintln!(
+            "Intel Quick Sync bitrate reconfigured (bitrate_bps={bps}, buffer_kb={}, \
+             ext_buffers={} retained)",
+            unsafe { par.info.mfx.BufferSizeInKB },
+            par.NumExtParam,
+        );
         Ok(BitrateApplied::Applied)
     }
 
@@ -577,6 +994,62 @@ impl Encoder {
         self.encode_texture(&tex, force_idr)
     }
 
+    /// Encode a frame the GPU's video processor already scaled *and* converted to NV12.
+    ///
+    /// This is the CPU-bridge path's whole VPP pass gone, not just a smaller upload. The bridge
+    /// exists because the captured display lives on an adapter Quick Sync cannot read, so the
+    /// frame has to come back through system memory either way; what changes is that the scaler
+    /// hands over 1.5 bytes a pixel already in the encoder's own format instead of 4 bytes of
+    /// BGRA that this encoder then re-uploaded and ran a `VideoProcessorBlt` over. The upload
+    /// goes straight into the encode surface.
+    ///
+    /// Layout per `Scaler::read_back` with `ReadbackFormat::Nv12`: `height` rows of luma then
+    /// `height / 2` rows of interleaved chroma (U then V), all at one `row_pitch`. That is
+    /// exactly one D3D11 NV12 subresource, so `UpdateSubresource` takes it in a single call.
+    pub fn encode_nv12_padded(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        let (w, h) = (self.config.width as usize, self.config.height as usize);
+        let rows = h + h / 2;
+        let need = rows * row_pitch as usize;
+        if (row_pitch as usize) < w || data.len() < need {
+            bail!(
+                "encode_nv12_padded: need row_pitch >= {w} and >= {need} bytes for {w}x{h} NV12                  (got pitch {row_pitch}, {} bytes)",
+                data.len()
+            );
+        }
+
+        let staging = self.ensure_nv12_upload_texture()?;
+        unsafe {
+            self.context.UpdateSubresource(
+                &staging,
+                0,
+                None,
+                data.as_ptr() as *const c_void,
+                row_pitch,
+                0,
+            );
+        }
+
+        let force_idr = force_idr || self.idr_requested;
+        let surf = self.get_surface(SurfaceKind::Encode)?;
+        if let Err(e) = unsafe { self.copy_into_nv12_surface(surf, &staging) } {
+            self.release_surface(surf);
+            return Err(e);
+        }
+        let out = unsafe { self.encode_surface(surf, force_idr) };
+        self.replace_last_nv12(surf);
+        let out = out?;
+        if force_idr {
+            self.idr_requested = false;
+        }
+        self.frame_index += 1;
+        Ok(out)
+    }
+
     pub fn encode_repeat(&mut self, force_idr: bool) -> Result<Vec<u8>> {
         if self.last_nv12.is_null() {
             return Ok(Vec::new());
@@ -588,6 +1061,83 @@ impl Encoder {
         }
         self.frame_index += 1;
         Ok(out)
+    }
+
+    /// The NV12 upload texture the CPU-bridge NV12 path writes into, created once.
+    ///
+    /// Separate from `upload_texture`, which is BGRA: a session uses one or the other for its
+    /// whole life, so only one is ever allocated.
+    fn ensure_nv12_upload_texture(&mut self) -> Result<ID3D11Texture2D> {
+        if let Some(t) = &self.nv12_upload_texture {
+            return Ok(t.clone());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.config.width,
+            Height: self.config.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex)) }
+            .context("CreateTexture2D (Intel NV12 CPU-upload staging)")?;
+        let tex = tex.context("CreateTexture2D returned no NV12 texture")?;
+        self.nv12_upload_texture = Some(tex.clone());
+        Ok(tex)
+    }
+
+    /// Copy a whole NV12 texture into a oneVPL surface's own D3D11 texture.
+    ///
+    /// No `D3D11_BOX`: the two are the same size by construction, and a box on an NV12 resource
+    /// has to be expressed in luma coordinates with even bounds, which is a needless way to be
+    /// wrong. `Flush` for the same reason `copy_into_surface` flushes — the oneVPL submit that
+    /// follows is on this same context, and starting the copy early is measurably worth more
+    /// than the extra submit costs.
+    unsafe fn copy_into_nv12_surface(
+        &self,
+        surf: *mut mfxFrameSurface1,
+        src: &ID3D11Texture2D,
+    ) -> Result<()> {
+        let iface = unsafe { (*surf).FrameInterface };
+        if iface.is_null() {
+            bail!("encode surface has no FrameInterface");
+        }
+        let get_native = unsafe { (*iface).GetNativeHandle }
+            .ok_or_else(|| anyhow!("FrameInterface::GetNativeHandle is null"))?;
+        let mut res: mfxHDL = ptr::null_mut();
+        let mut res_type: mfxResourceType = 0;
+        check_strict(
+            unsafe { get_native(surf, &mut res, &mut res_type) },
+            "FrameInterface::GetNativeHandle (encode surface)",
+        )?;
+        if res_type != MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
+            bail!("encode surface is not a D3D11 texture (resource_type={res_type})");
+        }
+        let dst_ptr = res;
+        let dst = unsafe { ID3D11Texture2D::from_raw_borrowed(&dst_ptr) }
+            .ok_or_else(|| anyhow!("GetNativeHandle returned null texture"))?;
+        let dst_res: ID3D11Resource = dst
+            .cast()
+            .context("encode surface texture as ID3D11Resource")?;
+        let src_res: ID3D11Resource = src
+            .cast()
+            .context("NV12 upload texture as ID3D11Resource")?;
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src_res, 0, None);
+            if per_frame_flush_enabled() {
+                self.context.Flush();
+            }
+        }
+        Ok(())
     }
 
     fn ensure_upload_texture(&mut self) -> Result<ID3D11Texture2D> {
@@ -618,8 +1168,13 @@ impl Encoder {
     }
 
     fn vpp_convert(&mut self, src: &ID3D11Texture2D) -> Result<*mut mfxFrameSurface1> {
+        let t_surface = std::time::Instant::now();
         let in_surf = self.get_surface(SurfaceKind::VppIn)?;
+        let t_copy = std::time::Instant::now();
+        self.stage_us.get_surface.push(t_copy - t_surface);
         let copy_res = unsafe { self.copy_into_surface(in_surf, src) };
+        self.stage_us.copy_in.push(t_copy.elapsed());
+        let t_vpp = std::time::Instant::now();
         let nv12 = match copy_res.and_then(|()| self.get_surface(SurfaceKind::VppOut)) {
             Ok(s) => s,
             Err(e) => {
@@ -628,8 +1183,11 @@ impl Encoder {
             }
         };
 
+        // `syncp` is deliberately never passed to `MFXVideoCORE_SyncOperation`. ENCODE consumes
+        // this surface in the same session, so the runtime carries the dependency itself and
+        // synchronising here would cost a frame of pipelining for nothing. Do not "fix" it.
         let mut syncp: mfxSyncPoint = ptr::null_mut();
-        let mut attempts = 0u32;
+        let mut busy = DeviceBusyBackoff::new("MFXVideoVPP_RunFrameVPPAsync");
         let st = loop {
             let st = unsafe {
                 (self.vpl.MFXVideoVPP_RunFrameVPPAsync)(
@@ -641,17 +1199,17 @@ impl Encoder {
                 )
             };
             if st == MFX_WRN_DEVICE_BUSY {
-                attempts += 1;
-                if attempts >= DEVICE_BUSY_MAX_RETRIES {
+                if let Err(e) = busy.wait() {
                     self.release_surface(in_surf);
                     self.release_surface(nv12);
-                    bail!("MFXVideoVPP_RunFrameVPPAsync: device busy after {attempts} retries");
+                    return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
             break st;
         };
+        busy.finish();
+        self.stage_us.vpp.push(t_vpp.elapsed());
         self.release_surface(in_surf);
         match check(st, "MFXVideoVPP_RunFrameVPPAsync") {
             Ok(()) => Ok(nv12),
@@ -695,6 +1253,14 @@ impl Encoder {
             back: 1,
         };
 
+        // No oneVPL surface import here, and that is measured rather than assumed. Importing the
+        // captured texture as an `mfxFrameSurface1` (`mfxSurfaceD3D11Tex2D`, oneVPL 2.9+) would
+        // let VPP read it directly and delete this copy — but the copy is 136 us against a
+        // ~7000 us frame on Intel UHD Graphics (`intel_quicksync_fused_downscale` prints the
+        // per-stage split), about 2%, and most of that 136 us is the `Flush` below, which
+        // measured as a p50 win and would go with it. New FFI on a version-gated API, to remove
+        // 2% and a measured gain, is not a trade worth making.
+        let flush = per_frame_flush_enabled();
         match &self.bridge {
             None => {
                 let src_res: ID3D11Resource =
@@ -710,7 +1276,9 @@ impl Encoder {
                         0,
                         Some(&box_),
                     );
-                    self.context.Flush();
+                    if flush {
+                        self.context.Flush();
+                    }
                 }
             }
             Some(bridge) => {
@@ -733,7 +1301,9 @@ impl Encoder {
                             0,
                             Some(&box_),
                         );
-                        self.context.Flush();
+                        if flush {
+                            self.context.Flush();
+                        }
                     }
                     Ok(())
                 })();
@@ -764,7 +1334,7 @@ impl Encoder {
         bs.DataLength = 0;
 
         let mut syncp: mfxSyncPoint = ptr::null_mut();
-        let mut attempts = 0u32;
+        let mut busy = DeviceBusyBackoff::new("MFXVideoENCODE_EncodeFrameAsync");
         loop {
             let st = unsafe {
                 (self.vpl.MFXVideoENCODE_EncodeFrameAsync)(
@@ -776,13 +1346,10 @@ impl Encoder {
                 )
             };
             if st == MFX_WRN_DEVICE_BUSY {
-                attempts += 1;
-                if attempts >= DEVICE_BUSY_MAX_RETRIES {
-                    bail!("MFXVideoENCODE_EncodeFrameAsync: device busy after {attempts} retries");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                busy.wait()?;
                 continue;
             }
+            busy.finish();
             if st == MFX_ERR_MORE_DATA {
                 return Ok(Vec::new());
             }
@@ -866,11 +1433,77 @@ impl Drop for Encoder {
             (self.vpl.MFXVideoENCODE_Close)(self.session);
             (self.vpl.MFXVideoVPP_Close)(self.session);
             (self.vpl.MFXClose)(self.session);
+            if !self.loader.is_null() {
+                (self.vpl.MFXUnload)(self.loader);
+            }
         }
     }
 }
 
-fn create_session(vpl: &Vpl) -> Result<mfxSession> {
+/// Serializes oneVPL implementation enumeration across the process.
+///
+/// `MFXLoad` + `MFXSetConfigFilterProperty` + `MFXCreateSession` is a dispatcher-wide
+/// enumeration: it opens the candidate runtimes and asks each one whether it can serve the
+/// filter. Run two of them at once against the same iGPU and one loses — measured on this box
+/// as `MFXCreateSession` returning `MFX_ERR_NOT_FOUND` in roughly half of concurrent pairs,
+/// which the old code reported as "no Intel hardware oneVPL implementation". An encoder is
+/// built per streaming session, so two clients joining together on an Intel host is exactly the
+/// concurrent case, and the loser did not retry — it fell to x264 for the life of that session.
+static SESSION_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How many times to re-enumerate before believing `MFX_ERR_NOT_FOUND`.
+///
+/// The lock removes the contention this process creates; the retry covers the rest — another
+/// process using the same iGPU, or a runtime still tearing down the previous session's device.
+const SESSION_CREATE_ATTEMPTS: u32 = 4;
+const SESSION_CREATE_BACKOFF_MS: u64 = 25;
+
+fn create_session(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
+    // A poisoned lock here means another thread panicked mid-enumeration. The data is `()`, so
+    // there is nothing to be inconsistent about, and refusing to encode over it would be worse.
+    let _serialize = SESSION_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..SESSION_CREATE_ATTEMPTS {
+        match create_session_once(vpl) {
+            Ok(v) => {
+                if attempt > 0 {
+                    tprintln!(
+                        "oneVPL: session created on attempt {} of {SESSION_CREATE_ATTEMPTS}",
+                        attempt + 1
+                    );
+                }
+                return Ok(v);
+            }
+            Err(e) if is_transient_session_error(&e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    SESSION_CREATE_BACKOFF_MS * u64::from(attempt + 1),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last
+        .expect("the retry loop only exits empty-handed after recording an error")
+        .context(format!(
+            "no Intel hardware oneVPL implementation after {SESSION_CREATE_ATTEMPTS} attempts \
+             (would fail over to next vendor)"
+        )))
+}
+
+/// `MFX_ERR_NOT_FOUND` and `MFX_ERR_DEVICE_*` from enumeration are "not right now", not
+/// "not on this machine". Anything else is a real refusal and retrying only delays the failover.
+fn is_transient_session_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("MFX_ERR_NOT_FOUND")
+        || s.contains("MFX_ERR_DEVICE_LOST")
+        || s.contains("MFX_ERR_DEVICE_FAILED")
+}
+
+fn create_session_once(vpl: &Vpl) -> Result<(mfxSession, mfxLoader)> {
     let loader = unsafe { (vpl.MFXLoad)() };
     if loader.is_null() {
         bail!("MFXLoad returned null (oneVPL dispatcher unavailable)");
@@ -907,19 +1540,41 @@ fn create_session(vpl: &Vpl) -> Result<mfxSession> {
     match build() {
         Ok(session) => {
             let mut ver: u32 = 0;
-            let _ = unsafe { (vpl.MFXQueryVersion)(session, &mut ver) };
+            let st = unsafe { (vpl.MFXQueryVersion)(session, &mut ver) };
+            let (major, minor) = (ver >> 16, ver & 0xFFFF);
             tprintln!(
-                "oneVPL session created: HW impl via D3D11, api_version={}.{}",
-                ver >> 16,
-                ver & 0xFFFF
+                "oneVPL session created: HW impl via D3D11, api_version={major}.{minor}, \
+                 dispatcher={}",
+                vpl.library_path().display(),
             );
-            Ok(session)
+            // The encoder depends on 2.x-only internal allocation
+            // (`MFXMemory_GetSurfaceForVPP`/`Encode`, `mfxFrameSurfaceInterface::GetNativeHandle`).
+            // A 1.x runtime returns MFX_ERR_UNSUPPORTED from those on the *first frame*, long
+            // after `build_backend` committed to this vendor and logged "live capture ready" —
+            // so the check has to happen here, where failing over is still possible.
+            if st < MFX_ERR_NONE {
+                unsafe { (vpl.MFXClose)(session) };
+                unsafe { (vpl.MFXUnload)(loader) };
+                bail!("MFXQueryVersion failed (mfxStatus={st}); cannot confirm a 2.x runtime");
+            }
+            if major < 2 {
+                unsafe { (vpl.MFXClose)(session) };
+                unsafe { (vpl.MFXUnload)(loader) };
+                bail!(
+                    "oneVPL runtime reports API {major}.{minor}; this encoder needs 2.0+ for \
+                     internal surface allocation, and a 1.x runtime would fail at the first frame"
+                );
+            }
+            Ok((session, loader))
         }
         Err(e) => {
             unsafe { (vpl.MFXUnload)(loader) };
-            Err(e.context(
-                "no Intel hardware oneVPL implementation (would fail over to next vendor)",
-            ))
+            // No blanket "no Intel hardware" here — `create_session` decides that, after the
+            // retries, and only for statuses that mean it.
+            Err(e.context(format!(
+                "oneVPL implementation enumeration failed (dispatcher {})",
+                vpl.library_path().display()
+            )))
         }
     }
 }
@@ -1024,11 +1679,23 @@ fn luid_eq(a: LUID, b: LUID) -> bool {
     a.LowPart == b.LowPart && a.HighPart == b.HighPart
 }
 
+/// The coded-picture buffer the rate controller may bank into: about one frame of bits.
+///
+/// This used to be `(coded_w * coded_h * 4) / 1024` — the size of one *uncompressed* BGRA
+/// frame, 8160 KB at 1920x1088, which is ~65 Mbit, i.e. about 6.5 seconds of buffer at a
+/// 10 Mbps target. The encoder was free to bank several seconds of bits and smooth excursions
+/// over a long window instead of clipping them per frame, which on a fixed-rate link becomes
+/// queueing delay and then loss. The output *allocation* still needs to be large; that is a
+/// separate number now.
+fn vbv_kb(bitrate_bps: u32, fps: u32) -> u16 {
+    ((bitrate_bps / 8 / fps.max(1)) / 1024).clamp(1, 65000) as u16
+}
+
 fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, fps: u32) -> bool {
     let fps = fps.max(1);
     let coded_w = align_up_u16(config.width, 16);
     let coded_h = align_up_u16(config.height, 16);
-    let buffer_size_kb = ((coded_w as u32 * coded_h as u32 * 4) / 1024).clamp(512, 65000) as u16;
+    let buffer_size_kb = vbv_kb(config.bitrate_bps, fps);
     let target_kbps = (config.bitrate_bps / 1000).clamp(1, 65000) as u16;
     let max_kbps = (config.max_bitrate_bps / 1000).clamp(target_kbps as u32, 65000) as u16;
 
@@ -1057,7 +1724,7 @@ fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, f
     mfx.TargetUsage = MFX_TARGETUSAGE_BEST_SPEED;
     mfx.GopPicSize = 0xFFFF;
     mfx.GopRefDist = 1;
-    mfx.NumSlice = (config.height / 256).clamp(4, 8) as u16;
+    mfx.NumSlice = slice_count_for_height(config.height);
     mfx.NumRefFrame = 1;
     mfx.BufferSizeInKB = buffer_size_kb;
     if let Some(qp) = config.qp {
@@ -1067,19 +1734,80 @@ fn query_fps_supported(vpl: &Vpl, session: mfxSession, config: &EncoderConfig, f
         mfx.TargetKbps = q;
         mfx.MaxKbps = q;
     } else {
-        mfx.RateControlMethod = MFX_RATECONTROL_CBR;
+        mfx.RateControlMethod = MFX_RATECONTROL_VCM;
         mfx.TargetKbps = target_kbps;
         mfx.MaxKbps = max_kbps;
     }
+    mfx.IdrInterval = 0;
 
     let mut par: mfxVideoParam = unsafe { std::mem::zeroed() };
     par.AsyncDepth = 1;
     par.IOPattern = MFX_IOPATTERN_IN_VIDEO_MEMORY;
     par.info = mfxInfoUnion { mfx };
 
-    let p: *mut mfxVideoParam = &mut par;
-    let status = unsafe { (vpl.MFXVideoENCODE_Query)(session, p, p) };
-    let out_fps = unsafe { par.info.mfx.FrameInfo.FrameRateExtN };
+    // The ext buffers matter to the answer. Without them this probed a configuration the
+    // encoder never uses — plain VCM with no `LowDelayBRC`, no per-frame size cap and no intra
+    // refresh — so a rate the runtime accepts bare and refuses under the real low-latency
+    // posture came back as supported, and `MFXVideoENCODE_Init` then failed at a frame rate the
+    // probe had just blessed.
+    let mut co: mfxExtCodingOption = unsafe { std::mem::zeroed() };
+    co.Header.BufferId = MFX_EXTBUFF_CODING_OPTION;
+    co.Header.BufferSz = std::mem::size_of::<mfxExtCodingOption>() as u32;
+    co.MaxDecFrameBuffering = 1;
+    co.NalHrdConformance = MFX_CODINGOPTION_OFF;
+    co.PicTimingSEI = MFX_CODINGOPTION_OFF;
+
+    let mut co2: mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+    co2.Header.BufferId = MFX_EXTBUFF_CODING_OPTION2;
+    co2.Header.BufferSz = std::mem::size_of::<mfxExtCodingOption2>() as u32;
+    co2.RepeatPPS = MFX_CODINGOPTION_ON;
+    co2.BRefType = MFX_B_REF_OFF;
+    if config.intra_refresh {
+        co2.IntRefType = MFX_REFRESH_HORIZONTAL;
+        co2.IntRefCycleSize = fps.clamp(2, u16::MAX as u32) as u16;
+    }
+
+    let mut co3: mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+    co3.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3;
+    co3.Header.BufferSz = std::mem::size_of::<mfxExtCodingOption3>() as u32;
+    co3.ScenarioInfo = MFX_SCENARIO_DISPLAY_REMOTING;
+    co3.GPB = MFX_CODINGOPTION_OFF;
+    if config.qp.is_none() {
+        co3.LowDelayBRC = MFX_CODINGOPTION_ON;
+        co3.WinBRCSize = 1;
+        co3.WinBRCMaxAvgKbps = max_kbps;
+        let avg_frame_bytes = (config.bitrate_bps / 8 / fps).max(1);
+        co3.MaxFrameSizeP = avg_frame_bytes.saturating_mul(2);
+        co3.MaxFrameSizeI = avg_frame_bytes.saturating_mul(6);
+    }
+
+    let mut in_ptrs: [*mut mfxExtBuffer; 3] = [
+        &mut co as *mut _ as *mut mfxExtBuffer,
+        &mut co2 as *mut _ as *mut mfxExtBuffer,
+        &mut co3 as *mut _ as *mut mfxExtBuffer,
+    ];
+    par.ExtParam = in_ptrs.as_mut_ptr();
+    par.NumExtParam = in_ptrs.len() as u16;
+
+    // In and out must be distinct once ext buffers are attached: the runtime writes the
+    // corrected parameters into `out` while reading `in`, and the old code aliased them.
+    let mut out_co: mfxExtCodingOption = unsafe { std::mem::zeroed() };
+    out_co.Header = co.Header;
+    let mut out_co2: mfxExtCodingOption2 = unsafe { std::mem::zeroed() };
+    out_co2.Header = co2.Header;
+    let mut out_co3: mfxExtCodingOption3 = unsafe { std::mem::zeroed() };
+    out_co3.Header = co3.Header;
+    let mut out_ptrs: [*mut mfxExtBuffer; 3] = [
+        &mut out_co as *mut _ as *mut mfxExtBuffer,
+        &mut out_co2 as *mut _ as *mut mfxExtBuffer,
+        &mut out_co3 as *mut _ as *mut mfxExtBuffer,
+    ];
+    let mut out = par;
+    out.ExtParam = out_ptrs.as_mut_ptr();
+    out.NumExtParam = out_ptrs.len() as u16;
+
+    let status = unsafe { (vpl.MFXVideoENCODE_Query)(session, &mut par, &mut out) };
+    let out_fps = unsafe { out.info.mfx.FrameInfo.FrameRateExtN };
     status >= MFX_ERR_NONE && out_fps == fps
 }
 
@@ -1095,6 +1823,13 @@ fn query_max_supported_fps(
     }
     const PROBE_LOW: u32 = 30;
     if !query_fps_supported(vpl, session, config, PROBE_LOW) {
+        // Not "this device tops out at 60" — the probe itself failed, for a reason we have not
+        // established, and the cap is a guess. It used to be applied silently, so a host whose
+        // Query fails for an unrelated reason quietly lost every rate above 60.
+        teprintln!(
+            "Intel Quick Sync: the {PROBE_LOW} fps probe failed, so the supported frame-rate \
+             range is unknown; capping at {INTEL_FPS_QUERY_FALLBACK} fps as a guess"
+        );
         return requested.min(INTEL_FPS_QUERY_FALLBACK);
     }
     let (mut lo, mut hi, mut best) = (PROBE_LOW, requested, PROBE_LOW);
