@@ -304,6 +304,61 @@ async function trickle() {
   }
 }
 
+// --- what the offer waits for, in milliseconds --------------------------------------------
+// The one number this change is about: how long `setLocalDescription` resolving is from the
+// WHEP POST going out. Trickle removes the wait entirely, so the measured quantity is the wait
+// itself. Three network shapes, five trials each, median reported — the timers are `setTimeout`
+// so the floor is the event loop, not the code.
+
+async function measure() {
+  const TRIALS = 5;
+  const median = (xs) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+
+  async function trial(fn) {
+    const xs = [];
+    for (let i = 0; i < TRIALS; i++) xs.push(await timed(fn));
+    return median(xs);
+  }
+
+  // A LAN join: a host candidate lands in the first millisecond and the wait ends one host
+  // grace later.
+  const lan = await trial(async () => {
+    const pc = fakePc();
+    const p = ctx.waitForIceGathering(pc, 3000, false);
+    pc.emitCandidate('host');
+    await p;
+  });
+
+  // A relayed join with a reachable TURN server: the allocation is a round trip behind the host
+  // candidate, and the wait cannot end on anything before it.
+  const relayed = await trial(async () => {
+    const pc = fakePc();
+    const p = ctx.waitForIceGathering(pc, 6000, true);
+    pc.emitCandidate('host');
+    await sleep(300);
+    pc.emitCandidate('relay');
+    await p;
+  });
+
+  // A relayed join whose TURN server never answers: libwebrtc retransmits the ALLOCATE on the
+  // RFC 5389 schedule and the wait runs to its deadline. Shortened to 600 ms here so the harness
+  // does not sit for six seconds; the shipped deadline is 6000.
+  const dead = await trial(async () => {
+    const pc = fakePc();
+    await ctx.waitForIceGathering(pc, 600, true);
+  });
+
+  // With trickle there is no wait: the offer is posted from `setLocalDescription` and every
+  // candidate follows over PATCH.
+  console.log('\n--- what the offer waits for (median of ' + TRIALS + ') ---');
+  console.log('  gather-then-post, LAN                 ' + lan + ' ms');
+  console.log('  gather-then-post, relayed (TURN 300ms)' + String(relayed).padStart(5) + ' ms');
+  console.log('  gather-then-post, TURN unreachable    ' + dead + ' ms (of a 600 ms deadline; shipped is 6000)');
+  console.log('  trickle                               0 ms');
+  if (lan < ctx.__grace.host) fail('the LAN wait measured below its own grace constant');
+  if (relayed <= lan) fail('a relayed wait measured no longer than a LAN one');
+}
+
 async function run() {
   {
     const pc = fakePc();
@@ -370,6 +425,7 @@ async function run() {
   }
 
   await trickle();
+  await measure();
 
   if (failures) {
     console.log('\n' + failures + ' ICE assertion(s) failed');
