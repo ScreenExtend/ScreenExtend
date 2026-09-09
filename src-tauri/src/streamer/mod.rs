@@ -12,6 +12,7 @@ pub mod pacer;
 pub mod packetizer;
 pub mod pipeline;
 pub mod platform;
+pub mod repair;
 pub mod server;
 pub mod session;
 pub mod sockets;

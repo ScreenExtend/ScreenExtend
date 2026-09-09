@@ -788,6 +788,15 @@ impl Encoder {
         force || own || shared
     }
 
+    /// The index the *next* submitted picture will carry in `NV_ENC_PIC_PARAMS::inputTimeStamp`.
+    ///
+    /// The transport needs it before the submit, not after: a picture is marked as a long-term
+    /// reference by setting the mark on the encoder and then submitting, so the slot's contents
+    /// have to be recorded against the index that submit is about to use.
+    pub fn next_frame_index(&self) -> u64 {
+        self.frame_index
+    }
+
     /// How many long-term reference slots this encoder has. 0 means the repair API is inert and
     /// the only loss recovery available is a keyframe.
     pub fn ltr_slots(&self) -> u32 {
