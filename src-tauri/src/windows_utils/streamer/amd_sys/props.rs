@@ -81,6 +81,7 @@ pub mod names {
         AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE = "OutColorProfile";
         AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC = "OutColorTransferChar";
         AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES = "OutColorPrimaries";
+        AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF = "OutMatrixCoeff";
         AMF_VIDEO_ENCODER_OUTPUT_MODE = "OutputMode";
 
         // ---- dynamic: settable on a running component, applied at the next SubmitInput ----
