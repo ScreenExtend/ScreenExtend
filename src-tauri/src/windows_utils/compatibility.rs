@@ -321,13 +321,18 @@ pub fn check_system_requirements() -> CompatibilityReport {
 
     match probes.display_backend {
         DisplayBackend::IddDriver => {}
+        // The driver is the one "unsupported API" the app can fix by itself: the bootstrap
+        // runs the elevated installer and retries, which is the flow every first launch (and
+        // every fresh install, whose pre-uninstall hook removes the previous driver) goes
+        // through. `installable` keeps the row visible to `doctor` and `status` without the
+        // desktop UI treating a missing driver as an unsupported operating system.
         DisplayBackend::DriverNotInstalled => unsupported.push(UnsupportedApi {
             name: "Virtual Display Driver".to_string(),
             description:
                 "Not installed. Each connected device needs one; install the driver to continue."
                     .to_string(),
             required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "blocking".to_string(),
+            severity: "installable".to_string(),
         }),
         DisplayBackend::DriverNotResponding => unsupported.push(UnsupportedApi {
             name: "Virtual Display Driver".to_string(),
@@ -335,7 +340,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
                 "Installed but not answering. Reinstall the driver, or restart this machine."
                     .to_string(),
             required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "blocking".to_string(),
+            severity: "installable".to_string(),
         }),
     }
 

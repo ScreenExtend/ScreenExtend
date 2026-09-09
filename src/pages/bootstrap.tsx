@@ -318,16 +318,20 @@ export default function Bootstrap() {
         await runSetup(true);
         return;
       }
+      // "installable" rows (the virtual display driver) are not a compatibility verdict:
+      // runSetup(true) installs the driver through the elevated installer and retries, the
+      // same first-launch flow as before the probe existed. Only the rest can block or warn.
+      const visible = report.unsupported_apis.filter(api => api.severity !== "installable");
       const hasBlocking =
         !report.os_supported ||
-        report.unsupported_apis.some(api => api.severity === "blocking");
+        visible.some(api => api.severity === "blocking");
       if (hasBlocking) {
-        setCompatReport(report);
+        setCompatReport({ ...report, unsupported_apis: visible });
         setCompatBlocking(true);
         return;
       }
-      if (report.unsupported_apis.length > 0 && !(await getConfig())?.dontShowAgain?.compatibility) {
-        setCompatReport(report);
+      if (visible.length > 0 && !(await getConfig())?.dontShowAgain?.compatibility) {
+        setCompatReport({ ...report, unsupported_apis: visible });
         setCompatBlocking(false);
         return;
       }

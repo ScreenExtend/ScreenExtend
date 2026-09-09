@@ -858,12 +858,24 @@ mod desktop {
     fn windows_certificate_trusted() -> Option<bool> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let out = std::process::Command::new("certutil")
-            .args(["-store", "root", "ScreenExtend"])
+        // `certutil -store root <id>` matches the certificate's CN exactly; the bundled
+        // certificate's subject is "ScreenExtend App", so ask for that first, then fall back
+        // to scanning the store listing so a renamed certificate is still found.
+        let exact = std::process::Command::new("certutil")
+            .args(["-store", "root", "ScreenExtend App"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
-        Some(out.status.success())
+        if exact.status.success() {
+            return Some(true);
+        }
+        let listing = std::process::Command::new("certutil")
+            .args(["-store", "root"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&listing.stdout).to_ascii_lowercase();
+        Some(text.contains("screenextend"))
     }
 
     fn driver_state(_app: &tauri::AppHandle) -> DriverState {
