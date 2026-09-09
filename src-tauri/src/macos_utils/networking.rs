@@ -129,8 +129,16 @@ fn interface_index(name: &str) -> Option<u32> {
 }
 
 /// `CWInterface.ssid` returns nil on macOS 10.15+ unless the process holds Location Services
-/// authorization, which ScreenExtend never requests. The last name we did read is remembered so a
-/// nil read shows the previous SSID rather than flapping to the placeholder.
+/// authorization.
+///
+/// **ScreenExtend does not ask for Location, deliberately.** The SSID is a label on a dashboard
+/// row; a Location prompt is one of the heaviest consents macOS shows, and asking for it to
+/// decorate a row that already carries the adapter's addresses is not a trade worth making. So on
+/// a Mac that has never granted it the row reads "Wi-Fi", on purpose rather than by accident, and
+/// the reason is said once in the log instead of looking like a bug next to the Windows dashboard.
+///
+/// The last name we *did* read is still remembered, so a machine that has the authorization does
+/// not flap to the placeholder on a single nil read.
 fn wifi_ssid(name: &str) -> Option<String> {
     static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
@@ -148,8 +156,156 @@ fn wifi_ssid(name: &str) -> Option<String> {
             last.lock().unwrap().insert(name.to_string(), ssid.clone());
             Some(ssid)
         }
-        None => last.lock().unwrap().get(name).cloned(),
+        None => {
+            let cached = last.lock().unwrap().get(name).cloned();
+            if cached.is_none() {
+                static EXPLAINED: OnceLock<()> = OnceLock::new();
+                EXPLAINED.get_or_init(|| {
+                    tprintln!(
+                        "[network] the Wi-Fi network name is unavailable: macOS treats an SSID as \
+                         location data and only hands it to a process holding Location Services \
+                         authorization, which ScreenExtend does not request. Adapters will be \
+                         labelled \"Wi-Fi\"; their addresses are unaffected."
+                    );
+                });
+            }
+            cached
+        }
     }
+}
+
+/// Whether AWDL — Apple Wireless Direct Link, the radio AirDrop, Handoff and Sidecar run on — is
+/// up on this Mac, and which channel the Wi-Fi interface is associated to.
+///
+/// Both matter to latency and neither is something ScreenExtend can fix, so they are reported
+/// once rather than acted on. A single-radio Mac time-shares between the infrastructure link and
+/// AWDL's social channels (6, 44 and 149), which is measured elsewhere as periodic 50-200 ms
+/// stalls on a stream — a jitter source the *user* can act on by narrowing AirDrop's
+/// discoverability, and one that will otherwise be blamed on us.
+fn awdl_is_up() -> bool {
+    unsafe {
+        let mut ifap: *mut ifaddrs = std::ptr::null_mut();
+        if getifaddrs(&mut ifap) != 0 {
+            return false;
+        }
+        let mut up = false;
+        let mut ifa = ifap;
+        while !ifa.is_null() {
+            let name = CStr::from_ptr((*ifa).ifa_name).to_string_lossy();
+            if name.starts_with("awdl") && (*ifa).ifa_flags as i32 & IFF_UP != 0 {
+                up = true;
+                break;
+            }
+            ifa = (*ifa).ifa_next;
+        }
+        freeifaddrs(ifap);
+        up
+    }
+}
+
+/// AWDL's three default social channels. Every nearby Apple device parks its AWDL interface on one
+/// of these for discovery.
+const AWDL_SOCIAL_CHANNELS: [isize; 3] = [6, 44, 149];
+
+fn report_radio_conditions() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let channel = unsafe {
+            CWWiFiClient::sharedWiFiClient()
+                .interface()
+                .and_then(|i| i.wlanChannel())
+                .map(|c| c.channelNumber())
+        };
+        let awdl = awdl_is_up();
+        match channel {
+            Some(number) if AWDL_SOCIAL_CHANNELS.contains(&number) => teprintln!(
+                "[network] this Mac's Wi-Fi is associated on channel {number}, one of AWDL's \
+                 social channels (6, 44, 149){}. Expect periodic stalls while nearby Apple \
+                 devices discover each other on it; a different channel on the router, or \
+                 narrowing AirDrop discoverability, is the fix",
+                if awdl { ", and awdl0 is up" } else { "" }
+            ),
+            Some(number) if awdl => tprintln!(
+                "[network] Wi-Fi channel {number}, awdl0 up. A single-radio Mac retunes to AWDL's \
+                 social channels periodically, which shows up as jitter on the stream; setting \
+                 AirDrop to Contacts Only or Receiving Off reduces it"
+            ),
+            Some(number) => tprintln!("[network] Wi-Fi channel {number}, awdl0 down"),
+            None if awdl => tprintln!("[network] awdl0 is up; Wi-Fi channel unavailable"),
+            None => {}
+        }
+    });
+}
+
+/// The kernel's routing socket: how BSD announces interface and address changes.
+///
+/// `PF_ROUTE` predates macOS, needs no framework, no run loop and no entitlement, and it carries
+/// exactly the events that change what the streamers bind — `RTM_NEWADDR`, `RTM_DELADDR`,
+/// `RTM_IFINFO`. The previous watcher re-ran the whole `getifaddrs` + `ioctl` + CoreWLAN
+/// enumeration once a second forever, whether or not anything had moved.
+struct RouteSocket(libc::c_int);
+
+impl RouteSocket {
+    fn open() -> Option<Self> {
+        let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
+        (fd >= 0).then_some(Self(fd))
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 2048];
+        loop {
+            let n = unsafe {
+                libc::recv(
+                    self.0,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n <= 0 {
+                return;
+            }
+        }
+    }
+
+    /// Blocks until the kernel reports something or `timeout` elapses. The payload is not read for
+    /// meaning: the enumeration below is the source of truth, and this only decides when to run it.
+    fn wait(&self, timeout: Duration) -> bool {
+        let mut fds = libc::pollfd {
+            fd: self.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        if unsafe { libc::poll(&mut fds, 1, ms) } <= 0 {
+            return false;
+        }
+        self.drain();
+        true
+    }
+}
+
+impl Drop for RouteSocket {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// A Wi-Fi switch produces a burst of routing messages — link down, address removed, link up,
+/// address added. One enumeration should cover the lot.
+const ROUTE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Re-enumerate this often even with a silent routing socket, so a message we somehow miss costs
+/// at most this much rather than the life of the process.
+const ROUTE_BACKSTOP: Duration = Duration::from_secs(30);
+/// Only used when the routing socket cannot be opened at all.
+const FALLBACK_POLL: Duration = Duration::from_secs(1);
+
+/// How many full adapter enumerations the watcher has run. The whole point of the routing socket
+/// is that this stops growing when nothing changes, so it is worth being able to read.
+static ENUMERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn watch_enumerations() -> u64 {
+    ENUMERATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The host's own routable IPv4 on one interface. Used to tell a hosted network that is merely
@@ -285,6 +441,7 @@ fn enumerate_adapters(hosted_name: Option<&str>) -> Vec<NetworkInfo> {
 #[tauri::command]
 #[specta::specta]
 pub fn get_network_adapters(app: AppHandle, state: State<'_, AppState>) -> Vec<NetworkInfo> {
+    ENUMERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let hosted = is_hosted_network(app.clone(), state).then(|| hosted_network_name(&app));
     enumerate_adapters(hosted.as_deref())
 }
@@ -296,13 +453,45 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
 #[tauri::command]
 #[specta::specta]
 pub fn watch_for_network_changes(app: AppHandle) {
+    // A Tauri command the frontend can call more than once. It used to start another identical
+    // thread every time, each one enumerating and each one able to call `sync_streamers`.
+    static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WATCHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
     std::thread::spawn(move || {
+        report_radio_conditions();
+
         let mut previous = get_network_adapters(app.clone(), app.state::<AppState>());
         tprintln!("[network-watcher] initial network adapters: {previous:?}");
         apply(&app, previous.clone());
 
+        let route = RouteSocket::open();
+        match &route {
+            Some(_) => tprintln!(
+                "[network-watcher] watching the kernel routing socket; adapters are re-enumerated \
+                 when something changes rather than once a second"
+            ),
+            None => teprintln!(
+                "[network-watcher] could not open a PF_ROUTE socket ({}); falling back to polling \
+                 once a second",
+                std::io::Error::last_os_error()
+            ),
+        }
+
         loop {
-            std::thread::sleep(Duration::from_secs(1));
+            match &route {
+                Some(sock) => {
+                    if sock.wait(ROUTE_BACKSTOP) {
+                        // Let the rest of a Wi-Fi switch's burst land before reading the world.
+                        std::thread::sleep(ROUTE_DEBOUNCE);
+                        sock.drain();
+                    }
+                }
+                None => std::thread::sleep(FALLBACK_POLL),
+            }
+
             let current = get_network_adapters(app.clone(), app.state::<AppState>());
             if same_topology(&current, &previous) {
                 previous = current;
@@ -350,5 +539,91 @@ mod tests {
         let before = [info(4, "Wi-Fi", &["192.168.1.20"])];
         let after = [info(4, "Wi-Fi", &["192.168.1.21"])];
         assert!(!same_topology(&before, &after));
+    }
+
+    #[test]
+    fn the_awdl_social_channels_are_the_published_three() {
+        assert_eq!(AWDL_SOCIAL_CHANNELS, [6, 44, 149]);
+    }
+
+    #[test]
+    fn a_routing_socket_can_be_opened() {
+        assert!(
+            RouteSocket::open().is_some(),
+            "PF_ROUTE is unavailable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// What the watcher costs at idle, before and after.
+    ///
+    /// The old shape ran the full `getifaddrs` + `SIOCGIFMEDIA` + CoreWLAN enumeration once a
+    /// second forever. The new one blocks on the routing socket. Both halves are measured over the
+    /// same window on the same machine so the comparison is not against a remembered number.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::networking::tests::measure_adapter_watch_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_adapter_watch_cost() {
+        use std::time::Instant;
+        const WINDOW: Duration = Duration::from_secs(30);
+
+        let started = Instant::now();
+        let mut polled = 0u32;
+        while started.elapsed() < WINDOW {
+            let _ = enumerate_adapters(None);
+            polled += 1;
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let interfaces = enumerate_adapters(None).len();
+
+        let Some(sock) = RouteSocket::open() else {
+            println!("PF_ROUTE unavailable; only the poll half was measured");
+            return;
+        };
+        sock.drain();
+        let started = Instant::now();
+        let mut woken = 0u32;
+        while started.elapsed() < WINDOW {
+            if sock.wait(Duration::from_secs(1)) {
+                woken += 1;
+                std::thread::sleep(ROUTE_DEBOUNCE);
+                sock.drain();
+            }
+        }
+
+        println!(
+            "over {}s at idle with {interfaces} reported adapters: poll shape {polled} \
+             enumerations, routing-socket shape {woken}",
+            WINDOW.as_secs()
+        );
+    }
+
+    /// What this Mac will actually report, and why. Prints rather than asserts: the answers are
+    /// properties of the machine's Location authorization and its radio, not of the code.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::networking::tests::report_wifi_naming_and_radio -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn report_wifi_naming_and_radio() {
+        for adapter in enumerate_adapters(None) {
+            println!(
+                "adapter index {} named {:?} with {:?}",
+                adapter.interface_index, adapter.network_name, adapter.ip_addresses
+            );
+        }
+        println!("awdl0 up: {}", awdl_is_up());
+        let channel = unsafe {
+            CWWiFiClient::sharedWiFiClient()
+                .interface()
+                .and_then(|i| i.wlanChannel())
+                .map(|c| c.channelNumber())
+        };
+        println!("associated channel: {channel:?}");
+        report_radio_conditions();
     }
 }
