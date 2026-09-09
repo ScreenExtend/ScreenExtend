@@ -316,6 +316,46 @@ impl Encoder {
         context: ID3D11DeviceContext,
         max_ltr_frames: i64,
     ) -> Result<Self> {
+        let mut this = Self::open(config, device, context, max_ltr_frames)?;
+
+        this.build_ring(PREFERRED_INPUT_FORMAT)?;
+        this.configure_and_init()?;
+        this.read_extradata();
+
+        tprintln!(
+            "AMD AMF H.264 encoder initialized (D3D11 / {}): {}x{}@{}, bitrate_bps={}, \
+             input={}, profile={:?}, rc={}, qp={:?}, ltr_frames={}, query_timeout={}",
+            usage_name(this.usage),
+            config.width,
+            config.height,
+            config.fps,
+            config.bitrate_bps,
+            surface_format_name(this.surface_format),
+            config.profile,
+            rate_control_name(this.rate_control),
+            config.qp,
+            this.ltr.max_frames,
+            if this.query_timeout_supported {
+                "1ms-blocking"
+            } else {
+                "poll+sleep"
+            },
+        );
+
+        Ok(this)
+    }
+
+    /// Everything up to and including the capability report: load the runtime, take a context on
+    /// `device`, create the AVC component and refuse a non-hardware one. Split out of
+    /// [`Self::build`] so [`probe_availability`] can ask "would AMF encode on this machine?"
+    /// without paying for the property table, the input ring or `Init()` — and so that both
+    /// paths tear down through the one `Drop` impl.
+    fn open(
+        config: EncoderConfig,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        max_ltr_frames: i64,
+    ) -> Result<Self> {
         // AMF's own DeviceDX11.cpp does this unconditionally, and AMD's fix for flicker plus
         // *growing* latency on a Desktop-Duplication device was "do not use
         // D3D11_CREATE_DEVICE_SINGLETHREADED" (AMF issue #92).
@@ -445,31 +485,49 @@ impl Encoder {
             );
         }
 
-        this.build_ring(PREFERRED_INPUT_FORMAT)?;
-        this.configure_and_init()?;
-        this.read_extradata();
-
-        tprintln!(
-            "AMD AMF H.264 encoder initialized (D3D11 / {}): {}x{}@{}, bitrate_bps={}, \
-             input={}, profile={:?}, rc={}, qp={:?}, ltr_frames={}, query_timeout={}",
-            usage_name(this.usage),
-            config.width,
-            config.height,
-            config.fps,
-            config.bitrate_bps,
-            surface_format_name(this.surface_format),
-            config.profile,
-            rate_control_name(this.rate_control),
-            config.qp,
-            this.ltr.max_frames,
-            if this.query_timeout_supported {
-                "1ms-blocking"
-            } else {
-                "poll+sleep"
-            },
-        );
+        // Long-term references are a *choice*, not an addition: AMF disables rolling
+        // intra-refresh while the client controls LTR ("With user control of LTR, B-pictures and
+        // Intra-refresh features are not supported"). So the request is honoured only when the
+        // hardware can actually hold more than one reference and the runtime knows the property;
+        // otherwise ULL's free refresh stays, which is the better trade for a caller that has no
+        // repair loop.
+        this.ltr.max_frames = this.usable_ltr_frames(max_ltr_frames);
 
         Ok(this)
+    }
+
+    /// How many LTR slots to ask for, given what the caller wants and what the adapter reported.
+    ///
+    /// `MaxOfLTRFrames` accepts 0..=2 and is further bounded by the level's DPB limit, and the
+    /// docs make intra-refresh conditional on more than one reference frame — so an adapter that
+    /// reports a single reference cannot do user-controlled LTR at all.
+    fn usable_ltr_frames(&self, requested: i64) -> i64 {
+        if requested <= 0 {
+            return 0;
+        }
+        if self.caps.max_reference_frames <= 1 {
+            tprintln!(
+                "AMF LTR: not enabled — this adapter reports max_refs={} (need > 1); \
+                 keeping the usage's rolling intra-refresh as the loss-recovery mechanism",
+                self.caps.max_reference_frames
+            );
+            return 0;
+        }
+        // SAFETY: the component's first 13 vtable slots are the AMFPropertyStorage prefix, and
+        // the name is a NUL-terminated static.
+        if !unsafe {
+            has_property(
+                as_property_storage(self.component),
+                prop::AMF_VIDEO_ENCODER_MAX_LTR_FRAMES,
+            )
+        } {
+            tprintln!(
+                "AMF LTR: not enabled — this runtime has no MaxOfLTRFrames property; \
+                 keeping the usage's rolling intra-refresh as the loss-recovery mechanism"
+            );
+            return 0;
+        }
+        requested.clamp(0, MAX_LTR_FRAMES_SUPPORTED)
     }
 
     pub fn device(&self) -> &ID3D11Device {
@@ -1758,6 +1816,69 @@ fn create_amd_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         let context = context.context("D3D11CreateDevice returned no context")?;
         Ok((device, context))
     }
+}
+
+/// What [`probe_availability`] found, for the compatibility report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmfAvailability {
+    /// `amfrt64.dll` loaded, the AVC component was created on an AMD adapter, and `GetCaps`
+    /// reported a hardware or GPU acceleration type.
+    Hardware,
+    /// One short sentence naming what stopped it, for the compatibility card and `doctor --json`.
+    Unavailable(String),
+}
+
+/// Would AMF encode on this machine? Cheap, and safe on a box with no Radeon driver.
+///
+/// The compatibility report used to classify AMD adapters by their *description string* and then
+/// claim `"x264 (no AMD hardware encoder)"`, which stopped being true the day the AMF backend
+/// landed. This answers the same question the pipeline answers, by the same means: load the
+/// runtime, take a context on the AMD adapter, create the AVC component and read `GetCaps`. It
+/// stops before the property table, the input ring and `Init()`, so it costs a device creation
+/// and a component creation, and it tears down through `Drop for Encoder` like everything else.
+///
+/// A missing `amfrt64.dll` is the normal outcome on any machine without a Radeon driver and is
+/// reported as one line, never as a panic.
+pub fn probe_availability() -> AmfAvailability {
+    // Small and legal everywhere: nothing is encoded, so the geometry only has to pass AMF's own
+    // range check, and `open` never reads the bitrate.
+    const PROBE: EncoderConfig = EncoderConfig {
+        width: 1280,
+        height: 720,
+        fps: 60,
+        bitrate_bps: 6_000_000,
+        max_bitrate_bps: 6_000_000,
+        profile: H264Profile::High,
+        qp: None,
+        min_qp: None,
+        intra_refresh: true,
+    };
+
+    let (device, context) = match create_amd_d3d11_device() {
+        Ok(pair) => pair,
+        Err(e) => return AmfAvailability::Unavailable(one_line(&e)),
+    };
+    match Encoder::open(PROBE, device, context, 0) {
+        Ok(encoder) => {
+            let accel = acceleration_name(encoder.caps.acceleration);
+            tprintln!("AMF probe: an AVC encoder is available on this adapter (accel={accel})");
+            AmfAvailability::Hardware
+        }
+        Err(e) => AmfAvailability::Unavailable(one_line(&e)),
+    }
+}
+
+/// An `anyhow` chain flattened to one short clause, so it can sit inside a UI string.
+fn one_line(e: &anyhow::Error) -> String {
+    const MAX: usize = 140;
+    let mut s = format!("{e:#}").replace(['\r', '\n'], " ");
+    while s.contains("  ") {
+        s = s.replace("  ", " ");
+    }
+    if s.chars().count() > MAX {
+        s = s.chars().take(MAX - 1).collect::<String>() + "…";
+    }
+    s
 }
 
 /// `--probe-encode --encoder amd`: encode a synthetic pattern to an Annex-B file.
