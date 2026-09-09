@@ -90,3 +90,22 @@ resolved — implemented and verified, or deliberately rejected with the reasoni
 - `docs/CAPABILITY-TIERS.md` — every subsystem × tier with its probe and status.
 - `docs/BASELINE.md` — the pre-optimization numbers; `docs/TELEMETRY.md` — how to read them.
 - `docs/manual-tests/` — scripts for what the two development machines cannot execute.
+
+## Regenerating `src/lib/bindings.ts`
+
+The exporter runs from a **debug** build started with **no CLI arguments** — in practice
+`pnpm tauri dev`. Two things about that guard are worth knowing before you trust the result:
+
+- Builds land in the shared `$CARGO_TARGET_DIR`, not `src-tauri/target/`, so "which binary just
+  ran" is not obvious. *Any* argument-less run of *any* debug build rewrites the file, including
+  a stale one left over from before an API change — which silently reverts the whole TS surface.
+- The generated file is prefixed `// @ts-nocheck`, so `tsc` cannot see the mismatch. The only
+  symptom is a runtime "command not found" in the webview.
+
+So: run it, then **diff `src/lib/bindings.ts`** before committing. `node scripts/check-bindings.mjs`
+is the automated half — it cross-checks the `collect_commands!` / `collect_events!` lists in
+`lib.rs` against what the generated file exports, needs no build, and runs in CI. Its companion
+`node scripts/check-versions.mjs` asserts the app version is the same in all four files.
+
+The export path is resolved from `CARGO_MANIFEST_DIR`, so the working directory no longer decides
+which file gets written.
