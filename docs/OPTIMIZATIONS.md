@@ -285,7 +285,7 @@ Coverage added by W15, and the coverage deliberately not added. The audit this w
 itself the tell that nothing touching hardware was running.
 
 Windows `cargo test --lib` at the end of this workstream: **360 passed, 13 ignored**, 48 s.
-macOS: **376 passed, 22 ignored**. Six Node harnesses cover the client page (`pnpm test:client`).
+macOS: **376 passed, 22 ignored**. Seven Node harnesses cover the client page (`pnpm test:client`).
 
 ### The convention every gated test now follows
 
@@ -333,6 +333,7 @@ indistinguishable from `ok`.
 | client jitter buffer | `scripts/test-client-worklet.mjs` | `audio-worker.js` writes into a `SharedArrayBuffer` and `audio-worklet.js` reads out of the same one, so the planar ring layout — described identically in three files and checked by nothing — is a real cross-file contract test. Plus the power-of-two capacity, overruns, priming, concealment decaying rather than clicking, drift trimmed only at a silence boundary, the mode mismatch in both directions, and the MessageChannel handoff. | VERIFIED |
 | client video path | `scripts/test-client-transform.mjs` | The RTP timestamp inverting back to a host capture time **across the 32-bit wrap** — get it wrong and the reported display lag moves by thirteen hours. Plus the resume-keyframe gate surviving that same wrap, backpressure tripping on decodes-without-outputs while `decodeQueueSize` reads zero, every keyframe tier being withdrawable, the codec hint, the refused size hint, and a contextless canvas claiming no render tier. | VERIFIED |
 | client reconfig/kick | `scripts/test-client-reconfig.mjs` | The other half of the epoch mechanism: first read adopts without rebuilding, an unchanged epoch is a no-op, a bump rebuilds once, the 15 s watchdog un-freezes a stuck rebuild, a kick stops everything, a refused poll is counted where a 500 is not, and the poll never overlaps itself. | VERIFIED |
+| input wire format, both sides | `scripts/test-client-input.mjs` + `streamer/input/protocol.rs` | One fixture, `streamer/input/client-frames.json`, written by the shipped `input.js` under Node and parsed by the shipped Rust parser. The JS side asserts every field at the offsets `docs/INPUT-PROTOCOL.md` documents; the Rust side asserts the decoded event. Neither can drift alone, which is what the format being tested on one side and written on the other could not catch. Includes the rule that a frame at or above its fixed length is *valid* when truncated — the stamp, flags byte and fast-channel sequence are tails an older client does not send. | VERIFIED |
 | client sequence gate | `scripts/test-client-audio.mjs` | The five `seqgate_*` tests moved off a `SeqGate` struct that existed only inside `streamer/audio/tests.rs` and onto the shipped `audio-worker.js`. Both sides of the half-range boundary are now covered, which is where the deleted mirror had already drifted. | VERIFIED |
 
 ### Recorded rejections

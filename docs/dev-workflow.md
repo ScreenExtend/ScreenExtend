@@ -53,12 +53,19 @@ Windows, from `src-tauri/`: `cargo fmt --check`, `cargo clippy --all-targets -- 
 `pnpm build`, `node scripts/check-legacy-webkit.mjs`.
 
 From the root when anything under `src-tauri/src/streamer/static/` changed: `pnpm test:client`.
-That runs the six dependency-free Node harnesses over the shipped client page — the input wire
-format and telemetry frame, the Opus decode worker and its sequence gate, the jitter buffer plus
-the planar ring ABI it shares with the worker, the WebCodecs video path and the RTP-to-host-clock
-inversion A/V sync rides on, ICE gathering, and the `/reconfig` epochs. They load the real `.js`
-under `node:vm` with browser stubs, so there is no runner and no devDependency, and the served
-files stay byte-identical. `node scripts/check-legacy-webkit.mjs` covers the same directory for
+That runs the seven dependency-free Node harnesses over the shipped client page — the input wire
+format and telemetry frame, a set of **golden input vectors the Rust parser reads back**, the
+Opus decode worker and its sequence gate, the jitter buffer plus the planar ring ABI it shares
+with the worker, the WebCodecs video path and the RTP-to-host-clock inversion A/V sync rides on,
+ICE gathering, and the `/reconfig` epochs. They load the real `.js` under `node:vm` with browser
+stubs, so there is no runner and no devDependency, and the served files stay byte-identical.
+
+The golden vectors are the one that runs on both sides:
+`src-tauri/src/streamer/input/client-frames.json` is written by
+`node scripts/test-client-input.mjs --write` from the shipped `input.js`, and
+`streamer::input::protocol`'s tests parse the same file. **Regenerate it after any deliberate
+change to what the client emits, and read the diff** — a changed vector is a wire-format change,
+and every already-shipped client is on the old one. `node scripts/check-legacy-webkit.mjs` covers the same directory for
 the *syntax* floor; these cover the behaviour.
 
 Mac, over SSH from `src-tauri/`: the same three cargo gates, plus
