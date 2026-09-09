@@ -157,9 +157,20 @@ fn spawn_pipeline(
         wake,
         max_bitrate_bps: enc.max_bitrate_bps,
         h264_profile: enc.profile,
-        // VideoToolbox exposes no long-term-reference control, so this stays at zero slots and
-        // `request_repair` falls through to a keyframe. The state still has to exist: the
-        // transport writes feedback receipts into it unconditionally.
+        // Zero slots, so `request_repair` falls through to a keyframe — but not because
+        // VideoToolbox cannot do this. It can, from macOS 12.0, in a shape that does not fit a
+        // slot bitmap: `EnableLTR` makes the encoder mark and manage its own long-term
+        // references and hand back an opaque token per picture
+        // (`kVTSampleAttachmentKey_RequireLTRAcknowledgementToken`); the host acknowledges tokens
+        // on a later submit and the encoder simply never predicts from an unacknowledged one.
+        // There is no "mark this picture", no slot number and no explicit invalidation, so
+        // `RepairAction`'s `mark_ltr` / `use_ltr_bitmap` have nothing to map onto — the adapter is
+        // the acknowledgement direction plus `ForceLTRRefresh` for `request_repair`, written up in
+        // `findings/major-vt-ltr-frames-would-replace-idr-on-every-pli.md`.
+        //
+        // The state still has to exist regardless: the transport writes feedback receipts into it
+        // unconditionally, and `Encoder::supports_ltr()` already reports per session whether this
+        // Mac's encoder advertises the property at all.
         repair: Arc::clone(&repair),
     };
 
