@@ -44,6 +44,38 @@ struct SentPacket {
     seq: u16,
     send_us: i64,
     bytes: u32,
+    /// Which access unit this packet belongs to, as a per-session ordinal.
+    frame: u32,
+}
+
+/// How many in-flight frames to keep a per-frame tally for.
+const FRAME_TALLIES: usize = 256;
+
+/// One access unit's packets, until every one of them has been reported on.
+///
+/// Transport-wide feedback names every sequence number the client did and did not receive, so it
+/// answers a question RTCP receiver reports cannot: *did this whole frame arrive?* That is exactly
+/// the acknowledgement an encoder needs to use a long-term reference frame instead of an IDR for
+/// loss recovery — VideoToolbox's `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's
+/// reference invalidation both want it — and getting it here means it costs no client change, no
+/// new control-channel opcode and no round trip beyond the one TWCC already pays.
+#[derive(Debug, Clone, Copy)]
+struct FrameTally {
+    ordinal: u32,
+    capture_ns: u64,
+    sent: u32,
+    received: u32,
+    lost: u32,
+}
+
+impl FrameTally {
+    fn decided(&self) -> bool {
+        self.received + self.lost >= self.sent
+    }
+
+    fn intact(&self) -> bool {
+        self.lost == 0 && self.received >= self.sent && self.sent > 0
+    }
 }
 
 /// The transport-wide sequence numbers this session has put on the wire, with when.
@@ -52,6 +84,7 @@ pub struct SendHistory {
     ring: VecDeque<SentPacket>,
     next_seq: u16,
     epoch: Instant,
+    frames: VecDeque<FrameTally>,
 }
 
 impl SendHistory {
@@ -60,11 +93,16 @@ impl SendHistory {
             ring: VecDeque::with_capacity(SEND_HISTORY),
             next_seq: 0,
             epoch,
+            frames: VecDeque::with_capacity(FRAME_TALLIES),
         }
     }
 
     /// Claim the next transport-wide sequence number for a packet about to be written.
-    pub fn record(&mut self, bytes: u32, now: Instant) -> u16 {
+    ///
+    /// `frame` is the writer's own per-session access-unit ordinal and `capture_ns` the host-clock
+    /// instant that frame was captured — the identity the encoder already stamped on it, so an
+    /// acknowledgement can be matched back to a reference frame without inventing a second one.
+    pub fn record(&mut self, bytes: u32, now: Instant, frame: u32, capture_ns: u64) -> u16 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         if self.ring.len() == SEND_HISTORY {
@@ -74,8 +112,56 @@ impl SendHistory {
             seq,
             send_us: now.saturating_duration_since(self.epoch).as_micros() as i64,
             bytes,
+            frame,
         });
+        match self.frames.back_mut() {
+            Some(t) if t.ordinal == frame => t.sent += 1,
+            _ => {
+                if self.frames.len() == FRAME_TALLIES {
+                    self.frames.pop_front();
+                }
+                self.frames.push_back(FrameTally {
+                    ordinal: frame,
+                    capture_ns,
+                    sent: 1,
+                    received: 0,
+                    lost: 0,
+                });
+            }
+        }
         seq
+    }
+
+    /// Record one packet's fate against its frame.
+    fn note(&mut self, frame: u32, received: bool) {
+        if let Some(t) = self.frames.iter_mut().rev().find(|t| t.ordinal == frame) {
+            if received {
+                t.received += 1;
+            } else {
+                t.lost += 1;
+            }
+        }
+    }
+
+    /// The newest frame every packet of which the client has now reported receiving.
+    ///
+    /// A frame with even one lost packet is never acknowledged: the point of the signal is that
+    /// the encoder may keep referencing that picture, and a decoder missing a slice of it cannot.
+    /// Decided frames are dropped either way, so a lossy stretch does not accumulate tallies.
+    fn take_decided_frames(&mut self, lost_out: &mut Vec<u64>) -> Option<(u32, u64)> {
+        let mut newest: Option<(u32, u64)> = None;
+        while let Some(front) = self.frames.front().copied() {
+            if !front.decided() {
+                break;
+            }
+            self.frames.pop_front();
+            if front.intact() {
+                newest = Some((front.ordinal, front.capture_ns));
+            } else {
+                lost_out.push(front.capture_ns);
+            }
+        }
+        newest
     }
 
     fn lookup(&self, seq: u16) -> Option<SentPacket> {
@@ -98,7 +184,7 @@ impl SendHistory {
 }
 
 /// What one `TransportLayerCc` report said.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeedbackSummary {
     /// Packets the report covered and we had a send time for.
     pub matched: u32,
@@ -108,6 +194,13 @@ pub struct FeedbackSummary {
     pub lost: u32,
     /// Bytes of the matched packets that arrived, over the span they arrived in.
     pub received_bps: u32,
+    /// Host-clock capture time of the newest access unit the client received in full, when this
+    /// report completed one. The encoder can use it as a long-term reference acknowledgement.
+    pub acked_capture_ns: Option<u64>,
+    /// Host-clock capture times of access units this report proved incomplete. Each one is a
+    /// picture the encoder must stop referencing, or every frame predicted from it is undecodable
+    /// on this client.
+    pub lost_capture_ns: Vec<u64>,
 }
 
 impl FeedbackSummary {
@@ -173,9 +266,17 @@ pub fn interpret(
     let mut last_arrival = 0i64;
     let mut bytes = 0u64;
 
+    // Every symbol, received or not, is also a verdict on the frame its packet belonged to. That
+    // is what makes a whole access unit acknowledgeable without a client change.
+    let mut verdicts: Vec<(u32, bool)> = Vec::with_capacity(symbols.len());
+
     for (i, sym) in symbols.iter().enumerate() {
         let seq = fb.base_sequence_number.wrapping_add(i as u16);
         summary.reported += 1;
+        let received = !matches!(sym, SymbolTypeTcc::PacketNotReceived);
+        if let Some(p) = history.lookup(seq) {
+            verdicts.push((p.frame, received));
+        }
         match sym {
             SymbolTypeTcc::PacketNotReceived => {
                 summary.lost += 1;
@@ -219,6 +320,14 @@ pub fn interpret(
             summary.received_bps = ((bytes as f64 * 8.0 * 1.0e6) / span_us as f64) as u32;
         }
     }
+
+    // After the lookups, because `retire_through` drops the packets the verdicts came from.
+    for (frame, received) in verdicts {
+        history.note(frame, received);
+    }
+    summary.acked_capture_ns = history
+        .take_decided_frames(&mut summary.lost_capture_ns)
+        .map(|(_, capture_ns)| capture_ns);
 
     history.retire_through(
         fb.base_sequence_number
@@ -465,6 +574,10 @@ pub struct SharedFeedback {
     /// oversubscribed link, so the controller treats it as a congestion signal in its own right
     /// rather than only asking for a keyframe, which would make it worse.
     lag_events: std::sync::atomic::AtomicU64,
+    /// Host-clock capture time of the newest access unit the client has confirmed receiving in
+    /// full. Zero until one has been. This is the acknowledgement a long-term-reference encoder
+    /// needs; nothing consumes it yet, which is why it is published rather than acted on.
+    acked_capture_ns: std::sync::atomic::AtomicU64,
 }
 
 impl SharedFeedback {
@@ -475,7 +588,29 @@ impl SharedFeedback {
         if s.received_bps > 0 {
             self.received_bps.store(s.received_bps, Relaxed);
         }
+        if let Some(ns) = s.acked_capture_ns {
+            // Monotonic: a later report can only ever move this forward, and reports can be
+            // reordered on the wire.
+            let _ = self
+                .acked_capture_ns
+                .fetch_update(Relaxed, Relaxed, |cur| (ns > cur).then_some(ns));
+        }
         self.twcc_reports.fetch_add(1, Relaxed);
+    }
+
+    /// The newest frame the client has confirmed receiving whole, by its host-clock capture time.
+    ///
+    /// Transport-wide feedback names every sequence number that did and did not arrive, so a whole
+    /// access unit can be acknowledged from it with no client change, no new control-channel
+    /// opcode and no round trip beyond the one TWCC already pays. That is exactly the input
+    /// VideoToolbox's `kVTEncodeFrameOptionKey_AcknowledgedLTRTokens` and NVENC's reference
+    /// invalidation want, and it is why the capture instant is the identity: the encoder already
+    /// stamped it on the frame, so nothing new has to be carried to match it back.
+    pub fn acked_frame_capture_ns(&self) -> Option<u64> {
+        let ns = self
+            .acked_capture_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (ns > 0).then_some(ns)
     }
 
     pub fn record_remb(&self, bps: u32) {
@@ -560,7 +695,7 @@ mod tests {
         let e = epoch();
         let mut h = SendHistory::new(e);
         for i in 0..5u16 {
-            assert_eq!(h.record(1200, e + Duration::from_millis(i as u64)), i);
+            assert_eq!(h.record(1200, e + Duration::from_millis(i as u64), 0, 0), i);
         }
     }
 
@@ -569,7 +704,7 @@ mod tests {
         let e = epoch();
         let mut h = SendHistory::new(e);
         for i in 0..(SEND_HISTORY + 100) {
-            h.record(1200, e + Duration::from_micros(i as u64));
+            h.record(1200, e + Duration::from_micros(i as u64), 0, 0);
         }
         assert_eq!(h.ring.len(), SEND_HISTORY);
     }
@@ -581,7 +716,7 @@ mod tests {
         let e = epoch();
         let mut h = SendHistory::new(e);
         for i in 0..10 {
-            h.record(1200, e + Duration::from_micros(i * 1000));
+            h.record(1200, e + Duration::from_micros(i * 1000), 0, 0);
         }
         let fb = TransportLayerCc {
             sender_ssrc: 1,
@@ -618,7 +753,7 @@ mod tests {
         let e = epoch();
         let mut h = SendHistory::new(e);
         for i in 0..20 {
-            h.record(1200, e + Duration::from_micros(i * 1000));
+            h.record(1200, e + Duration::from_micros(i * 1000), 0, 0);
         }
         // Sent 1 ms apart, arriving 4 ms apart: 3 ms of queue growth per packet, no loss.
         let fb = TransportLayerCc {
@@ -656,7 +791,7 @@ mod tests {
         let e = epoch();
         let mut h = SendHistory::new(e);
         for i in 0..8 {
-            h.record(1200, e + Duration::from_micros(i * 1000));
+            h.record(1200, e + Duration::from_micros(i * 1000), 0, 0);
         }
         let mut symbols = vec![SymbolTypeTcc::PacketReceivedSmallDelta; 8];
         symbols[2] = SymbolTypeTcc::PacketNotReceived;
@@ -686,7 +821,7 @@ mod tests {
     fn feedback_for_packets_we_never_sent_is_ignored_not_counted_as_delay() {
         let e = epoch();
         let mut h = SendHistory::new(e);
-        h.record(1200, e);
+        h.record(1200, e, 0, 0);
         let fb = TransportLayerCc {
             sender_ssrc: 1,
             media_ssrc: 2,
@@ -766,6 +901,7 @@ mod tests {
             reported: 10,
             lost: 2,
             received_bps: 5_000_000,
+            ..Default::default()
         });
         let (loss, n) = f.take_loss().unwrap();
         assert!((loss - 0.2).abs() < 1e-9);
@@ -794,5 +930,91 @@ mod tests {
         r.observe(6_500_000.0);
         assert_eq!(r.last_bps(), Some(6_500_000));
         assert_eq!(r.reports(), 1);
+    }
+
+    /// The acknowledgement signal, exercised through `SendHistory` directly: `interpret` needs a
+    /// real `TransportLayerCc`, and what matters here is the tally, not the wire format.
+    fn take_intact(h: &mut SendHistory) -> Option<(u32, u64)> {
+        let mut lost = Vec::new();
+        h.take_decided_frames(&mut lost)
+    }
+
+    #[test]
+    fn a_frame_is_acknowledged_only_when_every_one_of_its_packets_arrived() {
+        let e = Instant::now();
+        let mut h = SendHistory::new(e);
+        // Frame 1: three packets, all received. Frame 2: three packets, one lost.
+        for _ in 0..3 {
+            h.record(1200, e, 1, 1_000);
+        }
+        for _ in 0..3 {
+            h.record(1200, e, 2, 2_000);
+        }
+        assert_eq!(take_intact(&mut h), None, "nothing decided yet");
+
+        h.note(1, true);
+        h.note(1, true);
+        assert_eq!(take_intact(&mut h), None, "two of three is not the frame");
+        h.note(1, true);
+        assert_eq!(take_intact(&mut h), Some((1, 1_000)));
+
+        h.note(2, true);
+        h.note(2, false);
+        h.note(2, true);
+        assert_eq!(
+            take_intact(&mut h),
+            None,
+            "a frame missing a packet must never be acknowledged"
+        );
+    }
+
+    #[test]
+    fn only_the_newest_intact_frame_is_reported_and_decided_frames_do_not_pile_up() {
+        let e = Instant::now();
+        let mut h = SendHistory::new(e);
+        for frame in 1..=3u32 {
+            h.record(1200, e, frame, frame as u64 * 1_000);
+        }
+        for frame in 1..=3u32 {
+            h.note(frame, true);
+        }
+        assert_eq!(take_intact(&mut h), Some((3, 3_000)));
+        assert_eq!(take_intact(&mut h), None, "the tallies were consumed");
+    }
+
+    #[test]
+    fn the_published_acknowledgement_only_moves_forward() {
+        let f = SharedFeedback::default();
+        assert_eq!(f.acked_frame_capture_ns(), None);
+        f.record_report(&FeedbackSummary {
+            acked_capture_ns: Some(5_000),
+            ..Default::default()
+        });
+        assert_eq!(f.acked_frame_capture_ns(), Some(5_000));
+        // Reports can be reordered on the wire; an older one must not walk it backwards.
+        f.record_report(&FeedbackSummary {
+            acked_capture_ns: Some(1_000),
+            ..Default::default()
+        });
+        assert_eq!(f.acked_frame_capture_ns(), Some(5_000));
+        f.record_report(&FeedbackSummary {
+            acked_capture_ns: Some(9_000),
+            ..Default::default()
+        });
+        assert_eq!(f.acked_frame_capture_ns(), Some(9_000));
+    }
+
+    #[test]
+    fn a_frame_the_client_did_not_receive_whole_is_reported_as_lost() {
+        let e = Instant::now();
+        let mut h = SendHistory::new(e);
+        for _ in 0..2 {
+            h.record(1200, e, 7, 7_000);
+        }
+        h.note(7, true);
+        h.note(7, false);
+        let mut lost = Vec::new();
+        assert_eq!(h.take_decided_frames(&mut lost), None);
+        assert_eq!(lost, vec![7_000], "the encoder must stop referencing it");
     }
 }
