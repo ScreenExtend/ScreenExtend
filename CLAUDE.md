@@ -694,8 +694,10 @@ the video RTP stamps ride one epoch.
 
 A standalone C++ `AudioServerPlugIn` (not DriverKit — Apple does not grant DriverKit
 entitlements for virtual audio devices), built on libASPL. Compiled with `clang++` directly via
-`scripts/build.sh` (no CMake/Xcode needed), packaged/signed/notarized via `scripts/package.sh`
-and `scripts/sign_and_notarize.sh`, installed to `/Library/Audio/Plug-Ins/HAL/`. The
+`scripts/build.sh` (no CMake/Xcode needed) and packaged by `scripts/package.sh`;
+`scripts/release.sh` is the one command that does build → sign → package → notarize → staple,
+skipping cleanly whichever steps have no identity configured, so a developer with no Apple
+credentials still gets an unsigned `.pkg`. Installed to `/Library/Audio/Plug-Ins/HAL/`. The
 shared-memory byte layout in `src/shm_ring.hpp` is a **hard ABI contract** with
 `macos_utils/audio/legacy/shm_reader.rs` — change both together. All branded strings live in
 `src/branding.hpp`.
