@@ -288,6 +288,27 @@ async function trickle() {
     t.stop();
   }
 
+  // A transient failure retries once and then gives up rather than spinning.
+  {
+    patches.length = 0;
+    nextPatchStatus = 500;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    t.open('/whep/abc', '');
+    pc.emitCandidate('relay');
+    for (let i = 0; i < 6; i++) await settle();
+    if (patches.length !== 2) fail('a failed PATCH was retried ' + (patches.length - 1) + ' times, expected exactly 1');
+    else if (patches[1].opts.body.indexOf('typ relay') < 0) fail('the retry did not carry the candidate back');
+    else ok('a failed PATCH puts its candidates back and retries once');
+    const after = patches.length;
+    pc.emitCandidate('host');
+    for (let i = 0; i < 4; i++) await settle();
+    if (patches.length > after + 1) fail('a second failure kept retrying (' + patches.length + ' PATCHes)');
+    else ok('a second failure in a row is the endpoint, so the sender stops retrying');
+    nextPatchStatus = 204;
+    t.stop();
+  }
+
   // More candidates than one batch holds go out in order, one request at a time.
   {
     patches.length = 0;
