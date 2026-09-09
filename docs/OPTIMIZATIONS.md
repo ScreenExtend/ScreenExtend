@@ -2214,3 +2214,11 @@ describe it; `src-tauri/src/cli.rs`, `tauri.conf.json`, `windows_utils/streamer/
 and `docs/manual-tests/amd-amf.md` are excluded while W4b and W15 land. A delta pass over exactly
 those paths is owed: the `cli.rs` citation above, the `serve --encoder` line in the CLI section,
 the AMD status once it is measured, and the `guides/` pointer.
+
+**Anchoring what could still be lost.** Three objects held content that existed in no reachable
+commit, so any `git gc` would have deleted them with no remote copy and no error. Their content is
+now committed, and the objects themselves are pinned by local annotated tags —
+`archive/airplay-design` (`67687cb`), `archive/monaco-preload` (`c5bf2afe`) and
+`archive/audio-commit-plan` (blob `81cfd8b5`). `git fsck` no longer lists the two commits as
+dangling. The tags are local, are not release tags, and must not be pushed with `--tags`.
+`docs/recovered/README.md` carries the table.

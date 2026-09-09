@@ -17,6 +17,22 @@ a reader how much to trust the contents.
 | `intel.md` | added `17fcbc2`, deleted `70a09f9`/`937902a`; `src-tauri/src/windows_utils/streamer/intel.md` | The *pre-implementation* design note. A file of the same name lives at that path again today, rewritten after the backend shipped — this is the original, kept for the reasoning it records and nothing else. |
 | `airplay-fallback-design.md` | a stub | Promoted back to its original path, `docs/airplay-fallback-design.md`, which is where the code cites it. |
 
+## The objects behind these files
+
+Three of the originals were only ever in **unreachable** objects, which `git gc --prune=now` — or
+git's own automatic gc — would have deleted silently, with no remote copy to recover from. Their
+content is now in the tree, and the objects themselves are anchored by local annotated tags so
+the provenance survives too:
+
+| Tag | Object | What it holds |
+|-----|--------|---------------|
+| `archive/airplay-design` | commit `67687cb` | the only revision of `docs/airplay-fallback-design.md` that ever existed |
+| `archive/monaco-preload` | commit `c5bf2afe` | the monaco preload rationale comments and measurements, restored into `src/lib/preload-editor.ts` and `docs/OPTIMIZATIONS.md` row 9 |
+| `archive/audio-commit-plan` | blob `81cfd8b5` | the plan that split the system-audio work into the A-M series that landed on `main` — the only record of which shipped commit is which chunk, and it is in no tree |
+
+The tags are local. They are not release tags and should not be pushed with `--tags`; `git push
+origin archive/…` by name is the way to share one if it is ever wanted.
+
 Documents that comments used to cite and that **never existed in any commit, reachable or not** —
 `PRD-macos-audio.md`, `PRD-macos-legacy-audio.md`, `AUDIO_NOTES_MACOS.md`,
 `AUDIO_NOTES_MACOS_LEGACY.md` — cannot be recovered. Every citation of them has been replaced by
