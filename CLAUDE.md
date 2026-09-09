@@ -503,6 +503,8 @@ Cross-platform core, OS-independent:
 - `capture.rs` / `windows_capture/` — Windows.Graphics.Capture path; `windows_capture/` is a
   **vendored fork** of the `windows-capture` crate (2.0.0), already modified, so treat it as
   first-party code that happens to use `parking_lot`.
+  `windows_capture/FORK.md` records the upstream pin and checksum, every divergence and every
+  deleted file — read it before changing anything in there, and update it in the same commit.
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
   and is otherwise only reached by WGC failing, which is why the probe harness has
   `--capture-backend dxgi` to force it.
@@ -511,7 +513,8 @@ Cross-platform core, OS-independent:
   exercise capture as well as encode.
 - Encoders: `nvidia/` (hand-written NVENC FFI in `nvenc_sys/`), `intel/` (oneVPL / Quick Sync FFI
   in `intel_sys.rs`), `amd/` (AMF, with the hand-written C-vtable FFI in `amd_sys/`), `x264/`
-  (libx264 FFI, the CPU fallback).
+  (libx264 FFI, the CPU fallback). `intel.md` and `amd.md` sit beside them and are the reference
+  for why each backend is configured the way it is.
 - `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → AMF → x264;
   `Intel` tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`),
   then x264; `Amd` likewise (`Backend::Amf` → `Backend::AmfCpu` → x264); `Software` goes straight
