@@ -11,9 +11,9 @@
 //!    may set that period. Our *capture* stream cannot ask —
 //!    `IAudioClient3::InitializeSharedAudioStream` accepts only
 //!    `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, and the loopback flag is refused with
-//!    `AUDCLNT_E_INVALID_STREAM_FLAG` (measured, §3.1). The companion has no loopback flag, so
-//!    it can ask, and the capture stream inherits the result. `acquire()` already starts the
-//!    companion *before* opening loopback, which is exactly the ordering this needs.
+//!    `AUDCLNT_E_INVALID_STREAM_FLAG` (measured, same notes §3.1). The companion has no loopback
+//!    flag, so it can ask, and the capture stream inherits the result. `acquire()` already starts
+//!    the companion *before* opening loopback, which is exactly the ordering this needs.
 //!
 //! The period request is a probed tier, never a version check: query
 //! `GetSharedModeEnginePeriod`, ask for the minimum only if the driver reports one below its
