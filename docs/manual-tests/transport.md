@@ -51,9 +51,17 @@ is a real and useful result.
 
 Needs two stations on one AP and, ideally, a monitor-mode capture.
 
+**The tier is off by default and this is the measurement that decides whether it ships on.** Bound
+to the wildcard address it made the join flaky — the WHEP self-test connected on 3 of 5 runs,
+because the muxed gather emits a host candidate per local address (24 on the dev box) while one
+socket can only send from one route. It now binds the adapter the streamer serves and filters ICE
+to that address, which removes the cause, but the self-test cannot exercise that path — its config
+leaves `bind_ip` unspecified. So: `SCREENEXTEND_MEDIA_SOCKET=1`, and **check the join still
+connects 10 times out of 10** before believing any latency number from it.
+
 1. Host and client on the same AP; a second station saturating the link with `iperf3`.
-2. `ScreenExtend serve -v`. On a same-subnet join the log should show
-   `media socket: muxing ICE over 0.0.0.0:NNNNN with SO_SNDBUF, SO_RCVBUF, SIO_UDP_CONNRESET=off`
+2. `SCREENEXTEND_MEDIA_SOCKET=1 ScreenExtend serve -v`. On a same-subnet join the log should show
+   `media socket: muxing ICE over <adapter ip>:NNNNN with SO_SNDBUF, SO_RCVBUF, SIO_UDP_CONNRESET=off`
    and, once the pair is nominated,
    `media socket: marked as interactive video for <client ip:port>`.
    `DSCP marking unavailable` means qWAVE is off or absent — record which.
@@ -66,7 +74,8 @@ storm, before and after.
 
 **Also confirm the LAN tier did not cost anything it should not have:** the muxed socket disables
 server-reflexive gathering, so check that a same-subnet join still connects and that
-`ICE candidates in local answer (host)` reports host candidates on a single port.
+`ICE candidates in local answer (host)` reports **one** host candidate, on the adapter's own
+address. More than one means the IP filter is not doing its job and the flakiness above is back.
 
 ## 3. Trickle ICE against a real browser (`major-client-can-now-trickle-ice-...`)
 
@@ -105,3 +114,43 @@ from CABAC alone, more on flat regions and sharp text from the 8x8 transform.
 
 `ffprobe` on a captured stream should show the SPS's `level_idc` matching the advertised
 `profile-level-id`.
+
+## 5. Repair from a long-term reference instead of an IDR (`major-nvenc-reference-invalidation-...`)
+
+**Decides:** how much of the keyframe storm the repair path actually removes on a lossy link. The
+byte cost of one repair is already measured (`nvenc_ltr_repair_is_cheaper_than_an_idr`: 23698 B
+against a 28423 B IDR, on a synthetic worst case where every pixel changes every frame); what
+cannot be measured without induced loss is the *rate* — how many IDRs a real lossy minute stops
+producing.
+
+Neither the probe harness nor the WHEP self-test can inject loss, so this needs an external tool.
+
+1. `ScreenExtend serve -v --no-cloud` on an NVIDIA host, and join from a real browser. Confirm the
+   tier is live:
+
+   ```
+   NVENC: 2 long-term reference slot(s); a lost frame can be repaired without an IDR
+   ```
+
+   If that line is absent the encoder has no slots and every recovery is a keyframe, which is the
+   pre-existing behaviour and not a failure.
+
+2. Induce loss on the client side with `clumsy` (Windows) at 2 % and then 5 %, or `dnctl`/`pfctl`
+   on a macOS client.
+
+3. Count per minute, from `ScreenExtend status --json` and the log:
+   - `idrs_sent` — the number this change exists to reduce;
+   - `keyframe_requests` and `keyframe_requests_suppressed`;
+   - `picture recovery: … (repairing from a long-term reference, no IDR)` log lines, which are the
+     repairs that replaced a keyframe.
+
+4. Compare the client's p95 inter-frame gap and `framesDropped` across the two runs. The target is
+   that a single lost packet costs one P frame's worth of artefact rather than an IDR burst.
+
+**Also worth watching:** `nvEncInvalidateRefFrames` refusing (`the frame has probably already left
+the DPB, so this loss needs a keyframe`). A high refusal rate means feedback is arriving later than
+the DPB holds the picture, and the marking cadence should be slowed rather than the tier abandoned.
+
+The path is wired into the **NVENC zero-copy ring only** — the default on any NVIDIA host. DXGI
+duplication, the synthetic probe path and macOS all report zero long-term slots, so on those the
+transport goes on asking for keyframes and nothing here applies.
