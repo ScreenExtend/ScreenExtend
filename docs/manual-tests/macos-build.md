@@ -106,3 +106,52 @@ Worth doing once so the gate is known to fail rather than assumed to:
 
 **Record the result** as a row in `docs/OPTIMIZATIONS.md` and flip the build row in
 `docs/CAPABILITY-TIERS.md` from `UNVERIFIED` to `VERIFIED`.
+
+---
+
+## 5. The macOS bundle carries its Info.plist, its CSP and the audio package (W13b)
+
+Three things reach a macOS build by convention rather than by anything that was ever
+asserted, and all three fail silently.
+
+`src-tauri/tauri.macos.conf.json` is **auto-merged by Tauri on macOS** — the
+`--config src-tauri/tauri.macos.conf.json` in release CI is redundant, not load-bearing.
+This was established the hard way: adding `resources/ScreenExtendAudio.pkg` to
+`bundle.resources` there broke a plain `cargo check` on the Mac
+(`resource path 'resources/ScreenExtendAudio.pkg' doesn't exist`, from `tauri-build`'s
+resource validation in the build script), even though the file is only ever named in the
+macOS overlay and `--config` was not passed. That is why the package is now carried by
+`bundle.macOS.files` — the bundler copies those at packaging time, so a tree without the
+gitignored package still checks and builds.
+
+Run after `pnpm tauri build --config src-tauri/tauri.macos.conf.json`:
+
+```sh
+app=src-tauri/target/release/bundle/macos/ScreenExtend.app     # or universal-apple-darwin/
+plutil -p "$app/Contents/Info.plist" | grep -E \
+  'NSAudioCapture|NSAllowsLocalNetworking|LSMinimumSystemVersion|AutomaticGraphicsSwitching'
+defaults read "$app/Contents/Info.plist" NSSupportsAutomaticGraphicsSwitching   # -> 1
+ls -l "$app/Contents/Resources/resources/"                     # libopus.dylib + the .pkg
+```
+
+Expect `NSAudioCaptureUsageDescription`, both ATS keys, `LSMinimumSystemVersion = 10.15`
+and `NSSupportsAutomaticGraphicsSwitching = 1`. A missing usage description is a hard
+process kill the first time a user enables System Audio, with nothing in our own log.
+The release workflow now asserts all four plus the package, so this is the local rehearsal
+of a gate that already exists.
+
+**The CSP.** `tauri.macos.conf.json` used to set `app.security.csp: null`, so every shipped
+macOS build ran the control UI with no policy at all while Windows ran with one. It now
+carries the Windows policy plus `worker-src 'self' blob:; child-src 'self' blob:` — the
+second is there because Safari 13.1 has no `worker-src` and falls back to `child-src`, and
+the monaco language services are workers. Verify on the 10.15 box:
+
+1. Open the app, then Settings.
+2. Exercise the log terminal and the JSON config editor (the editor is monaco; if its
+   workers are blocked it silently drops to the main thread, or the chunk fails outright).
+3. Open the Web Inspector console and confirm there is **no** `Refused to ...` CSP line.
+4. In the console, `document.querySelector('meta[http-equiv="Content-Security-Policy"]')`
+   should be non-null (Tauri injects the policy as a meta tag).
+
+If a directive genuinely cannot be satisfied on 13.1, narrow *that directive* and leave a
+note here — do not put `"csp": null` back.

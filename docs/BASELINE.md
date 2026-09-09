@@ -57,6 +57,38 @@ they are excluded from the capture-relative stages, which is why those describe 
 | Quick Sync (CPU bridge) | WGC | 172 (141) | 3,108,831 | 9.44 / 10.49 / 37.75 / 39.73 | — | 0.00 / 0.00 / 1.84 / 4.80 | 7.34 / 16.78 / 46.14 / 55.27 | **27.26 / 31.46 / 83.89 / 88.25** |
 | any | DXGI | — | — | — | — | — | — | **unmeasurable** — see below |
 
+### Scripted content through the real capture path (core close-out)
+
+Every `live` row above captured whatever happened to be on the desktop, because `--workload`
+implied `--synthetic-pattern` and that path fed the encoder directly — no duplicator, no frame
+pool, no scaler. `probe --live --workload <w>` now paints the generated frames into a borderless
+window covering the captured display, so the content is repeatable *and* goes through capture.
+
+| Workload | Encoder | Capture | frames | capture delivery | scale |
+|---|---|---|---|---|---|
+| motion | NVENC zero-copy ring | WGC | 817 in 12 s | 7.34 / 18.87 / 31.46 / 217.84 | 0.15 / 0.21 / 0.33 / 1.60 |
+
+Debug build, so the absolute numbers are not comparable with the release rows above — the point
+of the row is that `capture delivery` and `scale` have values at all, where every previous
+workload run reported them empty. Re-run the other three workloads on a release build to extend
+the table.
+
+### Virtual-display mode changes (`report_selected_refresh_rate` / `report_mode_change_cost`)
+
+Median of three trials, Windows 11 26200, bundled IDD:
+
+| | median | trials |
+|---|---:|---|
+| in-ladder mode change, resolution unchanged | 111 ms | 89 / 111 / 112 |
+| in-ladder mode change, new resolution | 308 ms | 296 / 308 / 381 |
+| monitor departure alone | 179 ms | 178 / 179 / 187 |
+| remove + recreate + reattach | 491 ms | 459 / 491 / 501 |
+| then set the new mode | 281 ms | 276 / 281 / 333 |
+
+A geometry inside the pre-registered ladder costs one mode change; one outside it costs ~772 ms
+plus a desktop-wide window reflow and a capture-session rebuild that no stopwatch sees. See
+`docs/OPTIMIZATIONS.md`, "Needs a driver rebuild, and what it is worth".
+
 ### Standalone encoder measurement (unit test, `cargo test --lib x264_encoder -- --nocapture`)
 
 ```
@@ -96,19 +128,23 @@ cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate_down
 
 | Capture size | delivered (fps) | dropped by WindowServer | callback mean | displayTime → callback p50 / p90 / p99 / max |
 |---|---|---|---|---|
-| MACOS_CAP_NATIVE |
-| MACOS_CAP_HALF |
+| native 1440x900 | queued | queued | queued | queued |
+| half 720x448 | queued | queued | queued | queued |
 
 ### Capture → encoded (`pipeline::tests::end_to_end_latency`, 6 s, 1440x900@60)
 
 | Build | captured (fps) | WindowServer drops | encoder output drops | capture → encoded p50 / p99 / max |
 |---|---|---|---|---|
-| MACOS_E2E_BEFORE |
-| MACOS_E2E_AFTER |
+| before the VideoToolbox work (commit `719891df`, CGDS surface fixes only) | 61 (365 / 367 / 366 frames in 6 s) | 0 / 1 / 0 | not counted yet | **13.70 / 15.60 / 33.08** |
+| after (commit `34815f3a`) | queued | queued | queued | queued |
 
 ### Whole host path (`probe --whep-selftest`, 30 s)
 
-MACOS_SELFTEST
+Queued. The run is scripted and waiting on the shared Mac’s cargo lock behind four other agents’ fat-LTO release builds; the script is `src-tauri/target/w5-measure.sh` and its log `src-tauri/target/w5-measure.log`. It runs
+`ScreenExtend probe --whep-selftest --duration 30` from a `--features probe` release build, plus
+`cgds::tests::capture_rate{,_downscaled}`, `encoder::tests::{the_sps_promises_no_reordering,hw_capability_probe,encode_synthetic}`,
+`pipeline::tests::{end_to_end_latency,production_pipeline_smoke}`, and finishes with the dyld floor check and
+`nm -u … | grep -i displaystream`.
 
 ## What the numbers say
 
@@ -149,6 +185,8 @@ Recorded honestly rather than left blank.
 | **AMD** | No AMD GPU on either machine. See `docs/manual-tests/amd-amf.md`. |
 | **Quick Sync at other geometries** | The 1280x720 encoder initializes and encodes; the extreme-fps and fused-downscale configurations report "no Intel hardware oneVPL implementation" from the *same* adapter — `findings/major-intel-quicksync-partly-unavailable-on-this-box.md`. |
 | **Audio stages** | The Windows capture timestamp now comes from the endpoint hardware rather than encode time, but verifying it needs a client with system audio enabled; COMPILE-CHECKED, not measured. |
+| **macOS WindowServer drop count** | `CGDisplayStreamUpdateGetDropCount` is now read on every delivery and `probe_main_display` prints it, which is the instrument the three open CGDisplayStream questions (`queueDepth`, `minimumFrameTime`, WindowServer contention) each need. Taking the number requires a 30 s run against an *animated* screen on the 10.15.8 box, and the expected signature is documented with the IOSurface use-count finding: near zero, then a spike, then near zero. COMPILE-CHECKED here; the run has not been done. |
+| **Reordered input** | `input_reorder_drops` cannot move until a client sends the optional fast-channel sequence (`findings/minor-client-input-does-not-send-the-fast-channel-sequence.md`), and confirming it needs an induced-reorder link (`clumsy`, or a TURN relay path). The host-side comparison is unit-tested across the `u16` wrap. |
 
 ## Competitor baselines
 
