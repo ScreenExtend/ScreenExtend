@@ -20,9 +20,11 @@
 //! cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture
 //! ```
 //!
-//! The summary line is shaped for `scripts/perf-gate.mjs`: it carries `capture_to_encoded=` as
-//! `p50/p90/p99/max` in milliseconds and `p95_encode=<n>us`, the same two metric spellings the
-//! gate already parses from the probe and x264 runs.
+//! The summary line is shaped for `scripts/perf-gate.mjs`: `capture_to_encoded=` as
+//! `p50/p90/p99/max` in milliseconds, plus `capture_encode_p95=<n>us`. The encode stage is
+//! spelled differently from the x264 test's `p95_encode=` on purpose — this one is whichever
+//! encoder the `Auto` ladder picked on the machine, so sharing a metric name with libx264 would
+//! be comparing NVENC against a software baseline.
 
 use std::time::{Duration, Instant};
 
@@ -224,7 +226,7 @@ fn windows_capture_to_encoded_latency() {
         "windows capture->encoded OK: backend={backend_name} {enc_w}x{enc_h}@{fps}, \
          {} frames, {bytes} bytes, coalesced={coalesced}, \
          capture_to_encoded={:.2}/{:.2}/{:.2}/{:.2} (p50/p90/p99/max ms), \
-         p95_encode={}us (budget {budget_us}us)",
+         capture_encode_p95={}us (budget {budget_us}us)",
         enc.count,
         ms(e2e.p50),
         ms(e2e.p90),
