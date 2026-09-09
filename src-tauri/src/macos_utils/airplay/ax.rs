@@ -678,18 +678,46 @@ fn open_menu(extra: &Extra, budget: Instant) -> Result<(), String> {
 /// drops them out of full screen, which is a real side effect of an operation
 /// they did not start. So it is only sent when a menu is demonstrably open, by
 /// the same signal `open_menu` uses, and it says so in the log.
+/// How the menu is dismissed.
+///
+/// An enum rather than a comment, because the mistake this guards against is a specific one:
+/// pressing the menu-bar extra is a *toggle*, so using it to "close" leaves the picker on screen
+/// after a device connects. There is deliberately no variant for it, which makes the rule a
+/// compile-time fact rather than something a test has to read the source to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DismissPlan {
+    /// `AXCancel` on the open menu — the only dismissal that is not also a toggle.
+    Cancel,
+    /// Nothing to do: the menu is not open.
+    AlreadyClosed,
+    /// A synthetic Escape, because `AXCancel` was refused and the menu is still up.
+    Escape,
+}
+
+/// Pure: what dismissal to perform, given what the AX tree answered.
+fn dismiss_plan(cancel_accepted: bool, still_open: bool) -> DismissPlan {
+    if cancel_accepted {
+        DismissPlan::Cancel
+    } else if !still_open {
+        DismissPlan::AlreadyClosed
+    } else {
+        DismissPlan::Escape
+    }
+}
+
 fn close_menu(extra: &Extra) {
     let menus = children(extra.element.0);
-    for child in menus.iter() {
-        if perform(child, "AXCancel").is_ok() {
-            return;
+    let cancel_accepted = menus
+        .iter()
+        .any(|child| perform(child, "AXCancel").is_ok());
+    let still_open = !cancel_accepted && !read_menu(extra).items.is_empty();
+    match dismiss_plan(cancel_accepted, still_open) {
+        DismissPlan::Cancel | DismissPlan::AlreadyClosed => {}
+        DismissPlan::Escape => {
+            tprintln!("[airplay] the Displays menu would not cancel; sending a synthetic Escape");
+            press_escape();
         }
     }
-    if read_menu(extra).items.is_empty() {
-        return;
-    }
-    tprintln!("[airplay] the Displays menu would not cancel; sending a synthetic Escape");
-    press_escape();
 }
 
 /// `kVK_Escape`.
@@ -747,6 +775,32 @@ const STATE_ROW_TIMEOUT: Duration = Duration::from_millis(1000);
 /// to reconfiguring displays.
 const ACTION_SETTLE: Duration = Duration::from_millis(250);
 
+/// Poll `find` until it answers or `deadline` passes.
+///
+/// The picker opens on "AirPlay: Looking for TV…" and fills its rows in as discovery answers, so
+/// looking once and closing is how a selection silently fails to happen. Separated from the AX
+/// calls around it so the *waiting* can be tested with a closure that answers late — which is
+/// the only part a machine with no Displays menu extra can execute.
+fn wait_for_row<T>(started: Instant, deadline: Instant, find: impl Fn() -> Option<T>) -> Option<T> {
+    loop {
+        if let Some(found) = find() {
+            return Some(found);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(poll_interval(started));
+    }
+}
+
+/// Give a dispatched menu action a moment before the caller moves on.
+///
+/// `AXPress` returns once the action is *dispatched*, not once macOS has acted on it, so a
+/// caller that immediately re-read the display list would read the state before the change.
+fn settle_after_action() {
+    std::thread::sleep(ACTION_SETTLE);
+}
+
 /// Opens the menu, waits for a row, and presses it — retrying the sequence.
 ///
 /// Finding and pressing are deliberately adjacent: a reference fetched and then
@@ -776,24 +830,14 @@ fn press_row_in_menu(
         // previous pass is no good.
         let started = Instant::now();
         let deadline = (started + appear_timeout).min(budget);
-        let mut pressed = None;
-        loop {
-            if let Some(row) = find(&extra) {
-                pressed = Some(press(row.0));
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(poll_interval(started));
-        }
+        let pressed = wait_for_row(started, deadline, || find(&extra)).map(|row| press(row.0));
 
         match pressed {
             Some(Ok(())) => {
                 // Deliberately no dismissal: activating a menu item is what
                 // closes an NSMenu, and anything we did afterwards could only
                 // re-open it. Just let the action get going.
-                std::thread::sleep(ACTION_SETTLE);
+                settle_after_action();
                 return Ok(());
             }
             Some(Err(e)) => {
@@ -1022,23 +1066,62 @@ mod tests {
         // The picker opens on "AirPlay: Looking for TV…" and fills in devices as
         // discovery answers, so a single look followed by a close is how a
         // selection silently fails to happen.
-        let src = include_str!("ax.rs");
-        let body = &src[src.find("fn press_row_in_menu(").expect("fn exists")..];
-        let body = &body[..body
-            .find(
-                "
-}
-",
-            )
-            .expect("fn body")];
+        //
+        // This used to assert on the *text* of `press_row_in_menu`, because the
+        // wait was tangled up in AX calls no test machine can make. It is now a
+        // seam that takes the lookup as a closure, so the waiting itself runs
+        // here: the row below appears only on the fourth look.
+        let looks = std::cell::Cell::new(0);
+        let started = Instant::now();
+        let found = wait_for_row(started, started + Duration::from_secs(2), || {
+            looks.set(looks.get() + 1);
+            if looks.get() >= 4 {
+                Some("Living Room TV")
+            } else {
+                None
+            }
+        });
+        assert_eq!(found, Some("Living Room TV"), "a late row must still be found");
+        assert!(looks.get() >= 4, "the menu was read {} time(s)", looks.get());
+    }
+
+    #[test]
+    fn a_row_that_never_appears_gives_up_at_the_deadline() {
+        // The other half: waiting must be bounded, or a Mac with no receiver on
+        // the network hangs the join instead of reporting that it found nothing.
+        let looks = std::cell::Cell::new(0);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(300);
+        let found = wait_for_row(started, deadline, || -> Option<&str> {
+            looks.set(looks.get() + 1);
+            None
+        });
+        assert_eq!(found, None);
+        assert!(looks.get() > 1, "it looked once and gave up");
         assert!(
-            body.contains("appear_timeout"),
-            "the row must be waited for"
+            Instant::now() >= deadline,
+            "it returned before its own deadline"
         );
+    }
+
+    #[test]
+    fn a_row_that_is_already_there_is_pressed_without_waiting() {
+        let started = Instant::now();
+        let found = wait_for_row(started, started + Duration::from_secs(30), || Some(7));
+        assert_eq!(found, Some(7));
         assert!(
-            body.contains("ACTION_SETTLE"),
-            "the dispatched action needs a moment before the caller moves on"
+            started.elapsed() < Duration::from_secs(1),
+            "an available row should not have waited"
         );
+    }
+
+    #[test]
+    fn a_dispatched_action_is_given_time_to_take_effect() {
+        // `AXPress` returns when the action is dispatched, not when macOS has
+        // acted on it, so the caller has to pause before reading the result.
+        let started = Instant::now();
+        settle_after_action();
+        assert!(started.elapsed() >= ACTION_SETTLE);
     }
 
     #[test]
@@ -1051,24 +1134,31 @@ mod tests {
     #[test]
     fn dismissing_the_menu_never_presses_the_extra() {
         // Pressing the extra is a toggle: using it to "close" is what leaves the
-        // picker on screen after a device connects. This asserts the source
-        // stays that way, since the mistake is easy to reintroduce.
-        let src = include_str!("ax.rs");
-        let body = &src[src.find("fn close_menu(").expect("close_menu exists")..];
-        let body = &body[..body
-            .find(
-                "
-}
-",
-            )
-            .expect("close_menu body")];
-        assert!(
-            !body.contains("press(extra.element"),
-            "close_menu must not toggle the menu-bar extra"
+        // picker on screen after a device connects. `DismissPlan` has no variant
+        // for it, so that rule is now a compile-time fact; what is left to check
+        // is that the three real outcomes are chosen correctly.
+        //
+        // This used to read the text of `close_menu` and look for the absence of
+        // a substring, which a comment mentioning it would have broken.
+        assert_eq!(
+            dismiss_plan(true, false),
+            DismissPlan::Cancel,
+            "AXCancel is the dismissal that is not a toggle"
         );
-        assert!(
-            body.contains("press_escape()"),
-            "escape is the safe fallback"
+        assert_eq!(
+            dismiss_plan(true, true),
+            DismissPlan::Cancel,
+            "a menu that accepted AXCancel needs nothing else"
+        );
+        assert_eq!(
+            dismiss_plan(false, false),
+            DismissPlan::AlreadyClosed,
+            "a menu that is not open must not be sent an Escape at the desktop"
+        );
+        assert_eq!(
+            dismiss_plan(false, true),
+            DismissPlan::Escape,
+            "escape is the fallback when AXCancel is refused"
         );
     }
 
