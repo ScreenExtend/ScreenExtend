@@ -234,11 +234,14 @@ fn another_instance_running() -> bool {
     };
     let lock_path = dir.join(crate::single_instance::LOCK_FILE);
     match crate::single_instance::acquire_lock(&lock_path) {
-        Some(file) => {
+        crate::single_instance::LockOutcome::Acquired(file) => {
             drop(file); // we only wanted to know; the running host must be able to take it back
             false
         }
-        None => true,
+        crate::single_instance::LockOutcome::HeldByOther => true,
+        // A lock file we cannot even open is not evidence of a running host. Reporting one
+        // would make the watchdog decline to restore the user's audio output forever.
+        crate::single_instance::LockOutcome::Unavailable(_) => false,
     }
 }
 

@@ -19,6 +19,19 @@ pub enum Command {
     /// runs in a separate process from the host, so this is the only way it can report
     /// per-session counters that exist only in the host's memory.
     Stats,
+    /// "Are you there?" — answered with `OK`. This is what lets another process test for a
+    /// running host without taking the lock, which is inherently racy: the GUI is not holding
+    /// it between `acquire_lock` and `std::mem::forget`, so a concurrent lock test can win it
+    /// and make the starting instance believe it is the second one.
+    Ping,
+    /// Re-read `config.json` and replay it into the running host's `AppState`, so a change
+    /// made by `devices set` / `turn set` / `config set` applies live instead of at the next
+    /// start. Answered with `OK` once the replay has run.
+    Reload,
+    /// Send back the running host's log backlog, newest last, one line per line, terminated by
+    /// a blank line. `ScreenExtend logs` runs in a fresh process whose own ring is empty, so
+    /// this is the only way for it to print anything.
+    Logs,
 }
 
 impl Command {
@@ -27,31 +40,53 @@ impl Command {
             Command::Focus => "FOCUS",
             Command::Quit => "QUIT",
             Command::Stats => "STATS",
+            Command::Ping => "PING",
+            Command::Reload => "RELOAD",
+            Command::Logs => "LOGS",
         }
     }
 }
 
-pub fn acquire_lock(path: &Path) -> Option<File> {
-    let file = File::options()
+/// What happened when we asked for the single-instance lock.
+///
+/// The three outcomes used to collapse into `Option::None`, so a permissions error, a read-only
+/// profile and a genuinely running second instance were indistinguishable — and every caller
+/// read them all as "already running", which for the GUI meant offering to show an instance
+/// that does not exist.
+pub enum LockOutcome {
+    Acquired(File),
+    HeldByOther,
+    Unavailable(std::io::Error),
+}
+
+pub fn acquire_lock(path: &Path) -> LockOutcome {
+    let file = match File::options()
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(e) => return LockOutcome::Unavailable(e),
+    };
     match file.try_lock_exclusive() {
-        Ok(true) => Some(file),
-        _ => None,
+        Ok(true) => LockOutcome::Acquired(file),
+        Ok(false) => LockOutcome::HeldByOther,
+        Err(e) => LockOutcome::Unavailable(e),
     }
 }
 
-pub fn wait_for_lock(path: &Path, timeout: Duration) -> Option<File> {
+/// Poll for the lock until `timeout`. Only `HeldByOther` is worth waiting on; an I/O error is
+/// returned at once, since retrying an unwritable path just burns the timeout.
+pub fn wait_for_lock(path: &Path, timeout: Duration) -> LockOutcome {
     let start = Instant::now();
     loop {
-        if let Some(file) = acquire_lock(path) {
-            return Some(file);
+        match acquire_lock(path) {
+            LockOutcome::HeldByOther => {}
+            outcome => return outcome,
         }
         if start.elapsed() >= timeout {
-            return None;
+            return LockOutcome::HeldByOther;
         }
         std::thread::sleep(Duration::from_millis(150));
     }
@@ -103,14 +138,16 @@ fn write_ctrl_file(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 }
 
-pub fn start_control_server<Q>(
+pub fn start_control_server<Q, R>(
     app: AppHandle,
     ctrl_path: PathBuf,
     focus: fn(&tauri::WebviewWindow),
     quit: Q,
+    reload: R,
 ) -> std::io::Result<()>
 where
     Q: Fn(&AppHandle) + Send + 'static,
+    R: Fn(&AppHandle) -> Result<(), String> + Send + 'static,
 {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
@@ -121,7 +158,7 @@ where
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let _ = stream.set_read_timeout(Some(CTRL_READ_TIMEOUT));
-            handle_connection(stream, &app, &token, focus, &quit);
+            handle_connection(stream, &app, &token, focus, &quit, &reload);
         }
     });
     Ok(())
@@ -133,14 +170,16 @@ pub fn clear_control_file(ctrl_path: &Path) {
     let _ = std::fs::remove_file(ctrl_path);
 }
 
-fn handle_connection<Q>(
+fn handle_connection<Q, R>(
     stream: TcpStream,
     app: &AppHandle,
     token: &str,
     focus: fn(&tauri::WebviewWindow),
     quit: &Q,
+    reload: &R,
 ) where
     Q: Fn(&AppHandle),
+    R: Fn(&AppHandle) -> Result<(), String>,
 {
     let Ok(read_half) = stream.try_clone() else {
         return;
@@ -171,6 +210,27 @@ fn handle_connection<Q>(
             let json = crate::streamer::telemetry::snapshot_json().to_string();
             let _ = stream.write_all(json.as_bytes());
             let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        }
+        Some("PING") => {
+            let _ = stream.write_all(b"OK\n");
+            let _ = stream.flush();
+        }
+        Some("RELOAD") => {
+            let reply = match reload(app) {
+                Ok(()) => "OK\n".to_string(),
+                Err(e) => format!("ERR {e}\n"),
+            };
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        }
+        Some("LOGS") => {
+            let mut out = String::new();
+            for line in crate::logbus::get_log_backlog() {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            let _ = stream.write_all(out.as_bytes());
             let _ = stream.flush();
         }
         _ => {}

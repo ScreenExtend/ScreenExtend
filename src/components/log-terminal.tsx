@@ -85,6 +85,9 @@ export function LogTerminal() {
       flushHandle.current = undefined;
       pending.current = [];
       if (unlisten) stopListening(unlisten);
+      // The host cannot see that the listener is gone, so it keeps batching LogLine events
+      // into the void until it is told. Nothing renders differently either way.
+      void commands.setLogStreaming(false).catch(e => console.error("log stream disarm failed", e));
     };
   }, []);
 
