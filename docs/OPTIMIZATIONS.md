@@ -284,8 +284,9 @@ Coverage added by W15, and the coverage deliberately not added. The audit this w
 138 of them compiled and run on Windows, with a whole-suite wall time of 1.16 s — which was
 itself the tell that nothing touching hardware was running.
 
-Windows `cargo test --lib` at the end of this workstream: **360 passed, 13 ignored**, 48 s.
-macOS: **376 passed, 22 ignored**. Seven Node harnesses cover the client page (`pnpm test:client`).
+Windows `cargo test --lib` at the end of this workstream: **369 passed, 13 ignored**, 45 s.
+macOS: **398 passed, 26 ignored**. Seven Node harnesses cover the client page
+(`pnpm test:client`).
 
 ### The convention every gated test now follows
 
@@ -369,14 +370,26 @@ harnesses load the shipped `.js` under `node:vm` with hand-written browser stubs
 `node`, and add nothing to `package.json` but a `test:client` script. `src-tauri/src/streamer/static/`
 is byte-identical.
 
+### Closed after W5 merged
+
+| area | file | what it asserts | status |
+|---|---|---|---|
+| macOS capture ladder | `macos_utils/streamer/mod.rs` | `capture_ladder(sck_available)` lifted out of `start_capture`, the same probing/ranking split that made the audio tiering testable. CGDisplayStream is always the last rung — deprecated, obsoleted in the macOS 15 SDK, and the only capture API on the 10.15 floor; ScreenCaptureKit leads only where its classes exist; no rung repeats; the live probe agrees with the table. The 12.3+ branch had no coverage at all on the 10.15 dev box before this. | VERIFIED (10.15.8) |
+| VideoToolbox encode timing | `macos_utils/streamer/encoder.rs` | `encode_synthetic` times every `submit` and prints `vt_encode_p50/p95/p99/max`. `submit` is the right thing to watch because the encode itself is asynchronous: this is the cost the capture thread pays per frame, and a regression in it stalls capture whatever happens afterwards. | VERIFIED |
+| the perf gate covers macOS | `scripts/perf-gate.mjs`, `.github/workflows/ci.yml` | `vt_p95_encode_us` / `vt_p50_encode_us`, and the `perf-gate` matrix becomes `[windows-latest, macos-13, macos-15]` with the measure step choosing its command by `RUNNER_OS`. macos-13 is Intel and macos-15 Apple Silicon, so they are separate keys. Neither run needs a display or a Screen Recording grant, which is what makes the encoder module the measurable one on a hosted runner. | wired; both keys unseeded, which the gate reports and passes |
+
+Bare `#[ignore]`s in the crate: **zero**, on both platforms. The CI `cargo test` step no longer
+excludes `a_display_name_resolves_only_to_a_live_display` by name — it gates itself through
+`test_support::skip` now, and excluding a test by name hides it from the report entirely, which
+is the opposite of the convention.
+
 ### Still open, and why
 
-- **`macos_utils/streamer/*`** — eight bare `#[ignore]`s and the `p95_encode` line that would let
-  the CI perf gate cover macOS (`encode_synthetic` asserts bitstream structure and times nothing).
-  Deferred: W5 owns that directory and was still moving.
 - **The Windows capture→encoded baseline.** The harness exists and is wired into the gate; the
   numbers need a machine where Desktop Duplication works. `docs/manual-tests/latency-harnesses.md`
-  has the command.
+  has the command, and the dev-box failure written down so it is not rediscovered.
+- **The three macOS perf-gate keys.** `dev-windows-rtx3080ti` is the only seeded one; `ci-*` keys
+  seed themselves from their first run's artifact. That is the designed path, not an omission.
 - **The React desktop UI** still has no tests. Out of this workstream's scope and largely covered
   by `tsc` plus the Safari 13.1 floor check; a component-level runner is a separate decision.
 
