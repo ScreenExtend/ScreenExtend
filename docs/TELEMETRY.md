@@ -456,11 +456,14 @@ host. The field is a union of the page's own bits and the audio module's.
 | 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
 
 Bit 22 is set when `/net-config` did not say `trickleIce: true` (an older host, or the cloud
-relay, which tunnels `/whep` but not `/net-config`), and also in the one case the client cannot
-detect before it posts: a host that advertised trickle and then answered with no `Location`
-header, where the page latches trickle off and rejoins with a gathered offer. It says the join
-paid the gather wait, which is the thing worth seeing on a slow join — bit 15 then says whether
-that wait ran all the way to its deadline.
+relay, which tunnels `/whep` but not `/net-config`), and in the cases the client cannot detect
+before it posts: an answer with no `Location` header, a `PATCH` refused with 403/405/415/501, two
+consecutive `PATCH` failures, or a first `PATCH` still unacknowledged after 2 s. In all of those
+the page latches trickle off and rejoins once with a gathered offer. The bit says the join paid
+the gather wait, which is the thing worth seeing on a slow join — bit 15 then says whether that
+wait ran all the way to its deadline. `no_trickle_ice` is its name in
+`CLIENT_DEGRADED_NAMES`, so it reaches the host's `degraded=…` summary line like every other
+bit.
 
 ### Opcode note
 

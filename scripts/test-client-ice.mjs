@@ -10,8 +10,13 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const STATIC = process.argv[2] || 'src-tauri/src/streamer/static';
+const args = process.argv.slice(2);
+const UPDATE = args.indexOf('--update') >= 0;
+const STATIC = args.filter((a) => a.charAt(0) !== '-')[0] || 'src-tauri/src/streamer/static';
 const page = fs.readFileSync(STATIC + '/index.html', 'utf8');
+// The golden `application/trickle-ice-sdpfrag` body, emitted here and parsed by
+// `the_client_fragment_shape_parses_whole` in webrtc_session.rs. Regenerate with --update.
+const FIXTURE = STATIC.replace(/[\\/]static\/?$/, '') + '/test/trickle-fragment.sdpfrag';
 
 let failures = 0;
 function ok(msg) { console.log('ok  - ' + msg); }
@@ -371,6 +376,29 @@ async function trickle() {
     if (deadReason) fail('a session that produced no candidates was blamed on the endpoint');
     else ok('no candidates means no PATCH and no failure to report');
     t.stop();
+  }
+
+  // The golden vector the Rust parser is tested against. It is produced by the *shipped*
+  // `trickleFragment`, not by a copy of it, so a change to the client body either updates this
+  // file — and the Rust test then parses the new bytes — or fails here. A hand-written literal on
+  // the Rust side could not do either.
+  {
+    const body = ctx.trickleFragment('UF01', [
+      cand('candidate:1 1 udp 2130706431 192.168.1.5 54321 typ host'),
+      cand('candidate:2 1 udp 41885439 203.0.113.7 40000 typ relay raddr 0.0.0.0 rport 0'),
+    ], true);
+    const want = fs.existsSync(FIXTURE) ? fs.readFileSync(FIXTURE, 'utf8') : null;
+    if (UPDATE) {
+      fs.writeFileSync(FIXTURE, body);
+      ok('wrote the golden fragment to ' + FIXTURE);
+    } else if (want === null) {
+      fail(FIXTURE + ' is missing; re-run with --update');
+    } else if (want !== body) {
+      fail('the client fragment no longer matches ' + FIXTURE + '; re-run with --update so the '
+        + 'Rust parser test moves with it');
+    } else {
+      ok('the shipped fragment still matches the golden vector the Rust parser is tested on');
+    }
   }
 
   // A duplicate sitting behind a fresh candidate is still filtered.
