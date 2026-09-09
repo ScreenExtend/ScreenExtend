@@ -350,8 +350,17 @@ async fn run_loop(mut config: CloudConfig, server_config: Config, sink: SharedCl
 
         let jitter_ms = rand::random::<u64>() % 1000;
         tokio::time::sleep(Duration::from_millis(backoff_secs * 1000 + jitter_ms)).await;
-        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+        backoff_secs = next_backoff_secs(backoff_secs);
     }
+}
+
+/// The reconnect schedule: double, then hold at [`MAX_BACKOFF_SECS`].
+///
+/// Extracted so the schedule can be asserted without a relay and without waiting for it. The
+/// caller adds up to a second of jitter on top, which is what stops every host that lost the
+/// same relay from reconnecting in lockstep.
+fn next_backoff_secs(current: u64) -> u64 {
+    current.saturating_mul(2).min(MAX_BACKOFF_SECS)
 }
 
 async fn connect_and_serve(
@@ -569,6 +578,253 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The relay is a separate service that this repo does not build, so the wire format is a
+    // contract with something nothing here can compile against. Every field name below is the
+    // JSON key the relay reads or writes; renaming one is a silent protocol break — serde will
+    // happily serialise the new name and the relay will read a default.
+
+    fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        v.get(key).unwrap_or_else(|| panic!("no `{key}` in {v}"))
+    }
+
+    #[test]
+    fn register_carries_the_protocol_version_and_camel_case_keys() {
+        let msg = HostToRelay::Register {
+            protocol: RELAY_PROTOCOL_VERSION,
+            session_id: "ABCDEFGHJKLM".into(),
+            host_version: "0.6.3".into(),
+            display_name: Some("Studio PC".into()),
+            capabilities: HostCapabilities::default(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(field(&v, "type"), "register");
+        assert_eq!(field(&v, "protocol"), 1);
+        assert_eq!(field(&v, "sessionId"), "ABCDEFGHJKLM");
+        assert_eq!(field(&v, "hostVersion"), "0.6.3");
+        assert_eq!(field(&v, "displayName"), "Studio PC");
+        assert_eq!(field(field(&v, "capabilities"), "webcodecs"), true);
+        assert!(field(field(&v, "capabilities"), "h264Profiles")
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "baseline"));
+    }
+
+    #[test]
+    fn an_absent_display_name_is_omitted_rather_than_sent_as_null() {
+        // `skip_serializing_if` is what keeps a host with no name from advertising `null` as
+        // one; the relay treats a present key as a name.
+        let msg = HostToRelay::Register {
+            protocol: RELAY_PROTOCOL_VERSION,
+            session_id: "ABCDEFGHJKLM".into(),
+            host_version: "0.6.3".into(),
+            display_name: None,
+            capabilities: HostCapabilities::default(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert!(v.get("displayName").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_signal_response_carries_the_request_id_it_answers() {
+        // The relay multiplexes every client's WHEP round trip over one socket, so a response
+        // with the wrong id is a client that never gets an answer.
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/sdp".to_string());
+        let msg = HostToRelay::SignalResponse {
+            request_id: "req-42".into(),
+            status: 200,
+            headers,
+            body: "v=0\r\n".into(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(field(&v, "type"), "signal_response");
+        assert_eq!(field(&v, "requestId"), "req-42");
+        assert_eq!(field(&v, "status"), 200);
+        assert_eq!(
+            field(field(&v, "headers"), "content-type"),
+            "application/sdp"
+        );
+    }
+
+    #[test]
+    fn unregister_and_pong_keep_their_snake_case_tags() {
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&HostToRelay::Unregister {
+                session_id: "ABCDEFGHJKLM".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(field(&v, "type"), "unregister");
+        assert_eq!(field(&v, "sessionId"), "ABCDEFGHJKLM");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&HostToRelay::Pong { ts: 17 }).unwrap())
+                .unwrap();
+        assert_eq!(field(&v, "type"), "pong");
+        assert_eq!(field(&v, "ts"), 17);
+    }
+
+    #[test]
+    fn every_relay_frame_this_host_understands_parses() {
+        // Exactly the frames the relay sends, spelled as it sends them.
+        let frames = [
+            r#"{"type":"registered","sessionId":"ABCDEFGHJKLM","joinUrl":"https://session.screenextend.app/j/ABCDEFGHJKLM","heartbeatSec":20}"#,
+            r#"{"type":"register_error","sessionId":"ABCDEFGHJKLM","code":"session_taken","message":"held by another host"}"#,
+            r#"{"type":"client_gone","clientId":"c-9"}"#,
+            r#"{"type":"ping","ts":1710000000}"#,
+            r#"{"type":"shutdown","reason":"maintenance","reconnectAfterMs":5000}"#,
+        ];
+        for raw in frames {
+            serde_json::from_str::<RelayToHost>(raw)
+                .unwrap_or_else(|e| panic!("relay frame did not parse: {raw}\n{e}"));
+        }
+    }
+
+    #[test]
+    fn a_signal_request_parses_with_its_ice_servers_and_remote_hint() {
+        let raw = r#"{
+            "type":"signal_request","requestId":"req-1","sessionId":"ABCDEFGHJKLM",
+            "clientId":"c-1","method":"POST","path":"/whep","query":"",
+            "headers":{"content-type":"application/json"},"body":"{}",
+            "iceServers":[{"urls":["turn:relay.example:3478"],"username":"u","credential":"c"}],
+            "remote":{"ipHash":"deadbeef","geoHint":"EU"}
+        }"#;
+        match serde_json::from_str::<RelayToHost>(raw).expect("signal_request") {
+            RelayToHost::SignalRequest {
+                request_id,
+                client_id,
+                path,
+                ice_servers,
+                remote,
+                ..
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(client_id, "c-1");
+                assert_eq!(path, "/whep");
+                assert_eq!(ice_servers.len(), 1);
+                let rtc = ice_servers.into_iter().next().unwrap().into_rtc();
+                assert_eq!(rtc.urls, vec!["turn:relay.example:3478".to_string()]);
+                assert_eq!(rtc.username, "u");
+                assert_eq!(rtc.credential, "c");
+                assert_eq!(remote.geo_hint, "EU");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_minimal_signal_request_parses_with_defaults() {
+        // Everything but the ids and the method/path is `#[serde(default)]` on purpose: a relay
+        // that stops sending an optional field must not take the host offline.
+        let raw = r#"{"type":"signal_request","requestId":"r","clientId":"c","method":"GET","path":"/ice-config"}"#;
+        match serde_json::from_str::<RelayToHost>(raw).expect("minimal signal_request") {
+            RelayToHost::SignalRequest {
+                query,
+                headers,
+                body,
+                ice_servers,
+                remote,
+                ..
+            } => {
+                assert!(query.is_empty());
+                assert!(headers.is_empty());
+                assert!(body.is_empty());
+                assert!(ice_servers.is_empty());
+                assert!(remote.ip_hash.is_empty());
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_frame_type_is_an_error_the_read_loop_can_skip() {
+        // The read loop logs and continues on a parse failure rather than dropping the
+        // connection, which is what lets the relay add a frame type before the host knows it.
+        assert!(serde_json::from_str::<RelayToHost>(r#"{"type":"whats_this","x":1}"#).is_err());
+        assert!(serde_json::from_str::<RelayToHost>("not json at all").is_err());
+    }
+
+    #[test]
+    fn the_session_taken_code_is_the_one_the_reconnect_loop_matches_on() {
+        // The reconnect loop rotates the session id off `RegisterRejected`, whose `code` is this
+        // constant, so the constant and the wire spelling have to be the same thing. The three
+        // tests at the end of this module cover the matching; this one covers the parsing.
+        let raw = r#"{"type":"register_error","code":"session_taken","message":""}"#;
+        match serde_json::from_str::<RelayToHost>(raw).expect("register_error") {
+            RelayToHost::RegisterError { code, .. } => {
+                assert_eq!(code, register_error_code::SESSION_TAKEN);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_backoff_doubles_and_then_holds() {
+        // A relay that is down stays down; the schedule has to stop growing or a host that lost
+        // it overnight comes back hours late.
+        let mut secs = 1u64;
+        let mut seen = vec![secs];
+        for _ in 0..10 {
+            secs = next_backoff_secs(secs);
+            seen.push(secs);
+        }
+        assert_eq!(&seen[..6], &[1, 2, 4, 8, 16, 30]);
+        assert!(seen.iter().all(|s| *s <= MAX_BACKOFF_SECS));
+        assert_eq!(*seen.last().unwrap(), MAX_BACKOFF_SECS);
+        // And it never overflows back to a tight loop, whatever it is handed.
+        assert_eq!(next_backoff_secs(u64::MAX), MAX_BACKOFF_SECS);
+        assert_eq!(next_backoff_secs(0), 0);
+    }
+
+    #[test]
+    fn the_heartbeat_timeout_is_longer_than_the_relays_own_interval() {
+        // The relay advertises `heartbeatSec` (20 s in practice) and the host bails when no
+        // frame arrives inside this window. Making them equal would drop a healthy connection
+        // on the first late ping.
+        assert!(HEARTBEAT_TIMEOUT >= Duration::from_secs(40));
+        assert!(HEARTBEAT_TIMEOUT > Duration::from_secs(MAX_BACKOFF_SECS));
+    }
+
+    #[test]
+    fn a_generated_session_id_has_no_ambiguous_characters() {
+        // The id is read off a QR code or typed from a screen. `0`/`O` and `1`/`I`/`l` are the
+        // pairs people get wrong, and a mistyped id is an unexplained join failure.
+        for _ in 0..64 {
+            let id = generate_session_id();
+            assert_eq!(id.len(), 12);
+            for c in id.chars() {
+                assert!(c.is_ascii_uppercase() || c.is_ascii_digit(), "{id}");
+                assert!(!"01IO".contains(c), "{id} contains an ambiguous character");
+            }
+        }
+        assert_ne!(generate_session_id(), generate_session_id());
+    }
+
+    #[test]
+    fn the_cloud_state_strings_are_the_ones_the_ui_switches_on() {
+        // These reach the desktop UI through `CloudStatusChange` and are compared as strings.
+        assert_eq!(CloudState::Disabled.as_str(), "disabled");
+        assert_eq!(CloudState::Connecting.as_str(), "connecting");
+        assert_eq!(CloudState::Registered.as_str(), "registered");
+        assert_eq!(CloudState::Offline.as_str(), "offline");
+        assert_eq!(CloudState::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn the_relay_url_is_a_wss_url_on_the_documented_domain() {
+        assert!(CLOUD_WS_URL.starts_with("wss://"), "{CLOUD_WS_URL}");
+        assert!(CLOUD_WS_URL.contains(CLOUD_DOMAIN), "{CLOUD_WS_URL}");
+        assert!(
+            CLOUD_WS_URL.contains(&format!("/v{RELAY_PROTOCOL_VERSION}/")),
+            "the path should carry the protocol version the register frame claims"
+        );
+    }
 
     #[test]
     fn the_relays_session_taken_code_is_recognised_through_context() {

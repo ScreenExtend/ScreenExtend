@@ -1307,7 +1307,7 @@ struct CaptureFlags {
     telemetry: SharedTelemetry,
 }
 
-enum EncodePath {
+pub(crate) enum EncodePath {
     ZeroCopy {
         igpu_context: ID3D11DeviceContext,
         shared_igpu: ID3D11Texture2D,
@@ -1326,7 +1326,7 @@ impl EncodePath {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum Backend {
+pub(crate) enum Backend {
     Nvenc { encoder: Encoder, path: EncodePath },
     Intel { encoder: IntelEncoder },
     IntelCpu { encoder: IntelEncoder },
@@ -1336,7 +1336,7 @@ enum Backend {
 }
 
 impl Backend {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Backend::Nvenc { path, .. } => path.name(),
             Backend::Intel { .. } => "intel-same-adapter",
@@ -1367,7 +1367,7 @@ impl Backend {
         }
     }
 
-    fn wants_prescale(&self) -> bool {
+    pub(crate) fn wants_prescale(&self) -> bool {
         !matches!(self, Backend::Intel { .. })
     }
 
@@ -1399,7 +1399,7 @@ impl Backend {
     /// the captured texture and its internal conversion beats a pre-pass. `Backend::Amf` — the
     /// GPU path — is not a bridge and takes the blt straight into its own ring texture, whose
     /// format is the encoder's business.
-    fn cpu_bridge_format(&self) -> ReadbackFormat {
+    pub(crate) fn cpu_bridge_format(&self) -> ReadbackFormat {
         match self {
             Backend::X264 { .. } | Backend::IntelCpu { .. } | Backend::AmfCpu { .. } => {
                 ReadbackFormat::Nv12
@@ -1410,7 +1410,7 @@ impl Backend {
         }
     }
 
-    fn is_cpu_bridge(&self) -> bool {
+    pub(crate) fn is_cpu_bridge(&self) -> bool {
         matches!(
             self,
             Backend::Nvenc {
@@ -1422,7 +1422,7 @@ impl Backend {
         )
     }
 
-    fn encode_gpu(
+    pub(crate) fn encode_gpu(
         &mut self,
         raw: &ID3D11Texture2D,
         scaler: Option<&mut Scaler>,
@@ -1476,7 +1476,7 @@ impl Backend {
     /// for, and only the scaler path can honour it. The two no-scaler routes — the staging
     /// readback of a captured frame and `TextureReader` — read the source texture's own format,
     /// which is BGRA. Guessing here would hand an encoder 1.5 bytes a pixel to read as 4.
-    fn encode_cpu(
+    pub(crate) fn encode_cpu(
         &mut self,
         data: &[u8],
         row_pitch: u32,
@@ -2338,7 +2338,57 @@ fn scaler_output_format(backend: &Backend) -> ReadbackFormat {
     }
 }
 
-fn build_backend(
+/// One rung of the encoder fallback ladder.
+///
+/// Named separately from [`Backend`] because a rung is a *choice*, not a constructed encoder:
+/// the ladder can be asserted on a machine with no GPU at all, which is the only way the Windows
+/// compatibility story gets any coverage — nothing anywhere used to exercise it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Nvenc,
+    Intel,
+    Amf,
+    X264,
+}
+
+impl BackendKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendKind::Nvenc => "NVENC",
+            BackendKind::Intel => "Intel Quick Sync",
+            BackendKind::Amf => "AMD AMF",
+            BackendKind::X264 => "software x264",
+        }
+    }
+}
+
+/// The encoders [`build_backend`] tries, in order, for a requested vendor.
+///
+/// Each rung still owns its own internal fallback — Quick Sync and AMF each try the same-adapter
+/// path before their own-device CPU bridge, and NVENC tries zero-copy before its CPU bridge —
+/// so this is the order the *vendors* are attempted in, not the number of attempts made.
+///
+/// AMF sits after Intel deliberately: an Intel-iGPU + Radeon-dGPU laptop should still prefer the
+/// same-adapter Quick Sync path, and an all-AMD box never reaches the Intel branch because its
+/// capture device is not Intel.
+pub fn encoder_ladder(vendor: crate::streamer::config::EncoderVendor) -> &'static [BackendKind] {
+    use crate::streamer::config::EncoderVendor;
+
+    match vendor {
+        EncoderVendor::Software => &[BackendKind::X264],
+        EncoderVendor::Nvidia => &[BackendKind::Nvenc, BackendKind::X264],
+        EncoderVendor::Intel => &[BackendKind::Intel, BackendKind::X264],
+        EncoderVendor::Amd => &[BackendKind::Amf, BackendKind::X264],
+        EncoderVendor::Auto => &[
+            BackendKind::Nvenc,
+            BackendKind::Intel,
+            BackendKind::Amf,
+            BackendKind::X264,
+        ],
+    }
+}
+
+pub(crate) fn build_backend(
     config: EncoderConfig,
     vendor: crate::streamer::config::EncoderVendor,
     native_w: u32,
@@ -2346,8 +2396,6 @@ fn build_backend(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
 ) -> Result<Backend> {
-    use crate::streamer::config::EncoderVendor;
-
     let try_nvenc = || -> Result<Backend> {
         match build_zero_copy(config, device, context) {
             Ok((encoder, path)) => {
@@ -2452,42 +2500,35 @@ fn build_backend(
         }
     };
 
-    match vendor {
-        EncoderVendor::Software => try_x264(),
-        EncoderVendor::Nvidia => try_nvenc().or_else(|nv_err| {
-            teprintln!("NVENC unavailable ({nv_err:?}); falling back to software x264");
-            try_x264()
-                .map_err(|xe| nv_err.context(format!("software fallback also failed: {xe:?}")))
-        }),
-        EncoderVendor::Intel => try_intel().or_else(|ie| {
-            teprintln!("Intel Quick Sync unavailable ({ie:?}); falling back to software x264");
-            try_x264().map_err(|xe| ie.context(format!("software fallback also failed: {xe:?}")))
-        }),
-        EncoderVendor::Amd => try_amf().or_else(|ae| {
-            teprintln!("AMD AMF unavailable ({ae:?}); falling back to software x264");
-            try_x264().map_err(|xe| ae.context(format!("software fallback also failed: {xe:?}")))
-        }),
-        // AMF sits after Intel deliberately: an Intel-iGPU + Radeon-dGPU laptop should still
-        // prefer the same-adapter Quick Sync path, and an all-AMD box never reaches the Intel
-        // branch because its capture device is not Intel.
-        EncoderVendor::Auto => try_nvenc()
-            .or_else(|nv_err| {
-                teprintln!("NVENC unavailable ({nv_err:?}); trying Intel Quick Sync");
-                try_intel()
-                    .map_err(|ie| nv_err.context(format!("Intel fallback also failed: {ie:?}")))
-            })
-            .or_else(|hw_err| {
-                teprintln!("Intel Quick Sync unavailable ({hw_err:?}); trying AMD AMF");
-                try_amf().map_err(|ae| hw_err.context(format!("AMD fallback also failed: {ae:?}")))
-            })
-            .or_else(|hw_err| {
-                teprintln!(
-                    "no hardware encoder available ({hw_err:?}); falling back to software x264"
-                );
-                try_x264()
-                    .map_err(|xe| hw_err.context(format!("software fallback also failed: {xe:?}")))
-            }),
+    let ladder = encoder_ladder(vendor);
+    let mut failure: Option<anyhow::Error> = None;
+    for (i, kind) in ladder.iter().copied().enumerate() {
+        if let Some(previous) = failure.as_ref() {
+            teprintln!(
+                "{} unavailable ({previous:?}); trying {}",
+                ladder[i - 1].name(),
+                kind.name()
+            );
+        }
+        let attempt = match kind {
+            BackendKind::Nvenc => try_nvenc(),
+            BackendKind::Intel => try_intel(),
+            BackendKind::Amf => try_amf(),
+            BackendKind::X264 => try_x264(),
+        };
+        match attempt {
+            Ok(backend) => return Ok(backend),
+            Err(e) => {
+                failure = Some(match failure {
+                    Some(previous) => {
+                        previous.context(format!("{} also failed: {e:?}", kind.name()))
+                    }
+                    None => e,
+                });
+            }
+        }
     }
+    Err(failure.expect("encoder_ladder is never empty"))
 }
 
 #[allow(clippy::too_many_arguments)]

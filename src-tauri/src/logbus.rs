@@ -275,7 +275,7 @@ mod tests {
     /// larger half (a JSON serialization plus two Tauri-internal mutexes, paid whether or not
     /// the log panel was mounted), so the ratio below is a lower bound on the improvement.
     #[test]
-    #[ignore]
+    #[ignore = "benchmark, not an assertion; run with --ignored --nocapture"]
     fn bench_push_line() {
         const N: usize = 200_000;
 

@@ -16,6 +16,8 @@ mod logbus;
 mod cli;
 mod single_instance;
 mod streamer;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(target_os = "windows")]
 mod windows_utils;
