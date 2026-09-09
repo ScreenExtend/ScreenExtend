@@ -33,7 +33,7 @@ includes decode or paint (see [What could not be measured](#what-could-not-be-me
 |------|---------|-------|
 | Windows host | Windows 11 build 26200 (25H2), NVIDIA RTX 3080 Ti Laptop GPU (driver 580.97) + Intel UHD Graphics, hybrid; primary 1920x1080@360 | IDD virtual display driver installed and working; NVENC, Quick Sync and x264 all exercised |
 | macOS host (dev box) | macOS 10.15.8 Catalina, Intel, Command Line Tools only, reached over SSH | CGDisplayStream + VideoToolbox only — SCK, Process Tap and VT low-latency do not exist on this OS |
-| macOS host (modern) | not available during this run | every 12.3+ / 13+ / 14.2+ tier is *pending user verification* |
+| macOS host (modern) | not available during this run | **needs modern Mac** — every 12.3+ / 13+ / 14.2+ tier is unmeasured: ScreenCaptureKit capture, `EnableLowLatencyRateControl`, `EnableLTR`, the Process Tap audio path, and whether `displayTime` / the SCK PTS are composite times there or scheduled ones as on Catalina. The script to run is `docs/manual-tests/macos-capture-encode.md`, which lists the log lines and the numbers to record, section by section. |
 
 ## Matrix — Windows, `selftest` (full host path, static 1280x720@60)
 
@@ -115,7 +115,11 @@ that holds frames. A modern Mac should beat every number here.
 
 Method: release build (`lto = "fat"`, `codegen-units = 1`), the display's own 60 Hz,
 `caffeinate -u -t 5` before each trial and the trial itself under `caffeinate -dims`, three trials,
-median reported. The animated content is the probe's own cursor animation, which is what makes
+median reported. Machine load during the run: the Mac's own 4 cores, no other cargo build running
+(checked with `ps -eo comm | grep -E '/cargo$|rustc$'` — the shared target directory is used by
+five agents and a fat-LTO link next door is worth ~20 minutes of contention), no user at the
+console, reached over SSH. Trials are sequential within one process invocation, so they are
+≥15 s apart; the three E2E trials agreed to within 0.26 ms at p50. The animated content is the probe's own cursor animation, which is what makes
 WindowServer produce dirty rects at all — the machine is reached over SSH and has no user at it.
 
 ```sh
@@ -128,23 +132,90 @@ cargo test --release --lib macos_utils::streamer::cgds::tests::capture_rate_down
 
 | Capture size | delivered (fps) | dropped by WindowServer | callback mean | displayTime → callback p50 / p90 / p99 / max |
 |---|---|---|---|---|
-| native 1440x900 | queued | queued | queued | queued |
-| half 720x448 | queued | queued | queued | queued |
+| native 1440x900 | 195 (39.0) | **0** | 311.0 µs | −15.53 / −15.12 / −11.97 / −11.42 ms |
+| half 720x448, same process | 196 (39.2) | **0** | 88.3 µs | −15.33 / −14.76 / −11.23 / −11.11 ms |
+| half 720x448, alone | 292 (58.4) | **0** | 121.4 µs | −15.57 / −15.29 / −14.80 / −3.88 ms |
+
+Three things to read off this table.
+
+**WindowServer drops are zero everywhere.** That is the whole point of the queue-depth change:
+before it, two of two queued surfaces were pinned and the stream had nothing free to composite
+into. The counter is now read on every delivery (`CGDisplayStreamUpdateGetDropCount`) rather than
+assumed, so zero is a measurement.
+
+**The callback cost is proportional to the output size, not to the frame count** — 311 µs at
+1440x900 against 88 µs at 720x448 in the same process, a 3.5× drop for a 4× smaller surface.
+Whatever the delivery callback spends its time on, it is not the three per-frame heap allocations:
+those are size-independent. It also means asking CGDisplayStream for a smaller output really does
+move work off this process, which is what the downscale question was about.
+
+**`displayTime` is ahead of the callback, by almost exactly one frame period.** Every percentile
+on every row is negative and tightly banded around −15.5 ms at 60 Hz. It is a scheduled
+presentation time, not the moment the frame was composited, so anything that treats it as "when
+this frame was captured" understates host latency by a frame. Recorded as
+`findings/major-cgds-displaytime-is-a-future-presentation-time.md`.
 
 ### Capture → encoded (`pipeline::tests::end_to_end_latency`, 6 s, 1440x900@60)
 
 | Build | captured (fps) | WindowServer drops | encoder output drops | capture → encoded p50 / p99 / max |
 |---|---|---|---|---|
 | before the VideoToolbox work (commit `719891df`, CGDS surface fixes only) | 61 (365 / 367 / 366 frames in 6 s) | 0 / 1 / 0 | not counted yet | **13.70 / 15.60 / 33.08** |
-| after (commit `34815f3a`) | queued | queued | queued | queued |
+| after (commit `ef21bea4b`) | 62 (373 / 371 / 370 frames in 6 s) | 0 / 0 / 0 | **0 / 0 / 0** | **13.61 / 15.06 / 20.64** |
+
+Medians of three trials, each 6 s, 360 frames submitted every time. The p50 barely moves — 13.70 →
+13.61 ms — and that is expected: the median frame was never the problem. **The tail is the
+result.** The before-run's worst trial had a p99 of 40.9 ms and a max of 66.9 ms; the after-run's
+worst p99 is 15.3 ms and its worst max 31.5 ms, with the other two trials at 15.1 and 20.6 ms.
+Two and a half frame periods of jitter came out of the 99th percentile.
+
+Three supporting counters, all new and all zero: `windowserver_drops` (the capture side is not
+starving), `output_drops` (the bounded encoder output channel never had to discard), and
+`vt_pending_at_flush = Some(0)` (VideoToolbox is holding nothing when the session ends, so the
+in-flight cap and the drain thread agree with the encoder's own count).
 
 ### Whole host path (`probe --whep-selftest`, 30 s)
 
-Queued. The run is scripted and waiting on the shared Mac’s cargo lock behind four other agents’ fat-LTO release builds; the script is `src-tauri/target/w5-measure.sh` and its log `src-tauri/target/w5-measure.log`. It runs
-`ScreenExtend probe --whep-selftest --duration 30` from a `--features probe` release build, plus
-`cgds::tests::capture_rate{,_downscaled}`, `encoder::tests::{the_sps_promises_no_reordering,hw_capability_probe,encode_synthetic}`,
-`pipeline::tests::{end_to_end_latency,production_pipeline_smoke}`, and finishes with the dyld floor check and
-`nm -u … | grep -i displaystream`.
+**PASSED**: 1098 RTP packets over 30 s, `capture=cgdisplaystream encoder=videotoolbox-hardware`.
+
+| Stage | p50 / p90 / p99 / max (ms) |
+|---|---|
+| encode | 201.33 / 201.33 / 201.33 / 221.87 |
+| packetize | 0.09 / 0.12 / 0.33 / 0.57 |
+| socket_write | 0.36 / 0.72 / 3.15 / 3.72 |
+| pace_wait | 0.00 / 0.00 / 0.00 / 0.00 |
+| capture → socket | 184.55 / 201.33 / 201.33 / 207.04 |
+
+**Read the 201 ms as the keepalive, not as latency.** 156 of 161 frames in that window are
+`frames_repeated`: the self-test runs against a machine with no user at it and a completely still
+screen, so after the first real frame the 200 ms keepalive is what produces every subsequent one,
+and a repeated frame carries the original capture instant. The number to take from this row is
+that the path works end to end on a still display at all — which is the defect that made every
+macOS cell in this document empty until now — plus `packetize`, `socket_write` and `pace_wait`,
+which are real and are collectively under a millisecond at p50.
+
+For actual encode latency on this machine use the capture → encoded table above (13.61 ms p50),
+where the content is animated.
+
+Other results from the same run (`src-tauri/target/w5-measure.sh`, log `/tmp/w5-measure.log`):
+
+- **SPS VUI**: `max_num_reorder_frames = Some(0)`, `matrix_coefficients = 1`,
+  `colour_primaries = 1`, `video_full_range_flag = false`. The decoder is told to hold zero frames
+  before output, which is the half of `AllowFrameReordering = false` that a decoder actually obeys.
+- **Hardware ladder, 2019 Intel**: hardware H.264 succeeds at 1280x720, 1024x576, 960x540,
+  854x480, 768x432, 720x480 and **640x360**, and fails with `OSStatus -12915` at 576x324 and every
+  size below. The threshold on this machine is width ≥ 640, exactly the disjunction Chromium
+  documents (`width ≥ 640 OR height ≥ 480`) — 640x360 passes on width alone with a height well
+  under 480.
+- **Encoder instance limit**: 6 simultaneous hardware sessions created successfully, so the
+  scarce-resource path is not reachable here and `instance_limited` awareness stays
+  `COMPILE-CHECKED`.
+- **Synthetic encode**: 59 frames / 466,139 bytes, frame 0 NALs `[7, 8, 6, 5]` (SPS, PPS, SEI,
+  IDR), keyframes at indices `[0, 30]`.
+- **Production pipeline smoke**: 299 `EncodedFrame`s / 3,215,113 bytes broadcast, 1 IDR,
+  submit → broadcast p50 18.14 ms, max 19.87 ms.
+- **dyld floor**: 540 undefined symbols, **0 offenders**, 0 weak imports, 0 allowlisted — every
+  strongly bound undefined symbol exists at 10.15. `nm -u | grep -i displaystream` is empty, which
+  is the guard that the obsoleted capture API stays behind `dlsym`.
 
 ## What the numbers say
 

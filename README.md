@@ -47,6 +47,19 @@ Every client gets its own display and its own encoder, so several devices can ha
  └─────────────────┘                 └───────────────────────────────────┘
 ```
 
+### Joining over a cable
+
+A wired client is not a separate mode — it is just a different network. An Android phone with
+**Settings → Hotspot & tethering → USB tethering** turned on presents an ordinary IP interface to
+the host, so ScreenExtend serves it on that subnet like any other adapter: open the join URL
+printed for the tether address and it works with no extra setup. That removes Wi-Fi contention
+from the path entirely, which is the single biggest source of jitter on a busy network. iOS has no
+USB tethering, so this is Android-only.
+
+The host log names what the connection is actually riding
+(`session link: local candidate … is on a wired adapter`), so it is possible to tell a tethered
+join from a Wi-Fi one at a glance.
+
 ## Command line
 
 The shipped binary works headlessly:
@@ -60,7 +73,7 @@ ScreenExtend doctor   # check system requirements and permissions
 ScreenExtend drivers install   # virtual display driver (elevated)
 ```
 
-`ScreenExtend --help` lists the rest: `status`, `session`, `config`, `turn`, `account`, `autostart`, `logs`, `update`, `display-settings`, `stop`.
+`ScreenExtend --help` lists the rest: `status`, `session`, `config`, `turn`, `stun`, `account`, `autostart`, `logs`, `update`, `display-settings`, `stop`.
 
 ## Built with
 
