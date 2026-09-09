@@ -852,7 +852,7 @@ mod test {
 
     /// Records what this machine actually answers. Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of this machine's tethering capability; run with --ignored --nocapture"]
     fn report_tethering_capability() {
         match tethering_capability() {
             Some(capability) => println!(
@@ -867,7 +867,7 @@ mod test {
     /// The locale-independent legacy probe, next to the localized string it replaces. Run with
     /// `--ignored --nocapture`; needs no elevation.
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of the legacy WLAN hosted-network capability; run with --ignored --nocapture"]
     fn report_wlan_hosted_network_capability() {
         println!(
             "WlanQueryInterface(hosted_network_capable) => {:?}",

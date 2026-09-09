@@ -12,6 +12,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "lint": "eslint .",
+    "test:client": "node scripts/test-client.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

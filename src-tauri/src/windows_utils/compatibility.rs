@@ -381,7 +381,7 @@ mod test {
 
     /// Prints every probed backend on this machine. Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of this machine's probed backends; run with --ignored --nocapture"]
     fn report_backends() {
         let report = check_system_requirements();
         println!("os:             {}", report.os_version);
