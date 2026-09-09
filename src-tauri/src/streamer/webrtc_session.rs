@@ -1800,4 +1800,235 @@ mod tests {
         ];
         assert!(!payloads_carry_parameter_sets(&fua));
     }
+
+    // ---- SDP negotiation, with no display, no encoder and no network ---------------------
+    //
+    // `whep_selftest.rs` already checks these attributes against a captured answer. What it
+    // could not check is that *this* MediaEngine still produces them: the codec registration,
+    // the fmtp string, the five feedback entries and the RTX codec are all in `build_api`, and
+    // a change there is invisible until a real browser fails to decode. Two in-process peer
+    // connections negotiate for real; nothing here needs a virtual display.
+
+    async fn negotiate_answer(profile: H264Profile) -> Option<String> {
+        use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+        use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+
+        let api = build_api(profile).expect("build_api");
+        // A peer connection binds UDP sockets for its ICE agent, which a locked-down box may
+        // refuse; that is a skip, not a failure of the SDP under test.
+        let client = match api.new_peer_connection(RTCConfiguration::default()).await {
+            Ok(pc) => Arc::new(pc),
+            Err(e) => {
+                crate::test_support::skip("webrtc SDP negotiation (no peer connection)", e);
+                return None;
+            }
+        };
+        let host = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("host peer connection"),
+        );
+
+        client
+            .add_transceiver_from_kind(
+                RTPCodecType::Video,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    send_encodings: vec![],
+                }),
+            )
+            .await
+            .expect("recvonly video transceiver");
+
+        // The same raw RTP track the live session adds, so the answer describes the real thing.
+        let track = Arc::new(TrackLocalStaticRTP::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "screenextend".to_owned(),
+        ));
+        host.add_track(Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .expect("add video track");
+
+        let offer = client.create_offer(None).await.expect("offer");
+        client
+            .set_local_description(offer.clone())
+            .await
+            .expect("set local offer");
+        host.set_remote_description(offer)
+            .await
+            .expect("set remote offer");
+        let answer = host.create_answer(None).await.expect("answer");
+
+        client.close().await.ok();
+        host.close().await.ok();
+        Some(answer.sdp)
+    }
+
+    #[tokio::test]
+    async fn the_media_engine_still_answers_with_everything_a_browser_needs() {
+        let Some(sdp) = negotiate_answer(H264Profile::Baseline).await else {
+            return;
+        };
+        for (name, ok) in crate::streamer::test::whep_selftest::answer_sdp_checks(&sdp) {
+            assert!(ok, "the negotiated answer is missing {name}:\n{sdp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_h264_profile_negotiates_its_own_level_id() {
+        // The profile is a per-session setting, and picking the wrong level-id gives a client
+        // that either refuses the stream or decodes it in software.
+        for (profile, plid) in [
+            (H264Profile::Baseline, "42e01f"),
+            (H264Profile::Main, "4d001f"),
+            (H264Profile::High, "640c1f"),
+        ] {
+            let Some(sdp) = negotiate_answer(profile).await else {
+                return;
+            };
+            assert!(
+                sdp.contains(plid),
+                "{profile:?} should negotiate profile-level-id={plid}:\n{sdp}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fmtp_line_says_packetization_mode_1_and_allows_level_asymmetry() {
+        // Without `packetization-mode=1` a browser will not accept the fragmented NAL units the
+        // payloader emits; without level asymmetry a phone that decodes less than it encodes
+        // refuses the whole m-line.
+        let line = h264_fmtp("42e01f");
+        assert!(line.contains("packetization-mode=1"), "{line}");
+        assert!(line.contains("level-asymmetry-allowed=1"), "{line}");
+        assert!(line.contains("profile-level-id=42e01f"), "{line}");
+    }
+
+    #[test]
+    fn every_codec_gets_its_own_rtx_payload_type() {
+        // RTX carries the retransmissions NACK asks for. Two codecs sharing an apt, or a codec
+        // whose rtx pt collides with another codec's, silently disables loss recovery.
+        for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+            let codecs = h264_codecs(profile);
+            assert!(!codecs.is_empty(), "{profile:?} registers no codec");
+            let mut seen: Vec<PayloadType> = Vec::new();
+            for (pt, rtx, plid) in &codecs {
+                assert_ne!(
+                    pt, rtx,
+                    "{profile:?}: a codec and its RTX share a payload type"
+                );
+                assert_eq!(
+                    plid.len(),
+                    6,
+                    "{profile:?}: {plid} is not a profile-level-id"
+                );
+                assert!(!seen.contains(pt), "{profile:?}: payload type {pt} reused");
+                assert!(
+                    !seen.contains(rtx),
+                    "{profile:?}: payload type {rtx} reused"
+                );
+                seen.push(*pt);
+                seen.push(*rtx);
+            }
+        }
+    }
+
+    // ---- locality, which decides whether a session waits for a relay ----------------------
+
+    #[test]
+    fn private_and_link_local_addresses_are_recognised_in_both_families() {
+        for ip in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "169.254.10.20",
+            "127.0.0.1",
+            "::1",
+            "fe80::1",
+        ] {
+            assert!(is_private_ip(ip), "{ip} should be private/link-local");
+        }
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",
+            "2001:4860:4860::8888",
+            "not-an-ip",
+            "",
+        ] {
+            assert!(!is_private_ip(ip), "{ip} should not be private");
+        }
+    }
+
+    #[test]
+    fn the_same_subnet_check_is_ipv4_only_and_compares_three_octets() {
+        // It exists to spot AP client isolation: two devices on one /24 that still had to go
+        // through a relay. A false positive there prints advice about a router that is not the
+        // problem.
+        assert!(same_subnet_24("192.168.1.10", "192.168.1.200"));
+        assert!(!same_subnet_24("192.168.1.10", "192.168.2.10"));
+        assert!(!same_subnet_24("192.168.1.10", "10.0.0.10"));
+        assert!(!same_subnet_24("fe80::1", "fe80::2"), "IPv6 has no /24");
+        assert!(!same_subnet_24("192.168.1.10", "garbage"));
+    }
+
+    // ---- the SDP candidate summary, which is the only ICE diagnostic in the log ----------
+
+    #[test]
+    fn the_candidate_summary_counts_types_and_names_the_routable_ones() {
+        let sdp = "\
+v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 102\r\n\
+a=candidate:1 1 udp 2130706431 192.168.1.10 50000 typ host\r\n\
+a=candidate:2 1 udp 2130706431 192.168.1.10 50001 typ host\r\n\
+a=candidate:3 1 udp 1694498815 203.0.113.7 50002 typ srflx raddr 192.168.1.10 rport 50000\r\n\
+a=candidate:4 1 udp 16777215 198.51.100.9 50003 typ relay raddr 203.0.113.7 rport 50002\r\n";
+        let s = summarize_sdp_candidates(sdp);
+        assert!(s.contains("host=2"), "{s}");
+        assert!(s.contains("srflx=1"), "{s}");
+        assert!(s.contains("relay=1"), "{s}");
+        // The routable ones are named with their transport and address, because "we gathered a
+        // relay candidate" and "we gathered the *right* relay candidate" are different facts.
+        assert!(s.contains("relay/udp 198.51.100.9:50003"), "{s}");
+        assert!(s.contains("srflx/udp 203.0.113.7:50002"), "{s}");
+    }
+
+    #[test]
+    fn a_host_only_sdp_says_so_rather_than_looking_healthy() {
+        let sdp = "a=candidate:1 1 udp 2130706431 192.168.1.10 50000 typ host\r\n";
+        let s = summarize_sdp_candidates(sdp);
+        assert!(s.contains("host=1"), "{s}");
+        assert!(s.contains("no public/relay candidates"), "{s}");
+    }
+
+    #[test]
+    fn an_sdp_with_no_candidates_at_all_is_reported_as_such() {
+        assert_eq!(
+            summarize_sdp_candidates("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\n"),
+            "no ICE candidates in SDP"
+        );
+        assert_eq!(summarize_sdp_candidates(""), "no ICE candidates in SDP");
+    }
+
+    #[test]
+    fn a_trickled_candidate_line_is_summarised_the_same_way() {
+        // A candidate arriving over the data channel has no `a=` prefix; the summary is used on
+        // both, so both spellings have to be accepted.
+        let s = summarize_sdp_candidates("candidate:1 1 udp 2130706431 10.0.0.5 4000 typ host\r\n");
+        assert!(s.contains("host=1"), "{s}");
+    }
+
+    #[test]
+    fn a_malformed_candidate_is_counted_rather_than_dropping_the_summary() {
+        let s = summarize_sdp_candidates("a=candidate:garbage\r\n");
+        assert!(
+            s.contains("?=1"),
+            "an unparseable candidate should still be counted: {s}"
+        );
+    }
 }
