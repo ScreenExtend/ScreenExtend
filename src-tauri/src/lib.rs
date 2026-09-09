@@ -51,13 +51,7 @@ pub struct DeviceJoin(Device);
 pub struct DeviceModify(Device);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct DeviceModifyAction(Device);
-
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct DeviceRemove(Device);
-
-#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
-pub struct DeviceRemoveAction(Device);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct NetworkChange;
@@ -358,6 +352,193 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
     tauri::menu::MenuBuilder::new(handle).build()
 }
 
+// The legacy `installdrivers` / `removedrivers` / `hostednetwork` subcommands.
+//
+// They stay because installers from earlier releases invoke them by these exact names
+// (`windows/hooks.nsh`, `windows/fragment.wxs`), so an old uninstaller must keep working.
+// `drivers install|remove` and `network start` are the modern equivalents.
+//
+// Every path resolution and every shell call here used to be an `.unwrap()`. A missing
+// `nefconc`, a shell-ACL mismatch against `capabilities/default.json` or an unresolvable
+// resource directory therefore crashed the process — during an uninstall, where the caller
+// wants a non-zero exit code and a reason, not a crash dialog.
+
+/// Spawn one legacy external command. A non-zero exit is reported but not fatal: `certutil
+/// -delstore` for a certificate that is already gone is the normal uninstall case, and the
+/// previous code ignored the status entirely. Only a failure to run at all is an error.
+async fn legacy_shell(
+    app: &tauri::AppHandle,
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+) -> Result<(), String> {
+    match app
+        .shell()
+        .command(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(out) => {
+            if !out.status.success() {
+                teprintln!(
+                    "[legacy-cli] {program} {} exited with {:?}: {}",
+                    args.join(" "),
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("could not run {program}: {e}")),
+    }
+}
+
+fn legacy_resource(app: &tauri::AppHandle, file: &str) -> Result<String, String> {
+    app.path()
+        .resolve(file, BaseDirectory::Resource)
+        .map_err(|e| format!("could not resolve bundled resource {file}: {e}"))?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| format!("bundled resource path for {file} is not valid UTF-8"))
+}
+
+fn legacy_resource_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .resource_dir()
+        .map_err(|e| format!("could not resolve the resource directory: {e}"))
+}
+
+const VDD_HARDWARE_ID: &str = "Root\\VirtualDisplayDriver";
+const VDD_CLASS_GUID: &str = "4D36E968-E325-11CE-BFC1-08002BE10318";
+
+async fn legacy_install_drivers(app: &tauri::AppHandle) -> Result<(), String> {
+    let dir = legacy_resource_dir(app)?;
+    let cert = legacy_resource(app, "resources/ScreenExtend.cer")?;
+    let inf = legacy_resource(app, "resources/VirtualDisplayDriver.inf")?;
+    legacy_shell(app, "certutil", &["-addstore", "-f", "root", &cert], &dir).await?;
+    legacy_shell(
+        app,
+        "certutil",
+        &["-addstore", "-f", "TrustedPublisher", &cert],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "nefconc",
+        &[
+            "--remove-device-node",
+            "--hardware-id",
+            VDD_HARDWARE_ID,
+            "--class-guid",
+            VDD_CLASS_GUID,
+        ],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "nefconc",
+        &[
+            "--create-device-node",
+            "--class-name",
+            "Display",
+            "--class-guid",
+            VDD_CLASS_GUID,
+            "--hardware-id",
+            VDD_HARDWARE_ID,
+        ],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "nefconc",
+        &["--install-driver", "--inf-path", &inf],
+        &dir,
+    )
+    .await
+}
+
+async fn legacy_remove_drivers(app: &tauri::AppHandle) -> Result<(), String> {
+    let dir = legacy_resource_dir(app)?;
+    let inf = legacy_resource(app, "resources/VirtualDisplayDriver.inf")?;
+    legacy_shell(
+        app,
+        "nefconc",
+        &[
+            "--remove-device-node",
+            "--hardware-id",
+            VDD_HARDWARE_ID,
+            "--class-guid",
+            VDD_CLASS_GUID,
+        ],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "nefconc",
+        &["--uninstall-driver", "--inf-path", &inf],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "certutil",
+        &["-delstore", "root", "ScreenExtend"],
+        &dir,
+    )
+    .await?;
+    legacy_shell(
+        app,
+        "certutil",
+        &["-delstore", "TrustedPublisher", "ScreenExtend"],
+        &dir,
+    )
+    .await
+}
+
+async fn legacy_hosted_network(
+    app: &tauri::AppHandle,
+    ssid: &str,
+    password: &str,
+) -> Result<(), String> {
+    if ssid.is_empty() {
+        return Err("hostednetwork needs an SSID".to_string());
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    legacy_shell(
+        app,
+        "netsh",
+        &[
+            "wlan",
+            "set",
+            "hostednetwork",
+            "mode=allow",
+            &format!("ssid={ssid}"),
+            &format!("key={password}"),
+        ],
+        &cwd,
+    )
+    .await?;
+    legacy_shell(app, "netsh", &["wlan", "start", "hostednetwork"], &cwd).await
+}
+
+/// Run one legacy branch and turn its result into the process exit code the installer reads.
+fn finish_legacy(app: &tauri::AppHandle, result: Result<(), String>) {
+    match result {
+        Ok(()) => app.exit(0),
+        Err(e) => {
+            teprintln!("[legacy-cli] {e}");
+            eprintln!("error: {e}");
+            app.exit(1);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     cli::fast_path();
@@ -413,15 +594,14 @@ pub fn run() {
             set_disable_gpu_encode,
             get_disable_gpu_encode,
             logbus::get_log_backlog,
+            logbus::set_log_streaming,
             logbus::log_frontend_error
         ])
         .events(collect_events![
             DeviceJoin,
             DeviceAudioOutputs,
             DeviceModify,
-            DeviceModifyAction,
             DeviceRemove,
-            DeviceRemoveAction,
             NetworkChange,
             HostedNetworkNoPassword,
             CloudStatusChange,
@@ -430,16 +610,28 @@ pub fn run() {
             logbus::LogLine
         ]);
 
+    // Debug build, no CLI arguments: that is `pnpm tauri dev`, and `cargo run -- serve` is
+    // deliberately excluded. The path is resolved from the crate directory rather than from
+    // `..`, so it lands on the right file whatever the working directory is -- a relative
+    // path here wrote somewhere else, or panicked, depending on where the binary started.
+    //
+    // "no arguments" is still only a proxy for "this is the current build", so a stale debug
+    // binary can revert the whole surface. `scripts/check-bindings.mjs` is what catches that:
+    // a static cross-check against the macro lists above, run in CI.
     #[cfg(debug_assertions)]
     if std::env::args_os().nth(1).is_none() {
+        let bindings_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings.ts");
         builder
-            .export(Typescript::default(), "../src/lib/bindings.ts")
+            .export(Typescript::default(), &bindings_path)
             .expect("error while exporting typescript bindings");
-        let bindings_path = "../src/lib/bindings.ts";
-        let contents = std::fs::read_to_string(bindings_path)
+        let contents = std::fs::read_to_string(&bindings_path)
             .expect("error while reading typescript bindings");
-        std::fs::write(bindings_path, format!("// @ts-nocheck\n{contents}"))
+        // The generated file declares a `TAURI_CHANNEL` helper it does not always use, which
+        // `noUnusedLocals` rejects; that one artifact is why the whole file is unchecked.
+        std::fs::write(&bindings_path, format!("// @ts-nocheck\n{contents}"))
             .expect("error while writing typescript bindings");
+        println!("exported bindings to {}", bindings_path.display());
     }
 
     tauri::Builder::default()
@@ -459,7 +651,6 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_cli::init())
-        .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .menu(build_menu)
         .invoke_handler(builder.invoke_handler())
@@ -467,188 +658,77 @@ pub fn run() {
             builder.mount_events(app);
             let _ = crate::cli::dispatch(app.handle());
             crate::streamer::input::prime();
+            permissions::prime();
             match app.cli().matches().ok().and_then(|m| m.subcommand) {
                 Some(command) if command.name == "hostednetwork" => {
                     let mut ssid = String::new();
                     let mut password = String::new();
                     for (key, arg_data) in &command.matches.args {
                         match key.as_str() {
-                            "ssid" => {
-                                ssid = arg_data
-                                    .value
-                                    .as_str()
-                                    .map(|s| s.to_string())
-                                    .expect("no ssid");
-                            }
+                            "ssid" => ssid = arg_data.value.as_str().unwrap_or("").to_string(),
                             "password" => {
-                                password = arg_data
-                                    .value
-                                    .as_str()
-                                    .map(|s| s.to_string())
-                                    .expect("no password");
+                                password = arg_data.value.as_str().unwrap_or("").to_string()
                             }
                             _ => {}
                         }
                     }
-                    tauri::async_runtime::block_on(async {
-                        app.shell()
-                            .command("netsh")
-                            .args([
-                                "wlan",
-                                "set",
-                                "hostednetwork",
-                                "mode=allow",
-                                &format!("ssid={}", ssid),
-                                &format!("key={}", password),
-                            ])
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("netsh")
-                            .args(["wlan", "start", "hostednetwork"])
-                            .output()
-                            .await
-                            .unwrap();
-                    });
-                    app.handle().exit(0);
+                    let handle = app.handle().clone();
+                    let result = tauri::async_runtime::block_on(legacy_hosted_network(
+                        &handle, &ssid, &password,
+                    ));
+                    finish_legacy(&handle, result);
                 }
                 Some(command) if command.name == "installdrivers" => {
-                    tauri::async_runtime::block_on(async {
-                        let resource_path = |file: &str| {
-                            app.path()
-                                .resolve(file, BaseDirectory::Resource)
-                                .unwrap()
-                                .into_os_string()
-                                .into_string()
-                                .unwrap()
-                        };
-                        app.shell()
-                            .command("certutil")
-                            .args([
-                                "-addstore",
-                                "-f",
-                                "root",
-                                &resource_path("resources/ScreenExtend.cer"),
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("certutil")
-                            .args([
-                                "-addstore",
-                                "-f",
-                                "TrustedPublisher",
-                                &resource_path("resources/ScreenExtend.cer"),
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("nefconc")
-                            .args([
-                                "--remove-device-node",
-                                "--hardware-id",
-                                "Root\\VirtualDisplayDriver",
-                                "--class-guid",
-                                "4D36E968-E325-11CE-BFC1-08002BE10318",
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("nefconc")
-                            .args([
-                                "--create-device-node",
-                                "--class-name",
-                                "Display",
-                                "--class-guid",
-                                "4D36E968-E325-11CE-BFC1-08002BE10318",
-                                "--hardware-id",
-                                "Root\\VirtualDisplayDriver",
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("nefconc")
-                            .args([
-                                "--install-driver",
-                                "--inf-path",
-                                &resource_path("resources/VirtualDisplayDriver.inf"),
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                    });
-                    app.handle().exit(0);
+                    let handle = app.handle().clone();
+                    let result = tauri::async_runtime::block_on(legacy_install_drivers(&handle));
+                    finish_legacy(&handle, result);
                 }
                 Some(command) if command.name == "removedrivers" => {
-                    tauri::async_runtime::block_on(async {
-                        let resource_path = |file: &str| {
-                            app.path()
-                                .resolve(file, BaseDirectory::Resource)
-                                .unwrap()
-                                .into_os_string()
-                                .into_string()
-                                .unwrap()
-                        };
-                        app.shell()
-                            .command("nefconc")
-                            .args([
-                                "--remove-device-node",
-                                "--hardware-id",
-                                "Root\\VirtualDisplayDriver",
-                                "--class-guid",
-                                "4D36E968-E325-11CE-BFC1-08002BE10318",
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("nefconc")
-                            .args([
-                                "--uninstall-driver",
-                                "--inf-path",
-                                &resource_path("resources/VirtualDisplayDriver.inf"),
-                            ])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("certutil")
-                            .args(["-delstore", "root", "ScreenExtend"])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                        app.shell()
-                            .command("certutil")
-                            .args(["-delstore", "TrustedPublisher", "ScreenExtend"])
-                            .current_dir(app.path().resource_dir().unwrap())
-                            .output()
-                            .await
-                            .unwrap();
-                    });
-                    app.handle().exit(0);
+                    let handle = app.handle().clone();
+                    let result = tauri::async_runtime::block_on(legacy_remove_drivers(&handle));
+                    finish_legacy(&handle, result);
                 }
                 _ => {
-                    let lock_dir = app.path().app_local_data_dir().unwrap();
+                    // This runs before the window exists, so a failure here has no UI to report
+                    // itself in other than a dialog. It used to be an `.unwrap()` on the normal
+                    // startup path of every user.
+                    let lock_dir = match app.path().app_local_data_dir() {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            app.dialog()
+                                .message(format!(
+                                    "ScreenExtend cannot resolve its data directory:
+{e}"
+                                ))
+                                .title("ScreenExtend")
+                                .blocking_show();
+                            std::process::exit(1);
+                        }
+                    };
                     let _ = std::fs::create_dir_all(&lock_dir);
                     let lock_path = lock_dir.join(single_instance::LOCK_FILE);
                     let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
 
                     let mut lock = single_instance::acquire_lock(&lock_path);
 
-                    if lock.is_none() {
+                    // An unwritable or unopenable lock file is not another instance. Offering
+                    // "Show running instance" for one that does not exist is how that used to
+                    // present.
+                    if let single_instance::LockOutcome::Unavailable(e) = &lock {
+                        app.dialog()
+                            .message(format!(
+                                "ScreenExtend could not open its single-instance lock at
+{}
+
+{e}",
+                                lock_path.display()
+                            ))
+                            .title("ScreenExtend")
+                            .blocking_show();
+                        std::process::exit(1);
+                    }
+
+                    if matches!(lock, single_instance::LockOutcome::HeldByOther) {
                         let quit_other = app
                             .dialog()
                             .message("ScreenExtend is already running.")
@@ -668,7 +748,7 @@ pub fn run() {
                                 &lock_path,
                                 std::time::Duration::from_secs(10),
                             );
-                            if lock.is_none() {
+                            if !matches!(lock, single_instance::LockOutcome::Acquired(_)) {
                                 std::process::exit(0);
                             }
                         } else {
@@ -680,7 +760,7 @@ pub fn run() {
                         }
                     }
 
-                    if let Some(file) = lock {
+                    if let single_instance::LockOutcome::Acquired(file) = lock {
                         std::mem::forget(file);
                     }
 
@@ -704,6 +784,7 @@ pub fn run() {
                         ctrl_path,
                         focus_main_window,
                         single_instance::quit_main_window,
+                        cli::reload_config_into_state,
                     ) {
                         teprintln!("[single-instance] failed to start control server: {e}");
                     }

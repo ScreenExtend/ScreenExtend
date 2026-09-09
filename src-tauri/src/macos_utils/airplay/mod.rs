@@ -585,6 +585,19 @@ fn diagnose(receiver: &Receiver) -> String {
     }
 }
 
+/// Did macOS change the display geometry under us since the last call?
+///
+/// The sender re-sends unencrypted SPS/PPS whenever it does, which `MirrorStats` latches.
+/// The session watchdog polls this and bumps the reconfig epoch, so the client learns on its
+/// next `/reconfig` rather than when a size poll happens to notice.
+pub fn take_geometry_changed() -> bool {
+    warm_receiver()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|r| r.take_geometry_changed()))
+        .unwrap_or(false)
+}
+
 /// Reports what the picker currently lists, for `ScreenExtend doctor`.
 pub fn probe() -> Result<Vec<String>, String> {
     let snap = ax::snapshot(Instant::now() + SESSION_BUDGET)?;

@@ -45,6 +45,9 @@ export type Config = {
   disableGpuEncode: boolean,
   legacyVolumeKeyProxy: boolean,
   walkthroughCompleted: boolean,
+  // Seconds a display survives a device dropping off. It lives here rather than in
+  // localStorage because `ScreenExtend serve` reads it out of config.json and has no webview.
+  disconnectGraceSecs: number,
   serverPorts: {
     http: number,
     https: number
@@ -80,6 +83,7 @@ export const defaultConfig: Config = {
   disableGpuEncode: false,
   legacyVolumeKeyProxy: false,
   walkthroughCompleted: false,
+  disconnectGraceSecs: 10,
   serverPorts: {
     http: DEFAULT_HTTP_PORT,
     https: DEFAULT_HTTPS_PORT
