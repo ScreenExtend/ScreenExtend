@@ -1,4 +1,4 @@
-//! Linux injection backend — STUB (PRD §5.7).
+//! Linux injection backend — a stub. It compiles and reports `Unsupported`; nothing is injected.
 //!
 //! TODO: open /dev/uinput via `input-linux` or `uinput` crate.
 //!   - Mouse/keyboard: EV_KEY / EV_REL / EV_ABS on a virtual device.
@@ -32,7 +32,9 @@ impl Injector {
 
     pub fn dispatch(&mut self, _ev: &InputEvent) {
         if !self.warned {
-            teprintln!("Linux injection backend is a stub — events are dropped (see PRD §5.7)");
+            teprintln!(
+                "remote control is not supported on Linux hosts yet; input from clients is ignored"
+            );
             self.warned = true;
         }
     }

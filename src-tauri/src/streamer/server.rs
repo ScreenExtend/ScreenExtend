@@ -498,11 +498,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
-// Cross-origin isolation (§6.4): with these on the document *and* a secure context (HTTPS or
-// localhost), `crossOriginIsolated` becomes true and the client can use the SharedArrayBuffer
-// ring buffer. Over plain HTTP they're inert (isolation stays off; client falls back to the
-// postMessage ring). All our sub-resources are same-origin, so COEP:require-corp does not block
-// them — verify the existing video worker still loads if this ever regresses.
+// Cross-origin isolation (`docs/recovered/PRD.md` §6.4): with these on the document *and* a
+// secure context (HTTPS or localhost), `crossOriginIsolated` becomes true and the client can use
+// the SharedArrayBuffer ring buffer. Over plain HTTP they're inert (isolation stays off; client
+// falls back to the postMessage ring). All our sub-resources are same-origin, so
+// COEP:require-corp does not block them — verify the existing video worker still loads if this
+// ever regresses.
 fn isolation_headers() -> [(header::HeaderName, header::HeaderValue); 2] {
     [
         (

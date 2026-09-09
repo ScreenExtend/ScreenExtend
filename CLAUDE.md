@@ -13,38 +13,47 @@ host creates a real virtual display per client, GPU-encodes it, and streams it o
 Two distinct frontends live in this repo:
 - `src/` — the **desktop control UI** (React, runs in the Tauri webview on the host).
 - `src-tauri/src/streamer/static/` — the **client web page** served to joining devices
-  (`index.html`, `input.js`, `audio.js`, `audio-worker.js`, `audio-worklet.js`,
-  `transform-worker.js`, `nosleep.js`, `styles.css`, `logo.svg`). This is plain HTML/JS/CSS
-  served by the Rust HTTP server, `include_str!`'d into the binary, NOT part of the Vite/React
-  build. Edit it directly; there is no bundler step for it and it must stay dependency-free.
+  (`index.html`, `at-capacity.html`, `input.js`, `audio.js`, `audio-worker.js`,
+  `audio-worklet.js`, `transform-worker.js`, `nosleep.js`, `styles.css`, `logo.svg`). This is
+  plain HTML/JS/CSS served by the Rust HTTP server, `include_str!`'d into the binary, NOT part of
+  the Vite/React build. Edit it directly; there is no bundler step for it and it must stay
+  dependency-free.
 
 ## Repo map
 
 ```
 src/                        desktop control UI (React + Vite)
 src-tauri/                  Rust core (crate `screenextend`, lib `screenextend_lib`, bin `ScreenExtend`)
-  src/cli.rs                the shipped command-line interface
+  src/cli.rs                the shipped command-line interface + the `probe` harness
   src/lib.rs                Tauri app: command/event registry, setup, lifecycle
-  src/logbus.rs             tprintln!/teprintln! log bus (backlog + LogLine event)
-  src/single_instance.rs    lockfile + loopback control server (focus / quit)
+  src/logbus.rs             tprintln!/teprintln! log bus (writer thread + backlog + LogLine event)
+  src/single_instance.rs    lockfile + loopback control server (focus/quit/stats/ping/reload/logs)
+  src/test_support.rs       cfg(test) only: the skip convention, percentiles, measurement output
   src/streamer/             OS-independent streaming core + the client web page
   src/windows_utils/        Windows backend
   src/macos_utils/          macOS backend
-  src/linux_utils/          Linux scaffold (compiles, mostly bail!s)
-  resources/                bundled DLLs/driver/cert + PROVENANCE.md + SHA256SUMS
+  src/linux_utils/          Linux scaffold — does NOT compile today (see below)
+  macos/ScreenExtendAudio/  the macOS 10.15–12.x virtual audio device (AudioServerPlugIn, C++)
+  resources/                bundled DLLs/driver/cert + vendored AMF & NVENC headers
+                            + PROVENANCE.md + SHA256SUMS
   binaries/                 nefconc sidecar (externalBin) + provenance
   capabilities/             Tauri permission capabilities (shell allowlist lives here)
   windows/                  NSIS hook + WiX fragment for the installer
+  tools/                    build-time-only C layout generators for the AMF and NVENC ABIs
   examples/audio_spike.rs   throwaway WASAPI/Opus measurement spike
-macos/ScreenExtendAudio/    the macOS 10.15–12.x virtual audio device (AudioServerPlugIn, C++)
-.github/workflows/          build-release.yml only (CI is currently disabled — see below)
+scripts/                    the repo's checkers (see "Checkers" below) + client test harnesses
+ci/perf-baseline.json       committed encoder timings the CI perf gate compares against
+docs/                       the engineering docs and ledgers (see "Docs" below)
+.github/workflows/          ci.yml (gates, on every push) + build-release.yml (tag `app-v*`)
 ```
+
+`linux-vdd/` and `.agents/` are gitignored scratch directories; they may be present in a working
+tree and are not part of the build.
 
 ## Commands
 
 ```sh
 pnpm install                     # native build scripts are pre-approved via allowBuilds in pnpm-workspace.yaml
-pnpm approve-builds              # interactive; only needed to approve a NEW dependency's build script
 
 pnpm tauri dev                   # run the full desktop app (host). Also regenerates src/lib/bindings.ts
 pnpm tauri build                 # production build -> src-tauri/target/release/bundle/
@@ -65,13 +74,77 @@ Linting: ESLint 9 flat config in `eslint.config.js`, scoped to `src/` (`src-taur
 (rules-of-hooks as an error), `react-refresh` and `typescript-eslint`, plus a Node-globals
 block for `scripts/**/*.mjs`. Type-aware linting is on (`parserOptions.project`), which is what
 `@typescript-eslint/no-floating-promises` needs. It passes with 0 errors and ~27 non-blocking
-warnings. TypeScript strictness is additionally enforced by `tsc` in
-`pnpm build`.
+warnings. TypeScript strictness is additionally enforced by `tsc` in `pnpm build`.
 
-Tests are inline `#[cfg(test)]` modules, several of them collected in per-module `test/`
+### Tests
+
+Rust tests are inline `#[cfg(test)]` modules, several of them collected in per-module `test/`
 subdirectories (`streamer/test/`, `windows_utils/streamer/test/`, `windows_utils/audio/test/`,
-`macos_utils/audio/test/`, `macos_utils/audio/legacy/test/`). Many are hardware- or OS-gated and
-no-op off their platform.
+`macos_utils/audio/test/`, `macos_utils/audio/legacy/test/`). Many are hardware- or OS-gated.
+
+**A test that verified nothing must say so.** That is the one rule `src-tauri/src/test_support.rs`
+exists to enforce, after an audit found six hardware-gated tests reporting `ok` having returned at
+their first line — on exactly the machine where a green tick is most misleading. So:
+
+- A runtime-gated early return goes through `crate::test_support::skip(what, reason)` (or
+  `skip_because` for a plain sentence), which prints `SKIP <what>: <reason>` on **stderr** — not
+  `teprintln!`, which nothing under `cargo test` makes visible.
+- `SE_REQUIRE_HW=1` turns every such skip into a panic, so a machine that is supposed to have the
+  capability can be made strict without a second suite.
+- A test that cannot run unattended is `#[ignore = "<reason>"]`, so the harness prints the reason
+  rather than a bare `ignored`. **Do not exclude a test by name in CI** (`--skip`): that hides it
+  from the report, which is the failure mode the convention exists to prevent.
+- `test_support::show_measurements()` routes the log bus to stderr for tests that report timings
+  with `tprintln!`, and `percentiles()` prints them in the shape `scripts/perf-gate.mjs` parses.
+
+The client page has its own suite, `pnpm test:client` (`scripts/test-client.mjs`), which runs
+seven dependency-free Node harnesses over the shipped `.js` files with `vm` and minimal browser
+stubs: the input wire format and telemetry frame, golden input vectors the Rust parser reads back,
+the Opus decode worker, the jitter buffer and the planar ring ABI, the WebCodecs video path and
+the RTP→host-clock inversion, ICE gathering, and the `/reconfig` epochs. No runner and no
+devDependency, and `src-tauri/src/streamer/static/` stays byte-identical.
+
+The `#[ignore]`d latency harnesses are documented in `docs/manual-tests/latency-harnesses.md` —
+`cargo test` never runs them, so without that note the numbers are never produced. The perf gate
+(`ci/perf-baseline.json` + `scripts/perf-gate.mjs`) keys baselines by machine class, takes the
+**lowest** of several runs per metric, and lets a key carry its own `tolerance` overriding the
+20 % default; the dev box's key is at 10 % because an idle machine is a tighter instrument than a
+shared runner. An unseeded key is not a failure — the gate reports it, uploads the observed
+numbers and passes, which is how a new runner tells you what to paste back.
+
+### Checkers
+
+Four static checks, all runnable locally in seconds, all run by CI:
+
+- `node scripts/check-bindings.mjs` — cross-checks the `collect_commands!` / `collect_events!`
+  lists in `lib.rs` against what `src/lib/bindings.ts` exports. **Needs no build**, which is the
+  point: the generated file carries `// @ts-nocheck`, so a stale binary can revert the whole TS
+  surface with nothing else failing.
+- `node scripts/check-versions.mjs` — asserts the app version is identical in all four files.
+- `node scripts/check-legacy-webkit.mjs` — re-derives the post-floor API list from `dist/` (the
+  desktop UI, Safari 13.1 floor) *and* from `src-tauri/src/streamer/static/` (the client page,
+  under a stricter contract), and fails on anything not covered by a shim or an argument.
+- `bash scripts/check-macos-dyld.sh <binary> <sdk> [--floor 10.15]` — fails on any link-time
+  symbol newer than the floor. `scripts/macos-dyld-allowlist.txt` holds the reviewed exceptions.
+
+`scripts/perf-gate.mjs` and the `scripts/test-client-*.mjs` harnesses are covered under "Tests".
+
+### Docs
+
+`docs/` is committed and is the engineering record:
+
+- `INVENTORY.md` — the component inventory, and a "Corrections to CLAUDE.md" section. **Where
+  that file and this one disagree, check the code.**
+- `CAPABILITY-TIERS.md` — every tiered subsystem × tier, with its probe and verification status.
+- `TELEMETRY.md` — the host/client measurement contract; `INPUT-PROTOCOL.md` — the input,
+  `PING`/`PONG` and `STATS` wire formats; `DATAFLOW.md`, `LATENCY-MAP.md`, `BASELINE.md`.
+- `OPTIMIZATIONS.md` — every change attempted, with before/after and a `VERIFIED` /
+  `COMPILE-CHECKED` / `UNVERIFIED` status, including the ones that were rejected.
+- `RISK-REGISTER.md`, `dev-workflow.md` (the two-machine protocol), `manual-tests/` (scripts for
+  what the development machines cannot execute), `airplay-fallback-design.md`.
+- `discovery/`, `research/`, `reviews/` — the audit reports the current work is built on.
+- `recovered/` — design notes that were deleted from the tree and restored, each with a header
+  recording the commit it came from. Read `docs/recovered/README.md` before citing one.
 
 ## The shipped CLI (`src-tauri/src/cli.rs`)
 
@@ -79,9 +152,9 @@ The single binary is both the GUI app and a full CLI; with no arguments it opens
 There are two entry points, and both matter:
 
 1. **`cli::fast_path()`** — called at the very top of `lib.rs::run`, *before* the Tauri builder.
-   Handles `--help`/`-h`/`help`, `--version`/`-V`/`version`, and the hidden macOS
-   `audio-recover` watchdog (restores the saved default audio output after a crash). These must
-   work without a Tauri app, hence the separate path.
+   Handles `--help`/`-h`/`help`, `--version`/`-V`/`version`, the hidden macOS `audio-recover`
+   watchdog (restores the saved default audio output after a crash), and the `probe` harness.
+   These must work without a Tauri app, hence the separate path.
 2. **`cli::dispatch(app.handle())`** — called from `setup`, routes everything else through
    `desktop::route` (compiled only on Windows/macOS). Every branch is `-> !` and calls `exit()`;
    returning `Outcome::LaunchGui` is what falls through to the window.
@@ -90,7 +163,7 @@ Subcommands are declared in `tauri.conf.json` under `plugins.cli` (the `tauri-pl
 matches drive the router) and implemented in `cli.rs`:
 
 ```
-serve [--http-port N] [--https-port N] [--session-id ID] [--otp CODE]
+serve [--http-port N] [--https-port N] [--session-id ID] [--otp CODE] [--otp-file PATH]
       [--no-cloud] [--no-qr] [--software-encode] [-v|--verbose]
 status [--session-id ID] [--json]
 qr [-t lan|cloud|all] [--session-id ID] [--no-render] [--json]
@@ -99,6 +172,7 @@ devices list | set <ip> [--scale --orientation --refresh-rate --video-scale
                          --video-quality --control on|off --audio on|off] | reset <ip>
 network start <ssid> <password> | stop | status | wifi-on | wifi-qr
 config list | get <key> | set <key> <value> | path      # dotted keys, e.g. serverPorts.http
+stun show | set <urls> | clear
 turn show | set <urls> [--username U] [--credential C] | clear
 account name [value] | whoami | avatar set <path>|remove|show
 autostart enable | disable | status
@@ -111,15 +185,22 @@ stop
 ```
 
 Notes:
-- `serve` is the headless host: it takes the single-instance lock, runs `platform::setup`,
-  applies saved config (ports, TURN, disconnect grace, per-device overrides), mints or takes a
-  session id + OTP, optionally registers the cloud session, prints join URLs/QRs, and blocks on
-  Ctrl+C (`ctrlc`), removing all virtual displays on the way out.
-- Most read commands accept `--json`.
+- `serve` is the headless host: it takes the single-instance lock, **starts the single-instance
+  control server** (so `stop`, `status`, `logs` and `config set` can reach it), runs
+  `platform::setup`, applies saved config (ports, STUN, TURN, disconnect grace, device trust,
+  per-device overrides), mints or takes a session id + OTP, optionally registers the cloud
+  session, prints join URLs/QRs, and blocks on Ctrl+C (`ctrlc`), removing all virtual displays on
+  the way out.
+- **Secrets do not go on argv**, which every process on the machine can read: the OTP and the
+  session id are read from `SCREENEXTEND_OTP` / `SCREENEXTEND_SESSION_ID`, from `--otp-file`, or
+  from stdin with `-`. `--otp` still works and still says so.
+- Most read commands accept `--json`. `doctor` uses its exit code as the verdict (0 fine,
+  1 unsupported OS, 3 a required permission is missing), which is what CI asserts against.
 - `network start/stop/status` are Windows-only; on macOS they print an explanatory error because
   the hosted network is owned by the running host process.
-- `stop` and the "already running" dialog talk to the running instance over
-  `single_instance`'s loopback control server.
+- `stop`, `status`, `logs` and the config replay all talk to the running instance over
+  `single_instance`'s loopback control server (`STATS` / `PING` / `RELOAD` / `LOGS` / `FOCUS` /
+  `QUIT`, each authenticated with the token in `screenextend.ctrl`).
 - On Windows the binary is GUI-subsystem in release (`windows_subsystem = "windows"` in
   `main.rs`), so `attach_console()` (`AttachConsole(ATTACH_PARENT_PROCESS)`) is what makes CLI
   output visible in the parent shell.
@@ -128,14 +209,21 @@ Notes:
   `certutil`/`nefconc`/`netsh` and exit). `route` deliberately returns `LaunchGui` for them so
   `lib.rs` keeps ownership. Prefer `drivers install|remove` and `network start` for new work.
 
-### Developer probe harness (separate, not shipped-facing)
+### Developer probe harness (`ScreenExtend probe`, not shipped-facing)
 
-`src-tauri/src/streamer/cli.rs` + `streamer/config.rs::Config::from_args` + `Streamer::probe_*`
-are a **standalone developer harness** for exercising capture→encode→WebRTC in isolation
-(`--probe-capture`, `--probe-dxgi`, `--probe-encode`, `--probe-live`, `--probe-bitrate`,
-`--whep-selftest`, plus tuning flags like `--encoder`, `--qp`, `--h264-profile`,
-`--intra-refresh`, `--scale`, `--turn-*`). It parses `std::env::args` by hand and is **not**
-wired into `main.rs`; `Config::from_args`'s help text still names an old crate.
+`cli.rs`'s `probe` module plus `streamer/config.rs::Config::from_args` and `Streamer::probe_*`
+exercise capture→encode→WebRTC in isolation. It is intercepted in `fast_path` rather than
+declared in `tauri.conf.json`, because its flags are the streamer's own and `tauri-plugin-cli`
+would reject them; and it runs **inside the Tauri app**, because `--live` and `--whep-selftest`
+need a real virtual display and therefore `platform::setup` and the `AppState` it builds.
+
+`ScreenExtend probe --help` is authoritative. Modes: `--capture`, `--dxgi`, `--encode`, `--live`,
+`--bitrate`, `--audio` (with `--process-loopback`), `--whep-selftest` (needs `--features probe`,
+which is off by default because the self-test carries a TLS verifier that accepts any
+certificate). Tuning flags include `--encoder`, `--capture-backend wgc|dxgi|auto`, `--qp`,
+`--h264-profile`, `--intra-refresh`, `--scale`, `--synthetic-pattern`, `--workload`, `--counter`
+and the `--stun`/`--turn-*` family. Several of these exist because a tier is otherwise only
+reachable by the tier above it failing, and so cannot be measured.
 
 ## The Rust ↔ TypeScript bridge (important)
 
@@ -147,46 +235,58 @@ Commands and events are defined in Rust and consumed type-safely in TS via
 - The bridge is exported to **`src/lib/bindings.ts`** (prefixed with `// @ts-nocheck`) only on a
   **debug build** *and* only when the process was started **with no CLI arguments** — see the
   `#[cfg(debug_assertions)] if std::env::args_os().nth(1).is_none()` guard. Running
-  `cargo run -- serve` in debug will not regenerate bindings; `pnpm tauri dev` will.
+  `cargo run -- serve` in debug will not regenerate bindings; `pnpm tauri dev` will. The path is
+  resolved from `CARGO_MANIFEST_DIR`, so the working directory does not decide which file is
+  written.
+- "No arguments" is only a proxy for "this is the current build", so a stale debug binary can
+  silently revert the whole surface with `tsc` none the wiser. **Diff `bindings.ts` before
+  committing**, and run `node scripts/check-bindings.mjs`, which catches it without a build.
 - **`bindings.ts` is generated — never hand-edit it.** To change the API, edit the Rust
   command/event + its `#[specta]` types and re-run `pnpm tauri dev`.
 - Frontend calls go through `commands.*` and `events.*` imported from `@/lib/bindings`.
 
 Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `check_system_requirements`, `check_permissions`, `request_permission`,
-`open_permission_settings`, `setup`, `set_session_credentials`, `register_cloud_session`,
-`unregister_cloud_session`, `get_cloud_status`, `exit_app`, `get_username`, `set_avatar`,
-`get_avatar`, `remove_avatar`, `get_network_adapters`, `watch_for_network_changes`,
-`start_hosted_network`, `stop_hosted_network`, `is_hosted_network`, `is_wifi_on`,
-`turn_on_wifi`, `install_drivers`, `remove_drivers`, `install_audio_driver`,
-`uninstall_audio_driver`, `audio_driver_status`, `set_legacy_volume_key_proxy`,
-`set_device_override`, `refresh_device_stream`, `set_device_audio_output`,
-`get_device_audio_outputs`, `remove_device_override`, `set_device_banned`,
-`set_device_approved`, `set_disconnect_grace`,
-`get_disconnect_grace`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
-`get_server_ports`, `set_disable_gpu_encode`, `get_disable_gpu_encode`, `get_log_backlog`.
+`open_permission_settings`, `relaunch_app`, `setup`, `set_session_credentials`,
+`register_cloud_session`, `unregister_cloud_session`, `get_cloud_status`, `exit_app`,
+`set_window_zoom`, `get_username`, `set_avatar`, `get_avatar`, `remove_avatar`,
+`get_network_adapters`, `watch_for_network_changes`, `start_hosted_network`,
+`stop_hosted_network`, `is_hosted_network`, `is_wifi_on`, `turn_on_wifi`, `install_drivers`,
+`remove_drivers`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
+`set_legacy_volume_key_proxy`, `set_device_override`, `refresh_device_stream`,
+`set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
+`set_device_banned`, `set_device_approved`, `set_disconnect_grace`, `get_disconnect_grace`,
+`get_display_capacity`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
+`get_server_ports`, `set_disable_gpu_encode`, `get_disable_gpu_encode`, `get_log_backlog`,
+`set_log_streaming`, `log_frontend_error`.
 
-Registered events: `DeviceJoin`, `DeviceAudioOutputs`, `DeviceModify`, `DeviceModifyAction`,
-`DeviceRemove`, `DeviceRemoveAction`, `NetworkChange`, `HostedNetworkNoPassword`,
-`CloudStatusChange`, `SessionIdChange`, `JoinAttemptsPaused`, `LogLine`.
+Registered events: `DeviceJoin`, `DeviceAudioOutputs`, `DeviceModify`, `DeviceRemove`,
+`NetworkChange`, `HostedNetworkNoPassword`, `CloudStatusChange`, `SessionIdChange`,
+`JoinAttemptsPaused`, `LogLine`.
+
+Shared types worth knowing: `CompatibilityReport` (os name/version/floor/supported, the
+`unsupported_apis` list, and the six probed backend names — audio, display, capture, encoder,
+hosted network, input) and `DisplayCapacity` (`{ max, in_use, full, backend }`, which gates the
+whole dashboard render).
 
 ## Architecture
 
 ### App lifecycle (`lib.rs::run`)
 
 `main.rs` is three lines into `screenextend_lib::run()`. `run` then:
-1. `cli::fast_path()` (help/version/audio-recover, may exit).
+1. `cli::fast_path()` (help/version/audio-recover/probe, may exit).
 2. Builds the specta `Builder` with the command/event lists; exports `bindings.ts` under the
    debug + no-args guard.
 3. Builds the Tauri app with plugins: updater (custom comparator — *any* version difference
    counts as an update), process, autostart (LaunchAgent on macOS), dialog, os,
-   clipboard-manager, shell, notification, cli, http, store. macOS gets a real app menu
-   (`build_menu`).
-4. In `setup`: `mount_events`, `cli::dispatch`, `streamer::input::prime()`, then the legacy CLI
-   subcommands, then the default branch — acquire the single-instance lock (offering "Quit
-   running instance" / "Show running instance" on conflict), `logbus::attach`, build the main
-   window (1200×675, min 1050×650, maximized, title "ScreenExtend"), focus it, and start the
-   single-instance control server.
+   clipboard-manager, shell, notification, cli, store. macOS gets a real app menu
+   (`build_menu`), and `macos_utils::objc_exception::install_logger()` runs before the builder so
+   an uncaught Objective-C exception is logged rather than an opaque abort.
+4. In `setup`: `mount_events`, `cli::dispatch`, `streamer::input::prime()`,
+   `permissions::prime()`, then the legacy CLI subcommands, then the default branch — acquire the
+   single-instance lock (offering "Quit running instance" / "Show running instance" on conflict),
+   `logbus::attach`, build the main window (1200×675, min 1050×650, maximized, title
+   "ScreenExtend"), focus it, and start the single-instance control server.
 
 The per-OS `setup` **command** (invoked from the frontend, or by `serve`) is what initializes the
 virtual display and populates `AppState`.
@@ -194,40 +294,56 @@ virtual display and populates `AppState`.
 ### Single instance (`single_instance.rs`)
 
 An exclusive `fs4` lock on `screenextend.lock` in `app_local_data_dir` is the instance token; the
-running instance also listens on an ephemeral loopback TCP port whose address is written to
-`screenextend.ctrl`, so another process can send `Focus` or `Quit`. `ScreenExtend stop` and
-`cli::host_running()` both go through this.
+running instance also listens on an ephemeral loopback TCP port whose address **and a random
+token** are written to `screenextend.ctrl`, so another process can send `FOCUS`, `QUIT`, `STATS`
+(one line of telemetry JSON), `PING` (liveness without taking the lock, which is racy), `RELOAD`
+(re-read `config.json` into the running `AppState`) or `LOGS` (the backlog). The token is
+compared in constant time, the same as the join OTP.
 
 ### Logging (`logbus.rs`)
 
 Use **`tprintln!` / `teprintln!`** (exported by `#[macro_use] mod logbus`) rather than
-`println!`/`eprintln!` in the Rust core. They push into a 2000-line ring backlog, emit a
-`LogLine` event to the UI (the Settings log terminal), and only echo to stdout/stderr when
-verbose mode is on (`serve -v`). `get_log_backlog` and `ScreenExtend logs` read the backlog.
+`println!`/`eprintln!` in the Rust core. A call site pays for exactly one bounded-channel send of
+the already-formatted `String`: no lock a capture, encode or audio thread can contend on, and no
+JSON serialization, because Tauri serializes an event payload *before* it checks whether anyone
+is listening. A dedicated `logbus` writer thread owns the 2000-line ring backlog, coalesces up to
+64 lines per 50 ms into one `LogLine` event, and emits only while the Settings log panel says it
+is listening (`set_log_streaming`). Lines are echoed to stdout/stderr only in verbose mode
+(`serve -v`). Overflow drops the line and reports the drop in-band. `get_log_backlog` and
+`ScreenExtend logs` read the backlog.
 
 ### Platform abstraction
 
 `src-tauri/src/` has three `cfg`-gated sibling modules — `windows_utils/`, `macos_utils/`,
-`linux_utils/` — each exposing the **same surface**: `AppState`, `setup`, `networking`,
+`linux_utils/` — each meant to expose the **same surface**: `AppState`, `setup`, `networking`,
 `hosted_network`, `virtual_display`, `streamer`, `compatibility`, `permissions`,
 `device_reporter`, `audio`, plus the shared command set. Windows additionally has `driver_ipc/`
-and the vendored `windows_capture/`. `lib.rs` glob-imports the active one
-(`use windows_utils::*` etc.), so the Tauri command list is identical across OSes and dispatch
-happens at compile time. `streamer/platform.rs` is the runtime dispatcher for
-capture/encode/tuning/audio-start that calls into the per-OS backend.
+and the vendored `windows_capture/`; macOS additionally has `airplay/` and `objc_exception.rs`.
+`lib.rs` glob-imports the active one (`use windows_utils::*` etc.), so the Tauri command list is
+identical across OSes and dispatch happens at compile time. `streamer/platform.rs` is the runtime
+dispatcher for capture/encode/tuning/audio-start that calls into the per-OS backend.
 
 `AppState` (identical on Windows and macOS) holds: `virtual_display`, `stop_hosted_network`,
 `hosted_network_running`, `network_adapters`, `local_ips`, `streamers`, `session_auth`,
-`device_reporter`, `device_overrides`, `sessions`, `disconnect_grace`, `user_turn`,
+`device_reporter`, `device_overrides`, `sessions`, `disconnect_grace`, `user_turn`, `stun_urls`,
 `banned_devices`, `approved_devices`, `otp_limiter`, `server_ports`, `disable_gpu_encode`,
 `cloud`, `cloud_status`, `audio_hub`.
 
-**Current support:** Windows (NVENC/QSV/AMF/x264) and macOS (VideoToolbox) are functional. Linux
-is scaffolded but non-functional. The AMD AMF backend (`windows_utils/streamer/amd/` +
-`amd_sys/`, design in `amd.md`) is complete and wired into the `Auto` chain, but **`UNVERIFIED`**
-— no machine on this project has an AMD GPU, so its FFI is asserted by `test/amd_layout.rs` and
-nothing in it has ever encoded a frame (`docs/manual-tests/amd-amf.md`). When adding a
-capability, add it to all three modules to keep the surface consistent (Linux paths may `bail!`).
+**Current support:** Windows (NVENC / Quick Sync / AMF / x264) and macOS (VideoToolbox) are
+functional.
+
+**Linux does not currently compile**, and the repo map above says so on purpose. `linux_utils`
+implements roughly two thirds of the commands `collect_commands!` names, `linux_utils/networking.rs`
+is a single blank line, `AppState` is `{}`, and `streamer/pipeline.rs` has `cfg` arms for windows
+and macos only with no `not(any(...))` fallback while `lib.rs` declares `mod streamer;`
+unconditionally. Fixing it is real work, not a flag. When adding a capability, still add it to
+all three modules to keep the surface consistent (Linux paths may `bail!`).
+
+The **AMD AMF backend** (`windows_utils/streamer/amd/` + `amd_sys/`, design in
+`windows_utils/streamer/amd.md`) is complete and wired into the `Auto` chain, but **`UNVERIFIED`**
+— no machine on this project has an AMD GPU, so its FFI is asserted by `test/amd_layout.rs`
+(numbers measured by a C compiler reading the vendored headers, not counted by hand) and nothing
+in it has ever encoded a frame. `docs/manual-tests/amd-amf.md` is the script that closes it.
 
 ### Concurrency & locking
 
@@ -235,7 +351,16 @@ Shared mutable state (`AppState` fields, the `streamer` session/override/ban map
 etc.) is guarded with **`std::sync::Mutex` — this is the one blocking mutex type for
 first-party code.** Do not introduce `parking_lot::Mutex` outside
 `windows_utils/windows_capture/` (that module is a vendored fork of the `windows-capture` crate
-and keeps its own `parking_lot` locks — leave it as-is).
+and keeps its own `parking_lot` locks; it is a fork under active maintenance, not a frozen blob,
+but keep its style).
+
+**Take a streamer-core lock with `lock_recover()`, not `.unwrap()`.** `streamer/lock.rs` adds
+`LockExt::lock_recover`, which recovers a poisoned guard, counts the recovery and logs the first
+one. The `Arc<Mutex<…>>` values here are shared across every adapter's server and the cloud
+thread, so one panic while any guard is live would otherwise poison the lock for the whole host:
+axum catches the panic per task, and the visible symptom is every request returning 500 with
+nothing in the log to explain it. The guarded data is maps, counters and epochs — a torn update
+to one of those is far cheaper than a host that must be restarted.
 
 **The rule: never hold a `std::sync::MutexGuard` across an `.await`.** Keep critical sections
 short — lock, read/copy/clone what you need, drop the guard, *then* await. This is also
@@ -244,15 +369,16 @@ compiler-enforced in `Send` contexts (axum handlers, `async` Tauri commands) bec
 non-`Send` closures/callbacks, so keep the discipline everywhere.
 
 Watch the temporary-lifetime footgun: a guard produced in an `if let` / `match` scrutinee
-(e.g. `if let Some(x) = map.lock().unwrap().get(k) { … }`) lives until the **end of the
+(e.g. `if let Some(x) = map.lock_recover().get(k) { … }`) lives until the **end of the
 block**, not the end of the line — never put an `.await` inside such a block.
 
 Use an async-aware lock (`tokio::sync::Mutex`/`RwLock`) **only** when a lock genuinely must be
 held across an `.await`. There are exactly two today, both intentional:
-`DISPLAY_CORRELATION_LOCK` in `streamer/server.rs:94` (serializes virtual-display creation
-across its `spawn_blocking`/settle awaits) and `receive_error: RwLock<…>` in
-`windows_utils/driver_ipc/client.rs`. Prefer the sync mutex + short critical section for
-anything else.
+`DISPLAY_CORRELATION_LOCK` in `streamer/server.rs` (it serializes virtual-display creation, and
+it is held **process-wide across a ≤5 s attach poll** — plus, on macOS, up to 3 s of mode-activate
+polling — so a second join can wait behind the first; the before/after device-name diff is what
+needs the exclusivity) and `receive_error: RwLock<…>` in `windows_utils/driver_ipc/client.rs`.
+Prefer the sync mutex + short critical section for anything else.
 
 Real-time threads (audio capture, the video capture callbacks) take none of these locks — see
 the capture-thread conventions below.
@@ -261,9 +387,14 @@ the capture-thread conventions below.
 
 Cross-platform core, OS-independent:
 
-- `mod.rs` — the `Streamer` type: `run`/`run_with_handle`/`serve` build a multi-thread tokio
-  runtime with `on_thread_start(platform::tune_transport_thread)` and call `server::run`;
-  `prepare()` sets DPI awareness + process tuning. Also exposes the `probe_*` entry points.
+- `mod.rs` — the `Streamer` type and **one shared tokio runtime for the whole host**
+  (`transport_runtime()`): multi-thread, at most `MAX_TRANSPORT_WORKERS` = 4 workers,
+  `on_thread_start(platform::tune_transport_thread)`, built once and kept for the process
+  lifetime. Every network adapter's server runs on it. Before this each adapter built its own
+  runtime sized to `available_parallelism()`, so three adapters on a 16-thread host meant 48
+  priority-boosted, mostly idle workers competing with the encoder; and an adapter change (a
+  Wi-Fi roam) tore a whole runtime down and rebuilt it. `prepare()` sets DPI awareness + process
+  tuning. Also exposes the `probe_*` entry points.
 - `config.rs` — `Config` (the whole streaming configuration, including the `Shared*` handles
   threaded in from `AppState`), `ScalePercent` (10–100), `EncoderVendor`
   (`auto|nvidia|intel|amd|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
@@ -272,22 +403,26 @@ Cross-platform core, OS-independent:
   creates the virtual display sized to the client, starts the pipeline. Holds the clamp
   constants: `MIN/MAX_REFRESH_RATE` 15/500, `MIN/MAX_DISPLAY_SCALE` 25/200,
   `MAX_EFFECTIVE_SCALE` 500, the input caps (`MAX_SDP_LEN` 64 KiB, `MAX_DEVICE_NAME_CHARS` 64, …),
-  `DISPLAY_ATTACH_TIMEOUT` 5 s and `LEAVE_SETTLE` 1.5 s. Routes: `/`, `/health`, `/whep`,
-  `/leave`, `/reconfig`, `/ice-config`, `/net-config`, `/audio-outputs`, plus the static assets
-  (`/input.js`, `/audio.js`, `/audio-worker.js`, `/audio-worklet.js`, `/transform-worker.js`,
-  `/nosleep.js`, `/styles.css`, `/logo.svg`). `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__`
-  substituted and the cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`)
-  that make `crossOriginIsolated` true on a secure context, which is what lets the audio ring be
-  a real `SharedArrayBuffer` (see `audio-worker.js`). The client does **not** report that back —
-  the transport is its own business; the host only needs `webcodecsOpus && worklet`.
-  It also owns the DPR ladder: `dpr_mode_ladder` pre-registers one display mode per ratio in
-  `platform::display_dpr_ladder()` (plus each transpose, so an orientation flip is already
-  registered), and the effective ratio is snapped down by `platform::snap_display_dpr`.
+  `DISPLAY_ATTACH_TIMEOUT` 5 s and `LEAVE_SETTLE` 1.5 s. Routes: `/`, `/health`, `POST /whep`,
+  `PATCH /whep/{id}` (trickle ICE, `application/trickle-ice-sdpfrag`), `DELETE /whep/{id}`,
+  `/leave`, `/reconfig`, `/ice-config`, `/net-config`, `/audio-outputs`, plus the static assets.
+  `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__` substituted and the
+  cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`) that make
+  `crossOriginIsolated` true on a secure context, which is what lets the audio ring be a real
+  `SharedArrayBuffer`; over plain HTTP they are inert and the client falls back. `at_capacity_page`
+  serves `static/at-capacity.html` when the display backend is full.
+  `server.rs` also owns the DPR ladder: `dpr_mode_ladder` builds one resolution per ratio in
+  `platform::display_dpr_ladder()`, sorted and deduped, and hands it to
+  `create_display_with_modes`; **each backend adds the transposes** (Windows in
+  `virtual_display.rs`, macOS in `mode_list`) so an orientation flip is a pure mode switch. The
+  effective ratio is snapped down by `platform::snap_display_dpr`.
 - `session.rs` — per-client session state keyed by client IP (`DeviceSessionState`, live
   display, capture stopper, sequence numbers), device overrides, the OTP limiter, disconnect
-  grace (default 10 s, range 0–600), server ports, user TURN config, per-session audio-output
-  lists. Settings changes apply live via **epoch bumps** (`bump_reconfig_epoch`,
-  `bump_kick_epoch`) rather than tearing down the display; the client polls `/reconfig`.
+  grace (default 10 s, range 0–600), server ports, user STUN/TURN config, per-session
+  audio-output lists. Display-scale and similar changes apply live via **epoch bumps**
+  (`bump_reconfig_epoch`, `bump_kick_epoch`) without tearing down the display — but note that the
+  *client's* `applyReconfig` still rebuilds its WebRTC session for most changes, so "live" means
+  the display survives, not that nothing renegotiates.
   **Device trust** (auto-join approval + bans) is keyed on a per-device **token**
   (`mint_device_token`, `Shared{Approved,Banned}Devices`, `is_device_*`), *not* the IP — the
   host mints the token on a successful OTP join and returns it via the `X-Device-Token` header;
@@ -297,24 +432,50 @@ Cross-platform core, OS-independent:
   relay's rotating-`client_id` bypass; the pause surfaces as the `JoinAttemptsPaused` event.
 - `webrtc_session.rs` — WebRTC/WHEP negotiation, ICE servers, locality detection
   (`SessionLocality`), SDP candidate summarizing, the audio DataChannel + Opus-track fallback,
-  and the loss-based bitrate driver (`getStats` poll every 120 ms). The video track is a raw
-  `TrackLocalStaticRTP` (not `TrackLocalStaticSample`): we packetize H.264 ourselves so each
-  frame's RTP timestamp carries the shared host clock (`host_ns_to_rtp90k`), which the client
-  inverts for A/V sync. NACK/RTX interceptors and loss-based BWE are unaffected.
-- `bitrate.rs` — `BitrateController` (smoothing, cut thresholds, `DEFAULT_MIN_BITRATE_BPS`
-  1 Mbps) and `estimate_from_loss`.
-- `pipeline.rs` — thin re-export layer pointing at the active OS pipeline
-  (`windows_utils::streamer::pipeline` / `macos_utils::streamer::pipeline`).
+  and the bitrate driver. The video track is a raw `TrackLocalStaticRTP` (not
+  `TrackLocalStaticSample`): we packetize H.264 ourselves so each frame's RTP timestamp carries
+  the shared host clock (`host_ns_to_rtp90k`), which the client inverts for A/V sync.
+- `packetizer.rs` — our RFC 6184 packetizer, replacing `rtp::codecs::h264::H264Payloader`, which
+  could silently drop SPS/PPS when the STAP-A aggregate did not fit the MTU and then clear the
+  stashed copies — with an infinite GOP that is a permanently black client with every host-side
+  signal reporting success.
+- `negotiate.rs` — reads the offer's `profile-level-id` and decides the H.264 profile and the
+  level the answer advertises, instead of sending Baseline to everything (Baseline costs CAVLC
+  and no 8×8 transform: 5–15 % of the bitrate at equal quality, and bytes are queueing delay).
+- `congestion.rs` — send-side congestion control from **transport-wide feedback**. The writer
+  stamps the transport-wide sequence number itself, so the host knows which packet got which
+  sequence and can read a delay signal at the browser's TWCC cadence instead of driving the
+  bitrate off RTCP `fraction_lost` at ~1 Hz. `bitrate.rs` holds `BitrateController` (smoothing,
+  cut thresholds, `DEFAULT_MIN_BITRATE_BPS` 1 Mbps) and `estimate_from_loss`.
+- `pacer.rs` — a send pacer for the per-viewer RTP writer, because webrtc-rs has none: a 40 KB
+  IDR is ~35 back-to-back datagrams landing in one 802.11 TXOP.
+- `repair.rs` — loss recovery without a keyframe. The transport writes per-frame receipts derived
+  from transport-wide feedback; the encode thread reads them at its next submit and turns them
+  into `invalidate_reference` / `use_ltr` / `mark_ltr`. `keyframe.rs` is the gate that stops the
+  four separate paths reaching for an IDR (RTCP PLI, RTCP FIR, payloader error, lagged viewer)
+  from turning a transient into a keyframe storm; its window is derived from the measured RTT.
+- `sockets.rs` — the UDP socket options webrtc-rs never sets: DSCP/`IP_TOS` so video is not in
+  the AP's best-effort queue with every background download, `SO_SNDBUF`, and Windows'
+  `SIO_UDP_CONNRESET`.
+- `telemetry.rs` — per-stage frame timing and degradation counters, all on the one host clock, so
+  a host number is directly comparable with what the client reports back over `OP::STATS`.
+  Nothing in `record` allocates, locks or logs — three relaxed `fetch_add`s and a `fetch_max`.
+  Read it with `ScreenExtend status --json`, which goes through the control server's `STATS` verb.
+- `lock.rs` — `LockExt::lock_recover`, above.
+- `pipeline.rs` — thin re-export layer pointing at the active OS pipeline.
 - `platform.rs` — the runtime dispatcher: DPI awareness, process/thread tuning,
   `max_display_dpr()` (2.0 on macOS, 4.0 elsewhere), the probe entry points,
   `start_audio_capture()`, and the `EncoderBackend`/`BackendConfig` trait shared by encoders.
+- `synthetic.rs` — the scripted workloads (`static`, `scroll`, `motion`, `drag`, `mixed`) the
+  probe harness encodes, so an encoder number can name the content that produced it.
 - `tls.rs` — self-signed cert generation at runtime (`rcgen`), cached as
   `self-signed-cert.pem`/`self-signed-key.pem` (both gitignored).
 - `cloud.rs` — cross-network relay control channel (WebSocket via `tokio-tungstenite`) to
   `wss://session.screenextend.app/host/v1/connect`, protocol version 1, 45 s heartbeat timeout,
   exponential backoff to 30 s, `CloudState` surfaced to the UI via `CloudStatusChange`.
   Cross-network joins require a configured TURN server.
-- `input/` — remote keyboard/mouse/clipboard injection: `protocol.rs` (wire format),
+- `input/` — remote keyboard/mouse/clipboard injection: `protocol.rs` (wire format, including the
+  `PING`/`PONG` pair, `STATS`, `KEYFRAME_REQUEST` and the batched pointer frames),
   `scancode.rs`, and a per-OS backend selected with `#[path]` (`windows.rs`, `macos.rs`,
   `linux.rs`, `generic.rs`). `prime()` warms the macOS keyboard path at startup.
 - `audio/` — cross-platform system-audio transport glue: `AudioPacket`, `AudioDiagnostics`,
@@ -333,27 +494,47 @@ Cross-platform core, OS-independent:
   backend (libopus is cross-platform C; only the bundled library name differs: `libopus.dll` vs
   `libopus.dylib`). `macos_utils/audio/opus_encoder.rs` is only a re-export of these.
 - `static/` — the client browser page (see below).
-- `test/` — `whep_selftest.rs` (in-process WHEP client that asserts RTP flows) and `bitrate.rs`.
+- `test/` — `whep_selftest.rs` (in-process WHEP client that asserts RTP flows), `bitrate.rs`, and
+  the trickle-ICE golden vector (`.sdpfrag`, pinned `binary` in `.gitattributes` because it is
+  the exact CRLF body the client writes).
 
 ### Video capture & encode — Windows (`windows_utils/streamer/`)
 
 - `capture.rs` / `windows_capture/` — Windows.Graphics.Capture path; `windows_capture/` is a
-  **vendored fork** of the `windows-capture` crate (keep its `parking_lot` locks and style).
-- `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing.
-- `scaler.rs`, `tuning.rs` — GPU scaling and process/thread priority tuning.
+  **vendored fork** of the `windows-capture` crate (2.0.0), already modified, so treat it as
+  first-party code that happens to use `parking_lot`.
+  `windows_capture/FORK.md` records the upstream pin and checksum, every divergence and every
+  deleted file — read it before changing anything in there, and update it in the same commit.
+- `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
+  and is otherwise only reached by WGC failing, which is why the probe harness has
+  `--capture-backend dxgi` to force it.
+- `scaler.rs`, `tuning.rs`, `workload_window.rs` — GPU scaling, process/thread priority tuning,
+  and a borderless window that paints a scripted workload onto a real display so `--workload` can
+  exercise capture as well as encode.
 - Encoders: `nvidia/` (hand-written NVENC FFI in `nvenc_sys/`), `intel/` (oneVPL / Quick Sync FFI
   in `intel_sys.rs`), `amd/` (AMF, with the hand-written C-vtable FFI in `amd_sys/`), `x264/`
-  (libx264 FFI, the CPU fallback).
+  (libx264 FFI, the CPU fallback). `intel.md` and `amd.md` sit beside them and are the reference
+  for why each backend is configured the way it is.
 - `pipeline.rs` picks the backend: `EncoderVendor::Auto` tries NVENC → Intel → AMF → x264;
   `Intel` tries the same-adapter path, then an own-device "CPU bridge" (`Backend::IntelCpu`),
   then x264; `Amd` likewise (`Backend::Amf` → `Backend::AmfCpu` → x264); `Software` goes straight
   to x264. Vendor detection is by DXGI **`VendorId`** (`Vendor::from_pci_id`), falling back to
-  the description string (`select_vendor`) only where no id is available. NVENC uses a texture
-  ring to decouple capture from encode; AMF uses one to keep the capture texture free while it
-  encodes.
-- **The AMF backend is `UNVERIFIED`** — see the "Current support" note above. Its ABI is
-  regenerated from the vendored MIT headers in `resources/amf-headers/` by
-  `tools/amf_layout_gen.c`; never hand-edit the generated bodies in `test/amd_layout.rs`.
+  the description string (`select_vendor`) only where no id is available. The tier that actually
+  started is reported through `CompatibilityReport.encoder_backend`, not only to the log.
+- NVENC runs **asynchronous mode** when the caps report it and `nvEncRegisterAsyncEvent` exists:
+  a per-picture completion event with a bounded `WaitForSingleObject` turns a wedged encoder into
+  a named error instead of a thread blocked inside the driver, and it allows several output
+  buffers instead of one. `SE_NVENC_NO_ASYNC=1` goes back to the synchronous path. It also runs
+  up to `MAX_LTR_SLOTS` = 2 long-term reference slots, cap-gated on
+  `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, which is what lets `repair.rs` answer a loss with a
+  P-frame predicted from a reference the client is known to hold rather than an IDR.
+- **The FFI layout tests are generated from the real headers, by a C compiler.** `test/nvenc_layout.rs`
+  and `test/amd_layout.rs` assert struct sizes, field offsets, vtable slot indices, GUIDs and
+  struct revision words measured by `tools/nvenc_layout_gen.c` / `tools/amf_layout_gen.c` reading
+  the vendored headers in `resources/{nvenc,amf}-headers/` — not by a bindgen run checking itself.
+  A wrong revision word or vtable slot is not a compile error and not a crash; it is a silent
+  degrade to the next vendor on a machine with working hardware. **Never hand-edit the generated
+  `abi_*` bodies**; regenerate them. `src-tauri/tools/README.md` has the procedure.
 
 ### Video capture & encode — macOS (`macos_utils/streamer/`)
 
@@ -366,19 +547,27 @@ Cross-platform core, OS-independent:
 - `sck.rs` — the SCK backend. **Dyld-safety is load-bearing**: SCK only exists on 12.3+, so a
   link-time reference (`objc2-screen-capture-kit`, an `extern_class!`, any 12.3+ `extern static`)
   would add an undefined dyld symbol absent on the 10.15 floor and break loading of the *whole*
-  binary. It therefore uses runtime interop only — `AnyClass::get`, `msg_send!`, and a
-  `ClassBuilder`-constructed `SCStreamOutput` delegate.
+  binary. It therefore uses runtime interop only — `AnyClass::get`, `msg_send!`, `dlsym` for the
+  string constants, and a `ClassBuilder`-constructed `SCStreamOutput` delegate. Its module doc
+  numbers the eight steps of the flow and the body comments refer back to those numbers.
 - `cgds.rs` — the CGDisplayStream fallback, IOSurface → CVPixelBuffer, ITU-R 709 YCbCr. Every
   function and constant is `dlsym`'d: the API is *obsoleted* in the macOS 15 SDK, and a link-time
   reference to a symbol Apple has announced the end of would make the whole binary unloadable the
   day it goes. Surfaces held past the callback carry an `IOSurfaceIncrementUseCount`, which the
   header requires and without which WindowServer overwrites frames mid-encode.
-- `encoder.rs` — VideoToolbox H.264 compression session; `gpu.rs` — an empty placeholder (the
-  macOS path needs no GPU convert or scale stage: WindowServer delivers the frame already scaled
-  and already in `420f`, and the IOSurface reaches VideoToolbox without a copy); `frame.rs` —
-  `Frame`/`FrameSink`; `display.rs`, `config.rs` — display
-  enumeration and modes; `mach.rs` — `mach_absolute_time`; `qos.rs`, `tuning.rs`, `power.rs`,
-  `activity.rs` — thread QoS, process tuning, power/idle assertions.
+- `encoder.rs` — VideoToolbox H.264 compression session; `clock.rs` — the capture-time gate (an
+  OS frame stamp is used only when it is in the past, because CGDisplayStream's `displayTime` is
+  a *scheduled presentation* time, ahead of delivery on every frame); `gpu.rs` — an empty
+  placeholder (the macOS path needs no GPU convert or scale stage: WindowServer delivers the frame
+  already scaled and already in `420f`, and the IOSurface reaches VideoToolbox without a copy);
+  `frame.rs` — `Frame`/`FrameSink`; `display.rs`, `config.rs` — display enumeration and modes;
+  `mach.rs` — `mach_absolute_time`; `qos.rs`, `tuning.rs`, `power.rs`, `activity.rs` — thread QoS,
+  process tuning, power/idle assertions.
+- VideoToolbox **does** have long-term references from macOS 12.0, but token-based: the encoder
+  picks its own and hands back an opaque `RequireLTRAcknowledgementToken`. There is no slot to
+  name, so `RepairAction`'s `mark_ltr`/`use_ltr_bitmap` have nothing to map onto and the macOS
+  pipeline declares zero slots — every repair is still a keyframe. `Encoder::supports_ltr()`
+  reports per session whether this Mac advertises the property. See `docs/OPTIMIZATIONS.md`.
 - `virtual_display.rs` — the private CoreGraphics `CGVirtualDisplay*` classes via
   `extern_class!` / `extern_methods!` (objc2 resolves these at runtime, so a Mac without them
   still loads the binary — but instantiating a missing class panics, hence the probe below).
@@ -429,16 +618,17 @@ it on a machine where tier 1 works.
 
 - `silence.rs` — a **silent render companion** is mandatory for tier 1: it is the clock source
   that makes the loopback event fire and keeps packets flowing while the host is idle (measured:
-  0/20 event signals without it, 20/20 with it). It is also the only stream we own that may ask
-  the engine for a smaller period (`engine.rs`, `IAudioClient3::InitializeSharedAudioStream`),
-  which the capture stream then inherits — a probed tier that is a correctly-detected no-op on
-  hardware exposing a single period. Started lazily, stopped with the capture, and its death is
-  now detected, logged, counted and recovered from.
+  0/20 event signals without it, 20/20 with it — `docs/recovered/AUDIO_NOTES.md` §3.2). It is
+  also the only stream we own that may ask the engine for a smaller period (`engine.rs`,
+  `IAudioClient3::InitializeSharedAudioStream`), which the capture stream then inherits — a
+  probed tier that is a correctly-detected no-op on hardware exposing a single period. Started
+  lazily, stopped with the capture, and its death is detected, logged, counted and recovered from.
 - `engine.rs` — `GetSharedModeEnginePeriod` / `GetDevicePeriod`. The engine *period* and the
   engine *buffer* are different numbers and are reported separately.
 - `format.rs` — mix-format negotiation; 48 kHz float32 stereo is the fast path, a non-matching
   endpoint is `AUTOCONVERTPCM`'d by the engine, and if the engine refuses, capture falls back to
-  the endpoint's own format and downmixes (ITU BS.775) / converts int→float in userspace.
+  the endpoint's own format and downmixes (ITU BS.775) / converts int→float in userspace. Note
+  that the fast path is not zero-copy: it is a load/clamp/push loop over the wake's frames.
 - `device.rs` — `IMMNotificationClient`; its callback runs on a COM thread we don't own, so it
   only posts to the capture thread over `crossbeam-channel` (never blocks, never takes the
   capture lock). `guards.rs` holds the RAII COM/handle/mix-format wrappers.
@@ -466,9 +656,9 @@ the UI through `CompatibilityReport.audio_backend`.
 - `process_tap.rs` — **Core Audio Process Tap** (`CATapDescription` + aggregate device + IOProc),
   macOS **14.2+**, preferred (audio-only, no screen-recording indicator). The aggregate device's
   tap-list UID must match the `CATapDescription` UUID or the tap returns `noErr` but pure silence
-  (the documented failure mode) — built exactly like the `AudioCap` reference. Teardown is RAII in
-  order stop→destroyIOProc→destroyAggregate→destroyTap so a leaked tap can't persist a hidden
-  capture.
+  (the documented failure mode) — built exactly like the `AudioCap` reference, from the
+  description's own `UUIDString`. Teardown is RAII in order
+  stop→destroyIOProc→destroyAggregate→destroyTap so a leaked tap can't persist a hidden capture.
 - `sck_audio.rs` — **ScreenCaptureKit `capturesAudio`**, macOS **13.0+**, fallback. SCK has no
   audio-only mode, so it rides a minimal 2×2/1 fps dummy video stream; uses the existing Screen
   Recording permission.
@@ -476,21 +666,20 @@ the UI through `CompatibilityReport.audio_backend`.
   Windows never produces) → interleaved-stereo f32; BS.775 downmix duplicated from the Windows
   sibling (the byte layouts diverge too much to share cleanly).
 - `mod.rs` — the shared `AudioSource` trait over all backends, the `probe_audio_backend()` tiering
-  (Process Tap → SCK → **VirtualDevice** (10.15–12.x) → `NeedsDriverInstall` → `Unsupported`; native
-  cached, legacy recomputed since install state flips at runtime), and the encoder worker.
-- `legacy/` — the **macOS 10.15–12.x virtual-device tier** (`PRD-macos-legacy-audio.md`,
-  `AUDIO_NOTES_MACOS_LEGACY.md`). Below 13.0 there is no native system-audio API at all, so this
-  ships ScreenExtend's own **AudioServerPlugIn** virtual device (built on libASPL/MIT, in
-  `src-tauri/macos/ScreenExtendAudio/`), sets it as the default output, and reads the captured mix back over a
-  POSIX shared-memory ring (`shm_reader.rs`, with a HAL-input fallback) into the same encoder ring —
-  zero new Opus/client code. `routing.rs` saves/switches/restores the default output (+ crash
-  recovery on launch); `playthrough.rs` plays the capture to the real device with a gain stage;
-  `volume_proxy.rs` + the driver's Volume/Mute controls keep the macOS volume keys working while the
-  virtual device is default (the classic UX regression this tier must repair), with `volume_keys.rs`
-  as a `CGEventTap` backstop that intercepts F10/F11/F12 directly if the OS doesn't re-enable them.
-  `installer.rs` runs a signed/notarized `.pkg` behind one admin prompt. **This tier is never selected on 13.0+** (native
-  wins). **Privacy:** it makes ScreenExtend the system output device while streaming — an extra
-  reason it is opt-in per device.
+  above, and the encoder worker.
+- `legacy/` — the **macOS 10.15–12.x virtual-device tier**. Below 13.0 there is no native
+  system-audio API at all, so this ships ScreenExtend's own **AudioServerPlugIn** virtual device
+  (built on libASPL/MIT, in `src-tauri/macos/ScreenExtendAudio/`), sets it as the default output,
+  and reads the captured mix back over a POSIX shared-memory ring (`shm_reader.rs`, with a
+  HAL-input fallback) into the same encoder ring — zero new Opus/client code. `routing.rs`
+  saves/switches/restores the default output (+ crash recovery on launch); `playthrough.rs` plays
+  the capture to the real device with a gain stage; `volume_proxy.rs` + the driver's Volume/Mute
+  controls keep the macOS volume keys working while the virtual device is default (the classic UX
+  regression this tier must repair), with `volume_keys.rs` as a `CGEventTap` backstop that
+  intercepts F10/F11/F12 directly if the OS doesn't re-enable them. `installer.rs` runs a
+  signed/notarized `.pkg` behind one admin prompt. **This tier is never selected on 13.0+**
+  (native wins). **Privacy:** it makes ScreenExtend the system output device while streaming — an
+  extra reason it is opt-in per device.
 
 **Dyld-safety (load-bearing, same rule as the video SCK backend):** the 14.2 tap functions are
 `dlsym`'d, `CATapDescription`/SCK classes come from `AnyClass::get`, SCK audio uses runtime
@@ -504,42 +693,71 @@ A/V clock is the shared `streamer::audio::host_now_ns()` (a monotonic `Instant` 
 backed by `mach_absolute_time` on macOS), *not* raw `mach_now()` ticks, so audio `capture_ns` and
 the video RTP stamps ride one epoch.
 
-### The macOS audio driver project (`macos/ScreenExtendAudio/`)
+### The macOS audio driver project (`src-tauri/macos/ScreenExtendAudio/`)
 
 A standalone C++ `AudioServerPlugIn` (not DriverKit — Apple does not grant DriverKit
 entitlements for virtual audio devices), built on libASPL. Compiled with `clang++` directly via
-`scripts/build.sh` (no CMake/Xcode needed), packaged/signed/notarized via `scripts/package.sh`
-and `scripts/sign_and_notarize.sh`, installed to `/Library/Audio/Plug-Ins/HAL/`. The
-shared-memory byte layout in `macos/ScreenExtendAudio/src/shm_ring.hpp` is a **hard ABI
-contract** with `macos_utils/audio/legacy/shm_reader.rs` — change both together. All branded
-strings live in `macos/ScreenExtendAudio/src/branding.hpp`. Its README records current status: it compiles and links against the 10.15
-SDK, but has never been signed, installed or loaded, so runtime behaviour is unverified.
+`scripts/build.sh` (no CMake/Xcode needed) and packaged by `scripts/package.sh`;
+`scripts/release.sh` is the one command that does build → sign → package → notarize → staple,
+skipping cleanly whichever steps have no identity configured, so a developer with no Apple
+credentials still gets an unsigned `.pkg`. Installed to `/Library/Audio/Plug-Ins/HAL/`. The
+shared-memory byte layout in `src/shm_ring.hpp` is a **hard ABI contract** with
+`macos_utils/audio/legacy/shm_reader.rs` — change both together. All branded strings live in
+`src/branding.hpp`.
+
+**Status: verified end to end on the 10.15.8 development Mac** (SIP disabled) — it builds from a
+clean tree, the `.pkg` installs and `coreaudiod` picks the device up without a reboot, the
+plug-in loads and creates its shared-memory segment, and 2,083,840 samples have gone through
+`OnProcessMixedOutput` into the shipped `start_capture()` path with 0 overruns and every
+`capture_ns` delta exactly 5.000 ms. What is **not** verified: signing and notarization (no Apple
+Developer identity on either machine, so it has only ever loaded with SIP disabled), arm64 (the
+10.15 SDK cannot target it), and the non-stereo downmix branch. Its README and
+`docs/manual-tests/macos-audio-driver-signing.md` carry the detail.
 
 ### The client web page (`streamer/static/`)
 
+It is one shared scope with no build step, so everything about it is a compatibility question
+first. Each subsystem degrades through explicit **tiers**, and every tier is a value the client
+reports back to the host in the `OP::STATS` frame — a device on the slow path must not look like
+one on the fast path (`docs/TELEMETRY.md`).
+
 - `index.html` — the join form (session id, device name, 6-digit OTP, fullscreen toggle), the
-  video stage (`<video>` / `<canvas>` swap), and four modals: HTTPS upsell,
-  limited-browser-support warning, same-device warning (driven by the `__SAME_DEVICE_FLAG__`
-  substitution) and remote-control permission. It also drives `/reconfig` polling,
-  viewport/orientation/DPR reporting, and kick handling.
-- `transform-worker.js` — WebCodecs/insertable-streams video path; recovers each frame's
-  host-capture time from its RTP timestamp and reports the display lag.
+  video stage (`<video>` / `<canvas>` swap), and the modals: HTTPS upsell, limited-browser-support
+  warning, same-device warning (driven by the `__SAME_DEVICE_FLAG__` substitution) and
+  remote-control permission. It also drives `/reconfig` polling, trickle ICE, viewport /
+  orientation / DPR reporting, and kick handling. It owns the two tier enums:
+  `VIDEO_PATH = { webcodecsCanvas, webcodecsVideo, videoElement }` and
+  `AUDIO_PATH = { workletSab, workletPort, workletPost, opusTrack }`.
+- `at-capacity.html` — served instead of the join form when the display backend is full.
+- `transform-worker.js` — the WebCodecs video path, over `RTCRtpScriptTransform` where it exists
+  and the legacy `createEncodedStreams` where it does not (`TRANSPORT` tiers), rendering either
+  into a canvas or through a `VideoTrackGenerator` (`renderTier`). It recovers each frame's
+  host-capture time from its RTP timestamp. **It never schedules; it resynchronises** — frames are
+  painted inline in the decoder's output callback, and when the decoder falls behind the answer is
+  to drop to the freshest frame and ask for a keyframe. The out-of-band keyframe request is only
+  claimed as a tier once a `PONG` says the host parses the opcode.
 - `audio.js` — owns the `AudioContext`, the worklet node and the decoder worker, plus the NetEQ
   track fallback. On the fast path it does nothing per packet but transfer the DataChannel buffer
   to the worker. It commands the worklet a buffer depth so audio plays in step with the picture;
-  measured offset via `SEAudio.getSyncInfo()` (no on-screen HUD).
+  measured offset via `SEAudio.getSyncInfo()` (no on-screen HUD). It also owns the ring's
+  allocation size, which makes the ring layout a **three-file** contract.
 - `audio-worker.js` — Opus decode off the main thread: header parse, dedup, WebCodecs
   `AudioDecoder`, deinterleave, ring write. An `RTCDataChannel` cannot be handed to a worker, so
   the page still receives the packet — but nothing else happens there.
 - `audio-worklet.js` — our jitter buffer; corrects drift only at silence boundaries. The ring is
   **planar** (separate L/R regions) so both sides are `set()` memcpys, and its byte layout is a
-  hard contract with `audio-worker.js` — change the two together. Cross-origin isolated, it is a
-  `SharedArrayBuffer` the worker writes and the worklet reads with `Atomics`, so a decoded packet
-  reaches the speakers without touching a message queue; otherwise the identical ring is private
-  and the worker's samples arrive by `postMessage` (via the page) as they always did. Positions
-  are absolute uint32 frame counters, which is why the capacity must stay a power of two.
-- `input.js` — pointer/keyboard/clipboard capture and the input wire protocol.
+  hard contract with `audio-worker.js` and `audio.js` — change the three together. Cross-origin
+  isolated, it is a `SharedArrayBuffer` the worker writes and the worklet reads with `Atomics`, so
+  a decoded packet reaches the speakers without touching a message queue; otherwise the identical
+  ring is fed over a `MessageChannel`, or by `postMessage` via the page. Positions are absolute
+  uint32 frame counters, which is why the capacity must stay a power of two.
+- `input.js` — pointer/keyboard/clipboard capture, the input wire protocol, coalesced pointer
+  batching, and `noteHostCaps` (the host capability bits in the `PONG` tail). Nothing on the page
+  may assume an optional mechanism works before the first `PONG` carrying its bit lands.
 - `nosleep.js` — keeps the client screen awake.
+
+The page has been through seven cold review passes (`docs/reviews/`), covering correctness,
+fallbacks, old browsers and regressions; read the relevant one before reworking a subsystem.
 
 ### Desktop UI (`src/`)
 
@@ -552,12 +770,19 @@ SDK, but has never been signed, installed or loaded, so runtime behaviour is unv
   per-IP audio outputs, hosted-network state. `App.tsx` also subscribes to backend events
   (`deviceJoin`, `deviceModify`, `deviceAudioOutputs`, `deviceRemove`, `networkChange`,
   `sessionIdChange`, `hostedNetworkNoPassword`, `joinAttemptsPaused`), mirrors them into that
-  state, and raises OS notifications via `@tauri-apps/plugin-notification`.
+  state, and raises OS notifications via `@tauri-apps/plugin-notification`. `dashboard.tsx`
+  additionally subscribes to `cloudStatusChange` and gates its render on `get_display_capacity`.
 - **Onboarding walkthrough** uses `nextstepjs` (`src/components/walkthrough.tsx`), which expects
   `next/navigation`; Vite aliases that to `src/lib/next-navigation-stub.ts` — keep the alias if
   you touch the resolver config in `vite.config.ts`.
+- The Settings page carries a monaco-based `config.json` editor (`config-json-editor.tsx`,
+  `json-editor.tsx`, `lib/monaco-*.ts`, `lib/config-schema.ts`, `lib/apply-config.ts`) and the log
+  terminal (`log-terminal.tsx`, which buffers to a `requestAnimationFrame` and keys rows by a
+  monotonic sequence so a burst is one commit, not 2000 repainted rows).
 - `src/lib/`: `bindings.ts` (generated), `zoom.ts` (webview zoom + persistence), `avatar.ts`,
-  `utils.ts` (`buildQrValues`, `generatePassword`, `cn`), `next-navigation-stub.ts`.
+  `utils.ts` (`buildQrValues`, `generatePassword`, `cn`), `error-reporting.ts` (routes
+  `console.error` to the log bus), `route-chunks.ts` / `preload-editor.ts` (chunking and the
+  editor preload), `legacy-webview-polyfills.ts`, `next-navigation-stub.ts`.
 - **i18n** is a custom lightweight implementation in `src/i18n/` (`useSyncExternalStore` +
   `import.meta.glob` over `locales/*.json`, locale persisted in `localStorage`) — NOT
   react-i18next. Use the `useTranslation()` hook and add keys to `src/i18n/locales/en.json`
@@ -573,35 +798,56 @@ User config is stored **frontend-side** in `tauri-plugin-store`'s `config.json` 
 
 ```
 name, theme, devices[], knownDevices[], sessionPassword, publicSessionsEnabled, zoomFactor,
-disableGpuEncode, legacyVolumeKeyProxy, walkthroughCompleted,
+disableGpuEncode, legacyVolumeKeyProxy, walkthroughCompleted, disconnectGraceSecs,
 serverPorts{http,https}, hostedNetworkCredentials{name,password},
-turnConfig{urls,username,credential}, dontShowAgain{editDevice,editNetwork,compatibility}
+turnConfig{urls,username,credential}, stunUrls,
+dontShowAgain{editDevice,editNetwork,compatibility,configEditor}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
 remoteControl, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os, screenSize, dpr,
-maxDpr }`.
+maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
 
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,
 `setServerPorts`, `setDisableGpuEncode`, `setDeviceBanned`, `setDeviceApproved`,
-`setLegacyVolumeKeyProxy`). The **CLI reads and writes the same store directly** (`cli.rs`'s
-`open_store` / `get_nested` / `set_nested`, dotted keys), and `serve` replays it into `AppState`
-at startup (`apply_saved_devices`). So a new setting usually needs three touches: the TS config
-type + default, the Rust command, and the `serve`/`config` CLI path.
+`setLegacyVolumeKeyProxy`); `stunUrls` is read on the Rust side at `setup`. The **CLI reads and
+writes the same store directly** (`cli.rs`'s `open_store` / `get_nested` / `set_nested`, dotted
+keys), `serve` replays it into `AppState` at startup (`apply_saved_config`), and the control
+server's `RELOAD` verb replays it into a *running* host. So a new setting usually needs three
+touches: the TS config type + default, the Rust command, and the `serve`/`config` CLI path.
 
 ## Versioning & releases
 
-- The version string is duplicated in **four** places and must be kept in sync:
-  `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and
-  `src-tauri/tauri.macos.conf.json` (`src-tauri/Cargo.lock` then updates automatically).
-  The Rust side reads the version from `CARGO_PKG_VERSION` / Tauri package info at runtime —
-  there is no hardcoded version literal in `src-tauri/src/`. Current version: **0.5.4**.
-- **CI is currently disabled.** `.github/workflows/ci.yml` was removed in commit `e1d5d28`
-  ("temporarily disable ci till further notice"); only `build-release.yml` remains,
-  so **nothing runs `cargo fmt`/`clippy`/`test` or `pnpm lint` automatically — run them
-  locally before pushing.** (`README.md` still describes the old always-on CI; that paragraph is
-  stale.)
+- The version string is duplicated in **four** files and must be kept in sync: `package.json`,
+  `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `src-tauri/tauri.macos.conf.json`
+  (`src-tauri/Cargo.lock` then updates automatically). `node scripts/check-versions.mjs` asserts
+  it, in CI and locally. The Rust side reads the version from `CARGO_PKG_VERSION` / Tauri package
+  info at runtime — there is no hardcoded version literal in `src-tauri/src/`, and there is
+  deliberately none in this file either.
+- **CI** (`.github/workflows/ci.yml`) runs on **every push to any branch** and on pull requests,
+  so it runs whenever the repository owner pushes. Jobs:
+  - `frontend` (ubuntu) — `pnpm lint`, `pnpm build`, `check-legacy-webkit.mjs`,
+    `pnpm test:client`, `check-bindings.mjs`, `check-versions.mjs`.
+  - `rust` (windows-latest, macos-13, macos-14, macos-15) — `pnpm build` first because
+    `tauri_build` embeds `../dist` at compile time, then `cargo fmt --check`,
+    `cargo clippy --all-targets -- -D warnings`, and a plain `cargo test` with **no `--skip`**:
+    a test that cannot run on the runner gates itself through `test_support::skip`.
+  - `macos-smoke` (macos-13/14/15) — the runners are the only machines on this project where
+    12.3+/13+/14.2+ code can execute at all. Builds the host binary, asserts `doctor --json`
+    reports the probed backends and that the **audio tier matches the runner's macOS**
+    (`screencapturekit` on macos-13, `process_tap` on 14/15), then runs the `#[ignore]`d
+    VideoToolbox encode tests.
+  - `dyld-floor` (macos-15) — release build, `otool -L` for any framework absent on 10.15,
+    `LC_BUILD_VERSION` against `minimumSystemVersion`, then `check-macos-dyld.sh --floor 10.15`.
+    The runner SDK is not the 10.15 SDK, so the strong verdict still comes from the dev Mac.
+  - `blob-checksums` (ubuntu) — `sha256sum -c` over both `SHA256SUMS` files. This is what both
+    `PROVENANCE.md` files mean by "verified in CI".
+  - `perf-gate` (windows) — three release runs of the x264 encoder tests, lowest taken, compared
+    against `ci/perf-baseline.json`.
+
+  A predecessor `ci.yml` existed for 4 minutes in 2026-08 and never ran; the current file is new
+  configuration, not a restoration.
 - **Release CI** (`.github/workflows/build-release.yml`) triggers on pushing a tag matching
   `app-v*` (or a manual `workflow_dispatch`) — **not** on push to `main`. It builds Windows x64
   and macOS universal (`--target universal-apple-darwin --config src-tauri/tauri.macos.conf.json`)
@@ -616,7 +862,12 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
 - **Windows bundle resources** (`tauri.conf.json` → `bundle.resources`): the signed Virtual
   Display Driver (`VirtualDisplayDriver.dll`/`.cat`/`.inf`), its cert (`ScreenExtend.cer`),
   `libx264-164.dll` (software-encode fallback), and `libopus.dll` (system-audio Opus encode,
-  loaded via `libloading`). Provenance + SHA-256 in `resources/PROVENANCE.md` / `SHA256SUMS`.
+  loaded via `libloading`). Provenance + SHA-256 in `resources/PROVENANCE.md` / `SHA256SUMS`,
+  checked by the `blob-checksums` CI job. The vendored AMF and NVENC headers live under
+  `resources/{amf,nvenc}-headers/` and are pinned `text eol=lf` in `.gitattributes` — without
+  that, a Windows checkout changes their bytes and the checksum job disagrees with every local
+  run. **Any new vendored blob directory needs a `.gitattributes` line at the same time as its
+  checksum.**
   `binaries/nefconc` is an `externalBin` sidecar driven with `certutil` to install the driver
   (requires Administrator; elevation via the `elevated-command` crate). Installer integration
   lives in `windows/hooks.nsh` (NSIS) and `windows/fragment.wxs` (WiX driver cleanup).
@@ -636,26 +887,34 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   `app.security.csp`.
 - **Permissions** are a real command surface on macOS (`macos_utils/permissions.rs`:
   Accessibility for remote input, Screen Recording for capture, with check / request / open
-  settings); the Windows and Linux implementations return an empty list. **Location Services is
-  deliberately never requested.** macOS treats a Wi-Fi SSID as location data, so `CWInterface.ssid`
-  can return nil without it and the dashboard then labels the adapter "Wi-Fi" — on purpose, not by
-  accident. A Location prompt is one of the heaviest consents macOS shows and the only thing it
-  would buy here is a cosmetic label on a row that already carries the adapter's addresses; do not
-  add it. `macos_utils/networking.rs::wifi_ssid` says so once in the log.
+  settings / relaunch); the Windows and Linux implementations return an empty list.
+  **Location Services is deliberately never requested.** macOS treats a Wi-Fi SSID as location
+  data, so `CWInterface.ssid` can return nil without it and the dashboard then labels the adapter
+  "Wi-Fi" — on purpose, not by accident. A Location prompt is one of the heaviest consents macOS
+  shows and the only thing it would buy here is a cosmetic label on a row that already carries the
+  adapter's addresses; do not add it. `macos_utils/networking.rs::wifi_ssid` says so once in the
+  log.
 
 ## Conventions & gotchas
 
-- Never hand-edit `src/lib/bindings.ts`; regenerate with `pnpm tauri dev` (debug + no CLI args).
+- Never hand-edit `src/lib/bindings.ts`; regenerate with `pnpm tauri dev` (debug + no CLI args),
+  diff it, and run `node scripts/check-bindings.mjs`.
 - A new Tauri command must be added to **all three** `*_utils` modules and to
   `collect_commands!`.
 - Use `tprintln!`/`teprintln!`, not `println!`/`eprintln!`, in the Rust core.
-- Keep `std::sync::Mutex` critical sections short and never hold one across `.await`.
+- Take streamer-core mutexes with `lock_recover()`; keep critical sections short and never hold
+  one across `.await`.
+- **Probe the capability, never the version number.** Every tiered subsystem in this repo picks
+  its tier by attempting the thing — `AnyClass::get`, `dlsym`, `GetProcAddress`, a trial API call,
+  a feature-level query — because a version number says nothing about a machine whose hardware,
+  drivers or permissions differ inside the same release. `docs/CAPABILITY-TIERS.md` is the table
+  of every tier, its probe and its verification status; a new tier belongs in it.
 - **No link-time references to macOS APIs newer than 10.15** — use `dlsym` / `AnyClass::get` /
   `msg_send!`. An eagerly-bound symbol dyld cannot resolve kills the whole process before
   `main()`, so this is a load bug, not a missing feature. `extern static` constants count:
   two VideoToolbox property keys (`MaximizePowerEfficiency`, 10.14;
   `PrioritizeEncodingSpeedOverQuality`, 11.0) had to move to `set_optional_bool` for exactly
-  this reason. Check with `nm -u target/release/ScreenExtend`.
+  this reason. Check with `scripts/check-macos-dyld.sh`, or `nm -u target/release/ScreenExtend`.
 - The client page has no build step and no dependencies; it must keep working in older mobile
   browsers (that constraint is why, for instance, flex `gap` was replaced with margins). It is
   one shared scope, so a single unsupported *token* anywhere in `index.html`, `input.js` or
@@ -672,9 +931,11 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
   never to buffer. Backpressure is measured as decodes that have not yet produced an *output*,
   never as `decodeQueueSize`, which counts acceptance and can read zero with frames in flight.
 - Every silent degradation on the client page is a bit in the `OP::STATS` frame
-  (`docs/TELEMETRY.md`). A new `catch (_) {}` there should call `noteSuppressed()`, and a new
-  tier should get a byte, or the host cannot tell a device on the slow path from one on the
-  fast path.
+  (`docs/TELEMETRY.md`, `docs/INPUT-PROTOCOL.md`). A new `catch (_) {}` there should call
+  `noteSuppressed()`, and a new tier should get a value, or the host cannot tell a device on the
+  slow path from one on the fast path. The `PONG` tail carries the host's capability bits the
+  same way, and both frames are **prefix-stable**: a reader that sees fewer bytes than it knows
+  about reads the prefix and treats the rest as absent.
 - DPR is only correct when the resolution multiplier and the OS scale step are the **same
   number**: resolution x `d`, DPI `100*d`%. Snap `d` with `platform::snap_display_dpr` (Windows
   exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),
@@ -683,14 +944,15 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
 - Simultaneous displays are **uncapped**. `VirtualDisplayController::max_concurrent_displays()`
   returns `None` everywhere except the macOS AirPlay tier, which returns `Some(1)` because macOS
   itself owns that display. Do not cap the other backends, and never evict a connected device to
-  make room for a new one.
+  make room for a new one; a host that is genuinely full serves `at-capacity.html`.
 - The desktop UI must run on **Safari 13.1** (the WKWebView on the 10.15 floor). Anything
   newer that a dependency reaches for is a hard crash, not a missing feature — monaco alone
   needed six shims, and its MediaQueryList call runs at module scope, so it took down the whole
   settings editor chunk. `src/lib/legacy-webview-polyfills.ts` carries the shims (imported first
   from `main.tsx`, and from the two monaco worker wrappers, which never run the entry chunk);
   `node scripts/check-legacy-webkit.mjs` re-derives the list from `dist/` after a build and
-  fails on anything unpatched. Keep the two in step. On the CSS side, `darkMode` is
+  fails on anything unpatched. Keep the two in step, and note that the CSS side of that check is
+  weaker than the JS side — a post-13.1 selector can ship silently. On the CSS side, `darkMode` is
   `["variant", ".dark &"]` because tailwind 3.4's default class strategy compiles to
   `:is(.dark *)`, which Safari 13 drops the whole rule over, and **flex** containers may not use
   `gap-*` (13.1 has it for grid only, flex landed in 14.1) — reach for `space-x/y-*`, or a margin
@@ -698,18 +960,25 @@ type + default, the Rust command, and the `serve`/`config` CLI path.
 - Bump the version in all four files at once.
 - New shell command → `capabilities/default.json`.
 - New user setting → TS config type/default + Rust command + the `serve`/`config` CLI path.
+- Record what you changed in `docs/OPTIMIZATIONS.md` with a status
+  (`VERIFIED` / `COMPILE-CHECKED` / `UNVERIFIED`), including the things that did not work.
 
 ## Dev-box notes
 
-The usual dev box for this repo is a **macOS 10.15.8 Catalina, Intel** MacBook with Command Line
-Tools only (no Xcode, no Homebrew) and git 2.24. Consequences: ScreenCaptureKit (12.3+) and the
-Core Audio Process Tap (14.2+) are unavailable there, VideoToolbox low-latency (11.0+) is off,
-`probe_audio_backend()` returns `Unsupported`/`NeedsDriverInstall`, and the 10.15 SDK cannot
-target arm64 (universal artifacts need CI or a newer Mac). Only `cargo check`/`clippy`/`test`,
-`pnpm lint`/`build`, and the CGDisplayStream video path can be exercised locally.
+Development happens on two machines and `docs/dev-workflow.md` is the protocol: a Windows box
+(the primary tree) and an Intel Mac reachable over SSH, moving commits between them with git
+bundles, never through `origin`.
 
-Design notes referenced by older commits and by `macos/ScreenExtendAudio/README.md`
-(`AUDIO_NOTES.md`, `AUDIO_NOTES_MACOS.md`, `AUDIO_NOTES_MACOS_LEGACY.md`,
-`PRD-macos-legacy-audio.md`) are **not in the tree on any branch** — they survive only in
-history, on the `sys-audio-winmac` branch (commit `420004a`). The measurement spike they came
-from is still checked in as `src-tauri/examples/audio_spike.rs`.
+The Mac is **macOS 10.15.8 Catalina, Intel**, with Command Line Tools only (no Xcode, no
+Homebrew) and git 2.24. Consequences: ScreenCaptureKit (12.3+) and the Core Audio Process Tap
+(14.2+) are unavailable there, VideoToolbox low-latency (11.0+) is off, `probe_audio_backend()`
+returns `VirtualDevice` or `NeedsDriverInstall`, and the 10.15 SDK cannot target arm64 (universal
+artifacts need CI or a newer Mac). What *can* be exercised locally is `cargo
+check`/`clippy`/`test`, `pnpm lint`/`build`, the CGDisplayStream video path, the legacy audio
+driver tier, and the 10.15-SDK dyld audit — which is the one check CI cannot do properly, because
+no hosted runner has that SDK. Everything above 10.15 is CI's job (`macos-smoke`), and the things
+neither can do are written up as scripts in `docs/manual-tests/`.
+
+The Windows box is Windows 11 26200 with an RTX 3080 Ti Laptop (hybrid graphics), so NVENC, Quick
+Sync, x264, WGC, DXGI and the WASAPI audio tiers are all exercisable there. **No machine on this
+project has an AMD GPU.**
