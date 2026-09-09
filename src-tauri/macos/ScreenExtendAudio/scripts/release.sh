@@ -119,7 +119,8 @@ if [ -z "${SE_SKIP_COPY:-}" ]; then
   mkdir -p "$(dirname "${STAGED}")"
   cp "${PKG}" "${STAGED}"
   echo "  ${STAGED}"
-  echo "  (tauri.macos.conf.json must list \"resources/ScreenExtendAudio.pkg\" in bundle.resources)"
+  echo "  (tauri.macos.conf.json maps this into the app under bundle.macOS.files as"
+  echo "   \"Resources/resources/ScreenExtendAudio.pkg\": \"resources/ScreenExtendAudio.pkg\")"
 fi
 
 echo
