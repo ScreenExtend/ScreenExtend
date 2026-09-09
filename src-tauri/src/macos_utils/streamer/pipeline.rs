@@ -41,6 +41,11 @@ pub struct Pipeline {
     wake: crossbeam_channel::Sender<()>,
     pub max_bitrate_bps: u32,
     pub h264_profile: H264Profile,
+    /// Loss recovery that is not a keyframe. The transport writes receipts into it from
+    /// transport-wide feedback; the encode thread reads them at its next submit. Inert — and the
+    /// transport falls back to its keyframe request — on any encoder with no long-term reference
+    /// slots, which `RepairState::set_ltr_slots(0)` is how a backend says.
+    pub repair: Arc<crate::streamer::repair::RepairState>,
 }
 
 impl Pipeline {
@@ -52,6 +57,18 @@ impl Pipeline {
     pub fn set_target_bitrate(&self, bps: u32) {
         self.target_bitrate.store(bps, Ordering::Relaxed);
         let _ = self.wake.try_send(());
+    }
+
+    /// Ask for a repair frame instead of a keyframe, if the client is known to hold a reference.
+    ///
+    /// Returns whether the request was taken; `false` means the caller must fall back to
+    /// `request_idr`, which is what every session did before this existed.
+    pub fn request_repair(&self) -> bool {
+        if !self.repair.request_repair() {
+            return false;
+        }
+        let _ = self.wake.try_send(());
+        true
     }
 }
 
@@ -91,6 +108,7 @@ fn spawn_pipeline(
 ) -> Result<(Pipeline, Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
     let (tx, _rx) = broadcast::channel::<EncodedFrame>(BROADCAST_CAPACITY);
     let idr_request = Arc::new(AtomicBool::new(false));
+    let repair = Arc::new(crate::streamer::repair::RepairState::new());
     let target_bitrate = Arc::new(AtomicU32::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let frame_duration = Duration::from_nanos(1_000_000_000 / enc.fps.max(1) as u64);

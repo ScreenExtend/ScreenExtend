@@ -12,6 +12,7 @@ pub mod virtual_display;
 use crate::streamer::cloud::{
     CloudClient, CloudConfig, CloudState, CloudStatusSink, SharedCloudStatusSink,
 };
+use crate::streamer::lock::LockExt;
 use crate::streamer::session::{
     self, DeviceOverride, SessionAuth, SharedApprovedDevices, SharedBannedDevices,
     SharedDeviceOverrides, SharedDeviceReporter, SharedOtpLimiter, SharedServerPorts,
@@ -47,6 +48,7 @@ pub struct AppState {
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
+    pub stun_urls: session::SharedStunConfig,
     pub banned_devices: SharedBannedDevices,
     pub approved_devices: SharedApprovedDevices,
     pub otp_limiter: SharedOtpLimiter,
@@ -162,6 +164,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
+        stun_urls: session::new_shared_stun_config(),
         banned_devices: session::new_shared_banned_devices(),
         approved_devices: session::new_shared_approved_devices(),
         otp_limiter: session::new_shared_otp_limiter(),
@@ -171,6 +174,18 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
         audio_hub: crate::streamer::audio::AudioHub::new(),
     };
+    // The saved STUN list, read from the same store the CLI writes, so `stun set`, `serve` and
+    // the desktop app all agree. Absent means "keep the built-in default"; an empty list is the
+    // deliberate "no STUN at all", which a LAN-only host has every reason to choose.
+    if let Some(urls) = crate::cli::saved_stun_urls(&app_handle) {
+        if urls.is_empty() {
+            tprintln!("[ice] STUN disabled by configuration; host candidates only");
+        } else {
+            tprintln!("[ice] STUN servers from configuration: {}", urls.join(", "));
+        }
+        *state.stun_urls.lock_recover() = urls;
+    }
+
     app_handle.manage(state);
     start_session_watchdog(app_handle.clone());
     true
@@ -304,24 +319,43 @@ pub fn set_device_override(
         dpr,
         audio_enabled,
     };
-    let restart_needed = {
-        let mut overrides = state.device_overrides.lock().unwrap();
-        let restart = match overrides.get(&ip) {
+    // Which overrides need the session rebuilt, and which only need the display touched. The
+    // client answers a reconfig epoch bump by tearing the whole session down — peer connection,
+    // encoder, capture, injector thread — and paying the full join cost. Everything below except
+    // the display scale is an encoder-session parameter, so that is unavoidable for them. The
+    // scale is not: it changes the extended desktop's DPI, not the captured geometry, so the
+    // stream the client is already decoding is exactly the stream it wants.
+    let (needs_rebuild, scale_only) = {
+        let mut overrides = state.device_overrides.lock_recover();
+        let verdict = match overrides.get(&ip) {
             Some(old) => {
-                old.scale != next.scale
-                    || old.orientation_portrait != next.orientation_portrait
+                let rebuild = old.orientation_portrait != next.orientation_portrait
                     || old.refresh_rate != next.refresh_rate
                     || old.video_scale != next.video_scale
                     || old.video_quality != next.video_quality
-                    || (old.dpr - next.dpr).abs() > f64::EPSILON
+                    || (old.dpr - next.dpr).abs() > f64::EPSILON;
+                (rebuild, !rebuild && old.scale != next.scale)
             }
-            None => true,
+            None => (true, false),
         };
         overrides.insert(ip.clone(), next);
-        restart
+        verdict
     };
-    if restart_needed {
+    if needs_rebuild {
         session::bump_reconfig_epoch(&state.sessions, &ip);
+    } else if scale_only {
+        let sessions = state.sessions.clone();
+        let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
+            MIN_DISPLAY_SCALE,
+            crate::streamer::server::MAX_EFFECTIVE_SCALE,
+        );
+        tauri::async_runtime::spawn(async move {
+            if !crate::streamer::server::apply_scale_live(&sessions, &ip, effective).await {
+                // Nothing live to touch, so there is nothing to apply it to; the next join reads
+                // it back out of the override map anyway.
+                tprintln!("display scale for {ip} saved; no live display to apply it to");
+            }
+        });
     }
 }
 
@@ -671,10 +705,12 @@ pub fn register_cloud_session(
         sessions: Some(state.sessions.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
+        stun_urls: state.stun_urls.lock_recover().clone(),
         banned_devices: Some(state.banned_devices.clone()),
         approved_devices: Some(state.approved_devices.clone()),
         otp_limiter: Some(state.otp_limiter.clone()),
         audio_hub: Some(state.audio_hub.clone()),
+        gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -825,10 +861,12 @@ pub fn sync_streamers(state: &AppState) {
             sessions: Some(state.sessions.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
+            stun_urls: state.stun_urls.lock_recover().clone(),
             banned_devices: Some(state.banned_devices.clone()),
             approved_devices: Some(state.approved_devices.clone()),
             otp_limiter: Some(state.otp_limiter.clone()),
             audio_hub: Some(state.audio_hub.clone()),
+            gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
             ..Config::default()
         };
 

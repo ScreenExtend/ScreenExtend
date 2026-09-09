@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+use super::lock::LockExt;
+
 #[derive(Default)]
 pub struct LeaveSignal {
     pub left: AtomicBool,
@@ -101,7 +103,7 @@ pub fn new_shared_banned_devices() -> SharedBannedDevices {
 }
 
 pub fn is_device_banned(banned: &SharedBannedDevices, token: &str, ip: &str) -> bool {
-    let set = banned.lock().unwrap();
+    let set = banned.lock_recover();
     (!token.is_empty() && set.contains(token)) || set.contains(ip)
 }
 
@@ -112,7 +114,7 @@ pub fn new_shared_approved_devices() -> SharedApprovedDevices {
 }
 
 pub fn is_device_approved(approved: &SharedApprovedDevices, token: &str) -> bool {
-    !token.is_empty() && approved.lock().unwrap().contains(token)
+    !token.is_empty() && approved.lock_recover().contains(token)
 }
 
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
@@ -170,6 +172,33 @@ pub type SharedTurnConfig = Arc<Mutex<UserTurnConfig>>;
 
 pub fn new_shared_turn_config() -> SharedTurnConfig {
     Arc::new(Mutex::new(UserTurnConfig::default()))
+}
+
+/// The STUN servers offered to a peer that is not already known to be on this subnet.
+///
+/// `DEFAULT_STUN_URL` was a compile-time constant with no way to change or disable it, and the
+/// only writer outside `Config::default` was `--stun` in the developer probe harness, which is not
+/// wired into the shipping binary. A same-subnet peer is no longer offered STUN at all, so the
+/// common case costs nothing — but a cross-network or unclassified join still contacted a Google
+/// endpoint, with no setting and no way to point it at a private server.
+pub type SharedStunConfig = Arc<Mutex<Vec<String>>>;
+
+pub fn new_shared_stun_config() -> SharedStunConfig {
+    Arc::new(Mutex::new(vec![
+        crate::streamer::config::DEFAULT_STUN_URL.to_string()
+    ]))
+}
+
+/// Parse a comma- or whitespace-separated STUN list the way the TURN surface parses its own.
+///
+/// An empty string means "no STUN at all", which is a legitimate setting: on a LAN-only host it
+/// removes the last reason for the join path to touch the public internet.
+pub fn parse_stun_urls(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,8 +267,7 @@ pub type SharedSessions = Arc<Mutex<HashMap<String, DeviceSessionState>>>;
 pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
     let signal = Arc::new(LeaveSignal::default());
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .leave = Some(signal.clone());
@@ -248,8 +276,7 @@ pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
 
 pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
     let signal = sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.leave.clone());
     if let Some(s) = signal {
@@ -260,15 +287,14 @@ pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
 
 pub fn set_control_sender(sessions: &SharedSessions, ip: &str, tx: ControlSender) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .control = Some(tx);
 }
 
 pub fn clear_control_sender(sessions: &SharedSessions, ip: &str, tx: &ControlSender) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     if let Some(state) = map.get_mut(ip) {
         if state.control.as_ref().is_some_and(|c| c.same_channel(tx)) {
             state.control = None;
@@ -287,8 +313,7 @@ fn send_bye_acked(
     sent: Option<std::sync::mpsc::Sender<()>>,
 ) -> bool {
     let tx = sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.control.clone());
     match tx {
@@ -298,7 +323,7 @@ fn send_bye_acked(
 }
 
 pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Duration) {
-    let ips: Vec<String> = sessions.lock().unwrap().keys().cloned().collect();
+    let ips: Vec<String> = sessions.lock_recover().keys().cloned().collect();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut queued = 0usize;
     for ip in &ips {
@@ -323,16 +348,14 @@ pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Dura
 
 pub fn get_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.live_display.clone())
 }
 
 pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDisplay) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .live_display = Some(display);
@@ -340,35 +363,32 @@ pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDispla
 
 pub fn take_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get_mut(ip)
         .and_then(|s| s.live_display.take())
 }
 
 pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     map.entry(ip.to_string()).or_default().reconfig_epoch += 1;
 }
 
 pub fn reconfig_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.reconfig_epoch)
         .unwrap_or(0)
 }
 
 pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     map.entry(ip.to_string()).or_default().kick_epoch += 1;
 }
 
 pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.kick_epoch)
         .unwrap_or(0)
@@ -376,8 +396,7 @@ pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
 
 pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: CaptureStopper) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .active_capture = Some((seq, stop));
@@ -385,8 +404,7 @@ pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: C
 
 pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<CaptureStopper> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get_mut(ip)
         .and_then(|s| s.active_capture.take())
         .map(|(_, stop)| stop)
@@ -397,7 +415,7 @@ pub fn take_active_capture_if(
     ip: &str,
     seq: u64,
 ) -> Option<CaptureStopper> {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let state = map.get_mut(ip)?;
     match &state.active_capture {
         Some((s, _)) if *s == seq => state.active_capture.take().map(|(_, stop)| stop),
@@ -406,7 +424,7 @@ pub fn take_active_capture_if(
 }
 
 pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
     entry.session_seq += 1;
     entry.session_seq
@@ -414,8 +432,7 @@ pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
 
 pub fn is_current_session(sessions: &SharedSessions, ip: &str, seq: u64) -> bool {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| s.session_seq == seq)
         .unwrap_or(false)
@@ -427,7 +444,7 @@ pub fn set_audio_outputs(
     supported: bool,
     outputs: Vec<AudioOutput>,
 ) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
     entry.audio_outputs_supported = supported;
     entry.audio_outputs = outputs;
@@ -435,8 +452,7 @@ pub fn set_audio_outputs(
 
 pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputsReport {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .map(|s| AudioOutputsReport {
             supported: s.audio_outputs_supported,
@@ -448,8 +464,7 @@ pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputs
 
 pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Option<String>) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .selected_audio_output = sel;
@@ -457,8 +472,7 @@ pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Optio
 
 pub fn selected_audio_output(sessions: &SharedSessions, ip: &str) -> Option<String> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .get(ip)
         .and_then(|s| s.selected_audio_output.clone())
 }
@@ -472,8 +486,8 @@ pub struct SessionAuth {
 impl SessionAuth {
     pub fn validate(&self, session_id: &str, otp: &str) -> bool {
         use subtle::ConstantTimeEq;
-        let want_session = self.session_id.lock().unwrap();
-        let want_otp = self.otp.lock().unwrap();
+        let want_session = self.session_id.lock_recover();
+        let want_otp = self.otp.lock_recover();
         if want_session.is_empty() || want_otp.is_empty() {
             return false;
         }
@@ -528,7 +542,7 @@ impl OtpLimiter {
     }
 
     pub fn global_paused(&self) -> Option<Duration> {
-        let mut g = self.global.lock().unwrap();
+        let mut g = self.global.lock_recover();
         match g.paused_until {
             Some(until) => {
                 let now = Instant::now();
@@ -544,7 +558,7 @@ impl OtpLimiter {
     }
 
     pub fn note_global_failure(&self) -> Option<Duration> {
-        let mut g = self.global.lock().unwrap();
+        let mut g = self.global.lock_recover();
         let now = Instant::now();
 
         if let Some(until) = g.paused_until {
@@ -572,12 +586,12 @@ impl OtpLimiter {
     }
 
     pub fn reset(&self) {
-        self.attempts.lock().unwrap().clear();
-        *self.global.lock().unwrap() = GlobalOtpState::default();
+        self.attempts.lock_recover().clear();
+        *self.global.lock_recover() = GlobalOtpState::default();
     }
 
     pub fn locked_for(&self, key: &str) -> Option<Duration> {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = self.attempts.lock_recover();
         let entry = map.get_mut(key)?;
         match entry.locked_until {
             Some(until) => {
@@ -594,7 +608,7 @@ impl OtpLimiter {
     }
 
     pub fn record_failure(&self, key: &str) -> OtpOutcome {
-        let mut map = self.attempts.lock().unwrap();
+        let mut map = self.attempts.lock_recover();
         let entry = map.entry(key.to_string()).or_default();
 
         if let Some(until) = entry.locked_until {
@@ -617,8 +631,8 @@ impl OtpLimiter {
     }
 
     pub fn record_success(&self, key: &str) {
-        self.attempts.lock().unwrap().remove(key);
-        *self.global.lock().unwrap() = GlobalOtpState::default();
+        self.attempts.lock_recover().remove(key);
+        *self.global.lock_recover() = GlobalOtpState::default();
     }
 }
 
@@ -652,6 +666,22 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The geometry the backend actually landed on, when it knows it.
+    ///
+    /// `create_display` returns a display id and nothing else, so the server always follows a
+    /// successful create with a forced `set_display_mode` and a settle poll — a whole extra
+    /// reconfiguration on a path that has already done several. That is unavoidable on a backend
+    /// that is *commanded* (the Windows IDD registers a mode list and the OS picks from it, so it
+    /// genuinely does not know), but wrong on one that *negotiates*: the macOS AirPlay tier
+    /// computes the closest mode from the ladder macOS published and then discards the answer, and
+    /// the forced set is guaranteed to fail whenever the requested size is off that ladder.
+    ///
+    /// Returning `None` means "ask the OS", which is the old behaviour and the default.
+    fn created_geometry(&self, id: u32) -> Option<(u32, u32)> {
+        let _ = id;
+        None
+    }
+
     fn max_concurrent_displays(&self) -> Option<usize> {
         None
     }
@@ -659,8 +689,7 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
 
 pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>) {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .entry(ip.to_string())
         .or_default()
         .host_ip = host_ip;
@@ -668,8 +697,7 @@ pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>)
 
 pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .values()
         .find(|s| s.live_display.is_some())
         .and_then(|s| s.host_ip.clone())
@@ -677,8 +705,7 @@ pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
 
 pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisplay> {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .iter()
         .filter(|(key, _)| key.as_str() != ip)
         .filter_map(|(_, s)| s.live_display.clone())
@@ -695,8 +722,7 @@ pub fn client_ips(sessions: &SharedSessions) -> Vec<String> {
 
 pub fn live_display_count(sessions: &SharedSessions) -> usize {
     sessions
-        .lock()
-        .unwrap()
+        .lock_recover()
         .values()
         .filter(|s| s.live_display.is_some())
         .count()
@@ -767,8 +793,8 @@ mod tests {
     fn session_auth_matches_and_rejects() {
         let auth = SessionAuth::default();
         assert!(!auth.validate("ABCDEFGHJKLM", "123456"));
-        *auth.session_id.lock().unwrap() = "ABCDEFGHJKLM".to_string();
-        *auth.otp.lock().unwrap() = "123456".to_string();
+        *auth.session_id.lock_recover() = "ABCDEFGHJKLM".to_string();
+        *auth.otp.lock_recover() = "123456".to_string();
         assert!(auth.validate("ABCDEFGHJKLM", "123456"));
         assert!(!auth.validate("ABCDEFGHJKLM", "123457")); // wrong otp
         assert!(!auth.validate("XBCDEFGHJKLM", "123456")); // wrong session

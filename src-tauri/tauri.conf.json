@@ -175,6 +175,35 @@
             "path": { "description": "Print the config.json path." }
           }
         },
+        "stun": {
+          "description": "STUN server configuration.",
+          "subcommands": {
+            "show": {
+              "description": "Show the STUN servers offered to a cross-network peer.",
+              "args": [
+                {
+                  "name": "json",
+                  "description": "Output JSON."
+                }
+              ]
+            },
+            "set": {
+              "description": "Set the STUN servers.",
+              "args": [
+                {
+                  "name": "urls",
+                  "index": 1,
+                  "takesValue": true,
+                  "required": true,
+                  "description": "Comma-separated STUN URLs."
+                }
+              ]
+            },
+            "clear": {
+              "description": "Offer no STUN server at all."
+            }
+          }
+        },
         "turn": {
           "description": "TURN relay configuration.",
           "subcommands": {
