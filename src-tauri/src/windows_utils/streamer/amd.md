@@ -101,13 +101,15 @@ AMFBuffer (Annex-B H.264) → Vec<u8> → the unchanged transport
 - **`SHADER_RESOURCE` is mandatory** on the ring textures. A texture lacking it fails with
   `AMF_DIRECTX_FAILED` at the first `QueryOutput`, not at wrap time, and `Duplicate()` does not
   help.
-- **Input format is not assumed.** `PREFERRED_INPUT_FORMAT` is BGRA today because `scaler.rs`
-  emits BGRA only; the encoder logs that AMF's internal colour converter is therefore active. If
-  the pipeline ever hands it a different format, `retune_input_format` rebuilds the ring and
-  re-`Init`s once. See `findings/major-amd-nv12-input-pending-scaler.md`: NV12 through the
-  existing `ID3D11VideoProcessor` is one GPU pass and belongs in `scaler.rs`, not here — and AMD
-  state that BGRA input silently invokes an internal converter that competes with the foreground
-  application, so it is a pass we neither control nor measure.
+- **Input format is not assumed.** `PREFERRED_INPUT_FORMAT` is BGRA, which is what an unscaled
+  capture hands over with no blt at all; the encoder logs that AMF's internal colour converter is
+  therefore active, because AMD state that packed-RGB input silently invokes a converter that
+  competes with the foreground application. If the pipeline ever hands it a different format,
+  `retune_input_format` rebuilds the ring and re-`Init`s once. `Scaler::with_format` can emit
+  NV12 and the **CPU bridge** asks for it (`docs/OPTIMIZATIONS.md` rows 108 and 245: readback
+  1192 → 740 µs at 1920x1080 → 1280x720); the GPU ring does not, because paying for a
+  `VideoProcessorBlt` purely to convert has never been measured against AMF's own converter on
+  AMD hardware.
 - **Annex-B output.** AMF AVC emits start codes, and `ExtraData` is the Annex-B SPS+PPS, cached
   after `Init` for the out-of-band path.
 
@@ -144,7 +146,7 @@ Applied by `apply_properties`, in this order, all before `Init()`.
 | 23 | `L"SlicesPerFrame"` + `L"OutputMode"` | `1`, `FRAME` | More slices only buy latency alongside `OUTPUT_MODE = SLICE`; without it AMF still returns one buffer per frame and the extra slices are pure compression cost. The NVENC path uses one slice too (`sliceMode = 0`). |
 | 24 | `L"CABACEnable"` | `CABAC`, or `CALV` on Baseline | Matches NVENC, where Baseline forces CAVLC for a cheaper client-side decode. |
 | 25 | `L"InputFullRangeColor"` + `L"FullRangeColor"` | `true` | We feed full-range colour and NVENC signals `videoFullRangeFlag = 1`; keeping them consistent stops AMD hosts looking washed out next to NVIDIA ones. `FullRangeColor` is the **only** colour property AMF actually writes into an AVC bitstream. |
-| 26 | `L"OutColorPrimaries"` / `L"OutColorTransferChar"` | BT.709, optional | Set in case a future driver honours them; they are reported never to reach the bitstream. See `findings/minor-amd-amf-does-not-write-vui-colour-signalling.md`. |
+| 26 | `L"OutColorPrimaries"` / `L"OutColorTransferChar"` / `L"OutMatrixCoeff"` / `L"OutColorProfile"` | BT.709, optional | Set in case a future driver honours them. AMF is reported never to write any of the four into an AVC bitstream (GPUOpen AMF issues #398, #277, #540, open on driver 24.8.1); only `FullRangeColor` reaches the stream. Since we packetize H.264 by hand, `amd/sps.rs` rewrites the SPS VUI instead — see section 3a. |
 | 27 | `L"EnableEncoderSmartAccessVideo"` | `false`, optional | SmartAccess parallelises encode across VCN instances for *throughput*; splitting one low-latency stream adds coordination, not speed. |
 | 28 | `L"InputQueueSize"` | `1`, optional | The default 16-deep queue is a latency reservoir. With one-in-flight it stays empty anyway, but a hard 1 makes `AMF_INPUT_FULL` a real signal instead of a 16-frame cushion. May be read-only. |
 | 29 | `L"IntraRefreshMBsNumberPerSlot"` | **not set**, or `0` when `--intra-refresh off` | ULL already enables rolling intra-refresh at 255 MBs/slot ≈ a 32-frame wave at 1080p ≈ 0.53 s at 60 fps. Free loss resilience. |
@@ -169,6 +171,46 @@ arbitrary client-driven sizes.
 `L"PeakBitrate"`, `L"VBVBufferSize"`. Dynamic writes take effect at the next `SubmitInput`. AMD
 warn "you cannot change it too often", so `streamer::bitrate::BitrateController` stays the only
 writer. Resolution never changes at runtime — that is a full re-init and an IDR spike.
+
+**How optional properties are written.** Every knob that varies by driver or VCN generation goes
+through `set_gated_*`, which probes `HasProperty`, writes, reads the value back, and records the
+outcome; `apply_properties` prints all of them as one `AMF optional properties:` line, because on
+a machine none of us can reach the log line is the diagnosis. `HasProperty` is *reported* rather
+than obeyed — the write is attempted either way, since a refused optional write costs nothing on
+AMF — so an entry reading `unknown-but-set:` is the runtime telling us what its `HasProperty`
+actually means. Only the correctness core (`Usage`, `QualityPreset`, geometry, rate control,
+`BPicturesPattern`, `IDRPeriod`) is fatal on failure.
+
+---
+
+## 3a. Colour signalling: we write the SPS VUI ourselves
+
+AMF is reported never to write `OutColorProfile`, `OutColorPrimaries`, `OutColorTransferChar` or
+`OutMatrixCoeff` into an AVC bitstream (GPUOpen AMF issues #398, #277 and #540, still open on
+driver 24.8.1). Only `FullRangeColor` reaches the stream, and nothing writes
+`bitstream_restriction_flag` at all — so a decoder infers the reorder depth from the level and
+holds `min(16, MaxDpbMbs / PicSizeInMbs)` frames before showing the first, which is 33–267 ms at
+60 fps for a stream that never reorders anything.
+
+`amd/sps.rs` fixes it where we already own the bytes: `webrtc_session.rs` packetizes H.264 by
+hand, so the SPS is ours. It finds the SPS NAL in the access unit and in `ExtraData`, unescapes,
+copies the prefix **bit for bit** so nothing the encoder decided changes, writes a canonical VUI
+(BT.709 primaries/transfer/matrix, `video_full_range_flag` matching the actual input format,
+`bitstream_restriction_flag = 1`, `max_num_reorder_frames = 0`), re-escapes and splices it back.
+
+Two properties of the design matter:
+
+- **It is gated on a read-back**, not on a driver version. `read_extradata` parses the SPS AMF
+  produced; if a future driver writes the colour description and the restriction correctly, the
+  rewrite never runs. The per-frame cost is then a single NAL-header read, because the scan stops
+  at the first slice NAL and parameter sets only ride forced IDRs (`HeaderInsertionSpacing = 0`).
+- **The VUI is canonical, not merged.** Every field it could have to preserve is one this
+  configuration deliberately turns off — `EnforceHRD = false`, no filler, no AUD, no SEI, one
+  slice, no B-frames — and the transport is RTP, whose timestamps are the clock, so timing info
+  goes too.
+
+Verified by `windows_utils/streamer/test/h264.rs::parse_sps`, which was written separately from
+the rewriter: a writer checked by its own parser proves nothing.
 
 ---
 
@@ -218,10 +260,18 @@ integration measures fine and feels awful in a stopwatch test.
   bytes harvested during the retry onto this frame's access unit rather than dropping them.
 - **Do not sleep when `QueryTimeout` is honoured.** `QueryOutput` does the waiting. A `Sleep(1)`
   on Windows is really 1–15 ms depending on timer resolution.
-- **One thread.** AMD's stated model is two (submit and query), but with strict one-in/one-out
-  there is nothing for a second thread to overlap, and OBS ships single-threaded.
+- **One thread inside the encoder.** AMD's stated model is two (submit and query), but with
+  strict one-in/one-out there is nothing for a second thread to overlap, and OBS ships
+  single-threaded. Capture/encode overlap comes from outside instead — see section 5a.
 - **Repeat** for a static desktop is literally "submit the staged texture again": zero copies,
-  and the pipeline's existing `spawn_repeater` drives it.
+  driven by `spawn_repeater` on the inline path and by the ring's own keepalive on the ring.
+- **The access unit is copied into a retained `au_scratch`** while AMF still owns the mapping,
+  and the owned `Vec` the pipeline wants is built after the buffer is released. Same shape and
+  same reason as `nvidia/encoder.rs`.
+- **An output object carrying zero bytes is a consumed frame, not "nothing yet".** `query_once`
+  classifies the three cases explicitly (`classify_query_output`); folding an empty non-null
+  buffer into the NULL-pointer case made it poll to `SUBMIT_DEADLINE` and then kill the session
+  for a frame that had already been handed over.
 - **Teardown** is `Drain` → `QueryOutput` until `AMF_EOF` → `Terminate` → `Release` on the
   component, then `Terminate` → `Release` on the context; the factory is DLL-owned and
   `AMFTrace` has no `Release` slot. `libloading::Library` is the **last** struct field so it
@@ -246,14 +296,70 @@ backwards.
 
 ### LTR
 
-Plumbed, off by default. `MaxOfLTRFrames` (0..=2, static) switches the encoder from ULL's free
-rolling intra-refresh to user-controlled long-term references — the two are mutually exclusive
-("With user control of LTR, B-pictures and Intra-refresh features are not supported").
-`mark_next_frame_as_ltr` / `force_ltr_reference` set the per-surface properties, and
-`last_marked_ltr` / `last_referenced_ltr` read what AMF reported on the output buffer. LTR is
-strictly better *if* we act on RTCP feedback — it repairs precisely and immediately rather than
-over half a second — but that needs `webrtc_session.rs` to tell the encoder which frames the
-client acknowledged. Until then, `new_on_device` passes 0.
+`MaxOfLTRFrames` (0..=2, static) switches the encoder from ULL's free rolling intra-refresh to
+user-controlled long-term references — the two are mutually exclusive ("With user control of LTR,
+B-pictures and Intra-refresh features are not supported"), so this is a **choice between two
+loss-recovery strategies**, not an addition.
+
+It is on where something drives it and off where nothing does:
+
+- **The ring path asks for it.** `build_amf_ring` requests `MAX_LTR_FRAMES_SUPPORTED`, because
+  `ring_encode_thread` consumes `streamer::repair::RepairState` — the transport writes receipts,
+  the encode thread turns them into `mark_ltr` / `use_ltr` at its next submit. A repair frame
+  predicted from a picture the client is known to hold costs a fraction of an IDR and does not
+  reset the rate controller.
+- **The inline path passes 0.** Nothing there reads receipts, so turning LTR on would trade a
+  free rolling refresh for a feature no one uses.
+- **Both are gated on the capability, twice.** `open` requires `HasProperty(MaxOfLTRFrames)` and
+  `caps.max_reference_frames > 1` (the docs make intra-refresh conditional on more than one
+  reference, and an adapter that reports one cannot do user-controlled LTR at all), and
+  `configure_and_init` then believes the property **read-back**, not the request. Believing we
+  hold slots the driver never gave us would make every repair reference a picture that was never
+  a long-term reference.
+- **There is no `invalidate_reference`.** AMF has no `nvEncInvalidateRefFrames` analogue; it
+  *disallows* LTRs outside the forced bitfield from current and future prediction instead, which
+  reaches a similar end by a different mechanism. `RingEncoder::invalidate_reference` therefore
+  reports `Unsupported` on AMF, which `ring_encode_thread` already reads as "stop the transport
+  asking" — on AMF the repair *is* the forced bitfield.
+
+`mark_next_frame_as_ltr` / `force_ltr_reference` set the per-surface properties; `last_marked_ltr`
+and `last_referenced_ltr` read back what AMF reported on the output buffer.
+
+---
+
+## 5a. The async ring: where capture/encode overlap comes from
+
+The encoder is one-in-flight and single-threaded by design. Overlap comes from
+`pipeline.rs::AsyncEncodeRing`, which both hardware backends share:
+
+```
+WGC callback:   take a free slot → blt/CopyResource into it → Flush → send ReadyMsg   (returns)
+encode thread:  ReadyMsg → repair receipts → SubmitInput → QueryOutput → broadcast → free the slot
+```
+
+Without it, every AMD frame was encoded *inside* the WGC `TypedEventHandler` — the blt, the
+`Flush`, the wrap, the submit, the blocking `QueryOutput` and the broadcast, serially, on the
+thread WGC is waiting on.
+
+The two backends differ in exactly one place, `RingTextures`:
+
+- **NVENC** (`Shared`) needs cross-adapter shared textures and a keyed mutex per slot, because
+  its encoder lives on the dGPU while capture happens on the iGPU.
+- **AMF** (`Local`) has neither: `new_on_device_with_ltr` builds the input textures on the
+  **capture** device, which is what makes `CreateSurfaceFromDX11Native` a pointer wrap rather
+  than a hidden cross-device copy. Nothing is shared, nothing is opened, and the free/ready
+  channels are the whole ownership protocol — so `PoisonedSlots` and `SlotEncodeError::Poisoned`
+  cannot fire on this path.
+
+The post-stage `Flush()` stays on both: it is AMD's own fix for flicker *and growing latency* on a
+Desktop-Duplication device (AMF issue #92), and removing it needs a measurement plus a torn-frame
+soak, not a faster number.
+
+Selection: the AMF ring is used for `--encoder amd`, and for `auto` **only when the capture device
+is itself AMD** — which is exactly the condition `build_backend`'s Auto ordering already reasons
+about ("an all-AMD box never reaches the Intel branch because its capture device is not Intel"),
+so an NVIDIA or hybrid host is unaffected. If the ring cannot be built, the classic
+`build_backend` path still produces `Backend::Amf` / `Backend::AmfCpu` as before.
 
 ---
 
@@ -263,8 +369,10 @@ Fully verifiable here, without an AMD GPU:
 
 - `cargo test --lib windows_utils::streamer::test::amd_layout` — every struct size, field offset,
   vtable slot index, total slot count, enum value and property-name string, against numbers
-  `cl.exe` measured from the vendored headers. Regenerate with
-  `src-tauri/tools/amf_layout_build.bat`; see `src-tauri/tools/README.md`.
+  `cl.exe` measured from the vendored headers, plus the `QueryOutput` classification. Regenerate
+  with `src-tauri/tools/amf_layout_build.bat`; see `src-tauri/tools/README.md`.
+- `cargo test --lib windows_utils::streamer::amd::sps` — the SPS VUI rewriter, read back with the
+  independently written parser in `test/h264.rs`.
 - The graceful-absence path: with no `amfrt64.dll`, the loader returns a typed `Err` naming the
   DLL, `Encoder::new` fails cleanly, and `build_backend`'s `Auto` chain falls through.
 - `dumpbin /imports … | findstr /i amf` prints nothing.
@@ -286,13 +394,15 @@ Everything else needs a Radeon desktop or a Ryzen APU laptop: `docs/manual-tests
 
 ## 8. Future work
 
-- **NV12 input** through `scaler.rs`, removing AMF's internal converter
-  (`findings/major-amd-nv12-input-pending-scaler.md`).
+- **NV12 input on the GPU ring.** The CPU bridge already takes NV12 (`docs/OPTIMIZATIONS.md` rows
+  108 and 245); the ring does not, because on the GPU path there is no readback to halve and
+  paying for a `VideoProcessorBlt` purely to convert has never been measured against AMF's
+  internal converter on AMD hardware. That measurement is the open question.
 - **Slice-mode output** (`OUTPUT_MODE = SLICE`, AMF 1.4.30+, gated on `SupportSliceOutput`) is
   the only genuinely sub-frame latency mechanism AMF offers, but it needs
   `webrtc_session.rs`'s hand-rolled H.264 packetizer to emit partial access units — and a
-  slice-level pipeline that exists on only one vendor is not worth that complexity.
-- **LTR-driven loss recovery**, once the WebRTC session can report acknowledged frames.
+  slice-level pipeline that exists on only one vendor is not worth that complexity. Row 246
+  rejected it on a measured ~2 ms ceiling on NVENC; the AMD number is the one nobody has.
 - **HEVC / AV1.** Everything is name-mangled per codec (`AMFVideoEncoderHW_HEVC`,
   `AMFVideoEncoderHW_AV1` — note the macro names do not match the wire strings) and the enum
   values are renumbered, so each codec needs its own Rust enums and property module. Gate purely

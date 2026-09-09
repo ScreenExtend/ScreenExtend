@@ -54,6 +54,10 @@ pub struct AppState {
     pub otp_limiter: SharedOtpLimiter,
     pub server_ports: SharedServerPorts,
     pub disable_gpu_encode: Arc<std::sync::atomic::AtomicBool>,
+    /// Which encoder the pipelines should ask for, from `serve --encoder`. A process-lifetime
+    /// CLI choice rather than a user setting, so it is not persisted and has no Tauri command;
+    /// the two places that build a streaming `Config` read it when they build one.
+    pub encoder_vendor: Arc<Mutex<crate::streamer::config::EncoderVendor>>,
     pub cloud: Mutex<Option<CloudClient>>,
     pub cloud_status: Arc<Mutex<(String, String)>>,
     pub audio_hub: crate::streamer::audio::SharedAudioHub,
@@ -170,6 +174,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         otp_limiter: session::new_shared_otp_limiter(),
         server_ports: session::new_shared_server_ports(),
         disable_gpu_encode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        encoder_vendor: Arc::new(Mutex::new(crate::streamer::config::EncoderVendor::default())),
         cloud: Mutex::new(None),
         cloud_status: Arc::new(Mutex::new(("connecting".to_string(), String::new()))),
         audio_hub: crate::streamer::audio::AudioHub::new(),
@@ -711,6 +716,7 @@ pub fn register_cloud_session(
         otp_limiter: Some(state.otp_limiter.clone()),
         audio_hub: Some(state.audio_hub.clone()),
         gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
+        encoder_vendor: *state.encoder_vendor.lock_recover(),
         ..Config::default()
     };
     *state.cloud_status.lock().unwrap() = ("connecting".to_string(), String::new());
@@ -867,6 +873,7 @@ pub fn sync_streamers(state: &AppState) {
             otp_limiter: Some(state.otp_limiter.clone()),
             audio_hub: Some(state.audio_hub.clone()),
             gpu_encode_toggle: Some(state.disable_gpu_encode.clone()),
+            encoder_vendor: *state.encoder_vendor.lock_recover(),
             ..Config::default()
         };
 
