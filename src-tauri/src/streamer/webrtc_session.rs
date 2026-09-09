@@ -412,12 +412,14 @@ fn udp_only_setting_engine(
     se.set_srflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
     se.set_prflx_acceptance_min_wait(Some(std::time::Duration::from_millis(50)));
     se.set_relay_acceptance_min_wait(Some(std::time::Duration::from_millis(0)));
-    // The answer has always advertised `video/rtx` with an `apt=` for each H.264 payload type, but
-    // webrtc-rs will not create the outgoing repair stream unless it is asked to — so the host was
-    // promising a retransmission stream it never opened, and NACK repairs went back on the media
-    // SSRC reusing their original sequence numbers. That is legal, and it is also indistinguishable
-    // at the receiver from a duplicate, which is exactly the wrong thing to feed a loss estimator.
-    se.enable_sender_rtx(true);
+    // `enable_sender_rtx(true)` is deliberately NOT set, and this comment is here because it looks
+    // like an oversight twice a year. webrtc-rs 0.17.1's NACK responder binds a stream only when
+    // `stream_support_nack(info)` — `rtcp_feedback` containing `nack` with an empty parameter —
+    // and the RTX codec is registered with `rtcp_feedback: vec![]`, so the responder never binds
+    // it; `resend_packets` then looks the stream up by `nack.media_ssrc` and writes to the
+    // *primary* SSRC's writer. Enabling it would add an `a=ssrc-group:FID` telling Chrome to
+    // expect retransmissions on a stream that would always be silent. Repairs already reach the
+    // client on the primary SSRC. See `docs/OPTIMIZATIONS.md` row 62.
     if let Some(mux) = mux {
         // Only ever on the LAN tier: muxed mode skips server-reflexive gathering outright
         // (`agent_gather.rs`, `UDPNetwork::Muxed(_) => continue`), and a same-subnet peer is
