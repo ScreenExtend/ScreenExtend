@@ -28,6 +28,12 @@ pub fn mach_delta_ns(from: u64, to: u64) -> u64 {
     (to.saturating_sub(from)).saturating_mul(numer) / denom
 }
 
+/// The inverse of [`ns_to_mach_ticks`], for reading a scheduler policy back.
+#[inline]
+pub fn mach_ticks_to_ns(ticks: u32) -> u64 {
+    mach_delta_ns(0, ticks as u64)
+}
+
 #[inline]
 pub fn ns_to_mach_ticks(ns: u64) -> u32 {
     let (numer, denom) = timebase();
