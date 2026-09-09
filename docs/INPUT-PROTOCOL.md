@@ -100,6 +100,14 @@ internal queue; that is unchanged and intentional. Frames on `reliable` carry no
 **An absent tail means the session is simply not reorder-gated**, which is exactly right for a
 client older than the field: the host has nothing to compare and injects everything, as before.
 
+The shipped client gates it on capability bit 5 **and** on the stamp, because the host finds the
+sequence by offset and it sits past the stamp — sending one without the other would put two bytes
+where nothing reads them. Its counter is per page, not per session, and is never reset: the host's
+high-water mark is per session and starts at "none", so a counter that only moves forward is right
+on both sides of a reconnect, while one that restarted at 0 against a host that had not would be
+rejected for half the sequence space. `scripts/test-client-stats.mjs` asserts the four offsets and
+that a reliable frame carries no sequence.
+
 ## Frame layouts
 
 ### `POINTER_*` — `0x01`–`0x08`, 40 bytes (+8)
