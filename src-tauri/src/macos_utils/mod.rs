@@ -24,7 +24,7 @@ use networking::NetworkInfo;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 use tauri::State;
@@ -172,7 +172,100 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         audio_hub: crate::streamer::audio::AudioHub::new(),
     };
     app_handle.manage(state);
+    start_session_watchdog(app_handle.clone());
     true
+}
+
+/// How often the watchdog wakes. Cheap enough to be frequent: the AirPlay latch is an
+/// atomic read and the screen-recording read is the window-list probe, 0.6 ms warm.
+const WATCHDOG_TICK: Duration = Duration::from_secs(5);
+
+/// How often authorization is actually re-read while a session is streaming.
+const TCC_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Watch two things that can change under a live session and that nothing else notices.
+///
+/// **Screen-recording consent.** macOS 15 re-asks roughly every 30 days and there is no
+/// supported way to suppress it. A host left running as a permanent second monitor -- the
+/// product's whole use case -- will meet that with a device connected, and if the user
+/// dismisses the dialog the capture APIs go on delivering frames: they just contain
+/// wallpaper. So the host reports a healthy stream while the client shows a blank desktop.
+/// `ensure_screen_recording_access` catches this at pipeline start, which is every join
+/// and every refresh, and nowhere in between -- this is the in-between. Only a definite
+/// `Some(true) -> Some(false)` transition acts; `None` means "could not read" and must
+/// never be treated as a refusal.
+///
+/// **AirPlay geometry.** On that display tier macOS owns the display and moves it under
+/// us; the sender re-sends codec data when it does, which `MirrorStats` latches. Bumping
+/// the reconfig epoch hands that to the client on its next `/reconfig` poll instead of
+/// waiting for a size poll to notice.
+fn start_session_watchdog(app_handle: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("se-session-watchdog".into())
+        .spawn(move || {
+            let airplay_tier = virtual_display::probe_display_backend()
+                == virtual_display::DisplayBackend::AirPlayFallback;
+            let mut authorized: Option<bool> = None;
+            let mut last_probe = Instant::now();
+            loop {
+                std::thread::sleep(WATCHDOG_TICK);
+                let Some(state) = app_handle.try_state::<AppState>() else {
+                    continue;
+                };
+
+                if airplay_tier && airplay::take_geometry_changed() {
+                    let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    if !ips.is_empty() {
+                        tprintln!(
+                            "[airplay] macOS changed the display geometry; asking {} client(s) \
+                             to renegotiate",
+                            ips.len()
+                        );
+                    }
+                    for ip in ips {
+                        session::bump_reconfig_epoch(&state.sessions, &ip);
+                    }
+                }
+
+                let streaming = {
+                    let sessions = state.sessions.lock().unwrap();
+                    sessions.values().any(|s| s.live_display.is_some())
+                };
+                if !streaming {
+                    // Nothing to protect, and the next join re-reads authorization anyway.
+                    authorized = None;
+                    continue;
+                }
+                if last_probe.elapsed() < TCC_REPROBE_INTERVAL {
+                    continue;
+                }
+                last_probe = Instant::now();
+                let now = permissions::screen_recording_live();
+                if authorized == Some(true) && now == Some(false) {
+                    teprintln!(
+                        "[tcc] Screen Recording authorization was revoked while streaming. \
+                         macOS 15 and later re-ask about every 30 days; capture would keep \
+                         delivering frames of the wallpaper, so the sessions are being ended \
+                         instead. Re-approve ScreenExtend under System Settings -> Privacy & \
+                         Security -> Screen Recording, then reconnect."
+                    );
+                    crate::streamer::session::broadcast_bye(
+                        &state.sessions,
+                        session::ByeReason::Kicked,
+                        crate::BYE_FLUSH_TIMEOUT,
+                    );
+                    let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    for ip in ips {
+                        session::bump_kick_epoch(&state.sessions, &ip);
+                        session::signal_leave(&state.sessions, &ip);
+                    }
+                }
+                if now.is_some() {
+                    authorized = now;
+                }
+            }
+        })
+        .ok();
 }
 
 #[tauri::command]
@@ -506,9 +599,21 @@ pub fn install_audio_driver(app: tauri::AppHandle) -> String {
         .path()
         .resolve("resources/ScreenExtendAudio.pkg", BaseDirectory::Resource);
     match pkg {
-        Ok(path) => audio::legacy::installer::install_pkg(&path)
-            .as_str()
-            .to_string(),
+        Ok(path) => {
+            if !path.exists() {
+                // `resolve` only joins a path, so an app bundle built without the package
+                // staged reaches `install_pkg` and fails there with nothing naming the cause.
+                teprintln!(
+                    "[audio] this build does not carry the audio driver package ({} is \
+                     missing). Build it with macos/ScreenExtendAudio/scripts/release.sh \
+                     before `tauri build`, or the Install button can only fail.",
+                    path.display()
+                );
+            }
+            audio::legacy::installer::install_pkg(&path)
+                .as_str()
+                .to_string()
+        }
         Err(e) => {
             teprintln!("[audio] could not resolve installer package: {e}");
             "failed".to_string()
@@ -729,11 +834,21 @@ pub fn sync_streamers(state: &AppState) {
 
         let thread_handle = handle.clone();
         let ip_for_log = ip.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
-                teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
-            }
-        });
+        // One thread per adapter, but they all drive the single shared transport runtime
+        // (`streamer::transport_runtime`) rather than each building one of their own.
+        // A discarded `JoinHandle` also discarded the spawn error, so a thread that never
+        // started left `streamers` claiming an adapter was served with nothing listening.
+        let spawned = std::thread::Builder::new()
+            .name(format!("se-adapter-{ip}"))
+            .spawn(move || {
+                if let Err(e) = Streamer::new(config).run_with_handle(thread_handle) {
+                    teprintln!("[streamer] streamer bound to {ip_for_log} exited: {e}");
+                }
+            });
+        if let Err(e) = spawned {
+            teprintln!("[streamer] could not start a streamer for {ip}: {e}");
+            continue;
+        }
 
         tprintln!("[streamer] started streamer bound to {ip}");
         streamers.insert(ip, StreamerHandle { handle });

@@ -10,6 +10,12 @@ src-tauri/resources/*.cat       binary
 src-tauri/resources/*.inf       binary
 src-tauri/resources/*.cer       binary
 
+# The AMF headers are vendored source whose SHA-256 is pinned in SHA256SUMS. Without a rule
+# git's auto text detection checks them out CRLF on Windows, which changes their bytes: the
+# blob-checksums job passes on its ubuntu runner while the same command fails on every
+# Windows dev box, for files nobody has touched.
+src-tauri/resources/amf-headers/** text eol=lf
+
 # `sha256sum -c` reads a trailing CR as part of the filename, so these must be LF
 # on every checkout or the verification job fails on the developer's machine.
 src-tauri/binaries/SHA256SUMS   text eol=lf
