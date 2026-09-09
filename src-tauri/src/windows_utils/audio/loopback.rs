@@ -645,7 +645,8 @@ unsafe fn acquire_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<Session> 
         && mix.channels == OUT_CHANNELS
         && matches!(mix.kind, SampleKind::F32)
     {
-        // Fast path (§4.4): 48 kHz float32 stereo — take the mix format verbatim.
+        // Fast path (`docs/recovered/PRD.md` §4.4): 48 kHz float32 stereo — take the mix format
+        // verbatim.
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -659,7 +660,7 @@ unsafe fn acquire_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<Session> 
         mix
     } else {
         // Non-48k / non-stereo / integer: ask the engine to convert to 48 kHz float stereo
-        // (§4.4 option 1: AUTOCONVERTPCM). No userspace resampler needed.
+        // (`docs/recovered/PRD.md` §4.4 option 1: AUTOCONVERTPCM). No userspace resampler needed.
         let want = target_wave_format();
         let flags = base_flags | STREAMFLAGS_AUTOCONVERTPCM | STREAMFLAGS_SRC_DEFAULT_QUALITY;
         let converted = client.Initialize(

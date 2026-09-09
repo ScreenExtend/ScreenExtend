@@ -4,6 +4,12 @@ Synthesis of the 17 discovery reports in `docs/discovery/` (A–O) and the ~350 
 `findings/`. Every row cites `file:line` from the working tree at `bef5f89`. Severity is the
 discovery corpus's own scale: **blocker** | **major** | **minor** | **spec** (speculative).
 
+**This is a snapshot, and many of these risks have since been closed.** `findings/` is the
+working queue — excluded from git, emptied as items are resolved, and gone when the engagement
+ends — so the finding filenames in the "Finding" column are pointers that mostly no longer
+resolve. The prose in the row is what carries the risk; `docs/OPTIMIZATIONS.md` records what was
+done about it. Check the code at the cited `file:line` before acting on a row.
+
 Owner workstreams: **W1** transport (streamer core, WebRTC, session, cloud) · **W3** Windows
 capture/encode · **W4** AMD · **W5** macOS capture/encode · **W6** macOS
 permissions/hosted-network/virtual-display · **W7** macOS audio · **W8** Windows + core audio ·
