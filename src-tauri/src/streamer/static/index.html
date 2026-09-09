@@ -216,6 +216,7 @@
                 TRANSFORM_FELL_BACK_TO_LEGACY: 1 << 19,
                 RVFC_UNAVAILABLE: 1 << 20,
                 KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
+                TRICKLE_ICE_UNAVAILABLE: 1 << 22,
             };
             let degradeFlags = 0;
             let suppressedErrors = 0;
@@ -988,6 +989,36 @@
                 return { iceServers: [], locality: 'unknown' };
             }
 
+            // `/net-config` is read by the HTTPS upsell and by the join, so it is fetched once
+            // and shared. Priming it at load is what keeps it off the join path: by the time
+            // Connect is pressed the answer is already here, and the trickle decision costs a
+            // property read rather than a round trip.
+            // Only a *successful* body is memoised. A page that raced the server coming up, or a
+            // single dropped request, would otherwise be pinned for its whole life to "no trickle
+            // and port 8443" — and this is primed at module scope, which is exactly the moment
+            // that race is most likely.
+            let netConfigPromise = null;
+            function getNetConfig() {
+                if (!netConfigPromise) {
+                    const attempt = fetch('/net-config').then(function (r) {
+                        if (!r.ok) throw new Error('/net-config ' + r.status);
+                        return r.json();
+                    }).then(function (j) {
+                        if (!j || typeof j !== 'object') throw new Error('/net-config is not an object');
+                        return j;
+                    }).catch(function () {
+                        noteSuppressed();
+                        if (netConfigPromise === attempt) netConfigPromise = null;
+                        return {};
+                    });
+                    netConfigPromise = attempt;
+                }
+                return netConfigPromise;
+            }
+            // Guarded because this is module scope: a browser with no `fetch` cannot reach any
+            // fast path on this page anyway, but a throw here would take the join form with it.
+            if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
+
             // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
             // waiting for one is only right when nothing else can carry the session. The host
             // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
@@ -1066,6 +1097,175 @@
                 });
             }
 
+            // Trickle ICE, RFC 9725 §4.6. The wait above is the whole reason a relayed join is
+            // slow: the offer is a single POST, so every candidate the session will ever use has
+            // to be in it, and a TURN allocation is a full round trip. A host that answers with a
+            // `Location` takes the rest by PATCH, so the offer can leave the moment it exists.
+            //
+            // Both halves are probed and neither is assumed. `/net-config`'s `trickleIce` decides
+            // whether to skip the wait; the `Location` header on the answer decides whether
+            // anything is actually sent. A host without either keeps the gather-then-post shape
+            // byte for byte, which is what every shipped host does.
+            const TRICKLE_MAX_BATCH = 24;
+            // How long the first PATCH has to be acknowledged. A verb a proxy rejects outright
+            // answers inside two round trips and the status says so; one that is black-holed
+            // never answers at all, and this is the only thing that notices.
+            const TRICKLE_FIRST_ACK_MS = 2000;
+            // Statuses that mean this verb will never work here, however many times it is tried:
+            // a proxy that does not route PATCH, a WAF that rejects the media type, a gateway
+            // that forbids it. 404 is not one of them — that is the session being over.
+            function trickleIsFatal(status) {
+                return status === 403 || status === 405 || status === 415 || status === 501;
+            }
+            let trickleOff = false;
+            let trickleSender = null;
+
+            function localIceUfrag(peer) {
+                try {
+                    const d = peer.localDescription;
+                    const m = /a=ice-ufrag:(\S+)/.exec((d && d.sdp) || '');
+                    return (m && m[1]) || '';
+                } catch (_) { noteSuppressed(); return ''; }
+            }
+
+            // An `application/trickle-ice-sdpfrag` body: a partial SDP, no library needed. One
+            // `m=` section for the batch — the page is `max-bundle`, so every candidate belongs
+            // to the first media section — and the mid beside it, which is what the host prefers
+            // over the m-line index it counts.
+            function trickleFragment(ufrag, cands, end) {
+                let body = '';
+                if (ufrag) body += 'a=ice-ufrag:' + ufrag + '\r\n';
+                if (cands.length) {
+                    body += 'm=video 9 UDP/TLS/RTP/SAVPF 0\r\n';
+                    const mid = cands[0].sdpMid;
+                    if (mid) body += 'a=mid:' + mid + '\r\n';
+                    for (let i = 0; i < cands.length; i++) {
+                        const line = cands[i].candidate;
+                        body += 'a=' + (line.indexOf('candidate:') === 0 ? line : 'candidate:' + line) + '\r\n';
+                    }
+                }
+                if (end) body += 'a=end-of-candidates\r\n';
+                return body;
+            }
+
+            // Buffers from the moment the offer exists, because gathering starts there and the
+            // resource URL only arrives with the answer: a candidate produced in between is one
+            // the host would otherwise never see.
+            function startTrickle(peer, onDead) {
+                const queue = [];
+                let url = null;
+                let ended = false;
+                let closed = false;
+                let flushing = false;
+                let posted = '';
+                let sentCount = 0;
+                let attempts = 0;
+                let failStreak = 0;
+                let ackTimer = 0;
+                let deadCalled = false;
+
+                function onCandidate(ev) {
+                    if (closed) return;
+                    const c = ev.candidate;
+                    if (!c || !c.candidate) ended = true;
+                    else queue.push(c);
+                    flush();
+                }
+
+                function stop() {
+                    if (closed) return;
+                    closed = true;
+                    queue.length = 0;
+                    if (ackTimer) { clearTimeout(ackTimer); ackTimer = 0; }
+                    try { peer.removeEventListener('icecandidate', onCandidate); } catch (_) { noteSuppressed(); }
+                }
+
+                // Nothing this sender carries ever reached the host, and the offer that was
+                // posted carries no candidates either — so the session cannot connect and the
+                // page has to be told, once. Everything else about the sender stops here too:
+                // there is no third thing to try.
+                function dead(reason) {
+                    if (deadCalled) return;
+                    deadCalled = true;
+                    stop();
+                    try { if (onDead) onDead(reason); } catch (_) { noteSuppressed(); }
+                }
+
+                function flush() {
+                    if (closed || !url || flushing) return;
+                    // A candidate the offer already carried would be added a second time and
+                    // the host has no way to tell the copy apart, so it would build a duplicate
+                    // pair for it. Filtered across the whole queue rather than off its head:
+                    // that the duplicates all precede the fresh ones is a property of how the
+                    // browser fills `localDescription`, not of anything here.
+                    const batch = [];
+                    while (queue.length && batch.length < TRICKLE_MAX_BATCH) {
+                        const c = queue.shift();
+                        if (posted.indexOf(c.candidate) < 0) batch.push(c);
+                    }
+                    const done = ended && !queue.length;
+                    if (!batch.length && !done) return;
+                    const ufrag = (batch.length && batch[0].usernameFragment) || localIceUfrag(peer);
+                    let requeued = false;
+                    // One retry, then give up on the batch. A candidate lost to a transient
+                    // failure can be the relay one, and PATCH is the only way it ever reaches the
+                    // host — but a second failure in a row is the endpoint, not the packet, and
+                    // an endpoint that refuses this verb refuses every batch, which is why giving
+                    // up is `dead()` and not a silent drop.
+                    function requeue(reason) {
+                        noteSuppressed();
+                        if (failStreak++ > 0) { dead(reason); return; }
+                        requeued = true;
+                        for (let i = batch.length - 1; i >= 0; i--) queue.unshift(batch[i]);
+                    }
+                    flushing = true;
+                    attempts++;
+                    fetch(url, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/trickle-ice-sdpfrag' },
+                        body: trickleFragment(ufrag, batch, done),
+                    }).then(function (r) {
+                        // 404 is the session being over, not a transport failure: there is
+                        // nothing left to send it to, and nothing a rejoin would fix.
+                        if (r.status === 404) { stop(); return; }
+                        if (trickleIsFatal(r.status)) { dead('PATCH ' + r.status); return; }
+                        if (r.ok) {
+                            sentCount += batch.length;
+                            failStreak = 0;
+                            if (ackTimer) { clearTimeout(ackTimer); ackTimer = 0; }
+                            return;
+                        }
+                        requeue('PATCH ' + r.status);
+                    }, function () {
+                        requeue('PATCH did not complete');
+                    }).then(function () {
+                        flushing = false;
+                        if (closed) return;
+                        if (done && !requeued) stop(); else flush();
+                    });
+                }
+
+                peer.addEventListener('icecandidate', onCandidate);
+                return {
+                    // `offerSdp` is the offer as it went out, not `localDescription` as it reads
+                    // later — that one keeps growing as candidates are gathered.
+                    open: function (resourceUrl, offerSdp) {
+                        url = resourceUrl;
+                        posted = offerSdp || '';
+                        // A PATCH that is answered with a status can be acted on; one that is
+                        // black-holed never settles, and then nothing above ever runs again.
+                        ackTimer = setTimeout(function () {
+                            ackTimer = 0;
+                            if (closed || sentCount > 0 || attempts === 0) return;
+                            dead('no PATCH acknowledged in ' + TRICKLE_FIRST_ACK_MS + ' ms');
+                        }, TRICKLE_FIRST_ACK_MS);
+                        flush();
+                    },
+                    stop: stop,
+                    count: function () { return sentCount; },
+                };
+            }
+
             function tryPlay() {
                 const p = video.play();
                 if (p && p.catch) {
@@ -1095,6 +1295,7 @@
                 if (videoStatsPoll) { clearInterval(videoStatsPoll); videoStatsPoll = null; }
                 videoWorkerStats = null;
                 stopFallbackFrameStats();
+                if (trickleSender) { trickleSender.stop(); trickleSender = null; }
                 try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
@@ -1116,6 +1317,36 @@
                 console.warn('falling back to createEncodedStreams:', reason);
                 teardownSession();
                 start(true);
+            }
+
+            // Trickle was advertised and then did not work: the resource was missing, the verb
+            // was refused, or nothing was ever acknowledged. The offer that went out carries no
+            // candidates, so unless ICE has already come up there is nothing to salvage — latch
+            // trickle off for the page and join again with a gathered offer. `trickleOff` is
+            // never cleared, so this happens at most once per page load and a manual reconnect
+            // does not repeat it.
+            function trickleFailed(reason, preferWebCodecs) {
+                if (trickleOff) return;
+                trickleOff = true;
+                degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                console.warn('[ice] trickled candidates are not reaching the host (' + reason + ')');
+                // Enough candidates got through before this to nominate a pair, so tearing the
+                // session down would cost more than the latch is worth and the latch is all the
+                // next join needs. The test is the *current* peer connection, not `isLive`: a
+                // reconfigure keeps the old picture on screen while the new connection is still
+                // negotiating, and that one does need the rejoin.
+                const connected = !!pc && (pc.connectionState === 'connected'
+                    || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
+                if (connected) return;
+                console.warn('[ice] rejoining with a gathered offer');
+                // No `/leave` and no `DELETE` first, deliberately: `start_session` stops the
+                // previous capture for this client before it starts a new one, so a replacement
+                // join is the host's own designed path, and signalling a leave would set the
+                // teardown running *concurrently* with the display the rejoin is creating. The
+                // two sibling rungs — `fallbackToVideo` and `retryWithLegacyTransform` — rejoin
+                // the same way for the same reason.
+                teardownSession();
+                start(preferWebCodecs);
             }
 
             function fallbackToVideo(reason) {
@@ -1480,10 +1711,16 @@
                 // After teardownSession, so this call owns the newest generation.
                 const gen = ++startGen;
                 const stale = () => gen !== startGen;
+                let localTrickle = null;
                 try {
                     const webcodecs = preferWebCodecs && canWebCodecs && !usingFallback;
 
                     const useScriptTransform = useScriptTransformNow();
+                    // Primed at load, so this is normally already resolved. Read before the ICE
+                    // config so both are in hand before the peer connection exists.
+                    const netConfig = await getNetConfig();
+                    if (stale()) return;
+                    const canTrickle = !trickleOff && netConfig.trickleIce === true;
                     const iceConfig = await getIceConfig();
                     if (stale()) return;
                     const iceServers = iceConfig.iceServers;
@@ -1787,8 +2024,22 @@
                     if (stale()) return;
                     await pc.setLocalDescription(offer);
                     if (stale()) return;
-                    await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
-                    if (stale()) return;
+                    if (canTrickle) {
+                        // No wait at all: the offer goes out with whatever `setLocalDescription`
+                        // had — usually nothing — and every candidate follows over PATCH. This is
+                        // the whole win on a relayed join, where the wait was a TURN allocation
+                        // the POST had no reason to be behind.
+                        localTrickle = startTrickle(pc, function (reason) {
+                            if (stale()) { noteSuppressed(); return; }
+                            trickleFailed(reason, preferWebCodecs);
+                        });
+                        trickleSender = localTrickle;
+                    } else {
+                        degrade(DEG.TRICKLE_ICE_UNAVAILABLE);
+                        await waitForIceGathering(pc, needRelay ? 6000 : 3000, needRelay);
+                        if (stale()) return;
+                    }
+                    const offerSdp = pc.localDescription.sdp;
 
                     let storedToken = '';
                     try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
@@ -1805,7 +2056,7 @@
                             width: joinData.width,
                             height: joinData.height,
                             dpr: getDpr(),
-                            sdp: pc.localDescription.sdp,
+                            sdp: offerSdp,
                             audioCapabilities: audioCaps,
                         }),
                     };
@@ -1834,8 +2085,26 @@
                     if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    // Read before anything can return: this join was accepted, and the token it
+                    // issued is what a rejoin — including the one two lines below — presents
+                    // instead of the OTP.
                     const issuedToken = resp.headers.get('X-Device-Token');
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
+                    let trickleResource = null;
+                    try { trickleResource = resp.headers.get('Location'); } catch (_) { noteSuppressed(); }
+                    if (localTrickle) {
+                        if (trickleResource) {
+                            localTrickle.open(trickleResource, offerSdp);
+                        } else {
+                            // The host said it takes trickled candidates and then handed back no
+                            // resource — a proxy that strips the header, or the cloud relay,
+                            // which tunnels /whep but has no URL space of its own. The offer that
+                            // went out carries no candidates, so there is nothing to salvage.
+                            localTrickle.stop();
+                            trickleFailed('the answer named no resource', preferWebCodecs);
+                            return;
+                        }
+                    }
                     const answerSdp = await resp.text();
                     if (stale()) return;
                     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
@@ -1864,6 +2133,9 @@
                     }
                 } catch (err) {
                     console.error(err);
+                    // Stopping is idempotent, and this one belongs to the connection that just
+                    // failed whether or not a newer start() has taken over.
+                    if (localTrickle) localTrickle.stop();
                     // A newer start() already owns pc and worker; this one's failure is about a
                     // connection nobody is using any more.
                     if (stale()) { noteSuppressed(); return; }
@@ -1882,8 +2154,7 @@
             async function httpsUrl() {
                 let httpsPort = 8443;
                 try {
-                    const r = await fetch('/net-config');
-                    if (r.ok) httpsPort = (await r.json()).httpsPort || httpsPort;
+                    httpsPort = (await getNetConfig()).httpsPort || httpsPort;
                 } catch (_) { noteSuppressed(); }
                 const u = new URL(location.href);
                 u.protocol = 'https:';
