@@ -37,8 +37,12 @@ pub fn answer_sdp_checks(answer_sdp: &str) -> Vec<(&'static str, bool)> {
             answer_sdp.contains("packetization-mode=1"),
         ),
         (
-            "profile-level-id=42e01f",
-            answer_sdp.contains("profile-level-id=42e01f"),
+            // The profile bytes must be symmetric — RFC 6184 requires it and webrtc-rs's own
+            // fmtp matcher compares exactly these two — but the *level* is now derived from the
+            // negotiated geometry, so asserting a literal `42e01f` would fail the moment the
+            // answer became honest about what it is sending.
+            "profile-level-id=42e0..",
+            answer_sdp.contains("profile-level-id=42e0"),
         ),
         (
             "rtcp-fb nack",

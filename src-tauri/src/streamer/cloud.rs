@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::streamer::config::Config;
+use crate::streamer::lock::LockExt;
 use crate::streamer::server::AppState;
 use crate::streamer::webrtc_session::RTCIceServer;
 
@@ -156,6 +157,38 @@ pub mod register_error_code {
     pub const UNAUTHORIZED: &str = "unauthorized";
 }
 
+/// A registration the relay refused, carrying the code as a value rather than as spelling.
+///
+/// The reconnect loop used to decide whether to rotate the user's join code by asking whether the
+/// error's *formatted text* contained `SESSION_TAKEN`. Nothing enforced that spelling: one
+/// `format!` that echoed a relay message would have rotated a working session id out from under
+/// the user, and the join code on screen would silently stop matching the one the client has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterRejected {
+    pub code: String,
+}
+
+impl std::fmt::Display for RegisterRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "register_error: {}", self.code)
+    }
+}
+
+impl std::error::Error for RegisterRejected {}
+
+impl RegisterRejected {
+    pub fn is_session_taken(&self) -> bool {
+        self.code == register_error_code::SESSION_TAKEN
+    }
+}
+
+/// Whether this error is the relay saying the session id is already registered elsewhere.
+fn is_session_taken(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<RegisterRejected>())
+        .any(RegisterRejected::is_session_taken)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum CloudState {
@@ -295,7 +328,7 @@ async fn run_loop(mut config: CloudConfig, server_config: Config, sink: SharedCl
                 backoff_secs = 1;
             }
             Err(e) => {
-                if e.to_string().contains(register_error_code::SESSION_TAKEN) {
+                if is_session_taken(&e) {
                     let new_id = generate_session_id();
                     tprintln!(
                         "[cloud] session id '{}' still held by relay; rotating to '{}'",
@@ -304,7 +337,7 @@ async fn run_loop(mut config: CloudConfig, server_config: Config, sink: SharedCl
                     );
                     config.session_id = new_id.clone();
                     if let Some(auth) = session_auth.as_ref() {
-                        *auth.session_id.lock().unwrap() = new_id.clone();
+                        *auth.session_id.lock_recover() = new_id.clone();
                     }
                     sink.session_rotated(new_id);
                     backoff_secs = 1;
@@ -429,7 +462,7 @@ fn handle_relay_message(
                 CloudState::Error,
                 format!("Registration rejected: {code} {message}"),
             );
-            bail!("register_error: {code}");
+            return Err(RegisterRejected { code }.into());
         }
         RelayToHost::SignalRequest {
             request_id,
@@ -719,8 +752,9 @@ mod tests {
 
     #[test]
     fn the_session_taken_code_is_the_one_the_reconnect_loop_matches_on() {
-        // `run_loop` rotates the session id by looking for this string inside the error, so the
-        // constant and the wire spelling have to be the same thing.
+        // The reconnect loop rotates the session id off `RegisterRejected`, whose `code` is this
+        // constant, so the constant and the wire spelling have to be the same thing. The three
+        // tests at the end of this module cover the matching; this one covers the parsing.
         let raw = r#"{"type":"register_error","code":"session_taken","message":""}"#;
         match serde_json::from_str::<RelayToHost>(raw).expect("register_error") {
             RelayToHost::RegisterError { code, .. } => {
@@ -790,5 +824,32 @@ mod tests {
             CLOUD_WS_URL.contains(&format!("/v{RELAY_PROTOCOL_VERSION}/")),
             "the path should carry the protocol version the register frame claims"
         );
+    }
+
+    #[test]
+    fn the_relays_session_taken_code_is_recognised_through_context() {
+        let e: anyhow::Error = RegisterRejected {
+            code: register_error_code::SESSION_TAKEN.to_string(),
+        }
+        .into();
+        assert!(is_session_taken(&e.context("relay handshake")));
+    }
+
+    #[test]
+    fn another_register_error_does_not_rotate_the_session_id() {
+        let e: anyhow::Error = RegisterRejected {
+            code: register_error_code::RATE_LIMITED.to_string(),
+        }
+        .into();
+        assert!(!is_session_taken(&e));
+    }
+
+    #[test]
+    fn an_unrelated_error_that_merely_spells_the_code_does_not_rotate_it() {
+        // The exact regression the typed error exists to prevent: any future `format!` that
+        // echoes a relay message used to be enough to rotate a working join code.
+        let e = anyhow!("websocket error: relay said session_taken about somebody else");
+        assert!(!is_session_taken(&e));
+        assert!(e.to_string().contains(register_error_code::SESSION_TAKEN));
     }
 }

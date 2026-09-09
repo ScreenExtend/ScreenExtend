@@ -514,6 +514,105 @@ fn apply(app: &AppHandle, adapters: Vec<NetworkInfo>) {
     }
 }
 
+/// `SIOCGIFMEDIA` — the ioctl `ifconfig` itself uses to print `media: autoselect`. Present since
+/// well before the 10.15 floor; the constant is not in `libc`, so it is spelled out here.
+///
+/// Deliberately a second constant rather than a reuse of the `SIOCGIFMEDIA` computed at the top
+/// of this file, and deliberately not reconciled with it during the merge that first put the two
+/// in one module. They do not agree: `_IOWR` encodes the request size, this literal encodes 40,
+/// and `iowr(56, size_of::<ifmediareq>())` encodes 44 because that struct is `packed(4)` while
+/// the header's is not. A 64-bit userland process should be asking with 48 (`0xc0306938`), which
+/// is neither. Each call site keeps the number it was written and tested against until somebody
+/// can check on hardware which of the three the kernel actually answers; collapsing them here
+/// would silently change one caller's behaviour on the strength of an argument nobody has run.
+/// See `findings/major-net-mac-two-disagreeing-siocgifmedia-constants.md`.
+const SIOCGIFMEDIA_LITERAL: libc::c_ulong = 0xc0286938;
+
+/// `IFM_ETHER` / `IFM_IEEE80211` occupy the type field, `IFM_NMASK`, of `ifm_current`.
+const IFM_NMASK: u32 = 0xf0;
+const IFM_ETHER: u32 = 0x00000020;
+const IFM_IEEE80211: u32 = 0x00000080;
+
+#[repr(C)]
+struct IfMediaReq {
+    ifm_name: [libc::c_char; libc::IFNAMSIZ],
+    ifm_current: libc::c_int,
+    ifm_mask: libc::c_int,
+    ifm_status: libc::c_int,
+    ifm_active: libc::c_int,
+    ifm_count: libc::c_int,
+    ifm_ulist: *mut libc::c_int,
+}
+
+/// Which physical medium a local IP is reached over.
+///
+/// `getifaddrs` gives the interface name for the address, and `SIOCGIFMEDIA` gives that
+/// interface's media type. USB tethering and RNDIS both report `IFM_ETHER`, which is the point:
+/// a phone on a cable is an ordinary Ethernet interface as far as the stack is concerned.
+pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::LinkMedium> {
+    use crate::streamer::platform::LinkMedium;
+
+    let want: std::net::IpAddr = ip.parse().ok()?;
+    let mut name: Option<String> = None;
+    unsafe {
+        let mut ifap: *mut ifaddrs = std::ptr::null_mut();
+        if getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let entry = &*cur;
+            if !entry.ifa_addr.is_null() {
+                let family = (*entry.ifa_addr).sa_family as i32;
+                let got: Option<std::net::IpAddr> = if family == AF_INET {
+                    let sin = entry.ifa_addr as *const libc::sockaddr_in;
+                    Some(std::net::IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                        (*sin).sin_addr.s_addr,
+                    ))))
+                } else if family == AF_INET6 {
+                    let sin6 = entry.ifa_addr as *const libc::sockaddr_in6;
+                    Some(std::net::IpAddr::V6(Ipv6Addr::from(
+                        (*sin6).sin6_addr.s6_addr,
+                    )))
+                } else {
+                    None
+                };
+                if got == Some(want) {
+                    name = Some(
+                        CStr::from_ptr(entry.ifa_name)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    break;
+                }
+            }
+            cur = entry.ifa_next;
+        }
+        freeifaddrs(ifap);
+    }
+    let name = name?;
+
+    let sock = unsafe { libc::socket(AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return None;
+    }
+    let mut req: IfMediaReq = unsafe { std::mem::zeroed() };
+    for (i, b) in name.as_bytes().iter().take(libc::IFNAMSIZ - 1).enumerate() {
+        req.ifm_name[i] = *b as libc::c_char;
+    }
+    let rc = unsafe { libc::ioctl(sock, SIOCGIFMEDIA_LITERAL, &mut req as *mut IfMediaReq) };
+    unsafe { libc::close(sock) };
+    if rc != 0 {
+        // A virtual or tunnel interface has no media type at all, which is not a failure.
+        return Some(LinkMedium::Other);
+    }
+    Some(match (req.ifm_current as u32) & IFM_NMASK {
+        IFM_ETHER => LinkMedium::Wired,
+        IFM_IEEE80211 => LinkMedium::Wireless,
+        _ => LinkMedium::Other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
