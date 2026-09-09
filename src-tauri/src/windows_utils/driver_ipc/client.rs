@@ -53,6 +53,32 @@ impl Client {
         Self::connect_to(DEFAULT_PIPE_NAME).await
     }
 
+    /// Connect, preferring a driver that speaks [`PROTOCOL_VERSION`].
+    ///
+    /// A rebuilt driver would serve `{name}.v{PROTOCOL_VERSION}` alongside the unversioned pipe;
+    /// one that predates versioning serves only the latter, so this falls back and behaves
+    /// exactly as before. Nothing is *sent* to negotiate — the shipped driver is a signed
+    /// third-party binary and how it reacts to a message it cannot decode is not testable here,
+    /// so the negotiation is which pipe exists, not what is written to it.
+    ///
+    /// Returns the connection and the protocol version it negotiated.
+    pub async fn connect_negotiated(base: &str) -> Result<(Self, u32), error::ConnectionError> {
+        let versioned = versioned_pipe_name(base);
+        if std::path::Path::new(&format!(r"\\.\pipe\{versioned}")).exists() {
+            match Self::connect_to(&versioned).await {
+                Ok(client) => {
+                    tprintln!("[driver-ipc] negotiated protocol v{PROTOCOL_VERSION}");
+                    return Ok((client, PROTOCOL_VERSION));
+                }
+                Err(e) => teprintln!(
+                    "[driver-ipc] the v{PROTOCOL_VERSION} pipe exists but did not accept a \
+                     connection ({e}); falling back to the unversioned pipe"
+                ),
+            }
+        }
+        Ok((Self::connect_to(base).await?, 1))
+    }
+
     /// Connect to driver on pipe with specified name.
     ///
     /// `name` is ONLY the {name} portion of \\.\pipe\{name}.
@@ -164,20 +190,30 @@ impl Client {
     /// Note: If multiple copies of this client exist, the receiver will only be
     /// closed after all copies are dropped.
     pub fn receive_events(&self) -> impl Stream<Item = Result<EventCommand, error::ReceiveError>> {
+        self.receive_events_or_lag().filter_map(|item| match item {
+            Ok(EventOrLag::Event(event)) => Some(Ok(event)),
+            Ok(EventOrLag::Lagged(_)) => None,
+            Err(e) => Some(Err(e)),
+        })
+    }
+
+    /// The same stream, but with the lag itself as an item rather than a log line.
+    ///
+    /// A consumer that caches driver state cannot ignore a gap: it is the *reason* the cache is
+    /// wrong, and it is the only moment at which it can know to go and ask again.
+    pub fn receive_events_or_lag(
+        &self,
+    ) -> impl Stream<Item = Result<EventOrLag, error::ReceiveError>> {
         use tokio_stream::wrappers::*;
 
         let stream = BroadcastStream::new(self.command_rx.resubscribe());
 
         stream.filter_map(|cmd| match cmd {
-            Ok(Ok(ClientCommand::Event(event))) => Some(Ok(event)),
+            Ok(Ok(ClientCommand::Event(event))) => Some(Ok(EventOrLag::Event(event))),
             Ok(Err(e)) => Some(Err(e)),
             Err(errors::BroadcastStreamRecvError::Lagged(n)) => {
-                // Dropped events leave DriverClient's cached monitor list stale, and
-                // refresh_state reads this same channel, so it cannot repair itself.
-                teprintln!(
-                    "[driver-ipc] dropped {n} driver events; cached monitor state may be stale"
-                );
-                None
+                teprintln!("[driver-ipc] dropped {n} driver events; resynchronising");
+                Some(Ok(EventOrLag::Lagged(n)))
             }
             _ => None,
         })
@@ -474,6 +510,56 @@ mod test {
 
         assert_eq!(events1.len(), 2, "{:?}", events1);
         assert_eq!(events2.len(), 2, "{:?}", events2);
+    }
+
+    /// A consumer that falls behind must be *told*, not quietly skipped past. `DriverClient`
+    /// caches its monitor list off this stream and `refresh_state` reads that cache, so the
+    /// gap is the only moment at which the cache can know it has gone wrong.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_lagging_consumer_is_told_how_much_it_missed() {
+        const PIPE_NAME: &str = "virtualdisplaydriver-test-lag_is_surfaced";
+
+        let mut server = MockServer::new(PIPE_NAME);
+        let client = Client::connect_to(PIPE_NAME)
+            .await
+            .expect("Failed to connect to pipe");
+
+        // Subscribed but deliberately never polled, so the broadcast overruns it.
+        let stream = client.receive_events_or_lag();
+        tokio::pin!(stream);
+
+        for _ in 0..(EVENT_CAPACITY * 2) {
+            client.notify(&[]).await.expect("Failed to notify");
+            server.pump().await;
+        }
+        sleep(Duration::from_millis(50)).await;
+
+        let first = stream.next().await.expect("stream ended");
+        assert!(
+            matches!(first, Ok(EventOrLag::Lagged(n)) if n > 0),
+            "expected a lag report, got {first:?}"
+        );
+    }
+
+    #[test]
+    fn the_versioned_pipe_is_a_suffix_of_the_shipped_one() {
+        // A driver that predates versioning never serves this name, which is the whole
+        // compatibility story: the host looks, does not find it, and connects as before.
+        assert_eq!(
+            versioned_pipe_name("virtualdisplaydriver"),
+            format!("virtualdisplaydriver.v{PROTOCOL_VERSION}")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_unversioned_driver_still_connects_and_reports_v1() {
+        const PIPE_NAME: &str = "virtualdisplaydriver-test-negotiate_falls_back";
+
+        let _server = MockServer::new(PIPE_NAME);
+        let (_client, protocol) = Client::connect_negotiated(PIPE_NAME)
+            .await
+            .expect("Failed to connect to pipe");
+        assert_eq!(protocol, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

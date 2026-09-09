@@ -61,6 +61,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
     let sck_available = capture_backend() == "ScreenCaptureKit";
     let display_backend = probe_display_backend();
     let hostap_backend = probe_hosted_network_backend();
+    let input_backend = crate::streamer::input::probe_backend();
 
     let mut unsupported: Vec<UnsupportedApi> = Vec::new();
 
@@ -111,6 +112,20 @@ pub fn check_system_requirements() -> CompatibilityReport {
         });
     }
 
+    // Not granted means every `CGEventPost` is dropped by the OS with no error the process can
+    // observe, so a client with remote control enabled sees a host that simply never moves.
+    // Reported through the list that already exists rather than a new UI surface; the
+    // `request_permission` / `open_permission_settings` commands are what act on it.
+    if at_least_min && !input_backend.injects() {
+        unsupported.push(UnsupportedApi {
+            name: "Accessibility (Remote Control)".to_string(),
+            description: "Letting a connected device drive this Mac's keyboard and pointer.                           Enable ScreenExtend in System Settings > Privacy & Security >                           Accessibility."
+                .to_string(),
+            required_version: "permission not granted".to_string(),
+            severity: "optional".to_string(),
+        });
+    }
+
     let audio_backend = super::audio::probe_audio_backend();
     if at_least_min && audio_backend == super::audio::AudioBackend::Unsupported {
         unsupported.push(UnsupportedApi {
@@ -122,12 +137,13 @@ pub fn check_system_requirements() -> CompatibilityReport {
     }
 
     tprintln!(
-        "[compat] {} — capture {}, display {}, audio {}, hosted network {}",
+        "[compat] {} — capture {}, display {}, audio {}, hosted network {}, input {}",
         os_version_string(),
         capture_backend(),
         display_backend.as_str(),
         audio_backend.as_str(),
-        hostap_backend.as_str()
+        hostap_backend.as_str(),
+        input_backend.as_str()
     );
 
     CompatibilityReport {
@@ -138,13 +154,13 @@ pub fn check_system_requirements() -> CompatibilityReport {
         unsupported_apis: unsupported,
         audio_backend: audio_backend.as_str().to_string(),
         display_backend: display_backend.as_str().to_string(),
-        capture_backend: if sck_available {
-            "ScreenCaptureKit".to_string()
-        } else {
-            "CGDisplayStream".to_string()
-        },
+        capture_backend: capture_backend().to_string(),
+        // Which VideoToolbox encoder, not just "VideoToolbox": `VTCopyVideoEncoderList` says
+        // whether this Mac has a hardware H.264 encoder at all, and the report is the one place
+        // a user can see that answer without reading the log.
         encoder_backend: super::streamer::encoder::probe_encoder_backend().to_string(),
-        hosted_network_backend: "CoreWLAN HostAP".to_string(),
+        hosted_network_backend: hostap_backend.as_str().to_string(),
+        input_backend: input_backend.as_str().to_string(),
     }
 }
 

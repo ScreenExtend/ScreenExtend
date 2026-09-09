@@ -685,6 +685,14 @@ pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisp
         .collect()
 }
 
+/// Every client IP this host has a session for.
+///
+/// The one place that can answer "has anything actually associated to our hosted network and
+/// joined?", which is the difference between an AP that is advertised and an AP that works.
+pub fn client_ips(sessions: &SharedSessions) -> Vec<String> {
+    sessions.lock().unwrap().keys().cloned().collect()
+}
+
 pub fn live_display_count(sessions: &SharedSessions) -> usize {
     sessions
         .lock()
