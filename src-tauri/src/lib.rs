@@ -189,31 +189,6 @@ impl Device {
     }
 }
 
-//#[tauri::command]
-//#[specta::specta]
-//fn get_devices(app: tauri::AppHandle) {
-//    let mut rng = rand::thread_rng();
-//    let device = Device {
-//        ip: format!(
-//            "192.168.{}.{}",
-//            rng.gen_range(1, 256),
-//            rng.gen_range(1, 256)
-//        ),
-//        name: format!("Device {}", rng.gen_range(1, 10)),
-//        scale: rng.gen_range(1, 9) * 25,
-//        orientation: if rng.gen_range(0, 2) == 1 {
-//            "Portrait".to_string()
-//        } else {
-//            "Landscape".to_string()
-//        },
-//        refresh_rate: rng.gen_range(15, 500),
-//        os: ["Windows", "MacOS", "Linux", "Android", "iOS", "iPadOS"][rng.gen_range(0, 6)]
-//            .to_string(),
-//        screen_size: format!("{}x{}", rng.gen_range(500, 2501), rng.gen_range(1, 2501)),
-//    };
-//    let _ = app.emit("device_join", device);
-//}
-
 #[tauri::command]
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
