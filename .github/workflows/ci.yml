@@ -55,11 +55,12 @@ jobs:
       - name: Safari 13.1 floor (dist/)
         run: node scripts/check-legacy-webkit.mjs
 
-      # Six dependency-free Node harnesses over the shipped client page: the input wire format
-      # and telemetry frame, the Opus decode worker and its sequence gate, the jitter buffer
-      # plus the planar ring ABI it shares with the worker, the WebCodecs video path and the
-      # RTP->host-clock inversion A/V sync rides on, ICE gathering, and the /reconfig epochs.
-      # They load the real .js with `vm` and browser stubs — no runner, no devDependency, and
+      # Seven dependency-free Node harnesses over the shipped client page: the input wire
+      # format and telemetry frame, a set of golden input vectors the Rust parser reads back,
+      # the Opus decode worker and its sequence gate, the jitter buffer plus the planar ring ABI
+      # it shares with the worker, the WebCodecs video path and the RTP->host-clock inversion
+      # A/V sync rides on, ICE gathering, and the /reconfig epochs. They load the real .js with
+      # `vm` and browser stubs — no runner, no devDependency, and
       # src-tauri/src/streamer/static/ stays byte-identical.
       - name: client page harnesses
         run: pnpm test:client
@@ -121,12 +122,15 @@ jobs:
 
       # Includes the hand-written FFI layout tests (nvenc_layout, amd_layout, intel), which
       # are the only thing asserting those ABIs — the AMD backend has never encoded a frame.
+      # No `--skip` any more. `a_display_name_resolves_only_to_a_live_display` used to be
+      # excluded by name because CoreGraphics reports no displays to a process outside a console
+      # session; it now gates itself through `test_support::skip`, which prints `SKIP <what>:
+      # <reason>` and fails under SE_REQUIRE_HW=1. Excluding a test by name in the job hides it
+      # from the report entirely — the whole point of the convention is that a test which
+      # verified nothing says so.
       - name: cargo test
         working-directory: src-tauri
-        # `a_display_name_resolves_only_to_a_live_display` calls CGMainDisplayID and needs a
-        # real console session; it is skipped rather than deleted so the gating decision
-        # stays visible. W15 owns turning this into a proper ignore/feature gate.
-        run: cargo test -- --skip a_display_name_resolves_only_to_a_live_display
+        run: cargo test
 
   # ------------------------------------------------- macOS runtime smoke (modern tiers)
   # The dev box is 10.15 Catalina, so these runners are the only place the 12.3+/13+/14.2+
@@ -319,11 +323,12 @@ jobs:
   # block in that file for how to seed one. Hosted runners are shared VMs, so seed a key
   # only from several runs, and expect to keep the tolerance loose.
   #
-  # Windows only, and not because macOS does not matter: x264 is compiled into the Windows
-  # backend alone, and no macOS test prints a timing at all — the VideoToolbox tests assert
-  # bitstream structure and nothing else. Giving the VideoToolbox encoder the same
-  # `p95_encode=...us` line the x264 one already prints is what would extend this job to
-  # macos-15; until then a macOS entry here would be a green step measuring nothing.
+  # Two platforms, two different measurement commands, one gate. Windows measures x264, which
+  # is the only encoder present on every machine and therefore the one comparable run to run
+  # (the GPU encoders are measured on the dev boxes, docs/BASELINE.md). macOS measures
+  # VideoToolbox's per-submit cost, which `encode_synthetic` now prints as `vt_encode_p95=...us`
+  # — before it did, the macOS half of this job was impossible for want of a number, not for
+  # want of a reason. Neither run needs a display or a Screen Recording grant.
   perf-gate:
     name: perf gate (${{ matrix.os }})
     needs: rust
@@ -331,7 +336,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest]
+        os: [windows-latest, macos-13, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -364,8 +369,14 @@ jobs:
         working-directory: src-tauri
         shell: bash
         run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            measure="cargo test --release --lib macos_utils::streamer::encoder -- --ignored --nocapture"
+          else
+            measure="cargo test --release --lib x264_encoder -- --nocapture"
+          fi
+          echo "measuring with: $measure"
           for i in 1 2 3; do
-            cargo test --release --lib x264_encoder -- --nocapture | tee "../perf-run-$i.txt"
+            $measure | tee "../perf-run-$i.txt"
           done
 
       - name: compare against ci/perf-baseline.json
