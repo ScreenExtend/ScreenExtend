@@ -1075,6 +1075,7 @@ async fn start_session(
                 fallback_track: caps.wants_fallback_track,
                 redundancy: caps.redundancy,
                 link_loss: None, // wired in by `start_session`, which owns the BWE
+                locality,
                 hub: std::sync::Arc::clone(hub),
                 overrides: std::sync::Arc::clone(overrides),
                 device_key: client_ip.to_string(),
@@ -1808,12 +1809,22 @@ fn build_ice_servers(config: &Config) -> Vec<RTCIceServer> {
     servers
 }
 
+/// An address as it has to appear in a URL. RFC 3986 requires an IPv6 literal to be bracketed, and
+/// an unbracketed one is not a URL a browser will open.
+pub fn url_host(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{ip}]"),
+        _ => ip.to_string(),
+    }
+}
+
 fn log_urls(lan_ip: Option<&str>, http_port: u16, https_port: u16, self_signed: bool) {
     tprintln!("server listening — HTTP :{http_port}, HTTPS :{https_port}");
     match lan_ip {
         Some(ip) => {
-            tprintln!("  LAN (open this first):  http://{ip}:{http_port}/");
-            tprintln!("  LAN (secure / WebCodecs): https://{ip}:{https_port}/");
+            let host = url_host(ip);
+            tprintln!("  LAN (open this first):  http://{host}:{http_port}/");
+            tprintln!("  LAN (secure / WebCodecs): https://{host}:{https_port}/");
         }
         None => tprintln!("  LAN IP not set; use this machine's IP manually (or pass --lan-ip)"),
     }
@@ -1840,6 +1851,13 @@ mod tests {
             stun_urls: vec!["stun:stun.l.google.com:19302".to_string()],
             ..Config::default()
         })
+    }
+
+    #[test]
+    fn an_ipv6_literal_is_bracketed_in_a_url() {
+        assert_eq!(url_host("192.168.1.20"), "192.168.1.20");
+        assert_eq!(url_host("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(url_host("localhost"), "localhost");
     }
 
     #[test]

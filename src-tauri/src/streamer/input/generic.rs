@@ -3,6 +3,10 @@ use super::ClientProfile;
 
 pub const NAME: &str = "generic-noop";
 
+pub fn probe() -> super::InputBackend {
+    super::InputBackend::Unsupported
+}
+
 pub fn boost_thread() {}
 
 pub struct Injector;

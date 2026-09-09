@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use super::session::{
     SessionAuth, SharedApprovedDevices, SharedBannedDevices, SharedDeviceOverrides,
@@ -89,7 +89,10 @@ impl Default for ScalePercent {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub bind_ip: Ipv4Addr,
+    /// What the axum servers bind. `IpAddr`, not `Ipv4Addr`: an IPv6-only network used to
+    /// produce no listener at all and no diagnostic, because every v6 address the enumeration
+    /// found failed a `parse::<Ipv4Addr>()` and was dropped with `.ok()`.
+    pub bind_ip: IpAddr,
     pub lan_ip: Option<String>,
     pub local_ips: Option<SharedLocalIps>,
     pub port: u16,
@@ -168,7 +171,7 @@ pub const DEFAULT_STUN_URL: &str = "stun:stun.l.google.com:19302";
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_ip: Ipv4Addr::UNSPECIFIED,
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             lan_ip: None,
             local_ips: None,
             port: 8080,

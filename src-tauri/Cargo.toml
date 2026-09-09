@@ -105,6 +105,7 @@ dispatch2 = "0.3"
 mach2 = "0.4"
 objc2-core-foundation = { version = "0.3", features = [
     "CFBase", "CFCGTypes", "CFDictionary", "CFString", "CFNumber", "CFArray",
+    "CFDate", "CFRunLoop",
 ] }
 objc2-io-surface = { version = "0.3", features = [
     "IOSurface", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation",
@@ -178,6 +179,7 @@ features = [
     "Win32_System_Memory",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_QoS",
+    "Win32_NetworkManagement_WiFi",
     "Win32_System_IO",
     "Win32_NetworkManagement_Ndis",
     "Graphics_Capture",
