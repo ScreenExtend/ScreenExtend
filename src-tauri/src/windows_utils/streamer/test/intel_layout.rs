@@ -100,3 +100,19 @@ fn key_field_offsets_match_onevpl_abi() {
         "CO3.LowDelayBRC"
     );
 }
+
+/// The rate-control enum has reserved gaps, so its values cannot be inferred from their order.
+/// Getting one wrong is neither a compile error nor a clean runtime error: asking for
+/// `MFX_RATECONTROL_LA` (8) in place of `MFX_RATECONTROL_VCM` (10) selects lookahead, which
+/// buffers frames, and the runtime faults inside `MFXVideoENCODE_Init` rather than refusing it.
+#[test]
+fn intel_rate_control_values_match_mfxstructures_h() {
+    assert_eq!(MFX_RATECONTROL_CBR, 1, "MFX_RATECONTROL_CBR");
+    assert_eq!(MFX_RATECONTROL_VBR, 2, "MFX_RATECONTROL_VBR");
+    assert_eq!(MFX_RATECONTROL_CQP, 3, "MFX_RATECONTROL_CQP");
+    assert_eq!(MFX_RATECONTROL_AVBR, 4, "MFX_RATECONTROL_AVBR");
+    assert_eq!(MFX_RATECONTROL_LA, 8, "MFX_RATECONTROL_LA");
+    assert_eq!(MFX_RATECONTROL_ICQ, 9, "MFX_RATECONTROL_ICQ");
+    assert_eq!(MFX_RATECONTROL_VCM, 10, "MFX_RATECONTROL_VCM");
+    assert_eq!(MFX_RATECONTROL_QVBR, 14, "MFX_RATECONTROL_QVBR");
+}

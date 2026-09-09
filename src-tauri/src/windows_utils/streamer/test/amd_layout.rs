@@ -44,6 +44,7 @@
 
 use std::mem::{align_of, offset_of, size_of};
 
+use crate::windows_utils::streamer::amd::encoder as enc;
 use crate::windows_utils::streamer::amd_sys::props::names as props;
 use crate::windows_utils::streamer::amd_sys::props::{codec, trace_writer};
 use crate::windows_utils::streamer::amd_sys::*;
@@ -789,6 +790,36 @@ fn abi_enum_values_match_amf_headers() {
 
     assert_eq!(AMF_DATA_BUFFER as i64, 0, "AMF_DATA_BUFFER");
     assert_eq!(AMF_DATA_SURFACE as i64, 1, "AMF_DATA_SURFACE");
+
+    // Colour signalling. `amd/encoder.rs` transcribes these as plain `i64` constants rather than
+    // binding the enums, so this pins the transcription against the header. The enum is not
+    // densely packed — FULL_709 is 7, not 4, because `ColorSpace.h` leaves the G10/G2084 values
+    // commented out in between — so counting instead of reading is how it goes wrong.
+    assert_eq!(
+        enc::COLOR_PRIMARIES_BT709,
+        1,
+        "COLOR_PRIMARIES_BT709 == AMF_COLOR_PRIMARIES_BT709"
+    );
+    assert_eq!(
+        enc::TRANSFER_CHARACTERISTIC_BT709,
+        1,
+        "TRANSFER_CHARACTERISTIC_BT709 == AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709"
+    );
+    assert_eq!(
+        enc::MATRIX_COEFF_BT709,
+        1,
+        "MATRIX_COEFF_BT709 == AMF_COLOR_MATRIX_COEFF_BT_709"
+    );
+    assert_eq!(
+        enc::COLOR_PROFILE_709,
+        1,
+        "COLOR_PROFILE_709 == AMF_VIDEO_CONVERTER_COLOR_PROFILE_709"
+    );
+    assert_eq!(
+        enc::COLOR_PROFILE_FULL_709,
+        7,
+        "COLOR_PROFILE_FULL_709 == AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709"
+    );
     assert_eq!(AMF_VARIANT_EMPTY as i64, 0, "AMF_VARIANT_EMPTY");
     assert_eq!(AMF_VARIANT_BOOL as i64, 1, "AMF_VARIANT_BOOL");
     assert_eq!(AMF_VARIANT_INT64 as i64, 2, "AMF_VARIANT_INT64");
@@ -1129,6 +1160,11 @@ fn abi_property_names_match_amf_headers() {
         props::AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
         "OutColorPrimaries",
         "AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES",
+    );
+    assert_wide(
+        props::AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF,
+        "OutMatrixCoeff",
+        "AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF",
     );
     assert_wide(
         props::AMF_VIDEO_ENCODER_QUERY_TIMEOUT,
