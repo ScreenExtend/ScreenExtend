@@ -122,6 +122,14 @@ impl SckAudioCapture {
                 epoch: 0,
             };
             let _: () = msg_send![&*config, setMinimumFrameInterval: interval];
+            // SCK has no audio-only mode before the 14.2 Process Tap, so this backend has to run
+            // a real screen stream to get audio at all — which is why it needs Screen Recording
+            // and lights the menu-bar indicator for the whole session. That much is Apple's
+            // constraint. What is ours is how much that dummy stream costs: 2x2 at 1 fps with no
+            // cursor compositing and the shallowest queue SCK accepts, and no screen output is
+            // ever registered so every frame it does produce is dropped at the delegate.
+            let _: () = msg_send![&*config, setShowsCursor: false];
+            let _: () = msg_send![&*config, setQueueDepth: 3isize];
         }
 
         let abl_scratch = vec![0u8; 4096].into_boxed_slice();
@@ -229,6 +237,21 @@ impl AudioSource for SckAudioCapture {
     }
 
     fn stop(&mut self) {
+        // The order here is the whole of this function's correctness. Releasing an `SCStream`, its
+        // delegate and a `DispatchQueue` handle does not drain or cancel blocks already enqueued
+        // on that queue, and Apple does not document `stopCaptureWithCompletionHandler:` as a
+        // barrier against an in-flight `stream:didOutputSampleBuffer:ofType:`. The Process Tap
+        // sibling gets that guarantee for free — `AudioDeviceDestroyIOProcID` is documented not to
+        // return while the IOProc runs — and SCK has no equivalent, so it is built by hand.
+
+        // 1. Blank the ivar the handler reads its context out of. A callback that starts after
+        //    this sees null and returns; one already past that read is covered by step 3.
+        if let Some(delegate) = &self.delegate {
+            // SAFETY: `delegate` is an instance of `delegate_class`, which declares the ivar
+            unsafe { set_ctx_ivar(delegate, ptr::null_mut()) };
+        }
+
+        // 2. Stop the stream and wait for its completion block.
         if let Some(stream) = &self.stream {
             let (tx, rx) = mpsc::channel::<()>();
             let handler = RcBlock::new(move |_error: *mut AnyObject| {
@@ -241,14 +264,20 @@ impl AudioSource for SckAudioCapture {
                     stopCaptureWithCompletionHandler: RcBlock::as_ptr(&handler)
                 ];
             }
-            // The delegate context is freed just below, so a stop that timed out rather than
-            // completed means a sample handler could still be in flight against it.
             if rx.recv_timeout(SCK_CALL_TIMEOUT).is_err() {
                 crate::teprintln!(
                     "audio: SCK stopCapture did not complete within {SCK_CALL_TIMEOUT:?}"
                 );
             }
         }
+
+        // 3. Drain the delivery queue. It is serial, so a synchronous block posted to it cannot
+        //    run until every handler queued ahead of it has returned — which is exactly the
+        //    guarantee the context box needs before it is freed.
+        if let Some(queue) = &self._queue {
+            queue.exec_sync(|| {});
+        }
+
         self.stream = None;
         self.delegate = None;
         self._content_filter = None;
@@ -256,7 +285,8 @@ impl AudioSource for SckAudioCapture {
         self._queue = None;
         self.nonsilent_probe = ptr::null();
         if !self.ctx.is_null() {
-            // SAFETY: the stream + delegate are released, so no callback can still read ctx
+            // SAFETY: the ivar is null, the stream is stopped, and the serial delivery queue has
+            // been drained to a barrier, so no handler can still be holding this pointer.
             drop(unsafe { Box::from_raw(self.ctx) });
             self.ctx = ptr::null_mut();
         }
