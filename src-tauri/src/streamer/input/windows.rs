@@ -377,8 +377,8 @@ impl Injector {
     ///
     /// Clamped to the desktop rather than to the client's own display, which is what macOS has
     /// always done — deliberately, so the two backends agree. Whether a locked client should be
-    /// confined to the display it is streaming is a product question, not a technical one; see
-    /// `findings/minor-input-relative-mode-escapes-the-target-display.md`.
+    /// confined to the display it is streaming is a product question, not a technical one, and
+    /// it has not been answered: confining it would need the session's own monitor rect here.
     fn advance_rel(&mut self, dx: i32, dy: i32) -> POINT {
         let base = match self.rel_pos {
             Some(p) => p,

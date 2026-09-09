@@ -1,3 +1,5 @@
+<!-- Recovered verbatim from DANGLING commit 67687cbeed16eae8aab8e24c21aa67f68bcb447d ("temp commit", 2026-09-02), parent 8ed8d09; unreachable from any branch. Original path: docs/airplay-fallback-design.md. Only revision that ever existed (blob 371b5879). -->
+
 # AirPlay virtual-display fallback (macOS 10.13 – 10.14.3)
 
 How ScreenExtend creates a display on Macs too old for `CGVirtualDisplay`: by
