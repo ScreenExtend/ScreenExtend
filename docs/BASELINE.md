@@ -33,7 +33,7 @@ includes decode or paint (see [What could not be measured](#what-could-not-be-me
 |------|---------|-------|
 | Windows host | Windows 11 build 26200 (25H2), NVIDIA RTX 3080 Ti Laptop GPU (driver 580.97) + Intel UHD Graphics, hybrid; primary 1920x1080@360 | IDD virtual display driver installed and working; NVENC, Quick Sync and x264 all exercised |
 | macOS host (dev box) | macOS 10.15.8 Catalina, Intel, Command Line Tools only, reached over SSH | CGDisplayStream + VideoToolbox only — SCK, Process Tap and VT low-latency do not exist on this OS |
-| macOS host (modern) | not available during this run | every 12.3+ / 13+ / 14.2+ tier is *pending user verification* |
+| macOS host (modern) | not available during this run | **needs modern Mac** — every 12.3+ / 13+ / 14.2+ tier is unmeasured: ScreenCaptureKit capture, `EnableLowLatencyRateControl`, `EnableLTR`, the Process Tap audio path, and whether `displayTime` / the SCK PTS are composite times there or scheduled ones as on Catalina. The script to run is `docs/manual-tests/macos-capture-encode.md`, which lists the log lines and the numbers to record, section by section. |
 
 ## Matrix — Windows, `selftest` (full host path, static 1280x720@60)
 
@@ -115,7 +115,11 @@ that holds frames. A modern Mac should beat every number here.
 
 Method: release build (`lto = "fat"`, `codegen-units = 1`), the display's own 60 Hz,
 `caffeinate -u -t 5` before each trial and the trial itself under `caffeinate -dims`, three trials,
-median reported. The animated content is the probe's own cursor animation, which is what makes
+median reported. Machine load during the run: the Mac's own 4 cores, no other cargo build running
+(checked with `ps -eo comm | grep -E '/cargo$|rustc$'` — the shared target directory is used by
+five agents and a fat-LTO link next door is worth ~20 minutes of contention), no user at the
+console, reached over SSH. Trials are sequential within one process invocation, so they are
+≥15 s apart; the three E2E trials agreed to within 0.26 ms at p50. The animated content is the probe's own cursor animation, which is what makes
 WindowServer produce dirty rects at all — the machine is reached over SSH and has no user at it.
 
 ```sh
@@ -156,7 +160,18 @@ this frame was captured" understates host latency by a frame. Recorded as
 | Build | captured (fps) | WindowServer drops | encoder output drops | capture → encoded p50 / p99 / max |
 |---|---|---|---|---|
 | before the VideoToolbox work (commit `719891df`, CGDS surface fixes only) | 61 (365 / 367 / 366 frames in 6 s) | 0 / 1 / 0 | not counted yet | **13.70 / 15.60 / 33.08** |
-| after (commit `34815f3a`) | queued | queued | queued | queued |
+| after (commit `ef21bea4b`) | 62 (373 / 371 / 370 frames in 6 s) | 0 / 0 / 0 | **0 / 0 / 0** | **13.61 / 15.06 / 20.64** |
+
+Medians of three trials, each 6 s, 360 frames submitted every time. The p50 barely moves — 13.70 →
+13.61 ms — and that is expected: the median frame was never the problem. **The tail is the
+result.** The before-run's worst trial had a p99 of 40.9 ms and a max of 66.9 ms; the after-run's
+worst p99 is 15.3 ms and its worst max 31.5 ms, with the other two trials at 15.1 and 20.6 ms.
+Two and a half frame periods of jitter came out of the 99th percentile.
+
+Three supporting counters, all new and all zero: `windowserver_drops` (the capture side is not
+starving), `output_drops` (the bounded encoder output channel never had to discard), and
+`vt_pending_at_flush = Some(0)` (VideoToolbox is holding nothing when the session ends, so the
+in-flight cap and the drain thread agree with the encoder's own count).
 
 ### Whole host path (`probe --whep-selftest`, 30 s)
 
