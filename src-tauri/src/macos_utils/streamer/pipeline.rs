@@ -125,6 +125,10 @@ fn spawn_pipeline(
         wake,
         max_bitrate_bps: enc.max_bitrate_bps,
         h264_profile: enc.profile,
+        // VideoToolbox exposes no long-term-reference control, so this stays at zero slots and
+        // `request_repair` falls through to a keyframe. The state still has to exist: the
+        // transport writes feedback receipts into it unconditionally.
+        repair: Arc::clone(&repair),
     };
 
     let encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
