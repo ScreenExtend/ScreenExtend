@@ -653,7 +653,7 @@ mod tests {
     /// cargo test --lib macos_utils::networking::tests::measure_adapter_watch_cost -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "measures for 60s over two 30s windows; run with --ignored --nocapture"]
     fn measure_adapter_watch_cost() {
         use std::time::Instant;
         const WINDOW: Duration = Duration::from_secs(30);
@@ -696,7 +696,7 @@ mod tests {
     /// cargo test --lib macos_utils::networking::tests::report_wifi_naming_and_radio -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of this Mac's adapters and radio; run with --ignored --nocapture"]
     fn report_wifi_naming_and_radio() {
         for adapter in enumerate_adapters(None) {
             println!(
@@ -765,10 +765,13 @@ mod tests {
     /// cargo test --lib macos_utils::networking::tests::probe_siocgifmedia_request_numbers -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "probes a real kernel over real interfaces; run with --ignored --nocapture"]
     fn probe_siocgifmedia_request_numbers() {
         let Some(sock) = IoctlSocket::open() else {
-            println!("no AF_INET socket available; nothing to probe");
+            crate::test_support::skip_because(
+                "SIOCGIFMEDIA request-number probe",
+                "no AF_INET socket available",
+            );
             return;
         };
         for name in interface_names() {

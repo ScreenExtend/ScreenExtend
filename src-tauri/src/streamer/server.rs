@@ -2076,6 +2076,10 @@ mod tests {
     fn a_snapped_ratio_can_be_expressed_as_a_display_scale() {
         let steps = platform::display_scale_steps();
         if steps.is_empty() {
+            crate::test_support::skip_because(
+                "a_snapped_ratio_can_be_expressed_as_a_display_scale",
+                "platform::display_scale_steps() is empty on this OS",
+            );
             return;
         }
         for raw in [1.0, 1.4, 1.5, 2.0, 2.625, 3.0, 4.0] {

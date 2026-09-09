@@ -9,32 +9,50 @@
     "the machine described in `machine` and a `source` saying what produced it. A key",
     "that is absent is not a failure - the gate reports it, writes the observed numbers",
     "as an artifact and passes, so the first CI run on a new runner tells you what to",
-    "paste back here.",
+    "paste back here. The same is true of a metric a key has no value for.",
     "",
-    "Tolerance, and why it is not 5%: the x264 p95 measured on the dev box ranged 4405 to",
-    "9067 us across runs of the same release binary, entirely according to how many other",
-    "rustc processes were on the machine - a 2.06x spread with nothing changed in the code.",
-    "A hosted runner is a shared VM and is no quieter. Two things make the gate usable:",
+    "Tolerance, and why the default is not 5%: the x264 p95 measured on the dev box ranged",
+    "4405 to 9067 us across runs of the same release binary, entirely according to how many",
+    "other rustc processes were on the machine - a 2.06x spread with nothing changed in the",
+    "code. A hosted runner is a shared VM and is no quieter. Two things make the gate usable:",
     "perf-gate.mjs takes several --input files and uses the LOWEST reading per metric (the",
     "one least polluted by contention), and the tolerance below is set from the residual",
-    "spread of those minima rather than from a wish. Tighten it once a key has real history,",
-    "and drop it toward 5% only on a runner you know to be quiescent."
+    "spread of those minima rather than from a wish.",
+    "",
+    "A key may carry its own `tolerance`, which wins over this one. That is how the 5% gate",
+    "the overhaul brief asked for is approached without making the CI job flap: an idle dev",
+    "box is a tighter instrument than a shared runner, and only it can afford a tighter gate.",
+    "Measured on the idle dev box, 2026-09-08, five consecutive runs of the same release",
+    "binary: 4157 / 4243 / 4244 / 4261 / 4490 us, an 8.0% spread with nothing changed. So 5%",
+    "would fail on noise even there, and 10% is the tightest honest number for a quiescent",
+    "machine; the 20% default stays for anything shared. Tighten a key once it has history."
   ],
   "tolerance": 0.2,
   "baselines": {
     "dev-windows-rtx3080ti": {
       "machine": "Windows 11 build 26200 (25H2), RTX 3080 Ti Laptop + Intel UHD, primary 1920x1080@360",
-      "source": "docs/BASELINE.md, release build at ddf9d76, `cargo test --release --lib x264_encoder -- --nocapture`",
+      "source": "docs/BASELINE.md, release build, `cargo test --release --lib x264_encoder -- --nocapture`",
       "seeded": "2026-09-08",
       "note": [
-        "This box, not a runner. Kept so a local run has something to compare against.",
-        "Four re-runs at 95dc755 with eleven other rustc/cargo processes on the box gave",
-        "p95_encode 4405 / 4883 / 5316 / 5787 us, so treat anything inside ~+/-15% of the",
-        "4537 us here as noise on a loaded machine and only trust the gate on an idle one.",
-        "x264_wall_ms is deliberately not baselined: it measures machine load rather than",
-        "the encoder (805 ms here against the 3334 ms in docs/BASELINE.md, same binary)."
+        "This box, not a runner. Kept so a local run has something to compare against, and it",
+        "carries its own 10% tolerance because an idle dev box is a tighter instrument than a",
+        "shared VM: five consecutive runs of one binary spanned 4157-4490 us (8.0%), so 5% would",
+        "flag noise and 10% is the tightest honest gate. Under load the same binary has measured",
+        "4405 / 4883 / 5316 / 5787 / 9067 us - only trust this key on a quiescent machine.",
+        "x264_wall_ms is deliberately not baselined: it measures machine load rather than the",
+        "encoder (805 ms here against the 3334 ms in docs/BASELINE.md, same binary).",
+        "",
+        "windows_capture_to_encoded_* and windows_capture_encode_p95_us are deliberately absent.",
+        "The harness that produces them (test/capture_latency.rs) needs DXGI Desktop Duplication,",
+        "and on this box every attempt returns DXGI_ERROR_UNSUPPORTED for \\.\\DISPLAY1 on the only",
+        "adapter that enumerates the output - the pre-existing dxgi_duplication_probe fails the",
+        "same way, so it is the machine, not the harness. Seed them from a session where",
+        "duplication works:",
+        "  cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
+        "An absent metric is reported and passed, never failed, so leaving them out costs nothing."
       ],
-      "x264_p95_encode_us": 4537
+      "x264_p95_encode_us": 4157,
+      "tolerance": 0.1
     }
   }
 }

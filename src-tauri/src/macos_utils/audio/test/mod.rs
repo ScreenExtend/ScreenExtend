@@ -1,5 +1,6 @@
 mod clock;
 mod format;
+mod tiering;
 
 /// Below 12.3 there is no native system-audio API at all, so the answer must be the driver — an
 /// action the user can take — and never `Unsupported`, which the UI presents as a dead end.
