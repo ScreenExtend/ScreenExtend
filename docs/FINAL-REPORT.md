@@ -2014,3 +2014,25 @@ with verbose logging forced on, turned a whole class of React warning that is in
 build into something a terminal run reports. Exactly one frontend line appeared in that boot, and it
 was a real duplicate-key bug that could carry an open sheet's form state onto the wrong device.
 Anyone touching `src/` should do that run before declaring a pass finished.
+
+---
+
+## 15. Closing state (addendum)
+
+- The report commit is **`3f3bfe8`** (`docs: final report for the latency & compatibility overhaul`),
+  one ahead of the production-build commit `e723fd4`; this addendum is the commit after it, and it is
+  the head of `latency-overhaul` on both trees (verified identical by `git rev-parse HEAD` on each).
+- Both working trees are clean; `git worktree list` shows only the main tree on each machine;
+  branches are `latency-overhaul` and `main` only, plus the three local `archive/*` tags.
+- `findings/`, `PROMPT.md`, `_sync/` and `_wt/` are removed on both machines. Nothing was pushed;
+  `origin` still holds `main`, `highdpi` and `sys-audio-winmac` exactly as before the engagement.
+- Mac disk at the end: **2.6 GB free** of 113 GB (the release and bundle artifacts are in
+  `src-tauri/target/release/`; the one prune that crossed the 2 GB rule is recorded in
+  `/Users/sarvesh/Desktop/ALERT.txt`, 664 bytes, left in place for the owner). Windows: 171 GB free.
+- Every orchestration subagent was stopped after its report was read; none remain.
+- Headline numbers restated for the reader who only opens this section: NVENC capture→encode-out
+  p50/p90/p99/max 12.58 / 15.73 / 27.26 / 28.45 → 8.39 / 9.44 / 12.58 / 16.43 ms; x264 20.97 / 23.07 /
+  37.75 / 40.31 → 8.39 / 10.49 / 13.63 / 23.12 ms; Quick Sync 27.26 / 31.46 / 83.89 / 88.25 →
+  20.97 / 31.46 / 37.75 / 42.21 ms on `intel-same-adapter`; real frames per 30 s 31–51 → 2 183–4 492;
+  under contention the max is unchanged (21.49 → 21.17 ms) while the rate drops 150 → 102 fps and a
+  concurrent compile slows 2.6 %.
