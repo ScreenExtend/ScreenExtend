@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires a console session, Screen Recording and a display that is changing; run with --ignored --nocapture"]
     fn end_to_end_latency() {
         let display = display::select_display(0).expect("main display");
         let (w, h, refresh) = display::display_geometry(display);
@@ -1140,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires a console session and Screen Recording; run with --ignored --nocapture"]
     fn production_pipeline_smoke() {
         let display = display::select_display(0).expect("main display");
         let (w, h, refresh) = display::display_geometry(display);
