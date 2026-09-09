@@ -203,9 +203,9 @@ mod probe {
 /// The developer probe harness, reachable as `ScreenExtend probe`.
 ///
 /// It runs inside the Tauri app on purpose: `--live` and `--whep-selftest` need a real virtual
-/// display, which means `platform::setup` and the `AppState` it builds. The standalone
-/// `streamer::cli::run` entry point could never do that, which is why it was never wired into
-/// `main.rs` and had bit-rotted into unreachable code.
+/// display, which means `platform::setup` and the `AppState` it builds. There used to be a
+/// standalone entry point in `streamer/cli.rs` that could never do that; it was never wired into
+/// `main.rs`, bit-rotted into unreachable code, and has been deleted.
 #[cfg(any(windows, target_os = "macos"))]
 mod probe {
     use super::exit;
@@ -484,7 +484,7 @@ The self-test prints its per-stage telemetry summary on exit; `--whep-selftest` 
         if packets == 0 {
             anyhow::bail!(
                 "no audio packets in {secs}s — the endpoint delivered nothing, which is the \
-                 silent-companion failure mode (AUDIO_NOTES.md §3.2)"
+                 silent-companion failure mode (`docs/recovered/AUDIO_NOTES.md` §3.2)"
             );
         }
         Ok(())

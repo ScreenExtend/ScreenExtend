@@ -104,6 +104,30 @@ impl WgcFeatures {
     }
 }
 
+/// **The** predicate for "can this machine run Windows.Graphics.Capture". Both the capture path
+/// and `windows_utils::compatibility` must go through this and nothing else.
+///
+/// It is `GraphicsCaptureSession::IsSupported()` alone. Upstream ANDed in
+/// `IsApiContractPresentByMajor("Windows.Foundation.UniversalApiContract", 8)`, i.e. Windows 10
+/// 1809, and the compatibility probe dropped that conjunct as a version-shaped proxy — so on a
+/// build where the contract gate binds, the report claimed WGC while `GraphicsCaptureApi::new`
+/// refused it and `wgc_features()` returned every knob absent. One of the two had to go, and it
+/// is the contract check, because **the capture path uses no API newer than the contract-6 set**
+/// `IsSupported()` itself belongs to: `Direct3D11CaptureFramePool::Create`,
+/// `CreateCaptureSession`, `item.Closed`, `FrameArrived` and `item.Size`. Everything above that —
+/// `CreateFreeThreaded` (1809), `IsCursorCaptureEnabled` (1903), `IsBorderRequired` (2004),
+/// `IncludeSecondaryWindows` (20348), `MinUpdateInterval` and `DirtyRegionMode` (26100) — is
+/// probed individually by [`wgc_features`] and applied only where present, which is the
+/// probe-by-capability rule the contract number was standing in for.
+///
+/// Keep the two callers on this one function. If a future change does take a hard dependency on a
+/// newer API, gate *that* API, not the whole backend.
+#[inline]
+#[must_use]
+pub fn wgc_supported() -> bool {
+    GraphicsCaptureSession::IsSupported().unwrap_or(false)
+}
+
 fn session_property(name: &str) -> bool {
     ApiInformation::IsPropertyPresent(
         &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
@@ -118,7 +142,7 @@ fn session_property(name: &str) -> bool {
 pub fn wgc_features() -> WgcFeatures {
     static FEATURES: OnceLock<WgcFeatures> = OnceLock::new();
     *FEATURES.get_or_init(|| {
-        if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+        if !wgc_supported() {
             return WgcFeatures::default();
         }
         WgcFeatures {
@@ -494,12 +518,13 @@ impl GraphicsCaptureApi {
     }
 
     /// Checks if the Windows Graphics Capture API is supported.
+    ///
+    /// Delegates to [`wgc_supported`], which is the one predicate the compatibility report uses
+    /// too — see its doc comment for why the `UniversalApiContract 8` conjunct upstream ANDed in
+    /// here is gone.
     #[inline]
     pub fn is_supported() -> Result<bool, Error> {
-        Ok(ApiInformation::IsApiContractPresentByMajor(
-            &HSTRING::from("Windows.Foundation.UniversalApiContract"),
-            8,
-        )? && GraphicsCaptureSession::IsSupported()?)
+        Ok(wgc_supported())
     }
 
     fn cleanup(&mut self) {

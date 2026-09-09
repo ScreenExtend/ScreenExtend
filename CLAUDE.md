@@ -44,6 +44,7 @@ src-tauri/                  Rust core (crate `screenextend`, lib `screenextend_l
 scripts/                    the repo's checkers (see "Checkers" below) + client test harnesses
 ci/perf-baseline.json       committed encoder timings the CI perf gate compares against
 docs/                       the engineering docs and ledgers (see "Docs" below)
+guides/                     standalone verification directives for hardware neither dev box has
 .github/workflows/          ci.yml (gates, on every push) + build-release.yml (tag `app-v*`)
 ```
 
@@ -145,6 +146,28 @@ Four static checks, all runnable locally in seconds, all run by CI:
 - `discovery/`, `research/`, `reviews/` — the audit reports the current work is built on.
 - `recovered/` — design notes that were deleted from the tree and restored, each with a header
   recording the commit it came from. Read `docs/recovered/README.md` before citing one.
+
+### `guides/`
+
+Five **standalone directives**, each written for one fresh session on hardware or an OS that
+neither development machine can exercise — a Windows 11 26200 / RTX 3080 Ti hybrid laptop and a
+macOS 10.15.8 Intel MacBook. A guide's reader has no access to the other guides or to either dev
+box; everything outside its stated territory is already audited and must not be touched. Pick the
+one whose row your machine satisfies, and run two in separate sessions rather than merging them —
+each owns a disjoint set of ledger rows.
+
+| Guide | Territory | Floor |
+|---|---|---|
+| `modern-mac.md` | everything macOS above the 10.15 dev floor: SCK video and audio, the Process Tap, VideoToolbox low-latency and LTR, Sequoia re-consent, `CGVirtualDisplay` on a modern OS, the hosted network end to end; Part B adds Developer ID signing, notarization, TCC identity, translocation and the universal binary | macOS 14.2, console session |
+| `intel-mac.md` | the band nothing else reaches: SCK's first release and the first-frame commit gate, the audio driver as the *selected* tier with its `.pkg` flow, and everything needing **two GPUs** | macOS 12.3–12.7.6, Intel, dual-GPU |
+| `windows-amd.md` | the entire AMF backend — audit, fix, then optimise to NVENC parity; `amd_layout` against a live runtime, the usage tiers, NV12 vs BGRA, the CPU bridge, LTR repair, the async ring, the SPS VUI rewrite | Windows 10 2004, a VCN/VCE AVC part |
+| `windows-legacy.md` | everything below Windows 11 24H2: the WGC property tiering, DXGI duplication end to end, hybrid-adapter selection, the DPR ladder on an older WDDM, `netsh` hosted network, the WASAPI engine period and the audio conversion tiers | Windows 10 19041 – build 22631, hybrid graphics |
+| `clients-network-and-glass-to-glass.md` | everything the host cannot prove alone: all fourteen client-browser tiers, the whole client page, trickle ICE and profile negotiation against real engines, DSCP/WMM on a real AP, TURN and the cloud relay, repair under induced loss, and the camera glass-to-glass measurement | a client matrix, two APs, a 240 fps camera |
+
+`guides/MASTER_GUIDE.md` is the index and `guides/PLAN.md` the 106-item inventory they are
+written from. Three things are covered by no guide and say so there: the pre-10.14.4 AirPlay
+tier (a scope decision, not a hardware problem — it can only be selected below the app's own
+`minimumSystemVersion`), the first run of the GitHub Actions workflows (needs a push), and Linux.
 
 ## The shipped CLI (`src-tauri/src/cli.rs`)
 
@@ -344,7 +367,11 @@ The **AMD AMF backend** (`windows_utils/streamer/amd/` + `amd_sys/`, design in
 `windows_utils/streamer/amd.md`) is complete and wired into the `Auto` chain, but **`UNVERIFIED`**
 — no machine on this project has an AMD GPU, so its FFI is asserted by `test/amd_layout.rs`
 (numbers measured by a C compiler reading the vendored headers, not counted by hand) and nothing
-in it has ever encoded a frame. `docs/manual-tests/amd-amf.md` is the script that closes it.
+in it has ever encoded a frame. Eight defects found by reading the shipped code (D-01…D-08) have
+since been fixed and are **`COMPILE-CHECKED`**, not measured: probe by PCI id rather than by
+description string, LTR on the ring, the `AsyncEncodeRing` AMF arm, and the `amd/sps.rs` VUI
+rewrite. `guides/windows-amd.md` is the standalone directive that verifies the whole backend on
+real hardware; `docs/manual-tests/amd-amf.md` is the shorter script inside it.
 
 ### Concurrency & locking
 
