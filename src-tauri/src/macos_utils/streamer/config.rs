@@ -16,6 +16,10 @@ pub struct EncoderConfig {
     /// The GPU driving the captured display, from `display::metal_registry_id`. `None` means
     /// "let VideoToolbox choose", which is right on a single-GPU Mac and a coin toss on any other.
     pub gpu_registry_id: Option<u64>,
+    /// The user's "software encode" setting. Until this landed, macOS read the flag nowhere at
+    /// all - `streamer/platform.rs` consumes it under `cfg(windows)` only - so the Settings
+    /// toggle and `serve --software-encode` were both inert on this platform.
+    pub software_encode: bool,
 }
 
 pub fn scaled_dims(native_w: u32, native_h: u32, scale: ScalePercent) -> (u32, u32) {
@@ -65,6 +69,10 @@ pub fn live_encoder_config(
         min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
         gpu_registry_id: None,
+        // A snapshot, matching the field it reads. When `Config::software_encode_now()` lands
+        // this becomes that call and the toggle starts working on a live session instead of
+        // needing every streamer rebuilt.
+        software_encode: cfg.disable_gpu_encode,
     }
 }
 
@@ -82,6 +90,14 @@ mod tests {
     fn a_display_that_reports_nothing_falls_back_to_60() {
         let cfg = Config::default();
         assert_eq!(live_encoder_config(1920, 1080, 0, &cfg).fps, 60);
+    }
+
+    #[test]
+    fn the_software_encode_flag_reaches_the_encoder() {
+        let mut cfg = Config::default();
+        assert!(!live_encoder_config(1920, 1080, 60, &cfg).software_encode);
+        cfg.disable_gpu_encode = true;
+        assert!(live_encoder_config(1920, 1080, 60, &cfg).software_encode);
     }
 
     #[test]
