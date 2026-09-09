@@ -314,12 +314,17 @@ fn handle_frame(
             return;
         }
         frames.fetch_add(1, Ordering::Relaxed);
+        let arrived_mach = mach_now();
         sink.publish(Frame {
             width,
             height,
-            arrived_mach: mach_now(),
+            arrived_mach,
             captured_at: Instant::now(),
-            os_time_ns: super::clock::mach_ticks_to_host_ns(display_time),
+            os_time_ns: super::clock::os_frame_time_or(
+                super::clock::mach_ticks_to_host_ns(arrived_mach),
+                super::clock::mach_ticks_to_host_ns(display_time),
+            ),
+            os_time_raw_ns: super::clock::mach_ticks_to_host_ns(display_time),
             backing: Backing::PixelBuffer {
                 pixbuf,
                 _surface: HeldSurface::hold(surface_ret),
@@ -591,12 +596,12 @@ mod tests {
             if let Some(frame) = source.try_take_latest() {
                 taken += 1;
                 let arrived = super::super::clock::mach_ticks_to_host_ns(frame.arrived_mach);
-                if frame.os_time_ns == 0 {
+                if frame.os_time_raw_ns == 0 {
                     no_os_stamp += 1;
                 } else {
                     // Signed: CGDisplayStream's `displayTime` is *"when the frame was to be
                     // displayed by the WindowServer"*, which can be ahead of our callback.
-                    delivery_ms.push((arrived as i64 - frame.os_time_ns as i64) as f64 / 1e6);
+                    delivery_ms.push((arrived as i64 - frame.os_time_raw_ns as i64) as f64 / 1e6);
                 }
                 held = Some(frame);
             }

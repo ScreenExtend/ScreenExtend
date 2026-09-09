@@ -45,9 +45,21 @@ pub struct Frame {
     pub arrived_mach: u64,
     pub captured_at: std::time::Instant,
     /// The OS's own frame time on the shared host clock — CGDisplayStream's `displayTime`,
-    /// ScreenCaptureKit's PTS. 0 when the backend supplied none. It is the only stamp that says
-    /// when the pixels existed rather than when our callback saw them.
+    /// ScreenCaptureKit's PTS — when that time is in the past, and the callback's own arrival
+    /// otherwise. Never 0 for a delivered frame.
+    ///
+    /// The clamp is not defensive coding. Measured on 10.15.8 at 60 Hz, CGDisplayStream's
+    /// `displayTime` is ahead of the delivery callback on *every* frame, by −15.5 ms at p50 and
+    /// −11.4 ms at its closest: it is the presentation time WindowServer scheduled the frame for,
+    /// not the moment it was composited. Header wording agrees — "when the frame was to be
+    /// displayed". Used raw it makes `capture_to_encode` a frame period shorter than the truth,
+    /// and on a fast host it can go negative.
     pub os_time_ns: u64,
+    /// The OS stamp exactly as the backend reported it, unclamped, and 0 when it reported none.
+    /// Telemetry must not use this; it exists so `capture_rate` can report the
+    /// `displayTime -> callback` distribution, which is how the clamp above was found and is the
+    /// one number that says whether a given Mac's stamp means what its header says.
+    pub os_time_raw_ns: u64,
     pub backing: Backing,
 }
 
@@ -140,6 +152,7 @@ mod tests {
             arrived_mach: tag,
             captured_at: std::time::Instant::now(),
             os_time_ns: 0,
+            os_time_raw_ns: 0,
             backing: Backing::Empty,
         }
     }
