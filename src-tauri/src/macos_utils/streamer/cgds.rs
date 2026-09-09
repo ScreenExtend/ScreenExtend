@@ -557,7 +557,7 @@ mod tests {
     /// and the cursor cannot be warped onto it, so it produces literally zero dirty rects and
     /// measures nothing (that emptiness is its own finding — see `probe_virtual_display`).
     #[test]
-    #[ignore]
+    #[ignore = "requires a console session, Screen Recording and animated content on the main display; run with --ignored --nocapture"]
     fn capture_rate() {
         let id = display::select_display(0).expect("a main display");
         let (gw, gh, _) = display::display_geometry(id);
@@ -647,7 +647,7 @@ mod tests {
     /// `capture_rate` (which captures at native size) and compare the two `displayTime→callback`
     /// distributions. If they match, the scaler is free and `gpu.rs` has nothing to do.
     #[test]
-    #[ignore]
+    #[ignore = "the half-scale A/B of capture_rate; same requirements; run with --ignored --nocapture"]
     fn capture_rate_downscaled() {
         let id = display::select_display(0).expect("a main display");
         let (gw, gh, _) = display::display_geometry(id);
@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires the CGVirtualDisplay private API and a console session; creates and removes a real display; run with --ignored --nocapture"]
     fn probe_virtual_display() {
         use crate::macos_utils::streamer::pipeline;
         use crate::macos_utils::virtual_display::MacosVirtualDisplay;
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires a console session and Screen Recording; run with --ignored --nocapture"]
     fn probe_main_display() {
         let display_id = display::select_display(0).expect("a main display");
         let (w, h, refresh) = display::display_geometry(display_id);
