@@ -35,10 +35,7 @@
     ],
     "macOS": {
       "entitlements": "./Entitlements.plist",
-      "minimumSystemVersion": "10.15",
-      "files": {
-        "Resources/resources/ScreenExtendAudio.pkg": "resources/ScreenExtendAudio.pkg"
-      }
+      "minimumSystemVersion": "10.15"
     }
   }
 }

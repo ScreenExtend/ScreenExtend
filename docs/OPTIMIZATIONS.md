@@ -442,8 +442,12 @@ w13b-code landed after that point and is what closed it. Verified end to end on 
 tree rather than by reading one side of it:
 
 - `scripts/release.sh` stages the notarized package at `src-tauri/resources/ScreenExtendAudio.pkg`.
-- `tauri.macos.conf.json` maps it with `bundle.macOS.files`:
-  `"Resources/resources/ScreenExtendAudio.pkg": "resources/ScreenExtendAudio.pkg"`.
+- `tauri.macos.release.conf.json` maps it with `bundle.macOS.files`:
+  `"Resources/resources/ScreenExtendAudio.pkg": "resources/ScreenExtendAudio.pkg"`. The
+  mapping lives in a release-only overlay because `bundle.macOS.files` is unconditional: with
+  it in the always-applied `tauri.macos.conf.json`, every macOS build on a machine that has
+  not run the credentialed `release.sh` died with `"resources/ScreenExtendAudio.pkg" does not
+  exist`. The release job passes both configs, in that order.
 - Both runtime call sites (`macos_utils/mod.rs` and `cli.rs`) resolve
   `"resources/ScreenExtendAudio.pkg"` against `BaseDirectory::Resource`, which is
   `Contents/Resources` on macOS — exactly the destination above.

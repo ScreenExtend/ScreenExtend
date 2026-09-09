@@ -20,7 +20,7 @@ jobs:
             args: '--target x86_64-pc-windows-msvc'
           - platform: 'macos-latest' # Universal (Apple Silicon + Intel)
             target: 'aarch64-apple-darwin,x86_64-apple-darwin'
-            args: '--target universal-apple-darwin --config src-tauri/tauri.macos.conf.json'
+            args: '--target universal-apple-darwin --config src-tauri/tauri.macos.conf.json --config src-tauri/tauri.macos.release.conf.json'
 
     runs-on: ${{ matrix.platform }}
     steps:
