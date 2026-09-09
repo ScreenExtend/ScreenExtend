@@ -115,7 +115,7 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 105 | capture-win (dxgi) | Duplication that is re-established without ever producing a frame fails the capture after 40 attempts, and the "re-established" line is rate-limited to the first and every tenth. | `redup_failures` counted only *failed* re-duplications and a success reset it, so an output returning `DXGI_ERROR_ACCESS_LOST` on every acquire looped forever: acquire, lose access, re-duplicate, repeat. Against a fresh IDD virtual display it did exactly that for a whole 12 s probe run, delivered no frames, and emitted a log line — hence a UI IPC event — every time round. | unbounded silent spin, ~3 log lines/s, 0 frames | bounded and named: the capture stops with `duplication was re-established 41 times without ever delivering a frame` | VERIFIED (reproduced the spin, then the bound) | yes | "Degrade loudly" is the requirement; a negotiated session showing black is the failure this removes. |
 | 106 | capture-win (dxgi) | The DXGI capture thread stages the composed frame into one of three slot textures on the duplication device and hands the index to a `dxgi-encode` thread, instead of encoding inline. Overrun drops are counted in `frames_dropped_ring`; the per-60-frame latency line now prints the frame budget beside the measured average. | Capture of frame N+1 could not begin until the encode of frame N returned, so the achievable rate was `1 / (capture + composite + encode)` rather than `1 / capture` — and on every CPU-bridge backend the encode is the large term. This is the path every Windows 10 and pre-24H2 Windows 11 host falls back to, so it is the common case rather than the rare one. | capture and encode serialized on one thread | decoupled; the copy is GPU-to-GPU on a device that is already multithread-protected | COMPILE-CHECKED — this box cannot duplicate its own primary display (row 104) and its IDD displays do not settle into a duplication, so the throughput claim has no local number | yes | One caveat, stated because it bounds the win: the encode thread shares the duplication device with the capture thread, and D3D11 multithread protection holds the device lock for the whole of a blocking `Map`. So on a CPU-bridge backend the *readback* (1192 us BGRA / 740 us NV12 at 720p, row 108) still stalls the capture thread, while the encode itself — 2-8 ms for x264 — no longer does. The majority of the serialization is gone, not all of it. Measured verification needs a machine where DXGI duplication works: `docs/manual-tests/windows-capture.md` §5b. |
 | 107 | capture-win (dxgi) | No video processor on the adapter composing the display means the encoder is configured at native resolution and the client does the scale, with a log line, instead of the session failing. | `Scaler::new` casts the duplication device to `ID3D11VideoDevice` and its context to `ID3D11VideoContext`; both fail on a device created without `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` — which `create_device_on` silently retries without — or on an adapter with no video engine, and an indirect-display adapter is not obliged to have one. The failure was `?`-propagated, so on a host that had already fallen back from WGC, a client with video-scale under 100% could not start a session at all. | error "building GPU downscaler for --scale", no session | native-resolution stream plus one explanatory line | VERIFIED that this box's duplication devices *do* expose a video processor, so the fallback branch is COMPILE-CHECKED | yes | A worse picture is not a dead session. |
-| 108 | scaler-win | `Scaler::with_format` can make its destination and staging surfaces `DXGI_FORMAT_NV12`, so the one `VideoProcessorBlt` that already scales also does the colour conversion, and `read_back` returns `height + height/2` rows at one pitch. NV12 is probed with `CheckVideoProcessorFormat`; an odd dimension or a refusal falls back to BGRA with a log line. `Backend::cpu_bridge_format()` is where a backend opts in. | BGRA is 4 bytes per pixel and NV12 is 1.5, so the `CopyResource` into staging, the blocking `Map` and the memcpy into the retained buffer all shrink by 62.5% — and every CPU-bridge encoder converts BGRA to 4:2:0 on the CPU anyway (x264 on a rayon pool, oneVPL through a second VPP pass, AMF through an internal converter), so that conversion moves onto silicon that was already running. | 1920x1080 → 1280x720, 60 iterations, median us/frame: **blt 5, readback 1192, total 1196**; 3,686,400 bytes | **blt 4, readback 740, total 743**; 1,382,400 bytes — **38% off the readback** | VERIFIED (`cargo test --lib scaler -- --nocapture`; two tests also assert the picture survives the conversion) | yes | The encoder half is not landed: no backend has an `encode_nv12_padded` yet, so `cpu_bridge_format` still answers BGRA for all of them. `findings/major-encoders-win-need-an-nv12-cpu-bridge-entry-point.md` carries the exact signature and plane layout for W3b and W4. |
+| 108 | scaler-win | `Scaler::with_format` can make its destination and staging surfaces `DXGI_FORMAT_NV12`, so the one `VideoProcessorBlt` that already scales also does the colour conversion, and `read_back` returns `height + height/2` rows at one pitch. NV12 is probed with `CheckVideoProcessorFormat`; an odd dimension or a refusal falls back to BGRA with a log line. `Backend::cpu_bridge_format()` is where a backend opts in. | BGRA is 4 bytes per pixel and NV12 is 1.5, so the `CopyResource` into staging, the blocking `Map` and the memcpy into the retained buffer all shrink by 62.5% — and every CPU-bridge encoder converts BGRA to 4:2:0 on the CPU anyway (x264 on a rayon pool, oneVPL through a second VPP pass, AMF through an internal converter), so that conversion moves onto silicon that was already running. | 1920x1080 → 1280x720, 60 iterations, median us/frame: **blt 5, readback 1192, total 1196**; 3,686,400 bytes | **blt 4, readback 740, total 743**; 1,382,400 bytes — **38% off the readback** | VERIFIED (`cargo test --lib scaler -- --nocapture`; two tests also assert the picture survives the conversion) | yes | **The encoder half has since landed on W3b's branch** (`worktree-agent-aac1ee30de0497a07`), built on this: x264 NV12 1655 -> 450 us/frame, the Intel CPU bridge 3766 -> 2820 us, and an identity-blt NV12 readback 2394 -> 1170 us. The handoff finding it was written against has been consumed and deleted. Until that branch merges, `cpu_bridge_format` on `latency-overhaul` still answers BGRA for every backend, so the scaler-side saving below is what this row alone buys. |
 | 109 | tuning-win | The idle repeater thread drops from `THREAD_PRIORITY_TIME_CRITICAL` to `THREAD_PRIORITY_HIGHEST`, keeping MMCSS and the P-core confinement. | The process is `HIGH_PRIORITY_CLASS` and every capture and encode thread is time-critical, so N clients meant roughly 2N time-critical threads competing with the tokio transport workers — which sit at `ABOVE_NORMAL` and are what actually push RTP. The repeater emits a keepalive every 200 ms; being a millisecond late costs nothing. | 2-3 time-critical threads per session | one fewer per DXGI and per classic session | VERIFIED (builds and runs; the contention claim itself needs a 4-client host to measure) | yes | The x264 case is the worst one, because a time-critical CPU encoder can saturate cores. |
 | 110 | audio (macOS) | Legacy-tier playthrough setpoint: fixed 4096 frames -> three of the output device's own IO periods, floored at 128 and ceilinged at 4096, raised 64 frames at a time only by a *measured* underrun; `DRIFT_GAIN` 2.0e-9 -> 5.0e-8 | The setpoint **is** the steady-state monitoring latency -- the drift loop's fixed point is that many frames of backlog. On this tier the virtual device is the system default output, so every sound the Mac makes passes through it before reaching the speakers. | 4096 frames = **85.3 ms** at 48 kHz, plus the device's own IOProc latency | 3 x 512 = 1536 frames = **32 ms** on a typical cycle; 3 x 128 = **8 ms** on a short one | COMPILE-CHECKED (setpoint arithmetic asserted by two new tests; click-to-sound needs a second machine to record with) | yes | The old gain needed ~30 s to move an 85 ms backlog, so the setpoint was the shock absorber for a loop too slow to reach it. 25x the gain against errors an order of magnitude smaller reaches the 0.3% trim limit (about five cents of pitch) in ~2 s. `IoCtx::underruns` was incremented and never loaded; the control thread now reports it and the bump every 10 s. |
 | 111 | audio (macOS) | `capture_ns` end to end on the legacy tier: the driver stamps `mach_absolute_time()` in `OnProcessMixedOutput`, publishes it through the layout-2 shm anchor, and the encoder worker extrapolates by sample counter | W8's Windows note asked for the signed skew against `host_now_ns()` to be measured before trusting any hardware stamp -- on Windows loopback the endpoint timestamp turned out to be a *play cursor* about 15 ms in the future and had to be clamped. | drain-time stamp: the moment the worker woke up, plus a synthetic forward ladder that could regress between passes | capture -> Opus packet **p50 -0.57 / p90 3.59 / p99 4.54 ms** (median of three 10 s runs, 3277 packets); **0 of 3277** `capture_ns` deltas anything but exactly 5.000 ms; **0** regressions, **0** sequence gaps; encode p50 0.09-0.12 ms | **VERIFIED** on macOS 10.15.8 | yes | p50 is negative on purpose: the driver stamps the mix when it exists, before it would have been heard, so a packet reaches the encoder ahead of its own audio's playout -- under one IO cycle and in the right direction, unlike the Windows case. **No clamp applied**, and that is the decision: clamping would flatten the within-block ladder that produces the exact 5 ms spacing above. A fourth run across a 3 s silent gap gave exactly 1 non-5 ms delta (the re-seat), 0 regressions, 0 sequence gaps. |
@@ -258,8 +258,42 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 269 | webrtc / rtx | `enable_sender_rtx(true)` **re-evaluated and rejected again** (row 62), with the reason moved into the code beside `udp_only_setting_engine`. | Brief item 6 asked for it, and it looks like an oversight every time somebody reads the answer's `video/rtx` registration. | — | Re-verified against `interceptor-0.17.1`: `bind_local_stream` binds only when `stream_support_nack(info)` — `rtcp_feedback` containing `nack` with an empty parameter — and the RTX codec is registered with `rtcp_feedback: vec![]`, so the responder never binds it; `resend_packets` looks the stream up by `nack.media_ssrc` and writes to the **primary** SSRC's writer. | VERIFIED (source reading, twice) | no — not enabled | Enabling it adds an `a=ssrc-group:FID` telling Chrome to expect retransmissions on a stream that is always silent, which is worse than the repairs it already accepts as late arrivals on the primary SSRC. It was briefly enabled during this close-out and reverted; the comment now lives at the setting engine so the next reader does not rediscover it from a ledger row. |
 | 270 | build | `.gitattributes`: `src-tauri/resources/amf-headers/** text eol=lf` (W13b) | The 26 vendored AMF headers have their SHA-256 pinned in `SHA256SUMS`, taken from the LF content, and nothing told git they were not ordinary text. | `sha256sum -c` in `src-tauri/resources` reported **7 OK, 26 FAILED** on Windows, for files nobody had touched, while the `blob-checksums` CI job passed on its ubuntu runner | **33 OK, 0 FAILED** on Windows | VERIFIED | yes | Found while checking that the driver checksums still matched after the PROVENANCE rewrite. Same rule W13a wrote for the binary blobs, extended to the one directory it did not cover; a checksum that only holds on one OS is not a checksum. |
 | 271 | whep / leak | The whole fallible region of `prepare_whep` is one `async` block whose `Err` closes the peer connection, closes the media socket and decrements `LIVE_SESSIONS` before returning. | Everything between `new_peer_connection` and the answer can fail — `set_remote_description` on a malformed offer most realistically — and every one of those `?`s returned with the connection, its ICE agent, that agent's UDP sockets and the mux read worker still alive. A client retrying a bad SDP leaked one of each per attempt. | one peer connection, one ICE agent and its sockets leaked per failed negotiation, with `LIVE_SESSIONS` still counting them | nothing outlives a failed negotiation; the trickle resource id is minted after the block, so a failure leaves no registry entry either | COMPILE-CHECKED (`LIVE_SESSIONS` is the counter that would show it; no induced-failure harness exists) | yes | Same shape as the leak `SessionHandle::close` was added to fix, on the path that never reaches a `SessionHandle`. |
+| 272 | encode / pipeline | `needs_scaler` gains a second reason: a CPU-bridge backend that wants NV12 gets an identity blt when the client is already at the display's size | The pipeline built a scaler only when the sizes differed, on the reasoning that an equal-size blt is an identity pass and a wasted surface. True of the blt, and it misses that the *readback* is the cost — so a native-resolution client on a CPU-bridge encoder, the common software-encode case, read back 4 bytes a pixel and converted colour on the CPU. | 1920x1080 identity, bgra8: blt 11 us, readback 2394 us, total 2405 us, 8,294,400 bytes | nv12: blt 6 us, readback 1170 us, total 1176 us, 3,110,400 bytes — 51% off the stage (60 iterations, median per frame, `identity_blt_to_nv12_against_a_bgra_readback`) | VERIFIED (Windows) | yes | And that is before the encoder-side saving of not running a colour matrix on the CPU at all. It also means every x264 CPU-bridge path now has a scaler, so the scalar BGRA convert is gone rather than merely avoidable. |
+| 273 | encode / intel | The same-adapter path's per-stage split measured, and oneVPL surface import rejected on the number | `major-intel-extra-full-frame-copy-per-frame` called the full-frame `CopySubresourceRegion` into the VPP input surface a real cost, and noted that nothing timed it separately from the VPP pass. | unmeasured | 1920x1080 to 1280x720 on Intel UHD Graphics, per-frame medians: get_surface 2 us, copy_into_surface 136 us, vpp_submit 64 us, against a ~7000 us frame | VERIFIED (Windows, Intel UHD Graphics) | no change | About 2% of the frame, and most of the 136 us is the `Flush` that measured as a p50 win and would go with the copy. Importing the captured texture as an `mfxFrameSurface1` (`mfxSurfaceD3D11Tex2D`, oneVPL 2.9+) would be new FFI on a version-gated API to remove 2% and a measured gain. The timing lives in a fixed-capacity sample ring that allocates once; sorting happens only in the accessor, which the encode thread never calls. |
+| 274 | encode / intel | Cross-adapter Quick Sync documented as a conclusion rather than a gap | `OpenSharedResource1` on an NT handle requires both devices on the same adapter, so the shared-texture trick that lets NVENC take a cross-adapter capture texture has no equivalent here and the frame must come back through system memory. | a `cross-adapter bridge is not implemented` message that read like an omission | the rationale block at the guard, and three things that make it matter less: W3a's adapter policy puts capture on the encoder's adapter where it can (this box now reports `intel-same-adapter`), the bridge is 62.5% cheaper through NV12, and `Auto` tries NVENC first | VERIFIED (Windows) | yes | The `InputBridge` in the same file proves the pattern — for the *same-adapter* no-VIDEO_SUPPORT case, which is a different problem. |
+| 275 | encode / x264 | ABR-with-VBV measured against a per-frame budget; `nal-hrd=cbr` rejected | `minor-x264-rate-control-is-abr-without-nal-hrd-cbr` asked whether ABR plus a VBV holds a per-frame budget or only a long-run average, which is what decides whether to set `i_nal_hrd = X264_NAL_HRD_CBR`. | unmeasured | 240 frames at 1280x720@60 and 8 Mbps against a 16666 B budget: mean 14154 B, p50 13159, p95 18054, p99 18350, max 19039 — 1.14x budget — and an IDR of 26075 B (`x264_vbv_bounds_the_access_unit_size`) | VERIFIED (Windows) | no | The VBV binds: the largest P access unit is 14% over budget against a VBV sized at two, and the mean lands at 85% of target. `nal-hrd=cbr` would add HRD parameters to the VUI and start inserting **filler data** to hold a genuinely constant rate — bandwidth spent on nothing, which is why NVENC disables filler explicitly and Quick Sync sets `NalHrdConformance = OFF`. |
+| 276 | encode / x264 | The zerolatency configuration is read back from the encoder instead of asserted | `ultrafast` is a preset and `zerolatency` is a tune, both of which move fields; `param_apply_profile` moves more; `x264_encoder_open` validates and can move them again. Every claim this codebase made about the software encoder's configuration was a claim about the request. | the init log printed the request | `x264_encoder_parameters` bound; the init log prints the effective values and `x264_zerolatency_settings_were_accepted` asserts them. On the shipped DLL (build 164) at 1280x720@60: threads 8, sliced_threads 1, bframes 0, rc_lookahead 0, sync_lookahead 0, keyint 60 (finite, because with intra refresh on keyint *is* the sweep period), intra_refresh 1, scenecut 0, repeat_headers 1, annexb 1, vbv_maxrate == bitrate, vbv_bufsize 266 kbit | VERIFIED (Windows) | yes | Each asserted field is a distinct way for the encoder to be quietly buffering a frame. |
+| 277 | encode | The per-frame changed-region hint evaluated and **not** consumed | Both Windows capture backends compute a dirty/move-rect union and discard it after the skip decision. The named consumers were x264's CPU colour convert (confine it to changed rows), Intel's `mfxExtDirtyRect`, and AMF's ROI map. | - | The largest of those is gone by another route: every CPU-bridge path now has a scaler, so x264 takes NV12 from the video processor and runs no colour matrix at all. | VERIFIED that the primary consumer no longer exists | no | What remains needs the capture side to expose the rect (a `Duplicator` accessor and a `ReadyMsg` field) plus a coordinate scale into encoder space, for `mfxExtDirtyRect` on one vendor and an unverifiable ROI map on another — against a saving nobody has measured, on a path whose largest cost was just deleted. Revisit if a measurement ever shows the encoders themselves spending time on unchanged macroblocks. |
+| 278 | encode / amd | The AMF backend stays `UNVERIFIED`, with the manual script extended to close the remaining questions | No machine on this project has an AMD GPU, so `major-amd-backend-has-never-encoded-a-frame` cannot be resolved by measurement here — only by making sure the person who does have one is asked the right questions. | 9 sections, none covering NV12 input or the intra-refresh cost | 11 sections: section 4 now expects `color_range` to follow the *input format* and asks for an NVENC side-by-side on the colour VUI; section 10 measures what ULL's free rolling intra refresh costs (encode the same clip with `--intra-refresh on` and `off`, compare size and SSIM/PSNR); section 11 verifies the NV12 retune, the post-retune latency and the chroma | UNVERIFIED by nature | n/a | The ABI half is as verified as it can be without hardware: `test/amd_layout.rs` is regenerated from the vendored MIT headers by `tools/amf_layout_gen.c`, and now pins the encoder's hand-transcribed colour constants too. Behaviour is the only thing left that needs a Radeon. |
+| 279 | encode / nvenc | NVENC's transient encoder-busy now says "device busy", the phrase `pipeline::is_transient_encode_error` matches on | The classifier decides whether to shed the frame and carry on or tear the session down by substring. AMF says it in those words for its transient results and Quick Sync does too; NVENC's own name for the condition is `NV_ENC_ERR_ENCODER_BUSY`, which does not contain the phrase. | every NVENC busy classified as fatal, killing a session that would have recovered on the next frame | classified as transient, like the other two | COMPILE-CHECKED (the busy path did not trigger on this hardware) | yes | The contract is a string match, which is fragile — but it is the contract three backends already share, and unifying it properly is a pipeline-side change. |
+| 280 | macos encode | The software-encode setting reaches VideoToolbox: `EncoderConfig.software_encode` plus a three-state `HwPolicy` on the session specification, whose `Forbid` rung sets `EnableHardwareAcceleratedVideoEncoder = false` | The flag was consumed on macOS by **nothing at all** — `streamer/platform.rs` reads it under `cfg(windows)` — so both the Settings toggle and `serve --software-encode` were inert on this platform. The ladder could not express the request either: it was a `bool require_hw`, and VideoToolbox spells "require hardware", "prefer hardware" and "refuse hardware" with two different keys and two different values. | software encode requested, hardware encoder used, nothing logged | one ladder rung, no hardware fallback, `[vt] software encode was requested …` on the session line | VERIFIED (10.15.8: gates green, 311 tests pass; the flag reaching `EncoderConfig` is unit-tested both ways. Which encoder VideoToolbox then picks is `COMPILE-CHECKED` — the 10.15 box has no low-latency encoder to distinguish it from) | yes | Closes the macOS half of `minor-session-gpu-toggle-snapshotted`. The live-handle half is one word away: `cfg.software_encode_now()` in place of the snapshot, once W1's `Config.gpu_encode_toggle` merges. Also splits the loud SOFTWARE-ENCODER warning from the calm by-request line, so the warning keeps meaning "something went wrong". |
+| 281 | macos capture | The CGDisplayStream drop count reaches telemetry as `frames_dropped_capture`, not `frames_dropped_ring` | Two workstreams fixed `major-cgds-drop-count-never-read` in parallel. `frames_dropped_ring` is ours — a frame we dropped between capture and encode. `frames_dropped_capture` is documented as presents the OS coalesced away because we were still busy, which is exactly what `CGDisplayStreamUpdateGetDropCount` counts, and is the same counter DXGI's `AccumulatedFrames` feeds on Windows. Filing it under the wrong one makes the two platforms uncomparable. | macOS WindowServer drops counted as a ring drop | counted as a capture drop, comparable with the DXGI number | VERIFIED (10.15.8: gates green) | yes | Merge resolution, not a new change; the drop count itself landed in row 143. The once-a-second reporter thread from the other branch is kept and is now stopped before the summary line prints, so it cannot log a partial total on the way out. |
+| 282 | macos capture | The CGDisplayStream API stays behind `dlsym` after the merge, rather than taking the incoming direct `CGDisplayStreamUpdate::drop_count` / `::rects` calls | The incoming implementation is correct and shorter, and it is a link-time reference to an API Apple obsoleted in the macOS 15 SDK. An eagerly bound symbol dyld cannot resolve kills the process before `main()`, so this is a load bug waiting on an SDK bump, not a missing feature. | 5 CGDisplayStream symbols + 5 CFString constants resolvable at link time | none: `nm -u \| grep -i displaystream` is empty | VERIFIED (10.15.8: `nm -u` guard is in `target/w5-measure.sh` and runs on every measurement pass) | yes | The same resolution keeps the first-frame bypass of the empty-dirty-rect skip, without which a client joining a still display never gets a picture — the incoming version does not have it. |
+| 283 | macos encode | Long-term reference frames: still probed and reported, still not enabled | `EnableLTR` without an acknowledgement loop is not a partial win, it is a loss: the encoder enters a reference-management mode nobody drives, and `ForceLTRRefresh` with nothing acknowledged emits an IDR — today's behaviour, at a cost. W1 built the acknowledgement signal (`SharedFeedback::acked_frame_capture_ns()`), but it is on `w1-closeout`, which has not merged into `latency-overhaul`; grepping this branch for it returns nothing. | `EnableLTR` reported as `available` / `absent` per session | unchanged | DEFERRED — unblocked by exactly one event, `w1-closeout` merging | n/a | Not a rejection. After that merge the change is the four encoder-side steps written out in `findings/major-vt-ltr-frames-would-replace-idr-on-every-pli.md`, plus one `Arc<AtomicU64>` set beside the existing `pipeline.set_target_bitrate(target)` in `webrtc_session.rs`. Untestable here regardless: 10.15.8 reports `EnableLTR=absent`. |
+| 284 | macos vdisplay | The AirPlay tier stores the geometry it negotiated instead of discarding it | It is the one display backend that negotiates rather than being commanded — `settle_geometry` picks off the ladder CoreDisplay publishes and the session then threw the answer away — so every join off that ladder (every DPR>1 client) pays a `CGDisplaySetDisplayMode` that cannot succeed, plus the settle poll behind it, plus a `could not force …` line. | settled geometry computed, dropped | stored on the session, readable as `airplay::settled_geometry(id)` | COMPILE-CHECKED (10.15.8: gates green. The saving is only realised once the trait override lands, and the live AirPlay harness needs a second Mac) | yes | Half of `minor-vdisplay-mac-airplay-can-report-the-geometry-it-negotiated`. The override is three lines and waits on W1's `VirtualDisplayController::created_geometry`, which is not in this tree; adding the trait method here as well would collide at merge time for no gain. |
 
 ## Notes
+
+### Decision: mac-closeout`s AirPlay NTP instrumentation supersedes the core-closeout mirror`s
+
+Two branches instrumented the AirPlay mirror stream`s plaintext timestamps independently, and
+both were written before either could see the other. The Mac mirror worktree `_wt/core-closeout`
+carried `ntp_now` / `ntp_delta_ns` / `plausible` (660 lines of `airplay/mirror.rs`);
+`mac-closeout` carried `ntp_fixed_to_ns` / `plausible_sender_seconds` (871 lines) and is the one
+that reached `latency-overhaul`.
+
+The orchestrator`s decision is that mac-closeout`s version stands. It is the larger and the
+more careful of the two: `plausible_sender_seconds` validates the sender clock as an uptime
+against a 400-day ceiling, which is what actually decides the stamp`s byte order from a single
+sample, where the mirror`s `plausible` only bounded a latency window.
+
+The mirror branch was diffed against the survivor before being dropped, and one piece of
+coverage was genuinely missing rather than merely differently spelled: every surviving
+assertion about the fixed-point conversion used a whole second (`1 << 32`), whose low 32 bits
+are zero, so nothing exercised the fractional half. That assertion is ported as
+`a_sub_second_ntp_value_converts_through_its_fraction`. Nothing else in the mirror was unique.
+
+Dropped with the branch: commits `5d44688df` and `497d13e70` on the Mac.
 
 ### What the core close-out could not verify here
 
@@ -636,15 +670,15 @@ no video stream to share there.
 W8 built `probe --audio` on Windows. Its first run on macOS (10.15.8, legacy driver tier, release
 binary, `say` driving the mix) gives the directly comparable figure:
 
-    macOS  legacy driver tier   capture -> subscriber  p50 1.84 / p90 3.67 / p99 5.24 / max 6.76 ms
+    macOS  legacy driver tier   capture -> subscriber  p50 2.10 / p90 4.19 / p99 4.19 / max 5.23 ms
     Win 11 endpoint loopback    capture -> subscriber  p50 9.44 / p90 9.44 / p99 9.44 / max 10.9 ms
 
-    packets=522 (52.2/s), payload avg 77 B, seq gaps 0, discontinuity 1
-    subscriber inter-arrival p50/p90/p99/max = 0.15 / 10.49 / 13.63 / 15.84 ms
+    packets=849 (84.9/s), payload avg 78.5 B, silent 31, seq gaps 0, discontinuity 1
+    subscriber inter-arrival p50/p90/p99/max = 0.10 / 10.49 / 10.49 / 11.24 ms
 
 The macOS tier is roughly five times better at p50 and twice at p99, which is what a 2.67 ms IO
 cycle buys against Windows' 10 ms engine period. The rate is 52.2 packets/s rather than 200
-because the virtual device runs no IO cycle while nothing is playing — the gaps are host silence
+than 200 because the virtual device runs no IO cycle while nothing is playing — the gaps are host silence
 and cost nothing on the wire (see row 111).
 
 **The libopus CTL readback matches Windows exactly**, which is what
@@ -658,6 +692,12 @@ evidence — `ctl_set` `bail!`s on a rejected value and would have failed captur
 
 Identical field for field, `lookahead=120` included — so the number the client uses to align
 playout is the same on both platforms.
+
+**Dyld floor check on the release binary: PASS.** `scripts/check-macos-dyld.sh` against the 10.15
+SDK reports 551 undefined symbols, 551 ok, **0 offenders**, 0 weak imports, 0 allowlisted — so
+nothing this workstream added to the audio FFI (the Process Tap `dlsym` pair, `CATapDescription`,
+the SCK class lookups, `libc::kill`, the `dispatch2` barrier) is a link-time reference newer than
+the floor. Its source scan lists them as runtime-resolved, which is the intended shape.
 
 **It caught two things no unit test could.**
 
@@ -798,56 +838,75 @@ zero callers to being the fast path in row 113.
 Same recipe as the baseline — `ScreenExtend probe --whep-selftest --duration 30 --encoder <e>
 --capture-backend <c>`, release build with `--features probe`, real capture of a virtual display
 created for the run at 1280x720@60, WHEP over loopback — on the merged `latency-overhaul` code.
-**Three trials per cell; the figure is the median of the three.** Milliseconds, p50 / p90 / p99 /
-max.
 
-Measurement hygiene: the first pass ran with 10-17 concurrent `rustc`/`cargo` processes from the
-other workstreams and its p50s were unusable. The numbers below are a second pass at a load of
-**4-6**. That is the quietest this laptop got, and not for want of waiting: a poll every 60 s for
-20 minutes never found fewer than 8 concurrent build processes, and the count was 26 by the time
-the poll gave up. The baseline was taken on an idle machine, so these tails are pessimistic
-rather than flattering. Both passes are kept in `scratchpad/runs` and `runs2`; they agreed on
-every count and every path selection, and differed only in the CPU-sensitive percentiles.
+**Read the ranges, not a single number.** This was measured four separate times, three trials
+each, because the first result did not reproduce. The laptop was shared with the other
+workstreams throughout and the concurrent `rustc`/`cargo` count swung between **2 and 17** —
+sometimes inside a single pass. The percentiles of the two CPU-bound cells move by about a factor
+of two across passes, and that variance is the other agents' compilers, not this work. Each cell
+below gives the **range of the four per-pass medians**, so the spread is visible rather than
+hidden by a favourable pick. Raw logs: `scratchpad/runs`, `runs2`, `runs3`, `runs4`.
 
-| Encoder | Path selected | frames (repeats) | real frames | RTP packets | capture delivery | encode | **capture → socket** |
-|---|---|---|---|---|---|---|---|
-| NVENC ring, **before** | `nvenc-zero-copy-ring` | 211 (144) | 67 | ~1,740 | 0.98 / 4.19 / 6.82 / 6.95 | 0.00 / 1.18 / 1.44 / 15.09 | **1.57 / 8.39 / 16.78 / 18.00** |
-| NVENC ring, **after** | `nvenc-zero-copy-ring` | 327 (122) | 205 | 2,778 | 0.92 / 3.15 / 8.39 / 8.88 | 1.05 / 1.44 / 3.67 / 3.93 | **2.10 / 3.67 / 10.49 / 10.69** |
-| x264, **before** | `software-x264` | 223 (142) | 81 | ~2,520 | 0.98 / 3.93 / 4.72 / 4.99 | 2.10 / 2.62 / 5.24 / 24.57 | **2.36 / 5.24 / 23.07 / 24.82** |
-| x264, **after** | `software-x264` | 304 (136) | 168 | 3,416 | 1.05 / 2.62 / 4.72 / 4.97 | 3.67 / 5.24 / 9.44 / 12.52 | **4.19 / 7.34 / 9.44 / 11.05** |
-| Quick Sync, **before** | `intel-cpu-bridge` | 219 (140) | 79 | ~1,650 | 3.15 / 7.86 / 15.73 / 16.11 | 4.19 / 11.53 / 16.78 / 21.65 | **11.53 / 16.78 / 25.17 / 26.05** |
-| Quick Sync, **after** | **`intel-same-adapter`** | 380 (133) | 247 | 4,010 | 2.36 / 5.77 / 9.44 / 12.45 | 5.24 / 7.86 / 10.49 / 13.05 | **8.39 / 13.63 / 18.87 / 21.17** |
-| any, DXGI, **before** | — | — | — | — | — | — | **unmeasurable** (two undiagnosed failures) |
-| any, DXGI, **after** | `dxgi + zero-copy` | 0 | 0 | 0 | — | — | **still zero, now diagnosed and bounded** |
+`capture → socket`, milliseconds, p50 / p90 / p99 / max. "real frames" is `frames` minus the
+keepalive repeats — the frames that actually carried new picture.
 
-What the table says:
+| Encoder | Path selected | real frames / 30 s | capture → socket |
+|---|---|---|---|
+| NVENC ring, **before** | `nvenc-zero-copy-ring` | 67 | 1.57 / 8.39 / 16.78 / 18.00 |
+| NVENC ring, **after** | `nvenc-zero-copy-ring` | **206** (206, 206, 206) | 1.84-2.36 / 3.67-7.34 / 6.82-37.75 / 7.08-63.19 |
+| NVENC ring, after, quietest pass (load 2-4) | | 206 | **1.84 / 3.93 / 6.82 / 7.08** |
+| x264, **before** | `software-x264` | 81 | 2.36 / 5.24 / 23.07 / 24.82 |
+| x264, **after** | `software-x264` | **159-450** | 4.19-8.39 / 7.34-12.58 / 9.44-27.26 / 11.05-109.67 |
+| Quick Sync, **before** | `intel-cpu-bridge` | 79 | 11.53 / 16.78 / 25.17 / 26.05 |
+| Quick Sync, **after** | **`intel-same-adapter`** | **126-357** | 8.39-11.53 / 13.63-15.73 / 16.78-20.97 / 21.17-33.94 |
+| any, DXGI, **before** | — | — | **unmeasurable** (two undiagnosed failures) |
+| any, DXGI, **after** | `dxgi + zero-copy` | 0 | **still zero, now diagnosed and bounded** |
 
-1. **The tail is where the whole result is.** `capture → socket` p99 fell on every encoder —
-   NVENC 16.78 → 10.49, x264 23.07 → 9.44, Quick Sync 25.17 → 18.87 — and the maxima fell further
-   still: 18.00 → 10.69, 24.82 → 11.05, 26.05 → 21.17. The `encode` maximum on the ring went
-   15.09 → 3.93. Jitter is what a second monitor is felt through, so these are the numbers that
-   matter, and they moved 40-55%.
-2. **Quick Sync moved onto the same-adapter path and improved on every percentile.** That is row
-   98 — the capture device is now created on the encoder's adapter — and it was not a predicted
-   consequence of it. p50 11.53 → 8.39, p90 16.78 → 13.63, p99 25.17 → 18.87, `capture delivery`
-   p99 15.73 → 9.44, and 2.4x the RTP packets. See the update appended to
-   `findings/major-intel-cross-adapter-unimplemented-forces-cpu-bridge.md`.
-3. **Every cell delivers two to three times as many real frames.** "Real frames" is `frames` minus
-   the keepalive repeats: NVENC 67 → 205, x264 81 → 168, Quick Sync 79 → 247. The frame-pool
-   changes (row 96 — drain-to-newest with a matched `Recreate` buffer count) and the
+What survives the variance, and what does not:
+
+1. **Quick Sync moved onto the same-adapter path.** Categorical, not a percentile: every Intel run
+   in all four passes reports `intel-same-adapter`, and every baseline run reported
+   `intel-cpu-bridge`. That is row 98 — the capture device is created on the encoder's adapter —
+   and it was not a predicted consequence of it. Its p90 (13.63-15.73 vs 16.78) and p99
+   (16.78-20.97 vs 25.17) are below the baseline in **all four** passes, so that improvement is
+   real even though the exact figure is not pinned. This retired most of the
+   "cross-adapter Quick Sync is unimplemented, so hybrid hosts fall to a CPU bridge" finding; what
+   is left of it is `EncoderVendor::Auto` on a machine whose capture adapter is not Intel, since
+   the `Auto` ladder asks for `HighPerformance` and would still reach the bridge if NVENC were
+   unavailable.
+2. **Every cell delivers far more real frames, and this is the most reproducible result here.**
+   The NVENC ring returned *exactly* 206 real frames in all three of its valid passes, against 67
+   before — 3.1x, with no spread at all. x264 went 81 → 159-450, Quick Sync 79 → 126-357. The
+   frame-pool changes (row 96, drain-to-newest with a matched `Recreate` buffer count) and the
    unchanged-frame skip (row 102) are what freed that up: the encoder had been spending its budget
    on frames the compositor had already superseded.
-4. **The p50s rise, and that is the same fact as (3) rather than a regression.** x264's `encode`
-   p50 went 2.10 → 3.67 ms while it encoded 168 real frames instead of 81 — x264's cost scales
-   with how much of the picture actually changed, so more real frames per second is a higher
-   per-frame cost. The ring's `encode` p50 of 0.00 in the baseline was never a real number either:
-   `docs/BASELINE.md` note 6 records that it measured the submit call, not the encode, because
-   the ring decouples the two. Read p90 and above on those rows.
-5. **DXGI is still zero, and that is now a diagnosis rather than a mystery.** Duplication *is*
+3. **The NVENC tail improved and the quieter the machine the clearer it is.** At load 2-4:
+   p90 8.39 → 3.93, p99 16.78 → 6.82, max 18.00 → 7.08. The `encode` maximum went 15.09 → 3.90 ms
+   in the same pass. The one heavily-loaded pass (10-17 builds) shows the opposite tail, which is
+   what a contended CPU does to a p99 and is why it is shown in the range rather than dropped.
+4. **The x264 percentiles are not resolvable on this machine and no claim is made about them.**
+   Its p99 range (9.44-27.26) straddles the baseline's 23.07 and its max range reaches 109.67.
+   Some of that is genuine: x264's cost scales with how much of the picture changed, and it is now
+   encoding two to five times as many real frames, so a higher per-frame cost is expected rather
+   than a regression. Disentangling the two needs a quiet host, which never appeared.
+5. **The p50s rise on every cell, and that is mostly the same fact as (2).** The ring's `encode`
+   p50 of 0.00 in the baseline was never a real number either: `docs/BASELINE.md` note 6 records
+   that it measured the submit call, not the encode, because the ring decouples the two.
+6. **DXGI is still zero, and that is now a diagnosis rather than a mystery.** Duplication *is*
    created (`via DuplicateOutput1`) and the session negotiates; the output then returns
    `ACCESS_LOST` on every acquire until the new cap fires with `duplication was re-established 41
    times without ever delivering a frame`. Before, that was an unbounded silent spin at three log
    lines a second. See the DXGI note below.
+
+**A measurement trap worth recording.** Back-to-back probe runs with no gap silently corrupt each
+other. Four of the twelve runs in the third pass produced no RTP at all, and every one of them
+opened with `[display] already extended (2 monitor(s), 2 source(s))` — the previous probe's
+virtual display was still attached, so the session attached to a stale display and streamed
+nothing. Those four were discarded rather than averaged in. A **15 s sleep between runs** removed
+it completely (fourth pass: 6/6 valid). This is
+`findings/minor-probe-leaves-its-virtual-display-behind-and-breaks-the-next-run.md` observed from
+the other end, and anyone re-running this matrix needs the gap — `docs/BASELINE.md`'s
+"Reproducing this table" says the same thing and it is easy to skip.
 
 ### What is left of the DXGI fallback on this hardware, and what that costs (W3a)
 

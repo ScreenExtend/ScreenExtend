@@ -114,7 +114,18 @@ fn time_one(
     src: &ID3D11Texture2D,
     format: ReadbackFormat,
 ) -> Option<ScalerTiming> {
-    let mut scaler = match Scaler::with_format(device, context, SRC_W, SRC_H, DST_W, DST_H, format)
+    time_one_to(device, context, src, format, DST_W, DST_H)
+}
+
+fn time_one_to(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    src: &ID3D11Texture2D,
+    format: ReadbackFormat,
+    dst_w: u32,
+    dst_h: u32,
+) -> Option<ScalerTiming> {
+    let mut scaler = match Scaler::with_format(device, context, SRC_W, SRC_H, dst_w, dst_h, format)
     {
         Ok(s) => s,
         Err(e) => {
@@ -264,5 +275,64 @@ fn nv12_output_carries_the_picture() {
     assert!(
         hi.saturating_sub(lo) > 16,
         "luma row is flat ({lo}..{hi}); the gradient did not survive the conversion"
+    );
+}
+
+/// Is an identity-size blt worth running purely to get NV12?
+///
+/// The pipeline builds a scaler only when the client's size differs from the display's, so a
+/// client at the native size gets no scaler — and then the CPU-bridge encoders read back BGRA
+/// and convert on the CPU, which is the cost `ReadbackFormat::Nv12` exists to delete. Whether it
+/// is worth adding a 1:1 `VideoProcessorBlt` to reach NV12 depends entirely on whether the blt
+/// costs less than the BGRA readback and the colour convert it replaces, and that is a number,
+/// not an opinion. This is the measurement; `Backend::cpu_bridge_format()` is the caller that
+/// would act on it.
+#[test]
+fn identity_blt_to_nv12_against_a_bgra_readback() {
+    let Some((device, context)) = device() else {
+        return;
+    };
+    let Some(src) = source(&device) else {
+        skip("scaler", "source texture");
+        return;
+    };
+
+    // 1:1, the case a native-resolution client produces.
+    let Some(bgra) = time_one_to(&device, &context, &src, ReadbackFormat::Bgra8, SRC_W, SRC_H)
+    else {
+        return;
+    };
+    let Some(nv12) = time_one_to(&device, &context, &src, ReadbackFormat::Nv12, SRC_W, SRC_H)
+    else {
+        return;
+    };
+
+    eprintln!(
+        "scaler identity {SRC_W}x{SRC_H}, {ITERATIONS} iterations, median us per frame:\n  \
+         bgra8 blt {} readback {} total {}, {} bytes\n  \
+         {}  blt {} readback {} total {}, {} bytes",
+        bgra.blt_us,
+        bgra.readback_us,
+        bgra.total_us,
+        bgra.bytes,
+        nv12.format.name(),
+        nv12.blt_us,
+        nv12.readback_us,
+        nv12.total_us,
+        nv12.bytes,
+    );
+
+    if nv12.format != ReadbackFormat::Nv12 {
+        skip(
+            "scaler nv12 identity",
+            "video processor refused NV12 output",
+        );
+        return;
+    }
+    assert!(
+        (nv12.bytes as f64) < (bgra.bytes as f64) * 0.5,
+        "NV12 readback should be well under half of BGRA even at 1:1: {} vs {}",
+        nv12.bytes,
+        bgra.bytes
     );
 }

@@ -927,10 +927,7 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             dup.context(),
         )?;
 
-        // No scaler at all when the display is already the size the client asked for: the blt
-        // would be an identity pass and the extra surface a wasted allocation.
-        let needs_scaler =
-            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let needs_scaler = needs_scaler(&backend, config.width, config.height, native_w, native_h);
         let scaler = if needs_scaler {
             Some(
                 Scaler::with_format(
@@ -1340,19 +1337,34 @@ impl Backend {
     /// oneVPL through a second VPP pass, AMF through an internal converter — so the conversion is
     /// not saved so much as moved onto silicon that was already running.
     ///
-    /// It stays BGRA until each encoder has an `encode_nv12_padded` to receive it
-    /// (`findings/major-scaler-win-emits-bgra-where-three-encoders-want-nv12.md`, W3b); the
-    /// scaler side is in place, so flipping a backend over is a one-line change here plus that
-    /// entry point. NVENC is deliberately not a candidate: `NV_ENC_BUFFER_FORMAT_ARGB` is
-    /// byte-identical to the captured texture and its internal conversion beats a pre-pass.
+    /// x264 takes NV12: libx264 deinterleaves it to its internal I420 in SIMD inside
+    /// `x264_frame_copy_picture`, so the scalar colour matrix that ran on a rayon pool is gone
+    /// entirely. Measured at 640x360, 30 frames, debug libraries: 1655 us median per frame on the
+    /// BGRA path against 450 us on the NV12 one, coding the same picture to within 1% of the same
+    /// bytes (`x264_nv12_input_matches_the_bgra_path`).
+    ///
+    /// The Intel CPU bridge takes NV12 for a bigger reason: it can then skip its VPP pass
+    /// altogether. On BGRA it re-uploaded 4 bytes a pixel and ran a `VideoProcessorBlt` to reach
+    /// NV12 — a conversion the scaler has already done, on the same kind of fixed-function block,
+    /// as part of a blt it was running anyway.
+    ///
+    /// The AMF bridge takes NV12 because VCN wants it: AMD state that packed-RGB input silently
+    /// invokes an internal GPU colour converter competing with the foreground application, and
+    /// OBS refuses BGRA on its texture path for the same reason. `UNVERIFIED` — no machine on
+    /// this project has an AMD GPU (`docs/manual-tests/amd-amf.md`).
+    ///
+    /// NVENC is deliberately not a candidate: `NV_ENC_BUFFER_FORMAT_ARGB` is byte-identical to
+    /// the captured texture and its internal conversion beats a pre-pass. `Backend::Amf` — the
+    /// GPU path — is not a bridge and takes the blt straight into its own ring texture, whose
+    /// format is the encoder's business.
     fn cpu_bridge_format(&self) -> ReadbackFormat {
         match self {
-            Backend::Nvenc { .. }
-            | Backend::Intel { .. }
-            | Backend::IntelCpu { .. }
-            | Backend::Amf { .. }
-            | Backend::AmfCpu { .. }
-            | Backend::X264 { .. } => ReadbackFormat::Bgra8,
+            Backend::X264 { .. } | Backend::IntelCpu { .. } | Backend::AmfCpu { .. } => {
+                ReadbackFormat::Nv12
+            }
+            Backend::Nvenc { .. } | Backend::Intel { .. } | Backend::Amf { .. } => {
+                ReadbackFormat::Bgra8
+            }
         }
     }
 
@@ -1416,16 +1428,50 @@ impl Backend {
         }
     }
 
-    fn encode_cpu(&mut self, data: &[u8], row_pitch: u32, force_idr: bool) -> Result<Vec<u8>> {
-        match self {
-            Backend::Nvenc {
-                encoder,
-                path: EncodePath::CpuBridge,
-            } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
-            Backend::IntelCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
-            Backend::AmfCpu { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
-            Backend::X264 { encoder } => encoder.encode_bgra_padded(data, row_pitch, force_idr),
-            _ => bail!("encode_cpu called on a GPU-path backend"),
+    /// Hand the readback to the encoder, in the format the reader actually produced.
+    ///
+    /// `format` is not `self.cpu_bridge_format()`: that is what the backend *asks* the scaler
+    /// for, and only the scaler path can honour it. The two no-scaler routes — the staging
+    /// readback of a captured frame and `TextureReader` — read the source texture's own format,
+    /// which is BGRA. Guessing here would hand an encoder 1.5 bytes a pixel to read as 4.
+    fn encode_cpu(
+        &mut self,
+        data: &[u8],
+        row_pitch: u32,
+        format: ReadbackFormat,
+        force_idr: bool,
+    ) -> Result<Vec<u8>> {
+        match (self, format) {
+            (
+                Backend::Nvenc {
+                    encoder,
+                    path: EncodePath::CpuBridge,
+                },
+                ReadbackFormat::Bgra8,
+            ) => encoder.encode_bgra_padded(data, row_pitch, force_idr),
+            (Backend::IntelCpu { encoder }, ReadbackFormat::Bgra8) => {
+                encoder.encode_bgra_padded(data, row_pitch, force_idr)
+            }
+            (Backend::IntelCpu { encoder }, ReadbackFormat::Nv12) => {
+                encoder.encode_nv12_padded(data, row_pitch, force_idr)
+            }
+            (Backend::AmfCpu { encoder }, ReadbackFormat::Bgra8) => {
+                encoder.encode_bgra_padded(data, row_pitch, force_idr)
+            }
+            (Backend::AmfCpu { encoder }, ReadbackFormat::Nv12) => {
+                encoder.encode_nv12_padded(data, row_pitch, force_idr)
+            }
+            (Backend::X264 { encoder }, ReadbackFormat::Bgra8) => {
+                encoder.encode_bgra_padded(data, row_pitch, force_idr)
+            }
+            (Backend::X264 { encoder }, ReadbackFormat::Nv12) => {
+                encoder.encode_nv12_padded(data, row_pitch, force_idr)
+            }
+            (backend, format) => bail!(
+                "encode_cpu: {} cannot take a {} readback",
+                backend.name(),
+                format.name()
+            ),
         }
     }
 
@@ -1479,9 +1525,10 @@ impl EncodeCore {
 
         let au = if backend.is_cpu_bridge() {
             if let Some(scaler) = scaler {
+                let format = scaler.format();
                 scaler.scale(frame.as_raw_texture())?;
                 let (data, row_pitch) = scaler.read_back()?;
-                backend.encode_cpu(data, row_pitch, force_idr)?
+                backend.encode_cpu(data, row_pitch, format, force_idr)?
             } else {
                 let desc = *frame.desc();
                 let stale = staging.as_ref().is_none_or(|s| {
@@ -1499,7 +1546,13 @@ impl EncodeCore {
                     .ok_or_else(|| anyhow!("cpu-bridge readback texture missing"))?;
                 let mut fb = frame.buffer_with(staging)?;
                 let row_pitch = fb.row_pitch();
-                backend.encode_cpu(fb.as_raw_buffer(), row_pitch, force_idr)?
+                // No scaler, so no video processor: this is the captured texture's own format.
+                backend.encode_cpu(
+                    fb.as_raw_buffer(),
+                    row_pitch,
+                    ReadbackFormat::Bgra8,
+                    force_idr,
+                )?
             }
         } else {
             backend.encode_gpu(frame.as_raw_texture(), scaler.as_mut(), force_idr)?
@@ -1526,16 +1579,17 @@ impl EncodeCore {
         } = self;
 
         let au = if backend.is_cpu_bridge() {
-            let (data, row_pitch) = if let Some(scaler) = scaler {
+            let (format, (data, row_pitch)) = if let Some(scaler) = scaler {
+                let format = scaler.format();
                 scaler.scale(tex)?;
-                scaler.read_back()?
+                (format, scaler.read_back()?)
             } else {
                 let reader = reader
                     .as_mut()
                     .ok_or_else(|| anyhow!("cpu-bridge texture encode without a TextureReader"))?;
-                reader.read_back(tex)?
+                (ReadbackFormat::Bgra8, reader.read_back(tex)?)
             };
-            backend.encode_cpu(data, row_pitch, force_idr)?
+            backend.encode_cpu(data, row_pitch, format, force_idr)?
         } else {
             backend.encode_gpu(tex, scaler.as_mut(), force_idr)?
         };
@@ -1716,6 +1770,11 @@ impl AsyncNvencRing {
         telemetry: SharedTelemetry,
     ) -> Self {
         let k = pairs.len();
+        // The keepalive path re-encodes the held slot without going through `stage()`, which is
+        // where `idr_request` is otherwise consumed. Hand the encoder the same atomic so a PLI
+        // on a static desktop produces an IDR rather than another P frame.
+        let mut encoder = encoder;
+        encoder.attach_idr_flag(Arc::clone(&idr_request));
         let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
         let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
@@ -2157,6 +2216,32 @@ fn video_processor_available(device: &ID3D11Device, context: &ID3D11DeviceContex
     device.cast::<ID3D11VideoDevice>().is_ok() && context.cast::<ID3D11VideoContext>().is_ok()
 }
 
+/// Whether to run a `VideoProcessorBlt` before handing the frame to the encoder.
+///
+/// Two independent reasons, and the second is not obvious:
+///
+/// 1. **Scaling.** The display is not the size the client asked for. An equal-size display needs
+///    no blt for this reason, and `Backend::Intel` never does because its VPP fuses the scale
+///    into the encode.
+/// 2. **Converting.** A CPU-bridge backend that wants NV12 gets a scaler even at identity size,
+///    because the blt is not what costs — the *readback* is, and NV12 halves it. Measured at
+///    1920x1080 identity, 60 iterations, median per frame
+///    (`identity_blt_to_nv12_against_a_bgra_readback`):
+///
+///    ```text
+///    bgra8  blt 11 us  readback 2394 us  total 2405 us  8,294,400 bytes
+///    nv12   blt  6 us  readback 1170 us  total 1176 us  3,110,400 bytes
+///    ```
+///
+///    51% off the stage for a 6 us blt, and that is before the encoder-side saving of not
+///    running a colour matrix on the CPU at all. Skipping the "wasted" identity pass was costing
+///    1.2 ms a frame on exactly the configuration a native-resolution client produces.
+fn needs_scaler(backend: &Backend, want_w: u32, want_h: u32, native_w: u32, native_h: u32) -> bool {
+    let scale = backend.wants_prescale() && (want_w != native_w || want_h != native_h);
+    let convert = backend.is_cpu_bridge() && backend.cpu_bridge_format() != ReadbackFormat::Bgra8;
+    scale || convert
+}
+
 /// The scaler's destination format for a given backend.
 ///
 /// Only a CPU-bridge backend reads the scaled surface back, so only it has an opinion. A GPU-path
@@ -2515,9 +2600,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             &ctx.device_context,
         )?;
 
-        // Same as the DXGI path: an equal-size display needs no blt.
-        let needs_scaler =
-            backend.wants_prescale() && (config.width != native_w || config.height != native_h);
+        let needs_scaler = needs_scaler(&backend, config.width, config.height, native_w, native_h);
         let scaler = if needs_scaler {
             match Scaler::with_format(
                 &ctx.device,
