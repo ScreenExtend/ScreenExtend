@@ -86,11 +86,16 @@ use crate::streamer::platform::BitrateApplied;
 
 /// The DXGI format this backend prefers for its own input textures.
 ///
-/// VCN wants NV12, and WGC/DXGI hand us BGRA. Converting is `scaler.rs`'s job — a
-/// `VideoProcessor` blit can scale and BT.709 colour-convert in one pass — but `scaler.rs`
-/// currently emits BGRA only, and teaching it NV12 belongs to another workstream. Until it
-/// lands, the ring is BGRA and AMF runs its own internal converter, which is logged rather than
-/// hidden. See `findings/major-amd-nv12-input-pending-scaler.md`.
+/// VCN wants NV12, and WGC/DXGI hand us BGRA. AMD state that packed-RGB input silently invokes
+/// an internal GPU colour converter that competes with the foreground application, and OBS
+/// refuses BGRA on its texture path for the same reason — a pass this code neither controls nor
+/// measures, so the encoder logs when it is active rather than hiding it.
+///
+/// `Scaler::with_format` can now emit NV12 and the CPU bridge asks for it
+/// (`docs/OPTIMIZATIONS.md` rows 108 and 245: readback 1192 → 740 µs at 1920x1080 → 1280x720).
+/// The **GPU** ring still starts in BGRA because that is what an unscaled capture hands over
+/// with no blt at all, and paying for a `VideoProcessorBlt` purely to convert has not been
+/// measured against AMF's internal converter on hardware anybody here has.
 ///
 /// The encoder does not depend on this constant being right: if the first frame arrives in a
 /// different format it re-initialises the component to match (see `retune_input_format`). This
@@ -324,6 +329,11 @@ pub struct Encoder {
     /// pipeline wants is built afterwards. Mirrors `nvidia/encoder.rs`'s `au_scratch`.
     au_scratch: Vec<u8>,
 
+    /// `(texture pointer, format)` of the last source texture `encode_texture` looked at, so the
+    /// no-scaler path does not call `GetDesc` per frame for a value that only changes with the
+    /// display mode.
+    src_format_cache: Option<(usize, DXGI_FORMAT)>,
+
     /// Whether the SPS AMF emits already carries the VUI we want. Decided once, from the SPS in
     /// `ExtraData`, so the per-frame path is a bool rather than a bitstream parse — and so the
     /// day a driver fixes AMF issue #398 this backend stops rewriting on its own.
@@ -501,6 +511,7 @@ impl Encoder {
             warned_input_full: false,
             warned_empty_output: false,
             au_scratch: Vec::new(),
+            src_format_cache: None,
             patch_sps_vui: false,
             amf,
         };
@@ -792,9 +803,22 @@ impl Encoder {
     ) -> Result<Vec<u8>> {
         // Without a scaler the stage is a CopyResource, which demands identical formats. With
         // one, VideoProcessorBlt converts, so any source format is fine.
+        //
+        // `GetDesc` is a per-frame call for a value that only changes when the virtual display
+        // changes mode, so the answer is cached against the texture pointer: WGC hands out
+        // frames from a fixed pool, and a mode change rebuilds it.
         if scaler.is_none() {
-            let src_format = texture_format(src);
+            let key = src.as_raw() as usize;
+            let src_format = match self.src_format_cache {
+                Some((cached_key, format)) if cached_key == key => format,
+                _ => {
+                    let format = texture_format(src);
+                    self.src_format_cache = Some((key, format));
+                    format
+                }
+            };
             if src_format != self.ring_format {
+                self.src_format_cache = None;
                 self.retune_input_format(src_format)?;
             }
         }
