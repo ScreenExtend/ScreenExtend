@@ -970,7 +970,17 @@ impl Encoder {
             .filter(|s| !s.is_empty())
             .map(|s| format!(" ({s})"))
             .unwrap_or_default();
-        bail!("{what} failed: {status:?}{detail}");
+        // `pipeline::is_transient_encode_error` looks for the substring "device busy" to decide
+        // whether to shed the frame and carry on or tear the session down. The AMF backend
+        // already says it in those words for its transient results; NVENC's own name for the
+        // condition is `NV_ENC_ERR_ENCODER_BUSY`, which does not contain the phrase, so every
+        // NVENC busy was being classified as fatal and killing a session that would have
+        // recovered on the next frame.
+        let hint = match status {
+            NVENCSTATUS::NV_ENC_ERR_ENCODER_BUSY => " [transient: device busy]",
+            _ => "",
+        };
+        bail!("{what} failed: {status:?}{detail}{hint}");
     }
 
     unsafe fn initialize(&mut self) -> Result<()> {
