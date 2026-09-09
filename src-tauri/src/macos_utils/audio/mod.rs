@@ -115,17 +115,73 @@ pub trait AudioSource: Send {
     }
 }
 
+/// What each capability probe answered, as plain data.
+///
+/// This is the seam that makes the tiering testable. The probes themselves `dlsym` the Process
+/// Tap entry points, look up `CATapDescription` and `SCStream`, and stat an installed driver —
+/// none of which exist on the 10.15 dev box, and only some of which exist on any one CI runner.
+/// The *ranking* is a separate decision with no I/O in it at all, and it is the piece that
+/// decides what every supported Mac gets, so it is the piece worth asserting exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioProbes {
+    /// `AudioHardwareCreateProcessTap` and `CATapDescription` both resolved (14.2+).
+    pub process_tap: bool,
+    /// The ScreenCaptureKit classes resolved (13.0+ for audio).
+    pub sck: bool,
+    /// The ScreenExtend Audio driver is installed *and* its device is present.
+    pub driver_healthy: bool,
+}
+
+impl AudioProbes {
+    /// Ask the machine. Native answers come from the `OnceLock` cache because a class cannot
+    /// appear while the process runs; the driver answer is deliberately live, because an install
+    /// finishes mid-session and the UI has to notice.
+    fn probe() -> Self {
+        Self {
+            process_tap: native_backends().contains(&AudioBackend::ProcessTap),
+            sck: native_backends().contains(&AudioBackend::ScreenCaptureKitAudio),
+            driver_healthy: legacy::probe::driver_healthy(),
+        }
+    }
+}
+
+/// The tier this Mac reports, given what the probes answered. Pure.
+pub(crate) fn rank_backend(probes: AudioProbes) -> AudioBackend {
+    if probes.process_tap {
+        return AudioBackend::ProcessTap;
+    }
+    if probes.sck {
+        return AudioBackend::ScreenCaptureKitAudio;
+    }
+    if probes.driver_healthy {
+        return AudioBackend::VirtualDevice;
+    }
+    // Below 12.3 there is no native system-audio API at all and the driver is the answer, so
+    // there is nothing to report as unsupported: the app's own floor is 10.15 and the driver
+    // covers it.
+    AudioBackend::NeedsDriverInstall
+}
+
+/// Every tier `start_capture` may try, best first. Pure.
+pub(crate) fn rank_capable_backends(probes: AudioProbes) -> Vec<AudioBackend> {
+    let mut v = Vec::new();
+    if probes.process_tap {
+        v.push(AudioBackend::ProcessTap);
+    }
+    if probes.sck {
+        v.push(AudioBackend::ScreenCaptureKitAudio);
+    }
+    // The driver is a real fallback, not a below-13.0-only tier. On 13.x with Screen Recording
+    // denied, SCK is selected, fails to start, and there is nothing after it — even when the
+    // driver is installed and would have worked.
+    if probes.driver_healthy {
+        v.push(AudioBackend::VirtualDevice);
+    }
+    v
+}
+
 pub fn probe_audio_backend() -> AudioBackend {
-    if let Some(b) = native_backends().first().copied() {
-        return b;
-    }
-    match legacy::probe::legacy_state() {
-        legacy::probe::LegacyState::Ready => AudioBackend::VirtualDevice,
-        // Below 12.3 there is no native system-audio API at all and the driver is the answer, so
-        // there is nothing to report as unsupported: the app's own floor is 10.15 and the driver
-        // covers it.
-        _ => AudioBackend::NeedsDriverInstall,
-    }
+    rank_backend(AudioProbes::probe())
 }
 
 /// The native tiers this Mac can run, best first.
@@ -151,14 +207,7 @@ fn native_backends() -> &'static [AudioBackend] {
 }
 
 fn capable_backends() -> Vec<AudioBackend> {
-    let mut v = native_backends().to_vec();
-    // The driver is a real fallback, not a below-13.0-only tier. On 13.x with Screen Recording
-    // denied, SCK is selected, fails to start, and there is nothing after it — even when the
-    // driver is installed and would have worked.
-    if legacy::probe::driver_healthy() {
-        v.push(AudioBackend::VirtualDevice);
-    }
-    v
+    rank_capable_backends(AudioProbes::probe())
 }
 
 fn make_backend(kind: AudioBackend) -> Box<dyn AudioSource> {

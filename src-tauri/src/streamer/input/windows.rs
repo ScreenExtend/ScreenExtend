@@ -1111,7 +1111,7 @@ mod tests {
     /// Injects for real, so it moves the host cursor: run it deliberately, not in a suite.
     /// `cargo test -- --ignored --nocapture pointer_batch_costs`
     #[test]
-    #[ignore]
+    #[ignore = "injects real input and moves the host cursor; run with --ignored --nocapture"]
     fn pointer_batch_costs_one_sendinput_not_one_per_sample() {
         const SAMPLES: usize = 40;
         const REPS: usize = 500;

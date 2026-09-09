@@ -1501,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires a working VideoToolbox H.264 encoder and writes /tmp/screenextend_test.h264; run with --ignored --nocapture"]
     fn encode_synthetic() {
         let (w, h) = (640usize, 480usize);
         let mut cfg = cfg_at(w as u32, h as u32);
@@ -1528,11 +1528,26 @@ mod tests {
             }
         }
 
+        // Per-submit timing, so this test produces a number as well as a verdict. Until now the
+        // only encode timing in the repo came from the Windows x264 test, which is why the CI
+        // perf gate had no macOS row at all — not a platform judgement, a data problem.
+        // `scripts/perf-gate.mjs` parses the `vt_encode_p95=<n>us` printed below as
+        // `vt_p95_encode_us`.
+        //
+        // `submit` hands the frame to the compression session and returns; the encode itself is
+        // asynchronous, which is exactly what makes this the right thing to watch. It is the
+        // cost the capture thread pays per frame, and a regression in it stalls capture whatever
+        // the encoder does afterwards. End-to-end latency is `pipeline.rs`'s `end_to_end_latency`.
+        let mut submit_us: Vec<u128> = Vec::with_capacity(60);
+        let started = std::time::Instant::now();
         for i in 0..60usize {
             let pb = make_bgra_frame(w, h, i);
+            let t0 = std::time::Instant::now();
             enc.submit(&pb, i == 30, tag()).expect("submit frame");
+            submit_us.push(t0.elapsed().as_micros());
             drain(&out, &mut per_frame, &mut bitstream, &mut buf);
         }
+        let wall_ms = started.elapsed().as_millis();
         enc.flush().expect("flush");
         while let Ok(cs) = out.recv_timeout(std::time::Duration::from_millis(500)) {
             cs.to_annexb(&mut buf);
@@ -1544,11 +1559,16 @@ mod tests {
         }
 
         std::fs::write("/tmp/screenextend_test.h264", &bitstream).expect("write bitstream");
+        let p = crate::test_support::percentiles(&submit_us);
         println!(
-            "wrote {} bytes, {} frames to /tmp/screenextend_test.h264 (output drops: {})",
-            bitstream.len(),
+            "videotoolbox encode OK: {} frames {w}x{h}, {} bytes, output drops {}, vt_encode_p50={}us vt_encode_p95={}us vt_encode_p99={}us vt_encode_max={}us, wall={wall_ms}ms",
             per_frame.len(),
-            enc.output_drops()
+            bitstream.len(),
+            enc.output_drops(),
+            p.p50,
+            p.p95,
+            p.p99,
+            p.max,
         );
         let keyframes: Vec<usize> = per_frame
             .iter()
@@ -1586,7 +1606,7 @@ mod tests {
 
     /// What the decoder is actually told about buffering and colour.
     #[test]
-    #[ignore]
+    #[ignore = "requires a working VideoToolbox H.264 encoder; run with --ignored --nocapture"]
     fn the_sps_promises_no_reordering() {
         let (w, h) = (640usize, 480usize);
         let mut enc = Encoder::new(cfg_at(w as u32, h as u32)).expect("encoder");
@@ -1623,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "creates and destroys eight 720p hardware sessions; run with --ignored --nocapture"]
     fn recreate_churn_releases_hw() {
         for i in 0..8 {
             let enc = Encoder::new(cfg_at(1280, 720));
@@ -1660,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires VideoToolbox and exercises the software fallback below the hardware floor; run with --ignored --nocapture"]
     fn creates_small_via_software() {
         for (w, h) in [(480u32, 270u32), (448u32, 252u32), (160u32, 90u32)] {
             let hw = hw_create_status(w, h);
@@ -1675,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "sweeps every resolution and holds six concurrent hardware sessions; run with --ignored --nocapture"]
     fn hw_capability_probe() {
         for (w, h) in [
             (1280u32, 720u32),
