@@ -1,6 +1,5 @@
 use windows::core::HSTRING;
 use windows::Foundation::Metadata::ApiInformation;
-use windows::Graphics::Capture::GraphicsCaptureSession;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE,
     DXGI_ERROR_NOT_FOUND,
@@ -131,10 +130,13 @@ fn run_probes() -> Probes {
     .unwrap_or_else(|_| Probes::optimistic())
 }
 
-/// `GraphicsCaptureSession::IsSupported()` is the capability test. The
-/// `UniversalApiContract 8` check that used to sit next to it could only add false negatives.
+/// The report and the capture path must never disagree about whether WGC is available, so this
+/// is a thin call into the one predicate the capture path itself gates on. It used to be a second
+/// copy that dropped upstream's `UniversalApiContract 8` conjunct while
+/// `GraphicsCaptureApi::is_supported()` kept it — which on a build where that gate binds made the
+/// report claim WGC on a host where capture would refuse to start.
 fn wgc_supported() -> bool {
-    GraphicsCaptureSession::IsSupported().unwrap_or(false)
+    crate::windows_capture::graphics_capture_api::wgc_supported()
 }
 
 /// Whether the DXGI Desktop Duplication *fallback* can actually run here.
@@ -410,6 +412,40 @@ pub fn check_system_requirements() -> CompatibilityReport {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The compatibility report and the capture path must answer the same question the same way.
+    ///
+    /// They used to be two copies of the predicate that disagreed by one conjunct
+    /// (`UniversalApiContract 8`), so a host where that gate bound was told WGC works while
+    /// `GraphicsCaptureApi::new` returned `Unsupported` and every optional knob read absent. This
+    /// passes trivially while both go through
+    /// `windows_capture::graphics_capture_api::wgc_supported`, which is the point: it fails the
+    /// moment somebody re-adds a term to one side only.
+    #[test]
+    fn the_report_and_the_capture_path_share_one_wgc_predicate() {
+        let report = wgc_supported();
+        let capture =
+            crate::windows_capture::graphics_capture_api::GraphicsCaptureApi::is_supported()
+                .unwrap_or(false);
+        assert_eq!(
+            report, capture,
+            "compatibility::wgc_supported() and GraphicsCaptureApi::is_supported() disagree; \
+             they must be the same predicate or the report can promise a backend that refuses \
+             to start"
+        );
+
+        // `wgc_features()` gates on the same answer, so an unsupported host must report every
+        // knob absent rather than a mix.
+        let features = crate::windows_capture::graphics_capture_api::wgc_features();
+        if !report {
+            assert_eq!(
+                features.summary(),
+                "-cursor -border -secondary-windows -min-update-interval -dirty-region \
+                 -free-threaded-pool",
+                "WGC is unsupported here, so no optional capture property may read present"
+            );
+        }
+    }
 
     /// Prints every probed backend on this machine. Run with `--ignored --nocapture`.
     #[test]
