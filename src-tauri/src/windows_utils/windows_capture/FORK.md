@@ -63,6 +63,19 @@ logged via `teprintln!` rather than swallowed silently.
 
 ### `graphics_capture_api.rs`
 
+- **One WGC predicate, and the `UniversalApiContract 8` conjunct is gone.** `wgc_supported()` is
+  `GraphicsCaptureSession::IsSupported()` alone; `GraphicsCaptureApi::is_supported()` delegates to
+  it, `wgc_features()` gates on it, and `windows_utils::compatibility` calls it rather than keeping
+  a second copy. Upstream ANDed in
+  `IsApiContractPresentByMajor("Windows.Foundation.UniversalApiContract", 8)` (Windows 10 1809),
+  and the compatibility probe had dropped that conjunct — so on a build where the gate binds the
+  report claimed WGC while capture refused to start and every optional knob read absent. The
+  contract check is the half that went, because the capture path uses no API newer than the
+  contract-6 set `IsSupported()` itself belongs to (`Create`, `CreateCaptureSession`,
+  `item.Closed`, `FrameArrived`, `item.Size`); everything above that is probed individually below.
+  `windows_utils::compatibility`'s
+  `the_report_and_the_capture_path_share_one_wgc_predicate` fails if a term is ever re-added to
+  one side only.
 - **`WgcFeatures` + `wgc_features()`** (`:61-137`). Every optional `GraphicsCaptureSession` knob —
   `IsCursorCaptureEnabled` (19041), `IsBorderRequired` (20348), `IncludeSecondaryWindows` (22000),
   `MinUpdateInterval` and `DirtyRegionMode` (both 26100), plus
