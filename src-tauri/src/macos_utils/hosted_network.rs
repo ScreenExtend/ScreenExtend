@@ -44,6 +44,9 @@ const MODE_SETTLE_TIMEOUT: Duration = Duration::from_millis(2500);
 const DHCP_SETTLE_TIMEOUT: Duration = Duration::from_millis(6000);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+/// How long an AP may stay up with nothing associated before saying so. Long enough for a person
+/// to pick the network on a phone, type the passphrase and be handed a lease.
+const ASSOCIATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HostedNetworkBackend {
@@ -77,6 +80,9 @@ pub struct HostedNetworkStatus {
     pub advertised: bool,
     /// The host holds a routable IPv4 on the AP interface, i.e. `bootpd` is serving.
     pub host_ipv4: Option<Ipv4Addr>,
+    /// A client that actually associated, took a DHCP lease from us and reached the streamer.
+    /// This is the only field that distinguishes an AP that works from one that merely exists.
+    pub associated_peer: Option<Ipv4Addr>,
 }
 
 fn status() -> &'static Mutex<HostedNetworkStatus> {
@@ -369,11 +375,19 @@ fn wait_for_ap_mode(interface: &CWInterface) -> bool {
 /// AP mode with no address on the interface means nothing is serving DHCP: clients will see the
 /// network and fail to join. This is the difference between advertised and working, and it settles
 /// a second or two after the start, so it is watched rather than waited on.
-fn wait_for_ipv4(name: &str, timeout: Duration) -> Option<Ipv4Addr> {
+///
+/// `previous` is the address the interface held *before* the start, and rejecting it is not a
+/// refinement. Measured on 10.15.8: two seconds after `startHostAPModeWithSSID:` returned YES and
+/// `interfaceMode()` read HostAP, `getifaddrs` still reported the station address from the network
+/// the Mac had just left — so a naive read reports the AP as verified, on the LAN address, before
+/// the interface has been reconfigured at all. Forty-five seconds later the real answer was that
+/// the AP holds no address whatsoever.
+fn wait_for_ipv4(name: &str, previous: Option<Ipv4Addr>, timeout: Duration) -> Option<Ipv4Addr> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(ip) = super::networking::interface_ipv4(name) {
-            return Some(ip);
+        match crate::macos_utils::networking::interface_ipv4(name) {
+            Some(ip) if Some(ip) != previous => return Some(ip),
+            _ => {}
         }
         if Instant::now() >= deadline {
             return None;
@@ -388,13 +402,19 @@ fn wait_for_ipv4(name: &str, timeout: Duration) -> Option<Ipv4Addr> {
 /// of the two outcomes happened. Phase two notices an AP that goes away on its own — a radio reset,
 /// a Wi-Fi mode change from the menu bar, or the OS reclaiming the interface — which is what
 /// otherwise leaves the dashboard with a green light on a dead AP.
-fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<String>) {
+fn watch_liveness(
+    app: AppHandle,
+    generation: u64,
+    ssid: String,
+    iface: Option<String>,
+    previous_ipv4: Option<Ipv4Addr>,
+) {
     std::thread::spawn(move || {
         use tauri::Manager;
 
         let host_ipv4 = iface
             .as_deref()
-            .and_then(|name| wait_for_ipv4(name, DHCP_SETTLE_TIMEOUT));
+            .and_then(|name| wait_for_ipv4(name, previous_ipv4, DHCP_SETTLE_TIMEOUT));
         if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
             return;
         }
@@ -415,11 +435,43 @@ fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<S
             }
         }
 
+        let since = Instant::now();
+        let mut announced_association = false;
+        let mut announced_silence = false;
+
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             if WATCH_GENERATION.load(Ordering::Relaxed) != generation {
                 return;
             }
+
+            // "Started" has never meant "a client can join". Look for one.
+            if let (Some(host), false) = (host_ipv4, announced_association) {
+                if let Some(peer) = associated_peer(&app, host) {
+                    status().lock().unwrap().associated_peer = Some(peer);
+                    tprintln!(
+                        "[hosted-network] '{ssid}' carried a client: {peer} associated, took a                          lease and joined"
+                    );
+                    announced_association = true;
+                }
+            }
+            if !announced_association
+                && !announced_silence
+                && since.elapsed() >= ASSOCIATION_TIMEOUT
+            {
+                announced_silence = true;
+                match host_ipv4 {
+                    Some(host) => teprintln!(
+                        "[hosted-network] '{ssid}' has been up for {}s on {host} with nothing                          associated. The usual causes, in order: the client refused the security                          type this Mac accepted; the client's radio does not support the band or                          channel in use; or the passphrase was mistyped. Check what the network                          looks like from the client before assuming the host is at fault",
+                        ASSOCIATION_TIMEOUT.as_secs()
+                    ),
+                    None => teprintln!(
+                        "[hosted-network] '{ssid}' has been up for {}s with no address on the                          interface and nothing associated; nothing is serving DHCP, so a client                          that does associate still cannot join",
+                        ASSOCIATION_TIMEOUT.as_secs()
+                    ),
+                }
+            }
+
             let still_up = wifi_interface()
                 .map(|i| interface_mode_is_host_ap(&i))
                 .unwrap_or(false);
@@ -440,6 +492,21 @@ fn watch_liveness(app: AppHandle, generation: u64, ssid: String, iface: Option<S
             return;
         }
     });
+}
+
+/// A client of *our* AP, as opposed to one that reached us over the wired LAN.
+///
+/// The hosted network hands out a /24 around the host's own address, so a session whose client IP
+/// shares that /24 came in over the AP. This is the promotion from "advertised" to "verified":
+/// nothing before it observes a client at all.
+fn associated_peer(app: &AppHandle, host: Ipv4Addr) -> Option<Ipv4Addr> {
+    use tauri::Manager;
+    let state = app.try_state::<AppState>()?;
+    let sessions = state.sessions.clone();
+    crate::streamer::session::client_ips(&sessions)
+        .into_iter()
+        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .find(|peer| peer.octets()[..3] == host.octets()[..3] && *peer != host)
 }
 
 struct Attempt {
@@ -618,6 +685,13 @@ pub fn start_hosted_network(
         return false;
     };
 
+    // Read before anything touches the radio. macOS leaves the station address on the interface
+    // for seconds after the AP is up, and a verification that accepts it reports the AP as
+    // working, on the address of the network the Mac just left.
+    let station_ipv4 = interface_bsd_name(&interface)
+        .as_deref()
+        .and_then(crate::macos_utils::networking::interface_ipv4);
+
     let backend = probe_hosted_network_backend();
     if backend == HostedNetworkBackend::Unsupported {
         teprintln!(
@@ -692,15 +766,18 @@ pub fn start_hosted_network(
         security: Some(outcome.security),
         advertised: true,
         host_ipv4: None,
+        associated_peer: None,
     };
 
     *state.stop_hosted_network.lock().unwrap() = Some(Box::new(stop_host_ap_mode));
     *state.hosted_network_running.lock().unwrap() = true;
+    let bsd = interface_bsd_name(&interface);
     watch_liveness(
         app,
         WATCH_GENERATION.load(Ordering::Relaxed),
         name.to_string(),
-        interface_bsd_name(&interface),
+        bsd.clone(),
+        station_ipv4,
     );
     true
 }
@@ -828,6 +905,96 @@ mod tests {
         );
     }
 
+    /// One bounded run of exactly what shipping code does, with every number the ledger wants:
+    /// which securityType the SPI accepts, on which channel and band, how long the radio takes to
+    /// reach AP mode, and whether anything then serves DHCP.
+    ///
+    /// **This takes the Wi-Fi interface.** On a Mac whose only network is that interface — which
+    /// is this project's dev box — it drops every remote session, so it has to be run detached
+    /// with a watchdog that restores the radio. `docs/manual-tests/macos-hosted-network.md` has
+    /// the script.
+    ///
+    /// ```text
+    /// cargo test --lib macos_utils::hosted_network::tests::measure_hostap_start -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
+    fn measure_hostap_start() {
+        let Some(interface) = wifi_interface() else {
+            println!("no Wi-Fi interface");
+            return;
+        };
+        println!("backend: {:?}", probe_hosted_network_backend());
+        let Some(channel) = pick_channel(&interface) else {
+            println!("no usable channel");
+            return;
+        };
+        let number = unsafe { channel.channelNumber() };
+        println!("channel {number} ({})", channel_band(&channel));
+        let name = interface_bsd_name(&interface);
+        let station_ipv4 = name
+            .as_deref()
+            .and_then(crate::macos_utils::networking::interface_ipv4);
+        println!("interface {name:?}, station address before the start {station_ipv4:?}");
+
+        let ssid = "ScreenExtend-Measure";
+        let password = "screenextend";
+        for attempt in secured_attempts(password).into_iter().chain([Attempt {
+            security: SECURITY_OPEN,
+            label: "securityType 2 (open)".to_string(),
+            password: None,
+        }]) {
+            let t0 = Instant::now();
+            let accepted = send_start_host_ap(
+                &interface,
+                &channel,
+                ssid,
+                attempt.security,
+                attempt.password.as_deref(),
+            );
+            let accepted_at = t0.elapsed();
+            let mode_ok = accepted && wait_for_ap_mode(&interface);
+            let mode_at = t0.elapsed();
+            let ip = mode_ok
+                .then(|| name.clone())
+                .flatten()
+                .and_then(|n| wait_for_ipv4(&n, station_ipv4, DHCP_SETTLE_TIMEOUT));
+            let ip_at = t0.elapsed();
+            println!(
+                "{}: accepted={accepted} in {accepted_at:?}, ap_mode={mode_ok} at {mode_at:?},                  ip={ip:?} at {ip_at:?}",
+                attempt.label
+            );
+            if mode_ok {
+                // Hold the AP up long enough for a second device to scan it, which is the only
+                // way to learn what security an accepted `securityType:` actually advertises.
+                let hold = std::env::var("SCREENEXTEND_HOSTAP_HOLD_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if hold > 0 {
+                    println!("holding '{ssid}' up for {hold}s — scan it from another device now");
+                    let held = Instant::now();
+                    while held.elapsed() < Duration::from_secs(hold) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        println!(
+                            "  t+{:>3}s mode_is_ap={} ipv4={:?}",
+                            held.elapsed().as_secs(),
+                            interface_mode_is_host_ap(&interface),
+                            name.as_deref()
+                                .and_then(crate::macos_utils::networking::interface_ipv4),
+                        );
+                    }
+                }
+                stop_host_ap_mode();
+                std::thread::sleep(Duration::from_millis(400));
+                break;
+            }
+            stop_host_ap_mode();
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        println!("stopped; the radio should rejoin its known network on its own");
+    }
+
     /// The security-type sweep the tree has been carrying as a 2012 comment. Run it on a real Mac
     /// with a phone nearby:
     ///
@@ -839,7 +1006,7 @@ mod tests {
     /// actually entered AP mode. Scan from a second device to see what each accepted value
     /// advertises.
     #[test]
-    #[ignore]
+    #[ignore = "takes the Wi-Fi interface; see docs/manual-tests/macos-hosted-network.md"]
     fn sweep_security_types() {
         let Some(interface) = wifi_interface() else {
             println!("no Wi-Fi interface");
@@ -855,6 +1022,9 @@ mod tests {
         };
         let ssid = "ScreenExtend-Sweep";
         let password = "screenextend";
+        let station = interface_bsd_name(&interface)
+            .as_deref()
+            .and_then(crate::macos_utils::networking::interface_ipv4);
         let mut candidates: Vec<u64> = (0..=64).collect();
         candidates.extend([96, 128, 160, 192, 256, 384, 512, 768, 1024, 2048]);
         for security in candidates {
@@ -863,7 +1033,7 @@ mod tests {
             let ip = mode_ok
                 .then(|| interface_bsd_name(&interface))
                 .flatten()
-                .and_then(|name| wait_for_ipv4(&name, DHCP_SETTLE_TIMEOUT));
+                .and_then(|name| wait_for_ipv4(&name, station, DHCP_SETTLE_TIMEOUT));
             println!("securityType {security:5}: accepted={accepted} ap_mode={mode_ok} ip={ip:?}");
             stop_host_ap_mode();
             std::thread::sleep(Duration::from_millis(400));

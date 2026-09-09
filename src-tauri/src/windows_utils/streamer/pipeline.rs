@@ -1072,6 +1072,16 @@ fn dxgi_capture_thread(args: DxgiThreadArgs, ready_tx: std::sync::mpsc::Sender<R
             }
         }
 
+        // Frames the OS coalesced away while we held the previous one. Drained every poll so
+        // the counter tracks the capture, not the report cadence.
+        let coalesced = dup.take_accumulated_drops();
+        if coalesced != 0 {
+            telemetry
+                .degradation
+                .frames_dropped_capture
+                .fetch_add(coalesced, Ordering::Relaxed);
+        }
+
         if !dirty {
             continue;
         }
@@ -1136,6 +1146,48 @@ pub fn probe_live(cfg: &Config, path: &str) -> Result<()> {
 
     let mut cfg = cfg.clone();
     cfg.synthetic_pattern = false;
+
+    // `--workload` normally implies `--synthetic-pattern`, which bypasses capture entirely. Here
+    // the same generated frames go onto the real display instead, so the run exercises the
+    // capture backend, the scaler and the encoder with content that is still repeatable. The
+    // window is dropped at the end of the probe, which closes it.
+    let _workload_window = match select_monitor(cfg.monitor) {
+        Ok((monitor, _)) => monitor
+            .device_name()
+            .ok()
+            .and_then(|name| super::capture::monitor_rect(&name))
+            .and_then(|(left, top, width, height)| {
+                match super::workload_window::WorkloadWindow::spawn(
+                    left,
+                    top,
+                    width,
+                    height,
+                    cfg.max_fps.clamp(1, 240),
+                    cfg.workload,
+                    cfg.counter,
+                ) {
+                    Ok(window) => {
+                        tprintln!(
+                            "probe: painting the '{}' workload onto {width}x{height} at ({left},{top})",
+                            cfg.workload.name()
+                        );
+                        Some(window)
+                    }
+                    Err(e) => {
+                        teprintln!(
+                            "probe: could not put the workload on the display ({e:#}); \
+                             capturing whatever is on it instead"
+                        );
+                        None
+                    }
+                }
+            }),
+        Err(e) => {
+            teprintln!("probe: no monitor to paint the workload onto ({e:#})");
+            None
+        }
+    };
+
     let pipeline = start(&cfg)?;
     // Without this the probe's own telemetry is unreachable: the registry is keyed by session
     // and only the HTTP server publishes into it, so a probe run collected numbers nobody

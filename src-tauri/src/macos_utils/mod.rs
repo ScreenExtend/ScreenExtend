@@ -23,7 +23,7 @@ use crate::DisplayCapacity;
 use device_reporter::TauriDeviceReporter;
 use networking::NetworkInfo;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::path::BaseDirectory;
@@ -648,43 +648,56 @@ fn display_slot_holder(state: &AppState) -> Option<String> {
     session::display_holder_host_ip(&state.sessions)
 }
 
+/// Whether an IPv6 address is one a client can reach by typing it into a browser.
+///
+/// Link-local (`fe80::/10`) is not: it needs a zone index (`%en0`), and no URL carries one. The
+/// loopback and unspecified addresses are not either. Global unicast and unique-local are, and on
+/// an IPv6-only network they are the only way to host at all.
+fn servable_v6(ip: &std::net::Ipv6Addr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified() && ip.segments()[0] & 0xffc0 != 0xfe80
+}
+
 pub fn sync_streamers(state: &AppState) {
-    let (desired, dropped_v6, fresh_local_ips) = {
+    let (desired, unusable, fresh_local_ips) = {
         let adapters = state.network_adapters.lock().unwrap();
-        let desired: Vec<(String, Ipv4Addr)> = adapters
-            .iter()
-            .flat_map(|adapter| adapter.ip_addresses.iter())
-            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok().map(|addr| (ip.clone(), addr)))
-            .collect();
-        // `Config.bind_ip` is an `Ipv4Addr`, so every IPv6 address the enumeration found is
-        // dropped here — silently, until now, even though the dashboard still shows it.
-        let dropped_v6: Vec<String> = adapters
-            .iter()
-            .flat_map(|adapter| adapter.ip_addresses.iter())
-            .filter(|ip| ip.parse::<Ipv4Addr>().is_err())
-            .cloned()
-            .collect();
-        let fresh_local_ips = crate::streamer::server::collect_local_ips(
+        let all = || {
             adapters
                 .iter()
-                .flat_map(|adapter| adapter.ip_addresses.iter().map(String::as_str)),
-        );
-        (desired, dropped_v6, fresh_local_ips)
+                .flat_map(|adapter| adapter.ip_addresses.iter())
+        };
+
+        // IPv4 first, then whatever IPv6 a browser can actually reach. An IPv6-only network used
+        // to produce no listener at all and no diagnostic, because every v6 address failed
+        // `parse::<Ipv4Addr>()` and was dropped with `.ok()`.
+        let mut desired: Vec<(String, IpAddr)> = Vec::new();
+        let mut unusable: Vec<String> = Vec::new();
+        for ip in all() {
+            match ip.parse::<IpAddr>() {
+                Ok(addr @ IpAddr::V4(_)) => desired.push((ip.clone(), addr)),
+                Ok(IpAddr::V6(v6)) if servable_v6(&v6) => {
+                    desired.push((ip.clone(), IpAddr::V6(v6)))
+                }
+                _ => unusable.push(ip.clone()),
+            }
+        }
+        desired.sort_by_key(|(_, addr)| addr.is_ipv6());
+
+        let fresh_local_ips = crate::streamer::server::collect_local_ips(all().map(String::as_str));
+        (desired, unusable, fresh_local_ips)
     };
 
     *state.local_ips.lock().unwrap() = fresh_local_ips;
 
-    if !dropped_v6.is_empty() {
+    if !unusable.is_empty() {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let first_time = !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed);
         if first_time || desired.is_empty() {
             teprintln!(
-                "[streamer] {} IPv6 address(es) are not being served ({}): the streamer binds \
-                 IPv4 only{}",
-                dropped_v6.len(),
-                dropped_v6.join(", "),
+                "[streamer] {} address(es) are not being served ({}): a link-local IPv6 address                  needs a zone index that no browser URL can carry{}",
+                unusable.len(),
+                unusable.join(", "),
                 if desired.is_empty() {
-                    ", and no IPv4 address is available, so nothing is listening and no device can join"
+                    ", and no other address is available, so nothing is listening and no device can join"
                 } else {
                     ""
                 }
@@ -762,5 +775,25 @@ pub fn sync_streamers(state: &AppState) {
 
         tprintln!("[streamer] started streamer bound to {ip}");
         streamers.insert(ip, StreamerHandle { handle });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn only_reachable_ipv6_addresses_are_served() {
+        // The one this dev box reports, and the reason an IPv6-only network still cannot host
+        // from it: fe80::/10 needs a zone index no URL can carry.
+        assert!(!servable_v6(
+            &"fe80::844:907:64ca:8224".parse::<Ipv6Addr>().unwrap()
+        ));
+        assert!(!servable_v6(&Ipv6Addr::LOCALHOST));
+        assert!(!servable_v6(&Ipv6Addr::UNSPECIFIED));
+        // Global unicast and unique-local are what an IPv6-only network actually hands out.
+        assert!(servable_v6(&"2001:db8::1".parse::<Ipv6Addr>().unwrap()));
+        assert!(servable_v6(&"fd00::1".parse::<Ipv6Addr>().unwrap()));
     }
 }

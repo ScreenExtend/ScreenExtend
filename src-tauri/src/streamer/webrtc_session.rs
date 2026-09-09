@@ -161,6 +161,11 @@ pub struct AudioParams {
     /// Link loss as measured by the video BWE, in hundredths of a percent. Wired in by
     /// `start_session`; `None` outside a live session.
     pub link_loss: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Where this client is, decided from its IP before the handshake rather than measured
+    /// 500 ms into the session. A relayed session is *known* to be relayed before a single
+    /// packet is sent, which is the one thing the loss-driven redundancy policy cannot learn
+    /// in time.
+    pub locality: SessionLocality,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
     pub device_key: String,
@@ -178,12 +183,22 @@ const AUDIO_REDUNDANCY_LOSS_THRESHOLD: u32 = 50; // hundredths of a percent
 impl AudioParams {
     /// Should this packet carry the previous frame alongside it?
     ///
-    /// Two conditions, both required: the client said it can parse the format, and the link is
-    /// actually losing packets. A client that cannot parse it must never be sent it, and a
-    /// clean link should not pay for it.
+    /// The client saying it can parse the format is absolute: one that cannot must never be
+    /// sent it. Past that, the question is whether the link is losing packets — and the
+    /// measured answer lags the loss it describes, because `link_loss` can only move after
+    /// loss has already been observed and reported by the video BWE.
+    ///
+    /// A `CrossNetwork` session does not have to wait for that. It is relayed through a TURN
+    /// server by construction, so it starts defensive and the loss-driven policy takes over
+    /// from there; it never turns redundancy *off*, it only removes the opening window in
+    /// which a relayed client's first packets are unprotected. `SameNetwork` and `Unknown`
+    /// keep the old purely-reactive behaviour: a clean LAN should not pay for this.
     fn redundancy_now(&self) -> bool {
         if !self.redundancy {
             return false;
+        }
+        if self.locality == SessionLocality::CrossNetwork {
+            return true;
         }
         self.link_loss
             .as_ref()
@@ -1013,6 +1028,11 @@ pub async fn activate_whep(
                 // local interval, not a stamp anything else compares against.
                 let mut last_idr_request: Option<std::time::Instant> = None;
                 let telemetry_for_stats = Arc::clone(&session_telemetry);
+                // One log line per distinct rejection per channel, so a client whose page has
+                // drifted from this host build is diagnosable without a flood. A drifted client
+                // repeats the same malformed frame thousands of times a second.
+                let mut reported_errors: std::collections::HashSet<input::protocol::ParseError> =
+                    std::collections::HashSet::new();
                 // The Pong reply used to be written from inside the receive handler, which
                 // head-of-line blocked every later message on this channel behind an SCTP send.
                 // It goes to a task that owns the channel instead, so the handler only ever
@@ -1033,8 +1053,22 @@ pub async fn activate_whep(
                     pong_tx
                 });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let Some(parsed) = input::protocol::parse(&msg.data) else {
-                        return Box::pin(async {});
+                    let parsed = match input::protocol::parse(&msg.data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            telemetry_for_stats
+                                .degradation
+                                .input_parse_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            if reported_errors.insert(e) {
+                                teprintln!(
+                                    "input: rejected a frame on the {} channel: {e} ({} bytes)",
+                                    if is_reliable { "reliable" } else { "fast" },
+                                    msg.data.len()
+                                );
+                            }
+                            return Box::pin(async {});
+                        }
                     };
                     // Both of these are transport business and are answered before the
                     // remote-control gate: a device with control disabled still needs its
@@ -1075,7 +1109,9 @@ pub async fn activate_whep(
                                 idr_keyframes.request_quietly();
                             }
                         }
-                        ev if control_enabled => tx.route(ev, parsed.fast, parsed.client_ns),
+                        ev if control_enabled => {
+                            tx.route(ev, parsed.fast, parsed.client_ns, parsed.seq)
+                        }
                         _ => {}
                     }
                     Box::pin(async {})
@@ -2101,6 +2137,52 @@ mod tests {
             out.push_str("\r\n");
         }
         out
+    }
+
+    fn audio_params(locality: SessionLocality, redundancy: bool) -> AudioParams {
+        AudioParams {
+            fast: true,
+            fallback_track: false,
+            redundancy,
+            link_loss: Some(Arc::new(std::sync::atomic::AtomicU32::new(0))),
+            locality,
+            hub: crate::streamer::audio::AudioHub::new(),
+            overrides: Arc::new(std::sync::Mutex::new(Default::default())),
+            device_key: "test".to_string(),
+        }
+    }
+
+    /// A relayed session is known to be relayed before the first packet, so it does not have to
+    /// wait for the BWE to observe loss it could have predicted.
+    #[test]
+    fn a_relayed_session_starts_defensive_and_a_lan_one_does_not() {
+        assert!(audio_params(SessionLocality::CrossNetwork, true).redundancy_now());
+        assert!(!audio_params(SessionLocality::SameNetwork, true).redundancy_now());
+        assert!(!audio_params(SessionLocality::Unknown, true).redundancy_now());
+    }
+
+    /// The client's declared capability outranks everything: one that cannot parse the format
+    /// must never be sent it, however bad the link is.
+    #[test]
+    fn a_client_that_cannot_parse_redundancy_is_never_sent_it() {
+        assert!(!audio_params(SessionLocality::CrossNetwork, false).redundancy_now());
+        let p = audio_params(SessionLocality::SameNetwork, false);
+        p.link_loss
+            .as_ref()
+            .unwrap()
+            .store(9_000, Ordering::Relaxed);
+        assert!(!p.redundancy_now());
+    }
+
+    /// Loss still drives it on a LAN, which is the case the pre-classification cannot predict.
+    #[test]
+    fn observed_loss_still_turns_redundancy_on() {
+        let p = audio_params(SessionLocality::SameNetwork, true);
+        p.link_loss
+            .as_ref()
+            .unwrap()
+            .store(AUDIO_REDUNDANCY_LOSS_THRESHOLD, Ordering::Relaxed);
+        assert!(p.redundancy_now());
     }
 
     #[test]
