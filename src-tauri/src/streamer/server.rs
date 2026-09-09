@@ -1424,6 +1424,7 @@ async fn start_session(
             locality,
             video,
             audio_params.as_ref(),
+            state.config.bind_ip,
         )
     );
     let handshake_ms = t_handshake.elapsed().as_secs_f64() * 1000.0;

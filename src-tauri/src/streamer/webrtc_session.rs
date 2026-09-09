@@ -266,8 +266,35 @@ struct MediaSocket {
 
 /// Bind and configure the LAN-tier media socket, or return `None` and let the session use the
 /// stock ephemeral sockets.
-fn lan_media_socket() -> Option<MediaSocket> {
-    let (sock, tuning) = match sockets::bind_tuned("0.0.0.0:0".parse().ok()?) {
+/// Whether the tuned media socket is enabled for this process.
+///
+/// **Off by default, and this is a measured decision, not caution.** Bound to `0.0.0.0` it made
+/// the join flaky: `UDPMuxDefault` has one socket, but the muxed gather still emits a host
+/// candidate for *every* local address — 24 of them on the Windows dev box, which carries several
+/// virtual adapters — and a pair whose local candidate is not the address the OS route actually
+/// sends from can pass inbound connectivity checks and fail outbound. Measured with the WHEP
+/// self-test on that box: **3 of 5 joins connected**. Binding one named address fixes the cause
+/// (see below), but that path cannot be exercised by the self-test, whose config leaves `bind_ip`
+/// unspecified — so it ships behind a switch until somebody can measure it on a real AP, which is
+/// also the only place its benefit exists. `docs/manual-tests/transport.md` §2 is that measurement.
+fn media_socket_enabled() -> bool {
+    matches!(
+        std::env::var("SCREENEXTEND_MEDIA_SOCKET").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Bind the tuned media socket to one named local address.
+///
+/// The address is the adapter this streamer serves (`Config::bind_ip`). Binding it, rather than
+/// `0.0.0.0`, is what makes the muxed candidate honest: one local address, one host candidate,
+/// and every packet leaving from the address the candidate names.
+fn lan_media_socket(bind: std::net::IpAddr) -> Option<MediaSocket> {
+    if bind.is_unspecified() {
+        // Nothing to bind to means the 24-candidate shape above, so do not.
+        return None;
+    }
+    let (sock, tuning) = match sockets::bind_tuned(std::net::SocketAddr::new(bind, 0)) {
         Ok(v) => v,
         Err(e) => {
             tprintln!("media socket: could not bind a tuned UDP socket ({e}); using ICE defaults");
@@ -311,7 +338,7 @@ fn lan_media_socket() -> Option<MediaSocket> {
 
 fn build_api(
     profile: H264Profile,
-    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    mux: Option<(Arc<webrtc::ice::udp_mux::UDPMuxDefault>, std::net::IpAddr)>,
 ) -> Result<webrtc::api::API> {
     let mut media_engine = MediaEngine::default();
 
@@ -416,7 +443,7 @@ fn build_api(
 }
 
 fn udp_only_setting_engine(
-    mux: Option<Arc<webrtc::ice::udp_mux::UDPMuxDefault>>,
+    mux: Option<(Arc<webrtc::ice::udp_mux::UDPMuxDefault>, std::net::IpAddr)>,
 ) -> webrtc::api::setting_engine::SettingEngine {
     use webrtc::ice::network_type::NetworkType;
     use webrtc::ice::udp_mux::UDPMux;
@@ -435,7 +462,12 @@ fn udp_only_setting_engine(
     // *primary* SSRC's writer. Enabling it would add an `a=ssrc-group:FID` telling Chrome to
     // expect retransmissions on a stream that would always be silent. Repairs already reach the
     // client on the primary SSRC. See `docs/OPTIMIZATIONS.md` row 62.
-    if let Some(mux) = mux {
+    if let Some((mux, bound)) = mux {
+        // One socket means one address that can actually send, so offer exactly that one. Without
+        // this the muxed gather advertises a host candidate per local address on the machine —
+        // every Hyper-V, VirtualBox and VPN adapter included — and every one of those pairs points
+        // at a socket that will not send from it.
+        se.set_ip_filter(Box::new(move |ip: std::net::IpAddr| ip == bound));
         // Only ever on the LAN tier: muxed mode skips server-reflexive gathering outright
         // (`agent_gather.rs`, `UDPNetwork::Muxed(_) => continue`), and a same-subnet peer is
         // already offered no STUN server. Relay gathering builds its own sockets and is
@@ -752,19 +784,23 @@ impl PendingWhep {
 ///
 /// Needs no pipeline: the profile comes from the negotiation, the audio decision from the join
 /// request's capability flags, and the transport constants from the pre-classified locality.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_whep(
     offer_sdp: String,
     ice_servers: Vec<RTCIceServer>,
     locality: SessionLocality,
     video: negotiate::NegotiatedVideo,
     audio: Option<&AudioParams>,
+    bind_ip: std::net::IpAddr,
 ) -> Result<PendingWhep> {
     let profile = video.profile;
     // The LAN tier: our own socket, with the send/receive buffers and the Windows CONNRESET fix
-    // webrtc-rs never applies, muxed so one port carries every host candidate. Never on a relayed
-    // or unclassified path, because muxed mode gives up server-reflexive gathering.
-    let media_socket = if locality == SessionLocality::SameNetwork {
-        lan_media_socket()
+    // webrtc-rs never applies, muxed so one port carries the host candidate. Never on a relayed or
+    // unclassified path, because muxed mode gives up server-reflexive gathering; never without an
+    // explicit opt-in, because it made the join flaky on a multi-adapter host — see
+    // `media_socket_enabled`.
+    let media_socket = if locality == SessionLocality::SameNetwork && media_socket_enabled() {
+        lan_media_socket(bind_ip)
     } else {
         None
     };
@@ -775,7 +811,10 @@ pub async fn prepare_whep(
             ms.tuning.describe()
         );
     }
-    let api = build_api(profile, media_socket.as_ref().map(|m| Arc::clone(&m.mux)))?;
+    let api = build_api(
+        profile,
+        media_socket.as_ref().map(|m| (Arc::clone(&m.mux), bind_ip)),
+    )?;
 
     let rtc_config = RTCConfiguration {
         ice_servers,
@@ -1549,8 +1588,17 @@ pub async fn handle_whep_offer(
     audio: Option<AudioParams>,
     locality: SessionLocality,
     video: negotiate::NegotiatedVideo,
+    bind_ip: std::net::IpAddr,
 ) -> Result<(String, SessionHandle)> {
-    let pending = prepare_whep(offer_sdp, ice_servers, locality, video, audio.as_ref()).await?;
+    let pending = prepare_whep(
+        offer_sdp,
+        ice_servers,
+        locality,
+        video,
+        audio.as_ref(),
+        bind_ip,
+    )
+    .await?;
     activate_whep(pending, pipeline, closed_tx, input, audio).await
 }
 
