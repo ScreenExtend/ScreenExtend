@@ -150,12 +150,6 @@ struct Session {
     /// The mode macOS chose on its own, before we moved the display onto the
     /// one the client asked for. Restored on teardown — see [`remove_display`].
     granted: (u32, u32),
-    /// The geometry the display actually ended up at, after the mode set and its
-    /// settle poll. This tier *negotiates* its geometry rather than being commanded,
-    /// so it is the one backend that can answer the question, and it was computing
-    /// this and throwing it away.
-    #[allow(dead_code)]
-    settled: (u32, u32),
     /// What every display was doing before the session, so the Mac's own screen
     /// can be put back after macOS mirrors and un-mirrors it.
     modes_before: topology::ModeSnapshot,
@@ -227,22 +221,6 @@ fn prewarm() {
 fn registry() -> &'static Mutex<SessionRegistry> {
     static REGISTRY: OnceLock<Mutex<SessionRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(SessionRegistry::default()))
-}
-
-/// The geometry an AirPlay display actually landed on, or `None` for a display this
-/// backend did not create.
-///
-/// The server uses this to skip the forced `set_display_mode` and the settle poll behind
-/// it when the display is already the size that was asked for. On the ladder CoreDisplay
-/// publishes — 800x600, 1024x768, 1280x720, 1280x1024, 1440x900, 1680x1050, 1920x1080,
-/// all at 60 Hz — every request off it currently pays a `CGDisplaySetDisplayMode` round
-/// trip that cannot succeed, which is every DPR>1 device.
-#[allow(dead_code)]
-pub fn settled_geometry(id: u32) -> Option<(u32, u32)> {
-    registry()
-        .lock()
-        .ok()
-        .and_then(|r| r.sessions.get(&id).map(|s| s.settled))
 }
 
 /// True when a display id was created by this backend.
@@ -430,7 +408,6 @@ impl VirtualDisplayController for AirPlayVirtualDisplay {
                 name: receiver_name,
                 requested: Geometry::new(width, height, refresh_rate),
                 granted,
-                settled: (w, h),
                 modes_before,
             },
         );
