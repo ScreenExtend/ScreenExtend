@@ -74,7 +74,8 @@
             { "name": "otp-file", "takesValue": true, "description": "Read the OTP from this file instead of the command line." },
             { "name": "no-cloud", "description": "Do not register a public 'Anywhere (Internet)' session." },
             { "name": "no-qr", "description": "Do not render QR codes in the terminal." },
-            { "name": "software-encode", "description": "Force CPU (software) video encoding." },
+            { "name": "software-encode", "description": "Force CPU (software) video encoding. Alias for --encoder software." },
+            { "name": "encoder", "takesValue": true, "possibleValues": ["auto", "nvidia", "intel", "amd", "software"], "description": "Which video encoder to use (default: auto — NVENC, then Quick Sync, then AMD AMF, then x264)." },
             { "name": "verbose", "short": "v", "description": "Print internal diagnostic logs to the terminal." }
           ]
         },

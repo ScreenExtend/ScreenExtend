@@ -36,6 +36,17 @@ pub enum EncoderVendor {
 }
 
 impl EncoderVendor {
+    /// The canonical spelling, which is also what `--encoder` accepts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvidia => "nvidia",
+            Self::Intel => "intel",
+            Self::Amd => "amd",
+            Self::Software => "software",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),

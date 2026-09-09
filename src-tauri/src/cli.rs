@@ -112,7 +112,9 @@ SERVE OPTIONS:
                           a command line is readable by every process on the machine.
     --no-cloud            Do not register a public "Anywhere (Internet)" session
     --no-qr               Do not render QR codes in the terminal
-    --software-encode     Force CPU (software) video encoding
+    --encoder <v>         Video encoder: auto | nvidia | intel | amd | software
+                          (default: auto — NVENC, then Quick Sync, then AMD AMF, then x264)
+    --software-encode     Force CPU (software) video encoding; alias for --encoder software
     -v, --verbose         Print internal diagnostic logs to the terminal
 
 GLOBAL:
@@ -676,6 +678,8 @@ mod desktop {
     use tauri::path::BaseDirectory;
 
     use crate::single_instance;
+    use crate::streamer::config::EncoderVendor;
+    use crate::streamer::lock::LockExt;
     use crate::streamer::session::{
         DEFAULT_DISCONNECT_GRACE_SECS, DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT,
     };
@@ -1106,6 +1110,23 @@ mod desktop {
             state
                 .disable_gpu_encode
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // `--encoder` picks the vendor the pipelines try first; `--software-encode` and the
+        // persisted `disableGpuEncode` are the older, narrower way of saying `--encoder
+        // software`, and they still win, because that toggle is also what the desktop UI sets.
+        // `tauri-plugin-cli` validates the value against `possibleValues`, so an unparseable one
+        // never reaches here.
+        if let Some(vendor) = arg_str(m, "encoder").and_then(|v| EncoderVendor::parse(&v)) {
+            *state.encoder_vendor.lock_recover() = vendor;
+            if software && vendor != EncoderVendor::Software {
+                eprintln!(
+                    "note: --encoder {vendor:?} is overridden by software encoding \
+                     (--software-encode, or the saved disableGpuEncode setting)"
+                );
+            } else {
+                println!("Encoder: {}", vendor.as_str());
+            }
         }
 
         if let Some(store) = store.as_deref() {
