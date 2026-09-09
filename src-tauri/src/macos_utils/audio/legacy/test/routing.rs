@@ -128,6 +128,7 @@ fn crash_recovery_restores_when_we_died_holding_the_default() {
         saved_uid: "built-in-speakers".to_string(),
         changed: true,
         timestamp: 42,
+        owner_pid: 0, // no owner recorded: an older build, or a host that is gone
     }
     .save(&path);
     let port = FakePort::new(OURS);
@@ -156,6 +157,7 @@ fn crash_recovery_no_op_when_default_is_not_us() {
         saved_uid: "built-in".to_string(),
         changed: true,
         timestamp: 1,
+        owner_pid: 0,
     }
     .save(&path);
     let port = FakePort::new("external-dac");
@@ -164,4 +166,43 @@ fn crash_recovery_no_op_when_default_is_not_us() {
     // must not stomp the user's current choice
     assert_eq!(port.get().as_deref(), Some("external-dac"));
     let _ = std::fs::remove_file(&path);
+}
+
+/// The recovery agent is bootstrapped with `RunAtLoad`, so it runs the instant the tier starts —
+/// while the host that just took the default output is very much alive. Restoring then would pull
+/// the device out from under a live stream, which is exactly what `probe --audio` did before the
+/// owner pid was recorded.
+#[test]
+fn crash_recovery_leaves_a_live_owner_alone() {
+    let path = temp_state_path();
+    // A real live process of our own. `kill(pid, 0)` succeeds only for a process we may signal,
+    // which is the point: a pid now belonging to *another user* is pid reuse, our host is gone,
+    // and recovery should run. launchd would therefore be the wrong stand-in here.
+    let mut owner = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn a live owner");
+    RoutingState {
+        saved_uid: "built-in-speakers".to_string(),
+        changed: true,
+        timestamp: 42,
+        owner_pid: owner.id(),
+    }
+    .save(&path);
+    let port = FakePort::new(OURS);
+
+    assert!(
+        !recover(&port, OURS, &path),
+        "a running owner must keep the default output it took"
+    );
+    assert_eq!(
+        port.get().as_deref(),
+        Some(OURS),
+        "the device must not be handed back while the owner is alive"
+    );
+    // and the state must survive, so a later crash is still recoverable
+    assert!(RoutingState::load(&path).changed);
+
+    let _ = owner.kill();
+    let _ = owner.wait();
 }
