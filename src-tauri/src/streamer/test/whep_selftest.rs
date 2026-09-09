@@ -353,7 +353,9 @@ async fn http_post_join(port: u16, sdp: &str) -> Result<String> {
         .split_once("\r\n\r\n")
         .ok_or_else(|| anyhow!("malformed HTTP response (no header/body split)"))?;
     let status_line = head.lines().next().unwrap_or("");
-    if !status_line.contains("200") {
+    // `201 Created` on the direct listener, which is the one this self-test drives; `200` is
+    // what the cloud tunnel answers, since it hands out no resource to point a `Location` at.
+    if !(status_line.contains("201") || status_line.contains("200")) {
         bail!("POST /whep returned: {status_line}\nbody: {body}");
     }
     Ok(body.to_string())

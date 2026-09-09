@@ -239,6 +239,22 @@ fn is_supersedable(ev: &InputEvent) -> bool {
     }
 }
 
+/// Whether a frame that arrived behind one already injected may be *dropped*.
+///
+/// Narrower than [`is_supersedable`] by exactly one case, and the difference is the arithmetic.
+/// An absolute pointer position is last-value-wins, so replaying an older one walks the cursor
+/// backwards; a `MOUSE_DELTA` carries a relative *increment* that both backends accumulate into a
+/// position they track themselves, and increments commute — applying a reordered one was always
+/// exactly correct, and dropping it loses that motion permanently, under pointer lock, where the
+/// user has the least ability to compensate.
+///
+/// What a late delta must not do is restate a stale button word: `button_transitions` compares it
+/// against the injector's current state and would synthesise a spurious press or release. The
+/// caller rewrites that word before dispatch, which is why this can return `false` safely.
+fn is_reorder_droppable(ev: &InputEvent) -> bool {
+    !matches!(ev, InputEvent::MouseDelta { .. }) && is_supersedable(ev)
+}
+
 #[derive(Clone)]
 pub struct InjectorTx {
     fast: Sender<Queued>,
@@ -312,6 +328,11 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
             // unordered with no retransmits, so two moves can arrive swapped; replaying the
             // older one walks the cursor backwards and then forwards again for a frame.
             let mut highest_seq: Option<u16> = None;
+            // The button word of the newest `MOUSE_DELTA` actually injected. A late delta's own
+            // word is stale by construction, so it is replaced with this before dispatch and the
+            // backend's `button_transitions` compare becomes a no-op — the motion is kept, the
+            // spurious press or release is not.
+            let mut last_delta_buttons: u16 = 0;
             loop {
                 let q = select! {
                     recv(rel_rx) -> m => match m {
@@ -332,25 +353,35 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                // Only supersedable frames are gated: a reordered button or key is a state
-                // transition the host cannot reconstruct, so it is injected whatever its
-                // sequence says.
+                // Only droppable frames are gated: a reordered button or key is a state
+                // transition the host cannot reconstruct, and a reordered relative delta is
+                // motion it cannot recover, so both are injected whatever their sequence says.
+                let mut ev = q.ev;
                 if let Some(seq) = q.seq {
-                    if is_supersedable(&q.ev) {
-                        match highest_seq {
-                            Some(last) if !protocol::seq_is_newer(seq, last) => {
-                                t.degradation
-                                    .input_reorder_drops
-                                    .fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                            _ => highest_seq = Some(seq),
+                    let behind =
+                        matches!(highest_seq, Some(last) if !protocol::seq_is_newer(seq, last));
+                    if behind && is_reorder_droppable(&ev) {
+                        t.degradation
+                            .input_reorder_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if behind {
+                        // Kept, but its restatement of the button word is older than what has
+                        // already been injected and would be read as a transition.
+                        if let InputEvent::MouseDelta { buttons, .. } = &mut ev {
+                            *buttons = last_delta_buttons;
                         }
                     } else {
+                        // Only a *newer* sequence advances the mark. Letting a late frame set it
+                        // walked the high-water backwards and briefly disarmed the gate.
                         highest_seq = Some(seq);
                     }
                 }
-                inj.dispatch(&q.ev);
+                if let InputEvent::MouseDelta { buttons, .. } = &ev {
+                    last_delta_buttons = *buttons;
+                }
+                inj.dispatch(&ev);
                 t.stages
                     .input_inject
                     .record(host_now_ns().saturating_sub(q.host_recv_ns));
@@ -454,6 +485,60 @@ mod tests {
             protocol::SRC_TOUCH,
             Phase::Move
         )));
+    }
+
+    /// The age gate and the reorder gate ask different questions, and a relative delta answers
+    /// them differently: it is redundant with its successors (so it may be dropped for *age*)
+    /// but its position term is an increment, and increments commute (so it may never be dropped
+    /// for *order* — that motion has no other source).
+    #[test]
+    fn a_late_relative_delta_is_kept_where_a_late_absolute_position_is_dropped() {
+        let delta = InputEvent::MouseDelta {
+            dx: 3,
+            dy: -2,
+            buttons: 0,
+            unadjusted: true,
+        };
+        assert!(is_supersedable(&delta), "still droppable for age");
+        assert!(!is_reorder_droppable(&delta), "never droppable for order");
+
+        // Everything else the reorder gate covers is unchanged: an absolute cursor position is
+        // last-value-wins, and ink and state transitions were never gated at all.
+        assert!(is_reorder_droppable(&pointer_from(
+            protocol::SRC_MOUSE,
+            Phase::Move
+        )));
+        assert!(is_reorder_droppable(&batch(protocol::SRC_MOUSE)));
+        assert!(!is_reorder_droppable(&batch(protocol::SRC_PEN)));
+        assert!(!is_reorder_droppable(&pointer_from(
+            protocol::SRC_MOUSE,
+            Phase::Down
+        )));
+    }
+
+    /// The high-water mark may only ever move forward. Advancing it from a frame that was itself
+    /// behind — which the ungated `else` arm used to do for every non-droppable frame — walks it
+    /// backwards and silently disarms the gate for everything in between.
+    #[test]
+    fn only_a_newer_sequence_advances_the_high_water_mark() {
+        fn apply(highest: &mut Option<u16>, seq: u16) -> bool {
+            let behind = matches!(*highest, Some(last) if !protocol::seq_is_newer(seq, last));
+            if !behind {
+                *highest = Some(seq);
+            }
+            behind
+        }
+        let mut highest: Option<u16> = None;
+        assert!(!apply(&mut highest, 10));
+        assert!(!apply(&mut highest, 11));
+        assert!(apply(&mut highest, 9), "9 is behind 11");
+        assert_eq!(highest, Some(11), "a late frame must not move the mark");
+        assert!(
+            apply(&mut highest, 11),
+            "the mark itself is not newer than the mark"
+        );
+        assert!(!apply(&mut highest, 12));
+        assert_eq!(highest, Some(12));
     }
 
     #[test]
