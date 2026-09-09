@@ -55,8 +55,14 @@ jobs:
       - name: Safari 13.1 floor (dist/)
         run: node scripts/check-legacy-webkit.mjs
 
-      - name: client stats harness
-        run: node scripts/test-client-stats.mjs
+      # Six dependency-free Node harnesses over the shipped client page: the input wire format
+      # and telemetry frame, the Opus decode worker and its sequence gate, the jitter buffer
+      # plus the planar ring ABI it shares with the worker, the WebCodecs video path and the
+      # RTP->host-clock inversion A/V sync rides on, ICE gathering, and the /reconfig epochs.
+      # They load the real .js with `vm` and browser stubs — no runner, no devDependency, and
+      # src-tauri/src/streamer/static/ stays byte-identical.
+      - name: client page harnesses
+        run: pnpm test:client
 
       # bindings.ts is written by whichever debug binary last ran with no CLI arguments, and
       # it carries `// @ts-nocheck`, so a stale binary can revert the whole TS API surface

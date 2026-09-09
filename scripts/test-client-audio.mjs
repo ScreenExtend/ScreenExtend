@@ -144,7 +144,85 @@ else {
   eq('redundant copies discarded', sync.redundantDiscarded, 1);
 }
 
-// 7. A truncated redundant body is refused rather than half-parsed.
+// 7. The sequence gate, over the shipped implementation.
+//
+//    These five cases used to live in `src-tauri/src/streamer/audio/tests.rs` against a
+//    `SeqGate` struct defined in that test file and used nowhere else — and the copy had
+//    already drifted from the real gate at one value (`0x7FFF_FFFF`). The host is the producer
+//    and never dedups, so the only sequence gate in the product is the one below.
+// A fresh module scope per case, because `lastSeq` persists across messages by design.
+function freshWorker() {
+  const local = { decoded: [], posted: [] };
+  const c = {
+    console: { log() {}, warn() {}, error() {} },
+    performance: { now: () => clock, timeOrigin: 1_700_000_000_000 },
+    AudioDecoder: class {
+      constructor(init) { this.init = init; this.state = 'unconfigured'; }
+      configure() { this.state = 'configured'; }
+      decode(chunk) { local.decoded.push(chunk.timestamp); this.init.output(new FakeAudioData(chunk.timestamp)); }
+      close() { this.state = 'closed'; }
+    },
+    EncodedAudioChunk: class { constructor(o) { Object.assign(this, o); } },
+    ArrayBuffer, Float32Array, Uint8Array, DataView, Math,
+    postMessage(m) { local.posted.push(m); },
+  };
+  c.self = c;
+  vm.createContext(c);
+  vm.runInContext(src, c, { filename: 'audio-worker.js' });
+  c.onmessage({ data: { type: 'init', sab: null, capFrames: 65536 } });
+  local.send = (seq) => c.onmessage({ data: packet(seq, capture(seq), 0, body(seq & 0xff)) });
+  return local;
+}
+
+{
+  const w = freshWorker();
+  for (let s = 0; s < 10; s++) w.send(s);
+  eq('an in-order run is accepted whole', w.decoded.length, 10);
+}
+{
+  const w = freshWorker();
+  w.send(5);
+  w.send(5);
+  eq('a duplicate seq decodes once', w.decoded.length, 1);
+}
+{
+  const w = freshWorker();
+  w.send(10); w.send(11); w.send(9); w.send(12);
+  eq('a packet older than the last played is dropped', w.decoded.length, 3);
+}
+{
+  // A gap is not a stall: 8 is newer than 5, so it plays. Concealment covers 6 and 7.
+  const w = freshWorker();
+  w.send(5); w.send(8);
+  if (w.decoded.length >= 2) ok('a forward gap does not stall the gate');
+  else fail('a forward reorder gap stalled: ' + w.decoded.length + ' decodes');
+}
+{
+  // u32 wraparound. The cutoff is `>= 0x80000000` on the unsigned difference, so 0 after
+  // 0xFFFFFFFF is newer and 0xFFFFFFFF after 1 is late. This is the exact value the deleted
+  // Rust mirror disagreed on.
+  const w = freshWorker();
+  w.send(0xFFFFFFFE); w.send(0xFFFFFFFF); w.send(0); w.send(1);
+  const afterWrap = w.decoded.length;
+  w.send(0xFFFFFFFF);
+  eq('wraparound to 0 is newer, and the pre-wrap seq is then late', w.decoded.length, afterWrap);
+  if (afterWrap >= 4) ok('all four packets across the wrap were accepted');
+  else fail('only ' + afterWrap + ' packets survived the wrap');
+}
+{
+  // The half-range boundary itself: a difference of exactly 0x7FFFFFFF is newer (the drifted
+  // Rust mirror called it late), and 0x80000000 is late.
+  const w = freshWorker();
+  w.send(0);
+  w.send(0x7FFFFFFF);
+  eq('a gap of exactly 0x7FFFFFFF is newer', w.decoded.length, 2);
+  const w2 = freshWorker();
+  w2.send(0);
+  w2.send(0x80000000);
+  eq('a gap of exactly 0x80000000 is late', w2.decoded.length, 1);
+}
+
+// 8. A truncated redundant body is refused rather than half-parsed.
 decoded.length = 0;
 const bad = new ArrayBuffer(HDR + 2 + 4);
 const bv = new DataView(bad);
