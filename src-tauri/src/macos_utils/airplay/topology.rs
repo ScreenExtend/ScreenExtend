@@ -572,7 +572,10 @@ mod tests {
     #[test]
     fn baseline_of_the_live_system_is_not_empty() {
         if !has_a_console_session() {
-            println!("no console session (ssh?); skipping");
+            crate::test_support::skip_because(
+                "airplay display baseline",
+                "CoreGraphics reports no displays outside a console session (ssh?)",
+            );
             return;
         }
         assert!(!baseline().0.is_empty());
@@ -593,12 +596,33 @@ mod tests {
     }
 
     #[test]
-    fn no_airplay_display_is_found_when_none_is_attached() {
-        // The built-in must never be returned here: it is what the host would
-        // otherwise start capturing and resizing.
-        if let Some(id) = find_airplay_display() {
-            assert!(!unsafe { CGDisplayIsBuiltin(id) });
-            assert!(is_airplay_display(id));
+    fn whatever_is_found_is_an_airplay_display_and_not_the_builtin() {
+        // The name used to promise "none is found when none is attached" and the
+        // body was an `if let` that ran no assertion in exactly that case — the
+        // one the name describes. Both halves are now stated: the search agrees
+        // with the predicate, and the built-in is never the answer, because the
+        // built-in is what the host would otherwise start capturing and resizing.
+        let found = find_airplay_display();
+        match found {
+            Some(id) => {
+                assert!(
+                    !unsafe { CGDisplayIsBuiltin(id) },
+                    "the built-in display was returned as an AirPlay receiver"
+                );
+                assert!(is_airplay_display(id));
+            }
+            None => {
+                // Nothing was found, so nothing on this machine may satisfy the
+                // predicate either. That is the assertion the old name promised.
+                let matching: Vec<_> = active_displays()
+                    .into_iter()
+                    .filter(|id| is_airplay_display(*id))
+                    .collect();
+                assert!(
+                    matching.is_empty(),
+                    "find_airplay_display() returned None while {matching:?} match is_airplay_display()"
+                );
+            }
         }
     }
 

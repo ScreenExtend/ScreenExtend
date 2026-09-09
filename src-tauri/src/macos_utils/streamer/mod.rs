@@ -154,6 +154,31 @@ pub fn probe_screen_recording() -> bool {
     cgds::probe_screen_recording()
 }
 
+/// One rung of the capture fallback ladder.
+///
+/// Named separately from the backends themselves because a rung is a *choice*, not a started
+/// stream: `capture_ladder` can be asserted on a machine where neither API exists, which is the
+/// only way the 12.3+ branch gets any coverage on the 10.15 dev box. The same split makes the
+/// audio tiering testable (`macos_utils::audio::rank_backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRung {
+    ScreenCaptureKit,
+    CgDisplayStream,
+}
+
+/// The backends [`start_capture`] tries, in order, given what the class lookup answered.
+///
+/// CGDisplayStream is always last and always present: it is deprecated and obsoleted in the
+/// macOS 15 SDK, and it is also the only capture API that exists on the 10.15 floor, so it is
+/// the rung that must never be removed however old the alternative gets.
+pub fn capture_ladder(sck_available: bool) -> &'static [CaptureRung] {
+    if sck_available {
+        &[CaptureRung::ScreenCaptureKit, CaptureRung::CgDisplayStream]
+    } else {
+        &[CaptureRung::CgDisplayStream]
+    }
+}
+
 pub fn start_capture(
     display: DisplayId,
     gpu: Arc<Gpu>,
@@ -161,20 +186,21 @@ pub fn start_capture(
     cfg: CaptureConfig,
     telemetry: SharedTelemetry,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
-    let sck_err = if screencapturekit_available() {
-        match start_sck(display, gpu.clone(), sink.clone(), cfg, telemetry.clone()) {
-            Ok(backend) => return Ok(backend),
-            Err(e) => {
-                teprintln!(
-                    "[capture] ScreenCaptureKit failed to start for display {display}: {e}; \
+    let sck_err =
+        if capture_ladder(screencapturekit_available()).contains(&CaptureRung::ScreenCaptureKit) {
+            match start_sck(display, gpu.clone(), sink.clone(), cfg, telemetry.clone()) {
+                Ok(backend) => return Ok(backend),
+                Err(e) => {
+                    teprintln!(
+                        "[capture] ScreenCaptureKit failed to start for display {display}: {e}; \
                      falling back to CGDisplayStream"
-                );
-                Some(e)
+                    );
+                    Some(e)
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     match start_cgds(display, gpu, sink, cfg, telemetry) {
         Ok(backend) => Ok(backend),
@@ -226,4 +252,64 @@ fn start_cgds(
     let mut b = cgds::CgDisplayStreamBackend::new(display, gpu, sink, cfg, telemetry)?;
     b.start()?;
     Ok(Box::new(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The capture ladder, on any Mac. `start_capture` itself needs a display, a Metal device and
+    // a Screen Recording grant, so nothing about the *decision* it makes was ever asserted —
+    // including on the 10.15 dev box, where the branch that matters most (12.3+ has SCK) cannot
+    // be reached at all.
+
+    #[test]
+    fn cgdisplaystream_is_always_the_last_rung() {
+        // It is deprecated, obsoleted in the macOS 15 SDK, and the only capture API that exists
+        // on the 10.15 floor. Whatever else is available, it is what has to be behind it.
+        for sck in [false, true] {
+            let ladder = capture_ladder(sck);
+            assert_eq!(
+                ladder.last(),
+                Some(&CaptureRung::CgDisplayStream),
+                "sck={sck}: something must be behind ScreenCaptureKit"
+            );
+            assert!(!ladder.is_empty());
+        }
+    }
+
+    #[test]
+    fn screencapturekit_leads_only_where_its_classes_exist() {
+        assert_eq!(
+            capture_ladder(true),
+            &[CaptureRung::ScreenCaptureKit, CaptureRung::CgDisplayStream]
+        );
+        // On the 10.15 floor there is no SCK to try, and reaching for it would be a class
+        // lookup that fails rather than a fallback that works.
+        assert_eq!(capture_ladder(false), &[CaptureRung::CgDisplayStream]);
+    }
+
+    #[test]
+    fn no_ladder_tries_the_same_backend_twice() {
+        for sck in [false, true] {
+            let ladder = capture_ladder(sck);
+            for (i, rung) in ladder.iter().enumerate() {
+                assert!(
+                    !ladder[i + 1..].contains(rung),
+                    "sck={sck} tries {rung:?} twice: {ladder:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn this_machine_agrees_with_its_own_probe() {
+        // Ties the table above to the live class lookup, so it cannot describe a function
+        // nothing calls. Prints rather than asserts which rung leads: that is a property of the
+        // machine, not of the code.
+        let available = screencapturekit_available();
+        let ladder = capture_ladder(available);
+        assert_eq!(ladder.contains(&CaptureRung::ScreenCaptureKit), available);
+        println!("ScreenCaptureKit available: {available}; ladder {ladder:?}");
+    }
 }
