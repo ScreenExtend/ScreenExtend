@@ -707,9 +707,7 @@ fn dismiss_plan(cancel_accepted: bool, still_open: bool) -> DismissPlan {
 
 fn close_menu(extra: &Extra) {
     let menus = children(extra.element.0);
-    let cancel_accepted = menus
-        .iter()
-        .any(|child| perform(child, "AXCancel").is_ok());
+    let cancel_accepted = menus.iter().any(|child| perform(child, "AXCancel").is_ok());
     let still_open = !cancel_accepted && !read_menu(extra).items.is_empty();
     match dismiss_plan(cancel_accepted, still_open) {
         DismissPlan::Cancel | DismissPlan::AlreadyClosed => {}
@@ -1081,8 +1079,16 @@ mod tests {
                 None
             }
         });
-        assert_eq!(found, Some("Living Room TV"), "a late row must still be found");
-        assert!(looks.get() >= 4, "the menu was read {} time(s)", looks.get());
+        assert_eq!(
+            found,
+            Some("Living Room TV"),
+            "a late row must still be found"
+        );
+        assert!(
+            looks.get() >= 4,
+            "the menu was read {} time(s)",
+            looks.get()
+        );
     }
 
     #[test]
