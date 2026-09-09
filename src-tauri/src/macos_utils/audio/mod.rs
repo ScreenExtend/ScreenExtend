@@ -452,10 +452,15 @@ fn worker(
                 && start_instant.elapsed() >= Duration::from_secs(5)
                 && backend.nonsilent_samples() == 0
             {
+                // The classic cause — an aggregate device whose tap-list UID does not match the
+                // `CATapDescription` UUID, which makes the tap return `noErr` and pure silence —
+                // cannot happen here: `process_tap.rs` builds the sub-tap dictionary from the
+                // description's own `UUIDString`. What is left for the user to check is consent
+                // and exclusivity.
                 crate::teprintln!(
                     "audio: {} has produced only silence for 5s — if the host IS playing audio, \
-                     this is the CATapDescription silent-samples failure mode \
-                     (see AUDIO_NOTES_MACOS.md §4.1)",
+                     check Screen Recording / audio permissions and whether another process \
+                     holds an exclusive tap on the output device",
                     backend.backend_name()
                 );
                 warned_silent = true;

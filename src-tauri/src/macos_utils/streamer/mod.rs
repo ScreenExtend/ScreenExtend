@@ -26,10 +26,6 @@ use crate::streamer::telemetry::SharedTelemetry;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
-    #[error("no Metal device available")]
-    NoMetalDevice,
-    #[error("failed to create CVMetalTextureCache (CVReturn {0})")]
-    TextureCache(i32),
     #[error("could not fetch SCShareableContent")]
     ShareableContent,
     #[error("target display not found")]
@@ -40,8 +36,6 @@ pub enum CaptureError {
     StartFailed,
     #[error("Screen Recording permission not granted (TCC)")]
     PermissionDenied,
-    #[error("{0} not yet implemented (M1/M2): see PRD {1}")]
-    NotImplemented(&'static str, &'static str),
     #[error("ScreenCaptureKit failed ({sck}); CGDisplayStream fallback also failed: {cgds}")]
     FallbackFailed { sck: String, cgds: String },
 }

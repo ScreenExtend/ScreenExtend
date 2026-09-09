@@ -37,10 +37,6 @@ const KNOWN_DEBT = {
   "Error cause": [
     { file: "monaco-setup", max: 1, why: "monaco's worker-post failure path; an unknown options bag is ignored, the Error still constructs" },
   ],
-  "inset shorthand": [
-    { file: "index.html", max: 1, why: "client page, pre-existing; see findings/minor-client-inset-shorthand-above-the-mobile-floor.md" },
-    { file: "styles.css", max: 5, why: "client page, pre-existing; see findings/minor-client-inset-shorthand-above-the-mobile-floor.md" },
-  ],
 };
 
 const JS_CHECKS = [
