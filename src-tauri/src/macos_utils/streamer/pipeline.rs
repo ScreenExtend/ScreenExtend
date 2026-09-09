@@ -676,6 +676,7 @@ pub fn probe_bitrate(cfg: &Config) -> Result<()> {
         min_qp: cfg.quality_qp,
         intra_refresh: cfg.intra_refresh,
         gpu_registry_id: None,
+        software_encode: cfg.disable_gpu_encode,
     };
     let mut encoder = Encoder::new(enc).context("creating VideoToolbox encoder")?;
     let out = encoder.output();
@@ -972,6 +973,7 @@ mod tests {
             min_qp: None,
             intra_refresh: false,
             gpu_registry_id: display::metal_registry_id(display),
+            software_encode: false,
         }
     }
 

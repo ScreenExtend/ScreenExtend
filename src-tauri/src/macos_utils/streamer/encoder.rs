@@ -134,6 +134,9 @@ pub struct Encoder {
     qp_mode: bool,
     identity: EncoderIdentity,
     supports_ltr: bool,
+    /// Whether *this* session is on software because the user asked, which is the difference
+    /// between an expected outcome and the loud warning below it.
+    software_requested: bool,
 }
 
 unsafe impl Send for Encoder {}
@@ -157,13 +160,32 @@ impl Encoder {
         // The rungs, best first. There is no version gate on the low-latency rung any more: the
         // ladder already falls through when `EnableLowLatencyRateControl` is not honoured, and a
         // `sw_vers` fork was a slower, less accurate way of learning the same thing.
-        let specs: [(bool, bool); 3] = [(true, true), (false, true), (false, false)];
+        //
+        // When the user has asked for software encode there is no ladder: one rung that forbids
+        // the hardware encoder outright. Falling back to hardware here would be the setting
+        // silently refusing to do the one thing it says on the tin, so a failure to create that
+        // session is reported as a failure rather than worked around.
+        let ladder: &[(bool, HwPolicy)] = if cfg.software_encode {
+            &[(false, HwPolicy::Forbid)]
+        } else {
+            &[
+                (true, HwPolicy::Require),
+                (false, HwPolicy::Require),
+                (false, HwPolicy::Enable),
+            ]
+        };
+        if cfg.software_encode {
+            tprintln!(
+                "[vt] software encode was requested, so this session forbids the hardware \
+                 encoder (EnableHardwareAcceleratedVideoEncoder=false)"
+            );
+        }
 
         let mut session = None;
         let mut low_latency = false;
         let mut last_status = 0;
-        for (ll, require_hw) in specs {
-            let Some(spec) = build_encoder_spec(ll, require_hw, cfg.gpu_registry_id) else {
+        for &(ll, hw) in ladder {
+            let Some(spec) = build_encoder_spec(ll, hw, cfg.gpu_registry_id) else {
                 continue;
             };
             match create_session(&cfg, &spec, refcon) {
@@ -174,7 +196,7 @@ impl Encoder {
                 }
                 Err(status) => {
                     last_status = status;
-                    if require_hw {
+                    if hw == HwPolicy::Require {
                         teprintln!(
                             "[vt] HW encoder unavailable for {}x{} (low_latency={ll}, \
                              OSStatus {status}); trying a weaker encoder spec",
@@ -203,6 +225,7 @@ impl Encoder {
             qp_mode: cfg.qp.is_some(),
             identity: EncoderIdentity::default(),
             supports_ltr: false,
+            software_requested: cfg.software_encode,
         };
         enc.configure(&cfg)?;
         unsafe { enc.session.prepare_to_encode_frames() };
@@ -556,12 +579,19 @@ impl Encoder {
             }
         );
         if self.identity.hardware == Some(false) {
-            teprintln!(
-                "[vt] this session is on the SOFTWARE H.264 encoder. Expect higher latency and \
-                 CPU. The usual causes are an encode size below this Mac's hardware minimum \
-                 (~640x480 on Intel) and another application already holding the hardware \
-                 encoder; both are machine-wide, not specific to this device."
-            );
+            if self.software_requested {
+                tprintln!(
+                    "[vt] this session is on the software H.264 encoder because software encode \
+                     is switched on. Expect higher latency and CPU; that is the setting working."
+                );
+            } else {
+                teprintln!(
+                    "[vt] this session is on the SOFTWARE H.264 encoder. Expect higher latency \
+                     and CPU. The usual causes are an encode size below this Mac's hardware \
+                     minimum (~640x480 on Intel) and another application already holding the \
+                     hardware encoder; both are machine-wide, not specific to this device."
+                );
+            }
         }
     }
 
@@ -709,7 +739,7 @@ fn supported_properties(cfg: &EncoderConfig) -> HashSet<String> {
         return set;
     };
     let f: CopySupportedFn = unsafe { std::mem::transmute(sym) };
-    let spec = build_encoder_spec(false, false, cfg.gpu_registry_id);
+    let spec = build_encoder_spec(false, HwPolicy::Enable, cfg.gpu_registry_id);
     let mut id_out: *const CFString = ptr::null();
     let mut props_out: *const CFDictionary = ptr::null();
     let st = unsafe {
@@ -982,12 +1012,28 @@ fn sample_to_annexb_into(sample: &CMSampleBuffer, out: &mut Vec<u8>) -> bool {
     is_keyframe
 }
 
+/// What the session specification should say about the hardware encoder.
+///
+/// Three states, not two, because "prefer hardware" and "refuse hardware" are different requests
+/// and VideoToolbox spells them with different keys. The middle rung exists so a machine whose
+/// hardware encoder is busy still gets a session; the last one exists because the user asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HwPolicy {
+    /// `RequireHardwareAcceleratedVideoEncoder` - fail the create rather than land quietly on
+    /// software. This is what makes the fallback a logged decision instead of an invisible one.
+    Require,
+    /// `EnableHardwareAcceleratedVideoEncoder = true` - take hardware if any is free.
+    Enable,
+    /// `EnableHardwareAcceleratedVideoEncoder = false` - the user asked for software encode.
+    Forbid,
+}
+
 fn build_encoder_spec(
     low_latency: bool,
-    require_hw: bool,
+    hw: HwPolicy,
     gpu_registry_id: Option<u64>,
 ) -> Option<CFRetained<CFDictionary>> {
-    let hw_key = if require_hw {
+    let hw_key = if hw == HwPolicy::Require {
         unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder }
     } else {
         unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder }
@@ -1000,7 +1046,7 @@ fn build_encoder_spec(
     let gpu_num = gpu_registry_id.map(|id| CFNumber::new_i64(id as i64));
 
     let mut pairs: Vec<(&CFString, &CFType)> = Vec::with_capacity(3);
-    pairs.push((hw_key, cfbool(true)));
+    pairs.push((hw_key, cfbool(hw != HwPolicy::Forbid)));
     if low_latency {
         pairs.push((&ll_key, cfbool(true)));
     }
@@ -1432,6 +1478,7 @@ mod tests {
             min_qp: None,
             intra_refresh: false,
             gpu_registry_id: None,
+            software_encode: false,
         }
     }
 
@@ -1599,7 +1646,7 @@ mod tests {
             emitted: Arc::new(AtomicU64::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
         }));
-        let spec = build_encoder_spec(false, true, None).expect("encoder spec");
+        let spec = build_encoder_spec(false, HwPolicy::Require, None).expect("encoder spec");
         let r = create_session(&cfg_at(w, h), &spec, refcon);
         let out = match r {
             Ok(s) => {
