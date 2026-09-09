@@ -10,7 +10,7 @@
 //! The only hook webrtc-rs offers is `SettingEngine::set_udp_network(UDPNetwork::Muxed(..))`,
 //! which accepts any `Conn` — and `impl Conn for tokio::net::UdpSocket` exists, so a socket
 //! configured here can become the ICE transport. It has a hard cost:
-//! `agent_gather.rs:117-120` skips server-reflexive gathering entirely in muxed mode
+//! `webrtc-ice`'s `agent_gather.rs:117-120` skips server-reflexive gathering entirely in muxed mode
 //! (`UDPNetwork::Muxed(_) => continue`). Relay gathering is unaffected, and a same-subnet peer is
 //! already offered no STUN server at all, so this is used **only** on a session classified
 //! `SameNetwork` — where srflx candidates were never going to be gathered anyway.

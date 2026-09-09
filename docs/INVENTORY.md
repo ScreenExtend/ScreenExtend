@@ -4,6 +4,12 @@ Synthesized from the seventeen discovery reports in `docs/discovery/` (A–O, E1
 lines), with spot-checks against the working tree at `bef5f89`. Where a report and `CLAUDE.md`
 disagree, the code wins and the disagreement is recorded at the end.
 
+> **This is a snapshot of the tree at `bef5f89`, not a live document.** Much of what it records as
+> a problem has since been fixed — CI exists, the log bus is off-thread, the per-adapter runtimes
+> are one shared runtime, the audio bridge thread is gone, telemetry and a clock offset exist, and
+> the macOS audio driver has run end to end. Read a row as "what was true when the audit ran", and
+> check the code before acting on it. `docs/OPTIMIZATIONS.md` is the live record of what changed.
+
 **230 components, `C-001` to `C-230`.** The prior pass listed ~99; this pass confirms most of
 them, corrects 25, and adds the rest — chiefly the things that are structurally load-bearing but
 were invisible from a feature-shaped reading of the product: the log-bus IPC emission, the two
@@ -29,13 +35,13 @@ hybrid graphics; macOS 10.15.8 Catalina Intel, Command Line Tools only):
 - `COMPILE-CHECKED` — builds and/or passes a static/layout test, never executed here.
 - `UNVERIFIED` — no local signal at all (modern-macOS tiers, AMD, Linux, AirPlay in production).
 
-**Known problems** cites `findings/*.md` by filename. Those filenames are being consolidated and
-re-prefixed by concurrent work (the directory grew from 386 to 424 files and gained an
-`_out-of-scope/` subdirectory while this document was being written), so a citation may have
-moved. All 269 distinct references here resolved against `findings/` at the time of writing;
-about twenty findings that the reports cited have since been merged into others and their names
-were dropped rather than guessed at. **The prose in the cell is authoritative; the filename is a
-pointer.**
+**Known problems** cites `findings/*.md` by filename. `findings/` is the engagement's working
+queue: it is excluded from git, a file is deleted the moment its finding is resolved, and the
+whole directory goes away when the engagement ends. So **the prose in the cell is authoritative;
+the filename is a pointer, and most of those pointers no longer resolve.** The fix for a
+resolved finding is recorded in `docs/OPTIMIZATIONS.md`, not here. (At the time of writing all
+269 distinct references resolved; the directory was also being consolidated concurrently, so some
+were already stale then.)
 
 Nothing in this inventory has been **measured**. `docs/BASELINE.md` is empty by design: no
 before-numbers exist yet, and the history contains none either (report O §7.1 — ten commits are
