@@ -155,7 +155,10 @@ pub fn check_system_requirements() -> CompatibilityReport {
         audio_backend: audio_backend.as_str().to_string(),
         display_backend: display_backend.as_str().to_string(),
         capture_backend: capture_backend().to_string(),
-        encoder_backend: "VideoToolbox".to_string(),
+        // Which VideoToolbox encoder, not just "VideoToolbox": `VTCopyVideoEncoderList` says
+        // whether this Mac has a hardware H.264 encoder at all, and the report is the one place
+        // a user can see that answer without reading the log.
+        encoder_backend: super::streamer::encoder::probe_encoder_backend().to_string(),
         hosted_network_backend: hostap_backend.as_str().to_string(),
         input_backend: input_backend.as_str().to_string(),
     }
