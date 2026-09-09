@@ -2213,7 +2213,11 @@ describe it; `src-tauri/src/cli.rs`, `tauri.conf.json`, `windows_utils/streamer/
 `windows_utils/streamer/pipeline.rs`, `windows_utils/compatibility.rs`, every `test/` directory
 and `docs/manual-tests/amd-amf.md` are excluded while W4b and W15 land. A delta pass over exactly
 those paths is owed: the `cli.rs` citation above, the `serve --encoder` line in the CLI section,
-the AMD status once it is measured, and the `guides/` pointer.
+the AMD status once it is measured, and the `guides/` pointer. One code finding tagged to this
+workstream is blocked the same way: `compatibility.rs::wgc_supported()` drops the
+`UniversalApiContract` conjunct that `GraphicsCaptureApi::is_supported()` still ANDs in, so on a
+build where the contract gate binds the compatibility report claims WGC while the capture path
+refuses it. The fix is one shared predicate across the two files, and one of them is excluded.
 
 **Anchoring what could still be lost.** Three objects held content that existed in no reachable
 commit, so any `git gc` would have deleted them with no remote copy and no error. Their content is
