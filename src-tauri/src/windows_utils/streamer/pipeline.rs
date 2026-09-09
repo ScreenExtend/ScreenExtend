@@ -240,7 +240,6 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
         let frame_duration = Duration::from_nanos(1_000_000_000 / SP_FPS as u64);
         let (wake, wake_rx) = crossbeam_channel::bounded::<()>(1);
         telemetry.capture_backend.set("synthetic".into());
-        telemetry.encoder.set("nvenc".into());
         let pipeline = Pipeline {
             tx: tx.clone(),
             frame_duration,
@@ -265,8 +264,9 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
             min_qp: cfg.quality_qp,
             intra_refresh: cfg.intra_refresh,
         };
+        let vendor = effective_vendor(cfg);
         std::thread::Builder::new()
-            .name("nvenc-encode".to_string())
+            .name("synthetic-encode".to_string())
             .spawn(move || {
                 synthetic_pattern_loop(
                     tx,
@@ -274,6 +274,7 @@ pub fn start(cfg: &Config) -> Result<Pipeline> {
                     repair,
                     target_bitrate,
                     enc,
+                    vendor,
                     wake_rx,
                     telemetry,
                     workload,
@@ -1660,7 +1661,7 @@ impl EncodeCore {
 
 struct LiveCapture {
     core: Option<Arc<Mutex<EncodeCore>>>,
-    ring: Option<AsyncNvencRing>,
+    ring: Option<AsyncEncodeRing>,
     tx: broadcast::Sender<EncodedFrame>,
     epoch: Instant,
     last_frame_at: Arc<AtomicU64>,
@@ -1742,6 +1743,41 @@ fn build_zero_copy_ring(
     Ok((encoder, pairs))
 }
 
+/// The AMD half of the async ring.
+///
+/// Nothing is shared and nothing is opened: the encoder builds its input textures on the
+/// **capture** device, which is what makes `CreateSurfaceFromDX11Native` a pointer wrap rather
+/// than a hidden cross-device copy, so the ring just borrows them. That is also why there is no
+/// keyed mutex — the free/ready channels are the whole ownership protocol.
+///
+/// `MAX_LTR_FRAMES_SUPPORTED` long-term references are requested here and nowhere else: this is
+/// the only path that drives `streamer::repair::RepairState`, and AMF turns off the rolling
+/// intra-refresh `USAGE = ULTRA_LOW_LATENCY` gives away for free as soon as the client controls
+/// LTR. The encoder clamps the request to what the adapter reports and reads back what AMF
+/// granted, so `ltr_slots()` is the truth and may still be 0.
+fn build_amf_ring(
+    config: EncoderConfig,
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    ring: usize,
+) -> Result<(AmfEncoder, Vec<ID3D11Texture2D>)> {
+    let encoder = AmfEncoder::new_on_device_with_ltr(
+        config,
+        device,
+        context,
+        super::amd::encoder::MAX_LTR_FRAMES_SUPPORTED,
+        ring,
+    )?;
+    let textures = encoder.ring_textures();
+    if textures.len() != ring {
+        bail!(
+            "AMF ring encoder produced {} textures, expected {ring}",
+            textures.len()
+        );
+    }
+    Ok((encoder, textures))
+}
+
 struct ReadyMsg {
     slot: usize,
     force_idr: bool,
@@ -1772,9 +1808,146 @@ impl PoisonedSlots {
     }
 }
 
-struct AsyncNvencRing {
-    shared_igpu: Vec<ID3D11Texture2D>,
-    igpu_mutex: Vec<IDXGIKeyedMutex>,
+/// The encoder half of the async ring.
+///
+/// Two engines, one protocol. NVENC's ring textures are **shared** across adapters and reached
+/// through a keyed mutex, because its encoder lives on the dGPU while capture happens on the
+/// iGPU. AMF's live on the capture device itself — same-adapter is the normal AMD shape — so
+/// there is no handle to open and no mutex to hold, and slot ownership is entirely the ring's
+/// free/ready channels'. Everything downstream of the submit is identical, which is the point:
+/// the encode thread, the keepalive, the bitrate driver and the `RepairState` protocol are
+/// written once.
+// One of these exists per session and is moved once, into the encode thread. Boxing would buy
+// nothing and would put an indirection on the per-frame submit; `Backend` is allowed for the
+// same reason.
+#[allow(clippy::large_enum_variant)]
+enum RingEncoder {
+    Nvenc(Encoder),
+    Amf(AmfEncoder),
+}
+
+impl RingEncoder {
+    fn name(&self) -> &'static str {
+        match self {
+            RingEncoder::Nvenc(_) => "nvenc-zero-copy-ring",
+            RingEncoder::Amf(_) => "amd-amf-ring",
+        }
+    }
+
+    fn device(&self) -> &ID3D11Device {
+        match self {
+            RingEncoder::Nvenc(e) => e.device(),
+            RingEncoder::Amf(e) => e.device(),
+        }
+    }
+
+    fn attach_idr_flag(&mut self, flag: Arc<AtomicBool>) {
+        match self {
+            RingEncoder::Nvenc(e) => e.attach_idr_flag(flag),
+            RingEncoder::Amf(e) => e.attach_idr_flag(flag),
+        }
+    }
+
+    fn request_idr(&mut self) {
+        match self {
+            RingEncoder::Nvenc(e) => e.request_idr(),
+            RingEncoder::Amf(e) => e.request_idr(),
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) -> Result<BitrateApplied> {
+        match self {
+            RingEncoder::Nvenc(e) => e.set_bitrate(bps),
+            RingEncoder::Amf(e) => e.set_bitrate(bps),
+        }
+    }
+
+    fn ltr_slots(&self) -> u32 {
+        match self {
+            RingEncoder::Nvenc(e) => e.ltr_slots(),
+            RingEncoder::Amf(e) => e.ltr_slots(),
+        }
+    }
+
+    fn next_frame_index(&self) -> u64 {
+        match self {
+            RingEncoder::Nvenc(e) => e.next_frame_index(),
+            RingEncoder::Amf(e) => e.next_frame_index(),
+        }
+    }
+
+    fn mark_ltr(&mut self) -> Option<u32> {
+        match self {
+            RingEncoder::Nvenc(e) => e.mark_ltr(),
+            RingEncoder::Amf(e) => e.mark_ltr(),
+        }
+    }
+
+    fn use_ltr(&mut self, bitmap: u32) -> bool {
+        match self {
+            RingEncoder::Nvenc(e) => e.use_ltr(bitmap),
+            RingEncoder::Amf(e) => e.use_ltr(bitmap),
+        }
+    }
+
+    /// Drop a frame the client never received from the reference set.
+    ///
+    /// AMF has no `nvEncInvalidateRefFrames` analogue: it *disallows* long-term references
+    /// outside the forced bitfield from current and future prediction, which reaches a similar
+    /// end by a different mechanism, so the explicit invalidation is `Unsupported` there.
+    /// `ring_encode_thread` reads that as "stop the transport asking", which is correct — on AMF
+    /// the repair is the forced bitfield, not the invalidation.
+    fn invalidate_reference(&mut self, frame_index: u64) -> RefInvalidation {
+        match self {
+            RingEncoder::Nvenc(e) => e.invalidate_reference(frame_index),
+            RingEncoder::Amf(_) => RefInvalidation::Unsupported,
+        }
+    }
+
+    fn encode_slot(&mut self, slot: usize, force_idr: bool) -> Result<Vec<u8>, SlotEncodeError> {
+        match self {
+            RingEncoder::Nvenc(e) => e.encode_input_slot(slot, force_idr),
+            // No keyed mutex to wedge, so an AMF slot can never be poisoned.
+            RingEncoder::Amf(e) => e
+                .encode_slot(slot, force_idr)
+                .map_err(SlotEncodeError::Encode),
+        }
+    }
+
+    fn encode_repeat_slot(&mut self, slot: usize) -> Result<Vec<u8>> {
+        match self {
+            RingEncoder::Nvenc(e) => e.encode_repeat_slot(slot),
+            RingEncoder::Amf(e) => e.encode_repeat_slot(slot),
+        }
+    }
+}
+
+/// The staging half of the async ring: where the capture callback puts each frame.
+enum RingTextures {
+    /// NVENC. Cross-adapter shared textures, each guarded by a keyed mutex the encode thread
+    /// takes at `KEY_ENCODER` and gives back at `KEY_WRITER`.
+    Shared {
+        textures: Vec<ID3D11Texture2D>,
+        mutexes: Vec<IDXGIKeyedMutex>,
+    },
+    /// AMF. The encoder's own textures, on the capture device. One `CopyResource` (or
+    /// `VideoProcessorBlt`) and the `Flush` AMD's own fix for AMF issue #92 calls for; the
+    /// free/ready channels are the only thing that says who owns a slot.
+    Local { textures: Vec<ID3D11Texture2D> },
+}
+
+impl RingTextures {
+    fn len(&self) -> usize {
+        match self {
+            RingTextures::Shared { textures, .. } | RingTextures::Local { textures } => {
+                textures.len()
+            }
+        }
+    }
+}
+
+struct AsyncEncodeRing {
+    textures: RingTextures,
     igpu_context: ID3D11DeviceContext,
     scaler: Option<Scaler>,
     free_slots: crossbeam_channel::Sender<usize>,
@@ -1794,11 +1967,11 @@ struct AsyncNvencRing {
     telemetry: SharedTelemetry,
 }
 
-impl AsyncNvencRing {
+impl AsyncEncodeRing {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        encoder: Encoder,
-        pairs: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+        encoder: RingEncoder,
+        textures: RingTextures,
         igpu_context: ID3D11DeviceContext,
         scaler: Option<Scaler>,
         tx: broadcast::Sender<EncodedFrame>,
@@ -1812,13 +1985,13 @@ impl AsyncNvencRing {
         epoch: Instant,
         telemetry: SharedTelemetry,
     ) -> Self {
-        let k = pairs.len();
+        let k = textures.len();
         // The keepalive path re-encodes the held slot without going through `stage()`, which is
         // where `idr_request` is otherwise consumed. Hand the encoder the same atomic so a PLI
         // on a static desktop produces an IDR rather than another P frame.
         let mut encoder = encoder;
         encoder.attach_idr_flag(Arc::clone(&idr_request));
-        let (shared_igpu, igpu_mutex): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let thread_name = format!("{}-encode", encoder.name());
 
         let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded::<ReadyMsg>(k);
@@ -1846,9 +2019,9 @@ impl AsyncNvencRing {
                 telemetry: Arc::clone(&telemetry),
             };
             std::thread::Builder::new()
-                .name("nvenc-ring-encode".to_string())
+                .name(thread_name)
                 .spawn(move || ring_encode_thread(args))
-                .expect("spawn nvenc ring encode thread")
+                .expect("spawn ring encode thread")
         };
 
         // A capture-side acquire only ever waits for a slot the encoder has already released, so
@@ -1860,8 +2033,7 @@ impl AsyncNvencRing {
             .clamp(5, 50);
 
         Self {
-            shared_igpu,
-            igpu_mutex,
+            textures,
             igpu_context,
             scaler,
             free_slots: free_tx,
@@ -1921,42 +2093,70 @@ impl AsyncNvencRing {
             return Ok(false);
         };
 
-        let mutex = &self.igpu_mutex[slot];
-        let dst = &self.shared_igpu[slot];
+        match &self.textures {
+            RingTextures::Shared { textures, mutexes } => {
+                let mutex = &mutexes[slot];
+                let dst = &textures[slot];
 
-        if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, self.stage_timeout_ms) }
-            .context("ring iGPU keyed mutex AcquireSync(writer)")
-        {
-            // Nobody released it within two frame periods; treat the slot as wedged rather than
-            // handing it back for the next frame to block on all over again.
-            self.poisoned.mark(slot);
-            self.note_drop();
-            return Err(e);
-        }
-
-        let staged = unsafe {
-            let r = match self.scaler.as_mut() {
-                Some(s) => s.scale_into(raw, dst),
-                None => {
-                    self.igpu_context.CopyResource(dst, raw);
-                    Ok(())
+                if let Err(e) = unsafe { mutex.AcquireSync(KEY_WRITER, self.stage_timeout_ms) }
+                    .context("ring iGPU keyed mutex AcquireSync(writer)")
+                {
+                    // Nobody released it within two frame periods; treat the slot as wedged
+                    // rather than handing it back for the next frame to block on all over again.
+                    self.poisoned.mark(slot);
+                    self.note_drop();
+                    return Err(e);
                 }
-            };
-            self.igpu_context.Flush();
-            r
-        };
-        let released = unsafe { mutex.ReleaseSync(KEY_ENCODER) };
 
-        if let Err(e) = staged {
-            teprintln!(
-                "ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle"
-            );
-        }
-        if let Err(e) = released {
-            // The slot is still held at `KEY_WRITER` by this device and the encoder will never
-            // get it. Returning it to the free pool would wedge the next capture callback.
-            self.poisoned.mark(slot);
-            return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
+                let staged = unsafe {
+                    let r = match self.scaler.as_mut() {
+                        Some(s) => s.scale_into(raw, dst),
+                        None => {
+                            self.igpu_context.CopyResource(dst, raw);
+                            Ok(())
+                        }
+                    };
+                    self.igpu_context.Flush();
+                    r
+                };
+                let released = unsafe { mutex.ReleaseSync(KEY_ENCODER) };
+
+                if let Err(e) = staged {
+                    teprintln!(
+                        "ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle"
+                    );
+                }
+                if let Err(e) = released {
+                    // The slot is still held at `KEY_WRITER` by this device and the encoder will
+                    // never get it. Returning it to the free pool would wedge the next capture
+                    // callback.
+                    self.poisoned.mark(slot);
+                    return Err(e).context("ring iGPU keyed mutex ReleaseSync(encoder)");
+                }
+            }
+            // Same-adapter: no shared handle, no keyed mutex, nothing that can wedge. The
+            // `Flush` stays — it is AMD's own fix for flicker plus *growing* latency on a
+            // Desktop-Duplication device (AMF issue #92), and removing it needs a measurement
+            // and a torn-frame soak, not a faster number.
+            RingTextures::Local { textures } => {
+                let dst = &textures[slot];
+                let staged = unsafe {
+                    let r = match self.scaler.as_mut() {
+                        Some(s) => s.scale_into(raw, dst),
+                        None => {
+                            self.igpu_context.CopyResource(dst, raw);
+                            Ok(())
+                        }
+                    };
+                    self.igpu_context.Flush();
+                    r
+                };
+                if let Err(e) = staged {
+                    teprintln!(
+                        "ring stage copy failed (slot={slot}): {e:?}; encoding stale slot to recycle"
+                    );
+                }
+            }
         }
 
         timing.mark_scale_done();
@@ -1991,14 +2191,14 @@ impl AsyncNvencRing {
     }
 }
 
-impl Drop for AsyncNvencRing {
+impl Drop for AsyncEncodeRing {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
 struct RingEncodeArgs {
-    encoder: Encoder,
+    encoder: RingEncoder,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
     tx: broadcast::Sender<EncodedFrame>,
@@ -2026,13 +2226,13 @@ enum RingEvent {
 
 /// A repeat of the held slot, emitted when the desktop is static.
 ///
-/// Two things make this the only place a keyframe request can land on an idle desktop: NVENC is
-/// configured with an infinite GOP and IDR period, so there is no periodic keyframe at all, and
-/// `AsyncNvencRing::stage` — the only other reader of `idr_request` — runs only when WGC delivers
-/// a new frame. Without this, a client that joined or lost its reference chain while nothing was
-/// moving waited for the user to move something.
+/// Two things make this the only place a keyframe request can land on an idle desktop: both ring
+/// encoders are configured with an infinite GOP and IDR period, so there is no periodic keyframe
+/// at all, and `AsyncEncodeRing::stage` — the only other reader of `idr_request` — runs only when
+/// WGC delivers a new frame. Without this, a client that joined or lost its reference chain while
+/// nothing was moving waited for the user to move something.
 fn ring_keepalive(
-    encoder: &mut Encoder,
+    encoder: &mut RingEncoder,
     slot: usize,
     force_idr: bool,
     tx: &broadcast::Sender<EncodedFrame>,
@@ -2042,6 +2242,9 @@ fn ring_keepalive(
         encoder.request_idr();
     }
     match encoder.encode_repeat_slot(slot) {
+        // An encoder that consumed the picture and produced no bytes dropped a frame; only the
+        // AMF backend can reach this. Sending it would packetize a payloadless access unit.
+        Ok(au) if au.is_empty() => {}
         Ok(au) => {
             let mut timing = FrameTiming::repeating();
             timing.mark_encode_submit();
@@ -2085,13 +2288,15 @@ fn ring_encode_thread(args: RingEncodeArgs) {
     } = args;
 
     let _thread_tuning = tuning::tune_current_thread();
+    let encoder_name = encoder.name();
     // Tell the transport what loss recovery is available here. Zero slots leaves
     // `RepairState::can_repair` false for the session, so the transport keeps asking for
     // keyframes exactly as it did before this existed.
     repair.set_ltr_slots(encoder.ltr_slots());
     if encoder.ltr_slots() > 0 {
         tprintln!(
-            "NVENC: {} long-term reference slot(s); a lost frame can be repaired without an IDR",
+            "{encoder_name}: {} long-term reference slot(s); a lost frame can be repaired \
+             without an IDR",
             encoder.ltr_slots()
         );
     }
@@ -2211,20 +2416,25 @@ fn ring_encode_thread(args: RingEncodeArgs) {
             }
         }
         let submitted_index = encoder.next_frame_index();
-        match encoder.encode_input_slot(msg.slot, msg.force_idr) {
+        match encoder.encode_slot(msg.slot, msg.force_idr) {
             Ok(au) => {
                 timing.mark_encode_done();
-                repair.note_encoded(
-                    crate::streamer::audio::host_instant_to_ns(msg.capture),
-                    submitted_index,
-                );
-                telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                let _ = tx.send(EncodedFrame {
-                    data: Bytes::from(au),
-                    capture: msg.capture,
-                    timing,
-                });
-                last_emit = Instant::now();
+                // A zero-length access unit is a dropped frame, not a frame to send — only the
+                // AMF backend can produce one. The slot is still recycled, and the frame is not
+                // recorded against a capture instant the transport could then acknowledge.
+                if !au.is_empty() {
+                    repair.note_encoded(
+                        crate::streamer::audio::host_instant_to_ns(msg.capture),
+                        submitted_index,
+                    );
+                    telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx.send(EncodedFrame {
+                        data: Bytes::from(au),
+                        capture: msg.capture,
+                        timing,
+                    });
+                    last_emit = Instant::now();
+                }
                 if !release_and_hold(&free_tx, &mut held_slot, msg.slot) {
                     break;
                 }
@@ -2261,11 +2471,11 @@ fn ring_encode_thread(args: RingEncodeArgs) {
             }
         }
     }
-    tprintln!("nvenc ring encode thread stopped");
+    tprintln!("{encoder_name} encode thread stopped");
 }
 
 fn apply_pending_bitrate_atomic(
-    encoder: &mut Encoder,
+    encoder: &mut RingEncoder,
     target_bitrate: &AtomicU32,
     current: &mut u32,
     warned: &mut bool,
@@ -2584,8 +2794,10 @@ fn spawn_repeater(
                         Err(_) => break,
                     };
                     match core.encode_repeat() {
-                        Ok(Some(au)) => au,
-                        Ok(None) => continue,
+                        // An empty access unit is a dropped frame, not a frame to send; see
+                        // `on_frame_arrived`.
+                        Ok(Some(au)) if !au.is_empty() => au,
+                        Ok(Some(_)) | Ok(None) => continue,
                         Err(e) => {
                             teprintln!("idle repeat encode failed: {e:?}");
                             continue;
@@ -2639,71 +2851,43 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
         use crate::streamer::config::EncoderVendor;
         const RING: usize = 3;
-        let try_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
-        if try_ring {
+        // NVENC's ring is tried for `Nvidia` and for `Auto`, exactly as before. AMF's is tried
+        // for `Amd`, and for `Auto` **only when the capture device is itself AMD** — which is
+        // precisely the case `build_backend`'s documented Auto ordering already reasons about
+        // ("an all-AMD box never reaches the Intel branch because its capture device is not
+        // Intel"). On a hybrid box the capture device is the iGPU, so this stays false and the
+        // NVENC-then-Intel-then-AMF chain below is unchanged.
+        let capture_is_amd = super::device_vendor(&ctx.device) == super::Vendor::Amd;
+        let try_nvenc_ring = matches!(vendor, EncoderVendor::Nvidia | EncoderVendor::Auto);
+        let try_amf_ring = matches!(vendor, EncoderVendor::Amd)
+            || (matches!(vendor, EncoderVendor::Auto) && capture_is_amd);
+
+        // The ring encoder builds its own input textures, so a `--scale` prescaler blits
+        // straight into the slot rather than through a staging texture. Identical for both.
+        let ring_scaler = || -> Result<Option<Scaler>> {
+            if config.width == native_w && config.height == native_h {
+                return Ok(None);
+            }
+            Scaler::new(
+                &ctx.device,
+                &ctx.device_context,
+                native_w,
+                native_h,
+                config.width,
+                config.height,
+            )
+            .map(Some)
+            .map_err(|e| e.context("building GPU downscaler for --scale"))
+        };
+
+        let ring_built: Option<(RingEncoder, RingTextures)> = if try_nvenc_ring {
             match build_zero_copy_ring(config, &ctx.device, RING) {
                 Ok((encoder, pairs)) => {
-                    tuning::raise_d3d11_gpu_priority(encoder.device());
-
-                    let scaler = if config.width != native_w || config.height != native_h {
-                        match Scaler::new(
-                            &ctx.device,
-                            &ctx.device_context,
-                            native_w,
-                            native_h,
-                            config.width,
-                            config.height,
-                        ) {
-                            Ok(s) => Some(s),
-                            Err(e) => return Err(e.context("building GPU downscaler for --scale")),
-                        }
-                    } else {
-                        None
-                    };
-
-                    super::report_adapter_pairing(&ctx.adapter, Some(encoder.device()));
-                    telemetry.encoder.set("nvenc-zero-copy-ring".into());
-                    let ring = AsyncNvencRing::new(
-                        encoder,
-                        pairs,
-                        ctx.device_context.clone(),
-                        scaler,
-                        tx.clone(),
-                        Arc::clone(&target_bitrate),
-                        config.bitrate_bps,
-                        Arc::clone(&last_frame_at),
-                        Arc::clone(&idr_request),
-                        Arc::clone(&repair),
-                        wake_rx,
-                        frame_duration,
-                        epoch,
-                        Arc::clone(&telemetry),
-                    );
-
-                    tprintln!(
-                        "pipeline: live capture ready -- NVENC ZERO-COPY RING (K={}) decoupled path ({}x{}@{})",
-                        RING, config.width, config.height, config.fps
-                    );
-
-                    return Ok(Self {
-                        core: None,
-                        ring: Some(ring),
-                        tx,
-                        epoch,
-                        last_frame_at,
-                        path_name: "zero-copy-ring",
-                        frames_sent: 0,
-                        busy_streak: 0,
-                        stop,
-                        frame_pool_buffers: FRAME_POOL_BUFFERS_RING,
-                        stale_frames: Arc::new(AtomicU32::new(0)),
-                        stale_frames_reported: 0,
-                        dirty_region_reporting: features.dirty_region,
-                        unchanged_streak: 0,
-                        _thread_tuning: thread_tuning,
-                        _keep_awake: keep_awake,
-                        telemetry,
-                    });
+                    let (textures, mutexes): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+                    Some((
+                        RingEncoder::Nvenc(encoder),
+                        RingTextures::Shared { textures, mutexes },
+                    ))
                 }
                 Err(e) => {
                     telemetry
@@ -2713,8 +2897,85 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                     teprintln!(
                         "NVENC zero-copy ring unavailable ({e:?}); falling back to classic backend path"
                     );
+                    None
                 }
             }
+        } else {
+            None
+        };
+
+        let ring_built = match ring_built {
+            Some(built) => Some(built),
+            None if try_amf_ring => {
+                match build_amf_ring(config, &ctx.device, &ctx.device_context, RING) {
+                    Ok((encoder, textures)) => {
+                        Some((RingEncoder::Amf(encoder), RingTextures::Local { textures }))
+                    }
+                    Err(e) => {
+                        telemetry
+                            .degradation
+                            .capture_fallback
+                            .fetch_add(1, Ordering::Relaxed);
+                        teprintln!(
+                            "AMD AMF ring unavailable ({e:?}); falling back to classic backend path"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        if let Some((encoder, textures)) = ring_built {
+            tuning::raise_d3d11_gpu_priority(encoder.device());
+            let scaler = ring_scaler()?;
+            let path_name = encoder.name();
+
+            super::report_adapter_pairing(&ctx.adapter, Some(encoder.device()));
+            telemetry.encoder.set(path_name.into());
+            let ring = AsyncEncodeRing::new(
+                encoder,
+                textures,
+                ctx.device_context.clone(),
+                scaler,
+                tx.clone(),
+                Arc::clone(&target_bitrate),
+                config.bitrate_bps,
+                Arc::clone(&last_frame_at),
+                Arc::clone(&idr_request),
+                Arc::clone(&repair),
+                wake_rx,
+                frame_duration,
+                epoch,
+                Arc::clone(&telemetry),
+            );
+
+            tprintln!(
+                "pipeline: live capture ready -- {path_name} RING (K={RING}) decoupled path ({}x{}@{})",
+                config.width,
+                config.height,
+                config.fps
+            );
+
+            return Ok(Self {
+                core: None,
+                ring: Some(ring),
+                tx,
+                epoch,
+                last_frame_at,
+                path_name,
+                frames_sent: 0,
+                busy_streak: 0,
+                stop,
+                frame_pool_buffers: FRAME_POOL_BUFFERS_RING,
+                stale_frames: Arc::new(AtomicU32::new(0)),
+                stale_frames_reported: 0,
+                dirty_region_reporting: features.dirty_region,
+                unchanged_streak: 0,
+                _thread_tuning: thread_tuning,
+                _keep_awake: keep_awake,
+                telemetry,
+            });
         }
 
         let backend = build_backend(
@@ -2890,6 +3151,13 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             Err(e) => return Err(e),
         };
         self.busy_streak = 0;
+        // An encoder that consumed the picture and produced no bytes has dropped a frame, not
+        // produced an empty one. Only the AMF backend can reach this (a zero-length output
+        // buffer, see `amd::encoder::classify_query_output`); broadcasting it would put a
+        // payloadless access unit through the packetizer.
+        if au.is_empty() {
+            return Ok(());
+        }
 
         self.last_frame_at
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2911,6 +3179,52 @@ impl GraphicsCaptureApiHandler for LiveCapture {
     }
 }
 
+/// A `Backend` on the encoder's **own** D3D11 device, for a path that has no capture device.
+///
+/// The synthetic-pattern probe holds a CPU frame buffer and no captured texture, so every rung
+/// here is an own-device constructor and every encode goes through `Backend::encode_cpu`. It
+/// walks [`encoder_ladder`] rather than repeating the order, so the probe cannot drift from what
+/// a live session would pick.
+fn build_own_device_backend(
+    config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
+) -> Result<Backend> {
+    let ladder = encoder_ladder(vendor);
+    let mut failure: Option<anyhow::Error> = None;
+    for (i, kind) in ladder.iter().copied().enumerate() {
+        if let Some(previous) = failure.as_ref() {
+            teprintln!(
+                "synthetic encode: {} unavailable ({previous:?}); trying {}",
+                ladder[i - 1].name(),
+                kind.name()
+            );
+        }
+        let attempt = match kind {
+            BackendKind::Nvenc => Encoder::new(config).map(|encoder| Backend::Nvenc {
+                encoder,
+                path: EncodePath::CpuBridge,
+            }),
+            BackendKind::Intel => {
+                IntelEncoder::new(config).map(|e| Backend::IntelCpu { encoder: e })
+            }
+            BackendKind::Amf => AmfEncoder::new(config).map(|e| Backend::AmfCpu { encoder: e }),
+            BackendKind::X264 => X264Encoder::new(config).map(|e| Backend::X264 { encoder: e }),
+        };
+        match attempt {
+            Ok(backend) => return Ok(backend),
+            Err(e) => {
+                failure = Some(match failure {
+                    Some(previous) => {
+                        previous.context(format!("{} also failed: {e:?}", kind.name()))
+                    }
+                    None => e,
+                });
+            }
+        }
+    }
+    Err(failure.unwrap_or_else(|| anyhow!("the encoder ladder for {vendor:?} is empty")))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn synthetic_pattern_loop(
     tx: broadcast::Sender<EncodedFrame>,
@@ -2921,6 +3235,7 @@ fn synthetic_pattern_loop(
 
     target_bitrate: Arc<AtomicU32>,
     config: EncoderConfig,
+    vendor: crate::streamer::config::EncoderVendor,
     wake_rx: crossbeam_channel::Receiver<()>,
     telemetry: SharedTelemetry,
     workload: crate::streamer::synthetic::Workload,
@@ -2929,14 +3244,19 @@ fn synthetic_pattern_loop(
     let _thread_tuning = tuning::tune_current_thread();
     let counter_epoch = Instant::now();
 
-    let mut encoder = match Encoder::new(config) {
-        Ok(e) => e,
+    let mut backend = match build_own_device_backend(config, vendor) {
+        Ok(b) => b,
         Err(e) => {
-            teprintln!("encode thread: failed to create NVENC encoder ({e:?}); pipeline stopped");
+            teprintln!(
+                "encode thread: no encoder for --encoder {vendor:?} ({e:?}); pipeline stopped"
+            );
             return;
         }
     };
-    tuning::raise_d3d11_gpu_priority(encoder.device());
+    if let Some(device) = backend.device() {
+        tuning::raise_d3d11_gpu_priority(device);
+    }
+    telemetry.encoder.set(backend.name().into());
     let mut current_bitrate = config.bitrate_bps;
     let mut bitrate_warned = false;
 
@@ -2947,14 +3267,15 @@ fn synthetic_pattern_loop(
 
     tprintln!(
         "pipeline: synthetic pattern encode loop started ({SP_WIDTH}x{SP_HEIGHT}@{SP_FPS}, \
-         workload={}, counter={counter})",
+         encoder={}, workload={}, counter={counter})",
+        backend.name(),
         workload.name()
     );
 
     loop {
         let pending = target_bitrate.swap(0, Ordering::Relaxed);
         if pending != 0 && pending != current_bitrate {
-            match encoder.set_bitrate(pending) {
+            match backend.set_bitrate(pending) {
                 Ok(BitrateApplied::Applied) => {
                     tprintln!("adapting bitrate: {current_bitrate} -> {pending} bps");
                     current_bitrate = pending;
@@ -2989,7 +3310,11 @@ fn synthetic_pattern_loop(
 
         let mut timing = FrameTiming::entering_capture();
         timing.mark_encode_submit();
-        match encoder.encode_bgra(&frame_buf, force_idr) {
+        // Every own-device backend takes the frame the same way: a full-width BGRA upload.
+        // `encode_cpu(.., width * 4, Bgra8, ..)` is byte-for-byte what `encode_bgra` did on the
+        // NVENC arm, with the row pitch spelled out instead of implied.
+        match backend.encode_cpu(&frame_buf, SP_WIDTH * 4, ReadbackFormat::Bgra8, force_idr) {
+            Ok(au) if au.is_empty() => {}
             Ok(au) => {
                 timing.mark_encode_done();
                 telemetry.frames_encoded.fetch_add(1, Ordering::Relaxed);

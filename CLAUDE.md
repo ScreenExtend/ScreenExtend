@@ -164,7 +164,8 @@ matches drive the router) and implemented in `cli.rs`:
 
 ```
 serve [--http-port N] [--https-port N] [--session-id ID] [--otp CODE] [--otp-file PATH]
-      [--no-cloud] [--no-qr] [--software-encode] [-v|--verbose]
+      [--no-cloud] [--no-qr] [--encoder auto|nvidia|intel|amd|software]
+      [--software-encode] [-v|--verbose]
 status [--session-id ID] [--json]
 qr [-t lan|cloud|all] [--session-id ID] [--no-render] [--json]
 session new [--no-render] [--json]
@@ -327,7 +328,7 @@ dispatcher for capture/encode/tuning/audio-start that calls into the per-OS back
 `hosted_network_running`, `network_adapters`, `local_ips`, `streamers`, `session_auth`,
 `device_reporter`, `device_overrides`, `sessions`, `disconnect_grace`, `user_turn`, `stun_urls`,
 `banned_devices`, `approved_devices`, `otp_limiter`, `server_ports`, `disable_gpu_encode`,
-`cloud`, `cloud_status`, `audio_hub`.
+`encoder_vendor`, `cloud`, `cloud_status`, `audio_hub`.
 
 **Current support:** Windows (NVENC / Quick Sync / AMF / x264) and macOS (VideoToolbox) are
 functional.
@@ -535,6 +536,17 @@ Cross-platform core, OS-independent:
   A wrong revision word or vtable slot is not a compile error and not a crash; it is a silent
   degrade to the next vendor on a machine with working hardware. **Never hand-edit the generated
   `abi_*` bodies**; regenerate them. `src-tauri/tools/README.md` has the procedure.
+- **`AsyncEncodeRing`** is the decoupling ring both hardware backends use: the capture callback
+  only blits into a free slot and sends a message, and a dedicated encode thread submits, drains
+  and broadcasts. It is `RingEncoder::{Nvenc, Amf}` over `RingTextures::{Shared, Local}` —
+  NVENC's slots are cross-adapter shared textures behind a keyed mutex, AMF's are the encoder's
+  own textures on the capture device, so nothing is shared and slot ownership is the free/ready
+  channels'. The AMF ring is chosen for `--encoder amd`, and for `auto` only when the capture
+  device is itself AMD; anything else falls back to the inline `build_backend` path.
+- **The AMF backend is `UNVERIFIED`** — see the "Current support" note above. Its design note is
+  `windows_utils/streamer/amd.md`, and `amd/sps.rs` rewrites the SPS VUI on the way out because
+  AMF writes neither colour signalling nor `bitstream_restriction_flag` into an AVC bitstream
+  (AMF issues #398, #277, #540) — gated on a read-back, so it stands down if a driver fixes it.
 
 ### Video capture & encode — macOS (`macos_utils/streamer/`)
 
