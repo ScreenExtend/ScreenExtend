@@ -14,6 +14,7 @@ mod pipeline;
 mod scaler;
 mod vendor;
 mod x264_encoder;
+mod x264_layout;
 
 #[test]
 #[ignore = "requires an interactive desktop; run with --ignored"]

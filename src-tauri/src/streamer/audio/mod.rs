@@ -3,6 +3,8 @@ pub mod opus_sys;
 pub mod protocol;
 
 #[cfg(test)]
+mod opus_abi;
+#[cfg(test)]
 mod tests;
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
