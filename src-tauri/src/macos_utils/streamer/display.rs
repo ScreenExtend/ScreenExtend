@@ -1,3 +1,8 @@
+use std::ptr::NonNull;
+
+use objc2::rc::Retained;
+use objc2::runtime::{AnyObject, Bool};
+use objc2::{msg_send, sel};
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayPixelsHigh, CGDisplayPixelsWide, CGError,
     CGGetActiveDisplayList, CGMainDisplayID,
@@ -11,6 +16,31 @@ unsafe extern "C" {
 }
 
 const MAX_DISPLAYS: usize = 16;
+
+/// The registry ID of the GPU currently driving this display.
+///
+/// It is what `kVTVideoEncoderSpecification_PreferredEncoderGPURegistryID` takes. Without it
+/// VideoToolbox picks an encoder by its own criteria, and on a Mac with more than one GPU that can
+/// be a different one from the GPU WindowServer composites this display on — in which case every
+/// frame's IOSurface migrates across the PCIe bridge before it can be encoded.
+///
+/// `CGDirectDisplayCopyCurrentMetalDevice` is CoreGraphics 10.11, below the floor. The returned
+/// Metal object is only ever messaged, never linked against, so this adds no framework dependency.
+pub fn metal_registry_id(display: DisplayId) -> Option<u64> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGDirectDisplayCopyCurrentMetalDevice(display: DisplayId) -> *mut AnyObject;
+    }
+    // SAFETY: a `Copy` function, so the result is +1 and `Retained::from_raw` takes that ownership.
+    let device = unsafe { CGDirectDisplayCopyCurrentMetalDevice(display) };
+    let device = unsafe { Retained::from_raw(NonNull::new(device)?.as_ptr()) }?;
+    let responds: Bool = unsafe { msg_send![&*device, respondsToSelector: sel!(registryID)] };
+    if !responds.as_bool() {
+        return None;
+    }
+    let id: u64 = unsafe { msg_send![&*device, registryID] };
+    (id != 0).then_some(id)
+}
 
 pub fn active_displays() -> Vec<DisplayId> {
     let mut ids = [0u32; MAX_DISPLAYS];
@@ -80,4 +110,66 @@ pub fn dimensions_by_name(device_name: &str) -> Option<(u32, u32)> {
     let display = display_by_name(device_name)?;
     let (w, h, _) = display_geometry(display);
     Some((w, h))
+}
+
+/// Keep a display changing for the duration of a capture measurement.
+///
+/// Every capture number in this territory is meaningless on a still screen: the delivery
+/// handlers drop frames whose dirty-rect list is empty, and WindowServer stops compositing a
+/// display that has gone to sleep (run `caffeinate -u -t 900 &` first, or these tests measure
+/// an asleep panel and report one frame). `CGDisplayMoveCursorToPoint` needs no Accessibility
+/// grant, unlike `CGEventPost`, and the cursor is composited into the frame because both
+/// backends ask for it — so moving it is the cheapest animation available over SSH.
+#[cfg(test)]
+pub struct CursorAnimation {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl CursorAnimation {
+    pub fn start(display: DisplayId, w: u32, h: u32) -> Self {
+        use objc2_core_foundation::CGPoint;
+        use objc2_core_graphics::CGDisplayMoveCursorToPoint;
+
+        // Moving the pointer alone is not enough: macOS hides the cursor when there has been no
+        // real HID input, and a hidden cursor composites nothing. The hide/show pair is
+        // reference-counted and forces WindowServer to recomposite the cursor rectangle whether
+        // or not the pointer was visible, which is what actually produces the dirty rects.
+        unsafe extern "C" {
+            fn CGDisplayHideCursor(display: DisplayId) -> i32;
+            fn CGDisplayShowCursor(display: DisplayId) -> i32;
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let x = f64::from(i.wrapping_mul(7) % w.max(2));
+                let y = f64::from(i.wrapping_mul(11) % h.max(2));
+                unsafe {
+                    let _ = CGDisplayMoveCursorToPoint(display, CGPoint { x, y });
+                    CGDisplayHideCursor(display);
+                    CGDisplayShowCursor(display);
+                }
+                i = i.wrapping_add(1);
+                std::thread::sleep(std::time::Duration::from_micros(2000));
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CursorAnimation {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }

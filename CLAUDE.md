@@ -358,17 +358,25 @@ Cross-platform core, OS-independent:
 ### Video capture & encode — macOS (`macos_utils/streamer/`)
 
 - `mod.rs` — the `CaptureBackend` trait, `CaptureError`, pixel formats, and `start_capture()`,
-  which tries **ScreenCaptureKit** when `screencapturekit_available()` (12.3+) and falls back to
-  **CGDisplayStream** (`cgds.rs`), reporting `FallbackFailed` only when both fail.
+  which tries **ScreenCaptureKit** when `screencapturekit_available()` — an `AnyClass::get`
+  probe for `SCStream` and `SCShareableContent`, never a version number — and falls back to
+  **CGDisplayStream** (`cgds.rs`), reporting `FallbackFailed` only when both fail. SCK is not
+  committed to until it has actually delivered a frame (1500 ms), because a stream that starts and
+  delivers nothing is indistinguishable from a slow one.
 - `sck.rs` — the SCK backend. **Dyld-safety is load-bearing**: SCK only exists on 12.3+, so a
   link-time reference (`objc2-screen-capture-kit`, an `extern_class!`, any 12.3+ `extern static`)
   would add an undefined dyld symbol absent on the 10.15 floor and break loading of the *whole*
   binary. It therefore uses runtime interop only — `AnyClass::get`, `msg_send!`, and a
   `ClassBuilder`-constructed `SCStreamOutput` delegate.
-- `cgds.rs` — the CGDisplayStream fallback (deprecated API, `#![allow(deprecated)]`),
-  IOSurface → CVPixelBuffer, ITU-R 709 YCbCr.
-- `encoder.rs` — VideoToolbox H.264 compression session; `gpu.rs` — Metal device +
-  `CVMetalTextureCache`; `frame.rs` — `Frame`/`FrameSink`; `display.rs`, `config.rs` — display
+- `cgds.rs` — the CGDisplayStream fallback, IOSurface → CVPixelBuffer, ITU-R 709 YCbCr. Every
+  function and constant is `dlsym`'d: the API is *obsoleted* in the macOS 15 SDK, and a link-time
+  reference to a symbol Apple has announced the end of would make the whole binary unloadable the
+  day it goes. Surfaces held past the callback carry an `IOSurfaceIncrementUseCount`, which the
+  header requires and without which WindowServer overwrites frames mid-encode.
+- `encoder.rs` — VideoToolbox H.264 compression session; `gpu.rs` — an empty placeholder (the
+  macOS path needs no GPU convert or scale stage: WindowServer delivers the frame already scaled
+  and already in `420f`, and the IOSurface reaches VideoToolbox without a copy); `frame.rs` —
+  `Frame`/`FrameSink`; `display.rs`, `config.rs` — display
   enumeration and modes; `mach.rs` — `mach_absolute_time`; `qos.rs`, `tuning.rs`, `power.rs`,
   `activity.rs` — thread QoS, process tuning, power/idle assertions.
 - `virtual_display.rs` — the private CoreGraphics `CGVirtualDisplay*` classes via
