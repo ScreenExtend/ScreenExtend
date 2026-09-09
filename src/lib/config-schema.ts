@@ -105,6 +105,7 @@ export const configJsonSchema: JsonSchema = {
     "disableGpuEncode",
     "legacyVolumeKeyProxy",
     "walkthroughCompleted",
+    "disconnectGraceSecs",
     "serverPorts",
     "hostedNetworkCredentials",
     "turnConfig",
@@ -148,6 +149,7 @@ export const configJsonSchema: JsonSchema = {
     disableGpuEncode: bool("Force CPU-only (software) H.264 encoding instead of the GPU encoder. Not recommended — it raises CPU usage and can cost quality or frame rate.", false),
     legacyVolumeKeyProxy: bool("macOS 10.15-12.x only. Keeps the hardware volume keys working while the ScreenExtend virtual audio device is the system output.", false),
     walkthroughCompleted: bool("Whether the onboarding walkthrough has been finished. Set this to false to see it again on the next launch.", false),
+    disconnectGraceSecs: int("How long a device's virtual display survives after it drops off, in seconds. 0 removes the display immediately; the host clamps this to 0-600.", 0, 600, 10),
     serverPorts: {
       type: "object",
       description: "TCP ports the local-network server listens on. Change these if another app already uses 8080/8443; devices must rejoin with the new link afterwards.",

@@ -468,7 +468,7 @@ export default function Settings() {
       });
       return;
     }
-    localStorage.setItem("disconnectGraceSecs", String(seconds));
+    await updateConfig({ disconnectGraceSecs: seconds });
     setOldDisconnectGrace(String(seconds));
     toast({
       title: t("toasts.disconnectTimeout.title"),
