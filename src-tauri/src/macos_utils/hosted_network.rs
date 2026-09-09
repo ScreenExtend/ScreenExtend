@@ -847,7 +847,7 @@ mod tests {
     /// cargo test --lib macos_utils::hosted_network::tests::report_hostap_surface -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "read-only report of this Mac's Wi-Fi surface; run with --ignored --nocapture"]
     fn report_hostap_surface() {
         let Some(interface) = wifi_interface() else {
             println!("no Wi-Fi interface");

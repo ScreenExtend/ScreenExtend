@@ -954,7 +954,10 @@ mod tests {
         // session, and ssh is how this crate is usually tested on the 10.15 box. The assertion is
         // about a live display, so with none present there is nothing to assert.
         if crate::macos_utils::streamer::display::active_displays().is_empty() {
-            println!("no console session (ssh?); skipping");
+            crate::test_support::skip_because(
+                "macos display name correlation",
+                "CoreGraphics reports no displays outside a console session (ssh?)",
+            );
             return;
         }
         let vd = MacosVirtualDisplay;
@@ -992,7 +995,7 @@ mod tests {
     /// cargo test --lib macos_utils::virtual_display::tests::time_a_retina_join -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "creates a real Retina virtual display; needs a console session (it hangs over SSH); run with --ignored --nocapture"]
     fn time_a_retina_join() {
         if !cg_virtual_display_available() {
             println!("CGVirtualDisplay is not available on this Mac");

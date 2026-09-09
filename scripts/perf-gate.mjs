@@ -17,7 +17,9 @@
 //                    paste back into the baseline file to re-seed a runner).
 //   --seed           update the baseline file in place with the observed numbers
 //                    instead of comparing. Never run this from a gating job.
-//   --tolerance <f>  override the file's tolerance, as a fraction (0.05 = 5%).
+//   --tolerance <f>  override the tolerance, as a fraction (0.05 = 5%). Otherwise a key's own
+//                    `tolerance` is used if it has one, else the file-wide default. Per key,
+//                    because an idle dev box and a shared CI VM are not the same instrument.
 //
 // Exit 0 = within tolerance, or nothing to compare against yet; 1 = regression;
 // 2 = usage/parse error.
@@ -37,7 +39,9 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const METRICS = {
   x264_p95_encode_us: {
     // `x264 smoke OK: ... p95_encode=4537us (budget 16666us)` — the x264 unit test.
-    pattern: /p95_encode=(\d+)us/,
+    // Anchored on its own prefix: other harnesses print a `p95_encode=` of their own, and an
+    // unanchored pattern quietly reported one encoder's number under another's name.
+    pattern: /x264 smoke OK:[^\n]*p95_encode=(\d+)us/,
     unit: "us",
     source: "cargo test --release --lib x264_encoder -- --nocapture",
   },
@@ -56,6 +60,49 @@ const METRICS = {
     pattern: /\bcapture_to_socket=[\d.]+\/[\d.]+\/([\d.]+)\/[\d.]+/,
     unit: "ms",
     source: "ScreenExtend probe --whep-selftest --duration 30",
+  },
+  // `windows capture->encoded OK: ... capture_to_encoded=<p50>/<p90>/<p99>/<max> (p50/p90/p99/max ms)`
+  // — the Windows counterpart to the macOS end_to_end_latency harness. This is the only
+  // metric in the table that spans capture as well as encode, which is what makes it the one
+  // worth watching: an encode-side win that costs a capture-side stall shows up here and
+  // nowhere else. It needs an interactive desktop, so it is a dev-box number, not a runner one.
+  windows_capture_to_encoded_p99_ms: {
+    pattern: /\bcapture_to_encoded=[\d.]+\/[\d.]+\/([\d.]+)\/[\d.]+/,
+    unit: "ms",
+    source:
+      "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
+  },
+  windows_capture_to_encoded_p50_ms: {
+    pattern: /\bcapture_to_encoded=([\d.]+)\/[\d.]+\/[\d.]+\/[\d.]+/,
+    unit: "ms",
+    source:
+      "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
+  },
+  // The encode stage of the same run, spelled differently from the x264 one on purpose: it is
+  // whichever encoder the `Auto` ladder picked on that machine, so comparing it against an
+  // x264 baseline would be comparing NVENC with libx264.
+  windows_capture_encode_p95_us: {
+    pattern: /\bcapture_encode_p95=(\d+)us/,
+    unit: "us",
+    source:
+      "cargo test --release --lib windows_capture_to_encoded -- --ignored --nocapture",
+  },
+  // `videotoolbox encode OK: ... vt_encode_p95=<n>us ...` — macOS's `encode_synthetic`.
+  // This is what makes a macOS perf-gate row possible at all: until it printed a timing, the
+  // gate's Windows-only matrix was a data problem rather than a platform judgement. No display
+  // and no Screen Recording grant needed, which is why the encoder module is the one a hosted
+  // runner can measure.
+  vt_p95_encode_us: {
+    pattern: /\bvt_encode_p95=(\d+)us/,
+    unit: "us",
+    source:
+      "cargo test --release --lib macos_utils::streamer::encoder -- --ignored --nocapture",
+  },
+  vt_p50_encode_us: {
+    pattern: /\bvt_encode_p50=(\d+)us/,
+    unit: "us",
+    source:
+      "cargo test --release --lib macos_utils::streamer::encoder -- --ignored --nocapture",
   },
 };
 
@@ -131,8 +178,13 @@ try {
   die(`cannot read ${args.baseline}: ${e.message}`);
 }
 
-const tolerance = args.tolerance ?? file.tolerance;
-if (!Number.isFinite(tolerance)) die("no usable tolerance (set `tolerance` in the baseline file)");
+// Resolved after the baseline entry is read, so a key can tighten (or loosen) the default.
+function resolveTolerance(baselineEntry) {
+  const t = args.tolerance ?? baselineEntry?.tolerance ?? file.tolerance;
+  if (!Number.isFinite(t)) die("no usable tolerance (set `tolerance` in the baseline file)");
+  return t;
+}
+const tolerance = resolveTolerance(file.baselines?.[args.key]);
 
 const runs = readRuns(args.inputs);
 
