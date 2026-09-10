@@ -2866,3 +2866,19 @@ deadline that sets the bit**. That is consistent with §15.6's own numbers — b
 runs, a demotion in three — bit 15 belongs to the runs where the page stayed on the fast path long
 enough for the deadline to run. The three defects above are read out of the shipped code and are
 each proved by a failing assertion; which of them fired in §15.6's runs is not proved.
+
+### `scripts/measure-stream.ps1` threw away the user's whole saved config — `VERIFIED`
+
+Found while putting this box back after the runs above. The harness clears the saved device rows
+before a run — correctly, they pin the geometry — by round-tripping `config.json` through
+`Set-Content -Encoding UTF8`, which on **PowerShell 5.1 writes a BOM**. `tauri-plugin-store`
+cannot parse a BOM: the host reads the file, fails, falls back to `defaultConfig` and rewrites it.
+So clearing one device row silently discarded **every** stored setting — `devices`,
+`knownDevices`, the ports, TURN, STUN, the theme — at the host's next launch, which is also when
+nobody is watching for it.
+
+Verified both ways on this box: restoring the identical JSON with a BOM comes back
+`devices=0 knownDevices=0` after a relaunch; restoring the same bytes without one comes back
+`devices=1 knownDevices=11` and stays. Written with `[IO.File]::WriteAllText(..., UTF8Encoding
+$false)` now. The harness still does not put the rows back at the end of a run, which is a
+separate (and documented) gap — `config.json.before` in the run directory is the copy.

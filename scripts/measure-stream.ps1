@@ -228,7 +228,14 @@ if (Test-Path $storeFile) {
         $store = Get-Content -Raw $storeFile | ConvertFrom-Json
         if ($null -ne $store.devices) {
             $store.devices = @()
-            $store | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 $storeFile
+            # `Set-Content -Encoding UTF8` writes a **BOM** on PowerShell 5.1, and
+            # `tauri-plugin-store` cannot parse one: the host reads the file, fails, falls back to
+            # `defaultConfig` and rewrites it — so clearing one device row silently threw away the
+            # whole saved configuration (every device, every known device, the ports, TURN, STUN)
+            # on the next launch. Verified on this box: restoring the same JSON without the BOM
+            # survives a relaunch; with it, `devices` and `knownDevices` come back empty.
+            [IO.File]::WriteAllText($storeFile, ($store | ConvertTo-Json -Depth 12),
+                (New-Object Text.UTF8Encoding $false))
         }
     } catch { Write-Warning "could not clear the saved device row: $_" }
 }
