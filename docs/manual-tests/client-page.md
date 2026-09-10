@@ -236,6 +236,24 @@ answer a card was from the host's own devtools.
 | Backgrounding | Switch apps and come back | The picture resumes, the wake lock is re-acquired, and the session is not dropped. |
 | Missing `nosleep.js` | In devtools, block `/nosleep.js`, then reload | The join form still renders and Connect still works. This used to be a top-level `new NoSleep()` that took the whole script down. |
 
+## 7b. Two tabs, one machine (rows 338-342)
+
+The owner's report. Everything here is about the join id the host mints at `POST /whep` and
+hands back in `X-Join-Id`; the client keeps it in `sessionStorage`, which is per tab, while the
+device token stays in `localStorage`, which is shared between tabs on purpose.
+
+| Check | How | Expected |
+|---|---|---|
+| Two tabs coexist | Join from two tabs of one browser on one machine | Two virtual displays. `ScreenExtend devices list` shows **two** rows with two join ids, the **same** device token and the same address. Both pictures keep moving; the first must not freeze. |
+| Two independent pipelines | `ScreenExtend status --json`, twice, ten seconds apart | `telemetry.sessions` has an entry per join id and `frames_encoded` climbs on **both**. |
+| Settings are the device's | Change the display scale for that device in the dashboard | Both tabs reconfigure. There is one settings row, not two. |
+| Closing one tab | Close the second tab | Its display goes and the other keeps streaming. `live_transport_sessions` falls by one. |
+| A reload is not a second display | Reload one tab | One display for that tab, not two. The reloaded page releases the id it found in `sessionStorage`. |
+| The page's own rejoin | Watch the host log through a join where the audio path demotes (`webcodecsOpus` true -> false) | `leave beacon for join <old>` then a new `join request`, and the old display is removed. Exactly one display for that tab at the end. |
+| Nothing is keyed by the address | Join, then move the client between Wi-Fi networks so its address changes | The session survives; the address in `devices list` changes to the new one. Trickle is not affected — the resource's second factor is the device token. |
+| A recycled address | Join from device A, disconnect it, join from device B on the address A had | B gets its own session, its own settings and none of A's trust state. If A was banned, B is not. |
+| A host that names no session | Put a proxy in front that strips `X-Join-Id`, `Location` and `Set-Cookie` | `degraded` bit 24 (`JOIN_ID_MISSING`), and the console says the host named no session. `/reconfig` then reads zeros, which is the honest answer — the host will not guess a session from the address. |
+
 ## 8. Compatibility copy
 
 | Check | Expected |

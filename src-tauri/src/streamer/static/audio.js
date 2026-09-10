@@ -629,7 +629,10 @@
             // period per device buying nothing.
             if (!force && body === lastPostedOutputs) return;
             lastPostedOutputs = body;
-            fetch('/audio-outputs', {
+            // Without a join the host has no session to attach the list to, and it will not
+            // guess one from the address.
+            if (!speakers.joinId) return;
+            fetch('/audio-outputs?join=' + encodeURIComponent(speakers.joinId), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body,
@@ -811,9 +814,13 @@
         } catch (_) { note(); return null; }
     }
 
-    function setSpeakerIdentity(sessionId, deviceToken) {
+    function setSpeakerIdentity(sessionId, deviceToken, joinId) {
         speakers.sessionId = sessionId || '';
         speakers.deviceToken = deviceToken || '';
+        // The join this list belongs to. Two tabs of one browser enumerate the same speakers
+        // and share the sink the host chooses, but each posts under its own session so a list
+        // that arrives late cannot land on the other tab's row.
+        speakers.joinId = joinId || '';
         // A new session — or a reconfigure that rebuilt one with the same identity — needs the
         // list once regardless of whether it changed, so the change detection in postOutputs
         // cannot swallow the first post of a connection.

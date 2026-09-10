@@ -1,5 +1,5 @@
 import React, { createContext, useContext } from "react";
-import { type Device } from "@/components/config-provider";
+import { type ConnectedDevice } from "@/components/config-provider";
 
 export type AudioOutputsInfo = {
   supported: boolean;
@@ -48,11 +48,11 @@ export type GlobalSetters = {
   setQrValues: React.Dispatch<React.SetStateAction<QrValue[]>>;
   setLoaded: React.Dispatch<React.SetStateAction<boolean>>;
   setClosing: React.Dispatch<React.SetStateAction<boolean>>;
-  setDevices: React.Dispatch<React.SetStateAction<Device[]>>;
+  setDevices: React.Dispatch<React.SetStateAction<ConnectedDevice[]>>;
   setPublicSessionsEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   setAvatar: React.Dispatch<React.SetStateAction<string | null>>;
   setZoom: React.Dispatch<React.SetStateAction<number>>;
-  setAudioOutputsByIp: React.Dispatch<React.SetStateAction<Record<string, AudioOutputsInfo>>>;
+  setAudioOutputsByToken: React.Dispatch<React.SetStateAction<Record<string, AudioOutputsInfo>>>;
 };
 
 const noop = () => {};
@@ -68,7 +68,7 @@ export const SettersContext = createContext<GlobalSetters>({
   setPublicSessionsEnabled: noop,
   setAvatar: noop,
   setZoom: noop,
-  setAudioOutputsByIp: noop,
+  setAudioOutputsByToken: noop,
 });
 
 export const SessionContext = createContext<SessionInfo>({
@@ -79,7 +79,8 @@ export const SessionContext = createContext<SessionInfo>({
 });
 
 export const QrValuesContext = createContext<QrValue[]>([]);
-export const DevicesContext = createContext<Device[]>([]);
+/** One entry per live join, so a device with two tabs open appears twice. */
+export const DevicesContext = createContext<ConnectedDevice[]>([]);
 export const AudioOutputsContext = createContext<Record<string, AudioOutputsInfo>>({});
 export const AvatarContext = createContext<string | null>(null);
 export const ZoomContext = createContext<number>(1);

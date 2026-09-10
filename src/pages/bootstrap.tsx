@@ -190,8 +190,14 @@ export default function Bootstrap() {
         // stretch between setup() returning and the dashboard appearing.
         const replay: Promise<unknown>[] = [];
         for (const device of existing.devices ?? []) {
+          // Keyed by the device token. A row with none names only an address, which is
+          // recycled between machines, so it waits for that device to join again.
+          if (!device.token) {
+            console.log(`[migrate] saved device ${device.ip} has no token; its settings wait for it to join once more`);
+            continue;
+          }
           replay.push(commands.setDeviceOverride(
-            device.ip,
+            device.token,
             device.scale,
             device.orientation,
             device.refreshRate,
@@ -201,8 +207,8 @@ export default function Bootstrap() {
             device.dpr ?? device.maxDpr ?? 1,
             device.systemAudio ?? false
           ));
-          replay.push(commands.setDevicePointerScope(device.ip, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
-          replay.push(commands.setDeviceAutoFrameRate(device.ip, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
+          replay.push(commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
+          replay.push(commands.setDeviceAutoFrameRate(device.token, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
         }
         for (const known of existing.knownDevices ?? []) {
           const token = known.token ?? "";

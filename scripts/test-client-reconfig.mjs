@@ -44,6 +44,8 @@ function takeFunction(name) {
 // those is recorded rather than stubbed away, because the assertions are about which of them
 // runs and in what order.
 const prelude = `
+  let currentJoinId = '';
+  function setJoinId(id) { currentJoinId = id || ''; }
   let reconfigPoll = null;
   let reconfigEpoch = null;
   let kickEpoch = null;
@@ -69,7 +71,9 @@ const prelude = `
 const epilogue = `
   this.api = {
     startReconfigPoll, armProbe, probeTick, applyReconfig, kickDevice, reconfigure,
-    clearReconfigWatchdog,
+    clearReconfigWatchdog, withJoin, releaseJoin,
+    setJoinId: (v) => { currentJoinId = v || ''; },
+    joinId: () => currentJoinId,
     state: () => ({ reconfigPoll, reconfigEpoch, kickEpoch, reconfiguring, kicked, isLive, refusedStreak, lastOfferedSinkId }),
     setLive: (v) => { isLive = v; },
     setDegraded: (v) => { degraded = v; },
@@ -86,6 +90,8 @@ const source = [
   takeConst('REFUSED_MS'),
   takeConst('RECONFIG_DEADLINE_MS'),
   'let reconfigWatchdog = null;',
+  takeFunction('withJoin'),
+  takeFunction('releaseJoin'),
   takeFunction('clearReconfigWatchdog'),
   takeFunction('startReconfigPoll'),
   takeFunction('armProbe'),
@@ -113,16 +119,28 @@ function makePoller() {
   // of cases 9-11: `false` is the engine refusing, and a host that repeats the same request
   // must not be answered with a second picker.
   const seAudio = { setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; } };
+  const urls = [];
+  const beacons = [];
   const ctx = {
     console,
     calls,
+    urls,
+    beacons,
     Promise,
     RegExp,
+    encodeURIComponent,
+    navigator: { sendBeacon: (u) => { beacons.push(u); return true; } },
+    sessionStorage: {
+      _v: {},
+      getItem(k) { return Object.prototype.hasOwnProperty.call(this._v, k) ? this._v[k] : null; },
+      setItem(k, v) { this._v[k] = String(v); },
+      removeItem(k) { delete this._v[k]; },
+    },
     SEAudio: seAudio,
     window: { SEAudio: seAudio },
     setTimeout: (fn, ms) => { localTimers.push({ fn, at: clock + ms }); return localTimers.length; },
     clearTimeout: (id) => { if (id) localTimers[id - 1] = null; },
-    fetch: async () => (typeof response === 'function' ? response() : response),
+    fetch: async (url) => { urls.push(url); return typeof response === 'function' ? response() : response; },
   };
   ctx.self = ctx;
   ctx.clock = 0;
@@ -131,6 +149,8 @@ function makePoller() {
   vm.runInContext(source, ctx, { filename: 'index.html:reconfig' });
   ctx.api.calls = calls;
   ctx.api.timers = localTimers;
+  ctx.api.urls = urls;
+  ctx.api.beacons = beacons;
   return ctx.api;
 }
 
@@ -317,6 +337,53 @@ else fail('a kicked page still ran ' + calls.join(', '));
   else fail('a deferred sink opened a picker: ' + calls.join(', '));
 }
 sinkResult = true;
+
+// ── 12. the join id names the session on every request ───────────────────────────────────
+// The host will not resolve a request by the peer's address: an address moves under a live
+// session and is handed to the next device that asks for one. Every session-scoped request
+// therefore carries the id the host minted at `POST /whep`, and a tab that has none names
+// nothing rather than something that happens to be nearby.
+{
+  const api = makePoller();
+  api.setJoinId('0123456789abcdef0123456789abcdef');
+  response = { ok: true, status: 200, json: async () => ({ epoch: 1, kick: 0 }) };
+  await api.startReconfigPoll();
+  eq('/reconfig names this tab\'s session', api.urls[0],
+    '/reconfig?join=0123456789abcdef0123456789abcdef');
+
+  api.urls.length = 0;
+  clock += api.grace.PROBE_OK_MS;
+  await api.probeTick();
+  eq('and every later poll names it too', api.urls[0],
+    '/reconfig?join=0123456789abcdef0123456789abcdef');
+}
+{
+  const api = makePoller();
+  response = { ok: true, status: 200, json: async () => ({ epoch: 1, kick: 0 }) };
+  await api.startReconfigPoll();
+  eq('a tab the host never named asks for nothing in particular', api.urls[0], '/reconfig');
+}
+// Releasing is the other half: a rejoin mints a new id, so the old session has to be given
+// back or its display stands until the disconnect grace expires.
+{
+  const api = makePoller();
+  api.setJoinId('ffffffffffffffffffffffffffffffff');
+  api.releaseJoin();
+  eq('leaving names the session being left', api.beacons[0],
+    '/leave?join=ffffffffffffffffffffffffffffffff');
+  eq('and the tab no longer claims it', api.joinId(), '');
+  api.releaseJoin();
+  eq('releasing twice sends one beacon', api.beacons.length, 1);
+}
+{
+  const api = makePoller();
+  api.setJoinId('11111111222222223333333344444444');
+  api.releaseJoin('99999999888888887777777766666666');
+  eq('an explicit id releases that one', api.beacons[0],
+    '/leave?join=99999999888888887777777766666666');
+  eq('and leaves this tab\'s own session alone', api.joinId(),
+    '11111111222222223333333344444444');
+}
 
 if (failures) {
   console.log('\n' + failures + ' reconfig assertion(s) failed');

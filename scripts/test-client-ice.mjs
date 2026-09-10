@@ -72,6 +72,7 @@ const source = [
   takeLet('icePending'),
   takeLet('liveHeld'),
   takeLet('iceSettleTimer'),
+  takeFunction('readDeviceToken'),
   takeFunction('trickleIsFatal'),
   takeFunction('iceCandidateType'),
   takeFunction('iceGraceFor'),
@@ -108,6 +109,14 @@ const ctx = {
   Promise,
   RegExp,
   DEG: { ICE_GATHERING_DEADLINE: 1 << 15, TRICKLE_ICE_UNAVAILABLE: 1 << 22 },
+  // `readDeviceToken` reads it; the resource's second factor is the device, not the address.
+  DEVICE_TOKEN_KEY: 'se.deviceToken',
+  localStorage: {
+    _v: { 'se.deviceToken': 'aaaaaaaabbbbbbbbccccccccdddddddd' },
+    getItem(k) { return Object.prototype.hasOwnProperty.call(this._v, k) ? this._v[k] : null; },
+    setItem(k, v) { this._v[k] = String(v); },
+    removeItem(k) { delete this._v[k]; },
+  },
   degrade(bit) { deadlineBits |= bit; },
   noteSuppressed() { suppressed++; },
   onStreamLive() { liveShown++; },
@@ -271,6 +280,12 @@ async function trickle() {
     else if (patches[0].opts.headers['Content-Type'] !== 'application/trickle-ice-sdpfrag') {
       fail('content type was ' + patches[0].opts.headers['Content-Type']);
     } else ok('opening the resource flushes the buffer as one PATCH of trickle-ice-sdpfrag');
+    // The resource id rides a cleartext `Location` on the HTTP listener, so it is not the whole
+    // authority. The second factor used to be the peer's address, which a roam changes under a
+    // live session; it is the device token now, and the client has to send it.
+    if (patches[0].opts.headers['X-Device-Token'] !== 'aaaaaaaabbbbbbbbccccccccdddddddd') {
+      fail('the PATCH presented ' + JSON.stringify(patches[0].opts.headers['X-Device-Token']));
+    } else ok('the PATCH presents the device token as the resource\'s second factor');
     if (t.count() !== 1) fail('the sent count is ' + t.count());
     else ok('a 204 counts the candidate as sent');
     t.stop();

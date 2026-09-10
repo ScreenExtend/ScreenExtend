@@ -155,8 +155,155 @@ pub async fn run(mut config: Config) -> Result<()> {
             .build()
     };
 
-    let pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
+    // Two peers, both from 127.0.0.1, both presenting their own device token — the owner's
+    // two-tabs-on-one-machine case, which used to collapse into one session with the first
+    // frozen and replaced by the second. Nothing about the address distinguishes them; the join
+    // id the host mints does.
+    let mut peers: Vec<Peer> = Vec::new();
+    for (label, token) in [
+        ("tab-1", "aaaaaaaabbbbbbbbccccccccdddddddd"),
+        ("tab-2", "11111111222222223333333344444444"),
+    ] {
+        peers.push(join_peer(&api, port, label, token).await?);
+    }
 
+    let sessions = config.sessions.clone();
+    if let Some(sessions) = sessions.as_ref() {
+        let ids: std::collections::BTreeSet<String> =
+            peers.iter().map(|p| p.join_id.clone()).collect();
+        if ids.len() != peers.len() {
+            bail!(
+                "two joins from one address were given {} join id(s)",
+                ids.len()
+            );
+        }
+        let displays = crate::streamer::session::live_display_count(sessions);
+        if displays < peers.len() {
+            bail!(
+                "{} peer(s) joined from one address but the host holds {displays} display(s); a \
+                 second join must never replace the first",
+                peers.len()
+            );
+        }
+        tprintln!(
+            "[selftest] {} joins from 127.0.0.1 hold {displays} display(s): {}",
+            peers.len(),
+            ids.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    } else {
+        tprintln!(
+            "[selftest] no session map behind this config; the two-display assertion is skipped"
+        );
+    }
+
+    let pc = Arc::clone(&peers[0].pc);
+    let rtp_count = Arc::clone(&peers[0].rtp_count);
+    let track_seen = Arc::clone(&peers[0].track_seen);
+    let first_rtp_ns = Arc::clone(&peers[0].first_rtp_ns);
+    let posted_ns = peers[0].posted_ns;
+    let applied_ns = peers[0].applied_ns;
+
+    tprintln!(
+        "[selftest] both peers negotiated; waiting up to {TIMEOUT_SECS}s for >= {MIN_RTP_PACKETS} \
+         RTP packets on the first"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    while tokio::time::Instant::now() < deadline {
+        if rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    match first_rtp_ns.load(Ordering::Relaxed) {
+        0 => teprintln!("[selftest] JOIN first_rtp_ms=none"),
+        first => tprintln!(
+            "[selftest] JOIN first_rtp_ms={:.1} join_total_ms={:.1}",
+            (first.saturating_sub(applied_ns)) as f64 / 1.0e6,
+            (first.saturating_sub(posted_ns)) as f64 / 1.0e6,
+        ),
+    }
+
+    // Proving RTP flows takes about a second, which is a liveness check and not a measurement:
+    // the stage histograms would describe a session that had barely started, mostly startup
+    // transients. `--duration` holds the session open so the numbers mean something.
+    if hold_secs > 0 && rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
+        tprintln!("[selftest] holding the session open for {hold_secs}s to collect telemetry");
+        let started = rtp_count.load(Ordering::Relaxed);
+        let hold_until = tokio::time::Instant::now() + Duration::from_secs(hold_secs);
+        while tokio::time::Instant::now() < hold_until {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !matches!(
+                pc.connection_state(),
+                RTCPeerConnectionState::Connected | RTCPeerConnectionState::Connecting
+            ) {
+                teprintln!("[selftest] peer connection dropped during the hold; stopping early");
+                break;
+            }
+        }
+        let during = rtp_count.load(Ordering::Relaxed) - started;
+        tprintln!(
+            "[selftest] {during} RTP packets over {hold_secs}s ({:.0}/s)",
+            during as f64 / hold_secs as f64
+        );
+    }
+
+    let final_count = rtp_count.load(Ordering::Relaxed);
+    let tracks = track_seen.load(Ordering::Relaxed);
+    tprintln!("[selftest] on_track fired: {tracks}; RTP packets received: {final_count}");
+
+    // Both peers are asserted to have received media: a second display that never paints is
+    // exactly the symptom being fixed.
+    let mut starved: Vec<&str> = Vec::new();
+    for peer in &peers {
+        let n = peer.rtp_count.load(Ordering::Relaxed);
+        tprintln!("[selftest] {}: {n} RTP packet(s)", peer.label);
+        if n == 0 {
+            starved.push(peer.label);
+        }
+    }
+    for peer in &peers {
+        peer.pc.close().await.ok();
+    }
+    server_handle.abort();
+
+    if !starved.is_empty() {
+        bail!(
+            "these peers received no media at all: {} — a second join must not stop the first",
+            starved.join(", ")
+        );
+    }
+    if tracks == 0 {
+        bail!("on_track never fired — no media track negotiated");
+    }
+    if final_count < MIN_RTP_PACKETS {
+        bail!("only {final_count} RTP packets in {TIMEOUT_SECS}s (need >= {MIN_RTP_PACKETS})");
+    }
+
+    tprintln!("=== M3 WHEP self-test PASSED ({final_count} RTP packets) ===");
+    Ok(())
+}
+
+/// One joined peer: its connection, its counters and the join id the host gave it.
+struct Peer {
+    label: &'static str,
+    join_id: String,
+    pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
+    rtp_count: Arc<AtomicU64>,
+    track_seen: Arc<AtomicU64>,
+    first_rtp_ns: Arc<AtomicU64>,
+    posted_ns: u64,
+    applied_ns: u64,
+}
+
+/// Offer, POST, apply the answer. Everything one tab does, so the harness can run several.
+async fn join_peer(
+    api: &webrtc::api::API,
+    port: u16,
+    label: &'static str,
+    device_token: &str,
+) -> Result<Peer> {
+    let pc = Arc::new(api.new_peer_connection(RTCConfiguration::default()).await?);
     pc.add_transceiver_from_kind(
         RTPCodecType::Video,
         Some(webrtc::rtp_transceiver::RTCRtpTransceiverInit {
@@ -224,12 +371,16 @@ pub async fn run(mut config: Config) -> Result<()> {
         .ok_or_else(|| anyhow!("no local description"))?
         .sdp;
 
-    tprintln!("[selftest] POST /whep ({} bytes)", offer_sdp.len());
+    tprintln!("[selftest] {label} POST /whep ({} bytes)", offer_sdp.len());
     let posted_ns = crate::streamer::audio::host_now_ns();
-    let answer_sdp = http_post_join(port, &offer_sdp).await?;
+    let (answer_sdp, join_id) = http_post_join(port, &offer_sdp, label, device_token).await?;
     let answered_ns = crate::streamer::audio::host_now_ns();
+    if join_id.is_empty() {
+        bail!("the host answered {label} with no join id; the session has no name");
+    }
+    tprintln!("[selftest] {label} join id: {join_id}");
     tprintln!(
-        "[selftest] JOIN whep_answer_ms={:.1} ({} bytes)",
+        "[selftest] {label} JOIN whep_answer_ms={:.1} ({} bytes)",
         (answered_ns - posted_ns) as f64 / 1.0e6,
         answer_sdp.len()
     );
@@ -254,62 +405,17 @@ pub async fn run(mut config: Config) -> Result<()> {
     tprintln!("[selftest] answer applied; waiting up to {TIMEOUT_SECS}s for >= {MIN_RTP_PACKETS} RTP packets");
 
     let applied_ns = crate::streamer::audio::host_now_ns();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(TIMEOUT_SECS);
-    while tokio::time::Instant::now() < deadline {
-        if rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    match first_rtp_ns.load(Ordering::Relaxed) {
-        0 => teprintln!("[selftest] JOIN first_rtp_ms=none"),
-        first => tprintln!(
-            "[selftest] JOIN first_rtp_ms={:.1} join_total_ms={:.1}",
-            (first.saturating_sub(applied_ns)) as f64 / 1.0e6,
-            (first.saturating_sub(posted_ns)) as f64 / 1.0e6,
-        ),
-    }
 
-    // Proving RTP flows takes about a second, which is a liveness check and not a measurement:
-    // the stage histograms would describe a session that had barely started, mostly startup
-    // transients. `--duration` holds the session open so the numbers mean something.
-    if hold_secs > 0 && rtp_count.load(Ordering::Relaxed) >= MIN_RTP_PACKETS {
-        tprintln!("[selftest] holding the session open for {hold_secs}s to collect telemetry");
-        let started = rtp_count.load(Ordering::Relaxed);
-        let hold_until = tokio::time::Instant::now() + Duration::from_secs(hold_secs);
-        while tokio::time::Instant::now() < hold_until {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            if !matches!(
-                pc.connection_state(),
-                RTCPeerConnectionState::Connected | RTCPeerConnectionState::Connecting
-            ) {
-                teprintln!("[selftest] peer connection dropped during the hold; stopping early");
-                break;
-            }
-        }
-        let during = rtp_count.load(Ordering::Relaxed) - started;
-        tprintln!(
-            "[selftest] {during} RTP packets over {hold_secs}s ({:.0}/s)",
-            during as f64 / hold_secs as f64
-        );
-    }
-
-    let final_count = rtp_count.load(Ordering::Relaxed);
-    let tracks = track_seen.load(Ordering::Relaxed);
-    tprintln!("[selftest] on_track fired: {tracks}; RTP packets received: {final_count}");
-
-    pc.close().await.ok();
-    server_handle.abort();
-
-    if tracks == 0 {
-        bail!("on_track never fired — no media track negotiated");
-    }
-    if final_count < MIN_RTP_PACKETS {
-        bail!("only {final_count} RTP packets in {TIMEOUT_SECS}s (need >= {MIN_RTP_PACKETS})");
-    }
-
-    tprintln!("=== M3 WHEP self-test PASSED ({final_count} RTP packets) ===");
-    Ok(())
+    Ok(Peer {
+        label,
+        join_id,
+        pc,
+        rtp_count,
+        track_seen,
+        first_rtp_ns,
+        posted_ns,
+        applied_ns,
+    })
 }
 
 async fn wait_for_health(port: u16) -> Result<()> {
@@ -328,11 +434,17 @@ async fn wait_for_health(port: u16) -> Result<()> {
 
 /// `/whep` takes a JSON join request, not a bare SDP body. Posting `application/sdp` — which
 /// this did — could only ever come back 400, which is why the self-test had never passed.
-async fn http_post_join(port: u16, sdp: &str) -> Result<String> {
+async fn http_post_join(
+    port: u16,
+    sdp: &str,
+    label: &str,
+    device_token: &str,
+) -> Result<(String, String)> {
     let body = serde_json::json!({
         "sessionId": SELFTEST_SESSION_ID,
         "otp": SELFTEST_OTP,
-        "deviceName": "whep-selftest",
+        "deviceName": format!("whep-selftest {label}"),
+        "deviceToken": device_token,
         "os": "selftest",
         "refreshRate": 60,
         "width": 1280,
@@ -358,7 +470,20 @@ async fn http_post_join(port: u16, sdp: &str) -> Result<String> {
     if !(status_line.contains("201") || status_line.contains("200")) {
         bail!("POST /whep returned: {status_line}\nbody: {body}");
     }
-    Ok(body.to_string())
+    // The session's name, as the host hands it out. `X-Join-Id` is the direct form; `Location`
+    // carries the same id as the WHEP resource.
+    let join_id = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            match k.trim().to_ascii_lowercase().as_str() {
+                "x-join-id" => Some(v.trim().to_string()),
+                "location" => Some(v.trim().rsplit('/').next()?.to_string()),
+                _ => None,
+            }
+        })
+        .unwrap_or_default();
+    Ok((body.to_string(), join_id))
 }
 
 async fn tls_send_recv(port: u16, request: &[u8]) -> Result<Vec<u8>> {

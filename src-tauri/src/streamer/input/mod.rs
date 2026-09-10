@@ -305,6 +305,15 @@ pub struct InjectorTx {
     /// producer side is exactly the "newest wins" policy this data wants.
     fast_relief: Receiver<Queued>,
     reliable: Sender<Queued>,
+    /// A one-shot the injector also selects on.
+    ///
+    /// The thread's only other exit is both of its input channels disconnecting, and every
+    /// sender clone lives inside a handler the peer connection owns — the input data channel's
+    /// `on_message`, the state-change handler that releases held keys. Those outlive the
+    /// `SessionHandle`, so "drop the sender and join" waited on a thread with no way to leave,
+    /// inside the task that removes the virtual display. This is the exit that does not depend
+    /// on anyone else letting go.
+    stop: Sender<()>,
     telemetry: SharedTelemetry,
     offset: Arc<ClockOffset>,
 }
@@ -343,6 +352,12 @@ impl InjectorTx {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Tell the injector to leave. Idempotent, and never blocks: the channel holds one slot and
+    /// a second call finds it full, which is the same instruction already in flight.
+    pub fn shutdown(&self) {
+        let _ = self.stop.try_send(());
+    }
+
     pub fn release_all(&self) {
         use self::protocol::Lifecycle;
         let _ = self.reliable.send(Queued {
@@ -357,6 +372,7 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
     let (fast_tx, fast_rx) = bounded::<Queued>(FAST_CAP);
     let fast_relief = fast_rx.clone();
     let (rel_tx, rel_rx) = unbounded::<Queued>();
+    let (stop_tx, stop_rx) = bounded::<()>(1);
 
     let thread_telemetry = Arc::clone(&telemetry);
     let join = thread::Builder::new()
@@ -377,6 +393,7 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
             let mut last_delta_buttons: u16 = 0;
             loop {
                 let q = select! {
+                    recv(stop_rx) -> _ => break,
                     recv(rel_rx) -> m => match m {
                         Ok(q) => q,
                         Err(_) => break,
@@ -438,6 +455,7 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
             fast: fast_tx,
             fast_relief,
             reliable: rel_tx,
+            stop: stop_tx,
             telemetry,
             offset: Arc::new(ClockOffset::default()),
         },

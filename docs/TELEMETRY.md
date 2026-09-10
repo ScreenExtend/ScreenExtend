@@ -461,6 +461,7 @@ host. The field is a union of the page's own bits and the audio module's.
 | 21 | Keyboard Lock unavailable |
 | 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
 | 23 | input was suspended so the user could reach a dialog on the page |
+| 24 | the host named no session, so `/reconfig` and `/leave` reach nothing |
 
 Bit 9 says the names beside the output ids are the client page's own numbering ("Output 1",
 "Output 2", "Default output") rather than what the operating system calls the hardware. It is
@@ -494,6 +495,15 @@ forwarding back from the host to put something in front of the user — a card, 
 browser's own output picker. Without it the host sees a device that simply stopped sending input
 and cannot tell a dialog from a wedge. It is only set where a session was actually forwarding:
 the microphone card raised before the join suspends nothing and reports nothing.
+
+Bit 24 means the answer carried neither an `X-Join-Id` header nor a `Location` resource and no
+`se_join` cookie was set, so this tab has no name for its own session. Only a proxy that strips
+all three can produce it. The consequence is that `/reconfig` reads stable zeros and `/leave`
+reaches nothing — the host will not resolve a request by the peer's address, because an address
+moves under a live session and is handed on to the next device that asks for one, so guessing is
+how one device ends up driving another's display. The picture still works; what is lost is every
+live settings change and the prompt release of the display when the tab closes, which then waits
+out the disconnect grace instead.
 
 Bit 22 is set when `/net-config` did not say `trickleIce: true` (an older host, or the cloud
 relay, which tunnels `/whep` but not `/net-config`), and in the cases the client cannot detect

@@ -19,7 +19,7 @@ export {
   DEFAULT_HTTPS_PORT,
   defaultConfig,
 } from "@/lib/config-defaults";
-export type { PointerScope, Device, KnownDevice, Config } from "@/lib/config-defaults";
+export type { PointerScope, Device, ConnectedDevice, KnownDevice, Config } from "@/lib/config-defaults";
 
 const sameDevice = (d: KnownDevice, token: string, ip: string) =>
   token ? d.token === token : (!d.token && d.ip === ip);
@@ -124,16 +124,32 @@ export const getSavedDevices = async (): Promise<Device[]> => {
   return (await getConfig())?.devices ?? [];
 };
 
+// A saved row belongs to a device, and a device is its token. Addresses are recycled — the one
+// a phone had this morning is the one somebody's laptop gets this afternoon — so a row matched
+// by address hands one device's settings to another. A row written before tokens existed still
+// matches by address, which is the only thing it names, until that device joins once more.
+const sameSavedDevice = (d: Device, token: string, ip: string) =>
+  token && d.token ? d.token === token : (!d.token && !!ip && d.ip === ip);
+
 export const saveDeviceSettings = async (device: Device) => {
   const existing = await getSavedDevices();
-  const devices = [...existing.filter(d => d.ip !== device.ip), { ...device, name: "" }];
+  const devices = [
+    ...existing.filter(d => !sameSavedDevice(d, device.token, device.ip)),
+    { ...device, name: "" },
+  ];
   await updateConfig({ devices });
 };
 
-export const removeSavedDevice = async (ip: string) => {
+export const removeSavedDevice = async (token: string, ip: string) => {
   const existing = await getSavedDevices();
-  await updateConfig({ devices: existing.filter(d => d.ip !== ip) });
+  await updateConfig({ devices: existing.filter(d => !sameSavedDevice(d, token, ip)) });
 };
+
+export const findSavedDevice = (
+  saved: Device[] | undefined,
+  token: string,
+  ip: string,
+): Device | undefined => saved?.find(d => sameSavedDevice(d, token, ip));
 
 export const getKnownDevices = async (): Promise<KnownDevice[]> => {
   const raw = (await getConfig())?.knownDevices ?? [];
