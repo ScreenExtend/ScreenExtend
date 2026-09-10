@@ -72,6 +72,34 @@ Mac, over SSH from `src-tauri/`: the same three cargo gates, plus
 `scripts/check-macos-dyld.sh target/release/ScreenExtend /Library/Developer/CommandLineTools/SDKs/MacOSX10.15.sdk`
 after any macOS change that touches FFI (it fails on any link-time symbol newer than 10.15).
 
+From the root when `pnpm-lock.yaml` changed: `pnpm test:lockfile`.
+
+## `pnpm-lock.yaml`
+
+**Never `pnpm install --no-optional`, and never hand-trim the lockfile: it must carry the
+platform packages.** `@tauri-apps/cli`, `esbuild` and `rollup` are all thin JS wrappers around a
+native binary that ships as one npm package per platform, listed in the wrapper's
+`optionalDependencies`; the installer picks the matching one. A lockfile that records the
+wrapper without that list installs *only* the wrapper, and `pnpm tauri` then dies with
+`Cannot find module '@tauri-apps/cli-win32-x64-msvc'`.
+
+That failure does not show up where it is made. The machine that wrote the lockfile already has
+the platform package in its pnpm store and in its `node_modules`, so every command keeps working
+there; the break appears on a fresh clone and on every CI runner, which is exactly where nobody
+is watching. `9a181cb` shipped in that state — a lockfile "refresh" dropped all eleven
+`@tauri-apps/cli-*` entries plus five exotic `@esbuild/*` / `@rollup/*` ones and `@pkgjs/parseargs`
+— and it went unnoticed for two days because the Windows box's store still held the binary.
+
+- Refresh the lockfile with `pnpm install --lockfile-only`, and if a package's optional list has
+  gone missing, `pnpm install --lockfile-only --fix-lockfile`. Plain `--lockfile-only` will *not*
+  restore it: pnpm reads the existing lockfile as satisfying `package.json` and does nothing,
+  `--force` included. `--fix-lockfile` is what re-resolves and re-fills.
+- Read the diff. Restoring optional entries is purely additive — new `packages:` and `snapshots:`
+  keys, no version changed. If pnpm wants to bump something you did not ask it to, pin it back.
+- `pnpm test:lockfile` (`scripts/check-lockfile.mjs`) is the guard, and it runs in CI's `frontend`
+  job right after the install. It reads every installed package's own `package.json` out of
+  `node_modules/.pnpm` and fails on any declared optional dependency the lockfile does not record.
+
 ### Tests that need something the gates do not have
 
 `cargo test` deliberately runs nothing that needs a desktop session, a GPU or a real display, so
