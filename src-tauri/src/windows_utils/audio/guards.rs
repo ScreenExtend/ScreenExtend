@@ -2,9 +2,7 @@ use anyhow::{Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_EVENT, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::WAVEFORMATEX;
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
-};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
     WaitForSingleObject,
@@ -38,19 +36,21 @@ impl Drop for MixFormatPtr {
     }
 }
 
-pub struct ComGuard;
+/// The MTA the WASAPI threads run in.
+///
+/// Both call sites — the MMCSS "Pro Audio" capture thread and the silent render companion — are
+/// threads this crate spawned itself, so they are the one kind that may initialize COM. It still
+/// goes through `windows_utils::com`, which asks `CoGetApartmentType` first: if a future caller
+/// ever reaches this from a Tauri thread the guard becomes inert rather than either failing with
+/// `RPC_E_CHANGED_MODE` or, worse, uninitializing an apartment it never took.
+pub struct ComGuard(crate::windows_utils::com::ComScope);
 
 impl ComGuard {
     pub fn init_mta() -> Result<Self> {
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }
-            .context("CoInitializeEx(MTA) on audio thread")?;
-        Ok(Self)
-    }
-}
-
-impl Drop for ComGuard {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize() };
+        use crate::windows_utils::com::{ensure_for_this_thread, Apartment};
+        ensure_for_this_thread("audio", Apartment::Mta)
+            .map(Self)
+            .context("COM (MTA) on audio thread")
     }
 }
 
