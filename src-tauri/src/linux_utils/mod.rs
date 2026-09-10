@@ -53,6 +53,10 @@ pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
 
 #[tauri::command]
 #[specta::specta]
+pub fn set_device_pointer_scope(_state: tauri::State<'_, AppState>, _ip: String, _scope: String) {}
+
+#[tauri::command]
+#[specta::specta]
 pub fn refresh_device_stream(_state: tauri::State<'_, AppState>, _ip: String) -> bool {
     false
 }

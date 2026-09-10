@@ -96,12 +96,130 @@ pub struct JoinAttemptsPaused {
     pub retry_after_secs: u32,
 }
 
+/// The severities a capability note can carry.
+///
+/// `blocking` is the only one that takes "Continue anyway" off the startup gate, so it is
+/// reserved for the **bare minimum**: a host that cannot create a virtual display, cannot
+/// capture, or cannot encode at all. Everything a user could plausibly live without — the
+/// hosted network, any audio tier, remote input, a hardware GPU, the preferred one of two
+/// working capture backends — is `optional`. `installable` is a row the app can fix by itself;
+/// the bootstrap remediates it and re-probes before deciding anything.
+pub const SEVERITY_BLOCKING: &str = "blocking";
+pub const SEVERITY_INSTALLABLE: &str = "installable";
+pub const SEVERITY_OPTIONAL: &str = "optional";
+
+/// Stable ids for the rows the frontend and `doctor` branch on. The prose beside them is for
+/// humans and may be reworded at any time; these may not.
+pub mod api_key {
+    /// No capture backend at all.
+    pub const CAPTURE: &str = "capture";
+    /// The preferred capture backend is missing but a working fallback was probed.
+    pub const CAPTURE_PREFERRED: &str = "capture-preferred";
+    /// No way to create a display for a joining device.
+    pub const DISPLAY: &str = "display";
+    /// No encoder at all — not even the software one.
+    pub const ENCODER: &str = "encoder";
+    /// The virtual display driver is not installed. Installable.
+    pub const DISPLAY_DRIVER: &str = "display-driver";
+    /// The virtual display driver is installed but not answering. Installable (reinstall).
+    pub const DISPLAY_DRIVER_UNRESPONSIVE: &str = "display-driver-unresponsive";
+    /// Displays work, but this backend can only drive one at a time.
+    pub const DISPLAY_CAPPED: &str = "display-capped";
+    pub const GPU_ADAPTER: &str = "gpu-adapter";
+    pub const AUDIO: &str = "audio";
+    pub const WIFI_RADIOS: &str = "wifi-radios";
+    pub const HOSTED_NETWORK: &str = "hosted-network";
+    pub const WMI: &str = "wmi";
+    pub const INPUT_ACCESSIBILITY: &str = "input-accessibility";
+}
+
+/// The three capabilities that make a host usable at all: it must be able to create a display,
+/// capture it, and encode the result. Missing any one of them means there is nothing to offer a
+/// device that joins, and only those three may produce a `blocking` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BareMinimum {
+    Display,
+    Capture,
+    Encoder,
+}
+
+impl BareMinimum {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Display => api_key::DISPLAY,
+            Self::Capture => api_key::CAPTURE,
+            Self::Encoder => api_key::ENCODER,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct UnsupportedApi {
+    /// Stable id from [`api_key`]. The severity says how bad it is; this says what it is.
+    pub key: String,
     pub name: String,
     pub description: String,
     pub required_version: String,
     pub severity: String,
+}
+
+impl UnsupportedApi {
+    /// A row that stops startup. Taking [`BareMinimum`] rather than a string is the audit: a
+    /// capability that is not one of the three cannot be given this severity by accident.
+    pub fn blocking(
+        what: BareMinimum,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: what.key().to_string(),
+            name: name.into(),
+            description: description.into(),
+            required_version: required_version.into(),
+            severity: SEVERITY_BLOCKING.to_string(),
+        }
+    }
+
+    /// A row the app can fix by itself, before it decides anything.
+    pub fn installable(
+        key: &str,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: key.to_string(),
+            name: name.into(),
+            description: description.into(),
+            required_version: required_version.into(),
+            severity: SEVERITY_INSTALLABLE.to_string(),
+        }
+    }
+
+    /// Something is missing, and the host still streams without it.
+    pub fn optional(
+        key: &str,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        required_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            key: key.to_string(),
+            name: name.into(),
+            description: description.into(),
+            required_version: required_version.into(),
+            severity: SEVERITY_OPTIONAL.to_string(),
+        }
+    }
+
+    pub fn is_blocking(&self) -> bool {
+        self.severity == SEVERITY_BLOCKING
+    }
+
+    pub fn is_installable(&self) -> bool {
+        self.severity == SEVERITY_INSTALLABLE
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
@@ -117,6 +235,26 @@ pub struct CompatibilityReport {
     pub encoder_backend: String,
     pub hosted_network_backend: String,
     pub input_backend: String,
+}
+
+impl CompatibilityReport {
+    /// Whether this host is missing something it cannot stream without.
+    ///
+    /// This is the one question the startup gate asks: a `true` here is the only reason the
+    /// user is not offered "Continue anyway". `installable` rows are deliberately not counted —
+    /// they are remediated and re-probed first, and only what survives that can be missing.
+    pub fn bare_minimum_missing(&self) -> bool {
+        !self.os_supported
+            || self
+                .unsupported_apis
+                .iter()
+                .any(UnsupportedApi::is_blocking)
+    }
+
+    /// The rows the app can fix by itself, in the order they were probed.
+    pub fn installable(&self) -> impl Iterator<Item = &UnsupportedApi> {
+        self.unsupported_apis.iter().filter(|a| a.is_installable())
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
@@ -142,6 +280,10 @@ pub struct Device {
     pub video_quality: u32,
     #[serde(rename = "remoteControl")]
     pub control_enabled: bool,
+    /// `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
+    /// See `streamer::input::PointerScope`.
+    #[serde(rename = "pointerScope")]
+    pub pointer_scope: String,
     #[serde(rename = "systemAudio")]
     pub audio_enabled: bool,
     pub os: String,
@@ -180,6 +322,9 @@ impl Device {
             video_scale: 100,
             video_quality: 15,
             control_enabled: true,
+            pointer_scope: streamer::input::PointerScope::default()
+                .as_str()
+                .to_string(),
             audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
@@ -555,6 +700,7 @@ pub fn run() {
             audio_driver_status,
             set_legacy_volume_key_proxy,
             set_device_override,
+            set_device_pointer_scope,
             refresh_device_stream,
             set_device_audio_output,
             get_device_audio_outputs,

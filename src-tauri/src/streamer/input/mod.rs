@@ -18,6 +18,45 @@ use self::protocol::InputEvent;
 pub struct ClientProfile {
     pub device_name: Option<String>,
     pub platform: ClientPlatform,
+    pub pointer_scope: PointerScope,
+}
+
+/// How far a pointer-locked client's relative motion is allowed to travel.
+///
+/// Absolute pointer frames carry coordinates inside the client's own display and are mapped
+/// there whatever this says; only `MOUSE_DELTA` under pointer lock accumulates a position of its
+/// own, and the question is what to clamp that position to.
+///
+/// The arguments are balanced — a user who granted control of the screen they can see has not
+/// obviously granted the desktop they cannot, but dragging a window back off the virtual display
+/// requires crossing the boundary — so it is a per-device choice rather than a rule. The default
+/// is the conservative one: the client can reach exactly what it is looking at. Blast radius is
+/// bounded by `control_enabled` either way, and the setting is read at join, like remote control
+/// itself, so a change applies to the next connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PointerScope {
+    /// Confine the locked cursor to the display this session is streaming.
+    #[default]
+    Display,
+    /// Let it cross onto the host's real monitors, i.e. the whole virtual desktop.
+    All,
+}
+
+impl PointerScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Display => "display",
+            Self::All => "all",
+        }
+    }
+
+    /// Anything unrecognised is the safe answer, which is also the default.
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            _ => Self::Display,
+        }
+    }
 }
 
 /// The client's own operating system, as it reported at join.
