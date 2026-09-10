@@ -7,10 +7,14 @@ import { X } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { useZoom } from "@/components/global-provider";
+import { HIGHLIGHT_PROXY_ID, WALKTHROUGH_TOUR } from "@/components/walkthrough-context";
 import { cn } from "@/lib/utils";
 
-export const WALKTHROUGH_TOUR = "welcome";
-export const HIGHLIGHT_PROXY_ID = "tour-highlight-proxy";
+// This module pulls in `nextstepjs` (and `motion` behind it), so it must stay off the
+// eager import graph -- `App.tsx` reaches it through a dynamic import. The two constants
+// live in `walkthrough-context.ts` for the same reason and are re-exported here for the
+// files that already had them from this path.
+export { HIGHLIGHT_PROXY_ID, WALKTHROUGH_TOUR };
 export type SidePadding = { top?: number; right?: number; bottom?: number; left?: number };
 
 interface WalkStep {

@@ -123,7 +123,8 @@
                 { "name": "video-scale", "takesValue": true, "description": "Video resolution percent (10-100)." },
                 { "name": "video-quality", "takesValue": true, "description": "Encoder quality 1 (best) to 51 (worst)." },
                 { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." },
-                { "name": "audio", "takesValue": true, "possibleValues": ["on", "off"], "description": "System audio streaming." }
+                { "name": "audio", "takesValue": true, "possibleValues": ["on", "off"], "description": "System audio streaming." },
+                { "name": "pointer-scope", "takesValue": true, "possibleValues": ["display", "all"], "description": "How far a pointer-locked client may drive the cursor: its own display, or every screen." }
               ]
             },
             "reset": {

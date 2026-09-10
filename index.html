@@ -37,20 +37,49 @@
         }
       })();
     </script>
+    <!-- Browser chrome the app has no use for. Each guard is scoped to what it is for;
+         a document-wide preventDefault costs a real gesture somewhere else in a window
+         that also hosts a full Monaco instance. `Element.closest` is Safari 9+. -->
     <script>
-      document.addEventListener("contextmenu", event => event.preventDefault());
-      document.addEventListener("click", (event) => {
-        if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
-          event.preventDefault();
-        }
+      (function () {
+      var editable = ".monaco-editor, input, textarea, select, [contenteditable]";
+
+      function within(node, selector) {
+        if (!node || node.nodeType !== 1 || typeof node.closest !== "function") return false;
+        return !!node.closest(selector);
+      }
+
+      // Text fields keep their menu: suppressing it everywhere took cut/copy/paste and
+      // spellcheck off every input in the app and replaced them with nothing.
+      document.addEventListener("contextmenu", function (event) {
+        if (within(event.target, editable)) return;
+        event.preventDefault();
       });
-      document.addEventListener("keydown", (event) => {
-        if (event.key === "F5" || (event.ctrlKey && event.key === "r")) {
-          event.preventDefault();
-        }
+
+      // Only modified clicks on links: those are the ones a webview may answer by opening
+      // a window the app cannot manage. Alt+click is Monaco's multi-cursor, Ctrl/Cmd+click
+      // is add-cursor and go-to-definition, and Shift+click is range-extend for text and
+      // list selection -- all of which the old document-wide guard swallowed.
+      document.addEventListener("click", function (event) {
+        if (!(event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)) return;
+        if (!within(event.target, "a[href]")) return;
+        event.preventDefault();
       });
-      document.addEventListener("dragover", event => event.preventDefault());
-      document.addEventListener("drop", event => event.preventDefault());
+
+      // Reload throws away every piece of in-memory state (the router is a memory router)
+      // and re-runs setup. `metaKey` matters most on macOS, whose WKWebView is the one
+      // likeliest to honour Cmd+R.
+      document.addEventListener("keydown", function (event) {
+        var reload =
+          event.key === "F5" ||
+          ((event.ctrlKey || event.metaKey) && (event.key === "r" || event.key === "R"));
+        if (reload) event.preventDefault();
+      });
+
+      // A file dropped on the window would otherwise navigate away from the app.
+      document.addEventListener("dragover", function (event) { event.preventDefault(); });
+      document.addEventListener("drop", function (event) { event.preventDefault(); });
+      })();
     </script>
     <script>
       window.addEventListener("error", function (event) {

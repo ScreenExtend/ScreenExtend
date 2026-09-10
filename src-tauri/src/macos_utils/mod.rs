@@ -275,9 +275,23 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                         crate::BYE_FLUSH_TIMEOUT,
                     );
                     let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    let ended = ips.len() as u32;
                     for ip in ips {
                         session::bump_kick_epoch(&state.sessions, &ip);
                         session::signal_leave(&state.sessions, &ip);
+                    }
+                    // The log line above is the record; this is what puts it in front of
+                    // the person at the host, who is otherwise left to work out why a
+                    // device dropped. `App.tsx` answers it by re-opening the permission
+                    // gate over whatever route is mounted.
+                    use tauri_specta::Event as _;
+                    if let Err(e) = (crate::ScreenRecordingRevoked {
+                        key: permissions::KEY_SCREEN_RECORDING.to_string(),
+                        sessions_ended: ended,
+                    })
+                    .emit(&app_handle)
+                    {
+                        teprintln!("[tcc] could not emit ScreenRecordingRevoked: {e}");
                     }
                 }
                 if now.is_some() {
@@ -323,6 +337,16 @@ pub fn set_device_override(
         control_enabled,
         dpr,
         audio_enabled,
+        // Not an argument here: `set_device_override` is already at specta's ten-argument
+        // ceiling, and unlike everything above it, pointer scope needs no rebuild verdict.
+        // `set_device_pointer_scope` owns it, and a device with no saved scope keeps the
+        // default rather than being reset by an unrelated display change.
+        pointer_scope: state
+            .device_overrides
+            .lock_recover()
+            .get(&ip)
+            .map(|o| o.pointer_scope)
+            .unwrap_or_default(),
     };
     // Which overrides need the session rebuilt, and which only need the display touched. The
     // client answers a reconfig epoch bump by tearing the whole session down — peer connection,
@@ -362,6 +386,43 @@ pub fn set_device_override(
             }
         });
     }
+}
+
+/// Where a pointer-locked client may drive this host's cursor: `"display"` (its own screen,
+/// the default) or `"all"` (every screen, including the host's real monitors).
+///
+/// Its own command rather than another `set_device_override` argument: that one is at specta's
+/// ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
+/// no live display to touch. The injector reads the scope when the session is built, so a
+/// change applies to the next connection, exactly like remote control itself.
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_pointer_scope(state: State<'_, AppState>, ip: String, scope: String) {
+    let parsed = crate::streamer::input::PointerScope::from_str(&scope);
+    let mut overrides = state.device_overrides.lock_recover();
+    match overrides.get_mut(&ip) {
+        Some(existing) => existing.pointer_scope = parsed,
+        None => {
+            // Nothing saved for this device yet. Everything else takes the same defaults the
+            // join path would have used, so saving a scope cannot silently pin a resolution.
+            overrides.insert(
+                ip.clone(),
+                DeviceOverride {
+                    scale: 100,
+                    orientation_portrait: false,
+                    refresh_rate: 60,
+                    video_scale: 100,
+                    video_quality: 15,
+                    control_enabled: true,
+                    dpr: 1.0,
+                    audio_enabled: false,
+                    pointer_scope: parsed,
+                },
+            );
+        }
+    }
+    drop(overrides);
+    tprintln!("[input] pointer scope for {ip} is now {}", parsed.as_str());
 }
 
 #[tauri::command]
@@ -466,7 +527,9 @@ pub fn get_disconnect_grace(state: State<'_, AppState>) -> u32 {
 #[tauri::command]
 #[specta::specta]
 pub fn get_display_capacity(state: State<'_, AppState>) -> DisplayCapacity {
-    let max = state.virtual_display.max_concurrent_displays();
+    // Through `shared_display_cap`, so `full` can only ever be true on the AirPlay tier, which
+    // macOS itself limits to one display.
+    let max = session::shared_display_cap(&state.virtual_display);
     let in_use = session::live_display_count(&state.sessions);
     DisplayCapacity {
         max: max.map(|m| m as u32),
@@ -752,7 +815,7 @@ pub fn get_cloud_status(state: State<'_, AppState>) -> crate::CloudStatusChange 
 }
 
 fn display_slot_holder(state: &AppState) -> Option<String> {
-    let max = state.virtual_display.max_concurrent_displays()?;
+    let max = session::shared_display_cap(&state.virtual_display)?;
     if session::live_display_count(&state.sessions) < max {
         return None;
     }

@@ -45,30 +45,54 @@ export function useFocus<T extends HTMLElement>() {
     return { inputRef, setInputFocus };
 }
 
-export async function buildQrValues(sessionId: string, httpPort: number = DEFAULT_STREAMER_HTTP_PORT): Promise<{ title: string; value: string }[]> {
-  if (!sessionId) return [];
+export type QrEntry = { title: string; value: string };
+
+/// An empty list has two very different causes, and callers that cannot tell them apart say the
+/// wrong thing: "no networks were found" is right for a machine with no usable adapter and wrong
+/// for an IPC call that failed, where the host may be serving perfectly well on a network we
+/// simply could not read. `adaptersUnavailable` is that distinction.
+export type QrValues = { entries: QrEntry[]; adaptersUnavailable: boolean };
+
+export async function readQrValues(
+  sessionId: string,
+  httpPort: number = DEFAULT_STREAMER_HTTP_PORT
+): Promise<QrValues> {
+  if (!sessionId) return { entries: [], adaptersUnavailable: false };
   const port = Number.isInteger(httpPort) && httpPort > 0 ? httpPort : DEFAULT_STREAMER_HTTP_PORT;
   let adapters: NetworkInfo[] = [];
   try {
     adapters = await commands.getNetworkAdapters();
   } catch (e) {
-    // The dashboard renders an empty list as "no networks were found", which is the wrong
-    // message for a failed IPC call -- but the correct one is a copy change, so for now
-    // the reason at least reaches the log bus.
     console.error("reading the network adapters failed", e);
-    return [];
+    return { entries: [], adaptersUnavailable: true };
   }
   const isIpv4 = (ip: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
-  return adapters
+  // Anything with a colon is IPv6. `%25eth0`-style zone identifiers and link-local
+  // addresses are dropped: a zone id is meaningful only on the host that wrote it, and
+  // fe80:: cannot be typed into a phone's browser and reach us.
+  const isRoutableIpv6 = (ip: string) =>
+    ip.indexOf(":") >= 0 && ip.indexOf("%") < 0 && !/^fe[89ab]/i.test(ip) && ip !== "::1";
+  const entries = adapters
     .map((adapter) => {
+      // IPv4 stays first where an adapter has both -- it is shorter to read off a screen
+      // and every client understands it. The IPv6 branch is what makes an IPv6-only
+      // network show a QR code at all: the host already binds and serves it, and the
+      // bracketed authority form is what a URL needs.
       const ipv4 = adapter.ip_addresses.find(isIpv4);
-      if (!ipv4) return null;
+      const host = ipv4 ?? adapter.ip_addresses.find(isRoutableIpv6);
+      if (!host) return null;
+      const authority = host === ipv4 ? host : `[${host}]`;
       return {
         title: adapter.network_name,
-        value: `http://${ipv4}:${port}/?id=${sessionId}`,
+        value: `http://${authority}:${port}/?id=${sessionId}`,
       };
     })
-    .filter((entry): entry is { title: string; value: string } => entry !== null);
+    .filter((entry): entry is QrEntry => entry !== null);
+  return { entries, adaptersUnavailable: false };
+}
+
+export async function buildQrValues(sessionId: string, httpPort: number = DEFAULT_STREAMER_HTTP_PORT): Promise<QrEntry[]> {
+  return (await readQrValues(sessionId, httpPort)).entries;
 }
 
 export function generatePassword(length = 12): string {

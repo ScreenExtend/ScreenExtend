@@ -1,5 +1,6 @@
 import { commands } from "@/lib/bindings";
 import {
+  DEFAULT_POINTER_SCOPE,
   flushConfig,
   updateConfig,
   type Config,
@@ -23,6 +24,7 @@ const resolveDevice = (device: Device): Device => ({
   videoScale: device.videoScale ?? 100,
   videoQuality: device.videoQuality ?? 23,
   remoteControl: device.remoteControl ?? false,
+  pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
   systemAudio: device.systemAudio ?? false,
   audioOutputDeviceId: device.audioOutputDeviceId ?? "",
   dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -73,6 +75,9 @@ export async function applyConfig(config: Config): Promise<Config> {
         device.dpr,
         device.systemAudio
       );
+      // Its own command rather than a `setDeviceOverride` argument: that one is at
+      // specta's ten-parameter ceiling.
+      await commands.setDevicePointerScope(device.ip, device.pointerScope ?? DEFAULT_POINTER_SCOPE);
       await commands.setDeviceAudioOutput(device.ip, device.audioOutputDeviceId);
     });
   }

@@ -579,7 +579,11 @@
                 // `selected` there is what `set_device_audio_output` asked for and the posted
                 // `selected` is ignored, so this is the only channel by which a change the user
                 // made in the browser's own output control reaches the host at all.
-                current: speakers.appliedSink || '',
+                //
+                // Omitted entirely until something has actually applied a sink, because
+                // `JSON.stringify` drops an `undefined` value: the host keeps `None`, and the
+                // UI can tell "this client never said" from `''`, the device's default output.
+                current: speakers.appliedSink === null ? undefined : speakers.appliedSink,
             });
             // The list is identical on all but a handful of ticks in a session, and the host
             // does the same work whether or not it changed. Re-POSTing it was a request per

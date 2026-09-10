@@ -152,11 +152,17 @@ impl AppState {
         }
     }
 
+    /// Whether this join has to be turned away for want of a display slot.
+    ///
+    /// Only the one-at-a-time AirPlay tier can answer yes — see
+    /// [`session::concurrent_display_cap`]. On every other backend this is `false` whatever the
+    /// session map looks like, so a join that is going to fail fails with its own error rather
+    /// than being reported as a full host.
     pub fn display_slot_unavailable(&self, client_ip: &str) -> bool {
         let Some(client) = self.config.virtual_display.as_ref() else {
             return false;
         };
-        let Some(max) = client.max_concurrent_displays() else {
+        let Some(max) = session::shared_display_cap(client) else {
             return false;
         };
         let Some(sessions) = self.config.sessions.as_ref() else {
@@ -173,7 +179,7 @@ impl AppState {
             .config
             .virtual_display
             .as_ref()
-            .and_then(|c| c.max_concurrent_displays());
+            .and_then(session::shared_display_cap);
         let in_use = self
             .config
             .sessions
@@ -1093,6 +1099,7 @@ async fn start_session(
         .as_ref()
         .and_then(|o| o.lock_recover().get(client_ip).copied());
     let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
+    let pointer_scope = override_for_ip.map(|o| o.pointer_scope).unwrap_or_default();
     let audio_params = match (
         state.config.audio_hub.as_ref(),
         state.config.device_overrides.as_ref(),
@@ -1506,6 +1513,7 @@ async fn start_session(
             device: Some(device_name.clone()),
             client_os: req.os.trim().to_string(),
             control_enabled,
+            pointer_scope,
             control_rx: Some(control_rx),
         },
         audio_params,
@@ -2016,6 +2024,26 @@ mod tests {
         let state = state_with(Some(1), &[]);
         assert!(!state.display_slot_unavailable("10.0.0.2"));
         assert_eq!(state.display_capacity(), (Some(1), 0));
+    }
+
+    /// One display at a time is the macOS AirPlay tier's limit and nothing else's. A backend
+    /// that reports any other finite cap is a bug, and the product rule is that the user is
+    /// never turned away: the cap is dropped, the join goes ahead, and whatever really goes
+    /// wrong reports itself. `at-capacity.html` must be unreachable from here.
+    #[test]
+    fn only_a_one_display_backend_can_turn_a_device_away() {
+        for cap in [Some(2), Some(3), Some(8)] {
+            let state = state_with(cap, &["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
+            assert!(
+                !state.display_slot_unavailable("10.0.0.9"),
+                "cap {cap:?}: an uncapped backend must never serve at-capacity.html"
+            );
+            assert_eq!(
+                state.display_capacity().0,
+                None,
+                "cap {cap:?}: must be reported as uncapped, so the dashboard never reads full"
+            );
+        }
     }
 
     #[test]

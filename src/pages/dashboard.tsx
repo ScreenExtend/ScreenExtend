@@ -15,11 +15,9 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
-import { useNextStep } from "nextstepjs";
-
 import { useConnectedDevices, useQrValues, useSession } from "@/components/global-provider";
 import { getConfig } from "@/components/config-provider";
-import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
+import { WALKTHROUGH_TOUR, useWalkthrough } from "@/components/walkthrough-context";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -54,7 +52,7 @@ export default function Dashboard() {
   const qrValues = useQrValues();
   const { sessionId, publicSessionsEnabled } = useSession();
   const devices = useConnectedDevices();
-  const { startNextStep } = useNextStep();
+  const { start: startWalkthrough } = useWalkthrough();
   const { t } = useTranslation();
   const [cloudStatus, setCloudStatus] = useState<CloudStatus>({ state: "connecting", detail: "" });
   const [statusLoaded, setStatusLoaded] = useState(false);
@@ -68,13 +66,13 @@ export default function Dashboard() {
         const cfg = await getConfig();
         if (cancelled || walkthroughAutoStarted || cfg?.walkthroughCompleted) return;
         walkthroughAutoStarted = true;
-        requestAnimationFrame(() => { if (!cancelled) startNextStep(WALKTHROUGH_TOUR); });
+        requestAnimationFrame(() => { if (!cancelled) startWalkthrough(WALKTHROUGH_TOUR); });
       } catch (e) {
         console.error("walkthrough auto-start check failed", e);
       }
     })();
     return () => { cancelled = true; };
-  }, [startNextStep]);
+  }, [startWalkthrough]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
