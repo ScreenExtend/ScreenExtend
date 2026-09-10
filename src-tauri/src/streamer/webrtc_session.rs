@@ -153,6 +153,43 @@ impl KeyframeRequester {
         }
         true
     }
+
+    /// A keyframe, and nothing cleverer, because the **client** asked for one.
+    ///
+    /// A PLI, a FIR or the client's out-of-band opcode all mean the same thing: *this decoder
+    /// cannot continue from what it has*. A long-term-reference repair is the wrong answer to
+    /// that by construction — it predicts from a picture the decoder is being told it does not
+    /// have — and the `can_repair` guard does not catch it, because "the client holds this
+    /// reference" is inferred from transport-wide feedback, i.e. from the *packets* arriving,
+    /// not from anything having decoded them.
+    ///
+    /// The two come apart on every single join. The session's opening IDR goes out while the
+    /// track is binding, its packets are acknowledged, and the page then installs its transform
+    /// and creates a decoder that has never seen a keyframe. From that point every request it
+    /// makes was answered with a repair frame it could not use: measured on the Windows dev box,
+    /// 35 admitted requests produced one IDR, the page logged `no WebCodecs frame within 5s`,
+    /// and it demoted itself to a `<video>` element for the rest of the session.
+    ///
+    /// libwebrtc's rule is the same one: a PLI is answered with a keyframe, full stop. The
+    /// repair path keeps the losses the *transport* detected, which do imply a decoder that is
+    /// running.
+    pub fn request_keyframe_for_client(&self, reason: &str) -> bool {
+        if !self.gate.allow(audio::host_now_ns()) {
+            return false;
+        }
+        tprintln!("keyframe requested: {reason}");
+        self.pipeline.request_idr();
+        true
+    }
+
+    /// The same, without the log line, for the paths a stalled decoder repeats.
+    pub fn request_keyframe_for_client_quietly(&self) -> bool {
+        if !self.gate.allow(audio::host_now_ns()) {
+            return false;
+        }
+        self.pipeline.request_idr();
+        true
+    }
 }
 
 pub struct InputParams {
@@ -1168,7 +1205,7 @@ pub async fn activate_whep(
                                 // `pipeline.request_idr()` directly: this floor guards against a
                                 // looping client, the gate guards against answering a decoder's
                                 // whole backlog with the largest frame the encoder emits.
-                                idr_keyframes.request_quietly();
+                                idr_keyframes.request_keyframe_for_client_quietly();
                             }
                         }
                         ev if control_enabled => {
@@ -1210,7 +1247,7 @@ pub async fn activate_whep(
                             .degradation
                             .keyframe_requests
                             .fetch_add(1, Ordering::Relaxed);
-                        keyframes.request_quietly();
+                        keyframes.request_keyframe_for_client_quietly();
                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
                         // Counted, never logged: a lossy link produces these continuously and
                         // every logbus line is a JSON IPC event to the UI.
@@ -1314,6 +1351,7 @@ pub async fn activate_whep(
                 pipeline.frame_duration,
             );
             let mut warned_unbound = false;
+            let mut first_frame_written = false;
             let mut warned_dropped_params = false;
             // Two extensions when the client offered transport-wide-cc, one when it did not.
             // Stamping an extension the peer never negotiated costs a marshal and a `BytesMut`
@@ -1440,6 +1478,23 @@ pub async fn activate_whep(
                                 );
                             }
                             continue;
+                        }
+                        // The first frame this viewer *actually* received. If the session's
+                        // opening IDR went out before the binding existed — which is the normal
+                        // case, the track binds during ICE — then everything since has been a P
+                        // frame predicting from a picture this decoder has never seen, and it
+                        // will sit black until something produces another keyframe. Nothing did:
+                        // the encoders run an infinite GOP, and on a still desktop the keepalive
+                        // only ever repeats. Ask once, through the gate, at the first byte that
+                        // reached the wire.
+                        //
+                        // Measured on the Windows dev box against a Chrome client: without this
+                        // the page logged `no WebCodecs frame within 5s` and demoted itself to a
+                        // `<video>` element on every join where the client's own PLI did not
+                        // happen to arrive first.
+                        if warned_unbound || !first_frame_written {
+                            first_frame_written = true;
+                            keyframes.request_keyframe_for_client("first RTP reached the wire");
                         }
                         warned_unbound = false;
                         timing.mark_socket_write_done();

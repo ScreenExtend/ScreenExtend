@@ -41,13 +41,18 @@ param(
     [int]$HttpPort = 8080,
     [int]$HttpsPort = 8443,
     [switch]$Http,
-    [int]$CdpPort = 9333,
+    # 0 picks a fresh port per run. A browser from a previous run holds the debugging port for
+    # several seconds after its process is gone, and a second Chrome that cannot bind it exits
+    # without ever exposing a target - which is a failed run for a reason that has nothing to do
+    # with the build under test.
+    [int]$CdpPort = 0,
     [string]$OutDir = "$env:TEMP\se-measure",
     [switch]$NoRecord
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
+if ($CdpPort -eq 0) { $CdpPort = Get-Random -Minimum 9400 -Maximum 9899 }
 
 if (-not (Test-Path $Binary)) { throw "no binary at $Binary" }
 $null = New-Item -ItemType Directory -Force -Path $OutDir
@@ -281,10 +286,19 @@ $joinUrl = if ($Http) { "$base/?id=$sessionId&otp=$otp&name=measure&fs=0" }
 # A measurement browser from an earlier run keeps the debugging port, and `curl /json` would then
 # hand back its stale join page - which this script would drive with the wrong OTP and then wait
 # on forever. Take the port back before asking for it.
+# Every process of a previous measurement browser, not just the one that was launched: Chrome's
+# renderers and GPU process outlive the browser process by enough to keep the debugging port, and
+# `curl /json` then answers with the *last* run's join page, which this script would drive with
+# the wrong OTP and then wait on forever.
+$killed = 0
 Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*--remote-debugging-port=$CdpPort*" } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Milliseconds 500
+    Where-Object { $_.CommandLine -like '*se-measure*' -or $_.CommandLine -like "*--remote-debugging-port=$CdpPort*" } |
+    ForEach-Object { $killed++; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if ($killed -gt 0) { Step "cleared $killed leftover browser process(es)" }
+for ($i = 0; $i -lt 20; $i++) {
+    if (-not (& curl.exe -s --max-time 1 "http://127.0.0.1:$CdpPort/json" 2>$null)) { break }
+    Start-Sleep -Milliseconds 500
+}
 
 # Launched on about:blank and navigated over CDP, not straight at the join URL: it is the only
 # way to be sure the attached target is this run's, and it is where the dialog stubs go in. A
@@ -437,6 +451,10 @@ for ($i = 0; $i -lt 160; $i++) {
         $s = Invoke-Js 'window.SEVideo ? JSON.stringify(SEVideo.getStats()) : ""'
         if ($s) {
             $st = $s | ConvertFrom-Json
+            # `framesPainted` comes from the worker's own counter, refreshed by a 1 Hz poll, and
+            # it resets to zero whenever the page rebuilds its session. `videoPath` is the tier
+            # that is live right now, so it is the readiness signal; the painted count is what the
+            # run measures afterwards.
             if ($st.framesPainted -gt 0) {
                 try { $asked = Invoke-Js "(function(){var b={};try{b=JSON.parse(window.__whep||'{}')}catch(e){} return JSON.stringify({posted:{refreshRate:b.refreshRate,width:b.width,height:b.height,dpr:b.dpr},now:{dpr:window.devicePixelRatio,screen:screen.width+'x'+screen.height},hooked:typeof window.__whep});})()" } catch { }
                 $joined = $true
@@ -458,7 +476,12 @@ Step "client painted its first frame; asked for $asked"
 
 # The display the host created for this client is the one that was not there before the join.
 Start-Sleep -Milliseconds 500
-$virtual = [SEInput]::Monitors() | Where-Object { $_.Split(',')[4] -eq '0' } | Select-Object -First 1
+$virtual = $null
+for ($i = 0; $i -lt 20; $i++) {
+    $virtual = [SEInput]::Monitors() | Where-Object { $_.Split(',')[4] -eq '0' } | Select-Object -First 1
+    if ($virtual) { break }
+    Start-Sleep -Milliseconds 500
+}
 if (-not $virtual) { throw 'no non-primary display; the virtual display was not created' }
 $p = $virtual.Split(',')
 $vb = [pscustomobject]@{ X = [int]$p[0]; Y = [int]$p[1]; Width = [int]$p[2]; Height = [int]$p[3] }
@@ -609,7 +632,7 @@ $final = $null
 try { $final = (Invoke-Js 'JSON.stringify(SEVideo.getStats())') | ConvertFrom-Json } catch { }
 
 try {
-    $log = Invoke-Js "(window.__log || []).slice(-60).join('`n')"
+    $log = Invoke-Js '(window.__log || []).slice(-80).join(String.fromCharCode(10))'
     if ($log) { Set-Content -Encoding UTF8 -Path (Join-Path $runDir 'client-console.log') -Value $log }
 } catch { }
 
@@ -689,10 +712,9 @@ $summaryPath = Join-Path $runDir 'summary.json'
 $summary | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 $summaryPath
 
 try { Invoke-Js 'true' | Out-Null } catch { }
-if ($chromeProc -and -not $chromeProc.HasExited) { Stop-Process -Id $chromeProc.Id -Force -ErrorAction SilentlyContinue }
-Get-Process chrome -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -eq $chrome -and $_.MainWindowTitle -like '*ScreenExtend*' } |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*se-measure*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if ($hostProc -and -not $hostProc.HasExited) {
     $quit = Start-Process -FilePath $Binary -PassThru -WindowStyle Hidden -ArgumentList @('stop')
     if (-not $quit.WaitForExit(8000)) { Stop-Process -Id $quit.Id -Force -ErrorAction SilentlyContinue }
