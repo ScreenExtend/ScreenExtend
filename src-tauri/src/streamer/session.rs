@@ -37,9 +37,14 @@ pub struct ControlMsg {
 pub type ControlSender = tokio::sync::mpsc::UnboundedSender<ControlMsg>;
 pub type ControlReceiver = tokio::sync::mpsc::UnboundedReceiver<ControlMsg>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DeviceInfo {
+    /// The session this row is. One per browser tab; a device with two tabs open produces two.
+    pub join_id: String,
+    /// Where the device was when it joined. A label — it may change under a live session and it
+    /// is recycled between devices, so nothing addresses it.
     pub ip: String,
+    /// The device this join belongs to, and the key every per-device setting is stored under.
     pub token: String,
     pub name: String,
     pub os: String,
@@ -122,14 +127,55 @@ pub struct AudioOutputsReport {
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_join(&self, device: DeviceInfo);
-    fn report_remove(&self, ip: String);
+    /// One join ended. The join id is the identity — the device may still hold other joins, and
+    /// its IP is only ever a label.
+    fn report_remove(&self, join_id: String, token: String);
     fn report_join_attempts_paused(&self, _retry_after_secs: u64) {}
-    fn report_audio_outputs(&self, _ip: String, _report: AudioOutputsReport) {}
+    fn report_audio_outputs(&self, _join_id: String, _token: String, _report: AudioOutputsReport) {}
 }
 
 pub type SharedDeviceReporter = Arc<dyn DeviceReporter>;
 
+/// Per-device settings, keyed by the device **token** — never the IP.
+///
+/// An address is recycled: a phone that leaves and a laptop that picks up its DHCP lease are the
+/// same string and a different device, and the settings of the first must not land on the second.
+/// The token is minted once per device on its first successful OTP join and presented on every
+/// join after that, so it survives a roam, a lease renewal and a NAT rebind.
 pub type SharedDeviceOverrides = Arc<Mutex<HashMap<String, DeviceOverride>>>;
+
+/// The audio output the host has asked a device to play on, keyed by device token.
+///
+/// Per device rather than per join: two tabs of one browser share one set of speakers, and the
+/// choice has to outlive every join so it can be replayed from `config.json` into a host with
+/// nothing connected yet.
+pub type SharedAudioSinks = Arc<Mutex<HashMap<String, String>>>;
+
+pub fn new_shared_audio_sinks() -> SharedAudioSinks {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub fn set_device_audio_sink(sinks: &SharedAudioSinks, token: &str, sink: Option<String>) {
+    if token.is_empty() {
+        return;
+    }
+    let mut map = sinks.lock_recover();
+    match sink {
+        Some(s) if !s.is_empty() => {
+            map.insert(token.to_string(), s);
+        }
+        _ => {
+            map.remove(token);
+        }
+    }
+}
+
+pub fn device_audio_sink(sinks: &SharedAudioSinks, token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    sinks.lock_recover().get(token).cloned()
+}
 
 pub type SharedLocalIps = Arc<Mutex<Vec<IpAddr>>>;
 
@@ -142,15 +188,34 @@ pub fn mint_device_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The identity of one live session — one browser tab — minted by the host at `POST /whep` and
+/// handed back as the WHEP resource id.
+///
+/// 128 bits from the same source as the device token, because it is the capability that
+/// `PATCH`/`DELETE /whep/{id}`, `/reconfig`, `/leave` and `/audio-outputs` are addressed by. It
+/// deliberately carries nothing about the peer: an address changes under a session (a Wi-Fi roam,
+/// a DHCP renewal, a NAT rebind) and is recycled between devices, so it can be a label and never
+/// a name.
+pub fn mint_join_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub type SharedBannedDevices = Arc<Mutex<std::collections::HashSet<String>>>;
 
 pub fn new_shared_banned_devices() -> SharedBannedDevices {
     Arc::new(Mutex::new(std::collections::HashSet::new()))
 }
 
-pub fn is_device_banned(banned: &SharedBannedDevices, token: &str, ip: &str) -> bool {
-    let set = banned.lock_recover();
-    (!token.is_empty() && set.contains(token)) || set.contains(ip)
+/// Whether this **device** is banned.
+///
+/// By token only. An IP ban used to be honoured too, and it is the one shape of ban that can hit
+/// the wrong machine: the address a banned phone had this morning is the address the owner's
+/// laptop gets this afternoon, and the laptop is then locked out with nothing in the UI to
+/// explain it. A device that has never completed an OTP join has no token, and there is nothing
+/// to ban it by — it has never been seen.
+pub fn is_device_banned(banned: &SharedBannedDevices, token: &str) -> bool {
+    !token.is_empty() && banned.lock_recover().contains(token)
 }
 
 pub type SharedApprovedDevices = Arc<Mutex<std::collections::HashSet<String>>>;
@@ -276,8 +341,25 @@ impl LiveDisplay {
 
 pub type CaptureStopper = Box<dyn FnOnce() + Send>;
 
+/// Everything one live join owns.
+///
+/// The map this lives in is keyed by the **join id**, so two tabs of one browser — same device,
+/// same token, same address — are two entries with two displays, and neither can reach the
+/// other's. `device_token` is the device this join belongs to, and it is what every per-device
+/// lookup (settings, trust, the audio sink) is keyed by. `ip` is a label for the UI and the
+/// logs: it is refreshed from whichever request arrives last, and nothing is ever addressed by
+/// it.
 #[derive(Default)]
 pub struct DeviceSessionState {
+    pub device_token: String,
+    /// The peer's address as of the most recent request on this session. A display hint only.
+    pub ip: String,
+    /// The cloud relay's id for this client, when the join arrived through the tunnel. The relay
+    /// announces a departure by that id and nothing else, so it is the only way to map its
+    /// `client_gone` onto the joins it ended.
+    pub relay_client: Option<String>,
+    pub device_name: String,
+    pub screen_size: String,
     pub reconfig_epoch: u64,
     pub kick_epoch: u64,
     pub session_seq: u64,
@@ -288,7 +370,6 @@ pub struct DeviceSessionState {
     pub host_ip: Option<String>,
     pub audio_outputs: Vec<AudioOutput>,
     pub audio_outputs_supported: bool,
-    pub selected_audio_output: Option<String>,
     pub current_audio_output: Option<String>,
     pub audio_outputs_labelled: Option<bool>,
 }
@@ -296,6 +377,8 @@ pub struct DeviceSessionState {
 impl std::fmt::Debug for DeviceSessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceSessionState")
+            .field("device_token", &self.device_token)
+            .field("ip", &self.ip)
             .field("reconfig_epoch", &self.reconfig_epoch)
             .field("kick_epoch", &self.kick_epoch)
             .field("session_seq", &self.session_seq)
@@ -310,22 +393,145 @@ impl std::fmt::Debug for DeviceSessionState {
     }
 }
 
+/// Live sessions, keyed by join id. Never by address.
 pub type SharedSessions = Arc<Mutex<HashMap<String, DeviceSessionState>>>;
 
-pub fn arm_leave(sessions: &SharedSessions, ip: &str) -> Arc<LeaveSignal> {
+/// Open the session for `join`, creating it if the join is new.
+///
+/// Every write below goes through this rather than `entry().or_default()` on its own, so a state
+/// that a settings command creates before the client has connected still carries the device it
+/// belongs to.
+pub fn open_session(sessions: &SharedSessions, join: &str, token: &str, ip: &str) {
+    open_session_via(sessions, join, token, ip, None)
+}
+
+pub fn open_session_via(
+    sessions: &SharedSessions,
+    join: &str,
+    token: &str,
+    ip: &str,
+    relay_client: Option<&str>,
+) {
+    let mut map = sessions.lock_recover();
+    let entry = map.entry(join.to_string()).or_default();
+    if !token.is_empty() {
+        entry.device_token = token.to_string();
+    }
+    if !ip.is_empty() {
+        entry.ip = ip.to_string();
+    }
+    if let Some(relay) = relay_client {
+        entry.relay_client = Some(relay.to_string());
+    }
+}
+
+/// Every live join the cloud relay announced under one `client_id`.
+pub fn joins_for_relay_client(sessions: &SharedSessions, client_id: &str) -> Vec<String> {
+    sessions
+        .lock_recover()
+        .iter()
+        .filter(|(_, s)| s.relay_client.as_deref() == Some(client_id))
+        .map(|(join, _)| join.clone())
+        .collect()
+}
+
+/// Record what the UI shows beside a join: the name the client chose and the size it asked for.
+pub fn set_session_labels(sessions: &SharedSessions, join: &str, name: &str, screen_size: &str) {
+    let mut map = sessions.lock_recover();
+    let entry = map.entry(join.to_string()).or_default();
+    entry.device_name = name.to_string();
+    entry.screen_size = screen_size.to_string();
+}
+
+/// Refresh the address label after a request from a session that is already open.
+///
+/// A roam or a lease renewal moves a live session to a new address; nothing about the session
+/// changes, so this only keeps the dashboard row honest.
+pub fn note_session_ip(sessions: &SharedSessions, join: &str, ip: &str) {
+    if ip.is_empty() {
+        return;
+    }
+    let mut map = sessions.lock_recover();
+    if let Some(state) = map.get_mut(join) {
+        if state.ip != ip {
+            state.ip = ip.to_string();
+        }
+    }
+}
+
+/// Forget a join entirely. Called once, when its display is gone for good.
+///
+/// The map used to be keyed by address, so it was bounded by the number of devices that had ever
+/// connected and nothing had to clean up. Keyed by join, every tab that is ever opened is an
+/// entry, so one has to.
+pub fn remove_session(sessions: &SharedSessions, join: &str) {
+    sessions.lock_recover().remove(join);
+}
+
+pub fn device_token_for(sessions: &SharedSessions, join: &str) -> Option<String> {
+    sessions
+        .lock_recover()
+        .get(join)
+        .map(|s| s.device_token.clone())
+        .filter(|t| !t.is_empty())
+}
+
+pub fn session_ip(sessions: &SharedSessions, join: &str) -> Option<String> {
+    sessions
+        .lock_recover()
+        .get(join)
+        .map(|s| s.ip.clone())
+        .filter(|ip| !ip.is_empty())
+}
+
+/// Every live join belonging to one device.
+pub fn joins_for_token(sessions: &SharedSessions, token: &str) -> Vec<String> {
+    if token.is_empty() {
+        return Vec::new();
+    }
+    sessions
+        .lock_recover()
+        .iter()
+        .filter(|(_, s)| s.device_token == token)
+        .map(|(join, _)| join.clone())
+        .collect()
+}
+
+/// The device token of whatever is connected from `ip` right now.
+///
+/// A convenience for the CLI and for a caller that still has only an address: it resolves to a
+/// real identity when exactly one device is there, and refuses when more than one is, because an
+/// address is a place and not a device. Never used on a request path.
+pub fn token_for_ip(sessions: &SharedSessions, ip: &str) -> Option<String> {
+    let map = sessions.lock_recover();
+    let mut found: Option<String> = None;
+    for state in map.values() {
+        if state.ip != ip || state.device_token.is_empty() {
+            continue;
+        }
+        match &found {
+            Some(t) if t != &state.device_token => return None,
+            Some(_) => {}
+            None => found = Some(state.device_token.clone()),
+        }
+    }
+    found
+}
+
+pub fn arm_leave(sessions: &SharedSessions, join: &str) -> Arc<LeaveSignal> {
     let signal = Arc::new(LeaveSignal::default());
     sessions
         .lock_recover()
-        .entry(ip.to_string())
+        .entry(join.to_string())
         .or_default()
         .leave = Some(signal.clone());
     signal
 }
 
-pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
+pub fn signal_leave(sessions: &SharedSessions, join: &str) {
     let signal = sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .and_then(|s| s.leave.clone());
     if let Some(s) = signal {
         s.left.store(true, Ordering::SeqCst);
@@ -333,36 +539,36 @@ pub fn signal_leave(sessions: &SharedSessions, ip: &str) {
     }
 }
 
-pub fn set_control_sender(sessions: &SharedSessions, ip: &str, tx: ControlSender) {
+pub fn set_control_sender(sessions: &SharedSessions, join: &str, tx: ControlSender) {
     sessions
         .lock_recover()
-        .entry(ip.to_string())
+        .entry(join.to_string())
         .or_default()
         .control = Some(tx);
 }
 
-pub fn clear_control_sender(sessions: &SharedSessions, ip: &str, tx: &ControlSender) {
+pub fn clear_control_sender(sessions: &SharedSessions, join: &str, tx: &ControlSender) {
     let mut map = sessions.lock_recover();
-    if let Some(state) = map.get_mut(ip) {
+    if let Some(state) = map.get_mut(join) {
         if state.control.as_ref().is_some_and(|c| c.same_channel(tx)) {
             state.control = None;
         }
     }
 }
 
-pub fn send_bye(sessions: &SharedSessions, ip: &str, reason: ByeReason) -> bool {
-    send_bye_acked(sessions, ip, reason, None)
+pub fn send_bye(sessions: &SharedSessions, join: &str, reason: ByeReason) -> bool {
+    send_bye_acked(sessions, join, reason, None)
 }
 
 fn send_bye_acked(
     sessions: &SharedSessions,
-    ip: &str,
+    join: &str,
     reason: ByeReason,
     sent: Option<std::sync::mpsc::Sender<()>>,
 ) -> bool {
     let tx = sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .and_then(|s| s.control.clone());
     match tx {
         Some(tx) => tx.send(ControlMsg { reason, sent }).is_ok(),
@@ -371,11 +577,11 @@ fn send_bye_acked(
 }
 
 pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Duration) {
-    let ips: Vec<String> = sessions.lock_recover().keys().cloned().collect();
+    let joins: Vec<String> = sessions.lock_recover().keys().cloned().collect();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut queued = 0usize;
-    for ip in &ips {
-        if send_bye_acked(sessions, ip, reason, Some(tx.clone())) {
+    for join in &joins {
+        if send_bye_acked(sessions, join, reason, Some(tx.clone())) {
             queued += 1;
         }
     }
@@ -394,108 +600,134 @@ pub fn broadcast_bye(sessions: &SharedSessions, reason: ByeReason, timeout: Dura
     }
 }
 
-pub fn get_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
+pub fn get_live_display(sessions: &SharedSessions, join: &str) -> Option<LiveDisplay> {
     sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .and_then(|s| s.live_display.clone())
 }
 
-pub fn set_live_display(sessions: &SharedSessions, ip: &str, display: LiveDisplay) {
+pub fn set_live_display(sessions: &SharedSessions, join: &str, display: LiveDisplay) {
     sessions
         .lock_recover()
-        .entry(ip.to_string())
+        .entry(join.to_string())
         .or_default()
         .live_display = Some(display);
 }
 
-pub fn take_live_display(sessions: &SharedSessions, ip: &str) -> Option<LiveDisplay> {
+pub fn take_live_display(sessions: &SharedSessions, join: &str) -> Option<LiveDisplay> {
     sessions
         .lock_recover()
-        .get_mut(ip)
+        .get_mut(join)
         .and_then(|s| s.live_display.take())
 }
 
-pub fn bump_reconfig_epoch(sessions: &SharedSessions, ip: &str) {
+pub fn bump_reconfig_epoch(sessions: &SharedSessions, join: &str) {
     let mut map = sessions.lock_recover();
-    map.entry(ip.to_string()).or_default().reconfig_epoch += 1;
+    map.entry(join.to_string()).or_default().reconfig_epoch += 1;
 }
 
-pub fn reconfig_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
+/// Bump every live join of one device. What a per-device settings change means, now that a
+/// device can hold more than one.
+pub fn bump_reconfig_epoch_for_device(sessions: &SharedSessions, token: &str) -> usize {
+    let joins = joins_for_token(sessions, token);
+    for join in &joins {
+        bump_reconfig_epoch(sessions, join);
+    }
+    joins.len()
+}
+
+pub fn reconfig_epoch(sessions: &SharedSessions, join: &str) -> u64 {
     sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .map(|s| s.reconfig_epoch)
         .unwrap_or(0)
 }
 
-pub fn bump_kick_epoch(sessions: &SharedSessions, ip: &str) {
+pub fn bump_kick_epoch(sessions: &SharedSessions, join: &str) {
     let mut map = sessions.lock_recover();
-    map.entry(ip.to_string()).or_default().kick_epoch += 1;
+    map.entry(join.to_string()).or_default().kick_epoch += 1;
 }
 
-pub fn kick_epoch(sessions: &SharedSessions, ip: &str) -> u64 {
+pub fn kick_epoch(sessions: &SharedSessions, join: &str) -> u64 {
     sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .map(|s| s.kick_epoch)
         .unwrap_or(0)
 }
 
-pub fn set_active_capture(sessions: &SharedSessions, ip: &str, seq: u64, stop: CaptureStopper) {
+/// End one join: tell the client, move its kick epoch, and release the session's waiter.
+pub fn kick_join(sessions: &SharedSessions, join: &str, reason: ByeReason) {
+    send_bye(sessions, join, reason);
+    bump_kick_epoch(sessions, join);
+    signal_leave(sessions, join);
+}
+
+/// End every join of one device. Returns how many there were.
+pub fn kick_device(sessions: &SharedSessions, token: &str, reason: ByeReason) -> usize {
+    let joins = joins_for_token(sessions, token);
+    for join in &joins {
+        kick_join(sessions, join, reason);
+    }
+    joins.len()
+}
+
+pub fn set_active_capture(sessions: &SharedSessions, join: &str, seq: u64, stop: CaptureStopper) {
     sessions
         .lock_recover()
-        .entry(ip.to_string())
+        .entry(join.to_string())
         .or_default()
         .active_capture = Some((seq, stop));
 }
 
-pub fn take_active_capture(sessions: &SharedSessions, ip: &str) -> Option<CaptureStopper> {
+pub fn take_active_capture(sessions: &SharedSessions, join: &str) -> Option<CaptureStopper> {
     sessions
         .lock_recover()
-        .get_mut(ip)
+        .get_mut(join)
         .and_then(|s| s.active_capture.take())
         .map(|(_, stop)| stop)
 }
 
 pub fn take_active_capture_if(
     sessions: &SharedSessions,
-    ip: &str,
+    join: &str,
     seq: u64,
 ) -> Option<CaptureStopper> {
     let mut map = sessions.lock_recover();
-    let state = map.get_mut(ip)?;
+    let state = map.get_mut(join)?;
     match &state.active_capture {
         Some((s, _)) if *s == seq => state.active_capture.take().map(|(_, stop)| stop),
         _ => None,
     }
 }
 
-pub fn next_session_seq(sessions: &SharedSessions, ip: &str) -> u64 {
+pub fn next_session_seq(sessions: &SharedSessions, join: &str) -> u64 {
     let mut map = sessions.lock_recover();
-    let entry = map.entry(ip.to_string()).or_default();
+    let entry = map.entry(join.to_string()).or_default();
     entry.session_seq += 1;
     entry.session_seq
 }
 
-pub fn is_current_session(sessions: &SharedSessions, ip: &str, seq: u64) -> bool {
+pub fn is_current_session(sessions: &SharedSessions, join: &str, seq: u64) -> bool {
     sessions
         .lock_recover()
-        .get(ip)
+        .get(join)
         .map(|s| s.session_seq == seq)
         .unwrap_or(false)
 }
 
 pub fn set_audio_outputs(
     sessions: &SharedSessions,
-    ip: &str,
+    join: &str,
     supported: bool,
     outputs: Vec<AudioOutput>,
     current: Option<String>,
     labelled: Option<bool>,
 ) {
     let mut map = sessions.lock_recover();
-    let entry = map.entry(ip.to_string()).or_default();
+    let entry = map.entry(join.to_string()).or_default();
     entry.audio_outputs_supported = supported;
     entry.audio_outputs = outputs;
     // A client that does not report one must not erase what a newer one did.
@@ -507,33 +739,64 @@ pub fn set_audio_outputs(
     }
 }
 
-pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputsReport {
-    sessions
-        .lock_recover()
-        .get(ip)
-        .map(|s| AudioOutputsReport {
-            supported: s.audio_outputs_supported,
-            outputs: s.audio_outputs.clone(),
-            selected: s.selected_audio_output.clone().unwrap_or_default(),
-            current: s.current_audio_output.clone(),
-            labelled: s.audio_outputs_labelled,
-        })
-        .unwrap_or_default()
+/// What one join reports about its outputs, with the device's chosen sink beside it.
+pub fn audio_outputs_report(
+    sessions: &SharedSessions,
+    sinks: &SharedAudioSinks,
+    join: &str,
+) -> AudioOutputsReport {
+    let map = sessions.lock_recover();
+    let Some(s) = map.get(join) else {
+        return AudioOutputsReport::default();
+    };
+    let token = s.device_token.clone();
+    let report = AudioOutputsReport {
+        supported: s.audio_outputs_supported,
+        outputs: s.audio_outputs.clone(),
+        selected: String::new(),
+        current: s.current_audio_output.clone(),
+        labelled: s.audio_outputs_labelled,
+    };
+    drop(map);
+    AudioOutputsReport {
+        selected: device_audio_sink(sinks, &token).unwrap_or_default(),
+        ..report
+    }
 }
 
-pub fn set_selected_audio_output(sessions: &SharedSessions, ip: &str, sel: Option<String>) {
-    sessions
-        .lock_recover()
-        .entry(ip.to_string())
-        .or_default()
-        .selected_audio_output = sel;
+/// What the UI asks for: one device's outputs, taken from whichever of its joins has reported.
+///
+/// Two tabs of one browser enumerate the same speakers, so the first join that answered is as
+/// good as any; a join that never reported (`supported == false` with an empty list) is skipped
+/// so it cannot mask one that did.
+pub fn device_audio_outputs_report(
+    sessions: &SharedSessions,
+    sinks: &SharedAudioSinks,
+    token: &str,
+) -> AudioOutputsReport {
+    let best = {
+        let map = sessions.lock_recover();
+        map.values()
+            .filter(|s| s.device_token == token)
+            .max_by_key(|s| (s.supported_rank(), s.audio_outputs.len()))
+            .map(|s| AudioOutputsReport {
+                supported: s.audio_outputs_supported,
+                outputs: s.audio_outputs.clone(),
+                selected: String::new(),
+                current: s.current_audio_output.clone(),
+                labelled: s.audio_outputs_labelled,
+            })
+    };
+    AudioOutputsReport {
+        selected: device_audio_sink(sinks, token).unwrap_or_default(),
+        ..best.unwrap_or_default()
+    }
 }
 
-pub fn selected_audio_output(sessions: &SharedSessions, ip: &str) -> Option<String> {
-    sessions
-        .lock_recover()
-        .get(ip)
-        .and_then(|s| s.selected_audio_output.clone())
+impl DeviceSessionState {
+    fn supported_rank(&self) -> u8 {
+        u8::from(self.audio_outputs_supported)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -781,10 +1044,10 @@ pub fn shared_display_cap(client: &SharedVirtualDisplay) -> Option<usize> {
     concurrent_display_cap(client.as_ref())
 }
 
-pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>) {
+pub fn set_host_ip(sessions: &SharedSessions, join: &str, host_ip: Option<String>) {
     sessions
         .lock_recover()
-        .entry(ip.to_string())
+        .entry(join.to_string())
         .or_default()
         .host_ip = host_ip;
 }
@@ -797,21 +1060,57 @@ pub fn display_holder_host_ip(sessions: &SharedSessions) -> Option<String> {
         .and_then(|s| s.host_ip.clone())
 }
 
-pub fn live_displays_except(sessions: &SharedSessions, ip: &str) -> Vec<LiveDisplay> {
+pub fn live_displays_except(sessions: &SharedSessions, join: &str) -> Vec<LiveDisplay> {
     sessions
         .lock_recover()
         .iter()
-        .filter(|(key, _)| key.as_str() != ip)
+        .filter(|(key, _)| key.as_str() != join)
         .filter_map(|(_, s)| s.live_display.clone())
         .collect()
 }
 
-/// Every client IP this host has a session for.
+/// Every client address this host currently has a session from.
 ///
 /// The one place that can answer "has anything actually associated to our hosted network and
-/// joined?", which is the difference between an AP that is advertised and an AP that works.
+/// joined?", which is the difference between an AP that is advertised and an AP that works. It
+/// reads the label each session carries, not the map's keys — those are join ids now.
 pub fn client_ips(sessions: &SharedSessions) -> Vec<String> {
-    sessions.lock().unwrap().keys().cloned().collect()
+    let mut ips: Vec<String> = sessions
+        .lock_recover()
+        .values()
+        .map(|s| s.ip.clone())
+        .filter(|ip| !ip.is_empty())
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// One row per live join, for `devices list` and `status --json`.
+pub struct JoinSummary {
+    pub join_id: String,
+    pub device_token: String,
+    pub ip: String,
+    pub name: String,
+    pub screen_size: String,
+    pub display: Option<LiveDisplay>,
+}
+
+pub fn join_summaries(sessions: &SharedSessions) -> Vec<JoinSummary> {
+    let mut rows: Vec<JoinSummary> = sessions
+        .lock_recover()
+        .iter()
+        .map(|(join, s)| JoinSummary {
+            join_id: join.clone(),
+            device_token: s.device_token.clone(),
+            ip: s.ip.clone(),
+            name: s.device_name.clone(),
+            screen_size: s.screen_size.clone(),
+            display: s.live_display.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.join_id.cmp(&b.join_id));
+    rows
 }
 
 pub fn live_display_count(sessions: &SharedSessions) -> usize {
@@ -945,52 +1244,69 @@ mod tests {
     }
 
     #[test]
-    fn a_ban_holds_by_token_or_by_ip_but_never_on_an_empty_token() {
-        // Bans are the one place the IP still counts: a device that has not joined has no token
-        // to ban, and the host must still be able to keep it out.
+    fn a_ban_holds_by_token_and_never_by_address() {
+        // An address is recycled. Honouring an IP ban locks out whichever device picks up the
+        // banned one's lease next, with nothing in the UI to explain it — the exact failure the
+        // token exists to prevent.
         let banned = new_shared_banned_devices();
         let token = mint_device_token();
-        assert!(!is_device_banned(&banned, &token, "10.0.0.9"));
+        assert!(!is_device_banned(&banned, &token));
         banned.lock().unwrap().insert(token.clone());
-        assert!(is_device_banned(&banned, &token, "10.0.0.9"));
-        assert!(!is_device_banned(&banned, "other", "10.0.0.10"));
+        assert!(is_device_banned(&banned, &token));
+        assert!(!is_device_banned(&banned, "other"));
         banned.lock().unwrap().insert("10.0.0.9".to_string());
         assert!(
-            is_device_banned(&banned, "other", "10.0.0.9"),
-            "an IP ban still holds for a device with a different token"
+            !is_device_banned(&banned, ""),
+            "a device with no token has never joined and cannot be banned"
         );
-        assert!(!is_device_banned(&banned, "", "10.0.0.10"));
     }
 
     // ---- epoch bookkeeping: how a live settings change reaches the client -------------
 
     #[test]
-    fn an_unknown_device_reads_epoch_zero_rather_than_failing() {
-        // The client adopts whatever the first `/reconfig` returns, so a device the host has no
+    fn an_unknown_join_reads_epoch_zero_rather_than_failing() {
+        // The client adopts whatever the first `/reconfig` returns, so a join the host has no
         // state for must read a stable 0 and not a value that moves on its own.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
-        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 0);
-        assert_eq!(kick_epoch(&sessions, "10.0.0.1"), 0);
-        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 0);
+        assert_eq!(reconfig_epoch(&sessions, "join-a"), 0);
+        assert_eq!(kick_epoch(&sessions, "join-a"), 0);
+        assert_eq!(reconfig_epoch(&sessions, "join-a"), 0);
     }
 
     #[test]
-    fn each_bump_is_visible_exactly_once_and_only_to_that_device() {
+    fn each_bump_is_visible_exactly_once_and_only_to_that_join() {
         // The client compares the epoch it holds against the one it polls. A bump that moved two
-        // devices would rebuild a session nobody changed; a bump that never landed leaves a
-        // device on the old settings forever.
+        // joins would rebuild a session nobody changed; a bump that never landed leaves a tab on
+        // the old settings forever.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
-        bump_reconfig_epoch(&sessions, "10.0.0.1");
-        assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), 1);
-        assert_eq!(
-            reconfig_epoch(&sessions, "10.0.0.2"),
-            0,
-            "a bump is per device"
-        );
+        bump_reconfig_epoch(&sessions, "join-a");
+        assert_eq!(reconfig_epoch(&sessions, "join-a"), 1);
+        assert_eq!(reconfig_epoch(&sessions, "join-b"), 0, "a bump is per join");
         for expected in 2..=5 {
-            bump_reconfig_epoch(&sessions, "10.0.0.1");
-            assert_eq!(reconfig_epoch(&sessions, "10.0.0.1"), expected);
+            bump_reconfig_epoch(&sessions, "join-a");
+            assert_eq!(reconfig_epoch(&sessions, "join-a"), expected);
         }
+    }
+
+    #[test]
+    fn a_per_device_change_reaches_every_tab_that_device_has_open() {
+        // Two tabs of one browser share a device token and therefore share every setting. A
+        // change made once in the UI has to land on both, and on nobody else's.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let mine = mint_device_token();
+        let theirs = mint_device_token();
+        open_session(&sessions, "join-1", &mine, "192.168.1.5");
+        open_session(&sessions, "join-2", &mine, "192.168.1.5");
+        open_session(&sessions, "join-3", &theirs, "192.168.1.6");
+
+        assert_eq!(bump_reconfig_epoch_for_device(&sessions, &mine), 2);
+        assert_eq!(reconfig_epoch(&sessions, "join-1"), 1);
+        assert_eq!(reconfig_epoch(&sessions, "join-2"), 1);
+        assert_eq!(
+            reconfig_epoch(&sessions, "join-3"),
+            0,
+            "another device must not be rebuilt"
+        );
     }
 
     #[test]
@@ -998,20 +1314,110 @@ mod tests {
         // A settings change must not read as a kick: the client tears the session down and shows
         // "you have been removed" on a kick, and silently rebuilds on a reconfig.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
-        bump_reconfig_epoch(&sessions, "10.0.0.1");
-        bump_reconfig_epoch(&sessions, "10.0.0.1");
+        bump_reconfig_epoch(&sessions, "join-a");
+        bump_reconfig_epoch(&sessions, "join-a");
+        assert_eq!(kick_epoch(&sessions, "join-a"), 0, "a reconfig is not a kick");
+        bump_kick_epoch(&sessions, "join-a");
+        assert_eq!(kick_epoch(&sessions, "join-a"), 1);
         assert_eq!(
-            kick_epoch(&sessions, "10.0.0.1"),
-            0,
-            "a reconfig is not a kick"
-        );
-        bump_kick_epoch(&sessions, "10.0.0.1");
-        assert_eq!(kick_epoch(&sessions, "10.0.0.1"), 1);
-        assert_eq!(
-            reconfig_epoch(&sessions, "10.0.0.1"),
+            reconfig_epoch(&sessions, "join-a"),
             2,
             "a kick is not a reconfig"
         );
+    }
+
+    // ---- identity: the address is a label, never a name -------------------------------
+
+    #[test]
+    fn a_device_that_inherits_a_disconnected_devices_address_inherits_nothing_else() {
+        // The owner's case: a phone leaves, the router hands its address to a laptop. Keyed by
+        // address the laptop would have walked into the phone's session and its settings.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
+        let banned = new_shared_banned_devices();
+        let sinks = new_shared_audio_sinks();
+
+        let phone = mint_device_token();
+        let phone_join = mint_join_id();
+        open_session(&sessions, &phone_join, &phone, "192.168.1.42");
+        overrides.lock_recover().insert(
+            phone.clone(),
+            DeviceOverride {
+                scale: 175,
+                ..DeviceOverride::join_defaults()
+            },
+        );
+        set_device_audio_sink(&sinks, &phone, Some("phone-speaker".into()));
+        banned.lock_recover().insert(phone.clone());
+        bump_kick_epoch(&sessions, &phone_join);
+
+        // The phone goes away and its session is forgotten.
+        remove_session(&sessions, &phone_join);
+
+        // The laptop arrives on the same address with its own token.
+        let laptop = mint_device_token();
+        let laptop_join = mint_join_id();
+        open_session(&sessions, &laptop_join, &laptop, "192.168.1.42");
+
+        assert_ne!(laptop_join, phone_join);
+        assert!(
+            !is_device_banned(&banned, &laptop),
+            "the phone's ban must not reach the laptop"
+        );
+        assert!(
+            overrides.lock_recover().get(&laptop).is_none(),
+            "the phone's settings must not reach the laptop"
+        );
+        assert_eq!(
+            device_audio_sink(&sinks, &laptop),
+            None,
+            "the phone's speaker choice must not reach the laptop"
+        );
+        assert_eq!(
+            kick_epoch(&sessions, &laptop_join),
+            0,
+            "the laptop starts on a fresh epoch, not the phone's"
+        );
+        assert!(joins_for_token(&sessions, &phone).is_empty());
+        assert_eq!(joins_for_token(&sessions, &laptop), vec![laptop_join]);
+    }
+
+    #[test]
+    fn a_session_survives_its_peer_changing_address() {
+        // A roam or a DHCP renewal moves the peer; the session is named by its join id, so the
+        // only thing that changes is the label the dashboard shows.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        let join = mint_join_id();
+        open_session(&sessions, &join, &token, "192.168.1.9");
+        bump_reconfig_epoch(&sessions, &join);
+        note_session_ip(&sessions, &join, "10.0.0.4");
+        assert_eq!(session_ip(&sessions, &join).as_deref(), Some("10.0.0.4"));
+        assert_eq!(
+            reconfig_epoch(&sessions, &join),
+            1,
+            "the session is unchanged by the move"
+        );
+        assert_eq!(device_token_for(&sessions, &join).as_deref(), Some(&*token));
+    }
+
+    #[test]
+    fn an_address_resolves_to_a_device_only_while_it_is_unambiguous() {
+        // The CLI convenience lookup. One device there resolves; two do not, because an address
+        // is a place and the answer would be a coin toss.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let a = mint_device_token();
+        let b = mint_device_token();
+        open_session(&sessions, "join-1", &a, "192.168.1.5");
+        open_session(&sessions, "join-2", &a, "192.168.1.5");
+        assert_eq!(token_for_ip(&sessions, "192.168.1.5").as_deref(), Some(&*a));
+        open_session(&sessions, "join-3", &b, "192.168.1.5");
+        assert_eq!(
+            token_for_ip(&sessions, "192.168.1.5"),
+            None,
+            "two devices behind one address cannot be told apart by it"
+        );
+        assert_eq!(token_for_ip(&sessions, "192.168.1.9"), None);
     }
 
     #[test]
@@ -1019,38 +1425,72 @@ mod tests {
         // Settings can be changed before the device has ever connected — the CLI's `devices set`
         // writes through the same path — and a bump that landed nowhere would be silently lost.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
-        bump_kick_epoch(&sessions, "10.0.0.7");
-        assert!(sessions.lock().unwrap().contains_key("10.0.0.7"));
-        assert_eq!(kick_epoch(&sessions, "10.0.0.7"), 1);
+        bump_kick_epoch(&sessions, "join-7");
+        assert!(sessions.lock().unwrap().contains_key("join-7"));
+        assert_eq!(kick_epoch(&sessions, "join-7"), 1);
     }
 
     // ---- session sequence numbers: which capture owns the display ---------------------
 
     #[test]
     fn a_stale_session_never_stops_the_capture_that_replaced_it() {
-        // A rejoin mints a new sequence; the old session's teardown then runs and must not stop
-        // the capture the new one just started. That is what the conditional take is for.
+        // A reconnect on the same join id mints a new sequence; the old session's teardown then
+        // runs and must not stop the capture the new one just started. That is what the
+        // conditional take is for.
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
-        let first = next_session_seq(&sessions, "10.0.0.3");
-        let second = next_session_seq(&sessions, "10.0.0.3");
+        let first = next_session_seq(&sessions, "join-3");
+        let second = next_session_seq(&sessions, "join-3");
         assert!(second > first, "each session gets a fresh sequence");
-        assert!(!is_current_session(&sessions, "10.0.0.3", first));
-        assert!(is_current_session(&sessions, "10.0.0.3", second));
+        assert!(!is_current_session(&sessions, "join-3", first));
+        assert!(is_current_session(&sessions, "join-3", second));
 
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&stopped);
         set_active_capture(
             &sessions,
-            "10.0.0.3",
+            "join-3",
             second,
             Box::new(move || flag.store(true, Ordering::SeqCst)),
         );
         assert!(
-            take_active_capture_if(&sessions, "10.0.0.3", first).is_none(),
+            take_active_capture_if(&sessions, "join-3", first).is_none(),
             "the stale session must not claim the live capture"
         );
-        assert!(take_active_capture_if(&sessions, "10.0.0.3", second).is_some());
+        assert!(take_active_capture_if(&sessions, "join-3", second).is_some());
         assert!(!stopped.load(Ordering::SeqCst), "taking is not stopping");
+    }
+
+    #[test]
+    fn two_tabs_of_one_device_hold_two_independent_displays() {
+        // The owner's report: two tabs on one machine used to collapse into one session, so the
+        // first froze and was replaced by the second.
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        let (a, b) = (mint_join_id(), mint_join_id());
+        let display = |id: u32| LiveDisplay {
+            display_id: id,
+            device_name: format!("\\\\.\\DISPLAY{id}"),
+            width: 1920,
+            height: 1080,
+            refresh: 60,
+            scale: 100,
+            portrait: false,
+        };
+        open_session(&sessions, &a, &token, "192.168.1.5");
+        open_session(&sessions, &b, &token, "192.168.1.5");
+        set_live_display(&sessions, &a, display(4));
+        set_live_display(&sessions, &b, display(5));
+
+        assert_eq!(live_display_count(&sessions), 2);
+        assert_eq!(get_live_display(&sessions, &a).unwrap().display_id, 4);
+        assert_eq!(get_live_display(&sessions, &b).unwrap().display_id, 5);
+        assert_eq!(joins_for_token(&sessions, &token).len(), 2);
+
+        // One tab closes; the other keeps its display.
+        let _ = take_live_display(&sessions, &a);
+        remove_session(&sessions, &a);
+        assert_eq!(live_display_count(&sessions), 1);
+        assert_eq!(get_live_display(&sessions, &b).unwrap().display_id, 5);
     }
 
     // ---- disconnect grace --------------------------------------------------------------

@@ -45,6 +45,9 @@ pub struct AppState {
     pub session_auth: SessionAuth,
     pub device_reporter: SharedDeviceReporter,
     pub device_overrides: SharedDeviceOverrides,
+    /// The audio output each device has been asked to play on, keyed by device token. Per device
+    /// rather than per join, and it outlives every join so `serve` can replay a saved choice.
+    pub audio_sinks: session::SharedAudioSinks,
     pub sessions: SharedSessions,
     pub disconnect_grace: session::SharedDisconnectGrace,
     pub user_turn: SharedTurnConfig,
@@ -165,6 +168,7 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
         session_auth: SessionAuth::default(),
         device_reporter,
         device_overrides,
+        audio_sinks: session::new_shared_audio_sinks(),
         sessions,
         disconnect_grace: session::new_shared_disconnect_grace(),
         user_turn: session::new_shared_turn_config(),
@@ -234,16 +238,16 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                 };
 
                 if airplay_tier && airplay::take_geometry_changed() {
-                    let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
-                    if !ips.is_empty() {
+                    let joins: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    if !joins.is_empty() {
                         tprintln!(
-                            "[airplay] macOS changed the display geometry; asking {} client(s) \
+                            "[airplay] macOS changed the display geometry; asking {} session(s) \
                              to renegotiate",
-                            ips.len()
+                            joins.len()
                         );
                     }
-                    for ip in ips {
-                        session::bump_reconfig_epoch(&state.sessions, &ip);
+                    for join in joins {
+                        session::bump_reconfig_epoch(&state.sessions, &join);
                     }
                 }
 
@@ -274,11 +278,11 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                         session::ByeReason::Kicked,
                         crate::BYE_FLUSH_TIMEOUT,
                     );
-                    let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
-                    let ended = ips.len() as u32;
-                    for ip in ips {
-                        session::bump_kick_epoch(&state.sessions, &ip);
-                        session::signal_leave(&state.sessions, &ip);
+                    let joins: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    let ended = joins.len() as u32;
+                    for join in joins {
+                        session::bump_kick_epoch(&state.sessions, &join);
+                        session::signal_leave(&state.sessions, &join);
                     }
                     // The log line above is the record; this is what puts it in front of
                     // the person at the host, who is otherwise left to work out why a
@@ -307,7 +311,7 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
 #[allow(clippy::too_many_arguments)]
 pub fn set_device_override(
     state: State<'_, AppState>,
-    ip: String,
+    device: String,
     scale: u32,
     orientation: String,
     refresh_rate: u32,
@@ -334,9 +338,12 @@ pub fn set_device_override(
     // the end of their line — so the second one deadlocked the caller. `serve` calls this once
     // per saved device at startup, which is why a host with any device in `config.json` hung
     // before it ever printed a join URL.
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
     let (carried_scope, carried_auto_frame_rate) = {
         let overrides = state.device_overrides.lock_recover();
-        match overrides.get(&ip) {
+        match overrides.get(&token) {
             Some(o) => (o.pointer_scope, o.auto_frame_rate),
             None => (Default::default(), false),
         }
@@ -366,7 +373,7 @@ pub fn set_device_override(
     // stream the client is already decoding is exactly the stream it wants.
     let (needs_rebuild, scale_only) = {
         let mut overrides = state.device_overrides.lock_recover();
-        let verdict = match overrides.get(&ip) {
+        let verdict = match overrides.get(&token) {
             Some(old) => {
                 let rebuild = old.orientation_portrait != next.orientation_portrait
                     || old.refresh_rate != next.refresh_rate
@@ -377,11 +384,12 @@ pub fn set_device_override(
             }
             None => (true, false),
         };
-        overrides.insert(ip.clone(), next);
+        overrides.insert(token.clone(), next);
         verdict
     };
+    // Every tab this device has open, because the settings are the device's.
     if needs_rebuild {
-        session::bump_reconfig_epoch(&state.sessions, &ip);
+        session::bump_reconfig_epoch_for_device(&state.sessions, &token);
     } else if scale_only {
         let sessions = state.sessions.clone();
         let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
@@ -389,13 +397,54 @@ pub fn set_device_override(
             crate::streamer::server::MAX_EFFECTIVE_SCALE,
         );
         tauri::async_runtime::spawn(async move {
-            if !crate::streamer::server::apply_scale_live(&sessions, &ip, effective).await {
+            let applied =
+                crate::streamer::server::apply_scale_live_for_device(&sessions, &token, effective)
+                    .await;
+            if applied == 0 {
                 // Nothing live to touch, so there is nothing to apply it to; the next join reads
                 // it back out of the override map anyway.
-                tprintln!("display scale for {ip} saved; no live display to apply it to");
+                tprintln!("display scale for device {token} saved; no live display to apply it to");
             }
         });
     }
+}
+
+/// Resolve whatever the caller had — a device token, or an address it happens to know — to the
+/// one identity the host stores settings under.
+///
+/// A token is passed straight through. An address is a convenience for the CLI and for a caller
+/// holding an old row: it resolves only while exactly one device is connected from it, because an
+/// address is a place and not a device. Anything else is refused with a line in the log rather
+/// than guessed at, since guessing is how one device ends up wearing another's settings.
+pub fn resolve_device(state: &AppState, key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if is_device_token(key) {
+        return Some(key.to_string());
+    }
+    match session::token_for_ip(&state.sessions, key) {
+        Some(token) => {
+            tprintln!(
+                "[devices] {key} is an address, not a device; resolved to the device connected \
+                 from it — pass the token to be sure which device you mean"
+            );
+            Some(token)
+        }
+        None => {
+            teprintln!(
+                "[devices] {key} names no device: an address only identifies one while exactly \
+                 one device is connected from it, and addresses are recycled between devices"
+            );
+            None
+        }
+    }
+}
+
+/// What [`crate::streamer::session::mint_device_token`] produces: 128 bits as lowercase hex.
+fn is_device_token(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
@@ -407,14 +456,17 @@ pub fn set_device_override(
 /// change applies to the next connection, exactly like remote control itself.
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_pointer_scope(state: State<'_, AppState>, ip: String, scope: String) {
+pub fn set_device_pointer_scope(state: State<'_, AppState>, device: String, scope: String) {
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
     let parsed = crate::streamer::input::PointerScope::from_str(&scope);
     let mut overrides = state.device_overrides.lock_recover();
-    match overrides.get_mut(&ip) {
+    match overrides.get_mut(&token) {
         Some(existing) => existing.pointer_scope = parsed,
         None => {
             overrides.insert(
-                ip.clone(),
+                token.clone(),
                 DeviceOverride {
                     pointer_scope: parsed,
                     ..DeviceOverride::join_defaults()
@@ -423,7 +475,10 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, ip: String, scope: S
         }
     }
     drop(overrides);
-    tprintln!("[input] pointer scope for {ip} is now {}", parsed.as_str());
+    tprintln!(
+        "[input] pointer scope for device {token} is now {}",
+        parsed.as_str()
+    );
 }
 
 /// Whether this device's stream may drop below its chosen refresh rate on its own.
@@ -439,13 +494,16 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, ip: String, scope: S
 /// of the ruling is not implemented at all.
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_auto_frame_rate(state: State<'_, AppState>, ip: String, enabled: bool) {
+pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, enabled: bool) {
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
     let mut overrides = state.device_overrides.lock_recover();
-    match overrides.get_mut(&ip) {
+    match overrides.get_mut(&token) {
         Some(existing) => existing.auto_frame_rate = enabled,
         None => {
             overrides.insert(
-                ip.clone(),
+                token.clone(),
                 DeviceOverride {
                     auto_frame_rate: enabled,
                     ..DeviceOverride::join_defaults()
@@ -455,71 +513,121 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, ip: String, enable
     }
     drop(overrides);
     tprintln!(
-        "[stream] automatic frame rate for {ip} is now {}",
+        "[stream] automatic frame rate for device {token} is now {}",
         if enabled { "on" } else { "off" }
     );
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn refresh_device_stream(state: State<'_, AppState>, ip: String) -> bool {
-    if session::get_live_display(&state.sessions, &ip).is_none() {
-        tprintln!("stream refresh skipped: {ip} has no live display attached");
+pub fn refresh_device_stream(
+    state: State<'_, AppState>,
+    device: String,
+    join_id: Option<String>,
+) -> bool {
+    // A join id refreshes exactly that tab; without one, every tab the device has open, which is
+    // what "restart this device's stream" means when a device can hold several.
+    let joins: Vec<String> = match join_id.filter(|j| !j.trim().is_empty()) {
+        Some(join) => vec![join],
+        None => match resolve_device(&state, &device) {
+            Some(token) => session::joins_for_token(&state.sessions, &token),
+            None => Vec::new(),
+        },
+    };
+    let mut refreshed = 0usize;
+    for join in &joins {
+        if session::get_live_display(&state.sessions, join).is_none() {
+            tprintln!("stream refresh skipped: join {join} has no live display attached");
+            continue;
+        }
+        session::bump_reconfig_epoch(&state.sessions, join);
+        tprintln!("stream refresh requested for join {join}; it renegotiates on its next poll");
+        refreshed += 1;
+    }
+    refreshed > 0
+}
+
+/// End one live session without touching the device's settings or its trust.
+///
+/// The per-join counterpart to `remove_device_override`: a device with two tabs open can have one
+/// of them disconnected.
+#[tauri::command]
+#[specta::specta]
+pub fn disconnect_session(state: State<'_, AppState>, join_id: String) -> bool {
+    if session::get_live_display(&state.sessions, &join_id).is_none()
+        && session::device_token_for(&state.sessions, &join_id).is_none()
+    {
+        tprintln!("disconnect skipped: no session named {join_id}");
         return false;
     }
-    session::bump_reconfig_epoch(&state.sessions, &ip);
-    tprintln!("stream refresh requested for {ip}; client will renegotiate on its next poll");
+    session::kick_join(&state.sessions, &join_id, session::ByeReason::Kicked);
+    tprintln!("join {join_id} disconnected by the host");
     true
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_audio_output(state: State<'_, AppState>, ip: String, device_id: String) {
+pub fn set_device_audio_output(state: State<'_, AppState>, device: String, device_id: String) {
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
     let sel = if device_id.trim().is_empty() {
         None
     } else {
         Some(device_id)
     };
-    session::set_selected_audio_output(&state.sessions, &ip, sel);
+    // Per device: two tabs of one browser share one set of speakers, and the choice has to
+    // outlive every join so `serve` can replay it into a host with nothing connected yet.
+    session::set_device_audio_sink(&state.audio_sinks, &token, sel);
+    session::bump_reconfig_epoch_for_device(&state.sessions, &token);
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn get_device_audio_outputs(
     state: State<'_, AppState>,
-    ip: String,
+    device: String,
 ) -> crate::streamer::session::AudioOutputsReport {
-    session::audio_outputs_report(&state.sessions, &ip)
+    match resolve_device(&state, &device) {
+        Some(token) => session::device_audio_outputs_report(
+            &state.sessions,
+            &state.audio_sinks,
+            &token,
+        ),
+        None => Default::default(),
+    }
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn remove_device_override(state: State<'_, AppState>, ip: String) {
-    state.device_overrides.lock().unwrap().remove(&ip);
-    session::send_bye(&state.sessions, &ip, session::ByeReason::Kicked);
-    session::bump_kick_epoch(&state.sessions, &ip);
-    session::signal_leave(&state.sessions, &ip);
+pub fn remove_device_override(state: State<'_, AppState>, device: String) {
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
+    state.device_overrides.lock().unwrap().remove(&token);
+    state.audio_sinks.lock().unwrap().remove(&token);
+    let ended = session::kick_device(&state.sessions, &token, session::ByeReason::Kicked);
+    tprintln!("device {token} removed; {ended} live session(s) ended");
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn set_device_banned(state: State<'_, AppState>, token: String, ip: String, banned: bool) {
-    let key = if token.trim().is_empty() {
-        ip.clone()
-    } else {
-        token
+    // By token, never by address: the address a banned phone had this morning is the address
+    // somebody's laptop gets this afternoon. `ip` is kept as a label for the log and as the
+    // last-resort lookup for a caller holding an old row.
+    let Some(key) = resolve_device(&state, if token.trim().is_empty() { &ip } else { &token })
+    else {
+        teprintln!("[devices] cannot ban {ip}: it has never joined, so there is no device to ban");
+        return;
     };
     if banned {
-        state.banned_devices.lock().unwrap().insert(key);
-        if !ip.is_empty() {
-            session::send_bye(&state.sessions, &ip, session::ByeReason::Kicked);
-            session::bump_kick_epoch(&state.sessions, &ip);
-            session::signal_leave(&state.sessions, &ip);
-        }
-        tprintln!("device {ip} banned; existing session (if any) kicked");
+        state.banned_devices.lock().unwrap().insert(key.clone());
+        let ended = session::kick_device(&state.sessions, &key, session::ByeReason::Kicked);
+        tprintln!("device {key} banned; {ended} live session(s) kicked");
     } else {
         state.banned_devices.lock().unwrap().remove(&key);
-        tprintln!("device {ip} unbanned");
+        tprintln!("device {key} unbanned");
     }
 }
 
@@ -672,8 +780,8 @@ pub fn set_server_ports(
     // Tell the connected clients why their stream is about to end, rather than dropping the
     // transport under them.
     let connected: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
-    for ip in connected {
-        session::send_bye(&state.sessions, &ip, session::ByeReason::HostExit);
+    for join in connected {
+        session::send_bye(&state.sessions, &join, session::ByeReason::HostExit);
     }
 
     {
@@ -806,6 +914,7 @@ pub fn register_cloud_session(
         device_reporter: Some(state.device_reporter.clone()),
         device_overrides: Some(state.device_overrides.clone()),
         sessions: Some(state.sessions.clone()),
+        audio_sinks: Some(state.audio_sinks.clone()),
         disconnect_grace: Some(state.disconnect_grace.clone()),
         user_turn: Some(state.user_turn.clone()),
         stun_urls: state.stun_urls.lock_recover().clone(),
@@ -963,6 +1072,7 @@ pub fn sync_streamers(state: &AppState) {
             device_reporter: Some(state.device_reporter.clone()),
             device_overrides: Some(state.device_overrides.clone()),
             sessions: Some(state.sessions.clone()),
+            audio_sinks: Some(state.audio_sinks.clone()),
             disconnect_grace: Some(state.disconnect_grace.clone()),
             user_turn: Some(state.user_turn.clone()),
             stun_urls: state.stun_urls.lock_recover().clone(),

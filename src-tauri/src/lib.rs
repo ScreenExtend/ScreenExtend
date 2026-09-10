@@ -40,7 +40,11 @@ pub const BYE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct DeviceAudioOutputs {
-    pub ip: String,
+    /// The join that reported this list. One browser tab.
+    #[serde(rename = "joinId")]
+    pub join_id: String,
+    /// The device the join belongs to, and what the UI keys its row by.
+    pub token: String,
     pub supported: bool,
     pub outputs: Vec<AudioOutput>,
     /// What the host last asked this device to play on.
@@ -339,7 +343,14 @@ pub struct DisplayCapacity {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct Device {
+    /// The live session this row is — one browser tab. A device with two tabs open produces two
+    /// rows with one `token` between them. Empty on a row that describes only a device.
+    #[serde(rename = "joinId")]
+    pub join_id: String,
+    /// Where the device was when it last spoke. A label: it changes under a live session and it
+    /// is recycled between devices, so nothing is keyed by it.
     pub ip: String,
+    /// The device. Every per-device setting, and the `config.json` row, is keyed by this.
     pub token: String,
     pub name: String,
     pub scale: u32,
@@ -389,6 +400,7 @@ impl Device {
         const SLIDER_DPR_CEILING: f64 = 3.0;
         let max_dpr = crate::streamer::platform::snap_display_dpr(info.dpr.max(SLIDER_DPR_CEILING));
         Self {
+            join_id: info.join_id,
             ip: info.ip,
             token: info.token,
             name: info.name,
