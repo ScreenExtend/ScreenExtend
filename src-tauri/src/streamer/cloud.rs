@@ -501,7 +501,7 @@ fn handle_relay_message(
             });
         }
         RelayToHost::ClientGone { client_id } => {
-            crate::streamer::server::process_leave(state, &client_id);
+            crate::streamer::server::process_relay_client_gone(state, &client_id);
         }
         RelayToHost::Ping { ts } => {
             if let Ok(text) = serde_json::to_string(&HostToRelay::Pong { ts }) {
@@ -527,12 +527,26 @@ async fn dispatch(
 ) -> HostToRelay {
     use crate::streamer::server;
 
-    let (status, content_type, out_body, device_token): (
+    // The relay hands the path through as the client wrote it, so a `?join=` rides along with
+    // it and has to be split off before the route is matched.
+    let (route, query) = match path.split_once('?') {
+        Some((r, q)) => (r, q),
+        None => (path, ""),
+    };
+    let relay_join = query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("join="))
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, content_type, out_body, device_token, join_id): (
         u16,
         &'static str,
         String,
         Option<String>,
-    ) = match (method, path) {
+        Option<String>,
+    ) = match (method, route) {
         ("POST", "/whep") => {
             let base: Vec<RTCIceServer> = if ice_servers.is_empty() {
                 state.fallback_ice_servers()
@@ -543,22 +557,36 @@ async fn dispatch(
                     .collect()
             };
             let ice = state.ice_with_turn(base);
-            let r = server::process_whep(state, client_id, body.as_bytes(), ice).await;
-            (r.status, r.content_type, r.body, r.device_token)
+            let r = server::process_whep(
+                state,
+                server::JoinOrigin::relayed(client_id),
+                body.as_bytes(),
+                ice,
+            )
+            .await;
+            (r.status, r.content_type, r.body, r.device_token, r.resource)
         }
         ("GET", "/reconfig") => (
             200,
             "application/json",
-            server::process_reconfig(state, client_id),
+            server::process_reconfig(state, &relay_join),
+            None,
             None,
         ),
         ("POST", "/leave") => {
-            server::process_leave(state, client_id);
-            (204, "text/plain", String::new(), None)
+            if relay_join.is_empty() {
+                // A client that names no join is one that predates the id. The relay knows
+                // which of its clients this is, and that maps onto joins without ever touching
+                // an address.
+                server::process_relay_client_gone(state, client_id);
+            } else {
+                server::process_leave(state, &relay_join);
+            }
+            (204, "text/plain", String::new(), None, None)
         }
         _ => {
             teprintln!("[cloud] unsupported tunneled request {method} {path}");
-            (404, "text/plain", "not found".to_string(), None)
+            (404, "text/plain", "not found".to_string(), None, None)
         }
     };
 
@@ -566,6 +594,11 @@ async fn dispatch(
     headers.insert("content-type".to_string(), content_type.to_string());
     if let Some(token) = device_token {
         headers.insert("x-device-token".to_string(), token);
+    }
+    // The relay has no URL space, so there is no `Location` to read the id out of; the header is
+    // how a tunnelled client learns which session it is.
+    if let Some(join) = join_id {
+        headers.insert("x-join-id".to_string(), join);
     }
     HostToRelay::SignalResponse {
         request_id,

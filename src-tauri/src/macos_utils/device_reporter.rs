@@ -45,12 +45,13 @@ impl TauriDeviceReporter {
 
 impl DeviceReporter for TauriDeviceReporter {
     fn report_join(&self, info: DeviceInfo) {
-        let ip = info.ip.clone();
+        let token = info.token.clone();
         let mut device = Device::defaults(info);
+        // Settings are the device's, not the join's: two tabs of one browser read the same row.
         // Bound rather than left in the `if let` scrutinee: a guard produced there lives to the
         // end of the block, which is the shape the project bans near an `.await`.
-        let override_for_ip = self.overrides.lock().unwrap().get(&ip).copied();
-        if let Some(o) = override_for_ip {
+        let saved = self.overrides.lock().unwrap().get(&token).copied();
+        if let Some(o) = saved {
             device.scale = o.scale;
             device.refresh_rate = o.refresh_rate;
             device.video_scale = o.video_scale;
@@ -67,16 +68,11 @@ impl DeviceReporter for TauriDeviceReporter {
         self.resync_streamers();
     }
 
-    fn report_remove(&self, ip: String) {
+    fn report_remove(&self, join_id: String, token: String) {
         let device = Device::defaults(DeviceInfo {
-            ip,
-            token: String::new(),
-            name: String::new(),
-            os: String::new(),
-            screen_size: String::new(),
-            refresh_rate: 0,
-            portrait: false,
-            dpr: 1.0,
+            join_id,
+            token,
+            ..DeviceInfo::default()
         });
         if let Err(e) = DeviceRemove(device).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceRemove failed: {e:?}");
@@ -93,9 +89,10 @@ impl DeviceReporter for TauriDeviceReporter {
         }
     }
 
-    fn report_audio_outputs(&self, ip: String, report: AudioOutputsReport) {
+    fn report_audio_outputs(&self, join_id: String, token: String, report: AudioOutputsReport) {
         let ev = DeviceAudioOutputs {
-            ip,
+            join_id,
+            token,
             supported: report.supported,
             outputs: report
                 .outputs
