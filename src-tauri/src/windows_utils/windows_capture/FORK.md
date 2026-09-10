@@ -99,6 +99,13 @@ logged via `teprintln!` rather than swallowed silently.
 - `GraphicsCaptureApiHandler::frame_pool_buffers` and `stale_frame_counter` (`:552-568`), both
   defaulted (2, and `None`), read once at start (`:337-343`, `:446-452`) and passed to
   `GraphicsCaptureApi::new`.
+- `GraphicsCaptureApiHandler::cursor_capture_override`, defaulted `None`, read in the same block
+  as the two above and used in place of `Settings::cursor_capture_settings` when it is `Some`.
+  It exists because the right value is not knowable until the handler has been constructed: our
+  handler draws the pointer itself when it can build a `CursorOverlay` on the encoder's ring
+  slots, and only then wants `WithoutCursor`. Deciding in `Settings` would mean either a stale
+  cursor (WGC composites it and does not redraw it on a static indirect display) or, if the
+  overlay then failed to build, no cursor at all.
 - `Context` now carries an `AdapterInfo` (`:280-289`) so the handler knows which GPU it got.
 
 ### `d3d11.rs`
