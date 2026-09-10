@@ -146,9 +146,9 @@ export default function Bootstrap() {
   const [remediating, setRemediating] = useState(false);
   // The display driver is held by another ScreenExtend process. Its own dialog, because the
   // only two useful actions -- quit that process, try again -- are neither "continue" nor
-  // "exit", and because nothing here may install anything.
-  const [busyRows, setBusyRows] = useState<UnsupportedApi[] | null>(null);
-  const [busyPid, setBusyPid] = useState<number | null>(null);
+  // "exit", and because nothing here may install anything. The pid is the whole payload: the
+  // host's row says the same thing in prose, and one number is easier to translate around.
+  const [busyHolder, setBusyHolder] = useState<number | null | undefined>(undefined);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const [permReport, setPermReport] = useState<PermissionStatus[] | null>(null);
   const [updating, setUpdating] = useState(false);
@@ -482,7 +482,7 @@ export default function Bootstrap() {
       });
       return;
     }
-    setBusyRows(null);
+    setBusyHolder(undefined);
     await new Promise(resolve => setTimeout(resolve, HOLDER_QUIT_SETTLE_MS));
     await proceed();
   };
@@ -506,8 +506,7 @@ export default function Bootstrap() {
       const gate = classifyCompat(report, { remediated, dontShowAgain });
       switch (gate.kind) {
         case "busy":
-          setBusyRows(gate.rows);
-          setBusyPid(report.display_driver_holder_pid);
+          setBusyHolder(report.display_driver_holder_pid);
           return;
         case "remediate":
           if (await remediate(gate.rows)) {
@@ -745,16 +744,16 @@ export default function Bootstrap() {
       </AlertDialog>
       {/* Another ScreenExtend has the display driver. Nothing is broken, so there is no install
           button and no "Can't Start on This Computer" -- just the two things that help. */}
-      <AlertDialog open={busyRows !== null}>
+      <AlertDialog open={busyHolder !== undefined}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>{t("bootstrap.driverBusy.title")}</AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3 text-left">
                 <div>
-                  {busyPid === null
+                  {busyHolder === null || busyHolder === undefined
                     ? t("bootstrap.driverBusy.body")
-                    : withBold(t("bootstrap.driverBusy.bodyWithPid"), String(busyPid))}
+                    : withBold(t("bootstrap.driverBusy.bodyWithPid"), String(busyHolder))}
                 </div>
                 <div>{t("bootstrap.driverBusy.hint")}</div>
               </div>
@@ -784,7 +783,7 @@ export default function Bootstrap() {
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white"
               onClick={async () => {
-                setBusyRows(null);
+                setBusyHolder(undefined);
                 try {
                   await proceed();
                 } catch {
