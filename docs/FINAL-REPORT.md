@@ -2719,3 +2719,131 @@ unverified. The AMF ring arm and the classic non-ring path are `COMPILE-CHECKED`
 frame extracted from the client's own recording shows the Windows arrow with the right shape, the
 right alpha, and its tip on the pointer's coordinate. The first implementation of this passed every
 host counter while drawing nothing at all, because `MonitorFromPoint` never matched.
+
+## 15.10 Post-report rework: a session is a join, a device is a token, never an address
+
+The owner reported that two browser tabs from one machine could never coexist — the first froze
+and the second replaced it. The cause was a single line of design: `DeviceSessionState` was keyed
+by **client IP**, so a second `POST /whep` from that address walked into the first tab's session
+and stopped its capture. Everything downstream of that key inherited the same assumption.
+
+### The rulings
+
+- **Displays are unlimited on every backend that is not the macOS AirPlay tier — including
+  several from the same machine.** Only AirPlay has a real cap, because macOS itself owns that
+  display. Nothing else may turn a device away, and "it is the same computer" is not a reason to.
+- **Identity is never an IP address.** An address moves under a live session — a Wi-Fi roam, a
+  DHCP renewal, a NAT rebind — and it is *recycled between devices*, so a device that leaves hands
+  its address, and with it its session, its settings and its ban, to whatever picks up the lease
+  next. That is a correctness bug and a security one.
+- **Two identities, two lifetimes.** A **join id** names one tab, for as long as that tab is
+  joined. A **device token** names one device, across joins and reboots. Settings belong to the
+  device; the live session belongs to the join.
+
+### The design
+
+The host mints a 128-bit `join_id` at `POST /whep` and hands it back three ways — as the WHEP
+resource id, in an `X-Join-Id` header, and in an `se_join` cookie — so a client that loses one
+still has another. `SharedSessions` is keyed by it, and so is everything that is genuinely
+per-tab: the live display, the capture stopper, the sequence numbers, both epochs.
+`/reconfig`, `/leave` and `/audio-outputs` carry `?join=`, and `PATCH`/`DELETE /whep/{id}` take
+the join id in the path plus `X-Device-Token` as the second factor — which the peer's address used
+to be.
+
+Everything that belongs to the *device* moved to the token: `SharedDeviceOverrides`, approval,
+bans, the new `SharedAudioSinks`, and both `config.json` arrays. **No IP arm is left**;
+`is_device_banned` lost its address branch, and `session::token_for_ip` refuses to resolve an
+address two devices share rather than guessing. `config.json`'s `devices[]` keeps its shape and is
+matched by token, falling back to the address only for a row written before tokens existed — and
+such a row then waits for that device to join once more rather than being replayed onto whoever
+holds the address now.
+
+On the client page the split is a storage split, and it is the load-bearing detail: the join id
+lives in **`sessionStorage`** (per tab) and the device token stays in **`localStorage`** (per
+origin, shared between tabs on purpose — both tabs *are* the same device). Every rejoin the page
+performs — a reconfigure, a demotion to `<video>`, the legacy transform, a trickle latch — goes
+through `teardownSession()` and mints a *new* join id, so `teardownSession` must release the old
+one or a second display stands for the whole disconnect grace; a tab that reloaded releases the id
+it finds in `sessionStorage` for the same reason. A host that names no session at all (only a
+proxy stripping both the header and the cookie can do it) is reported as `DEG.JOIN_ID_MISSING`
+rather than a page that quietly stops reconfiguring.
+
+The desktop UI shows **one row per live join** (`ConnectedDevice = Device & { joinId }`,
+runtime-only, so `config.json` still stores devices); two rows of one device are told apart by
+screen size where that differs and by position where it does not. Kick and refresh take the join;
+every setting, the audio-outputs map and the trust rows take the token. New command
+`disconnect_session`; `refreshDeviceStream` gained a join id; `Device` gained `joinId`;
+`DeviceAudioOutputs` gained `joinId` and `token`. The CLI's `devices list` grew a live section fed
+by a new `joins` array in the control server's `STATS` reply, and `devices set|reset` takes a
+device token (an address still works while exactly one device is connected from it, and says so).
+
+### Two pre-existing defects the two-tab run found
+
+Both were only *reachable* once every join became its own session, and both were found by running
+it rather than reading it.
+
+1. **`SessionHandle::close` deadlocked on every clean `/leave`.** The injector thread's only exits
+   were its two input channels disconnecting, and every sender clone lives inside a handler the
+   peer connection owns. Those outlive the handle, so `drop(input_tx); join()` waited forever —
+   *inside the task that removes the virtual display*. Measured live: after a leave,
+   `live_transport_sessions` stayed at 2 and 4, the display was never removed, and `join … closed`
+   never printed. The connection is dropped before the join now, the injector selects on a
+   dedicated one-shot it is told to leave over, and the join is bounded at 2 s so a session that
+   cannot prove the thread went away still gives its display back. Dropping the connection alone
+   was not enough — the first attempt hit the deadline every time — which is why the explicit
+   shutdown exists. It went unseen because the only other caller was a session being superseded,
+   which kept its display on purpose.
+2. **A removal could steal a concurrent create's display name.** Windows reuses a display device
+   name the moment one is freed, so a removal overlapping a create's before/after diff hands the
+   same name back, the diff finds nothing new, and the join waits out `DISPLAY_ATTACH_TIMEOUT`
+   with a display created and orphaned. It could not happen while a session was replaced *by
+   address*, because the replacement reused the display; now a client that rejoins releases one
+   while asking for another. `remove_display_async` takes `DISPLAY_CORRELATION_LOCK`; the one
+   caller already inside it uses `remove_display_now`. Reproduced as a hung join with
+   `[display] already extended` spinning for the whole timeout, and gone after.
+
+### Verified, on this box
+
+Two Chrome tabs on `172.16.11.76`, one address, one device token: **two join ids**
+(`ee9db96f…`, `cb55b3f3…`), **two virtual displays** (`\\.\DISPLAY10` and `\\.\DISPLAY11`) beside
+the real `DISPLAY1`, and **both NVENC pipelines encoding** — frame counters climbing 2782→3306 and
+857→1382 over 12 s. Closing one tab removed **only its** display; the other kept streaming and
+`live_transport_sessions` fell 2→1. `probe --whep-selftest` now joins twice from 127.0.0.1 with
+two device tokens, asserts two distinct join ids and at least two live displays, and fails if
+either peer received no RTP — a second display that never paints is the symptom, not the fix.
+Ledger rows 338–342; `docs/manual-tests/client-page.md` §7b and `desktop-ui.md` §12 are the scripts.
+
+**macOS and Linux are `UNVERIFIED (not compiled)`.** The change touches `macos_utils/mod.rs`
+(+220 lines), `macos_utils/device_reporter.rs` and `linux_utils/mod.rs`, and the development Mac
+has been offline for every pass since §15.4, so nothing under those directories has been through a
+compiler. The shared core, the client page and the Windows arms are the verified part.
+
+### Gates and build
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **414 passed,
+0 failed, 16 ignored**, identical under `SE_REQUIRE_HW=1`; `cargo build --features probe` (the
+self-test's two-peer harness is behind that feature, so it has to compile); `pnpm lint` 0 errors;
+`pnpm build`; `check-legacy-webkit`; `pnpm test:client` 7/7; `pnpm test:gate`; `pnpm test:config`;
+`check-versions` 0.6.3; `sha256sum -c` 34/34 and 5/5. `bindings.ts` was regenerated from the
+merged tree and came back **byte-identical** — 53 commands, 11 events, `check-bindings` agreeing
+with `lib.rs`.
+
+`pnpm tauri build`: release profile in **6m 50s**, both installers, exit **1** on the updater
+signing step alone.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 13,996,032 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,885,752 |
+| `…/release/ScreenExtend.exe` | 30,171,648 |
+
+One note that belongs in the record because it is not a source problem and cost a build:
+the machine was restarted before this pass and came back with `node_modules` partly gone —
+`node_modules/.bin` empty, so `pnpm lint` reported "'eslint' is not recognized" and `pnpm build`
+picked up a *global* `tsc` new enough to reject `baseUrl` (TS5101). `pnpm install` restored the
+bin links, but the Tauri CLI's platform binary `@tauri-apps/cli-win32-x64-msvc` was a **broken
+symlink** into a store entry that no longer existed, and the lockfile carries no entry for it
+(it is resolved per-platform at install time), so neither `pnpm install` nor `pnpm install
+--force` could put it back. It was restored by fetching the 2.6.2 tarball and unpacking it at the
+path the existing symlink already pointed to. No committed file changed; `pnpm-lock.yaml` and
+`package.json` are untouched.
