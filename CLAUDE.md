@@ -280,7 +280,7 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `turn_on_wifi`, `install_drivers`,
 `remove_drivers`, `quit_driver_holder`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
-`set_device_auto_frame_rate`, `refresh_device_stream`,
+`set_device_auto_frame_rate`, `refresh_device_stream`, `disconnect_session`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
 `set_device_banned`, `set_device_approved`, `set_disconnect_grace`, `get_disconnect_grace`,
 `get_display_capacity`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
@@ -437,6 +437,11 @@ Cross-platform core, OS-independent:
   `DISPLAY_ATTACH_TIMEOUT` 5 s and `LEAVE_SETTLE` 1.5 s. Routes: `/`, `/health`, `POST /whep`,
   `PATCH /whep/{id}` (trickle ICE, `application/trickle-ice-sdpfrag`), `DELETE /whep/{id}`,
   `/leave`, `/reconfig`, `/ice-config`, `/net-config`, `/audio-outputs`, plus the static assets.
+  Every session-scoped route (`/reconfig`, `/leave`, `/audio-outputs`) names its session with
+  `?join=<id>`; `PATCH`/`DELETE /whep/{id}` take it in the path. None of them falls back to the
+  peer's address — see `session.rs` below. `remove_display_async` takes `DISPLAY_CORRELATION_LOCK`
+  for the removal too, because Windows reuses a display device name the moment one is freed and a
+  removal overlapping a create's before/after diff makes the create find nothing new.
   `index` serves `static/index.html` with `__SAME_DEVICE_FLAG__` substituted and the
   cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`) that make
   `crossOriginIsolated` true on a secure context, which is what lets the audio ring be a real
@@ -448,17 +453,46 @@ Cross-platform core, OS-independent:
   `create_display_with_modes`; **each backend adds the transposes** (Windows in
   `virtual_display.rs`, macOS in `mode_list`) so an orientation flip is a pure mode switch. The
   effective ratio is snapped down by `platform::snap_display_dpr`.
-- `session.rs` — per-client session state keyed by client IP (`DeviceSessionState`, live
-  display, capture stopper, sequence numbers), device overrides, the OTP limiter, disconnect
-  grace (default 10 s, range 0–600), server ports, user STUN/TURN config, per-session
-  audio-output lists. Display-scale and similar changes apply live via **epoch bumps**
-  (`bump_reconfig_epoch`, `bump_kick_epoch`) without tearing down the display — but note that the
+- `session.rs` — **two identities, and neither is an address.**
+
+  A **session is one join** — one browser tab. The host mints a 128-bit `join_id`
+  (`mint_join_id`) at `POST /whep` and hands it back as the WHEP resource, in `X-Join-Id` and in
+  an `se_join` cookie. `SharedSessions` is keyed by it, and so is everything a session owns:
+  `DeviceSessionState`'s live display, capture stopper, sequence numbers, both epochs, leave
+  signal, control channel, disconnect grace and the telemetry registry. Two tabs of one browser —
+  same machine, same address, same device — are two sessions with two displays and neither can
+  reach the other's. Simultaneous displays are uncapped; `session::concurrent_display_cap` is
+  still the only refusal and still only the macOS AirPlay tier. `remove_session` is called once,
+  on the final teardown, because keyed by join the map would otherwise gain an entry for every
+  tab ever opened.
+
+  A **device is its token** (`mint_device_token`, minted on the first successful OTP join,
+  returned via `X-Device-Token`, stored by the client in `localStorage` and presented on every
+  join after that). Per-device settings (`SharedDeviceOverrides`), the audio sink
+  (`SharedAudioSinks`), auto-join approval and bans (`Shared{Approved,Banned}Devices`,
+  `is_device_banned` — **token only**) and the `config.json` `devices[]`/`knownDevices[]` rows
+  are all keyed by it. Two tabs share a token and therefore share every setting.
+
+  **The IP is a label.** It is stored on the session (`note_session_ip`), refreshed from whichever
+  request arrives last, and shown in the UI and the log. Nothing is ever addressed by it: an
+  address moves under a live session (a Wi-Fi roam, a DHCP renewal, a NAT rebind) and is recycled
+  between devices, so resolving by it is how a device that leaves hands its session, its settings
+  and its ban to whatever picks up the lease next. `token_for_ip` exists only as a CLI
+  convenience and refuses to answer when two devices share an address. The one thing still keyed
+  by address is the OTP rate-limit bucket, which is a bucket and not an identity.
+
+  `/reconfig`, `/leave` and `/audio-outputs` carry `?join=`; the `se_join` cookie is a bridge for
+  a page cached from before the id existed, and because a cookie is per-origin the explicit
+  parameter always wins. `PATCH`/`DELETE /whep/{id}` take the join id in the path and require the
+  device token as a second factor. There is deliberately **no address fallback** on any request
+  path.
+
+  Display-scale and similar changes apply live via **epoch bumps** (`bump_reconfig_epoch`,
+  `bump_kick_epoch`) without tearing down the display; a per-device change goes through
+  `bump_reconfig_epoch_for_device`, which moves every join that device holds. Note that the
   *client's* `applyReconfig` still rebuilds its WebRTC session for most changes, so "live" means
   the display survives, not that nothing renegotiates.
-  **Device trust** (auto-join approval + bans) is keyed on a per-device **token**
-  (`mint_device_token`, `Shared{Approved,Banned}Devices`, `is_device_*`), *not* the IP — the
-  host mints the token on a successful OTP join and returns it via the `X-Device-Token` header;
-  the client stores it and presents it on rejoin. The IP is only a display hint.
+
   `OtpLimiter` allows `MAX_OTP_ATTEMPTS` 5 per key with a 60 s lockout, plus a global cross-key
   guard (`MAX_GLOBAL_OTP_ATTEMPTS` 20 per 60 s window → 60 s pause) that defeats the cloud
   relay's rotating-`client_id` bypass; the pause surfaces as the `JoinAttemptsPaused` event.
@@ -856,6 +890,11 @@ driverRepair{boot,install,reinstall,relaunch}
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
 remoteControl, pointerScope, autoFrameRate, systemAudio, audioOutputDeviceId,
 audioOutputDeviceLabel, os, screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
+**Both are keyed by `token`**, not by `ip` — the address is a display field that changes under a
+live session and is recycled between devices. A row written before tokens existed matches by
+address, which is all it names, until that device joins once more and is minted one; until then
+it is not replayed onto anything. `ConnectedDevice = Device & { joinId }` is the runtime-only
+shape the dashboard's device list carries — one entry per live join, never persisted.
 
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,
@@ -999,6 +1038,11 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),
   pre-register every ladder mode at create time — a live display cannot be given new ones — and
   re-apply the DPI *after* the resolution change, which resets it.
+- **Nothing on a request path resolves a peer by its address.** A session is named by the
+  `join_id` the host mints at `POST /whep`; a device is named by its token. An address moves
+  under a live session and is handed to the next device that asks for one, so keying by it is
+  how one device ends up driving another's display, wearing another's settings, or inheriting
+  another's ban. Keep it as a label.
 - Simultaneous displays are **uncapped**. `VirtualDisplayController::max_concurrent_displays()`
   returns `None` everywhere except the macOS AirPlay tier, which returns `Some(1)` because macOS
   itself owns that display. Do not cap the other backends, and never evict a connected device to
