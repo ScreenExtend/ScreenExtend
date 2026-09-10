@@ -2232,3 +2232,92 @@ against the owner's own `config.json`:
 
 Ledger: `docs/OPTIMIZATIONS.md` §UX-D. Manual test: `docs/manual-tests/desktop-ui.md` §11 —
 and it says to run it on a *built* app, because on the dev server this defect does not exist.
+
+## 15.4 Post-report audit: who initializes COM
+
+The owner's rule, and it is binding: **`CoInitializeEx` is called by Tauri; any Rust code inside
+Tauri must assume COM is already up and not call it again.** wry gives the main thread an STA for
+WebView2, every sync `#[tauri::command]` runs there, and a second `CoInitializeEx`/`RoInitialize`
+with a different concurrency model returns `RPC_E_CHANGED_MODE` and initializes nothing. Whatever
+runs next — WMI, WASAPI, a DXGI/D3D enumeration, a WinRT activation — then either fails or
+degrades quietly on an apartment nobody chose.
+
+The shipped build was breaking the rule and saying so, once per adapter enumeration, in the log
+bus of a completely healthy host:
+
+```
+[network] CoInitializeEx failed (HRESULT Call failed with: 0x80010106); assuming COM is already up
+```
+
+`0x80010106` is `RPC_E_CHANGED_MODE`. `windows_utils/networking.rs` called
+`wmi::COMLibrary::new()` on every WMI entry point and fell back to `assume_initialized()` when it
+was refused — a try-then-apologise pattern that happened to work, and that hid the question of
+which apartment the call was actually running in.
+
+### The thread map, measured
+
+`windows_utils::com` logs one line per (call site, apartment) pair the first time it sees it, so
+the map below is what the running host reports rather than a reading of the source. Taken from
+`ScreenExtend serve -v`, `probe --audio`, `probe --capture` and the built GUI on Windows 11 26200.
+
+| Thread | Spawned by | Apartment | Initialized by | COM/WinRT used there |
+|---|---|---|---|---|
+| Tauri main thread (GUI) | tao/wry | STA | **Tauri** | every sync command: `get_network_adapters`, `is_wifi_on`/`turn_on_wifi`, `start`/`stop_hosted_network`, the shell + dialog plugins |
+| Tauri main thread (`serve`, `probe`) | — | none until asked | **us**, via the helper | the same call sites, before any window exists |
+| `network-watcher` | `std::thread::spawn` | MTA | **us**, for the process lifetime | WMI adapter / IP / profile queries |
+| compatibility probe | `std::thread::spawn` in `run_probes` | MTA | **us** | WMI, `ApiInformation`, `GraphicsCaptureSession::IsSupported`, tethering + Wi-Fi Direct, `MMDeviceEnumerator` |
+| `audio-loopback` (MMCSS Pro Audio) | `std::thread::Builder` | MTA | **us** | WASAPI capture, `ActivateAudioInterfaceAsync` |
+| `audio-silence` | `std::thread::Builder` | MTA | **us** | WASAPI render, `IAudioClient3` |
+| WGC capture thread | `start_free_threaded` | MTA | **us**, via `WinRT` | the whole `Windows.Graphics.Capture` surface |
+| `spawn_blocking` workers | tokio | MTA per call | **us**, released on return | `link_medium_for_local_ip` |
+| transport runtime workers | tokio | never initialized | — | none — every COM call from a handler is already on `spawn_blocking` |
+| `se-adapter-<ip>` | `std::thread::Builder` | never initialized | — | none |
+| `IMMNotificationClient`, iphlpapi callbacks | the OS | the OS's | the OS | none: they only `try_send` |
+
+### What changed
+
+`src-tauri/src/windows_utils/com.rs` is the one way in. `ensure_for_this_thread(site, apartment)`
+reads `CoGetApartmentType` **first**: a thread with an apartment of its own is reported and left
+alone — no initialize, and above all no `CoUninitialize`, which would decrement a reference this
+crate never took — and a thread with none is initialized behind a `ComScope` that releases exactly
+what it took. `wmi_for_this_thread` replaces `COMLibrary::new()` at every call site;
+`CoInitializeSecurity` is now a `Once` in one place instead of "whichever thread reached WMI
+first, if any". Routed through it: `networking`'s four WMI entry points and the watcher thread,
+`compatibility::run_probes`, the audio `ComGuard` (both WASAPI threads), and the vendored
+`windows_capture::winrt::WinRT`, whose unconditional `RoInitialize(RO_INIT_MULTITHREADED)` would
+have failed the whole capture with `FailedToInitWinRT` the day `Handler::start` ran on a Tauri
+thread.
+
+One finding came from the tests rather than the reading, and it was already latent in the shipped
+build. `windows-core`'s `FactoryCache` keeps every *agile* WinRT activation factory in a
+process-wide `AtomicPtr` and never releases it, so `GraphicsCaptureSession::IsSupported()` and
+friends are answered from a raw pointer after the first call — a pointer that dies with the
+apartment behind it. The first scope that actually called `CoUninitialize` therefore killed a
+later `wgc_supported()` with `STATUS_ACCESS_VIOLATION` on an unrelated thread. `WinRT` has the
+same shape today: it balances its `CoIncrementMTAUsage` on drop, so a host that stops capturing
+with no other MTA thread alive drops the process's last COM reference and the *next* capture start
+reads a dead factory. `keep_process_com_alive()` — one unmatched `CoIncrementMTAUsage`, taken once
+— holds that floor for a cost of one idle keeper thread.
+
+### What proves it
+
+Six tests in `com.rs`, which assert the rule rather than the code: an STA thread and an MTA thread
+are both left alone (`owns_initialization() == false`); an app-spawned thread is given an explicit
+MTA and hands it back; only the outermost scope owns the apartment; and adapter enumeration, the
+WGC and hosted-network probes and the whole compatibility report answer **identically** from an
+STA, an MTA and an app-spawned thread — with `changed_mode_refusals()` still at zero. The last one
+matters most: without a scope, a thread with no apartment answers `false` to
+`GraphicsCaptureSession::IsSupported()`, which is indistinguishable from a machine without WGC and
+is then cached process-wide by `wgc_features()`.
+
+On the running host: `doctor --json` is byte-identical before and after (`wasapi` /
+`WindowsGraphicsCapture` / `IddDriver` / `nvenc` / `MobileHotspot` / `SendInput`, no unsupported
+APIs); `probe --capture` and `probe --audio` unchanged; `probe --whep-selftest --duration 5` passed
+with 2,446 RTP packets over the `nvenc-zero-copy-ring` path and the full WGC feature set
+(`+cursor +border +secondary-windows +min-update-interval +dirty-region +free-threaded-pool`),
+which is the direct evidence that no factory cache was poisoned; and `status --json` from the
+relaunched GUI reports the same adapters, ports and session state. `RPC_E_CHANGED_MODE` no longer
+appears anywhere in the log.
+
+Ledger: `docs/OPTIMIZATIONS.md` §UX-E. The rule is in `CLAUDE.md` under "Conventions & gotchas";
+the fork divergences are in `windows_capture/FORK.md` under `winrt.rs`.

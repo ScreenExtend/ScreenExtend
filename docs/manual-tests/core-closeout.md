@@ -131,3 +131,27 @@ stand.
 
 Also worth watching in step 3: whether two clients dragging at once produce a usable cursor at
 all. They share one physical cursor and there is no arbitration today.
+
+## 8. The COM apartment map on this machine (UX-E, Windows)
+
+`windows_utils::com` reports one `[com]` line per (call site, apartment) pair, so the map is
+readable from any host without a debugger. Two minutes, no client needed.
+
+1. Open the app, let the dashboard render, then `ScreenExtend logs --lines 500`.
+2. Grep for `[com]` and for `RPC_E_CHANGED_MODE` / `0x80010106`.
+3. Stop the app and run `ScreenExtend serve -v` for ten seconds; grep the same two things.
+4. `ScreenExtend probe --audio 3` and `ScreenExtend probe --capture`, same greps.
+
+**Expect:** `[com] process MTA pinned for the lifetime of the process` exactly once per process;
+one `process COM security` line (either "initialized (impersonate)" or "was already set by the
+host process" — both are answers); `network-watcher`, `compatibility-probe` and `audio` each
+reporting *no apartment of its own → initialized MTA*; and, in the **GUI** only, `network`
+reporting *already in the STA apartment; leaving it alone*, because that call arrives on Tauri's
+main thread. **No occurrence of `RPC_E_CHANGED_MODE` or `0x80010106` anywhere**, and
+`doctor --json`'s six backends identical to what the machine reported before.
+
+A host that reports `network: … MTA` in the GUI is not a failure — it means that build of Tauri
+did not give the main thread an STA — but it is worth reporting, because the whole map is written
+from what wry does today. A host that reports `RPC_E_CHANGED_MODE` at all is a regression: the
+helper asks before it initializes, so the only way to produce one is a call site that stopped
+going through it.
