@@ -208,6 +208,10 @@ pub fn check_system_requirements() -> CompatibilityReport {
         encoder_backend: super::streamer::encoder::probe_encoder_backend().to_string(),
         hosted_network_backend: hostap_backend.as_str().to_string(),
         input_backend: input_backend.as_str().to_string(),
+        // Both are Windows' display-driver story: macOS has no driver to install, and so no
+        // repair budget to scope to a boot.
+        display_driver_holder_pid: None,
+        boot_id: crate::boot_id(),
     }
 }
 

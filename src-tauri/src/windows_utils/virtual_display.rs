@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::driver_ipc::{sync::DriverClient, Mode, Monitor, DEFAULT_PIPE_NAME};
+use crate::driver_ipc::{
+    error::{ConnectionError, InitError},
+    sync::DriverClient,
+    Mode, Monitor, DEFAULT_PIPE_NAME,
+};
 
 use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
 
@@ -22,27 +26,84 @@ pub enum DisplayBackend {
     IddDriver,
     /// The driver's pipe does not exist: it was never installed, or its device node is gone.
     DriverNotInstalled,
-    /// The pipe exists but the driver did not answer a state request.
+    /// The driver is installed and healthy, and another ScreenExtend process is using it.
+    ///
+    /// There is nothing to repair here, and that is the whole point of the variant. It used to
+    /// arrive as `DriverNotResponding`, so the startup gate removed and reinstalled a perfectly
+    /// good signed driver — one elevation prompt each — probed again, found the same thing, and
+    /// went round.
+    ///
+    /// Two ways in, and the measured one is the second. `ERROR_PIPE_BUSY` if the driver ever
+    /// runs out of pipe instances; and a state request that times out, which is what actually
+    /// happens: `report_second_client_behaviour` opens twelve concurrent clients against the
+    /// bundled driver on Windows 11 26200 without complaint *while it is idle*, but
+    /// `report_mode_change_cost` measures a display create at ~4.9 s — during which the driver
+    /// answers nobody, and the 5 s handshake deadline in `driver_ipc` expires. A `doctor` or a
+    /// second launch that lands in that window used to call a busy driver a dead one.
+    DriverBusy {
+        /// The pid holding it, where we could name one. `None` is "somebody is, and we could
+        /// not work out who" — a `probe --live` run, or an instance that is still exiting.
+        holder: Option<u32>,
+    },
+    /// The pipe exists, accepted a connection, and then failed the protocol handshake.
     DriverNotResponding,
 }
 
 impl DisplayBackend {
+    /// The stable wire name. `DriverBusy` deliberately does not carry the pid: the string is
+    /// read by `doctor --json`, the compatibility card and the startup gate, and a value that
+    /// changes with the pid could not be compared against anything.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::IddDriver => "IddDriver",
             Self::DriverNotInstalled => "DriverNotInstalled",
+            Self::DriverBusy { .. } => "DriverBusy",
             Self::DriverNotResponding => "DriverNotResponding",
+        }
+    }
+
+    /// The pid holding the driver's pipe, when this is the busy state and we could name one.
+    pub fn holder(self) -> Option<u32> {
+        match self {
+            Self::DriverBusy { holder } => holder,
+            _ => None,
         }
     }
 }
 
 fn pipe_path() -> String {
-    format!(r"\\.\pipe\{DEFAULT_PIPE_NAME}")
+    pipe_path_for(DEFAULT_PIPE_NAME)
 }
 
-/// Set once this process has actually talked to the driver, so the probe does not have to open
-/// a second connection to a pipe we are already holding — the driver serves one client at a
-/// time, and a second connect from the same process fails while `setup`'s client is alive.
+fn pipe_path_for(name: &str) -> String {
+    format!(r"\\.\pipe\{name}")
+}
+
+/// `ERROR_PIPE_BUSY`: the pipe exists, and every instance of it already has a client.
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// `ERROR_SEM_TIMEOUT`, what a `WaitNamedPipe` that ran out of time reports. Same meaning as
+/// [`ERROR_PIPE_BUSY`] for our purposes — occupied, not dead.
+const ERROR_SEM_TIMEOUT: i32 = 121;
+
+/// `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`: nothing is serving this name.
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+const ERROR_PATH_NOT_FOUND: i32 = 3;
+
+fn is_busy_os_error(code: i32) -> bool {
+    code == ERROR_PIPE_BUSY || code == ERROR_SEM_TIMEOUT
+}
+
+fn is_absent_os_error(code: i32) -> bool {
+    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
+}
+
+/// Set once this process has actually talked to the driver.
+///
+/// A host that is already holding a working client has its answer and does not need to spend a
+/// connect and a 5 s handshake deadline asking again — least of all while its own
+/// `create_display` has the driver busy, which is the window this whole module now has to be
+/// careful about.
 static CONNECTED: OnceLock<()> = OnceLock::new();
 
 /// Probe the display backend. Never cached negatively: `drivers install` flips this at runtime.
@@ -50,22 +111,80 @@ pub fn probe_display_backend() -> DisplayBackend {
     if CONNECTED.get().is_some() {
         return DisplayBackend::IddDriver;
     }
-    if !std::path::Path::new(&pipe_path()).exists() {
-        return DisplayBackend::DriverNotInstalled;
-    }
-    // `DriverClient::new` blocks on driver_ipc's own tokio runtime, which panics if the calling
-    // thread belongs to a runtime. Tauri commands can, so give it a plain thread of its own.
-    let connected = std::thread::spawn(|| match DriverClient::new() {
-        Ok(_) => None,
-        Err(e) => Some(e.to_string()),
-    })
-    .join();
-    match connected {
-        Ok(None) => {
+    match probe_pipe(DEFAULT_PIPE_NAME) {
+        DisplayBackend::IddDriver => {
             let _ = CONNECTED.set(());
             DisplayBackend::IddDriver
         }
-        Ok(Some(e)) => {
+        other => other,
+    }
+}
+
+/// Classify a failed [`DriverClient::new`].
+///
+/// The `Path::exists()` test this replaced could not tell any of these apart, and worse, it got
+/// the busy case exactly backwards: `std::fs::metadata` opens the file, so a pipe whose every
+/// instance is taken reports **not found**. Asking the pipe itself and reading the error is the
+/// only way to separate "never installed" from "installed and occupied" from "wedged".
+///
+/// The handshake arm is the one that is not a simple error-code mapping, and it is the arm the
+/// reported fault actually takes. The bundled driver answers a state request within a
+/// millisecond when idle and not at all while it is attaching a monitor, which takes seconds —
+/// so a timeout means "occupied" whenever another of our own processes is alive to be occupying
+/// it, and reinstalling the driver cannot help while one is.
+fn classify_init_error(e: &InitError) -> DisplayBackend {
+    match e {
+        InitError::Connect(ConnectionError::Failed(io)) => match io.raw_os_error() {
+            Some(code) if is_busy_os_error(code) => DisplayBackend::DriverBusy {
+                holder: driver_pipe_holder(),
+            },
+            Some(code) if is_absent_os_error(code) => DisplayBackend::DriverNotInstalled,
+            _ => DisplayBackend::DriverNotResponding,
+        },
+        InitError::RequestState(_) => match driver_pipe_holder() {
+            Some(pid) => DisplayBackend::DriverBusy { holder: Some(pid) },
+            None => DisplayBackend::DriverNotResponding,
+        },
+    }
+}
+
+/// The classification itself, against one pipe name.
+///
+/// Split out from [`probe_display_backend`] so the busy path can be exercised against a pipe of
+/// the test's own — reproducing it against the real driver means fighting the running host for
+/// it, on exactly the machine where that must not happen.
+fn probe_pipe(name: &str) -> DisplayBackend {
+    // `DriverClient::new` blocks on driver_ipc's own tokio runtime, which panics if the calling
+    // thread belongs to a runtime. Tauri commands can, so give it a plain thread of its own.
+    let owned = name.to_string();
+    let connected = std::thread::spawn(move || match DriverClient::new_with(&owned) {
+        Ok(_) => Ok(()),
+        Err(e) => Err((classify_init_error(&e), e.to_string())),
+    })
+    .join();
+    match connected {
+        Ok(Ok(())) => DisplayBackend::IddDriver,
+        Ok(Err((DisplayBackend::DriverBusy { holder }, e))) => {
+            match holder {
+                Some(pid) => tprintln!(
+                    "[virtual-display] the driver is installed and healthy; pid {pid} has its \
+                     pipe ({e})"
+                ),
+                None => tprintln!(
+                    "[virtual-display] the driver is installed and healthy; another process has \
+                     its pipe ({e})"
+                ),
+            }
+            DisplayBackend::DriverBusy { holder }
+        }
+        Ok(Err((DisplayBackend::DriverNotInstalled, e))) => {
+            tprintln!(
+                "[virtual-display] {} does not exist ({e})",
+                pipe_path_for(name)
+            );
+            DisplayBackend::DriverNotInstalled
+        }
+        Ok(Err((_, e))) => {
             teprintln!("[virtual-display] driver pipe exists but did not answer: {e}");
             DisplayBackend::DriverNotResponding
         }
@@ -74,6 +193,95 @@ pub fn probe_display_backend() -> DisplayBackend {
             DisplayBackend::DriverNotResponding
         }
     }
+}
+
+/// Which process is holding the driver's pipe, when we can name one.
+///
+/// The single-instance control socket is asked first, because that answer is both authoritative
+/// and actionable: a GUI or a `serve` host replies to `PING` with its pid, and is the only kind
+/// of holder we can then offer to quit. Our own pid is not an answer — by the time the desktop
+/// UI probes, the control server it will find may well be this process's own. Anything without
+/// a control socket (`probe --live`, an instance still exiting) is found by looking for another
+/// copy of this executable.
+pub fn driver_pipe_holder() -> Option<u32> {
+    let me = std::process::id();
+    if let Some(pid) = crate::single_instance::running_instance_pid() {
+        if pid != me {
+            return Some(pid);
+        }
+    }
+    sibling_processes().into_iter().next()
+}
+
+/// Every other process running this same executable, oldest pid first.
+fn sibling_processes() -> Vec<u32> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::EnumProcesses;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Some(mine) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+    else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+
+    let mut pids = vec![0u32; 2048];
+    let mut needed = 0u32;
+    if unsafe {
+        EnumProcesses(
+            pids.as_mut_ptr(),
+            (pids.len() * std::mem::size_of::<u32>()) as u32,
+            &mut needed,
+        )
+    }
+    .is_err()
+    {
+        return Vec::new();
+    }
+    pids.truncate(needed as usize / std::mem::size_of::<u32>());
+
+    let mut out = Vec::new();
+    for pid in pids {
+        if pid == 0 || pid == me {
+            continue;
+        }
+        // Limited information is enough for the image name and is the access a same-user
+        // process is granted even when it runs at a different integrity level.
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            continue;
+        };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let named = unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut len,
+            )
+        };
+        let _ = unsafe { CloseHandle(handle) };
+        if named.is_err() {
+            continue;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        if path
+            .rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|f| f.to_lowercase() == mine)
+        {
+            out.push(pid);
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 #[derive(Debug)]
@@ -127,7 +335,19 @@ impl WindowsVirtualDisplay {
     /// installed", which used to be flattened into `None` and never logged.
     pub fn new_shared_reported() -> Result<SharedVirtualDisplay, String> {
         let mut client = DriverClient::new().map_err(|e| {
-            if std::path::Path::new(&pipe_path()).exists() {
+            if matches!(classify_init_error(&e), DisplayBackend::DriverBusy { .. }) {
+                // Not a fault. The driver serves one client at a time and somebody else has it,
+                // so the answer is to close them, never to reinstall anything.
+                match driver_pipe_holder() {
+                    Some(pid) => format!(
+                        "the display driver is installed and healthy, but another ScreenExtend \
+                         process (pid {pid}) is already using it. Quit that instance and try again."
+                    ),
+                    None => "the display driver is installed and healthy, but another \
+                             ScreenExtend process is already using it. Quit it and try again."
+                        .to_string(),
+                }
+            } else if std::path::Path::new(&pipe_path()).exists() {
                 format!(
                     "the display driver did not answer on {} ({e}); it may be starting, stopped, or wedged",
                     pipe_path()
@@ -518,6 +738,205 @@ mod test {
             DisplayBackend::DriverNotInstalled.as_str(),
             "DriverNotInstalled"
         );
+        assert_eq!(
+            DisplayBackend::DriverNotResponding.as_str(),
+            "DriverNotResponding"
+        );
+        // The pid rides in `holder`, never in the wire name — the name is compared against a
+        // literal by `doctor --json` and the startup gate.
+        assert_eq!(
+            DisplayBackend::DriverBusy { holder: None }.as_str(),
+            "DriverBusy"
+        );
+        assert_eq!(
+            DisplayBackend::DriverBusy { holder: Some(7) }.as_str(),
+            "DriverBusy"
+        );
+        assert_eq!(
+            DisplayBackend::DriverBusy { holder: Some(7) }.holder(),
+            Some(7)
+        );
+        assert_eq!(DisplayBackend::IddDriver.holder(), None);
+    }
+
+    /// The distinction the whole fix rests on: a refused connect can mean "occupied", and only
+    /// two OS errors mean that. Anything else is a driver that is genuinely not answering, and
+    /// treating it as busy would hide a real fault behind "quit the other instance".
+    #[test]
+    fn only_the_pipe_busy_errors_mean_occupied() {
+        assert!(is_busy_os_error(ERROR_PIPE_BUSY));
+        assert!(is_busy_os_error(ERROR_SEM_TIMEOUT));
+        // ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND.
+        for code in [5, 109, 0, ERROR_FILE_NOT_FOUND] {
+            assert!(!is_busy_os_error(code), "{code} must not read as busy");
+        }
+        assert!(is_absent_os_error(ERROR_FILE_NOT_FOUND));
+        assert!(is_absent_os_error(ERROR_PATH_NOT_FOUND));
+        assert!(!is_absent_os_error(ERROR_PIPE_BUSY));
+
+        let connect_error = |code| {
+            InitError::Connect(ConnectionError::Failed(std::io::Error::from_raw_os_error(
+                code,
+            )))
+        };
+        assert!(matches!(
+            classify_init_error(&connect_error(ERROR_PIPE_BUSY)),
+            DisplayBackend::DriverBusy { .. }
+        ));
+        assert_eq!(
+            classify_init_error(&connect_error(ERROR_FILE_NOT_FOUND)),
+            DisplayBackend::DriverNotInstalled
+        );
+        // ERROR_ACCESS_DENIED: the pipe is there and would not have us. Not a state anything
+        // can install its way out of, so it stays the honest "not answering".
+        assert_eq!(
+            classify_init_error(&connect_error(5)),
+            DisplayBackend::DriverNotResponding
+        );
+        // A handshake that timed out with nobody else on the machine to be holding the driver
+        // is a driver that is genuinely wedged.
+        let handshake = InitError::RequestState(crate::driver_ipc::error::RequestError::Timeout(
+            Duration::from_secs(5),
+        ));
+        if driver_pipe_holder().is_none() {
+            assert_eq!(
+                classify_init_error(&handshake),
+                DisplayBackend::DriverNotResponding
+            );
+        } else {
+            crate::test_support::skip(
+                "the wedged-driver classification",
+                "another ScreenExtend process is running, which is the busy case by definition",
+            );
+        }
+    }
+
+    /// A pipe whose single instance is already taken reads as `DriverBusy`, and a pipe that
+    /// accepts a connection and then says nothing reads as `DriverNotResponding`.
+    ///
+    /// Neither needs the real driver: the classification is about what the OS says to a
+    /// connect, so a named pipe of the test's own reproduces it exactly — and reproducing it
+    /// with the real driver would mean fighting the running host for it, on the one machine
+    /// where that matters.
+    #[test]
+    fn an_occupied_pipe_is_busy_and_a_silent_one_is_not_responding() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let taken = format!("screenextend-probe-busy-{}", std::process::id());
+        let taken_path = pipe_path_for(&taken);
+        let _server = rt
+            .block_on(async {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .max_instances(1)
+                    .create(&taken_path)
+            })
+            .expect("create a one-instance pipe server");
+        // One client occupies the only instance, exactly as the running host does.
+        let _client = rt
+            .block_on(async { ClientOptions::new().open(&taken_path) })
+            .expect("occupy the pipe");
+        match probe_pipe(&taken) {
+            DisplayBackend::DriverBusy { .. } => {}
+            other => panic!("an occupied pipe classified as {other:?}, not DriverBusy"),
+        }
+
+        // A pipe that lets us in and then says nothing: a wedged driver, unless one of our own
+        // processes is up, in which case it is the busy case by definition.
+        let silent = format!("screenextend-probe-silent-{}", std::process::id());
+        let silent_path = pipe_path_for(&silent);
+        let _mute = rt
+            .block_on(async {
+                ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .max_instances(2)
+                    .create(&silent_path)
+            })
+            .expect("create a pipe server that never answers");
+        if driver_pipe_holder().is_none() {
+            assert_eq!(probe_pipe(&silent), DisplayBackend::DriverNotResponding);
+        } else {
+            crate::test_support::skip(
+                "the wedged-driver probe",
+                "another ScreenExtend process is running, so a silent pipe reads as busy",
+            );
+        }
+
+        // And a name nothing is serving is a driver that was never installed.
+        assert_eq!(
+            probe_pipe("screenextend-probe-absent"),
+            DisplayBackend::DriverNotInstalled
+        );
+    }
+
+    /// What the *real* driver does to a second client, measured rather than assumed.
+    ///
+    /// This is the state the owner hit: one client already open, a second asking. It prints the
+    /// error the second connect gets, so the classification above can be checked against the
+    /// shipped driver rather than against a pipe of our own making. Needs the driver installed
+    /// and nothing else using it. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "requires the virtual display driver installed and idle; run with --ignored --nocapture"]
+    fn report_second_client_behaviour() {
+        println!(
+            "pipe {} exists: {}",
+            pipe_path(),
+            std::path::Path::new(&pipe_path()).exists()
+        );
+        println!(
+            "first probe (nothing holding it): {:?}",
+            probe_pipe(DEFAULT_PIPE_NAME)
+        );
+        let Ok(held) = DriverClient::new() else {
+            crate::test_support::skip_because(
+                "the second-client probe",
+                "the virtual display driver is not installed, or is already in use",
+            );
+            return;
+        };
+        println!("holding one client open; asking again from a second connection");
+        let mut open = vec![held];
+        for n in 2..=12 {
+            let started = Instant::now();
+            let next = std::thread::spawn(DriverClient::new)
+                .join()
+                .expect("probe thread");
+            match next {
+                Ok(client) => {
+                    println!("  client {n}: ok after {:?}", started.elapsed());
+                    open.push(client);
+                }
+                Err(e) => {
+                    println!("  client {n}: {e} after {:?}", started.elapsed());
+                    println!("    raw os error: {:?}", raw_os_error_of(&e));
+                    break;
+                }
+            }
+        }
+        println!("  {} clients open at once", open.len());
+        println!(
+            "  Path::exists() while held: {}",
+            std::path::Path::new(&pipe_path()).exists()
+        );
+        println!(
+            "  probe_pipe() while held:   {:?}",
+            probe_pipe(DEFAULT_PIPE_NAME)
+        );
+        drop(open);
+    }
+
+    #[cfg(test)]
+    fn raw_os_error_of(e: &InitError) -> Option<i32> {
+        match e {
+            InitError::Connect(ConnectionError::Failed(io)) => io.raw_os_error(),
+            InitError::RequestState(_) => None,
+        }
     }
 
     #[test]

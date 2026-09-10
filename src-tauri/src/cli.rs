@@ -175,6 +175,14 @@ pub fn fast_path() {
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
+    use crate::single_instance;
+    use tauri::Manager;
+    // Before the GUI early-return, because the desktop app needs it too: it is what lets the
+    // display-driver probe — a plain Tauri command with no `AppHandle` of its own in reach —
+    // ask the control socket which process is holding the driver's pipe.
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        single_instance::remember_ctrl_path(dir.join(single_instance::CTRL_FILE));
+    }
     let args = user_args();
     if args.is_empty() {
         return Outcome::LaunchGui;
@@ -824,7 +832,7 @@ mod desktop {
         if let Some(reply) =
             single_instance::query_running_instance(&ctrl_path, single_instance::Command::Ping)
         {
-            if reply.trim() == "OK" {
+            if single_instance::is_ok_reply(&reply) {
                 return true;
             }
         }
@@ -889,6 +897,16 @@ mod desktop {
                 platform::virtual_display::DisplayBackend::DriverNotInstalled => {
                     "NOT INSTALLED — run `ScreenExtend drivers install` (Administrator)".to_string()
                 }
+                // Not a fault, and not worth an exit code: the driver serves one client at a
+                // time, so `doctor` run beside a live host finds the pipe taken and has to say
+                // so in those words. Saying "not answering" here is what sent the desktop app
+                // reinstalling a healthy driver.
+                platform::virtual_display::DisplayBackend::DriverBusy { holder } => match holder {
+                    Some(pid) => {
+                        format!("installed, in use by ScreenExtend (pid {pid})")
+                    }
+                    None => "installed, in use by another ScreenExtend process".to_string(),
+                },
                 platform::virtual_display::DisplayBackend::DriverNotResponding => {
                     "installed but not answering its pipe".to_string()
                 }
@@ -909,6 +927,7 @@ mod desktop {
                 ],
                 json: serde_json::json!({
                     "virtualDisplay": backend.as_str(),
+                    "virtualDisplayHolderPid": backend.holder(),
                     "signingCertificate": match cert {
                         Some(true) => "trusted",
                         Some(false) => "absent",
