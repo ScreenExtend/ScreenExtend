@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
-use wmi::{COMLibrary, WMIConnection};
+use wmi::WMIConnection;
 
 use super::hosted_network::{probe_backend, HostedNetworkBackend};
 use super::streamer::{select_vendor, Vendor};
@@ -93,17 +93,18 @@ fn read_os_info() -> (String, u32) {
     (os_version, build_num)
 }
 
+/// Every probe below runs on a thread of this function's own, and that is load-bearing twice
+/// over: the WinRT and WMI calls want an MTA (a blocking `join()` on a Tauri STA has no message
+/// pump behind it), and an app-spawned thread is the only kind this crate is allowed to
+/// initialize. The caller's apartment therefore cannot reach the answer — which is what
+/// `com::test::the_compatibility_report_does_not_depend_on_the_callers_apartment` asserts.
 fn run_probes() -> Probes {
     std::thread::spawn(|| -> Probes {
-        let _com = match COMLibrary::new() {
-            Ok(c) => c,
-            Err(_) => return Probes::optimistic(),
+        let Ok((_com, com_con)) = super::com::wmi_for_this_thread("compatibility-probe") else {
+            return Probes::optimistic();
         };
 
-        let wmi = WMIConnection::with_namespace_path("root\\StandardCimv2", unsafe {
-            COMLibrary::assume_initialized()
-        })
-        .is_ok();
+        let wmi = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con).is_ok();
 
         let wgc = wgc_supported();
         let dxgi = dxgi_supported();
