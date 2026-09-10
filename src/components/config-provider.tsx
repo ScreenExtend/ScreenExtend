@@ -12,6 +12,7 @@ import {
 // schema and the node test that cross-checks them can both see it. Re-exported here
 // because every call site in the app imports the config from this file.
 export {
+  DEFAULT_AUTO_FRAME_RATE,
   DEFAULT_POINTER_SCOPE,
   DEFAULT_STUN_URL,
   DEFAULT_HTTP_PORT,

@@ -11,7 +11,11 @@
 // `config-provider.tsx` re-exports everything below, so no call site imports from here.
 
 export type PointerScope = "display" | "all";
-export const DEFAULT_POINTER_SCOPE: PointerScope = "display";
+// `all` is the product's intended behaviour: a second monitor whose mouse and keyboard stop at
+// its own edge is not a second monitor. `display` is the opt-in restriction, so a device saved
+// before the setting existed -- which carries no value at all -- keeps the reach it had.
+export const DEFAULT_POINTER_SCOPE: PointerScope = "all";
+export const DEFAULT_AUTO_FRAME_RATE = false;
 
 export type Device = {
   ip: string;
@@ -25,15 +29,24 @@ export type Device = {
   remoteControl: boolean;
   /**
    * Where a pointer-locked client's cursor may travel. Both input backends track their own
-   * position and clamp it, but today they clamp to the union of every attached display, so
-   * accumulated `MOUSE_DELTA` walks the cursor onto screens the client cannot see and can
-   * then click on. `display` keeps it on the session's own display; `all` is the old
-   * behaviour, and it is what dragging a window back off the virtual display needs.
+   * position and clamp it; `all`, the default, clamps to the union of every attached display,
+   * which is what dragging a window back off the virtual display needs. `display` is the
+   * restriction: the cursor stays on the session's own screen and cannot be walked onto a
+   * monitor the client's user cannot see.
    *
    * Optional because the field post-dates the devices already in `config.json`; a device
-   * saved before it reads as `display` through `DEFAULT_POINTER_SCOPE`.
+   * saved before it reads as `all` through `DEFAULT_POINTER_SCOPE`, i.e. unchanged.
    */
   pointerScope?: PointerScope;
+  /**
+   * Whether the stream may run below `refreshRate` on its own. Off -- the default -- makes the
+   * chosen rate a promise: the host delivers at that cadence and repeats an unchanged frame
+   * rather than skipping it, and no controller lowers it. On lets the pipeline adapt.
+   *
+   * Optional for the same reason as `pointerScope`; absent reads as
+   * `DEFAULT_AUTO_FRAME_RATE`.
+   */
+  autoFrameRate?: boolean;
   systemAudio: boolean;
   audioOutputDeviceId: string;
   audioOutputDeviceLabel: string;

@@ -153,6 +153,15 @@ pub struct Config {
     /// keeps the top end.
     pub quality_qp: Option<u8>,
     pub intra_refresh: bool,
+    /// Whether the pipeline may deliver fewer frames per second than `max_fps` asks for.
+    ///
+    /// `false`, the default, is the owner's ruling: the rate the user chose is the rate the
+    /// stream runs at, an unchanged frame is repeated at that cadence rather than skipped, and
+    /// no controller lowers it. Copied out of `DeviceOverride::auto_frame_rate` at join, so the
+    /// per-session pipeline can read one plain `bool` and never reaches for the override map.
+    /// The probe harness leaves it `false` for the same reason: a measurement wants a fixed
+    /// cadence.
+    pub auto_frame_rate: bool,
     pub encoder_vendor: EncoderVendor,
     /// The snapshot the standalone probe harness and `--software-encode` set. Prefer
     /// [`Config::software_encode_now`] everywhere that has a live host behind it.
@@ -216,6 +225,7 @@ impl Default for Config {
             qp: None,
             quality_qp: None,
             intra_refresh: false,
+            auto_frame_rate: false,
             encoder_vendor: EncoderVendor::Auto,
             disable_gpu_encode: false,
             gpu_encode_toggle: None,
