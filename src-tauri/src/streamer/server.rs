@@ -1566,7 +1566,8 @@ async fn start_session(
                             (display_id, name, topology_reset)
                         }
                         None => {
-                            remove_display_async(client, display_id).await;
+                            // Still inside the correlation lock, so this is the unlocked form.
+                            remove_display_now(client, display_id).await;
                             bail!("virtual display {display_id} did not attach within timeout");
                         }
                     }
@@ -1904,7 +1905,23 @@ async fn start_session(
     Ok((answer, resource_id))
 }
 
+/// Remove a display, holding the correlation lock while it happens.
+///
+/// A create identifies its new display by diffing the OS's device-name list before and after.
+/// Windows reuses a name the moment one is freed, so a removal that overlaps that window can
+/// hand the *same* name back to the new display and the diff then finds nothing new — the join
+/// waits out `DISPLAY_ATTACH_TIMEOUT` and fails, with a display created and orphaned. It could
+/// not happen while a session was replaced by address, because the replacement reused the
+/// display rather than creating a second one; now that every join is its own session, a client
+/// that rejoins releases one display while asking for another, and the two overlap by
+/// construction.
 async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
+    let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
+    remove_display_now(client, id).await;
+}
+
+/// The same, for the one caller that is already inside the correlation lock.
+async fn remove_display_now(client: &session::SharedVirtualDisplay, id: u32) {
     let client = client.clone();
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }

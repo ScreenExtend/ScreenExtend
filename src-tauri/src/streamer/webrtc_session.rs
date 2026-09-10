@@ -757,6 +757,21 @@ pub struct SessionHandle {
     resource_id: String,
 }
 
+/// How long `close` will wait for the injector thread to notice it has no work left.
+const INJECTOR_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for the injector to leave, but not forever. `true` when it did.
+fn join_injector(join: std::thread::JoinHandle<()>) -> bool {
+    let start = std::time::Instant::now();
+    while !join.is_finished() {
+        if start.elapsed() >= INJECTOR_JOIN_DEADLINE {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    join.join().is_ok()
+}
+
 impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
@@ -770,13 +785,33 @@ impl SessionHandle {
                 teprintln!("closing media socket: {e}");
             }
         }
-        // Dropping the last sender is what tells the injector thread to leave its `select!`.
+        // The connection's own handlers each hold a clone of the injector's sender — the input
+        // data channel's `on_message`, and the state-change handler that releases held keys —
+        // so the channel cannot disconnect while the connection is alive, whatever this handle
+        // does with its own copy. Letting the connection go is what actually abandons it.
+        //
+        // Without this the join below waited on a thread that had no way to leave, and it waited
+        // inside the task that removes the display: every clean leave left its virtual display
+        // standing and its transport counted as live. It went unseen because the only other
+        // caller was a session being superseded, which kept its display on purpose.
+        drop(self.pc);
+        if let Some(tx) = self.input_tx.as_ref() {
+            tx.shutdown();
+        }
         drop(self.input_tx.take());
         if let Some(join) = self.input_join.take() {
-            // The injector only ever blocks on the channel it was just told to abandon, so this
-            // is a formality — but a formality worth having, because it is the proof the thread
-            // went away rather than the hope that it did.
-            let _ = tokio::task::spawn_blocking(move || join.join()).await;
+            // The proof that the thread went away rather than the hope that it did — but
+            // bounded, because a session that cannot produce that proof must still give its
+            // display back. A thread that outlives this is parked on a channel nothing can feed;
+            // it costs one idle OS thread, not a screen the user is looking at.
+            let left = tokio::task::spawn_blocking(move || join_injector(join))
+                .await
+                .unwrap_or(false);
+            if !left {
+                teprintln!(
+                    "injector thread did not leave within {INJECTOR_JOIN_DEADLINE:?};                      continuing so the display is released anyway"
+                );
+            }
         }
         LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
     }
