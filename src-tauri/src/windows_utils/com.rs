@@ -191,7 +191,8 @@ pub fn ensure_for_this_thread(site: &'static str, want: Apartment) -> Result<Com
         Apartment::Mta => COINIT_MULTITHREADED,
         Apartment::Sta => COINIT_APARTMENTTHREADED,
     };
-    // SAFETY: no reserved pointer, and the thread was just observed to have no apartment.
+    // SAFETY: no reserved pointer, and the thread was just observed to have no apartment of its
+    // own. Explicitly initializing a thread sitting on the implicit MTA is allowed and pins it.
     let hr = unsafe { CoInitializeEx(None, flags) };
     if hr == RPC_E_CHANGED_MODE {
         CHANGED_MODE.fetch_add(1, Ordering::Relaxed);
@@ -306,7 +307,8 @@ fn report(site: &'static str, apartment: ThreadApartment, initialized: bool) {
     }
     if initialized {
         tprintln!(
-            "[com] {site}: thread had no apartment; initialized {} for this app-spawned thread",
+            "[com] {site}: thread had no apartment of its own; initialized {} for this \
+             app-spawned thread",
             apartment.as_str()
         );
     } else {
