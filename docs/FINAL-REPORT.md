@@ -2847,3 +2847,58 @@ symlink** into a store entry that no longer existed, and the lockfile carries no
 --force` could put it back. It was restored by fetching the 2.6.2 tarball and unpacking it at the
 path the existing symlink already pointed to. No committed file changed; `pnpm-lock.yaml` and
 `package.json` are untouched.
+
+## 15.11 Post-report fix: the lockfile stopped naming the Tauri CLI's native binary
+
+§15.10 closed with a note that the build had to be repaired by hand: the Tauri CLI's platform
+binary was missing and `pnpm-lock.yaml` had no entry for it, so neither `pnpm install` nor
+`--force` could restore it. That note was the symptom. This is the cause, and it was one commit.
+
+`@tauri-apps/cli` is a JS wrapper around a napi binary shipped as one npm package per platform,
+listed in the wrapper's own `optionalDependencies` and `require()`d at startup. `9a181cb`
+(2026-09-08, *"chore: refresh the lockfile after the nine dropped dependencies"* — 8 insertions,
+383 deletions) under-resolved and wrote the result out as a refresh, taking **seventeen** packages
+with it: the eleven `@tauri-apps/cli-*` platform packages, three `@esbuild/*`, two `@rollup/*` and
+`@pkgjs/parseargs`. None of them was a dependency anybody had dropped. Walking every revision of
+the lockfile back to 2024, that commit is the only one where the `cli-win32-x64-msvc` mention
+count goes to zero.
+
+**The failure mode is why this is worth a guard.** A lockfile that names the wrapper and not the
+list installs only the wrapper, so `pnpm install --frozen-lockfile` on a fresh clone succeeds —
+exit 0, no warning — and the next `pnpm tauri` anything dies with `Cannot find module
+'@tauri-apps/cli-win32-x64-msvc'`. It did not fail on the machine that made it, because this box's
+`node_modules/.pnpm` already held the package from an install predating the break; it only
+surfaced when a restart cleared that. CI would not have been so lucky: `ci.yml` runs
+`pnpm install --frozen-lockfile` in all five jobs and `build-release.yml` runs a plain
+`pnpm install`, and neither has a warm store. **The release build was one push away from failing
+on a defect nothing in the repo could see.**
+
+The repair is `pnpm install --lockfile-only --fix-lockfile` — plain `--lockfile-only` does not do
+it and neither does `--force`, both of which read the existing lockfile as already satisfying
+`package.json` and change nothing. The resulting diff is the exact inverse of `9a181cb`:
+**17 packages added, 0 removed, 0 version changes.**
+
+**Proved on a fresh clone, both ways** (`git clone --no-local`, `pnpm install --frozen-lockfile`,
+store untouched): before, install exits 0 and `pnpm tauri --version` throws `Cannot find module`;
+after, install exits 0 and it prints `tauri-cli 2.6.2`. The warm store rescued neither — which
+settles that this was never a local symlink accident. `--frozen-lockfile` installs the lockfile,
+and a package the lockfile does not name is not installed however many copies the store holds.
+
+**The guard** is `scripts/check-lockfile.mjs` — dependency-free, `pnpm test:lockfile`, wired into
+`ci.yml`'s `frontend` job immediately after the install, and the **fifth** entry in `CLAUDE.md`'s
+Checkers list. For every package in `node_modules/.pnpm` it reads that package's *own*
+`package.json` and asserts the lockfile's snapshot records each name in its `optionalDependencies`.
+Anchoring the assertion in what the package declares, rather than in a list somebody has to
+remember to maintain, is the point: a native-binding dependency added next year is covered the day
+it lands. Against the unfixed tree it names all seventeen and exits 1; here it reports
+`5 packages declare optionalDependencies; all are recorded in pnpm-lock.yaml`.
+
+Verified after the merge, in the order that matters — merge, *then* `pnpm install
+--frozen-lockfile`, because installing first would have pruned the hand-unpacked binary §15.10
+left behind. `pnpm tauri --version` now prints `tauri-cli 2.6.2` from a properly installed
+package, and `node_modules/.pnpm/@tauri-apps+cli-win32-x64-msvc@2.6.2` is a real store entry
+rather than a broken link. `pnpm test:lockfile`, `pnpm lint` (0 errors), `pnpm build`,
+`check-legacy-webkit`, `pnpm test:client` 7/7, `pnpm test:gate`, `pnpm test:config`,
+`check-bindings` (53 commands / 11 events) and `check-versions` (0.6.3) all pass. No Rust changed,
+so nothing was rebuilt and the running host was left alone. Ledger: `docs/OPTIMIZATIONS.md`
+§UX-LOCK; the workflow note is `docs/dev-workflow.md` §`pnpm-lock.yaml`.
