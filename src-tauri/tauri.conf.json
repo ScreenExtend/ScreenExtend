@@ -81,15 +81,15 @@
         "status": {
           "description": "Show session, network, driver and config state.",
           "args": [
-            { "name": "session-id", "takesValue": true, "description": "Build full join URLs for this session id." },
+            { "name": "session-id", "takesValue": true, "description": "Build join URLs for this session id instead of the running host's." },
             { "name": "json", "description": "Output JSON." }
           ]
         },
         "qr": {
-          "description": "Print join QR codes / URLs for a session.",
+          "description": "Print join QR codes / URLs for the session the running host is serving.",
           "args": [
             { "name": "target", "short": "t", "takesValue": true, "possibleValues": ["lan", "cloud", "all"], "description": "Which targets to show (default: all)." },
-            { "name": "session-id", "takesValue": true, "description": "Use a specific session id (default: random)." },
+            { "name": "session-id", "takesValue": true, "description": "Use this session id instead of the running host's (default: the host's, else random)." },
             { "name": "no-render", "description": "Print URLs only; do not draw QR codes." },
             { "name": "json", "description": "Output JSON." }
           ]
@@ -98,7 +98,7 @@
           "description": "Session credential helpers.",
           "subcommands": {
             "new": {
-              "description": "Generate a fresh session id + OTP and print join info.",
+              "description": "Mint a session id + OTP, apply them to the running host, and print the join info.",
               "args": [
                 { "name": "no-render", "description": "Print URLs only; do not draw QR codes." },
                 { "name": "json", "description": "Output JSON." }

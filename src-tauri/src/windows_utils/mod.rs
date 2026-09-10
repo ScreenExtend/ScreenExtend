@@ -99,7 +99,12 @@ impl CloudStatusSink for TauriCloudStatusSink {
 
     fn session_rotated(&self, session_id: String) {
         use tauri_specta::Event;
-        let payload = crate::SessionIdChange { session_id };
+        // Only the id moved: the relay found this one taken and picked another. An empty `otp`
+        // says so, and the UI keeps the code it is already showing.
+        let payload = crate::SessionIdChange {
+            session_id,
+            otp: String::new(),
+        };
         if let Err(e) = payload.emit(&self.app) {
             teprintln!("[cloud] failed to emit session id change event: {e:?}");
         }

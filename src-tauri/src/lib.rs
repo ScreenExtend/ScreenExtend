@@ -144,10 +144,19 @@ pub struct PermissionStatus {
     pub relaunch_required: bool,
 }
 
+/// The host's join credentials changed under the desktop UI, which mirrors both values.
+///
+/// Two things emit it: the cloud relay rotating an id it found taken, and `ScreenExtend session
+/// new` replacing the pair through the single-instance control socket. An **empty `otp` means
+/// the OTP did not change** — the rotation case — and the frontend must leave its copy alone
+/// rather than clearing it. Without the field the UI would show the new id beside the old code
+/// and then push that stale pair back through `set_session_credentials`, undoing the half of the
+/// change it could not see.
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct SessionIdChange {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    pub otp: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
