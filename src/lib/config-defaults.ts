@@ -18,7 +18,13 @@ export const DEFAULT_POINTER_SCOPE: PointerScope = "all";
 export const DEFAULT_AUTO_FRAME_RATE = false;
 
 export type Device = {
+  /**
+   * Where the device was last seen. A label, never a key: an address moves under a live
+   * session (a roam, a lease renewal) and is handed on to the next device that asks for one,
+   * so a row matched by address is a row that can land on the wrong machine.
+   */
   ip: string;
+  /** The device. Every setting below is stored under it, on both sides. */
   token: string;
   name: string;
   scale: number;
@@ -55,6 +61,17 @@ export type Device = {
   dpr: number;
   maxDpr: number;
 };
+
+/**
+ * One live session, as the dashboard sees it: a saved device's settings plus the id of the tab
+ * holding them. A device with two tabs open produces two of these with one `token` between
+ * them -- the settings are shared, the displays are not.
+ *
+ * Deliberately not part of `Device`: `config.json` stores devices, which outlive every session
+ * they ever hold, and a join id written into a saved row would be a name for something that no
+ * longer exists the moment the app restarts.
+ */
+export type ConnectedDevice = Device & { joinId: string };
 
 export type KnownDevice = {
   token: string;

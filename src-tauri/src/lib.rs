@@ -852,6 +852,7 @@ pub fn run() {
             set_device_pointer_scope,
             set_device_auto_frame_rate,
             refresh_device_stream,
+            disconnect_session,
             set_device_audio_output,
             get_device_audio_outputs,
             remove_device_override,

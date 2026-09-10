@@ -65,9 +65,14 @@ export async function applyConfig(config: Config): Promise<Config> {
   );
 
   for (const device of applied.devices) {
-    await at(`devices[${device.ip}]`, async () => {
+    // Settings belong to the device, and a device is its token. A row saved before tokens
+    // existed names only an address, and an address is handed on to the next machine that
+    // asks for one — so it waits for that device to join once more rather than being
+    // replayed onto whoever is there now.
+    if (!device.token) continue;
+    await at(`devices[${device.token}]`, async () => {
       await commands.setDeviceOverride(
-        device.ip,
+        device.token,
         device.scale,
         device.orientation,
         device.refreshRate,
@@ -79,17 +84,17 @@ export async function applyConfig(config: Config): Promise<Config> {
       );
       // Their own commands rather than `setDeviceOverride` arguments: that one is at
       // specta's ten-parameter ceiling.
-      await commands.setDevicePointerScope(device.ip, device.pointerScope ?? DEFAULT_POINTER_SCOPE);
+      await commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE);
       await commands.setDeviceAutoFrameRate(
-        device.ip,
+        device.token,
         device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE
       );
-      await commands.setDeviceAudioOutput(device.ip, device.audioOutputDeviceId);
+      await commands.setDeviceAudioOutput(device.token, device.audioOutputDeviceId);
     });
   }
 
   for (const known of applied.knownDevices) {
-    await at(`knownDevices[${known.ip}]`, async () => {
+    await at(`knownDevices[${known.token || known.ip}]`, async () => {
       await commands.setDeviceBanned(known.token, known.ip, known.banned);
       if (known.token) await commands.setDeviceApproved(known.token, !known.banned);
     });

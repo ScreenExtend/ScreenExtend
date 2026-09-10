@@ -25,19 +25,21 @@ import { useTranslation } from "@/i18n";
 import { Command } from "@tauri-apps/plugin-shell";
 import { type } from "@tauri-apps/plugin-os";
 import { useConnectedDevices } from "@/components/global-provider";
-import { type Device } from "@/components/config-provider";
+import { type ConnectedDevice } from "@/components/config-provider";
 import { commands } from "@/lib/bindings";
 import { cn } from "@/lib/utils";
 
-function RefreshStream({ device }: { device: Device }) {
+function RefreshStream({ device, label }: { device: ConnectedDevice; label: string }) {
   const [busy, setBusy] = useState(false);
   const { t } = useTranslation();
-  const name = device.name || device.ip;
+  const name = label;
 
   const refresh = async () => {
     setBusy(true);
     try {
-      const restarted = await commands.refreshDeviceStream(device.ip);
+      // This tab's stream, not the device's: a device with two open restarts only the one
+      // whose row was clicked.
+      const restarted = await commands.refreshDeviceStream(device.token, device.joinId);
       toast(
         restarted
           ? {
@@ -81,6 +83,22 @@ function RefreshStream({ device }: { device: Device }) {
       </TooltipContent>
     </Tooltip>
   );
+}
+
+// One row per live session, so a machine with two tabs open is two rows carrying the same
+// device name. The screen size tells them apart when it differs; when it does not, the row's
+// position among that device's own sessions does. Neither shows anything for a device holding
+// a single session, which is every device until the owner opens a second tab.
+function rowLabel(device: ConnectedDevice, all: ConnectedDevice[]): string {
+  const name = device.name || device.ip || "Unknown device";
+  const siblings = all.filter(d => d.token && d.token === device.token);
+  if (siblings.length < 2) return name;
+  const sizes = new Set(siblings.map(d => d.screenSize).filter(Boolean));
+  if (device.screenSize && sizes.size === siblings.length) {
+    return `${name} (${device.screenSize})`;
+  }
+  const nth = siblings.findIndex(d => d.joinId === device.joinId) + 1;
+  return nth > 0 ? `${name} (${nth})` : name;
 }
 
 export default function Devices() {
@@ -136,7 +154,7 @@ export default function Devices() {
               Display Settings
             </Button>
           </div>
-          <p className="text-gray-500">{ devices.length } Device{ devices.length !== 1 && "s" } Connected</p>
+          <p className="text-gray-500">{ devices.length } Screen{ devices.length !== 1 && "s" } Connected</p>
         </div>
         <div>
           <TooltipProvider delay={150}>
@@ -159,8 +177,8 @@ export default function Devices() {
                   every index after it shifts. React then reuses row instances across
                   different devices, which can carry an open sheet onto the wrong one. */}
               {devices.map((device) => (
-                <TableRow key={device.token || device.ip}>
-                  <TableCell>{device.name}</TableCell>
+                <TableRow key={device.joinId || device.token || device.ip}>
+                  <TableCell>{rowLabel(device, devices)}</TableCell>
                   <TableCell>{device.ip}</TableCell>
                   <TableCell>{device.os}</TableCell>
                   <TableCell>{device.scale}%</TableCell>
@@ -169,7 +187,7 @@ export default function Devices() {
                   <TableCell>{device.screenSize}</TableCell>
                   <TableCell className="text-center">
                     <div className="flex items-center justify-center space-x-2">
-                      <RefreshStream device={device} />
+                      <RefreshStream device={device} label={rowLabel(device, devices)} />
                       <DeviceDetails device={device} />
                     </div>
                   </TableCell>
