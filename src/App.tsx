@@ -388,6 +388,7 @@ function GlobalState({ children }: { children: ReactNode }) {
             outputs: p.outputs,
             selected: p.selected,
             current: p.current,
+            labelled: p.labelled,
           },
         }));
       }));

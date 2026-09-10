@@ -191,6 +191,22 @@ function DeviceDetailsBody({
   // Compared against the host's *applied* choice, not the unsaved form value, so editing
   // the picker does not flash a warning about a change that has not been sent yet.
   const sinkMismatch = clientSink !== null && !!audioOutputs && clientSink !== audioOutputs.selected;
+  // The client says whether the ids arrived carrying the operating system's own names.
+  // `false` means they did not -- the page then names them by position ("Output 1"), which
+  // is honest and routable but is not what the hardware is called, so the panel says so
+  // instead of presenting them as device names. A client too old to send the field says
+  // `null`/`undefined`, which is "did not say", not "no".
+  const namesUnavailable = audioOutputs?.labelled === false;
+  // Falls back to `(names unavailable)` rather than a truncated id when the client has told
+  // us the names are missing: an eight-character hash is not a thing a person can choose from.
+  const unnamed = (id: string): string =>
+    namesUnavailable ? t("device.audioOutput.unnamed") : id.slice(0, 8);
+  const outputLabel = (o: { id: string; label: string }): string =>
+    o.id === "se:earpiece"
+      ? t("device.audioOutput.earpiece")
+      : o.id === "se:loudspeaker"
+        ? t("device.audioOutput.speaker")
+        : o.label || unnamed(o.id);
   const sinkLabel = (id: string): string =>
     id === ""
       ? t("device.audioOutput.default")
@@ -198,7 +214,7 @@ function DeviceDetailsBody({
         ? t("device.audioOutput.earpiece")
         : id === "se:loudspeaker"
           ? t("device.audioOutput.speaker")
-          : audioOutputs?.outputs.find((o) => o.id === id)?.label || id.slice(0, 8);
+          : audioOutputs?.outputs.find((o) => o.id === id)?.label || unnamed(id);
   useEffect(() => {
     if (!open) return;
     (async () => {
@@ -211,6 +227,7 @@ function DeviceDetailsBody({
             outputs: r.outputs,
             selected: r.selected,
             current: r.current,
+            labelled: r.labelled,
           },
         }));
       } catch (e) {
@@ -604,11 +621,7 @@ function DeviceDetailsBody({
                       <SelectItem value="default">{t("device.audioOutput.default")}</SelectItem>
                       {(audioOutputs?.outputs ?? []).map((o) => (
                         <SelectItem key={o.id} value={o.id}>
-                          {o.id === "se:earpiece"
-                            ? t("device.audioOutput.earpiece")
-                            : o.id === "se:loudspeaker"
-                              ? t("device.audioOutput.speaker")
-                              : o.label || o.id.slice(0, 8)}
+                          {outputLabel(o)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -619,6 +632,16 @@ function DeviceDetailsBody({
                 (!audioOutputs || audioOutputs.outputs.length === 0) && (
                   <p className="mt-2 text-sm text-muted-foreground">
                     {t("device.audioOutput.waiting")}
+                  </p>
+                )}
+              {/* Names, not routing: the ids work either way. This says so, because a list
+                  reading "Output 1, Output 2" with no explanation looks like a fault. */}
+              {audioOutputs?.supported !== false &&
+                namesUnavailable &&
+                !!audioOutputs &&
+                audioOutputs.outputs.length > 0 && (
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {t("device.audioOutput.generic")}
                   </p>
                 )}
               {/* What the client says it is *actually* playing on. `setSinkId` needs

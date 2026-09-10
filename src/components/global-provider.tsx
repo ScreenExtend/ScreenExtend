@@ -16,6 +16,18 @@ export type AudioOutputsInfo = {
    * missing field means "the client did not say", not "the default".
    */
   current?: string | null;
+  /**
+   * Whether the ids in `outputs` came back carrying the operating system's own names.
+   * `false` means the browser withheld them -- the usual answer without a microphone
+   * grant, which this page deliberately no longer spends a prompt on -- so the client
+   * named them itself by position ("Output 1", "Default output"). Routing is unaffected:
+   * `setSinkId` takes the bare id. The host must simply not present those names as what
+   * the hardware is called.
+   *
+   * Optional, and `null` from a client that predates the field: "the client did not say",
+   * which is not the same answer as `false`.
+   */
+  labelled?: boolean | null;
 };
 
 export type QrValue = { title: string; value: string };

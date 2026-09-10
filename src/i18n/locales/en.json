@@ -308,6 +308,8 @@
       "earpiece": "Earpiece",
       "waiting": "Waiting for this device to report its speakers…",
       "unsupported": "This device's browser can't switch speakers; audio plays on its default output.",
+      "unnamed": "(names unavailable)",
+      "generic": "This device's browser withheld its speaker names, so they are listed by position. Choosing one still works.",
       "playingOn": "Playing on: {label}",
       "mismatch": "This device is still playing on {label}. Its browser needs a tap on the page before it will switch."
     },
