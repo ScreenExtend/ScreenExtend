@@ -131,10 +131,12 @@ function Connect-Cdp {
 }
 
 function Invoke-Cdp {
-    param([string]$Method, $Params = @{}, [int]$TimeoutMs = 15000)
+    param([string]$Method, $Params = @{}, [int]$TimeoutMs = 15000, [string]$SessionId)
     $script:cdpId++
     $myId = $script:cdpId
-    $payload = @{ id = $myId; method = $Method; params = $Params } | ConvertTo-Json -Depth 10 -Compress
+    $msg = @{ id = $myId; method = $Method; params = $Params }
+    if ($SessionId) { $msg.sessionId = $SessionId }
+    $payload = $msg | ConvertTo-Json -Depth 10 -Compress
     $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
     $seg = New-Object 'System.ArraySegment[byte]' -ArgumentList @(, $bytes)
     $script:cdpSocket.SendAsync($seg, 'Text', $true, [Threading.CancellationToken]::None).Wait() | Out-Null
@@ -160,22 +162,71 @@ function Invoke-Cdp {
 }
 
 function Invoke-Js {
-    param([string]$Expression, [int]$TimeoutMs = 15000, [switch]$UserGesture)
+    param([string]$Expression, [int]$TimeoutMs = 15000, [switch]$UserGesture, [string]$SessionId)
     $r = Invoke-Cdp 'Runtime.evaluate' @{
         expression    = $Expression
         returnByValue = $true
         awaitPromise  = $true
         userGesture   = [bool]$UserGesture
-    } $TimeoutMs
+    } $TimeoutMs $SessionId
     if ($r.exceptionDetails) { throw "page threw: $($r.exceptionDetails.text)" }
     return $r.result.value
 }
+
+# How smooth the *host's* desktop is while all this is going on.
+#
+# The owner's second report is not about the stream at all - "the system becomes laggy in general
+# and the cursor is weird". A window's requestAnimationFrame cadence is driven by the compositor,
+# and the compositor is what draws the pointer, so the interval between animation frames in an
+# ordinary window on the host's own screen is the closest thing to a number for "does the desktop
+# feel smooth". It is measured in a second, small, always-visible window so that the work of
+# decoding the stream is not what is being timed.
+$RAF_PROBE = @'
+<!doctype html><meta charset=utf-8><title>desktop smoothness</title>
+<style>body{margin:0;font:13px system-ui;background:#101014;color:#ddd;padding:12px}</style>
+<div id=o>measuring…</div><script>
+var d=[],p=0,o=document.getElementById('o');
+function f(t){if(p)d.push(t-p);p=t;if(d.length%30===0)o.textContent=d.length+' frames';requestAnimationFrame(f)}
+requestAnimationFrame(f);
+window.__stats=function(){
+  if(d.length<10)return null;
+  var s=d.slice().sort(function(a,b){return a-b});
+  var period=s[Math.floor(s.length/2)];
+  var hitch=0,worst=0,total=0;
+  for(var i=0;i<d.length;i++){total+=d[i];if(d[i]>period*2)hitch++;if(d[i]>worst)worst=d[i]}
+  return {frames:d.length,fps:Math.round(1000/period*10)/10,
+          p50:Math.round(s[Math.floor(s.length*0.5)]*100)/100,
+          p99:Math.round(s[Math.floor(s.length*0.99)]*100)/100,
+          max:Math.round(worst*100)/100,
+          hitches:hitch,hitchesPerMin:Math.round(hitch/(total/60000)*10)/10};
+};
+window.__reset=function(){d=[];p=0};
+</script>
+'@
 
 # --------------------------------------------------------------------------------------------
 # Host
 # --------------------------------------------------------------------------------------------
 Get-Process ScreenExtend -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
+
+# A device row saved from an earlier session pins the geometry and the refresh rate for every
+# later join from the same address - `refreshRate: 360` and `dpr: 2` were both found on this box,
+# written by a browser window that happened to be sitting on the *virtual* display, and they
+# survived every restart. Measuring against one is measuring that row, not the build. Removed for
+# the run and put back afterwards.
+$storeFile = Join-Path $env:APPDATA 'app.screenextend.desktop\config.json'
+$storeBackup = Join-Path $runDir 'config.json.before'
+if (Test-Path $storeFile) {
+    Copy-Item $storeFile $storeBackup -Force
+    try {
+        $store = Get-Content -Raw $storeFile | ConvertFrom-Json
+        if ($null -ne $store.devices) {
+            $store.devices = @()
+            $store | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 $storeFile
+        }
+    } catch { Write-Warning "could not clear the saved device row: $_" }
+}
 
 # The join form validates the session id against /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/ and
 # leaves Connect disabled for anything else - so an id the *host* accepts on the command line is
@@ -268,6 +319,38 @@ Step 'cdp connected'
 Invoke-Cdp 'Page.enable' @{} | Out-Null
 Step 'page domain enabled'
 
+# The desktop-smoothness probe, in its own small window beside the stream on the host's screen.
+$rafSession = $null
+try {
+    $probeUrl = 'data:text/html;charset=utf-8,' + [Uri]::EscapeDataString($RAF_PROBE)
+    $t = Invoke-Cdp 'Target.createTarget' @{ url = $probeUrl; newWindow = $true; width = 620; height = 420 }
+    $att = Invoke-Cdp 'Target.attachToTarget' @{ targetId = $t.targetId; flatten = $true }
+    $rafSession = $att.sessionId
+    $win = Invoke-Cdp 'Browser.getWindowForTarget' @{ targetId = $t.targetId }
+    Invoke-Cdp 'Browser.setWindowBounds' @{
+        windowId = $win.windowId
+        bounds   = @{ left = 1290; top = 0; width = 620; height = 420; windowState = 'normal' }
+    } | Out-Null
+    Start-Sleep -Milliseconds 2000
+    Invoke-Js 'window.__reset && window.__reset(), true' -SessionId $rafSession | Out-Null
+    Step 'desktop-smoothness probe up'
+} catch {
+    Step "desktop-smoothness probe unavailable: $_"
+    $rafSession = $null
+}
+
+
+
+# The page raises a microphone card during the join and genuinely waits for the answer:
+# `enumerateBeforeJoin` is the one thing on it that can prompt, and it is deliberately in front
+# of the first ICE candidate. Granting the permission up front is what a returning user has, and
+# it takes the card - and the race to dismiss it - out of the measurement.
+try {
+    $origin = ([Uri]$joinUrl).GetLeftPart([UriPartial]::Authority)
+    Invoke-Cdp 'Browser.grantPermissions' @{ origin = $origin; permissions = @('audioCapture') } | Out-Null
+    Step "microphone pre-granted for $origin"
+} catch { Step "could not pre-grant the microphone: $_" }
+
 Invoke-Cdp 'Page.navigate' @{ url = $joinUrl } | Out-Null
 Step "navigated to $joinUrl"
 $loaded = $false
@@ -276,6 +359,30 @@ for ($i = 0; $i -lt 40; $i++) {
     try { if ((Invoke-Js "document.readyState === 'complete' && !!document.getElementById('connect')") -eq $true) { $loaded = $true; break } } catch { }
 }
 if (-not $loaded) { throw 'the join page never finished loading' }
+
+# Record the exact body of the join POST. The host sizes the virtual display from `width`,
+# `height` and `dpr` in it, and reading those back off the page afterwards is not the same thing:
+# they are computed at submit time. Installed here rather than through
+# `Page.addScriptToEvaluateOnNewDocument`, which did not run at all on this Chrome.
+Invoke-Js @'
+(function () {
+  window.__whep = null;
+  window.__log = [];
+  var f = window.fetch;
+  window.fetch = function (u, o) {
+    try { if (String(u).indexOf('/whep') >= 0 && o && o.body) window.__whep = String(o.body); } catch (e) {}
+    return f.apply(window, arguments);
+  };
+  var m = ['log', 'warn', 'error'];
+  for (var i = 0; i < m.length; i++) {
+    (function (k) {
+      var orig = console[k];
+      console[k] = function () { try { window.__log.push(k + ': ' + Array.prototype.join.call(arguments, ' ')); } catch (e) {} return orig.apply(console, arguments); };
+    })(m[i]);
+  }
+  return true;
+})()
+'@ | Out-Null
 
 # The page raises a same-device warning when the request came from the host itself; it is modal
 # over the join form, so it is dismissed before anything else is touched.
@@ -308,21 +415,33 @@ for ($i = 0; $i -lt 6; $i++) {
     if (-not $state.disabled -and $state.clicked.Count -eq 0) { break }
     Start-Sleep -Milliseconds 700
 }
-$pre = Invoke-Js "JSON.stringify({ disabled: document.getElementById('connect').disabled, webcodecs: 'VideoDecoder' in window, secure: window.isSecureContext, coi: !!self.crossOriginIsolated })"
+# What the client is about to ask the host to build. The host sizes the virtual display at
+# `screen` x `devicePixelRatio` and drives it at the refresh rate the page measured, so a page
+# that measures either of those wrongly is a 4K 360 Hz display nobody asked for.
+$pre = Invoke-Js "JSON.stringify({ disabled: document.getElementById('connect').disabled, webcodecs: 'VideoDecoder' in window, secure: window.isSecureContext, coi: !!self.crossOriginIsolated, dpr: window.devicePixelRatio, screen: screen.width + 'x' + screen.height })"
 Step "pre-click: $pre"
 Step 'clicking connect'
 Invoke-Js "document.getElementById('connect').click(), true" -UserGesture | Out-Null
 
 # The join is only real once the client has painted; framesPainted is the client's own count of
 # frames that reached a sink, not of frames it accepted.
+$asked = $null
 $joined = $false
 for ($i = 0; $i -lt 160; $i++) {
     Start-Sleep -Milliseconds 500
     try {
+        # The microphone card is raised *after* Connect, and the join genuinely waits for the
+        # user's answer - `enumerateBeforeJoin` is the one thing on the page that can prompt, and
+        # it is deliberately in front of the first ICE candidate. Nobody is here to answer it.
+        Invoke-Js "(function(){var b=document.getElementById('permSkip');if(b&&b.offsetParent!==null){b.click();return 1}return 0})()" | Out-Null
         $s = Invoke-Js 'window.SEVideo ? JSON.stringify(SEVideo.getStats()) : ""'
         if ($s) {
             $st = $s | ConvertFrom-Json
-            if ($st.framesPainted -gt 0) { $joined = $true; break }
+            if ($st.framesPainted -gt 0) {
+                try { $asked = Invoke-Js "(function(){var b={};try{b=JSON.parse(window.__whep||'{}')}catch(e){} return JSON.stringify({posted:{refreshRate:b.refreshRate,width:b.width,height:b.height,dpr:b.dpr},now:{dpr:window.devicePixelRatio,screen:screen.width+'x'+screen.height},hooked:typeof window.__whep});})()" } catch { }
+                $joined = $true
+                break
+            }
         }
     } catch { }
 }
@@ -335,7 +454,7 @@ if (-not $joined) {
     Step "client console:`n$log"
     throw "client never painted a frame (host log: $hostLog)"
 }
-Step 'client painted its first frame'
+Step "client painted its first frame; asked for $asked"
 
 # The display the host created for this client is the one that was not there before the join.
 Start-Sleep -Milliseconds 500
@@ -368,6 +487,16 @@ addEventListener('resize',r);r();
         "--window-position=$($vb.X),$($vb.Y)", "--window-size=$($vb.Width),$($vb.Height)",
         "--app=file:///$($anim -replace '\\','/')") | Out-Null
     Start-Sleep -Seconds 3
+}
+
+# The desktop as it is with the host process running but nothing streaming: the control for the
+# streaming number below, taken on the same machine seconds apart rather than on another day.
+$desktopIdle = $null
+if ($rafSession) {
+    try {
+        $desktopIdle = (Invoke-Js 'JSON.stringify(window.__stats())' -SessionId $rafSession) | ConvertFrom-Json
+        Invoke-Js 'window.__reset(), true' -SessionId $rafSession | Out-Null
+    } catch { }
 }
 
 # --------------------------------------------------------------------------------------------
@@ -432,6 +561,9 @@ if (-not $NoRecord) {
 $samples = @()
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $prevPainted = $null
+$prevCpuMs = $null
+$prevWallMs = 0.0
+$cores = [Environment]::ProcessorCount
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
     Start-Sleep -Milliseconds 1000
     $row = [ordered]@{ t = [Math]::Round($sw.Elapsed.TotalSeconds, 2) }
@@ -449,6 +581,20 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
         $row.rttMs = $st.rttMs
         $row.hostToPaint = $st.hostToPaint
     } catch { $row.clientError = "$_" }
+    try {
+        $proc = Get-Process ScreenExtend -ErrorAction Stop
+        $row.hostThreads = $proc.Threads.Count
+        $cpuNow = $proc.TotalProcessorTime.TotalMilliseconds
+        $wallNow = $sw.Elapsed.TotalMilliseconds
+        if ($null -ne $prevCpuMs -and $wallNow -gt $prevWallMs) {
+            # Against wall time actually elapsed, not against the nominal 1 s: the CDP round trips
+            # in this loop make the real interval longer, and dividing by 1 s reads low.
+            $row.hostCpuPct = [Math]::Round(($cpuNow - $prevCpuMs) / ($wallNow - $prevWallMs) / $cores * 100.0, 1)
+        }
+        $prevCpuMs = $cpuNow
+        $prevWallMs = $wallNow
+        $row.hostPriority = "$($proc.PriorityClass)"
+    } catch { }
     $samples += [pscustomobject]$row
 }
 $sw.Stop()
@@ -461,6 +607,16 @@ $hostStatus = $null
 
 $final = $null
 try { $final = (Invoke-Js 'JSON.stringify(SEVideo.getStats())') | ConvertFrom-Json } catch { }
+
+try {
+    $log = Invoke-Js "(window.__log || []).slice(-60).join('`n')"
+    if ($log) { Set-Content -Encoding UTF8 -Path (Join-Path $runDir 'client-console.log') -Value $log }
+} catch { }
+
+$desktop = $null
+if ($rafSession) {
+    try { $desktop = (Invoke-Js 'JSON.stringify(window.__stats())' -SessionId $rafSession) | ConvertFrom-Json } catch { }
+}
 
 # --------------------------------------------------------------------------------------------
 # Freeze analysis. mpdecimate with the thresholds at their floor: `hi`/`lo` are 8x8-block SAD
@@ -509,11 +665,25 @@ $summary = [ordered]@{
             min  = ($painted | Measure-Object -Minimum).Minimum
             max  = ($painted | Measure-Object -Maximum).Maximum
         } } else { $null }
+    clientAsked  = if ($asked) { $asked | ConvertFrom-Json } else { $null }
     clientFinal  = $final
+    desktopIdle  = $desktopIdle
+    desktop      = $desktop
+    hostCpuPct   = $null
+    hostThreads  = $null
     freeze       = $freeze
     hostStatus   = $hostStatus
     samples      = $samples
 }
+$cpuSamples = $samples | Where-Object { $null -ne $_.hostCpuPct } | ForEach-Object { $_.hostCpuPct }
+if ($cpuSamples) {
+    $summary.hostCpuPct = [ordered]@{
+        mean = [Math]::Round((($cpuSamples | Measure-Object -Average).Average), 1)
+        max  = ($cpuSamples | Measure-Object -Maximum).Maximum
+    }
+}
+$thr = $samples | Where-Object { $null -ne $_.hostThreads } | ForEach-Object { $_.hostThreads }
+if ($thr) { $summary.hostThreads = ($thr | Measure-Object -Maximum).Maximum }
 $summary.hostTelemetryLine = (Select-String -Path $hostLog -Pattern 'telemetry: ' | Select-Object -Last 1).Line
 $summaryPath = Join-Path $runDir 'summary.json'
 $summary | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 $summaryPath
@@ -523,7 +693,16 @@ if ($chromeProc -and -not $chromeProc.HasExited) { Stop-Process -Id $chromeProc.
 Get-Process chrome -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $chrome -and $_.MainWindowTitle -like '*ScreenExtend*' } |
     Stop-Process -Force -ErrorAction SilentlyContinue
-if ($hostProc -and -not $hostProc.HasExited) { Stop-Process -Id $hostProc.Id -Force -ErrorAction SilentlyContinue }
+if ($hostProc -and -not $hostProc.HasExited) {
+    $quit = Start-Process -FilePath $Binary -PassThru -WindowStyle Hidden -ArgumentList @('stop')
+    if (-not $quit.WaitForExit(8000)) { Stop-Process -Id $quit.Id -Force -ErrorAction SilentlyContinue }
+    if (-not $hostProc.WaitForExit(8000)) {
+        Write-Warning 'the host did not stop on request; killing it (a virtual display may be left attached)'
+        Stop-Process -Id $hostProc.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (Test-Path $storeBackup) { Copy-Item $storeBackup $storeFile -Force }
 
 Write-Host ''
 Write-Host "=== $Label / $Scene ==="
@@ -537,6 +716,9 @@ if ($final) {
             $final.videoPath, [int]$final.renderTier, ([int]$final.degraded).ToString('x'), $final.keyRequests, $final.framesDropped, $final.decodeErrors)
     if ($final.hostToPaint) { Write-Host ("host capture -> paint  p50 {0}  p90 {1}  p99 {2} (us)" -f $final.hostToPaint.p50, $final.hostToPaint.p90, $final.hostToPaint.p99) }
 }
+if ($summary.hostCpuPct) { Write-Host ("host CPU {0}% of all cores (max {1}%), {2} threads" -f $summary.hostCpuPct.mean, $summary.hostCpuPct.max, $summary.hostThreads) }
+if ($desktopIdle) { Write-Host ("desktop, host up but idle: {0} fps, frame p99 {1} ms max {2} ms, hitches {3} ({4}/min)" -f $desktopIdle.fps, $desktopIdle.p99, $desktopIdle.max, $desktopIdle.hitches, $desktopIdle.hitchesPerMin) }
+if ($desktop) { Write-Host ("desktop smoothness: {0} fps, frame p50 {1} ms p99 {2} ms max {3} ms, hitches {4} ({5}/min)" -f $desktop.fps, $desktop.p50, $desktop.p99, $desktop.max, $desktop.hitches, $desktop.hitchesPerMin) }
 $tel = Select-String -Path $hostLog -Pattern 'telemetry: ' | Select-Object -Last 1
 if ($tel) { Write-Host ("host: " + ($tel.Line -replace '^.*telemetry: ', '')) }
 Write-Host "-> $summaryPath"

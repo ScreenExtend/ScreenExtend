@@ -334,6 +334,16 @@ counters! {
     // the previous frame — DXGI's `AccumulatedFrames` past the first, which was read only as an
     // early-out and never counted.
     frames_dropped_capture => "frames_dropped_capture",
+    // `frames_skipped_unchanged`: frames the compositor reported no dirty region for and the
+    // capture path therefore did not encode. It went uncounted for the whole of its first life,
+    // which is why a scene it was silently eating — a pointer moving over a still desktop, where
+    // the dirty-region report is empty and the picture has still changed — looked identical in
+    // every host number to a scene where nothing had happened at all.
+    frames_skipped_unchanged => "frames_skipped_unchanged",
+    // `frames_skipped_cadence`: frames dropped because the display composes faster than the rate
+    // this device asked for. Not a degradation — it is the cap doing its job — but the two must
+    // be distinguishable from each other and from a frame nobody dropped on purpose.
+    frames_skipped_cadence => "frames_skipped_cadence",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
     keyframe_requests_suppressed => "keyframe_requests_suppressed",

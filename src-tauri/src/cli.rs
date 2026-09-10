@@ -1144,6 +1144,7 @@ mod desktop {
         if let Some(store) = store.as_deref() {
             apply_saved_config(app, store);
         }
+        tprintln!("[serve] saved configuration applied");
 
         let session_id = match read_credential(m, "session-id", "SCREENEXTEND_SESSION_ID", None) {
             Ok(Some(id)) => id,
@@ -1161,6 +1162,7 @@ mod desktop {
                 exit(2);
             }
         };
+        tprintln!("[serve] session credentials resolved");
         platform::set_session_credentials(app.state(), session_id.clone(), otp.clone());
 
         platform::networking::watch_for_network_changes(app.clone());

@@ -16,13 +16,23 @@ pub fn apply_process_tuning() {
     }
 }
 
-/// Asks the GPU scheduler to treat this process as real-time.
+/// Where this process sits in the GPU scheduler's per-process priority classes.
 ///
-/// `IDXGIDevice::SetGPUThreadPriority` — which we also call, per device — turned out not to be
-/// enough on its own: OBS added exactly this call (commit `ec769ef`, "libobs-d3d11: Set maximum
-/// GPU priority") because capture was still being deprioritised underneath a full-screen game.
-/// It is per-process, so one call at startup covers every device created later, which matters
-/// because we create a capture device and an encoder device per client.
+/// The scale is `D3DKMT_SCHEDULINGPRIORITYCLASS`: Idle 0, Below Normal 1, Normal 2, Above Normal
+/// 3, High 4, Realtime 5. **DWM is the reason this is not set to 5.**
+///
+/// It was, for one engagement. The argument was OBS's (commit `ec769ef`, "libobs-d3d11: Set
+/// maximum GPU priority"), and OBS's case is not this one: OBS is capturing a full-screen game
+/// that is starving it, and OBS is what the user is watching. ScreenExtend runs behind whatever
+/// the user is actually doing, and putting its capture, its scale blt and its encode above the
+/// compositor's own packets is what the owner reported as the whole machine going slow with a
+/// pointer that flickers — the pointer is drawn by the compositor, so the compositor losing the
+/// GPU is exactly what a flickering pointer looks like.
+///
+/// `ABOVE_NORMAL` keeps the original intent — a full-screen game must not push the capture out —
+/// while leaving the compositor's `HIGH` above us, which is the ordering the desktop needs to stay
+/// responsive. `SE_GPU_SCHED_CLASS` overrides it with a raw class number for measurement, and
+/// setting it to `2` (Normal) turns the whole thing off.
 ///
 /// Resolved by `GetProcAddress`: it lives in gdi32 but is not in any import library, and a
 /// non-zero NTSTATUS is a reason to carry on, not to fail.
@@ -33,10 +43,16 @@ fn raise_gpu_scheduling_priority_class() {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     use windows::Win32::System::Threading::GetCurrentProcess;
 
-    /// `D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME`, the top of the Idle..Realtime scale.
-    const REALTIME: u32 = 5;
+    /// `D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL`. Below the compositor's, above a game's.
+    const ABOVE_NORMAL: u32 = 3;
 
     type SetPriorityClassFn = unsafe extern "system" fn(WinHandle, u32) -> i32;
+
+    let class = std::env::var("SE_GPU_SCHED_CLASS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v <= 5)
+        .unwrap_or(ABOVE_NORMAL);
 
     let Ok(gdi32) = (unsafe { GetModuleHandleA(s!("gdi32.dll")) }) else {
         teprintln!("[gpu] gdi32 not loaded; skipping GPU scheduling priority");
@@ -49,12 +65,12 @@ fn raise_gpu_scheduling_priority_class() {
         return;
     };
     let set: SetPriorityClassFn = unsafe { std::mem::transmute(proc) };
-    let status = unsafe { set(GetCurrentProcess(), REALTIME) };
+    let status = unsafe { set(GetCurrentProcess(), class) };
     if status == 0 {
-        tprintln!("[gpu] GPU scheduling priority class raised to REALTIME");
+        tprintln!("[gpu] GPU scheduling priority class set to {class} (0 idle .. 5 realtime)");
     } else {
         teprintln!(
-            "[gpu] D3DKMTSetProcessSchedulingPriorityClass(REALTIME) -> NTSTATUS 0x{status:08X}"
+            "[gpu] D3DKMTSetProcessSchedulingPriorityClass({class}) -> NTSTATUS 0x{status:08X}"
         );
     }
 }

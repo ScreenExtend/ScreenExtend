@@ -353,12 +353,17 @@ pub struct Device {
 
 impl Device {
     pub fn defaults(info: crate::streamer::session::DeviceInfo) -> Self {
+        // The *saved* rate is capped the same way the join path caps the reported one, and for
+        // the same reason: a device row written from a 360 Hz browser pinned the host to a 360 Hz
+        // virtual display for every later join, long after the session that measured it. The
+        // slider still goes to `MAX_REFRESH_RATE`; this is only what a device is given without
+        // anyone choosing it.
         let refresh_rate = if info.refresh_rate == 0 {
             60
         } else {
             info.refresh_rate.clamp(
                 crate::streamer::server::MIN_REFRESH_RATE,
-                crate::streamer::server::MAX_REFRESH_RATE,
+                crate::streamer::server::DEFAULT_MAX_AUTO_REFRESH,
             )
         };
         let native_dpr = crate::streamer::platform::snap_display_dpr(info.dpr);

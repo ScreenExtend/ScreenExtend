@@ -167,6 +167,106 @@ const FRAME_POOL_BUFFERS_RING: u32 = 3;
 /// otherwise serve a stale picture forever.
 const MAX_CONSECUTIVE_UNCHANGED: u32 = 5;
 
+/// Fraction of a frame period a frame may arrive early and still count as on-cadence, as a
+/// numerator over [`CADENCE_DEN`].
+///
+/// A 120 Hz compose against a 60 Hz cadence lands alternately 8.33 ms and 16.67 ms after the last
+/// kept frame, and an exact `>= 16.67 ms` test would keep only every *third* one, so a device that
+/// asked for 60 would get 40. Three quarters of a period keeps every second frame and nothing
+/// closer, which is the exact 2:1 decimation the ratio calls for, and it absorbs the scheduler's
+/// jitter on the way. It is a ratio rather than a constant because the period is per-session:
+/// a fixed slack that is right for 60 Hz is half a period at 120.
+const CADENCE_NUM: u32 = 3;
+const CADENCE_DEN: u32 = 4;
+
+/// Whether the pointer has moved, changed shape, or appeared or disappeared since the last frame.
+///
+/// WGC composites the cursor into the captured surface (`CursorCaptureSettings::WithCursor`), but
+/// the cursor is not part of the desktop surface DWM tracks dirty regions for. Moving the mouse
+/// over a still window therefore produces a stream of frames that report **no dirty region at
+/// all** while the picture visibly changes on every one of them. Skipping those is what froze the
+/// pointer: measured on the Windows dev box with the pointer swept continuously across an
+/// otherwise empty virtual display, the client painted **5 frames a second** — the 200 ms
+/// keepalive rate, i.e. every real frame was being thrown away — and the frames it did get carried
+/// the pointer wherever it had been when some other pixel last changed.
+///
+/// The DXGI backend has always got this right (`PointerPosition` and `LastMouseUpdateTime` mark
+/// the frame dirty in `dxgi/mod.rs`); this is the WGC equivalent. `GetCursorInfo` is a cheap
+/// user32 call with no lock and no allocation, which is what lets it sit in a WGC callback.
+///
+/// The monitor test matters: the cursor is only in *this* capture when it is over the display
+/// being captured, so a pointer moving on the host's own screen must not defeat the skip on a
+/// client's virtual display. A frame where the pointer has just left is still a change, which is
+/// why leaving is reported as well as arriving.
+struct CursorProbe {
+    /// The `HMONITOR` of the display being captured, as an integer so the struct stays `Send`.
+    monitor: isize,
+    handle: isize,
+    x: i32,
+    y: i32,
+    /// The pointer was over this monitor and showing at the previous frame.
+    on_monitor: bool,
+    /// `GetCursorInfo` failed; stop asking and let the dirty region decide on its own.
+    broken: bool,
+}
+
+impl CursorProbe {
+    fn new(monitor: isize) -> Self {
+        Self {
+            monitor,
+            handle: 0,
+            x: i32::MIN,
+            y: i32::MIN,
+            on_monitor: false,
+            broken: false,
+        }
+    }
+
+    fn changed(&mut self) -> bool {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, HMONITOR, MONITOR_DEFAULTTONULL};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetCursorInfo, CURSORINFO, CURSOR_SHOWING,
+        };
+
+        if self.broken {
+            return false;
+        }
+        let mut info = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetCursorInfo(&mut info) }.is_err() {
+            self.broken = true;
+            return false;
+        }
+        let showing = info.flags == CURSOR_SHOWING;
+        let pt = POINT {
+            x: info.ptScreenPos.x,
+            y: info.ptScreenPos.y,
+        };
+        let mine = HMONITOR(self.monitor as *mut core::ffi::c_void);
+        let on_monitor =
+            showing && unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) } == mine;
+        let handle = info.hCursor.0 as isize;
+
+        let changed = if on_monitor {
+            !self.on_monitor || handle != self.handle || pt.x != self.x || pt.y != self.y
+        } else {
+            // Leaving is the last frame the pointer affects; staying away affects nothing.
+            self.on_monitor
+        };
+
+        self.on_monitor = on_monitor;
+        if on_monitor {
+            self.handle = handle;
+            self.x = pt.x;
+            self.y = pt.y;
+        }
+        changed
+    }
+}
+
 fn is_transient_encode_error(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("device busy")
 }
@@ -493,6 +593,10 @@ fn start_live_capture(
         repair: Arc::clone(&repair),
     };
 
+    // Read before `monitor` is moved into the settings: `CursorProbe` needs it to tell a pointer
+    // that is over this display from one that is over the host's own.
+    let monitor_handle = monitor.as_raw_hmonitor() as isize;
+
     // Every one of these is applied only where the OS exposes the property; the ones it does not
     // are skipped, not fatal. `ReportOnly` gives us `Frame::dirty_regions()` without asking the
     // compositor to render the regions separately.
@@ -509,6 +613,8 @@ fn start_live_capture(
             vendor: effective_vendor(cfg),
             native_w: info.width,
             native_h: info.height,
+            monitor_handle,
+            auto_frame_rate: cfg.auto_frame_rate,
             tx,
             idr_request,
             repair,
@@ -1299,6 +1405,11 @@ struct CaptureFlags {
     vendor: crate::streamer::config::EncoderVendor,
     native_w: u32,
     native_h: u32,
+    /// `HMONITOR` of the captured display, for [`CursorProbe`].
+    monitor_handle: isize,
+    /// The device's `autoFrameRate`. Off — the default — makes `config.fps` a promise rather than
+    /// a ceiling: nothing skips a frame for being unchanged and the keepalive holds the cadence.
+    auto_frame_rate: bool,
     tx: broadcast::Sender<EncodedFrame>,
     idr_request: Arc<AtomicBool>,
     repair: Arc<crate::streamer::repair::RepairState>,
@@ -1677,6 +1788,14 @@ struct LiveCapture {
     /// True when this build exposes `DirtyRegionMode`, so `Frame::dirty_regions()` is meaningful.
     dirty_region_reporting: bool,
     unchanged_streak: u32,
+    cursor: CursorProbe,
+    /// Off — the default — means `config.fps` is a promise: no frame is skipped for being
+    /// unchanged and the keepalive holds the cadence.
+    auto_frame_rate: bool,
+    /// One frame period at the rate this device asked for. The display may compose faster than
+    /// that (see `DISPLAY_COMPOSE_HZ`); everything past the cadence is coalesced, never queued.
+    frame_period: Duration,
+    last_delivered: Option<Instant>,
     _thread_tuning: tuning::ThreadTuning,
     _keep_awake: tuning::KeepAwake,
     telemetry: SharedTelemetry,
@@ -1982,6 +2101,7 @@ impl AsyncEncodeRing {
         repair: Arc<crate::streamer::repair::RepairState>,
         wake_rx: crossbeam_channel::Receiver<()>,
         frame_duration: Duration,
+        auto_frame_rate: bool,
         epoch: Instant,
         telemetry: SharedTelemetry,
     ) -> Self {
@@ -2005,6 +2125,7 @@ impl AsyncEncodeRing {
         let encode_join = {
             let args = RingEncodeArgs {
                 encoder,
+                auto_frame_rate,
                 ready_rx,
                 free_tx: free_tx.clone(),
                 tx,
@@ -2199,6 +2320,8 @@ impl Drop for AsyncEncodeRing {
 
 struct RingEncodeArgs {
     encoder: RingEncoder,
+    /// See the keepalive comment in [`ring_encode_thread`].
+    auto_frame_rate: bool,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
     tx: broadcast::Sender<EncodedFrame>,
@@ -2273,6 +2396,7 @@ fn ring_keepalive(
 fn ring_encode_thread(args: RingEncodeArgs) {
     let RingEncodeArgs {
         mut encoder,
+        auto_frame_rate,
         ready_rx,
         free_tx,
         tx,
@@ -2304,10 +2428,23 @@ fn ring_encode_thread(args: RingEncodeArgs) {
     let mut lost_frames: Vec<u64> = Vec::with_capacity(8);
     let mut current_bitrate = initial_bitrate;
     let mut bitrate_warned = false;
-    const KEEPALIVE: Duration = Duration::from_millis(200);
+    // How long the stream may go without emitting anything.
+    //
+    // 200 ms is what an *adaptive* rate settles to on a still desktop, and it is what the owner
+    // was watching when the picture "advanced in steps": a pointer moving over a still window
+    // produces no dirty region and, on an indirect display, often no captured frame at all, so
+    // the keepalive repeat is the only thing left emitting and the cadence collapses to 5 Hz.
+    // With `autoFrameRate` off the rate the device asked for is a promise, so the keepalive holds
+    // that cadence instead — a repeat of a static picture is a skip-P of a few dozen bytes, which
+    // is a cheap way to buy a stream that never visibly stalls.
+    let keepalive = if auto_frame_rate {
+        Duration::from_millis(200)
+    } else {
+        frame_duration.clamp(Duration::from_millis(4), Duration::from_millis(200))
+    };
     // Tick at the frame period rather than the keepalive period so a pending IDR is honoured
-    // within one frame even when nothing is moving; a repeat is still only *emitted* every 200 ms.
-    let tick = frame_duration.clamp(Duration::from_millis(4), KEEPALIVE);
+    // within one frame even when nothing is moving.
+    let tick = frame_duration.clamp(Duration::from_millis(4), keepalive);
     let mut last_emit = Instant::now();
     let mut held_slot: Option<usize> = None;
     let mut wake_open = true;
@@ -2360,10 +2497,17 @@ fn ring_encode_thread(args: RingEncodeArgs) {
                     held_slot = None;
                     continue;
                 }
-                let idr_pending = idr_request.swap(false, Ordering::Relaxed);
-                if !idr_pending && last_emit.elapsed() < KEEPALIVE {
+                // Read, then claim only if this tick is actually going to emit. The `swap` used
+                // to happen first, so every tick that then fell through the `continue` below —
+                // and, before that, every tick with no held slot — silently threw away a
+                // keyframe request. At the 200 ms keepalive that was rare; at the frame cadence
+                // a fixed-rate session runs at, it is most of them, and a client that never gets
+                // the keyframe it asked for gives up on the WebCodecs path and demotes itself to
+                // a `<video>` element.
+                if !idr_request.load(Ordering::Relaxed) && last_emit.elapsed() < keepalive {
                     continue;
                 }
+                let idr_pending = idr_request.swap(false, Ordering::Relaxed);
                 apply_pending_bitrate_atomic(
                     &mut encoder,
                     &target_bitrate,
@@ -2832,6 +2976,8 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             vendor,
             native_w,
             native_h,
+            monitor_handle,
+            auto_frame_rate,
             tx,
             idr_request,
             repair,
@@ -2946,6 +3092,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 Arc::clone(&repair),
                 wake_rx,
                 frame_duration,
+                auto_frame_rate,
                 epoch,
                 Arc::clone(&telemetry),
             );
@@ -2972,6 +3119,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 stale_frames_reported: 0,
                 dirty_region_reporting: features.dirty_region,
                 unchanged_streak: 0,
+                cursor: CursorProbe::new(monitor_handle),
+                auto_frame_rate,
+                frame_period: frame_duration,
+                last_delivered: None,
                 _thread_tuning: thread_tuning,
                 _keep_awake: keep_awake,
                 telemetry,
@@ -3054,6 +3205,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             stale_frames_reported: 0,
             dirty_region_reporting: features.dirty_region,
             unchanged_streak: 0,
+            cursor: CursorProbe::new(monitor_handle),
+            auto_frame_rate,
+            frame_period: frame_duration,
+            last_delivered: None,
             _thread_tuning: thread_tuning,
             _keep_awake: keep_awake,
             telemetry,
@@ -3082,21 +3237,53 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
             .unwrap_or(0);
 
+        // The pointer is composited into the frame but is not part of what the compositor reports
+        // a dirty region for, so it has to be asked about separately — and it has to be asked
+        // *before* either gate below, because both of them would otherwise throw the frame that
+        // carries the pointer's new position away. See `CursorProbe`.
+        let cursor_moved = self.cursor.changed();
+
+        // The display may compose faster than the rate this device asked for: `DISPLAY_COMPOSE_HZ`
+        // buys a fresher frame by composing at 120 Hz for a 60 Hz client. Freshness is the whole
+        // point, so the extra frames are *coalesced*, not queued — WGC hands over the complete
+        // surface every time, so keeping only the newest inside each period loses nothing and the
+        // client is not asked to decode at twice the rate it advertised.
+        if let Some(last) = self.last_delivered {
+            if capture.duration_since(last) * CADENCE_DEN < self.frame_period * CADENCE_NUM {
+                self.telemetry
+                    .degradation
+                    .frames_skipped_cadence
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+
         // The DXGI backend has skipped unchanged frames since `present_region_is_empty` landed;
         // WGC had no equivalent and re-encoded every delivered frame. `DirtyRegionMode::ReportOnly`
-        // (build 26100+, requested only where the property exists) gives the same information, and
-        // the repeater/keepalive already emits a frame every 200 ms so a skipped frame is not a
-        // stalled client. The consecutive cap is the same safety valve the DXGI path uses, for a
-        // driver that under-reports.
-        if self.dirty_region_reporting {
+        // (build 26100+, requested only where the property exists) gives the same information.
+        //
+        // It is only consulted when the device asked for an adaptive frame rate. With
+        // `autoFrameRate` off — the default — `config.fps` is a promise rather than a ceiling, and
+        // a frame is never dropped for being unchanged: the saving is real but it is paid for in
+        // exactly the way the owner reported, a picture that advances in 200 ms steps because the
+        // keepalive is the only thing still emitting.
+        //
+        // The consecutive cap is the same safety valve the DXGI path uses, for a driver that
+        // under-reports.
+        if self.auto_frame_rate && self.dirty_region_reporting && !cursor_moved {
             if let Ok(regions) = frame.dirty_regions() {
                 if regions.is_empty() && self.unchanged_streak < MAX_CONSECUTIVE_UNCHANGED {
                     self.unchanged_streak += 1;
+                    self.telemetry
+                        .degradation
+                        .frames_skipped_unchanged
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 self.unchanged_streak = 0;
             }
         }
+        self.last_delivered = Some(capture);
 
         let stale = self.stale_frames.load(Ordering::Relaxed);
         if stale != self.stale_frames_reported {
