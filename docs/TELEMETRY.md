@@ -446,7 +446,7 @@ host. The field is a union of the page's own bits and the audio module's.
 | 6 | `AudioDecoder` cannot decode Opus (or failed after saying it could) |
 | 7 | `AudioContext` is suspended |
 | 8 | output latency is estimated from `getOutputTimestamp()`, not reported |
-| 9 | audio-output labels unavailable (no microphone grant) |
+| 9 | audio-output labels unavailable — the ids are named by the page, not the OS |
 | 10 | `RTCRtpScriptTransform` unavailable |
 | 11 | no way to request a keyframe |
 | 12 | `transferControlToOffscreen` unavailable |
@@ -461,6 +461,16 @@ host. The field is a union of the page's own bits and the audio module's.
 | 21 | Keyboard Lock unavailable |
 | 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
 | 23 | input was suspended so the user could reach a dialog on the page |
+
+Bit 9 says the names beside the output ids are the client page's own numbering ("Output 1",
+"Output 2", "Default output") rather than what the operating system calls the hardware. It is
+**not** a permission failure: a browser withholds output labels until a microphone grant exists,
+and the page no longer asks for one just to get nicer text — `setSinkId` takes the bare id, so an
+unlabelled list routes exactly as well as a labelled one. The same fact reaches the device panel
+as `labelled: false` on the `/audio-outputs` payload, `AudioOutputsReport` and the
+`DeviceAudioOutputs` event, so the host can render the list without presenting invented names as
+device names. The bit is still set when the microphone card *was* raised — enumeration returned
+nothing at all — and declined.
 
 Bit 15 covers two different waits, both of which mean "ICE did not finish on its own". On the
 gather-then-post tier it is the wait in front of the offer (`waitForIceGathering`). On the

@@ -48,6 +48,9 @@ pub struct DeviceAudioOutputs {
     /// What the device says it is actually playing on right now. `None` when it never said,
     /// which is not the same as `Some("")` — the device's default output.
     pub current: Option<String>,
+    /// `Some(false)` when the labels beside the ids are the client page's own numbering rather
+    /// than the operating system's names; `None` when the client never said.
+    pub labelled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]

@@ -725,6 +725,10 @@ struct AudioOutputsRequest {
     /// client built before the field still parses.
     #[serde(default)]
     current: Option<String>,
+    /// Whether the labels in `outputs` are the operating system's or the client's own
+    /// numbering. Optional, for the same reason `current` is.
+    #[serde(default)]
+    labelled: Option<bool>,
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -756,7 +760,7 @@ async fn audio_outputs(
         .map(|c| truncate_chars(&c, MAX_AUDIO_OUTPUT_STR));
 
     if let Some(s) = state.config.sessions.as_ref() {
-        session::set_audio_outputs(s, &ip, req.supported, outputs, current);
+        session::set_audio_outputs(s, &ip, req.supported, outputs, current, req.labelled);
         if let Some(reporter) = state.config.device_reporter.as_ref() {
             let report = session::audio_outputs_report(s, &ip);
             reporter.report_audio_outputs(ip.clone(), report);
