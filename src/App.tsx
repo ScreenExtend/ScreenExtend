@@ -378,15 +378,17 @@ function GlobalState({ children }: { children: ReactNode }) {
       }));
       unlisteners.push(await events.deviceAudioOutputs.listen(event => {
         const p = event.payload;
-        // `current` -- the sink the client reports it is actually playing on -- is not on
-        // the Rust event yet; it arrives with the client-page workstream as exactly
-        // `current: Option<String>` with `#[serde(default)]`, on both `AudioOutputsReport`
-        // and `DeviceAudioOutputs`. Reading it defensively means this build works either
-        // way and lights up on its own when that lands; drop the cast then.
-        const current = (p as unknown as { current?: string | null }).current;
+        // `current` is the sink the client reports it is actually playing on. `null` means
+        // this client never said -- an older page, or one that has not posted yet -- which
+        // is not the same answer as `""`, the device's default output.
         setAudioOutputsByIp(prev => ({
           ...prev,
-          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected, current },
+          [p.ip]: {
+            supported: p.supported,
+            outputs: p.outputs,
+            selected: p.selected,
+            current: p.current,
+          },
         }));
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {

@@ -217,6 +217,11 @@
                 RVFC_UNAVAILABLE: 1 << 20,
                 KEYBOARD_LOCK_UNAVAILABLE: 1 << 21,
                 TRICKLE_ICE_UNAVAILABLE: 1 << 22,
+                // Set the first time a dialog on this page took the locks and the input
+                // forwarding away from the host so the user could reach it. Without it the
+                // host sees a device that stopped sending input and cannot tell a modal from
+                // a wedge.
+                INPUT_SUSPENDED_FOR_MODAL: 1 << 23,
             };
             let degradeFlags = 0;
             let suppressedErrors = 0;
@@ -335,6 +340,11 @@
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
+                    // The session is over, so the frozen frame the rebuild was holding on to is
+                    // no longer standing in for anything, and a picker armed for a sink that
+                    // session was going to use would open on the next click of the join form.
+                    dropStaleCanvas();
+                    cancelQueuedPicker();
                     stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
@@ -345,7 +355,13 @@
                 }
             }
             function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
-            function showVideo() { video.style.display = 'block'; canvas.style.display = 'none'; }
+            function showVideo() {
+                video.style.display = 'block';
+                canvas.style.display = 'none';
+                // The picture now comes from the element, so a held-over canvas would sit on
+                // top of it showing the frame the session had before it demoted.
+                dropStaleCanvas();
+            }
 
             // The letterboxed picture rect that input coordinates are normalised against
             // needs the intrinsic size, and on the <video> paths this is where it arrives.
@@ -356,22 +372,87 @@
             video.addEventListener('loadedmetadata', relayVideoSize);
             video.addEventListener('resize', relayVideoSize);
 
+            // A rebuild cannot reuse a canvas whose control has been transferred to a worker, so
+            // every WebCodecs (re)start has to replace the element — and replacing it outright
+            // blanked the stage for the whole rebuild. That is the black stage behind every
+            // host-initiated reconfigure (a scale or refresh change from the dashboard), every
+            // orientation flip and every demotion. So the old canvas is kept on screen, the
+            // replacement is inserted behind it, and the first frame the new session paints is
+            // what removes the old one.
+            let staleCanvas = null;
+            function dropStaleCanvas() {
+                const old = staleCanvas;
+                if (!old) return;
+                staleCanvas = null;
+                try { if (old.parentNode) old.parentNode.removeChild(old); } catch (_) { noteSuppressed(); }
+            }
             function freshCanvas() {
                 const replacement = document.createElement('canvas');
                 replacement.id = 'canvas';
-                canvas.replaceWith(replacement);
+                if (isLive && canvas.style.display === 'block' && canvas.parentNode) {
+                    dropStaleCanvas();
+                    canvas.removeAttribute('id');
+                    canvas.className = 'stale';
+                    canvas.parentNode.insertBefore(replacement, canvas);
+                    staleCanvas = canvas;
+                } else {
+                    canvas.replaceWith(replacement);
+                }
                 canvas = replacement;
                 if (locked && !currentFullscreenEl()) { canvas.style.width = window.innerWidth + 'px'; canvas.style.height = window.innerHeight + 'px'; }
                 return canvas;
             }
 
             let isLive = false;
+
+            // Trickle ICE is kept for the speed, but its *outcome* is resolved before the
+            // streaming stage appears. The three ways it can fail — the answer named no
+            // resource, the verb was refused, nothing was ever acknowledged — all end in a
+            // rejoin with a gathered offer, and a rejoin behind a picture the user is already
+            // using is the one thing that must never happen. So the first rendered frame arms
+            // the transition and the sender's own "nothing more to send" performs it, which is
+            // `a=end-of-candidates` acknowledged on the happy path.
+            //
+            // The deadline is a net for a browser that emits neither a null candidate nor
+            // `iceGatheringState === 'complete'`, not a budget: it is well past any real
+            // gathering, including a TURN allocation, and it reports itself as bit 15.
+            const ICE_SETTLE_DEADLINE_MS = 8000;
+            let icePending = false;
+            let liveHeld = false;
+            let iceSettleTimer = 0;
+            function holdStageForIce() {
+                icePending = true;
+                liveHeld = false;
+                if (iceSettleTimer) clearTimeout(iceSettleTimer);
+                iceSettleTimer = setTimeout(function () {
+                    iceSettleTimer = 0;
+                    if (!icePending) return;
+                    degrade(DEG.ICE_GATHERING_DEADLINE);
+                    iceSettled();
+                }, ICE_SETTLE_DEADLINE_MS);
+            }
+            function releaseIceHold() {
+                icePending = false;
+                liveHeld = false;
+                if (iceSettleTimer) { clearTimeout(iceSettleTimer); iceSettleTimer = 0; }
+            }
+            function iceSettled() {
+                if (!icePending) return;
+                const held = liveHeld;
+                releaseIceHold();
+                if (held) onStreamLive();
+            }
+
             function onStreamLive() {
+                // Frames are arriving, so nothing below is still waiting for one: both
+                // watchdogs stand down here even when the stage transition is held.
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 if (statsPoll) { clearInterval(statsPoll); statsPoll = null; }
-                reconfiguring = false;
                 clearReconfigWatchdog();
+                if (icePending) { liveHeld = true; return; }
+                reconfiguring = false;
                 loadingEl.classList.remove('show');
+                dropStaleCanvas();
                 if (isLive) { startReconfigPoll(); return; }
                 isLive = true;
                 showError('');
@@ -435,15 +516,31 @@
 
             function applyReconfig(j) {
                 if (typeof j.audioSink === 'string') {
-                    try { if (window.SEAudio) SEAudio.setSpeaker(j.audioSink); } catch (_) { noteSuppressed(); }
-                    // The host asking to change this device's output is the moment the
-                    // microphone grant is worth something: without it the picker on the host is
-                    // a list of unlabelled ids. Offered only where the card was deferred rather
-                    // than declined, and it does nothing at all once the labels are known.
+                    // Applied silently, on whatever ids this device has. Where the labels were
+                    // never revealed — the microphone card was declined before the join — the
+                    // host's picker shows opaque ids and the routing still works; that is what
+                    // `degraded` bit 9 is for. Nothing here may raise a prompt: once the picture
+                    // is up, the session is not interrupted again.
+                    //
+                    // `false` is the engine refusing, not "not yet": a sink commanded before the
+                    // graph exists answers `null` and is applied when it does. Where the engine
+                    // refused there is one thing left to try, and it needs a gesture, so it is
+                    // queued for the next one rather than raised over the picture.
+                    //
+                    // `audioSink` is in *every* `/reconfig` body, so this runs about once a
+                    // second and `false` is answered about once a second too — the engine that
+                    // refused the id refuses it again on the next tick. The offer is therefore
+                    // latched on the id: one re-offer per sink the host asks for, which is what
+                    // the ruling says. Without the latch the picker re-armed on every tick and
+                    // the stage swallowed every gesture for the rest of the session.
                     try {
-                        if (window.SEAudio && SEAudio.offerOutputLabels) {
-                            Promise.resolve(SEAudio.offerOutputLabels(offerPermModalNow))
-                                .then(() => SEAudio.postOutputs(), noteSuppressed);
+                        if (window.SEAudio) {
+                            Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
+                                if (ok !== false) return;
+                                if (j.audioSink === lastOfferedSinkId) return;
+                                lastOfferedSinkId = j.audioSink;
+                                queueOutputPicker(j.audioSink);
+                            }, noteSuppressed);
                         }
                     } catch (_) { noteSuppressed(); }
                 }
@@ -790,6 +887,9 @@
                 if (gestureHandler) return;
                 gestureHandler = () => {
                     if (!locked) return;
+                    // A dialog is up, or this tap is the one that opens the queued output
+                    // picker: either way the user is reaching for the page, not for the stage.
+                    if (modalSuspend || pickerGestureArmed) return;
                     if (!fullscreenMode) {
                         if (!document.pointerLockElement) acquirePointerLock(stage);
                         return;
@@ -880,7 +980,7 @@
                     // iOS suspends the context when the page is backgrounded and nothing
                     // resumed it: the picture came back and the audio did not.
                     try { if (window.SEAudio) SEAudio.resume(); } catch (_) { noteSuppressed(); }
-                    if (!fullscreenMode) return;
+                    if (!fullscreenMode || modalSuspend) return;
                     // Fullscreen first: navigator.keyboard.lock() is specified to reject
                     // outside it, so asking on the way back from the background asked at the
                     // one moment it could not succeed and the rejection was swallowed.
@@ -904,7 +1004,7 @@
                 const fullscreenEvents = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
                 if (fullscreenHandler) fullscreenEvents.forEach((ev) => document.removeEventListener(ev, fullscreenHandler));
                 fullscreenHandler = async () => {
-                    if (!locked) return;
+                    if (!locked || modalSuspend) return;
                     if (currentFullscreenEl()) {
                         exitViewportMode();
                         clearViewportSize();
@@ -959,6 +1059,194 @@
                         else if (document.msExitFullscreen) await document.msExitFullscreen();
                     } catch (_) { noteSuppressed(); }
                 }
+            }
+
+            // Anything this page puts in front of the user — a modal, a card, or the browser's
+            // own output picker — is unreachable while the session still owns the input. The
+            // pointer is locked to the stage, so the cursor the user is looking for does not
+            // exist; the keyboard is locked, so Esc and Tab go to the host; and every click
+            // lands on the host's desktop instead of on the button. The only way to answer a
+            // card was from devtools.
+            //
+            // So a dialog takes the input back first: leave fullscreen (a fullscreen element
+            // renders only its own subtree, so a sibling modal is invisible inside one), drop
+            // pointer lock, unlock the keyboard, and tell the host focus is gone so it releases
+            // any modifier it is holding down. The gesture handler stands down for the duration
+            // rather than re-taking all three on the very tap that dismisses the dialog; the
+            // next tap after that re-enters, which is the path Esc already takes.
+            let modalDepth = 0;
+            let modalSuspend = false;
+            function exitPointerLockNow() {
+                try {
+                    if (document.exitPointerLock) document.exitPointerLock();
+                    else if (document.mozExitPointerLock) document.mozExitPointerLock();
+                    else if (document.webkitExitPointerLock) document.webkitExitPointerLock();
+                } catch (_) { noteSuppressed(); }
+            }
+            function exitFullscreenNow() {
+                if (!currentFullscreenEl()) return;
+                try {
+                    let p = null;
+                    if (document.exitFullscreen) p = document.exitFullscreen();
+                    else if (document.webkitExitFullscreen) p = document.webkitExitFullscreen();
+                    else if (document.mozCancelFullScreen) p = document.mozCancelFullScreen();
+                    else if (document.msExitFullscreen) p = document.msExitFullscreen();
+                    if (p && p.catch) p.catch(noteSuppressed);
+                } catch (_) { noteSuppressed(); }
+            }
+            function beginModal() {
+                modalDepth++;
+                if (modalDepth > 1) return;
+                modalSuspend = true;
+                let suspended = false;
+                try {
+                    if (window.RemoteInput && RemoteInput.setSuspended) suspended = !!RemoteInput.setSuspended(true);
+                } catch (_) { noteSuppressed(); }
+                // Only a session that was actually forwarding input has anything to report; a
+                // card raised on the join form suspended nothing.
+                if (suspended) degrade(DEG.INPUT_SUSPENDED_FOR_MODAL);
+                exitPointerLockNow();
+                try {
+                    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+                } catch (_) { noteSuppressed(); }
+                exitFullscreenNow();
+            }
+            function endModal() {
+                if (modalDepth === 0) return;
+                modalDepth--;
+                if (modalDepth > 0) return;
+                modalSuspend = false;
+                try {
+                    if (window.RemoteInput && RemoteInput.setSuspended) RemoteInput.setSuspended(false);
+                } catch (_) { noteSuppressed(); }
+            }
+            // `beginModal()` only *starts* the release: a pointer-lock exit is delivered on
+            // `pointerlockchange` and a fullscreen exit on `fullscreenchange`, both in a later
+            // task, and `webkitExitFullscreen` returns nothing at all. A page modal is a sibling
+            // of `#stage`, so revealing it while the fullscreen element is still `#stage` shows
+            // the user nothing — which is the failure this whole mechanism exists to fix. So the
+            // dialog is revealed from the confirmation, under the same 1500 ms fallback the
+            // deleted `offerPermModalNow` carried: an exit that never lands must not strand the
+            // caller with an invisible dialog and the input still suspended.
+            const MODAL_RELEASE_MS = 1500;
+            const MODAL_RELEASE_EVENTS = ['fullscreenchange', 'webkitfullscreenchange',
+                'mozfullscreenchange', 'MSFullscreenChange', 'pointerlockchange',
+                'mozpointerlockchange', 'webkitpointerlockchange'];
+            function inputReleased() {
+                return !currentFullscreenEl() && !document.pointerLockElement;
+            }
+            function whenInputReleased(cb) {
+                const run = () => { try { cb(); } catch (_) { noteSuppressed(); } };
+                if (inputReleased()) { run(); return; }
+                let settled = false;
+                let timer = 0;
+                const check = () => { if (inputReleased()) finish(); };
+                function finish() {
+                    if (settled) return;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    MODAL_RELEASE_EVENTS.forEach((ev) => document.removeEventListener(ev, check));
+                    run();
+                }
+                MODAL_RELEASE_EVENTS.forEach((ev) => document.addEventListener(ev, check));
+                timer = setTimeout(finish, MODAL_RELEASE_MS);
+            }
+            // Wraps anything that puts UI in front of the user. `fn` is handed a `done` callback
+            // it must call exactly once; the counter tolerates being unbalanced only downwards.
+            // `immediate` is for UI the *browser* draws — the output picker — which is not a
+            // subtree of the page, so no fullscreen exit has to have landed for it to be
+            // visible, and which must run inside the gesture's transient activation rather than
+            // a task later.
+            function withModal(fn, immediate) {
+                beginModal();
+                let closed = false;
+                const done = () => { if (closed) return; closed = true; endModal(); };
+                const body = () => { try { fn(done); } catch (_) { noteSuppressed(); done(); } };
+                if (immediate) body(); else whenInputReleased(body);
+            }
+
+            // The host asked this device to play somewhere and the engine refused it outright —
+            // no `setSinkId`, or it rejected. On an engine with `selectAudioOutput()` there is
+            // exactly one thing left to try, and it needs transient activation, so it waits for
+            // the user's next tap or key rather than being raised over the picture. One request
+            // is armed at a time; a newer host choice replaces the id it will open on.
+            let queuedPickerId = null;
+            let lastOfferedSinkId = null;
+            let pickerGestureArmed = false;
+            let pickerGestureFire = null;
+            // No `keydown`. `input.js` binds its own on `window` in the capture phase during
+            // `setup()`, i.e. before this one, so it would run first with `suspended` still
+            // false and the key that summons the dialog would land on the host's desktop —
+            // possibly a modifier, possibly something destructive. A tap is a sufficient
+            // gesture, and the stage is the thing being tapped. `pointerdown`/`touchend` are
+            // safe because input.js binds those on `#stage` in the bubble phase, so this
+            // window-capture listener wins.
+            const PICKER_GESTURES = ['pointerdown', 'touchend'];
+            // A browser chooser can be left open indefinitely — a backgrounded tab, an engine
+            // that resolves neither way — and everything downstream of it waits on it settling.
+            // Every other promise on the join path is bounded; this one is too.
+            const PICKER_DEADLINE_MS = 15000;
+            function pickOutputBounded(preferredId, onSettled) {
+                let settled = false;
+                let timer = 0;
+                const finish = (chosen) => {
+                    if (settled) return null;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
+                    return chosen || null;
+                };
+                // Synchronous, inside the gesture: the activation this depends on is spent by
+                // the first await, not by anything above it.
+                let p = null;
+                try { p = SEAudio.pickOutput(preferredId); } catch (_) { noteSuppressed(); }
+                return new Promise((resolve) => {
+                    timer = setTimeout(function () {
+                        timer = 0;
+                        noteSuppressed();
+                        resolve(finish(null));
+                    }, PICKER_DEADLINE_MS);
+                    Promise.resolve(p).then(
+                        (chosen) => resolve(finish(chosen)),
+                        () => { noteSuppressed(); resolve(finish(null)); });
+                });
+            }
+            function cancelQueuedPicker() {
+                queuedPickerId = null;
+                lastOfferedSinkId = null;
+                if (!pickerGestureFire) return;
+                const fn = pickerGestureFire;
+                pickerGestureFire = null;
+                pickerGestureArmed = false;
+                PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fn, true));
+            }
+            function queueOutputPicker(preferredId) {
+                let can = false;
+                try { can = !!(window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()); } catch (_) { noteSuppressed(); }
+                if (!can) {
+                    // Nothing left to offer. `sinkTier` staying 0 after a change the host asked
+                    // for is what says so, and it already does. Behind the caller's id latch,
+                    // so this is once per sink the host asks for, not once a second.
+                    console.warn('[audio] the host asked for an output this browser will not route to');
+                    return;
+                }
+                queuedPickerId = preferredId || '';
+                if (pickerGestureArmed) return;
+                pickerGestureArmed = true;
+                const fire = () => {
+                    PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fire, true));
+                    pickerGestureArmed = false;
+                    pickerGestureFire = null;
+                    const want = queuedPickerId;
+                    queuedPickerId = null;
+                    withModal((close) => {
+                        pickOutputBounded(want, close).then((chosen) => {
+                            if (chosen) console.log('[audio] output re-selected: ' + (chosen.label || chosen.id));
+                        }, noteSuppressed);
+                    }, true);
+                };
+                pickerGestureFire = fire;
+                PICKER_GESTURES.forEach((ev) => window.addEventListener(ev, fire, true));
             }
 
             let leaveSent = false;
@@ -1151,7 +1439,7 @@
             // Buffers from the moment the offer exists, because gathering starts there and the
             // resource URL only arrives with the answer: a candidate produced in between is one
             // the host would otherwise never see.
-            function startTrickle(peer, onDead) {
+            function startTrickle(peer, onDead, onSettled) {
                 const queue = [];
                 let url = null;
                 let ended = false;
@@ -1163,6 +1451,7 @@
                 let failStreak = 0;
                 let ackTimer = 0;
                 let deadCalled = false;
+                let settled = false;
 
                 function onCandidate(ev) {
                     if (closed) return;
@@ -1172,7 +1461,7 @@
                     flush();
                 }
 
-                function stop() {
+                function quiesce() {
                     if (closed) return;
                     closed = true;
                     queue.length = 0;
@@ -1180,15 +1469,30 @@
                     try { peer.removeEventListener('icecandidate', onCandidate); } catch (_) { noteSuppressed(); }
                 }
 
+                // "This sender will send nothing more", whichever way it got there: the final
+                // batch carrying `a=end-of-candidates` was acknowledged, the session is gone, or
+                // the verb is refused. The page holds the streaming stage back until this fires,
+                // so that a rejoin with a gathered offer can only ever happen *before* there is
+                // a picture — never behind one the user is already using.
+                function settle() {
+                    if (settled) return;
+                    settled = true;
+                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
+                }
+
+                function stop() { quiesce(); settle(); }
+
                 // Nothing this sender carries ever reached the host, and the offer that was
                 // posted carries no candidates either — so the session cannot connect and the
                 // page has to be told, once. Everything else about the sender stops here too:
-                // there is no third thing to try.
+                // there is no third thing to try. `onDead` runs before the settle so a rejoin
+                // replaces the gate rather than racing it.
                 function dead(reason) {
                     if (deadCalled) return;
                     deadCalled = true;
-                    stop();
+                    quiesce();
                     try { if (onDead) onDead(reason); } catch (_) { noteSuppressed(); }
+                    settle();
                 }
 
                 function flush() {
@@ -1285,6 +1589,7 @@
 
             function teardownSession() {
                 startGen++;
+                releaseIceHold();
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -1575,12 +1880,17 @@
             let audioFastRetired = false;
             window.SEVideo = {
                 noteSuppressed,
-                // The client claimed the WebCodecs audio path, so the host answered with no
-                // audio track at all — there is nothing on the wire to fall back to when the
-                // decoder or the worklet then gives up. Drop the claim and rebuild the
-                // session, and the next answer carries a real Opus track. Once only: if the
-                // rebuilt session fails too, it is failing on the browser's own decoder and
-                // another round would be a loop.
+                // The client claimed the WebCodecs audio path and the decoder or the worklet
+                // then gave up. Where the host honoured `wantsFallbackTrack` — every host in
+                // this repo does — audio.js has already attached the spare Opus track and this
+                // is never reached: the step-down is seamless and costs no renegotiation.
+                //
+                // This is the older-host case, where the answer carried no audio track at all.
+                // It used to rebuild the whole peer connection to ask for one, mid-session,
+                // behind a picture the user was watching. It no longer does: the claim is
+                // dropped so the *next* join gets a track, the loss is reported as `degraded`
+                // bit 6 and `audioPath` 0, and the picture is not touched. Nothing on this page
+                // renegotiates on its own account once the stage is up.
                 onAudioFastLost() {
                     if (audioFastRetired || !audioFast) return;
                     audioFastRetired = true;
@@ -1594,9 +1904,8 @@
                         verified: !!audioCaps.verified, wantsFallbackTrack: false,
                     };
                     degrade(DEG.AUDIO_OPUS_UNSUPPORTED);
-                    if (!isLive || kicked) return;
-                    console.warn('[audio] fast path lost; renegotiating for a standard track');
-                    reconfigure();
+                    console.warn('[audio] fast path lost and this host sent no spare track; ' +
+                        'audio stays off for this session — a rejoin gets a standard track');
                 },
                 getStats() {
                     const w = videoWorkerStats;
@@ -1737,7 +2046,15 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
-                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) { noteSuppressed(); }
+                    try {
+                        if (window.RemoteInput) {
+                            RemoteInput.setup(pc);
+                            // `teardown()` clears input.js's own flag, so a session built while
+                            // a dialog is still up would forward input with `modalSuspend` set
+                            // and the page's two notions of suspension would disagree.
+                            if (modalSuspend && RemoteInput.setSuspended) RemoteInput.setSuspended(true);
+                        }
+                    } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
                         if (audioFast) {
                             pc.ondatachannel = (ev) => {
@@ -2029,9 +2346,15 @@
                         // had — usually nothing — and every candidate follows over PATCH. This is
                         // the whole win on a relayed join, where the wait was a TURN allocation
                         // the POST had no reason to be behind.
+                        holdStageForIce();
                         localTrickle = startTrickle(pc, function (reason) {
                             if (stale()) { noteSuppressed(); return; }
                             trickleFailed(reason, preferWebCodecs);
+                        }, function () {
+                            // A settle from a sender this call no longer owns belongs to the
+                            // generation that replaced it, which armed its own hold.
+                            if (stale()) return;
+                            iceSettled();
                         });
                         trickleSender = localTrickle;
                     } else {
@@ -2170,13 +2493,16 @@
             async function offerHttpsUpgrade() {
                 loadingEl.classList.remove('show');
                 const href = await httpsUrl();
-                document.getElementById('goHttps').onclick = () => { location.href = href; };
-                document.getElementById('dismiss').onclick = () => {
-                    modal.classList.remove('show');
-                    loadingEl.classList.add('show');
-                    start(false);
-                };
-                modal.classList.add('show');
+                withModal((close) => {
+                    document.getElementById('goHttps').onclick = () => { close(); location.href = href; };
+                    document.getElementById('dismiss').onclick = () => {
+                        modal.classList.remove('show');
+                        close();
+                        loadingEl.classList.add('show');
+                        start(false);
+                    };
+                    modal.classList.add('show');
+                });
             }
 
             function beginStreaming() {
@@ -2191,9 +2517,11 @@
                 if (typeof compatBlocked !== 'undefined' && compatBlocked) return;
                 httpsUpgradeOffered = true;
                 const href = await httpsUrl();
-                document.getElementById('goHttps').onclick = () => { location.href = href; };
-                document.getElementById('dismiss').onclick = () => { modal.classList.remove('show'); };
-                modal.classList.add('show');
+                withModal((close) => {
+                    document.getElementById('goHttps').onclick = () => { close(); location.href = href; };
+                    document.getElementById('dismiss').onclick = () => { modal.classList.remove('show'); close(); };
+                    modal.classList.add('show');
+                });
             }
 
             const VALID_RE = /^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{12}$/;
@@ -2287,23 +2615,19 @@
             // the normal path: with REFRESH_SAMPLES at 24 the measurement lands inside the
             // deadline and the first offer already carries the right rate. It is wrong when
             // the page spent its first half-second in a background tab or behind a layout
-            // storm, where rAF is throttled and the measured rate is far too low — and a rate
-            // that only ever updated `joinData` was never corrected on a stationary tablet,
-            // because nothing else there ever reconfigures. So apply it, once, and only when
-            // the two disagree by more than the clamp step.
-            let refreshRefinementApplied = false;
+            // storm, where rAF is throttled and the measured rate is far too low.
+            //
+            // It used to answer that by rebuilding the session about a second after the picture
+            // came up — a renegotiation the user did not ask for, over a screen they had just
+            // started using, and one that retook the host's display-correlation lock on the way.
+            // It now only updates `joinData`, so the corrected rate rides the next reconfigure
+            // that happens for a reason of its own: a rotation, or a change made on the host.
             function noteRefinedRefreshRate(rate) {
                 if (!joinData || !rate) return;
                 const cur = joinData.refreshRate || 60;
                 if (Math.abs(rate - cur) < 5) return;
                 joinData.refreshRate = rate;
-                if (refreshRefinementApplied || !isLive || reconfiguring || kicked) {
-                    console.log('[refresh] refined to ' + rate + ' Hz; will apply at the next reconfigure');
-                    return;
-                }
-                refreshRefinementApplied = true;
-                console.log('[refresh] refined to ' + rate + ' Hz from ' + cur + '; rebuilding the host display');
-                reconfigure();
+                console.log('[refresh] refined to ' + rate + ' Hz from ' + cur + '; will apply at the next reconfigure');
             }
 
             function validate() {
@@ -2417,21 +2741,24 @@
                         severity: 'blocking',
                     });
                 }
-                // HTTPS can only restore what the browser withholds for lack of a secure
-                // context. On a page that is already secure it fixes nothing, and telling an
-                // iPhone that HTTPS will bring back an AudioDecoder its Safari has never
-                // shipped is simply wrong.
-                // Absent below Safari 11.1, where `!undefined` is true even on an https page —
-                // which is exactly the misleading copy the comment above exists to avoid.
-                const httpsCouldHelp = (typeof window.isSecureContext === 'boolean')
-                    ? !window.isSecureContext
-                    : (location.protocol === 'http:');
+                // `httpsFixable` is read by the compat gate below and only ever on an http
+                // page, where it means "do not list this row; offer the switch to HTTPS
+                // instead". The switch itself is offered on every system, deliberately: a
+                // secure context is the precondition for both fast paths whether or not this
+                // particular engine would then have them, and an offer that is right for almost
+                // every device beats a per-engine guess.
+                //
+                // The one exception is `http://localhost`, which *is* a secure context — so the
+                // fast paths are missing there for some other reason, and suppressing the rows
+                // would hide the only explanation the user gets. That is the same-device join.
+                const httpsFixable = location.protocol === 'http:' &&
+                    !(typeof window.isSecureContext === 'boolean' && window.isSecureContext);
                 if (!canWebCodecs) {
                     unsupported.push({
                         name: 'WebCodecs video',
                         description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
                         severity: 'optional',
-                        httpsFixable: httpsCouldHelp,
+                        httpsFixable: httpsFixable,
                     });
                 }
                 // One row, gated on the pair, and the original wording: this modal's rendered
@@ -2439,15 +2766,13 @@
                 // showed two rows where one used to appear on Safari 16.4-17 and Firefox 130+,
                 // and added a third for cross-origin isolation that is close to unreachable —
                 // WebCodecs needs a secure context, and on one the host's own COOP/COEP headers
-                // make `crossOriginIsolated` true. `httpsFixable` keeps the correction, because
-                // that one is not cosmetic: it drove a "Switch to HTTPS" button on iPhones whose
-                // Safari has never shipped an AudioDecoder for HTTPS to restore.
+                // make `crossOriginIsolated` true.
                 if (!audioFast) {
                     unsupported.push({
                         name: 'WebCodecs audio and AudioWorklet',
                         description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
                         severity: 'optional',
-                        httpsFixable: httpsCouldHelp,
+                        httpsFixable: httpsFixable,
                     });
                 }
                 const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
@@ -2525,6 +2850,10 @@
                 if (blocking.length > 0) {
                     compatBlocked = true;
                     connectBtn.disabled = true;
+                    // No dismiss button on the blocking form, so this one is never closed and
+                    // never releases: there is no session for it to be holding anything back
+                    // from either.
+                    beginModal();
                     renderCompatModal(blocking, true);
                     return;
                 }
@@ -2532,11 +2861,14 @@
                 const onHttp = location.protocol === 'http:';
                 const optional = report.filter((a) => a.severity === 'optional' && !(onHttp && a.httpsFixable));
                 if (optional.length > 0 && !compatPrefHidden()) {
-                    renderCompatModal(optional, false);
-                    document.getElementById('compatContinue').onclick = () => {
-                        setCompatPrefHidden(document.getElementById('compatDontShow').checked);
-                        compatModal.classList.remove('show');
-                    };
+                    withModal((close) => {
+                        renderCompatModal(optional, false);
+                        document.getElementById('compatContinue').onclick = () => {
+                            setCompatPrefHidden(document.getElementById('compatDontShow').checked);
+                            compatModal.classList.remove('show');
+                            close();
+                        };
+                    });
                 }
             })();
 
@@ -2545,96 +2877,44 @@
                     void offerHttpsOnLoad();
                     return;
                 }
-                const m = document.getElementById('sameDeviceModal');
-                const dismiss = document.getElementById('sameDeviceDismiss');
-                if (dismiss) dismiss.onclick = () => { m.classList.remove('show'); void offerHttpsOnLoad(); };
-                m.classList.add('show');
+                withModal((close) => {
+                    const m = document.getElementById('sameDeviceModal');
+                    const dismiss = document.getElementById('sameDeviceDismiss');
+                    if (dismiss) dismiss.onclick = () => { m.classList.remove('show'); close(); void offerHttpsOnLoad(); };
+                    m.classList.add('show');
+                });
             })();
 
             function showPermModal(onContinue, onSkip) {
-                const m = document.getElementById('permModal');
-                const cont = document.getElementById('permContinue');
-                const skip = document.getElementById('permSkip');
-                const done = (fn) => { m.style.display = 'none'; cont.onclick = null; skip.onclick = null; try { fn && fn(); } catch (_) { noteSuppressed(); } };
-                cont.onclick = () => done(onContinue);
-                skip.onclick = () => done(onSkip);
-                m.style.display = 'flex';
+                withModal((close) => {
+                    const m = document.getElementById('permModal');
+                    const cont = document.getElementById('permContinue');
+                    const skip = document.getElementById('permSkip');
+                    const done = (fn) => {
+                        m.style.display = 'none';
+                        cont.onclick = null;
+                        skip.onclick = null;
+                        close();
+                        try { fn && fn(); } catch (_) { noteSuppressed(); }
+                    };
+                    cont.onclick = () => done(onContinue);
+                    skip.onclick = () => done(onSkip);
+                    m.style.display = 'flex';
+                });
             }
 
-            // Only a modal the user can actually see is worth showing. A fullscreen element
-            // renders only its own subtree, so a prompt raised while the stage is fullscreen
-            // would be invisible and its promise would never settle; the host is told the
-            // labels are unavailable instead, which is the truth either way.
-            const FULLSCREEN_EVENTS = ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'];
-            // `onSkip` is called with `true` when the card could not be shown rather than
-            // answered. That distinction is what stops a session that entered fullscreen — the
-            // default — from being unable to ever ask again: a deferral is retried by
-            // `offerOutputLabels()` when something actually needs the answer, a decline is not.
-            function permModalIfVisible(onContinue, onSkip) {
-                if (currentFullscreenEl()) {
+            // The card is raised in exactly one place — before the join, from the submit
+            // handler, with the page still on the join form and nothing fullscreen. There is
+            // therefore no "the modal became invisible inside a fullscreen subtree" case to
+            // handle and no deferral to remember: the user answers it, and whichever way they
+            // answer, the session that follows is never interrupted by it again. A decline is
+            // reported for the rest of the session as `degraded` bit 9 and costs nothing but
+            // the labels beside the ids in the host's picker.
+            function micCard(onContinue, onSkip) {
+                showPermModal(onContinue, () => {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
-                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
-                    return;
-                }
-                // The check above is a single sample, and startLock() enters fullscreen
-                // asynchronously off onStreamLive — a modal raised a few hundred milliseconds
-                // earlier survived into the transition, became invisible inside the fullscreen
-                // subtree with its promise never settling, and then reappeared over the live
-                // picture the moment the user left fullscreen. Keep watching for the life of
-                // the modal and resolve it as skipped if that happens.
-                let watching = true;
-                const stopWatching = () => {
-                    if (!watching) return;
-                    watching = false;
-                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onFsChange));
-                };
-                const onFsChange = () => {
-                    if (!watching || !currentFullscreenEl()) return;
-                    stopWatching();
-                    degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
-                    document.getElementById('permModal').style.display = 'none';
-                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
-                };
-                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onFsChange));
-                showPermModal(
-                    () => { stopWatching(); if (onContinue) onContinue(); },
-                    () => { stopWatching(); if (onSkip) onSkip(false); },
-                );
-            }
-
-            // The retry. The card is only worth raising now because something asked for it — the
-            // host changing this device's output, or the user opening the picker — so leave
-            // fullscreen first rather than raising it into a subtree that does not render it.
-            // The gesture handler re-enters fullscreen on the next tap, which is the same path
-            // Esc already takes, so the visible state ends where it started.
-            function offerPermModalNow(onContinue, onSkip) {
-                if (!currentFullscreenEl()) { permModalIfVisible(onContinue, onSkip); return; }
-                let settled = false;
-                const stop = () => {
-                    FULLSCREEN_EVENTS.forEach((ev) => document.removeEventListener(ev, onLeft));
-                };
-                const onLeft = () => {
-                    if (settled || currentFullscreenEl()) return;
-                    settled = true;
-                    stop();
-                    permModalIfVisible(onContinue, onSkip);
-                };
-                FULLSCREEN_EVENTS.forEach((ev) => document.addEventListener(ev, onLeft));
-                try {
-                    let p = null;
-                    if (document.exitFullscreen) p = document.exitFullscreen();
-                    else if (document.webkitExitFullscreen) p = document.webkitExitFullscreen();
-                    else if (document.mozCancelFullScreen) p = document.mozCancelFullScreen();
-                    else if (document.msExitFullscreen) p = document.msExitFullscreen();
-                    if (p && p.catch) p.catch(noteSuppressed);
-                } catch (_) { noteSuppressed(); }
-                // An exit that never lands must not strand the caller's promise.
-                setTimeout(() => {
-                    if (settled) return;
-                    settled = true;
-                    stop();
-                    try { if (onSkip) onSkip(true); } catch (_) { noteSuppressed(); }
-                }, 1500);
+                    if (onSkip) onSkip();
+                });
             }
 
             document.getElementById('joinForm').addEventListener('submit', async (e) => {
@@ -2646,6 +2926,27 @@
                 // outside that window.
                 let audioReady = null;
                 try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
+
+                // `selectAudioOutput()` is the only permission-free output picker in any engine
+                // and the only one that hands back a *label* without a microphone grant — and it
+                // needs transient activation, which is why the tier had never once been
+                // reportable. This click is the activation. It is spent here, before the join
+                // does anything that would consume it (fullscreen and the keyboard lock come
+                // later, from `startLock`), and a no-op on every engine without the picker.
+                //
+                // Dismissing it is not an error: the join carries on with the default output.
+                let pickPromise = null;
+                try {
+                    if (window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()) {
+                        beginModal();
+                        // Bounded, and `endModal` runs from whichever of the three outcomes
+                        // arrives first. Nothing may leave the page suspended: `modalSuspend`
+                        // gates the gesture handler, so a stuck one costs fullscreen and pointer
+                        // lock for the rest of the session — and the join is itself gated on
+                        // this settling.
+                        pickPromise = pickOutputBounded(null, endModal);
+                    }
+                } catch (_) { noteSuppressed(); }
 
                 const g0 = screenGeom();
                 joinData = {
@@ -2694,7 +2995,38 @@
                         new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
                     ])
                     : Promise.resolve(true);
+                // Audio-output enumeration is for the host's device panel, not for playback,
+                // but it is the one thing on this page that can raise a browser permission
+                // prompt — and a prompt over a live second screen is an interruption. So it
+                // happens here, before a single ICE candidate exists, and the join waits for
+                // the user's answer rather than for a timer. Browsers that need no grant
+                // (anything with `selectAudioOutput`, anything that already shows labels) are
+                // never prompted and this costs one `enumerateDevices()`.
+                //
+                // It runs alongside the three promises above rather than in front of them, so
+                // the refresh-rate measurement and the decoder probe are done by the time the
+                // card is answered — but *behind* the picker where there is one. A granted pick
+                // is what exposes the labels, and an enumeration that started before it would
+                // finish afterwards and overwrite the labelled list with the unlabelled one it
+                // read. The two never both raise UI: an engine with the picker is exactly the
+                // engine `needsMicPermission()` answers no for.
+                let enumPromise = Promise.resolve(null);
+                try {
+                    if (window.SEAudio) {
+                        SEAudio.initSpeakers();
+                        const runEnum = () => {
+                            try { return SEAudio.enumerateBeforeJoin(micCard); } catch (_) { noteSuppressed(); return null; }
+                        };
+                        enumPromise = pickPromise
+                            ? pickPromise.then(runEnum, runEnum)
+                            : Promise.resolve(runEnum());
+                        SEAudio._enumPromise = enumPromise;
+                    }
+                } catch (_) { noteSuppressed(); }
+
                 const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
+                // Transitively awaits the picker where there is one.
+                try { await enumPromise; } catch (_) { noteSuppressed(); }
 
                 if (results[0]) {
                     audioCaps = results[0];
@@ -2711,18 +3043,7 @@
                 }
                 joinData.refreshRate = results[2];
 
-                // Audio-output enumeration is for the host's device panel, not for playback:
-                // it must never stand between the user and the picture. It runs after the
-                // stream is under way and, where the browser needs a microphone grant to
-                // reveal output labels, asks then — the prompt used to gate the join for up
-                // to twelve seconds.
                 beginStreaming();
-                try {
-                    if (window.SEAudio) {
-                        SEAudio.initSpeakers();
-                        SEAudio._enumPromise = SEAudio.enumerateLazily(permModalIfVisible);
-                    }
-                } catch (_) { noteSuppressed(); }
             });
         </script>
     </body>

@@ -236,7 +236,18 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type AudioOutput = { id: string; label: string }
-export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
+export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; 
+/**
+ * What the host last asked this device to play on.
+ */
+selected: string; 
+/**
+ * What the device reports it is *actually* playing on. The two diverge the moment the
+ * user changes the output in the browser's own UI, which only the client can see.
+ * `None` means this client never said — an older one, or one that has not posted yet —
+ * which is a different answer from `Some("")`, the device's default output.
+ */
+current: string | null }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
@@ -245,7 +256,16 @@ export type Device = { ip: string; token: string; name: string; scale: number; o
  * See `streamer::input::PointerScope`.
  */
 pointerScope: string; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
-export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
+export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; 
+/**
+ * What the host last asked this device to play on.
+ */
+selected: string; 
+/**
+ * What the device says it is actually playing on right now. `None` when it never said,
+ * which is not the same as `Some("")` — the device's default output.
+ */
+current: string | null }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceRemove = Device

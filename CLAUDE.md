@@ -763,9 +763,13 @@ reports back to the host in the `OP::STATS` frame — a device on the slow path 
 one on the fast path (`docs/TELEMETRY.md`).
 
 - `index.html` — the join form (session id, device name, 6-digit OTP, fullscreen toggle), the
-  video stage (`<video>` / `<canvas>` swap), and the modals: HTTPS upsell, limited-browser-support
-  warning, same-device warning (driven by the `__SAME_DEVICE_FLAG__` substitution) and
-  remote-control permission. It also drives `/reconfig` polling, trickle ICE, viewport /
+  video stage (`<video>` / `<canvas>` swap), and the four modals: HTTPS upsell,
+  limited-browser-support warning, same-device warning (driven by the `__SAME_DEVICE_FLAG__`
+  substitution) and the microphone card that reveals audio-output labels. Every one of them —
+  and the browser's own output picker — goes through `beginModal`/`endModal`, which leaves
+  fullscreen, drops the pointer and keyboard locks and stops forwarding input, because a dialog
+  raised over a locked stage cannot be clicked at all. It also drives `/reconfig` polling,
+  trickle ICE, viewport /
   orientation / DPR reporting, and kick handling. It owns the two tier enums:
   `VIDEO_PATH = { webcodecsCanvas, webcodecsVideo, videoElement }` and
   `AUDIO_PATH = { workletSab, workletPort, workletPost, opusTrack }`.

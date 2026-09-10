@@ -62,7 +62,7 @@ const prelude = `
   function showError(m) { calls.push('showError:' + m); }
   function linkLost(m) { calls.push('linkLost:' + m); }
   function start(again) { calls.push('start:' + !!again); }
-  function offerPermModalNow() { return false; }
+  function queueOutputPicker(id) { calls.push('queueOutputPicker:' + id); }
   function nowMs() { return clock; }
 `;
 
@@ -70,7 +70,7 @@ const epilogue = `
   this.api = {
     startReconfigPoll, armProbe, probeTick, applyReconfig, kickDevice, reconfigure,
     clearReconfigWatchdog,
-    state: () => ({ reconfigPoll, reconfigEpoch, kickEpoch, reconfiguring, kicked, isLive, refusedStreak }),
+    state: () => ({ reconfigPoll, reconfigEpoch, kickEpoch, reconfiguring, kicked, isLive, refusedStreak, lastOfferedSinkId }),
     setLive: (v) => { isLive = v; },
     setDegraded: (v) => { degraded = v; },
     setReconfiguring: (v) => { reconfiguring = v; },
@@ -80,6 +80,7 @@ const epilogue = `
 
 const source = [
   prelude,
+  takeConst('lastOfferedSinkId'),
   takeConst('PROBE_OK_MS'),
   takeConst('PROBE_FAST_MS'),
   takeConst('REFUSED_MS'),
@@ -97,6 +98,7 @@ const source = [
 
 let clock = 0;
 let response = null;   // what the next fetch resolves to, or a thrown error
+let sinkResult = true; // what the stubbed SEAudio.setSpeaker resolves to
 let timers = [];
 
 // A fresh realm per case: the lifted block declares `let`s at script scope, so running it
@@ -106,12 +108,18 @@ function makePoller() {
   const calls = [];
   const localTimers = [];
   timers = localTimers;
+  // `applyReconfig` tests `window.SEAudio` and then calls the bare global, which is the same
+  // object in a browser and has to be made so here. What it does with the answer is the whole
+  // of cases 9-11: `false` is the engine refusing, and a host that repeats the same request
+  // must not be answered with a second picker.
+  const seAudio = { setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; } };
   const ctx = {
     console,
     calls,
     Promise,
     RegExp,
-    window: {},
+    SEAudio: seAudio,
+    window: { SEAudio: seAudio },
     setTimeout: (fn, ms) => { localTimers.push({ fn, at: clock + ms }); return localTimers.length; },
     clearTimeout: (id) => { if (id) localTimers[id - 1] = null; },
     fetch: async () => (typeof response === 'function' ? response() : response),
@@ -260,6 +268,55 @@ else fail('a kicked page still ran ' + calls.join(', '));
   if (timers.filter(Boolean).length === 0) ok('a page mid-rebuild does not poll over its own reconfigure');
   else fail('a reconfiguring page armed a poll timer');
 }
+
+// ── 9. a sink the engine refuses is offered a picker once, not once a second ─────────────
+// `process_reconfig` puts `audioSink` in *every* body, and an engine that cannot route to it
+// answers `false` on every tick. Without a latch on the requested id the picker re-armed about
+// once a second, and from then on every tap on the stage opened a browser chooser instead of
+// re-entering fullscreen.
+{
+  const p = makePoller();
+  const calls = p.calls;
+  sinkResult = false;
+  for (let i = 0; i < 10; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-A' });
+  await settle();
+  const offers = calls.filter((c) => c === 'queueOutputPicker:sink-A');
+  eq('ten ticks of the same refused sink offer the picker once', offers.length, 1);
+  eq('and every tick still tries to apply it', calls.filter((c) => c === 'setSpeaker:sink-A').length, 10);
+  eq('the latch remembers which sink was offered', p.state().lastOfferedSinkId, 'sink-A');
+
+  // A different sink is a different request and gets its own single offer.
+  calls.length = 0;
+  for (let i = 0; i < 5; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-B' });
+  await settle();
+  eq('a new sink the host asks for is offered once', calls.filter((c) => c === 'queueOutputPicker:sink-B').length, 1);
+}
+
+// ── 10. a sink that applies never offers a picker ────────────────────────────────────────
+{
+  const p = makePoller();
+  const calls = p.calls;
+  sinkResult = true;
+  for (let i = 0; i < 5; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-C' });
+  await settle();
+  if (!calls.some((c) => c.startsWith('queueOutputPicker'))) ok('a sink that applies is never answered with a picker');
+  else fail('a working sink change opened a picker: ' + calls.join(', '));
+  eq('and the latch is untouched', p.state().lastOfferedSinkId, null);
+}
+
+// ── 11. `null` is "not yet", not a refusal ───────────────────────────────────────────────
+// A sink commanded before the audio graph exists is remembered by audio.js and applied when it
+// does. Reading that as a refusal would open a picker on a device that had not tried anything.
+{
+  const p = makePoller();
+  const calls = p.calls;
+  sinkResult = null;
+  for (let i = 0; i < 5; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-D' });
+  await settle();
+  if (!calls.some((c) => c.startsWith('queueOutputPicker'))) ok('a sink that has not been tried yet is not answered with a picker');
+  else fail('a deferred sink opened a picker: ' + calls.join(', '));
+}
+sinkResult = true;
 
 if (failures) {
   console.log('\n' + failures + ' reconfig assertion(s) failed');

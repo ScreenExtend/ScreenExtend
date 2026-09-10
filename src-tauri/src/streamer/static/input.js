@@ -60,6 +60,8 @@
   let pingTimer = null;
   let installed = false;
   let active = false;
+  // Set while the page has a dialog or the browser's output picker in front of the user.
+  let suspended = false;
   let surface = null;
   let imeSink = null;
 
@@ -809,7 +811,35 @@
   function ndy(e) { return normY(e); }
 
   function on(target, type, fn, opts) {
-    target.addEventListener(type, (e) => { if (active) fn(e); }, opts);
+    target.addEventListener(type, (e) => { if (active && !suspended) fn(e); }, opts);
+  }
+
+  // The page raises a dialog, a card, or the browser's own output picker: for as long as it is
+  // up the user's pointer and keyboard belong to this page, not to the host. Every listener
+  // installed through `on` stands down, and the host is told focus is gone so it lifts any
+  // modifier it is holding — otherwise a Ctrl held when the dialog opened is still down on the
+  // host when it closes. PING and STATS keep flowing, because a suspended client must still be
+  // distinguishable from a wedged one.
+  function setSuspended(on_) {
+    const want = !!on_;
+    if (want === suspended) return false;
+    suspended = want;
+    if (!active) return false;
+    if (want) {
+      sendState(OP.FOCUS_STATE, false);
+      // The page drops the pointer lock to raise the dialog, but `pointerlockchange` is
+      // dispatched in a later task — by which time this listener is itself gated off, so the
+      // host would keep believing the deltas it stopped receiving were still relative.
+      sendState(OP.POINTERLOCK_STATE, false);
+      clearHeld();
+      return true;
+    }
+    // Sent directly rather than through the gated listener, which is exactly what is off.
+    sendState(OP.FOCUS_STATE, true);
+    sendState(OP.POINTERLOCK_STATE, !!document.pointerLockElement);
+    refreshSize();
+    sendResize();
+    return true;
   }
 
   function installListeners() {
@@ -957,6 +987,7 @@
 
   function teardown() {
     active = false;
+    suspended = false;
     if (pingTimer) { clearInterval(pingTimer); pingTimer = 0; }
     clearHeld();
     [fast, reliable, bulk].forEach((ch) => { try { if (ch) ch.close(); } catch (_) {} });
@@ -980,6 +1011,8 @@
   window.RemoteInput = {
     setup,
     teardown,
+    setSuspended,
+    isSuspended() { return suspended; },
     requestKeyframe,
     setPictureSize,
     hostCapabilities() { return hostCaps; },

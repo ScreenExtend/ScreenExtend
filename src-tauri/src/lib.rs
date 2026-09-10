@@ -43,7 +43,11 @@ pub struct DeviceAudioOutputs {
     pub ip: String,
     pub supported: bool,
     pub outputs: Vec<AudioOutput>,
+    /// What the host last asked this device to play on.
     pub selected: String,
+    /// What the device says it is actually playing on right now. `None` when it never said,
+    /// which is not the same as `Some("")` — the device's default output.
+    pub current: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
