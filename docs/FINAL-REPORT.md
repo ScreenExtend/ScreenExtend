@@ -2321,3 +2321,126 @@ appears anywhere in the log.
 
 Ledger: `docs/OPTIMIZATIONS.md` §UX-E. The rule is in `CLAUDE.md` under "Conventions & gotchas";
 the fork divergences are in `windows_capture/FORK.md` under `winrt.rs`.
+
+## 15.5 Post-report device settings and the microphone prompt (owner's rulings)
+
+Three more rulings arrived after §15.4, from the owner watching the built app rather than reading
+the code. Each contradicts a decision made earlier in this report, and in each case the code now
+follows the ruling. Two branches carried them — `dev-settings` and `ux-client2` — and both are
+merged here.
+
+### The rulings
+
+- **The refresh rate a device is given is a fixed rate, not a ceiling — unless the device is
+  explicitly set to adapt.** A rate that sags on its own reads as the product being broken, and a
+  still picture is exactly when the sag shows: nothing moves, the pipeline decides nothing needs
+  sending, and the number on screen falls. Whether the pipeline may lower the delivered rate is
+  therefore a **per-device setting, `autoFrameRate`, and it is off by default**. Adaptive is the
+  opt-in; the promise is the default.
+
+  **What that means for this tree.** The setting is plumbed end to end — TS `Device` +
+  `DEFAULT_AUTO_FRAME_RATE`, the JSON-editor schema, `applyConfig`, the bootstrap replay,
+  `DeviceOverride::auto_frame_rate`, `set_device_auto_frame_rate` in all three `*_utils` and in
+  `collect_commands!`, `devices set --auto-framerate on|off`, the `AUTOFPS` column in
+  `devices list`, the `serve` / `RELOAD` replay, and `Config::auto_frame_rate`, which `server.rs`
+  copies out of the override map once at join so the per-session pipeline reads one plain `bool`
+  and never touches a shared map on a frame path. **The consumer is not here.** Delivering at the
+  fixed rate, repeating an unchanged frame at that cadence, and letting no controller lower it is
+  the stream-regression workstream's half, and `pipeline.rs` is untouched by this pass. Until that
+  branch lands, the flag is **plumbed but inert**: setting it changes what is stored, replayed and
+  reported, and changes nothing about what the encoder does. Anyone reading `AUTOFPS` in
+  `devices list` before then is reading an intent, not a behaviour.
+
+- **The cursor reaching every desktop is the point, not a leak.** A second monitor whose mouse and
+  keyboard stop at its own edge is not a second monitor. `PointerScope::default()` therefore flips
+  to `All`, and only an explicit `"display"` restricts a pointer-locked client to the screen it can
+  see. The device sheet's Select becomes a **"Restrict cursor to this display"** checkbox,
+  unchecked. This **supersedes ledger row 320**, which chose the conservative default on a security
+  argument the owner overruled.
+
+  The flip is also the migration. A device saved before the setting existed carries no
+  `pointerScope` at all, so reading absence as the new default leaves its reach unchanged; had the
+  default stayed `display`, the upgrade would have silently fenced in every device the user already
+  had. The TS, CLI and schema defaults moved together.
+
+- **The microphone is asked for only when enumerating the outputs produced nothing.** §15.2's
+  ruling put the card in front of the join; the owner's answer to what that looked like in practice
+  was "even on laptops and other devices it prompts for it". It did. The placement was right and
+  the **trigger** was wrong: a browser withholds output *labels* without a grant, but it does not
+  withhold the outputs, and `setSinkId` takes the bare id — an unlabelled list routes exactly as
+  well as a labelled one. The old trigger, "no labels", spent a permission prompt on nicer text, in
+  front of every join, on the majority of hardware.
+
+  The trigger is now "the enumeration produced nothing". Outputs found, labelled or not: no card,
+  the join proceeds. Zero outputs, or an enumeration that threw or timed out: the card, still
+  before the join, still awaited, still terminal on a decline. `selectAudioOutput()` engines are
+  never asked either way — they have a permission-free picker. `needsMicPermission()` now takes the
+  caller's enumeration, so a join costs one `enumerateDevices()` rather than two.
+
+  **What replaces the labels.** The page names the ids itself — "Default output", then "Output 1",
+  "Output 2" — and tells the host that it did, through a new `labelled` field (`Option<bool>`;
+  `None` means the client never said) on `/audio-outputs`, `DeviceSessionState`,
+  `AudioOutputsReport` and the `DeviceAudioOutputs` event, plus `degraded` bit 9, whose wording in
+  `docs/TELEMETRY.md` changed with it: it now means "the names are the page's own", not "the grant
+  was refused". The desktop panel reads that flag as part of this pass — `AudioOutputsInfo` carries
+  `labelled?: boolean | null`, both sites that rebuild it copy it through, and `labelled === false`
+  keeps the page's generic names while saying beneath the picker that the browser withheld the real
+  ones and that choosing one still works. An id with no name at all reads `(names unavailable)`
+  rather than the first eight characters of a hash. The test is `=== false`, never `!labelled`:
+  `null`/`undefined` is an older client that never said, and a caveat about withheld names would
+  then be an invention of its own.
+
+### What landed
+
+| Branch | Head merged | Contents |
+|---|---|---|
+| `dev-settings` | `951bbd1` | `autoFrameRate` end to end; the `pointerScope` default flip and the checkbox; ledger rows 322 and 323 |
+| `ux-client2` | `08e1d74` | the microphone trigger, the page-named outputs, `labelled` through Rust and the client, the six-outcome harness in `scripts/test-client-audio.mjs` |
+| (this pass) | `0ac71dd` | the desktop panel's read of `labelled`; ledger row 324 |
+
+Both merges were `--no-ff` and conflict-free. `bindings.ts` was regenerated from the merged tree
+and is unchanged by it — 51 commands, 11 events, `check-bindings.mjs` agreeing with `lib.rs`.
+
+### Verification
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **396 passed,
+0 failed, 14 ignored**, identical under `SE_REQUIRE_HW=1` (so no gated path skipped itself on a
+machine that has the hardware); `pnpm lint` 0 errors; `pnpm build`; `check-legacy-webkit`;
+`pnpm test:client` 7/7 harnesses; `pnpm test:gate`; `pnpm test:config`; `check-bindings`;
+`check-versions` 0.6.3 across all four files; `sha256sum -c` 34/34 and 5/5.
+
+**Status of the three rulings in this tree:** the pointer-scope flip and the microphone trigger are
+`COMPILE-CHECKED` on Windows and take effect in the built app. `autoFrameRate` is
+`COMPILE-CHECKED` and **inert** for the reason above. Every macOS arm of all three is
+**`UNVERIFIED (not compiled)`** — the development Mac was shut down for this pass, so nothing under
+`macos_utils/` has been through a compiler since §15.4.
+
+### The build
+
+`pnpm tauri build` from the repo root, with
+`CARGO_TARGET_DIR=C:/Users/sarve/.cargo/shared_target/ScreenExtend`. Release profile compiled in
+**11m 29s**; both installers were produced; the run then exited **1** on the one acceptable
+failure, the updater signing step, which runs after bundling and needs a key nobody on this
+project holds:
+
+```
+Error A public key has been found, but no private key. Make sure to set
+`TAURI_SIGNING_PRIVATE_KEY` environment variable.
+```
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 13,914,112 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,832,719 |
+| `…/release/ScreenExtend.exe` | 29,957,120 |
+
+**The built app was not relaunched, and nothing was stopped.** The stream-regression workstream
+was mid-run on this machine and its `serve` host held the single-instance lock; `ScreenExtend.exe
+stop` reaches whichever instance holds that lock, so it would have ended their measurement, and a
+GUI launch beside it would have created virtual displays and contended for the encoder during a
+timing run. Neither was done. The relaunch is the one step of this pass left outstanding, and it
+is one command once that workstream is finished:
+
+```powershell
+Start-Process 'C:\Users\sarve\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe'
+```
