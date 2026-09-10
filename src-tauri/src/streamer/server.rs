@@ -117,6 +117,22 @@ static DISPLAY_CORRELATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 pub const MIN_REFRESH_RATE: u32 = 15;
 pub const MAX_REFRESH_RATE: u32 = 500;
 
+/// The fastest rate a client is given **by default**, whatever it says its own screen runs at.
+///
+/// The client measures its refresh rate and the host used to take that number at face value: a
+/// browser on a 360 Hz laptop panel asked for 360, and the host duly built a 360 Hz virtual
+/// display and configured the encoder for 360 fps. Three things go wrong at once, and they were
+/// all visible on the Windows dev box. The compositor now has a second high-rate display to
+/// compose on the same integrated GPU, and the *real* desktop's animation cadence collapsed from
+/// 357 fps to 60. The encoder is asked for a frame budget it cannot meet at that geometry, so its
+/// rate control spends the whole session at the wrong operating point. And the number is
+/// persisted into the device row, so it survives every later join.
+///
+/// A second screen does not need to be faster than this. `MAX_REFRESH_RATE` is still what the
+/// per-device setting may be raised to — that is a choice the user makes, once, in the UI, for a
+/// device where it is worth it. This is only the ceiling on what a client may claim for itself.
+pub const DEFAULT_MAX_AUTO_REFRESH: u32 = 60;
+
 /// Compose cadence to ask the virtual display for, independent of the stream's frame rate.
 /// Every created display registers this rate alongside whatever was requested
 /// (`COMMON_REFRESH_RATES`), so selecting it costs nothing; if the driver refuses it the join
@@ -1085,8 +1101,15 @@ async fn start_session(
     let detected_refresh = if req.refresh_rate == 0 {
         60
     } else {
-        req.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
+        req.refresh_rate
+            .clamp(MIN_REFRESH_RATE, DEFAULT_MAX_AUTO_REFRESH)
     };
+    if req.refresh_rate > detected_refresh {
+        tprintln!(
+            "client reports a {} Hz screen; streaming at {detected_refresh} Hz              (raise it for this device in Devices if you want more)",
+            req.refresh_rate
+        );
+    }
 
     let mut cfg = state.config.as_ref().clone();
     cfg.max_fps = detected_refresh;
@@ -1160,15 +1183,22 @@ async fn start_session(
     } else {
         cfg.max_fps.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
     };
-    // The virtual display's refresh rate and the stream's frame rate were one number. They are
-    // not the same thing: an indirect display has no hardware vblank, so the mode's refresh rate
-    // *is* DWM's compose cadence and therefore the ceiling on how fresh any captured frame can
-    // be. At 60 Hz a frame is on average 8.3 ms stale before capture even sees it; at 120 Hz,
-    // 4.2 ms. Every display is already created with 120 Hz registered alongside its requested
-    // rate, and it was simply never selected. `cfg.max_fps` stays the stream cap.
-    let refresh = stream_fps
-        .max(DISPLAY_COMPOSE_HZ)
-        .clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
+    // The virtual display's refresh rate and the stream's frame rate are not the same number: an
+    // indirect display has no hardware vblank, so the mode's refresh rate *is* DWM's compose
+    // cadence and therefore the ceiling on how fresh any captured frame can be. At 60 Hz a frame
+    // is on average 8.3 ms stale before capture even sees it; at 120 Hz, 4.2 ms.
+    //
+    // That is worth ~4 ms and it costs the compositor, the capture and the copy a doubling, so it
+    // is only taken when the device asked for an adaptive rate. With `autoFrameRate` off — the
+    // default — the display is created at exactly the rate the device asked for, and the pipeline
+    // holds that cadence. The pipeline caps delivery at `max_fps` either way, so the extra
+    // compose steps are only ever paid for freshness, never sent.
+    let refresh = if cfg.auto_frame_rate {
+        stream_fps.max(DISPLAY_COMPOSE_HZ)
+    } else {
+        stream_fps
+    }
+    .clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
 
     let video = negotiate::choose(&offered_video, width, height, stream_fps);
     cfg.h264_profile = video.profile;

@@ -216,9 +216,14 @@ const lastOf = (posted, type) => { for (let i = posted.length - 1; i >= 0; i--) 
   else fail('the wrapped delta was treated as older than the resume keyframe and dropped');
 }
 
-// ── 4. backpressure is decodes without outputs, not decodeQueueSize ──────────────────
-// The stub's `decodeQueueSize` never leaves 0, so anything reading it would see a healthy
-// stream while nothing reaches the screen. What must fire instead is the in-flight count.
+// ── 4. backpressure is a decoder that stopped, not one that is merely pipelined ───────
+// Two halves, and the second is the one that was missing. `decodeQueueSize` never leaves 0 in
+// the stub, so anything reading it would see a healthy stream while nothing reaches the screen —
+// the in-flight count is what has to fire. But the in-flight count *alone* is also what a
+// hardware decoder that is keeping up perfectly looks like, because it is pipelined, and the
+// response to a backlog is severe: every delta is thrown away until a keyframe arrives, and the
+// host gates keyframes to one per 200 ms. So the count is the cheap half of the test and "no
+// output for BACKLOG_STALL_MS" is the load-bearing half.
 {
   const w = makeWorker({ swallowDeltas: true });
   w.attachCanvas();
@@ -229,7 +234,19 @@ const lastOf = (posted, type) => { for (let i = posted.length - 1; i >= 0; i--) 
   if (lastOf(w.posted, 'rendered')) ok('the first painted frame is announced so the page can clear its watchdog');
   else fail('no rendered message after the first keyframe');
 
+  // Enough frames to put the count over the cap, with the clock standing still: a decoder that
+  // has produced an output this instant is keeping up, however many pictures it is holding.
   for (let i = 1; i <= 8; i++) {
+    w.feed(frame('delta', 1000 + i * 1500));
+    await w.settle();
+  }
+  if (!lastOf(w.posted, 'backlog')) ok('a pipelined decoder that is still producing outputs is not called a backlog');
+  else fail('the in-flight count alone tripped the backlog path, which is what a healthy hardware decoder looks like');
+
+  // Now the decoder has genuinely stopped: nothing has come back out for longer than the stall
+  // window. This is the state the path exists for.
+  w.advance(200);
+  for (let i = 9; i <= 12; i++) {
     w.feed(frame('delta', 1000 + i * 1500));
     await w.settle();
   }
