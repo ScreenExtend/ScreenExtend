@@ -74,8 +74,9 @@ Run with no arguments to open the desktop app.
 SUBCOMMANDS:
     serve                 Run the streaming host headlessly (no window) until Ctrl+C
     status                Show session, network, driver and config state
-    qr                    Print join QR codes / URLs for a session
-    session new           Generate a fresh session id + OTP and print join info
+    qr                    Print join QR codes / URLs for the running host's session
+    session new           Mint a session id + OTP, apply them to the running host, print
+                          the join info
     devices list          List live joins and saved per-device display overrides
     devices set <device>  Save display overrides for a device (token, or an IP that resolves)
     devices reset <device>  Clear saved overrides for a device
@@ -2104,7 +2105,7 @@ mod desktop {
         if session_id.is_none() {
             if running {
                 println!(
-                    "\nThe host is up but has not minted a session yet (the desktop app does that a\nmoment after launch). Run this again, or `ScreenExtend session new` to set one."
+                    "\nThe host is up but did not report a session — it is still starting (the desktop\napp mints one a moment after launch), or it predates this build's SESSION control\nverb. Run this again, or `ScreenExtend session new` to set one."
                 );
             } else {
                 println!(
@@ -2121,6 +2122,12 @@ mod desktop {
         // The running host first. `qr` used to mint a fresh id on every invocation and print
         // join URLs for it, so three runs beside one host printed three ids and none of them was
         // the one the host was serving.
+        //
+        // "a host is running" and "a host told me its session" are two different questions, and
+        // the answer to the second can be no while the first is yes: a host still starting, or
+        // one from a build that predates the SESSION verb. The output has to separate them or a
+        // minted id would be presented as the considered answer.
+        let running = host_running(app);
         let live = live_session(app);
         let (session_id, source) = resolve_session_id(
             arg_str(m, "session-id"),
@@ -2150,7 +2157,8 @@ mod desktop {
             let out = serde_json::json!({
                 "sessionId": session_id,
                 "sessionIdSource": source.as_str(),
-                "hostRunning": live.is_some(),
+                "hostRunning": running,
+                "hostReportedSession": live.is_some(),
                 "publicSession": live.as_ref().map(|info| info.public_sessions),
                 "cloudState": live.as_ref().map(|info| info.cloud_state.clone()),
                 "targets": entries.iter().map(|(t, u)| serde_json::json!({"title": t, "url": u})).collect::<Vec<_>>(),
@@ -2162,6 +2170,11 @@ mod desktop {
         println!("Session: {session_id}");
         match source {
             IdSource::Host => println!("  (the session the running host is serving)"),
+            IdSource::Generated if running => println!(
+                "  NOTE: a host is running but did not report a session — it is still starting,\n  \
+                 or it predates this build's SESSION control verb. The id above was generated\n  \
+                 here and is NOT the one being served; run `ScreenExtend session new` to set it."
+            ),
             IdSource::Generated => println!(
                 "  NOTE: no host is running, so this id was generated here and nothing is\n  \
                  serving it yet. Start the host with it:\n    \
