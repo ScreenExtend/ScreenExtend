@@ -247,7 +247,14 @@ selected: string;
  * `None` means this client never said — an older one, or one that has not posted yet —
  * which is a different answer from `Some("")`, the device's default output.
  */
-current: string | null }
+current: string | null; 
+/**
+ * Whether the labels beside the ids above are the operating system's or this page's own.
+ * `Some(false)` means the browser withheld the real names and the client numbered them
+ * ("Output 1", "Output 2") rather than spend a microphone prompt on them, so they must
+ * not be presented as device names. `None` means the client never said.
+ */
+labelled: boolean | null }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
@@ -265,7 +272,12 @@ selected: string;
  * What the device says it is actually playing on right now. `None` when it never said,
  * which is not the same as `Some("")` — the device's default output.
  */
-current: string | null }
+current: string | null; 
+/**
+ * `Some(false)` when the labels beside the ids are the client page's own numbering rather
+ * than the operating system's names; `None` when the client never said.
+ */
+labelled: boolean | null }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceRemove = Device
