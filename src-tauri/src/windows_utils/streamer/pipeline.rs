@@ -3162,9 +3162,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             ) {
                 Ok(overlay) => {
                     tprintln!(
-                        "cursor: composited by the host ({} ring slots); WGC asked for the \
-                         desktop without a pointer",
-                        textures.len()
+                        "cursor: composited by the host on {} ring slots; WGC asked for the \
+                         desktop without a pointer. {}",
+                        textures.len(),
+                        overlay.describe()
                     );
                     Some(Arc::new(Mutex::new(overlay)))
                 }

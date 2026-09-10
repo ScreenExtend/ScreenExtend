@@ -44,7 +44,6 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{bail, Context as _, Result};
-use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D, D3D11_BOX,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
@@ -82,6 +81,9 @@ const MAX_CACHED_SPRITES: usize = 8;
 /// never wait at all. `KEY_TIMEOUT_MS` (1 s) is the wrong ceiling here: the WGC callback wants
 /// this same lock for the *next* frame, and a pointer redraw that misses one tick costs a tick.
 const RECOMPOSE_KEY_TIMEOUT_MS: u32 = 8;
+
+/// Smallest gap between the "no pointer drawn" lines. See [`CursorOverlay::note_absent`].
+const ABSENT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything about the pointer that decides what gets drawn where. Two equal values draw the
 /// same picture, which is exactly the test the encode thread's idle tick needs.
@@ -195,6 +197,8 @@ pub struct CursorOverlay {
     /// times a second.
     bad_shapes: Vec<isize>,
     shape_errors: u32,
+    absent_logged: u32,
+    absent_logged_at: Instant,
 
     telemetry: SharedTelemetry,
 }
@@ -246,8 +250,17 @@ impl CursorOverlay {
             });
         }
 
-        let (origin_x, origin_y, rect_w, rect_h) =
-            monitor_rect(monitor).unwrap_or((0, 0, native.0, native.1));
+        // The pointer is reported in desktop coordinates, so the display's own origin is the
+        // difference between drawing it where the user is pointing and drawing it a whole screen
+        // away. A virtual display normally sits at a negative x.
+        let rect = monitor_rect(monitor);
+        if rect.is_none() {
+            teprintln!(
+                "[cursor] GetMonitorInfoW({monitor:#x}) failed; assuming this display starts at \
+                 the desktop origin, which is wrong for any display but the primary"
+            );
+        }
+        let (origin_x, origin_y, rect_w, rect_h) = rect.unwrap_or((0, 0, native.0, native.1));
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
@@ -267,8 +280,29 @@ impl CursorOverlay {
             sprites: Vec::with_capacity(MAX_CACHED_SPRITES),
             bad_shapes: Vec::new(),
             shape_errors: 0,
+            absent_logged: 0,
+            // Far enough in the past that the first absence reports immediately. `checked_sub`
+            // because `Instant - Duration` panics on a machine that booted seconds ago.
+            absent_logged_at: Instant::now()
+                .checked_sub(ABSENT_LOG_INTERVAL)
+                .unwrap_or_else(Instant::now),
             telemetry,
         })
+    }
+
+    /// The geometry, for the one line the log gets when a session starts compositing.
+    pub fn describe(&self) -> String {
+        format!(
+            "display {}x{} at {},{} (hmonitor {:#x}) -> encode {}x{}, cursor dpi factor {:.2}",
+            self.src_w,
+            self.src_h,
+            self.origin_x,
+            self.origin_y,
+            self.monitor,
+            self.dst_w,
+            self.dst_h,
+            self.dpi_scale
+        )
     }
 
     /// Draw the pointer onto a slot the capture callback has just overwritten with a fresh frame.
@@ -345,7 +379,6 @@ impl CursorOverlay {
         if slot >= self.slots.len() {
             bail!("cursor overlay: slot {slot} out of range");
         }
-        self.refresh_geometry();
 
         let mut touched = false;
         if let Some(r) = self.slots[slot].drawn.take() {
@@ -540,36 +573,70 @@ impl CursorOverlay {
 
     /// The pointer, if it is showing *and* over the display being captured.
     ///
-    /// The monitor test is what keeps a pointer that has wandered onto the host's own screen from
+    /// The bounds test is what keeps a pointer that has wandered onto the host's own screen from
     /// being painted onto the client's — the per-device pointer scope defaults to `all`, so it
-    /// leaves this display all the time.
-    fn read_pointer(&self) -> Option<Pointer> {
-        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
+    /// leaves this display all the time. It is a rectangle test against the monitor's own bounds
+    /// rather than `MonitorFromPoint`, matching `dxgi/mod.rs::refresh_cursor_state`: the two agree
+    /// wherever the rectangle is known, and where it is not the rectangle test still draws a
+    /// pointer at a slightly wrong offset, where the handle test draws none at all.
+    fn read_pointer(&mut self) -> Option<Pointer> {
         use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
+        // Before the bounds test, not after: the rectangle it tests against is what a `/reconfig`
+        // moves, and testing against the old one puts the pointer on the wrong display for a
+        // second.
+        self.refresh_geometry();
         let mut info = CURSORINFO {
             cbSize: std::mem::size_of::<CURSORINFO>() as u32,
             ..Default::default()
         };
         if unsafe { GetCursorInfo(&mut info) }.is_err() {
+            self.note_absent("GetCursorInfo failed", 0, 0);
             return None;
         }
         if (info.flags.0 & CURSOR_SHOWING.0) == 0 || info.hCursor.is_invalid() {
+            self.note_absent("the pointer is hidden or suppressed", 0, 0);
             return None;
         }
-        let pt = POINT {
-            x: info.ptScreenPos.x,
-            y: info.ptScreenPos.y,
-        };
-        let mine = HMONITOR(self.monitor as *mut core::ffi::c_void);
-        if unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) } != mine {
+        let (x, y) = (info.ptScreenPos.x, info.ptScreenPos.y);
+        let inside = x >= self.origin_x
+            && x < self.origin_x + self.src_w as i32
+            && y >= self.origin_y
+            && y < self.origin_y + self.src_h as i32;
+        if !inside {
+            self.note_absent("the pointer is on another display", x, y);
             return None;
         }
         Some(Pointer {
-            x: pt.x,
-            y: pt.y,
+            x,
+            y,
             shape: info.hCursor.0 as isize,
         })
+    }
+
+    /// Says, a handful of times and never more often than every few seconds, why no pointer is
+    /// being drawn.
+    ///
+    /// A host drawing no pointer because the user's mouse is on their own screen and a host
+    /// drawing no pointer because its geometry is wrong look identical from the outside, and the
+    /// second one is the whole failure this module exists to avoid.
+    fn note_absent(&mut self, why: &str, x: i32, y: i32) {
+        const MAX_LINES: u32 = 3;
+        if self.absent_logged >= MAX_LINES || self.absent_logged_at.elapsed() < ABSENT_LOG_INTERVAL
+        {
+            return;
+        }
+        self.absent_logged += 1;
+        self.absent_logged_at = Instant::now();
+        teprintln!(
+            "[cursor] no pointer drawn: {why} (pointer {x},{y}; this display {}x{} at {},{}, \
+             hmonitor {:#x})",
+            self.src_w,
+            self.src_h,
+            self.origin_x,
+            self.origin_y,
+            self.monitor
+        );
     }
 
     fn refresh_geometry(&mut self) {
