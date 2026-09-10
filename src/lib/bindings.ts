@@ -119,8 +119,8 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
 /**
- * Where a pointer-locked client may drive this host's cursor: `"display"` (its own screen,
- * the default) or `"all"` (every screen, including the host's real monitors).
+ * Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
+ * the host's real monitors — the default) or `"display"` (only the screen it is streaming).
  * 
  * Its own command rather than another `set_device_override` argument: that one is at specta's
  * ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
@@ -129,6 +129,18 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
  */
 async setDevicePointerScope(ip: string, scope: string) : Promise<void> {
     await TAURI_INVOKE("set_device_pointer_scope", { ip, scope });
+},
+/**
+ * Whether this device's stream may drop below its chosen refresh rate on its own.
+ * 
+ * Off is the default and the owner's ruling: the rate the user picked is the rate the stream
+ * runs at, an unchanged frame is repeated rather than skipped, and no controller lowers it.
+ * A separate command for the same reason as `set_device_pointer_scope` — `set_device_override`
+ * is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
+ * a change applies to the next connection.
+ */
+async setDeviceAutoFrameRate(ip: string, enabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_auto_frame_rate", { ip, enabled });
 },
 async refreshDeviceStream(ip: string) : Promise<boolean> {
     return await TAURI_INVOKE("refresh_device_stream", { ip });
@@ -255,7 +267,12 @@ export type Device = { ip: string; token: string; name: string; scale: number; o
  * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
  * See `streamer::input::PointerScope`.
  */
-pointerScope: string; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+pointerScope: string; 
+/**
+ * Whether the stream may fall below `refresh_rate` on its own. Off means the chosen rate
+ * is a promise: see `streamer::session::DeviceOverride::auto_frame_rate`.
+ */
+autoFrameRate: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; 
 /**
  * What the host last asked this device to play on.

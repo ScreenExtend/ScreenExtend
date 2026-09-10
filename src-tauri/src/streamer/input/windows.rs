@@ -1202,14 +1202,18 @@ mod tests {
         assert_eq!(inj.pointer_bounds(), desktop);
     }
 
+    /// Only the explicit restriction restricts. A device saved before the setting existed
+    /// carries no `pointerScope` at all, and reading that as `Display` would have silently
+    /// fenced in every device the user already had.
     #[test]
-    fn an_unknown_pointer_scope_is_the_conservative_one() {
-        assert_eq!(PointerScope::from_str("all"), PointerScope::All);
-        assert_eq!(PointerScope::from_str("All"), PointerScope::All);
+    fn only_an_explicit_display_scope_restricts_the_pointer() {
         assert_eq!(PointerScope::from_str("display"), PointerScope::Display);
-        assert_eq!(PointerScope::from_str("everything"), PointerScope::Display);
-        assert_eq!(PointerScope::from_str(""), PointerScope::Display);
-        assert_eq!(PointerScope::default(), PointerScope::Display);
+        assert_eq!(PointerScope::from_str("Display"), PointerScope::Display);
+        assert_eq!(PointerScope::from_str("all"), PointerScope::All);
+        assert_eq!(PointerScope::from_str("everything"), PointerScope::All);
+        assert_eq!(PointerScope::from_str(""), PointerScope::All);
+        assert_eq!(PointerScope::default(), PointerScope::All);
         assert_eq!(PointerScope::All.as_str(), "all");
+        assert_eq!(PointerScope::Display.as_str(), "display");
     }
 }

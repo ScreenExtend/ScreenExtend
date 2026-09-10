@@ -337,6 +337,10 @@ pub struct Device {
     /// See `streamer::input::PointerScope`.
     #[serde(rename = "pointerScope")]
     pub pointer_scope: String,
+    /// Whether the stream may fall below `refresh_rate` on its own. Off means the chosen rate
+    /// is a promise: see `streamer::session::DeviceOverride::auto_frame_rate`.
+    #[serde(rename = "autoFrameRate")]
+    pub auto_frame_rate: bool,
     #[serde(rename = "systemAudio")]
     pub audio_enabled: bool,
     pub os: String,
@@ -378,6 +382,7 @@ impl Device {
             pointer_scope: streamer::input::PointerScope::default()
                 .as_str()
                 .to_string(),
+            auto_frame_rate: false,
             audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
@@ -754,6 +759,7 @@ pub fn run() {
             set_legacy_volume_key_proxy,
             set_device_override,
             set_device_pointer_scope,
+            set_device_auto_frame_rate,
             refresh_device_stream,
             set_device_audio_output,
             get_device_audio_outputs,

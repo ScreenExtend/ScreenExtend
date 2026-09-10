@@ -55,10 +55,11 @@ const deviceSchema: JsonSchema = {
       enum: ["display", "all"],
       enumDescriptions: [
         "Clamp the cursor to the display created for this device — it cannot reach a monitor the device's user cannot see.",
-        "Clamp to the union of every attached display, so the cursor can cross onto the host's own monitors. Needed to drag a window back off the virtual display.",
+        "Clamp to the union of every attached display, so the cursor can cross onto the host's own monitors. The default, and what dragging a window back off the virtual display needs.",
       ],
-      default: "display",
+      default: "all",
     },
+    autoFrameRate: bool("Let the stream drop below refreshRate on its own when the picture is still or the link is busy. Off, the default, holds the chosen rate and repeats an unchanged frame instead of skipping it.", false),
     systemAudio: bool("Stream the host's system audio to this device.", false),
     audioOutputDeviceId: str("Identifier of the audio output on the device that system audio is played through. Empty means the device's default output."),
     audioOutputDeviceLabel: str("Human-readable label for audioOutputDeviceId, shown in the device settings."),

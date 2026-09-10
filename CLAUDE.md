@@ -193,7 +193,8 @@ status [--session-id ID] [--json]
 qr [-t lan|cloud|all] [--session-id ID] [--no-render] [--json]
 session new [--no-render] [--json]
 devices list | set <ip> [--scale --orientation --refresh-rate --video-scale
-                         --video-quality --control on|off --audio on|off] | reset <ip>
+                         --video-quality --control on|off --audio on|off
+                         --pointer-scope display|all --auto-framerate on|off] | reset <ip>
 network start <ssid> <password> | stop | status | wifi-on | wifi-qr
 config list | get <key> | set <key> <value> | path      # dotted keys, e.g. serverPorts.http
 stun show | set <urls> | clear
@@ -279,7 +280,7 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `turn_on_wifi`, `install_drivers`,
 `remove_drivers`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
-`refresh_device_stream`,
+`set_device_auto_frame_rate`, `refresh_device_stream`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
 `set_device_banned`, `set_device_approved`, `set_disconnect_grace`, `get_disconnect_grace`,
 `get_display_capacity`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
@@ -852,8 +853,8 @@ dontShowAgain{editDevice,editNetwork,compatibility,configEditor}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
-remoteControl, pointerScope, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os,
-screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
+remoteControl, pointerScope, autoFrameRate, systemAudio, audioOutputDeviceId,
+audioOutputDeviceLabel, os, screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
 
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,

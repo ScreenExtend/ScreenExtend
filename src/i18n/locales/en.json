@@ -315,10 +315,12 @@
       "note": "macOS will show the screen-recording indicator in the menu bar while system audio is on, including when this device's video is off. This version of macOS has no audio-only capture, so ScreenExtend has to run a 2×2 screen stream to receive sound at all."
     },
     "pointerScope": {
-      "label": "Pointer Range",
-      "tip": "Where this device's pointer may go. \"This display\" keeps it inside the screen the device can actually see. \"All displays\" lets it cross onto your other monitors, which is what dragging a window back off the virtual display needs.",
-      "display": "This display only",
-      "all": "All displays"
+      "label": "Restrict cursor to this display",
+      "help": "Off by default: the mouse and keyboard reach every screen, so you can drag a window back off the extended display. Tick this to keep the cursor inside the screen this device can actually see."
+    },
+    "autoFrameRate": {
+      "label": "Automatic frame rate",
+      "help": "Off by default: the stream runs at the refresh rate above and never lowers it, repeating an unchanged frame rather than skipping it. Tick this to let ScreenExtend drop the rate when the picture is still or the connection is busy."
     }
   },
   "network": {
