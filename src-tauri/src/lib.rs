@@ -61,6 +61,55 @@ pub struct NetworkChange;
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct HostedNetworkNoPassword;
 
+/// macOS revoked Screen Recording while a session was live. The watchdog in
+/// `macos_utils::start_session_watchdog` ends the sessions on a definite
+/// `Some(true) -> Some(false)` edge; this is the half that tells the person at the host,
+/// who would otherwise only find it in the log. Windows and Linux never emit it.
+#[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
+pub struct ScreenRecordingRevoked {
+    /// The permission key the UI should re-check, matching `PermissionStatus.key`.
+    pub key: String,
+    /// How many live sessions were ended because of it.
+    pub sessions_ended: u32,
+}
+
+/// Everything the UI can say about the hosted network without opening the log terminal.
+///
+/// `state` is the tri-state both platforms already collect and neither could report:
+/// - `notStarted` — nothing is being advertised.
+/// - `advertised` — the platform accepted the start, and that is all that is known. An AP
+///   in this state is visible to a phone and may still be unjoinable, because nothing is
+///   serving DHCP.
+/// - `verified` — the AP interface holds a routable IPv4, i.e. something is serving
+///   addresses, so a client that associates can actually get on.
+///
+/// `secured` is what item 6 of the UI recommendations needs: on macOS the HostAP SPI can
+/// refuse every secured `securityType` and the fallback brings up an *unencrypted* AP,
+/// which stays up for the session while the join URL, session id and OTP are readable by
+/// anyone in range who associates. A toast cannot carry that; a badge on the card can.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Type)]
+pub struct HostedNetworkReport {
+    pub state: String,
+    pub backend: Option<String>,
+    pub ssid: String,
+    pub channel: Option<i32>,
+    pub band: Option<String>,
+    /// The security type as it was logged, e.g. `WPA2` or `securityType 2 (open — no
+    /// encryption)`. `None` when nothing is up.
+    pub security: Option<String>,
+    /// False means the network carries no encryption at all.
+    pub secured: bool,
+    pub host_ipv4: Option<String>,
+    /// A client seen on the AP's own subnet. macOS only; `None` elsewhere.
+    pub peer: Option<String>,
+}
+
+impl HostedNetworkReport {
+    pub const NOT_STARTED: &'static str = "notStarted";
+    pub const ADVERTISED: &'static str = "advertised";
+    pub const VERIFIED: &'static str = "verified";
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type, Event)]
 pub struct CloudStatusChange {
     pub state: String,
@@ -691,6 +740,7 @@ pub fn run() {
             hosted_network::start_hosted_network,
             hosted_network::stop_hosted_network,
             hosted_network::is_hosted_network,
+            hosted_network::get_hosted_network_status,
             hosted_network::is_wifi_on,
             hosted_network::turn_on_wifi,
             install_drivers,
@@ -727,6 +777,7 @@ pub fn run() {
             DeviceRemove,
             NetworkChange,
             HostedNetworkNoPassword,
+            ScreenRecordingRevoked,
             CloudStatusChange,
             SessionIdChange,
             JoinAttemptsPaused,

@@ -307,7 +307,39 @@
       "speaker": "Speaker",
       "earpiece": "Earpiece",
       "waiting": "Waiting for this device to report its speakers…",
-      "unsupported": "This device's browser can't switch speakers; audio plays on its default output."
+      "unsupported": "This device's browser can't switch speakers; audio plays on its default output.",
+      "playingOn": "Playing on: {label}",
+      "mismatch": "This device is still playing on {label}. Its browser needs a tap on the page before it will switch."
+    },
+    "screenRecordingIndicator": {
+      "note": "macOS will show the screen-recording indicator in the menu bar while system audio is on, including when this device's video is off. This version of macOS has no audio-only capture, so ScreenExtend has to run a 2×2 screen stream to receive sound at all."
+    },
+    "pointerScope": {
+      "label": "Pointer Range",
+      "tip": "Where this device's pointer may go. \"This display\" keeps it inside the screen the device can actually see. \"All displays\" lets it cross onto your other monitors, which is what dragging a window back off the virtual display needs.",
+      "display": "This display only",
+      "all": "All displays"
+    }
+  },
+  "network": {
+    "state": {
+      "notStarted": "Not started",
+      "advertised": "Advertised",
+      "verified": "Verified",
+      "advertisedTip": "The Wi-Fi radio accepted the network and devices can see it, but nothing has handed out an address yet. A device that joins now may sit on \"obtaining IP address\".",
+      "verifiedTip": "The network is up and serving addresses, so a device that joins can reach this computer.",
+      "peer": "{ip} has joined over this network."
+    },
+    "open": {
+      "title": "This network has no encryption.",
+      "body": "Your Mac refused every secured Wi-Fi type ScreenExtend asked for, so the network was created open. Anyone in range who joins it can read the join link, the Session ID and the OTP. It stays open until you stop it."
+    },
+    "details": {
+      "backend": "Created with",
+      "channel": "Channel",
+      "band": "Band",
+      "security": "Security",
+      "address": "This computer"
     }
   },
   "notifications": {
@@ -408,7 +440,13 @@
       "relaunchBody": "macOS gives a newly granted permission only to a freshly launched app, so ScreenExtend has to be restarted before it can use this one. Press Restart below.",
       "autoChecking": "Checking for changes…",
       "recheck": "Re-check",
-      "relaunch": "Restart"
+      "relaunch": "Restart",
+      "revokedTitle": "Screen Recording Was Turned Off",
+      "revokedBody": "macOS withdrew ScreenExtend's Screen Recording permission while it was streaming, so the connected devices were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
+      "revokedBodyWithCount": "macOS withdrew ScreenExtend's Screen Recording permission while it was streaming, so {count} connected device(s) were disconnected. Without it, capture keeps running and sends nothing but your desktop wallpaper, which is why the session is ended instead.",
+      "revokedSteps": "Re-approve ScreenExtend under System Settings → Privacy & Security → Screen Recording, then restart it and reconnect the device. macOS gives a newly granted permission only to a freshly launched app.",
+      "openSettings": "Open Settings",
+      "dismiss": "Dismiss"
     }
   },
   "configEditor": {

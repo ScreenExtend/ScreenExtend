@@ -48,11 +48,11 @@ const deviceSchema: JsonSchema = {
     remoteControl: bool("Let this device control the host with its keyboard, mouse and touch input.", false),
     pointerScope: {
       type: "string",
-      description: "How far this device may drive the host cursor while it holds pointer lock.",
+      description: "How far this device's pointer may travel when it has taken pointer lock. Only meaningful when remoteControl is on.",
       enum: ["display", "all"],
       enumDescriptions: [
-        "Confine it to the display this device is streaming.",
-        "Let it cross onto the host's own monitors, which this device cannot see.",
+        "Clamp the cursor to the display created for this device — it cannot reach a monitor the device's user cannot see.",
+        "Clamp to the union of every attached display, so the cursor can cross onto the host's own monitors. Needed to drag a window back off the virtual display.",
       ],
       default: "display",
     },

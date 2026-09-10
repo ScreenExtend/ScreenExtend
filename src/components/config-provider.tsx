@@ -2,6 +2,9 @@ import { useEffect, useSyncExternalStore } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { generatePassword } from "@/lib/utils";
 
+export type PointerScope = "display" | "all";
+export const DEFAULT_POINTER_SCOPE: PointerScope = "display";
+
 export type Device = {
   ip: string;
   token: string;
@@ -12,11 +15,17 @@ export type Device = {
   videoScale: number;
   videoQuality: number;
   remoteControl: boolean;
-  // How far this device may drive the host cursor while it holds pointer lock: "display"
-  // confines it to the screen it is streaming, "all" lets it cross onto the host's real
-  // monitors. A config saved before this existed has no value; every reader defaults it to
-  // "display", and so does the host for anything it does not recognise.
-  pointerScope: "display" | "all";
+  /**
+   * Where a pointer-locked client's cursor may travel. Both input backends track their own
+   * position and clamp it, but today they clamp to the union of every attached display, so
+   * accumulated `MOUSE_DELTA` walks the cursor onto screens the client cannot see and can
+   * then click on. `display` keeps it on the session's own display; `all` is the old
+   * behaviour, and it is what dragging a window back off the virtual display needs.
+   *
+   * Optional because the field post-dates the devices already in `config.json`; a device
+   * saved before it reads as `display` through `DEFAULT_POINTER_SCOPE`.
+   */
+  pointerScope?: PointerScope;
   systemAudio: boolean;
   audioOutputDeviceId: string;
   audioOutputDeviceLabel: string;

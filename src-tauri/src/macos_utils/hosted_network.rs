@@ -76,6 +76,11 @@ pub struct HostedNetworkStatus {
     pub channel: Option<isize>,
     pub band: Option<&'static str>,
     pub security: Option<String>,
+    /// Whether the AP that came up carries encryption at all. The HostAP SPI can refuse
+    /// every secured `securityType` this Mac was asked for, and the fallback then brings up
+    /// an open network that stays up for the session — so this is not a detail, it is the
+    /// difference between a passphrase and none.
+    pub secured: bool,
     /// The platform accepted the start request.
     pub advertised: bool,
     /// The host holds a routable IPv4 on the AP interface, i.e. `bootpd` is serving.
@@ -548,6 +553,7 @@ struct StartOutcome {
     channel: isize,
     band: &'static str,
     security: String,
+    secured: bool,
 }
 
 /// Try one (channel, security) pair and only report success once the radio agrees.
@@ -631,6 +637,7 @@ fn start_via_host_ap(
                         channel: unsafe { channel.channelNumber() },
                         band: channel_band(channel),
                         security: attempt.label,
+                        secured: true,
                     });
                 }
             }
@@ -665,6 +672,7 @@ fn start_via_host_ap(
                 channel: unsafe { channel.channelNumber() },
                 band: channel_band(channel),
                 security: open.label,
+                secured: false,
             });
         }
     }
@@ -740,6 +748,7 @@ pub fn start_hosted_network(
                 channel: PREFERRED_CHANNEL,
                 band: "2.4 GHz",
                 security: format!("IBSS security {security}"),
+                secured: security != IBSS_SECURITY_NONE,
             })
     };
 
@@ -764,6 +773,7 @@ pub fn start_hosted_network(
         channel: Some(outcome.channel),
         band: Some(outcome.band),
         security: Some(outcome.security),
+        secured: outcome.secured,
         advertised: true,
         host_ipv4: None,
         associated_peer: None,
@@ -817,6 +827,47 @@ pub fn is_hosted_network(_app: AppHandle, state: State<'_, AppState>) -> bool {
         .map(|interface| interface_mode_is_host_ap(&interface))
         .unwrap_or(false);
     live || *state.hosted_network_running.lock().unwrap()
+}
+
+/// Everything the network card can show without opening the log terminal: the tri-state,
+/// the backend, the channel and band the ladder settled on, the `securityType` that was
+/// accepted, and — the one that matters for consent — whether the AP carries encryption at
+/// all. All of it was already logged on every start and reachable through
+/// `hosted_network_status()`; none of it had a way to reach the UI.
+#[tauri::command]
+#[specta::specta]
+pub fn get_hosted_network_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> crate::HostedNetworkReport {
+    let live = is_hosted_network(app, state);
+    let status = hosted_network_status();
+    let advertised = live && status.advertised;
+    if !advertised {
+        return crate::HostedNetworkReport {
+            state: crate::HostedNetworkReport::NOT_STARTED.to_string(),
+            secured: true,
+            ..Default::default()
+        };
+    }
+    crate::HostedNetworkReport {
+        // `associated_peer` is the stronger signal and it is reported separately; the
+        // tri-state means the same thing on both platforms, which is "is anything serving
+        // DHCP behind this SSID".
+        state: if status.host_ipv4.is_some() {
+            crate::HostedNetworkReport::VERIFIED.to_string()
+        } else {
+            crate::HostedNetworkReport::ADVERTISED.to_string()
+        },
+        backend: status.backend.map(str::to_string),
+        ssid: status.ssid,
+        channel: status.channel.map(|c| c as i32),
+        band: status.band.map(str::to_string),
+        security: status.security,
+        secured: status.secured,
+        host_ipv4: status.host_ipv4.map(|ip| ip.to_string()),
+        peer: status.associated_peer.map(|ip| ip.to_string()),
+    }
 }
 
 #[cfg(test)]
