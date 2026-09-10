@@ -175,6 +175,14 @@ pub fn fast_path() {
 }
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
+    use crate::single_instance;
+    use tauri::Manager;
+    // Before the GUI early-return, because the desktop app needs it too: it is what lets the
+    // display-driver probe — a plain Tauri command with no `AppHandle` of its own in reach —
+    // ask the control socket which process is holding the driver's pipe.
+    if let Ok(dir) = app.path().app_local_data_dir() {
+        single_instance::remember_ctrl_path(dir.join(single_instance::CTRL_FILE));
+    }
     let args = user_args();
     if args.is_empty() {
         return Outcome::LaunchGui;
@@ -663,6 +671,62 @@ pub fn saved_stun_urls(_app: &tauri::AppHandle) -> Option<Vec<String>> {
     None
 }
 
+/// What `status` and `doctor` print for the display driver.
+///
+/// A free function so the busy wording can be asserted without a running host: the shipped
+/// driver does not enter that state on demand, so the only way to check the sentence a user
+/// would read is to build it from the backend value directly.
+#[cfg(windows)]
+pub fn driver_line(backend: crate::windows_utils::virtual_display::DisplayBackend) -> String {
+    use crate::windows_utils::virtual_display::DisplayBackend;
+    match backend {
+        DisplayBackend::IddDriver => "installed and answering".to_string(),
+        DisplayBackend::DriverNotInstalled => {
+            "NOT INSTALLED — run `ScreenExtend drivers install` (Administrator)".to_string()
+        }
+        // Not a fault, and not worth an exit code: a host that is already running has the
+        // driver, and `doctor` run beside one has to say so in those words. Saying "not
+        // answering" here is what sent the desktop app reinstalling a healthy driver.
+        DisplayBackend::DriverBusy { holder: Some(pid) } => {
+            format!("installed, in use by ScreenExtend (pid {pid})")
+        }
+        DisplayBackend::DriverBusy { holder: None } => {
+            "installed, in use by another ScreenExtend process".to_string()
+        }
+        DisplayBackend::DriverNotResponding => "installed but not answering its pipe".to_string(),
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod test {
+    use crate::windows_utils::virtual_display::DisplayBackend;
+
+    /// `doctor` used to have one sentence for two states. The busy one has to name the process
+    /// to close, because "not answering" sends the reader to reinstall a driver that is fine.
+    #[test]
+    fn the_driver_line_distinguishes_busy_from_dead() {
+        assert_eq!(
+            super::driver_line(DisplayBackend::DriverBusy {
+                holder: Some(71848)
+            }),
+            "installed, in use by ScreenExtend (pid 71848)"
+        );
+        assert_eq!(
+            super::driver_line(DisplayBackend::DriverBusy { holder: None }),
+            "installed, in use by another ScreenExtend process"
+        );
+        assert_eq!(
+            super::driver_line(DisplayBackend::DriverNotResponding),
+            "installed but not answering its pipe"
+        );
+        assert_eq!(
+            super::driver_line(DisplayBackend::IddDriver),
+            "installed and answering"
+        );
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 mod desktop {
     use super::*;
@@ -824,7 +888,7 @@ mod desktop {
         if let Some(reply) =
             single_instance::query_running_instance(&ctrl_path, single_instance::Command::Ping)
         {
-            if reply.trim() == "OK" {
+            if single_instance::is_ok_reply(&reply) {
                 return true;
             }
         }
@@ -882,17 +946,7 @@ mod desktop {
         #[cfg(windows)]
         {
             let backend = platform::virtual_display::probe_display_backend();
-            let display = match backend {
-                platform::virtual_display::DisplayBackend::IddDriver => {
-                    "installed and answering".to_string()
-                }
-                platform::virtual_display::DisplayBackend::DriverNotInstalled => {
-                    "NOT INSTALLED — run `ScreenExtend drivers install` (Administrator)".to_string()
-                }
-                platform::virtual_display::DisplayBackend::DriverNotResponding => {
-                    "installed but not answering its pipe".to_string()
-                }
-            };
+            let display = super::driver_line(backend);
             let cert = windows_certificate_trusted();
             let cert_text = match cert {
                 Some(true) => "trusted in the machine root store".to_string(),
@@ -909,6 +963,7 @@ mod desktop {
                 ],
                 json: serde_json::json!({
                     "virtualDisplay": backend.as_str(),
+                    "virtualDisplayHolderPid": backend.holder(),
                     "signingCertificate": match cert {
                         Some(true) => "trusted",
                         Some(false) => "absent",

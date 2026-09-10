@@ -27,8 +27,49 @@ missing. A missing driver is not a verdict — the app installs it and re-probes
 The `display-driver-unresponsive` branch (remove-then-install, then one bounded self-relaunch)
 needs a driver that is installed but does not answer `\\.\pipe\virtualdisplaydriver`. Killing the
 driver's service while the app is closed is the only way found to induce it; it has not been
-executed. The relaunch is memoised in `localStorage` under `se.driverRelaunchAt` with a
-ten-minute window, so if you do induce it, confirm from the log that at most one relaunch happens.
+executed. The relaunch is memoised twice — in `localStorage` under `se.driverRelaunchAt` with a
+ten-minute window, and in `config.json`'s `driverRepair` for the whole boot — so if you do induce
+it, confirm from the log that at most one relaunch happens.
+
+## 1a. The driver is busy, not broken (Windows)
+
+The driver serves many clients at once and answers in under a millisecond, so the busy state is
+not reachable by simply running two copies. What it catches is a probe that lands while the driver
+is not answering *and* another ScreenExtend process is alive — after which nothing may be
+installed and nothing may ask for elevation.
+
+1. Start a host: `ScreenExtend serve --no-cloud --no-qr`, and note the pid it prints.
+2. From a second shell, `ScreenExtend doctor --json`. On a healthy machine this reports
+   `drivers.virtualDisplay: "IddDriver"`, `virtualDisplayHolderPid: null` and **exit 0** — the
+   driver really is available to both processes, and that is the correct answer.
+3. Confirm the machinery that would name the holder:
+   `cargo test --lib windows_utils::virtual_display::test::report_driver_holder -- --ignored
+   --nocapture`. With the host from step 1 up it must print `control socket answers: Some(<that
+   pid>)`, `driver_pipe_holder(): Some(<that pid>)` and the line `doctor` would show:
+   `installed, in use by ScreenExtend (pid N)`. Stop the host and it must print `None` for all
+   three — a stale answer here would tell a user to quit a process that is not there.
+4. If you *can* induce the state (a driver mid-attach with a host up), the desktop app must show
+   **ScreenExtend Is Already Running**, naming the pid, with **Quit the Other Copy** and **Try
+   Again** — and **no UAC prompt at any point**. Quit the Other Copy sends `QUIT` over the control
+   server and retries; it only works on a host that answers the control socket, so against a
+   `probe --live` it must toast "Couldn't Quit the Other Copy" rather than doing nothing.
+
+## 1b. The repair budget (Windows, Administrator)
+
+The rule: one driver install, one reinstall and one self-relaunch **per boot**, and after that the
+app says restart rather than asking for elevation again.
+
+1. `ScreenExtend config get driverRepair` — after a fresh boot with no repairs it reads
+   `{"boot":"","install":0,"reinstall":0,"relaunch":0}` or is absent.
+2. Run step 5 of section 1 (decline the UAC prompt so the install fails). Read `driverRepair`
+   again: `install` must be 1 and `boot` must be non-empty.
+3. Press **Try Again** on the modal. It must re-probe and re-show the modal **without a second
+   UAC prompt**, and `driverRepair.install` must still be 1.
+4. Quit and relaunch the app. Still no UAC prompt, still 1 — the budget survives a launch, which
+   is the whole point.
+5. Restart Windows, launch the app: the budget is clear (`boot` no longer matches), so exactly one
+   fresh UAC prompt appears. Clearing `driverRepair` by hand in the Settings config editor has the
+   same effect without a restart.
 
 ## 2. "Continue anyway" on a degraded host
 

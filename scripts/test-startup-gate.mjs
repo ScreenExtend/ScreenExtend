@@ -10,7 +10,14 @@
 // whatever else is missing, and only a host that cannot — after the app has tried to install
 // what it can install — loses "Continue anyway".
 import assert from 'node:assert/strict';
-import { classifyCompat, driverRemediation, offersDriverInstall } from '../src/lib/startup-gate.ts';
+import {
+  classifyCompat,
+  driverRemediation,
+  mayAttempt,
+  offersDriverInstall,
+  recordAttempt,
+  repairForBoot,
+} from '../src/lib/startup-gate.ts';
 
 let failed = 0;
 function test(what, run) {
@@ -43,6 +50,8 @@ const report = (rows, os_supported = true) => ({
   encoder_backend: 'nvenc',
   hosted_network_backend: 'WiFiDirect',
   input_backend: 'SendInput',
+  display_driver_holder_pid: null,
+  boot_id: 'b1234',
 });
 
 const fresh = { remediated: false, dontShowAgain: false };
@@ -126,6 +135,78 @@ test('no capture backend at all blocks', () => {
 
 test('an unsupported OS blocks even with an empty list', () => {
   assert.equal(classifyCompat(report([], false), fresh).kind, 'blocked');
+});
+
+console.log('=== a driver somebody else is using ===');
+
+const busy = () => row('display-driver-busy', 'optional');
+
+test('a busy driver gets its own gate, not a repair and not a block', () => {
+  const gate = classifyCompat(report([busy()]), fresh);
+  assert.equal(gate.kind, 'busy');
+  assert.deepEqual(gate.rows.map(r => r.key), ['display-driver-busy']);
+});
+
+test('a busy driver is never installable, so "Install drivers" is not offered', () => {
+  // `display-driver-busy` starts with `display-driver`, which is exactly the prefix the install
+  // control matches on -- the severity is the only thing keeping it out.
+  assert.equal(offersDriverInstall(report([busy()])), false);
+  assert.equal(driverRemediation([busy()]), null);
+});
+
+test('a busy driver outranks the optional faults underneath it', () => {
+  const gate = classifyCompat(report([row('audio', 'optional'), busy()]), fresh);
+  assert.equal(gate.kind, 'busy');
+  // And it survives "do not show again", which is a preference about a degraded host, not
+  // about a host that has not been established yet.
+  assert.equal(
+    classifyCompat(report([busy()]), { remediated: false, dontShowAgain: true }).kind,
+    'busy'
+  );
+});
+
+test('a busy driver still yields to an unsupported OS', () => {
+  assert.equal(classifyCompat(report([busy()], false), fresh).kind, 'blocked');
+});
+
+test('a busy driver does not persist across a retry that clears it', () => {
+  assert.equal(classifyCompat(report([]), { remediated: true, dontShowAgain: false }).kind, 'ok');
+});
+
+console.log('=== the repair budget ===');
+
+test('one install, one reinstall and one relaunch per boot', () => {
+  let repair = repairForBoot(null, 'b1');
+  assert.deepEqual(repair, { boot: 'b1', install: 0, reinstall: 0, relaunch: 0 });
+  for (const what of ['install', 'reinstall', 'relaunch']) {
+    assert.equal(mayAttempt(repair, what), true, what + ' must be allowed once');
+    repair = recordAttempt(repair, what);
+    assert.equal(mayAttempt(repair, what), false, what + ' must not be allowed twice');
+  }
+});
+
+test('spending one attempt does not spend the others', () => {
+  const repair = recordAttempt(repairForBoot(null, 'b1'), 'reinstall');
+  assert.equal(mayAttempt(repair, 'reinstall'), false);
+  assert.equal(mayAttempt(repair, 'install'), true);
+  assert.equal(mayAttempt(repair, 'relaunch'), true);
+});
+
+test('a restart clears the budget, and nothing else does', () => {
+  const spent = { boot: 'b1', install: 1, reinstall: 1, relaunch: 1 };
+  // Same boot: the counts stand, which is what stops the second elevation prompt.
+  assert.deepEqual(repairForBoot(spent, 'b1'), spent);
+  assert.equal(mayAttempt(repairForBoot(spent, 'b1'), 'install'), false);
+  // A different boot id is a machine that has restarted, which is the advice the modal gives.
+  assert.equal(mayAttempt(repairForBoot(spent, 'b2'), 'install'), true);
+});
+
+test('a record with no boot id, or a partial one, still bounds the launch', () => {
+  // Every platform but Windows reports no boot id; the budget must still hold within a launch.
+  assert.equal(mayAttempt(repairForBoot({ boot: '', install: 1, reinstall: 0, relaunch: 0 }, ''), 'install'), false);
+  // A config hand-edited down to nothing must not read as "already attempted".
+  const partial = repairForBoot({ boot: 'b1' }, 'b1');
+  assert.deepEqual(partial, { boot: 'b1', install: 0, reinstall: 0, relaunch: 0 });
 });
 
 console.log('=== driver remediation ===');
