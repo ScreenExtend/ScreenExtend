@@ -67,13 +67,24 @@ export async function readQrValues(
     return { entries: [], adaptersUnavailable: true };
   }
   const isIpv4 = (ip: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
+  // Anything with a colon is IPv6. `%25eth0`-style zone identifiers and link-local
+  // addresses are dropped: a zone id is meaningful only on the host that wrote it, and
+  // fe80:: cannot be typed into a phone's browser and reach us.
+  const isRoutableIpv6 = (ip: string) =>
+    ip.indexOf(":") >= 0 && ip.indexOf("%") < 0 && !/^fe[89ab]/i.test(ip) && ip !== "::1";
   const entries = adapters
     .map((adapter) => {
+      // IPv4 stays first where an adapter has both -- it is shorter to read off a screen
+      // and every client understands it. The IPv6 branch is what makes an IPv6-only
+      // network show a QR code at all: the host already binds and serves it, and the
+      // bracketed authority form is what a URL needs.
       const ipv4 = adapter.ip_addresses.find(isIpv4);
-      if (!ipv4) return null;
+      const host = ipv4 ?? adapter.ip_addresses.find(isRoutableIpv6);
+      if (!host) return null;
+      const authority = host === ipv4 ? host : `[${host}]`;
       return {
         title: adapter.network_name,
-        value: `http://${ipv4}:${port}/?id=${sessionId}`,
+        value: `http://${authority}:${port}/?id=${sessionId}`,
       };
     })
     .filter((entry): entry is QrEntry => entry !== null);

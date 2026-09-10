@@ -275,9 +275,23 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                         crate::BYE_FLUSH_TIMEOUT,
                     );
                     let ips: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    let ended = ips.len() as u32;
                     for ip in ips {
                         session::bump_kick_epoch(&state.sessions, &ip);
                         session::signal_leave(&state.sessions, &ip);
+                    }
+                    // The log line above is the record; this is what puts it in front of
+                    // the person at the host, who is otherwise left to work out why a
+                    // device dropped. `App.tsx` answers it by re-opening the permission
+                    // gate over whatever route is mounted.
+                    use tauri_specta::Event as _;
+                    if let Err(e) = (crate::ScreenRecordingRevoked {
+                        key: permissions::KEY_SCREEN_RECORDING.to_string(),
+                        sessions_ended: ended,
+                    })
+                    .emit(&app_handle)
+                    {
+                        teprintln!("[tcc] could not emit ScreenRecordingRevoked: {e}");
                     }
                 }
                 if now.is_some() {

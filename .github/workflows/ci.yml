@@ -65,6 +65,13 @@ jobs:
       - name: client page harnesses
         run: pnpm test:client
 
+      # The startup gate decides whether the app opens at all, and on what it says when it
+      # refuses. Its rules are pure functions over a CompatibilityReport, so they are testable
+      # without a machine that has the missing capability -- which is the point, since no
+      # runner is a Mac without Screen Recording or a PC without the display driver.
+      - name: startup gate rules
+        run: pnpm test:gate
+
       # bindings.ts is written by whichever debug binary last ran with no CLI arguments, and
       # it carries `// @ts-nocheck`, so a stale binary can revert the whole TS API surface
       # with nothing failing afterwards -- the only symptom is a runtime "command not found"

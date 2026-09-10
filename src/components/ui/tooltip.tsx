@@ -56,7 +56,13 @@ function TooltipContent({
           {...props}
         >
           {children}
-          <TooltipPrimitive.Arrow className="z-60 size-2.5 translate-y-[calc(-50%)] rotate-45 rounded-[2px] border-b border-r border-slate-600 bg-slate-900 fill-slate-900 data-[side=bottom]:top-1 data-[side=inline-end]:top-1/2! data-[side=inline-end]:-left-1 data-[side=inline-end]:-translate-y-1/2 data-[side=inline-start]:top-1/2! data-[side=inline-start]:-right-1 data-[side=inline-start]:-translate-y-1/2 data-[side=left]:top-1/2! data-[side=left]:-right-1 data-[side=left]:-translate-y-1/2 data-[side=right]:top-1/2! data-[side=right]:-left-1 data-[side=right]:-translate-y-1/2 data-[side=top]:-bottom-2.5" />
+          {/* Six of these classes were written in Tailwind v4 syntax against a Tailwind 3
+              build: `z-60` is not in v3's z scale, and a trailing `!` is v4's important
+              marker where v3 wants a leading one. All six generated no CSS, so the arrow
+              on a side-anchored tooltip kept the `translate-y-[calc(-50%)]` from the base
+              class with no `top` to hang it off and sat at the popup's top edge instead of
+              its vertical centre. `z-[60]` and `!top-1/2` are the v3 spellings. */}
+          <TooltipPrimitive.Arrow className="z-[60] size-2.5 translate-y-[calc(-50%)] rotate-45 rounded-[2px] border-b border-r border-slate-600 bg-slate-900 fill-slate-900 data-[side=bottom]:top-1 data-[side=inline-end]:!top-1/2 data-[side=inline-end]:-left-1 data-[side=inline-end]:-translate-y-1/2 data-[side=inline-start]:!top-1/2 data-[side=inline-start]:-right-1 data-[side=inline-start]:-translate-y-1/2 data-[side=left]:!top-1/2 data-[side=left]:-right-1 data-[side=left]:-translate-y-1/2 data-[side=right]:!top-1/2 data-[side=right]:-left-1 data-[side=right]:-translate-y-1/2 data-[side=top]:-bottom-2.5" />
         </TooltipPrimitive.Popup>
       </TooltipPrimitive.Positioner>
     </TooltipPrimitive.Portal>

@@ -4,7 +4,18 @@ import { type Device } from "@/components/config-provider";
 export type AudioOutputsInfo = {
   supported: boolean;
   outputs: { id: string; label: string }[];
+  /** The sink the host has asked for, i.e. what is stored against the device. */
   selected: string;
+  /**
+   * The sink the client is actually playing on, as the client last reported it. It can
+   * diverge from `selected`: `setSinkId` needs transient activation in some engines, so a
+   * host-side change made while nobody is touching the phone does not apply until the next
+   * gesture, and Firefox's own output picker can change it behind the host's back.
+   *
+   * Optional because it post-dates the payload and older clients will not send it — a
+   * missing field means "the client did not say", not "the default".
+   */
+  current?: string | null;
 };
 
 export type QrValue = { title: string; value: string };

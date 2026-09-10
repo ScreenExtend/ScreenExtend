@@ -52,8 +52,19 @@
     @apply border-border;
   }
 
-  html, body, input, textarea, button, select, optgroup, pre, code, kbd, samp {
-    font-family: "Geist Variable", serif;
+  /* The fallback used to be `serif`, so the pre-swap frame was Times laid out at Geist's
+     metrics and the swap was a full-page reflow landing on the `text-4xl` sidebar
+     headline. A system sans stack is close enough in metrics that the swap is a repaint.
+     `pre`/`code`/`kbd`/`samp` were in the same rule and wanted a monospace fallback, not
+     a serif one, so they are split out. The other half of this -- the `<link rel=preload>`
+     that starts the font fetch with the head rather than after 50 KB of CSS -- is
+     `preloadWebfont()` in vite.config.ts. */
+  html, body, input, textarea, button, select, optgroup {
+    font-family: "Geist Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+
+  pre, code, kbd, samp {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
   }
 
   *::-webkit-scrollbar {
@@ -105,9 +116,9 @@
      top/left, font-size -- so every hover, focus or disabled flip on a button or input
      forced layout and paint on each frame of the 200 ms window. Nothing in the kit relies
      on a button or input transitioning geometry; what is visible is colour, the focus ring
-     (a box-shadow) and the disabled opacity. The `!important` stays: without it the
-     component-level `transition-colors` utilities would take over at their own 150 ms
-     duration, which would change how the UI animates. */
+     (a box-shadow) and the disabled opacity. This is the default for a bare `<button>` or
+     `<input>`; it carries no `!important`, so the nine kit components that declare
+     `transition-colors` win on their own elements at Tailwind's 150 ms cubic-bezier. */
   button, input {
     transition: color 200ms ease-in-out,
                 background-color 200ms ease-in-out,
@@ -116,7 +127,7 @@
                 box-shadow 200ms ease-in-out,
                 opacity 200ms ease-in-out,
                 fill 200ms ease-in-out,
-                stroke 200ms ease-in-out !important;
+                stroke 200ms ease-in-out;
     outline: 2px solid transparent;
     outline-offset: 2px;
   }
@@ -136,6 +147,10 @@
     display: none;
   }
 
+  /* Monaco's hidden text area is an `<input>`/`<textarea>` that the editor moves and
+     restyles per keystroke, so it must inherit none of the rule above. The selector
+     already outranks the bare element one; the `!important` is belt-and-braces against
+     whatever monaco sets inline. */
   .monaco-editor textarea, .monaco-editor input {
     transition: none !important;
   }

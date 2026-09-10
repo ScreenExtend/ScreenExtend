@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Route,
   RouterProvider,
@@ -18,8 +18,13 @@ const Dashboard = lazy(loadDashboard);
 const Devices = lazy(loadDevices);
 const Settings = lazy(loadSettings);
 
-import { NextStepProvider, NextStepReact } from "nextstepjs";
-import { HighlightProxy, WalkthroughArrow, WalkthroughCard, walkthroughSteps } from "@/components/walkthrough";
+// `nextstepjs` and the `motion` it pulls behind it were the largest non-React item in the
+// entry chunk (-146.01 kB / -25.8% measured on `main-*.js` when they are taken out), for a
+// tour that runs at most once per install. They are behind this dynamic import now; the
+// two wrapper elements `NextStepReact` used to render around the app are rendered
+// statically below so the DOM does not change when the chunk arrives.
+const WalkthroughMount = lazy(() => import("@/components/walkthrough-mount"));
+import { WalkthroughContext, type WalkthroughControl } from "@/components/walkthrough-context";
 
 import { getConfig, getConfigSnapshot, subscribeToConfig, updateConfig, flushConfig, recordKnownDevice, type Device } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
@@ -42,6 +47,7 @@ import {
   type QrValue,
 } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
+import { PermissionLapseDialog } from "@/components/permission-lapse-dialog";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -372,9 +378,15 @@ function GlobalState({ children }: { children: ReactNode }) {
       }));
       unlisteners.push(await events.deviceAudioOutputs.listen(event => {
         const p = event.payload;
+        // `current` -- the sink the client reports it is actually playing on -- is not on
+        // the Rust event yet; it arrives with the client-page workstream as exactly
+        // `current: Option<String>` with `#[serde(default)]`, on both `AudioOutputsReport`
+        // and `DeviceAudioOutputs`. Reading it defensively means this build works either
+        // way and lights up on its own when that lands; drop the cast then.
+        const current = (p as unknown as { current?: string | null }).current;
         setAudioOutputsByIp(prev => ({
           ...prev,
-          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected },
+          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected, current },
         }));
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {
@@ -494,27 +506,53 @@ function GlobalState({ children }: { children: ReactNode }) {
   );
 }
 
+// `NextStepReact` rendered these two around the whole app, and the outer one's
+// `position: relative` is the containing block for every absolutely-positioned descendant
+// with no closer positioned ancestor -- `#innerSidebar` among them. They are reproduced
+// here byte for byte (same `data-name`s, same inline styles) so removing the library from
+// the boot path does not move anything. The overlay, pointer and card the library renders
+// go through its own `DynamicPortal` into `document.body`, so nothing else it draws needs
+// to be an ancestor of the app.
+function WalkthroughFrame({ children }: { children: ReactNode }) {
+  return (
+    <div data-name="nextstep-wrapper" data-nextstep="dev" style={{ position: "relative", width: "100%" }}>
+      <div data-name="nextstep-site" style={{ display: "block", width: "100%" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function App() {
+  // `run` is bumped per start so "Replay Tour" remounts the provider and the tour begins
+  // from step one; it is never unmounted, since after the first start the chunk is
+  // resident and the tree it leaves behind is two zero-height divs.
+  const [run, setRun] = useState<{ id: number; tour: string } | null>(null);
+  const start = useCallback((tour: string) => {
+    setRun(prev => ({ id: (prev?.id ?? 0) + 1, tour }));
+  }, []);
+  const walkthrough = useMemo<WalkthroughControl>(() => ({ start }), [start]);
+
   return (
     <GlobalState>
       <ThemeProvider defaultTheme="system">
-        <NextStepProvider>
-          <NextStepReact
-            steps={walkthroughSteps}
-            cardComponent={WalkthroughCard}
-            onComplete={() => void markWalkthroughDone()}
-            onSkip={() => void markWalkthroughDone()}
-            shadowOpacity="0.5"
-            arrowComponent={WalkthroughArrow}
-            cardTransition={{ ease: "easeInOut", duration: 0.4 }}
-            disableConsoleLogs
-          >
-            <HighlightProxy />
+        <WalkthroughContext.Provider value={walkthrough}>
+          <WalkthroughFrame>
             <RouterProvider router={router} />
+            <PermissionLapseDialog />
             <ClosingOverlay />
-          </NextStepReact>
-        </NextStepProvider>
-        </ThemeProvider>
+          </WalkthroughFrame>
+          {run && (
+            <Suspense fallback={null}>
+              <WalkthroughMount
+                key={run.id}
+                tour={run.tour}
+                onFinish={() => void markWalkthroughDone()}
+              />
+            </Suspense>
+          )}
+        </WalkthroughContext.Provider>
+      </ThemeProvider>
     </GlobalState>
   );
 }
