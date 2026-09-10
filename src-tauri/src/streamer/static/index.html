@@ -222,6 +222,12 @@
                 // host sees a device that stopped sending input and cannot tell a modal from
                 // a wedge.
                 INPUT_SUSPENDED_FOR_MODAL: 1 << 23,
+                // The answer carried no join id and no cookie set one, so every later request
+                // this tab makes names no session: `/reconfig` reads zeros forever, `/leave`
+                // reaches nothing, and the host holds the display until the grace runs out.
+                // Only a proxy that strips both can produce it, which is exactly the kind of
+                // failure that is invisible without a bit.
+                JOIN_ID_MISSING: 1 << 24,
             };
             let degradeFlags = 0;
             let suppressedErrors = 0;
@@ -251,6 +257,56 @@
             let renderStalls = 0;
             let usingFallback = false;
             let joinData = null;
+            // The host names each session at `POST /whep` and hands the name back in
+            // `X-Join-Id`. It belongs to this tab and to no other, so it lives in
+            // `sessionStorage`: `localStorage` is shared by every tab of an origin, which is
+            // precisely why two tabs used to be one session on the host. The device token
+            // stays in `localStorage` on purpose — that one *is* shared, because both tabs are
+            // the same device and share its settings.
+            var JOIN_ID_KEY = 'se.joinId';
+            var currentJoinId = '';
+
+            function setJoinId(id) {
+                currentJoinId = id || '';
+                try {
+                    if (currentJoinId) sessionStorage.setItem(JOIN_ID_KEY, currentJoinId);
+                    else sessionStorage.removeItem(JOIN_ID_KEY);
+                } catch (_) { noteSuppressed(); }
+            }
+
+            function readStoredJoinId() {
+                try { return sessionStorage.getItem(JOIN_ID_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
+            }
+
+            // Every session-scoped request carries the id. A request without one names nothing
+            // and the host answers with nothing, which is the correct answer: it will not guess
+            // from the address, because addresses move under a live session and are handed on
+            // to the next device that asks for one.
+            function withJoin(path) {
+                if (!currentJoinId) return path;
+                return path + (path.indexOf('?') < 0 ? '?' : '&') + 'join=' + encodeURIComponent(currentJoinId);
+            }
+
+            // Release the session this tab holds, so the host takes its display down now rather
+            // than after the disconnect grace. `sendBeacon` because this also runs from
+            // `pagehide`, where a `fetch` is not guaranteed to leave.
+            function releaseJoin(id) {
+                var join = id || currentJoinId;
+                if (!join) return;
+                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(join)); } catch (_) { noteSuppressed(); }
+                if (join === currentJoinId) setJoinId('');
+            }
+
+            // A tab that reloaded still has the previous session's id, and the host is holding
+            // that display against a rejoin that is never coming under that name. Letting it go
+            // here costs one beacon and saves the whole disconnect grace.
+            (function releaseStaleJoin() {
+                var stale = readStoredJoinId();
+                if (!stale) return;
+                setJoinId('');
+                try { navigator.sendBeacon('/leave?join=' + encodeURIComponent(stale)); } catch (_) { noteSuppressed(); }
+            })();
+
             let reconfigPoll = null;
             let reconfigEpoch = null;
             let kickEpoch = null;
@@ -497,7 +553,7 @@
                 if (reconfigPoll) return;
                 if (reconfigEpoch === null) {
                     try {
-                        const r = await fetch('/reconfig');
+                        const r = await fetch(withJoin('/reconfig'));
                         if (r.ok) { const j = await r.json(); reconfigEpoch = j.epoch; kickEpoch = j.kick; markAlive(); }
                     } catch (_) { noteSuppressed(); }
                 }
@@ -517,7 +573,7 @@
                 let payload = null;
                 let unreachable = false;
                 try {
-                    const r = await fetch('/reconfig');
+                    const r = await fetch(withJoin('/reconfig'));
                     if (r.ok) payload = await r.json();
                     else if (r.status >= 502 && r.status <= 504) unreachable = true;
                 } catch (_) {
@@ -1273,7 +1329,7 @@
             function sendLeave() {
                 if (leaveSent || !isLive || reconfiguring) return;
                 leaveSent = true;
-                try { navigator.sendBeacon('/leave'); } catch (_) { noteSuppressed(); }
+                releaseJoin();
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
             }
             window.addEventListener('pagehide', sendLeave);
@@ -1561,9 +1617,15 @@
                     }
                     flushing = true;
                     attempts++;
+                    // The device token is the second factor on the resource. It used to be the
+                    // peer's address, which a roam or a lease renewal changed under a live
+                    // session — so a client that had done nothing wrong lost trickle mid-join.
+                    const patchHeaders = { 'Content-Type': 'application/trickle-ice-sdpfrag' };
+                    const patchToken = readDeviceToken();
+                    if (patchToken) patchHeaders['X-Device-Token'] = patchToken;
                     fetch(url, {
                         method: 'PATCH',
-                        headers: { 'Content-Type': 'application/trickle-ice-sdpfrag' },
+                        headers: patchHeaders,
                         body: trickleFragment(ufrag, batch, done),
                     }).then(function (r) {
                         // 404 is the session being over, not a transport failure: there is
@@ -1631,6 +1693,15 @@
 
             function teardownSession() {
                 startGen++;
+                // Every rejoin on this page — a reconfigure, a demotion to <video>, the legacy
+                // transform, a trickle latch — goes through here and then calls `start()` again,
+                // which mints a *new* join id. The host used to replace a session addressed by
+                // this client's IP, so letting go was unnecessary and racy; now that a session
+                // is named by its own id there is nothing to replace, and a rejoin that did not
+                // release the old one would leave a second display standing for the whole
+                // disconnect grace. The two ids are distinct, so the teardown of the old cannot
+                // touch the display the new one is creating.
+                releaseJoin();
                 releaseIceHold();
                 iceEverConnected = false;
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
@@ -2415,8 +2486,7 @@
                     }
                     const offerSdp = pc.localDescription.sdp;
 
-                    let storedToken = '';
-                    try { storedToken = localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); }
+                    const storedToken = readDeviceToken();
                     const whepOpts = {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -2466,6 +2536,26 @@
                     if (issuedToken) { try { localStorage.setItem(DEVICE_TOKEN_KEY, issuedToken); } catch (_) { noteSuppressed(); } }
                     let trickleResource = null;
                     try { trickleResource = resp.headers.get('Location'); } catch (_) { noteSuppressed(); }
+                    // The session's name. `X-Join-Id` is the direct form; the WHEP resource in
+                    // `Location` is the same id, so either header answers and a proxy has to
+                    // strip both to leave this tab nameless. The host also sets an `se_join`
+                    // cookie, which covers a page cached from before the id existed — but a
+                    // cookie is per-origin and two tabs share it, so this page never reads it
+                    // and always sends the explicit parameter.
+                    let issuedJoin = '';
+                    try { issuedJoin = resp.headers.get('X-Join-Id') || ''; } catch (_) { noteSuppressed(); }
+                    if (!issuedJoin && trickleResource) {
+                        const tail = /\/whep\/([0-9a-f]{32})$/.exec(trickleResource);
+                        if (tail) issuedJoin = tail[1];
+                    }
+                    if (issuedJoin) {
+                        setJoinId(issuedJoin);
+                        undegrade(DEG.JOIN_ID_MISSING);
+                    } else {
+                        setJoinId('');
+                        degrade(DEG.JOIN_ID_MISSING);
+                        console.warn('[join] the host named no session; /reconfig and /leave will reach nothing');
+                    }
                     if (localTrickle) {
                         if (trickleResource) {
                             localTrickle.open(trickleResource, offerSdp);
@@ -2489,7 +2579,7 @@
 
                     try {
                         if (window.SEAudio) {
-                            SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken);
+                            SEAudio.setSpeakerIdentity(joinData.sessionId, issuedToken || storedToken, currentJoinId);
                             Promise.resolve(SEAudio._enumPromise).then(() => SEAudio.postOutputs()).catch(() => {});
                         }
                     } catch (_) { noteSuppressed(); }
@@ -2588,6 +2678,9 @@
 
             const FULLSCREEN_MODE_KEY = 'se.fullscreenMode';
             const DEVICE_TOKEN_KEY = 'se.deviceToken';
+            function readDeviceToken() {
+                try { return localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch (_) { noteSuppressed(); return ''; }
+            }
             try {
                 if (localStorage.getItem(FULLSCREEN_MODE_KEY) === '0') fullscreenModeInput.checked = false;
             } catch (_) { noteSuppressed(); }

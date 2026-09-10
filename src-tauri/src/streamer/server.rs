@@ -174,7 +174,12 @@ impl AppState {
     /// [`session::concurrent_display_cap`]. On every other backend this is `false` whatever the
     /// session map looks like, so a join that is going to fail fails with its own error rather
     /// than being reported as a full host.
-    pub fn display_slot_unavailable(&self, client_ip: &str) -> bool {
+    ///
+    /// `holder` is the device token of whoever is asking, when it is known. A device that
+    /// already holds the one display is never told the host is full — it is reconnecting to
+    /// what it already has. `None` is the page load, which happens before any token is
+    /// presented.
+    pub fn display_slot_unavailable(&self, holder: Option<&str>) -> bool {
         let Some(client) = self.config.virtual_display.as_ref() else {
             return false;
         };
@@ -184,8 +189,13 @@ impl AppState {
         let Some(sessions) = self.config.sessions.as_ref() else {
             return false;
         };
-        if session::get_live_display(sessions, client_ip).is_some() {
-            return false;
+        if let Some(token) = holder.filter(|t| !t.is_empty()) {
+            let holds = session::joins_for_token(sessions, token)
+                .iter()
+                .any(|join| session::get_live_display(sessions, join).is_some());
+            if holds {
+                return false;
+            }
         }
         session::live_display_count(sessions) >= max
     }
@@ -561,12 +571,82 @@ fn same_device_page(same_device: bool) -> &'static str {
 async fn index(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
-    if state.display_slot_unavailable(&peer.ip().to_string()) {
+    // The page load carries no device token, but a device that is already connected does carry
+    // its join cookie — enough for a reload of the one AirPlay display not to be told the host
+    // is full.
+    let holder = state
+        .config
+        .sessions
+        .as_ref()
+        .zip(cookie_join(&headers))
+        .and_then(|(s, join)| session::device_token_for(s, &join));
+    if state.display_slot_unavailable(holder.as_deref()) {
         return at_capacity_page();
     }
     let html = same_device_page(state.is_same_device(peer.ip()));
     (isolation_headers(), Html(html)).into_response()
+}
+
+/// A join id as it is allowed to appear on the wire: exactly what [`session::mint_join_id`]
+/// produces. Anything else is discarded rather than used as a map key.
+fn valid_join_id(raw: &str) -> bool {
+    raw.len() == 32
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn cookie_join(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';')
+        .filter_map(|pair| pair.trim().strip_prefix(JOIN_COOKIE_PREFIX))
+        .find(|v| valid_join_id(v))
+        .map(str::to_string)
+}
+
+const JOIN_COOKIE: &str = "se_join";
+const JOIN_COOKIE_PREFIX: &str = "se_join=";
+
+#[derive(Deserialize, Default)]
+struct JoinQuery {
+    #[serde(default)]
+    join: String,
+}
+
+/// Which live session a request belongs to.
+///
+/// `?join=<id>` is the mechanism. The `se_join` cookie is a bridge for a page that was loaded
+/// before this host learned to hand the id out, and because a cookie is per-origin rather than
+/// per-tab the explicit parameter always wins — two tabs share the jar and only the parameter
+/// tells them apart.
+///
+/// There is deliberately no address fallback. An address is recycled between devices and moves
+/// under a live session, so resolving a request by it is exactly how one device ends up driving
+/// another's display.
+fn request_join(query: &JoinQuery, headers: &HeaderMap) -> Option<String> {
+    if valid_join_id(&query.join) {
+        return Some(query.join.clone());
+    }
+    cookie_join(headers)
+}
+
+/// The session a request names, with its address label refreshed.
+///
+/// The refresh is the only thing an address is used for: a peer that roams keeps its session and
+/// the dashboard stops showing where it used to be.
+fn resolve_join(
+    state: &AppState,
+    query: &JoinQuery,
+    headers: &HeaderMap,
+    peer: IpAddr,
+) -> Option<String> {
+    let join = request_join(query, headers)?;
+    if let Some(sessions) = state.config.sessions.as_ref() {
+        session::note_session_ip(sessions, &join, &peer.to_string());
+    }
+    Some(join)
 }
 
 fn at_capacity_page() -> Response {
@@ -706,16 +786,27 @@ async fn net_config(State(state): State<AppState>) -> Response {
 async fn reconfig(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Query(query): axum::extract::Query<JoinQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    let body = process_reconfig(&state, &peer.ip().to_string());
+    let body = match resolve_join(&state, &query, &headers, peer.ip()) {
+        Some(join) => process_reconfig(&state, &join),
+        // No session named, so nothing to report on. Stable zeros are what an unknown join has
+        // always read, and the client treats them as "no change".
+        None => process_reconfig(&state, ""),
+    };
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 async fn leave(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Query(query): axum::extract::Query<JoinQuery>,
+    headers: HeaderMap,
 ) -> Response {
-    process_leave(&state, &peer.ip().to_string());
+    if let Some(join) = resolve_join(&state, &query, &headers, peer.ip()) {
+        process_leave(&state, &join);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -754,13 +845,17 @@ fn truncate_chars(s: &str, max: usize) -> String {
 async fn audio_outputs(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Query(query): axum::extract::Query<JoinQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let req: AudioOutputsRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return StatusCode::NO_CONTENT.into_response(),
     };
-    let ip = peer.ip().to_string();
+    let Some(join) = resolve_join(&state, &query, &headers, peer.ip()) else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
     let outputs: Vec<session::AudioOutput> = req
         .outputs
         .into_iter()
@@ -776,40 +871,72 @@ async fn audio_outputs(
         .map(|c| truncate_chars(&c, MAX_AUDIO_OUTPUT_STR));
 
     if let Some(s) = state.config.sessions.as_ref() {
-        session::set_audio_outputs(s, &ip, req.supported, outputs, current, req.labelled);
+        session::set_audio_outputs(s, &join, req.supported, outputs, current, req.labelled);
         if let Some(reporter) = state.config.device_reporter.as_ref() {
-            let report = session::audio_outputs_report(s, &ip);
-            reporter.report_audio_outputs(ip.clone(), report);
+            let token = session::device_token_for(s, &join).unwrap_or_default();
+            let report = state.audio_outputs_report(&join);
+            reporter.report_audio_outputs(join, token, report);
         }
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub fn process_reconfig(state: &AppState, device_key: &str) -> String {
+impl AppState {
+    fn audio_outputs_report(&self, join: &str) -> session::AudioOutputsReport {
+        match (
+            self.config.sessions.as_ref(),
+            self.config.audio_sinks.as_ref(),
+        ) {
+            (Some(s), Some(sinks)) => session::audio_outputs_report(s, sinks, join),
+            _ => Default::default(),
+        }
+    }
+
+    fn device_audio_sink(&self, join: &str) -> String {
+        match (
+            self.config.sessions.as_ref(),
+            self.config.audio_sinks.as_ref(),
+        ) {
+            (Some(s), Some(sinks)) => session::device_token_for(s, join)
+                .and_then(|token| session::device_audio_sink(sinks, &token))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+}
+
+pub fn process_reconfig(state: &AppState, join: &str) -> String {
     let (epoch, kick) = state
         .config
         .sessions
         .as_ref()
         .map(|s| {
             (
-                session::reconfig_epoch(s, device_key),
-                session::kick_epoch(s, device_key),
+                session::reconfig_epoch(s, join),
+                session::kick_epoch(s, join),
             )
         })
         .unwrap_or((0, 0));
-    let audio_sink = state
-        .config
-        .sessions
-        .as_ref()
-        .and_then(|s| session::selected_audio_output(s, device_key))
-        .unwrap_or_default();
+    let audio_sink = state.device_audio_sink(join);
     serde_json::json!({ "epoch": epoch, "kick": kick, "audioSink": audio_sink }).to_string()
 }
 
-pub fn process_leave(state: &AppState, device_key: &str) {
+pub fn process_leave(state: &AppState, join: &str) {
     if let Some(s) = state.config.sessions.as_ref() {
-        tprintln!("leave beacon from {device_key}; tearing down session");
-        session::signal_leave(s, device_key);
+        tprintln!("leave beacon for join {join}; tearing down session");
+        session::signal_leave(s, join);
+    }
+}
+
+/// The relay announces a departure by its own `client_id` and nothing else, so every join that
+/// arrived under it ends.
+pub fn process_relay_client_gone(state: &AppState, client_id: &str) {
+    let Some(s) = state.config.sessions.as_ref() else {
+        return;
+    };
+    for join in session::joins_for_relay_client(s, client_id) {
+        tprintln!("[cloud] relay client {client_id} gone; tearing down join {join}");
+        session::signal_leave(s, &join);
     }
 }
 
@@ -823,11 +950,12 @@ fn build_net_json(config: &Config) -> String {
 async fn whep(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    _headers: HeaderMap,
+    req_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let client_ip = peer.ip().to_string();
-    if state.display_slot_unavailable(&client_ip) {
+    let presented = presented_device_token(&req_headers, &body);
+    if state.display_slot_unavailable(Some(presented.as_str())) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "text/plain")],
@@ -836,7 +964,7 @@ async fn whep(
             .into_response();
     }
     let ice = state.ice_for(state.locality_for(&client_ip));
-    let out = process_whep(&state, &client_ip, &body, ice).await;
+    let out = process_whep(&state, JoinOrigin::direct(&client_ip), &body, ice).await;
     let mut status = StatusCode::from_u16(out.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -858,8 +986,42 @@ async fn whep(
                 status = StatusCode::CREATED;
             }
         }
+        // The resource id *is* the session's name, so it is handed over under its own header
+        // too: a client that only wanted to know which session it is need not parse a URL. The
+        // cookie is the bridge for a page cached from before the id existed — per-origin, so
+        // the explicit `?join=` parameter overrides it wherever two tabs are open.
+        if let Ok(value) = header::HeaderValue::from_str(resource) {
+            headers.insert("x-join-id", value);
+        }
+        if let Ok(value) = header::HeaderValue::from_str(&format!(
+            "{JOIN_COOKIE}={resource}; Path=/; SameSite=Lax"
+        )) {
+            headers.insert(header::SET_COOKIE, value);
+        }
     }
     (status, headers, out.body).into_response()
+}
+
+/// The device token a request presents, from the `X-Device-Token` header or the join body.
+///
+/// The header is what `PATCH`/`DELETE` carry; the join body is what `POST /whep` carries,
+/// because the client has to send its whole join request anyway. Both are read here so the
+/// at-capacity check can run before the body is parsed properly.
+fn presented_device_token(headers: &HeaderMap, body: &[u8]) -> String {
+    if let Some(v) = headers.get("x-device-token").and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    #[derive(Deserialize)]
+    struct JustToken {
+        #[serde(default, rename = "deviceToken")]
+        device_token: String,
+    }
+    serde_json::from_slice::<JustToken>(body)
+        .map(|t| t.device_token.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Trickled ICE from the client, RFC 9725 §4.6.
@@ -871,11 +1033,18 @@ async fn whep(
 ///
 /// The resource id is a 128-bit capability, but it is handed out in a `Location` header that
 /// travels in cleartext on the HTTP listener — the listener most LAN joins actually use. So the
-/// id alone is not the authority: the peer that opened the session is checked too, and the
-/// fragment count is bounded, because adding remote candidates is a media-redirection primitive.
+/// id alone is not the authority: the **device token** that opened the session is checked too,
+/// and the fragment count is bounded, because adding remote candidates is a media-redirection
+/// primitive.
+///
+/// The second factor used to be the peer's address. It is the token now for the same reason the
+/// rest of this change exists: an address moves under a live session (a roam, a lease renewal, a
+/// NAT rebind), so checking it broke trickle for a peer that had done nothing wrong, and it is
+/// recycled between devices, so it did not identify one anyway.
 async fn whep_patch(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Ok(text) = std::str::from_utf8(&body) else {
@@ -884,8 +1053,9 @@ async fn whep_patch(
     if text.len() > MAX_SDP_LEN {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    let device_key = peer.ip().to_string();
-    match webrtc_session::add_trickled_candidates(&id, &device_key, text).await {
+    let _ = peer;
+    let device_token = presented_device_token(&headers, &[]);
+    match webrtc_session::add_trickled_candidates(&id, &device_token, text).await {
         webrtc_session::TrickleLookup::Found => StatusCode::NO_CONTENT.into_response(),
         // Not Found, not Gone: the same answer for "no such id" and "not yours", so a probe
         // cannot tell them apart. The client stops trickling on exactly `404`
@@ -899,30 +1069,58 @@ async fn whep_patch(
 /// Tear the resource down, RFC 9725 §4.4. The client already has `/leave`; this exists so the
 /// resource the `Location` header hands out is a real one.
 ///
-/// The id is resolved through the same registry `whep_patch` uses rather than trusting the
-/// caller's address: the session is keyed by device, so without the lookup `DELETE /whep/<any
-/// string at all>` would tear down whatever session the caller happened to own.
+/// The id is resolved through the same registry `whep_patch` uses, and against the same device
+/// token, so `DELETE /whep/<any string at all>` reaches nothing.
 async fn whep_delete(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
-    let device_key = peer.ip().to_string();
-    match webrtc_session::trickle_owner(&id, &device_key) {
-        Some(key) => {
-            process_leave(&state, &key);
+    let _ = peer;
+    let device_token = presented_device_token(&headers, &[]);
+    match webrtc_session::trickle_owner(&id, &device_token) {
+        Some(join) => {
+            process_leave(&state, &join);
             StatusCode::NO_CONTENT.into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
+/// Where a join arrived from. Everything in here is a label or a rate-limit bucket; none of it
+/// is an identity.
+#[derive(Clone, Copy)]
+pub struct JoinOrigin<'a> {
+    /// The peer's address, for the log, the locality guess and the OTP rate-limit bucket.
+    pub peer_ip: &'a str,
+    /// The relay's id for this client, when the join came through the cloud tunnel.
+    pub relay_client: Option<&'a str>,
+}
+
+impl<'a> JoinOrigin<'a> {
+    pub fn direct(peer_ip: &'a str) -> Self {
+        Self {
+            peer_ip,
+            relay_client: None,
+        }
+    }
+
+    pub fn relayed(client_id: &'a str) -> Self {
+        Self {
+            peer_ip: client_id,
+            relay_client: Some(client_id),
+        }
+    }
+}
+
 pub async fn process_whep(
     state: &AppState,
-    device_key: &str,
+    origin: JoinOrigin<'_>,
     body: &[u8],
     ice_servers: Vec<RTCIceServer>,
 ) -> ProcessedResponse {
+    let device_key = origin.peer_ip;
     let req: JoinRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
@@ -956,7 +1154,7 @@ pub async fn process_whep(
         .config
         .banned_devices
         .as_ref()
-        .is_some_and(|banned| session::is_device_banned(banned, &presented_token, device_key))
+        .is_some_and(|banned| session::is_device_banned(banned, &presented_token))
     {
         tprintln!("join rejected: {device_key} is banned by the host");
         return ProcessedResponse::err(
@@ -1046,7 +1244,7 @@ pub async fn process_whep(
         token
     };
 
-    match start_session(state, &req, device_key, &device_token, ice_servers).await {
+    match start_session(state, &req, origin, &device_token, ice_servers).await {
         Ok((answer, resource)) => {
             tprintln!(
                 "join accepted: WHEP answer generated ({} bytes)",
@@ -1073,10 +1271,24 @@ pub async fn process_whep(
 async fn start_session(
     state: &AppState,
     req: &JoinRequest,
-    client_ip: &str,
+    origin: JoinOrigin<'_>,
     device_token: &str,
     ice_servers: Vec<RTCIceServer>,
 ) -> Result<(String, String)> {
+    let client_ip = origin.peer_ip;
+    // One join, one name. The WHEP resource id *is* the session's identity, so `PATCH`,
+    // `DELETE`, `/reconfig`, `/leave` and `/audio-outputs` all address the same thing, and two
+    // tabs of one browser — same device, same token, same address — are two of them.
+    let join_id = session::mint_join_id();
+    if let Some(s) = state.config.sessions.as_ref() {
+        session::open_session_via(s, &join_id, device_token, client_ip, origin.relay_client);
+        session::set_session_labels(
+            s,
+            &join_id,
+            req.device_name.trim(),
+            &format!("{}x{}", req.width, req.height),
+        );
+    }
     let locality = state.locality_for(client_ip);
     let client = state
         .config
@@ -1088,15 +1300,8 @@ async fn start_session(
         .config
         .sessions
         .as_ref()
-        .map(|s| session::next_session_seq(s, client_ip))
+        .map(|s| session::next_session_seq(s, &join_id))
         .unwrap_or(0);
-
-    if let Some(s) = state.config.sessions.as_ref() {
-        if let Some(stop) = session::take_active_capture(s, client_ip) {
-            tprintln!("stopping previous capture for {client_ip} before starting a new session");
-            let _ = tokio::task::spawn_blocking(stop).await;
-        }
-    }
 
     let detected_refresh = if req.refresh_rate == 0 {
         60
@@ -1120,13 +1325,13 @@ async fn start_session(
     // decoder rebuilds over a few frames instead, and a client that missed the session's opening
     // keyframe recovers on its own rather than sitting black behind an infinite GOP.
     cfg.intra_refresh = true;
-    let override_for_ip = state
+    let device_settings = state
         .config
         .device_overrides
         .as_ref()
-        .and_then(|o| o.lock_recover().get(client_ip).copied());
-    let control_enabled = override_for_ip.map(|o| o.control_enabled).unwrap_or(true);
-    let pointer_scope = override_for_ip.map(|o| o.pointer_scope).unwrap_or_default();
+        .and_then(|o| o.lock_recover().get(device_token).copied());
+    let control_enabled = device_settings.map(|o| o.control_enabled).unwrap_or(true);
+    let pointer_scope = device_settings.map(|o| o.pointer_scope).unwrap_or_default();
     let audio_params = match (
         state.config.audio_hub.as_ref(),
         state.config.device_overrides.as_ref(),
@@ -1151,12 +1356,12 @@ async fn start_session(
                 locality,
                 hub: std::sync::Arc::clone(hub),
                 overrides: std::sync::Arc::clone(overrides),
-                device_key: client_ip.to_string(),
+                device_token: device_token.to_string(),
             })
         }
         _ => None,
     };
-    if let Some(o) = override_for_ip {
+    if let Some(o) = device_settings {
         cfg.scale = ScalePercent::new(o.video_scale);
         cfg.quality_qp = Some(o.video_quality);
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
@@ -1174,7 +1379,7 @@ async fn start_session(
     let offered_video = negotiate::read_offer(&req.sdp);
 
     let native_dpr = if req.dpr.is_finite() { req.dpr } else { 1.0 };
-    let dpr = platform::snap_display_dpr(override_for_ip.map(|o| o.dpr).unwrap_or(native_dpr));
+    let dpr = platform::snap_display_dpr(device_settings.map(|o| o.dpr).unwrap_or(native_dpr));
     let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
     let width = backing(req.width);
     let height = backing(req.height);
@@ -1217,32 +1422,20 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
-    let existing = state
-        .config
-        .sessions
-        .as_ref()
-        .and_then(|s| session::get_live_display(s, client_ip));
-    let existed_before = existing.is_some();
+    // A join is new by construction — its id was minted a few lines ago — so there is never a
+    // display to reuse or a previous orientation to carry. Reusing one is what a rejoin from the
+    // same address used to do, and it is exactly what made a second tab replace the first.
+    let existing: Option<session::LiveDisplay> = None;
+    let existed_before = false;
     let client_portrait = height > width;
-    let prev_client_portrait = existing.as_ref().map(|p| p.height > p.width);
-    let device_rotated = prev_client_portrait == Some(!client_portrait);
-    let honor_device = existing.is_none() || device_rotated;
-    let portrait = if honor_device {
-        client_portrait
-    } else {
-        override_for_ip
-            .map(|o| o.orientation_portrait)
-            .unwrap_or(client_portrait)
-    };
-    if honor_device {
-        if let Some(overrides) = state.config.device_overrides.as_ref() {
-            if let Some(o) = overrides.lock_recover().get_mut(client_ip) {
-                o.orientation_portrait = client_portrait;
-            }
+    let portrait = client_portrait;
+    if let Some(overrides) = state.config.device_overrides.as_ref() {
+        if let Some(o) = overrides.lock_recover().get_mut(device_token) {
+            o.orientation_portrait = client_portrait;
         }
     }
     let swap_axes = portrait != client_portrait;
-    let base_scale = override_for_ip
+    let base_scale = device_settings
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
     let scale =
@@ -1373,7 +1566,8 @@ async fn start_session(
                             (display_id, name, topology_reset)
                         }
                         None => {
-                            remove_display_async(client, display_id).await;
+                            // Still inside the correlation lock, so this is the unlocked form.
+                            remove_display_now(client, display_id).await;
                             bail!("virtual display {display_id} did not attach within timeout");
                         }
                     }
@@ -1423,7 +1617,7 @@ async fn start_session(
                 apply_display_scale(&device_name, scale).await;
                 if topology_reset {
                     if let Some(sessions) = state.config.sessions.as_ref() {
-                        let others = session::live_displays_except(sessions, client_ip);
+                        let others = session::live_displays_except(sessions, &join_id);
                         if !others.is_empty() {
                             tokio::spawn(restore_displays(others));
                         }
@@ -1434,7 +1628,7 @@ async fn start_session(
         };
 
         if let Some(s) = state.config.sessions.as_ref() {
-            session::set_host_ip(s, client_ip, state.config.lan_ip.clone());
+            session::set_host_ip(s, &join_id, state.config.lan_ip.clone());
             let landed = if mode_applied {
                 session::LiveDisplay {
                     display_id,
@@ -1460,7 +1654,7 @@ async fn start_session(
                     ..desired
                 }
             };
-            session::set_live_display(s, client_ip, landed);
+            session::set_live_display(s, &join_id, landed);
         }
 
         let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
@@ -1486,7 +1680,7 @@ async fn start_session(
         // Publish this session's counters under the client IP so `status --json` and the verbose
         // summary can find them without going through the session map, which is not reachable from
         // the process that runs `status`.
-        crate::streamer::telemetry::publish(client_ip, Arc::clone(&session.pipeline.telemetry));
+        crate::streamer::telemetry::publish(&join_id, Arc::clone(&session.pipeline.telemetry));
 
         {
             let name = device_name.clone();
@@ -1505,7 +1699,8 @@ async fn start_session(
         display_and_pipeline,
         webrtc_session::prepare_whep(
             req.sdp.clone(),
-            client_ip,
+            &join_id,
+            device_token,
             ice_servers,
             locality,
             video,
@@ -1525,10 +1720,13 @@ async fn start_session(
                 session.stop();
                 if !existed_before {
                     if let Some(s) = state.config.sessions.as_ref() {
-                        let _ = session::take_live_display(s, client_ip);
+                        let _ = session::take_live_display(s, &join_id);
                     }
                     remove_display_async(client, display_id).await;
                 }
+            }
+            if let Some(s) = state.config.sessions.as_ref() {
+                session::remove_session(s, &join_id);
             }
             return Err(e.context("WHEP handshake"));
         }
@@ -1537,6 +1735,9 @@ async fn start_session(
         Ok(v) => v,
         Err(e) => {
             pending.abandon().await;
+            if let Some(s) = state.config.sessions.as_ref() {
+                session::remove_session(s, &join_id);
+            }
             return Err(e);
         }
     };
@@ -1564,9 +1765,12 @@ async fn start_session(
             session.stop();
             if !existed_before {
                 if let Some(s) = state.config.sessions.as_ref() {
-                    let _ = session::take_live_display(s, client_ip);
+                    let _ = session::take_live_display(s, &join_id);
                 }
                 remove_display_async(client, display_id).await;
+            }
+            if let Some(s) = state.config.sessions.as_ref() {
+                session::remove_session(s, &join_id);
             }
             return Err(e.context("WHEP activation"));
         }
@@ -1578,6 +1782,7 @@ async fn start_session(
 
     if let Some(reporter) = state.config.device_reporter.as_ref() {
         reporter.report_join(DeviceInfo {
+            join_id: join_id.clone(),
             ip: client_ip.to_string(),
             token: device_token.to_string(),
             name: req.device_name.trim().to_string(),
@@ -1593,20 +1798,15 @@ async fn start_session(
         .config
         .sessions
         .as_ref()
-        .map(|s| session::arm_leave(s, client_ip));
+        .map(|s| session::arm_leave(s, &join_id));
 
     if let Some(s) = state.config.sessions.as_ref() {
-        session::set_control_sender(s, client_ip, control_tx.clone());
+        session::set_control_sender(s, &join_id, control_tx.clone());
     }
 
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
-            session::set_active_capture(
-                s,
-                client_ip,
-                session_seq,
-                Box::new(move || session.stop()),
-            );
+            session::set_active_capture(s, &join_id, session_seq, Box::new(move || session.stop()));
             None
         }
         None => Some(session),
@@ -1616,7 +1816,8 @@ async fn start_session(
     let reporter = state.config.device_reporter.clone();
     let sessions = state.config.sessions.clone();
     let disconnect_grace = state.config.disconnect_grace.clone();
-    let report_ip = client_ip.to_string();
+    let report_join = join_id.clone();
+    let report_token = device_token.to_string();
     tokio::spawn(async move {
         let left = match &leave {
             Some(sig) => {
@@ -1635,22 +1836,22 @@ async fn start_session(
         };
 
         if let Some(s) = sessions.as_ref() {
-            session::clear_control_sender(s, &report_ip, &control_tx);
+            session::clear_control_sender(s, &report_join, &control_tx);
         }
-        crate::streamer::telemetry::unregister(&report_ip);
+        crate::streamer::telemetry::unregister(&report_join);
 
         // Give back the peer connection, its ICE agent, that agent's UDP sockets and the
         // injector thread. Nothing did this before, and because the connection held an `Arc` to
         // itself through its own state-change handler, nothing could have.
         whep.close().await;
         tprintln!(
-            "session for {report_ip} closed; live transport sessions: {}",
+            "join {report_join} closed; live transport sessions: {}",
             webrtc_session::live_sessions()
         );
 
         let stop = sessions
             .as_ref()
-            .and_then(|s| session::take_active_capture_if(s, &report_ip, session_seq));
+            .and_then(|s| session::take_active_capture_if(s, &report_join, session_seq));
         if let Some(stop) = stop {
             let _ = tokio::task::spawn_blocking(stop).await;
         } else if let Some(session) = session_holder {
@@ -1673,7 +1874,7 @@ async fn start_session(
 
         let superseded = sessions
             .as_ref()
-            .map(|s| !session::is_current_session(s, &report_ip, session_seq))
+            .map(|s| !session::is_current_session(s, &report_join, session_seq))
             .unwrap_or(false);
         if superseded {
             tprintln!(
@@ -1690,18 +1891,37 @@ async fn start_session(
             }
         );
         if let Some(s) = sessions.as_ref() {
-            let _ = session::take_live_display(s, &report_ip);
+            let _ = session::take_live_display(s, &report_join);
+            // Keyed by join, the map gains an entry for every tab ever opened unless the last
+            // teardown forgets it. Keyed by address it never had to.
+            session::remove_session(s, &report_join);
         }
         remove_display_async(&client, display_id).await;
         if let Some(reporter) = reporter {
-            reporter.report_remove(report_ip);
+            reporter.report_remove(report_join, report_token);
         }
     });
 
     Ok((answer, resource_id))
 }
 
+/// Remove a display, holding the correlation lock while it happens.
+///
+/// A create identifies its new display by diffing the OS's device-name list before and after.
+/// Windows reuses a name the moment one is freed, so a removal that overlaps that window can
+/// hand the *same* name back to the new display and the diff then finds nothing new — the join
+/// waits out `DISPLAY_ATTACH_TIMEOUT` and fails, with a display created and orphaned. It could
+/// not happen while a session was replaced by address, because the replacement reused the
+/// display rather than creating a second one; now that every join is its own session, a client
+/// that rejoins releases one display while asking for another, and the two overlap by
+/// construction.
 async fn remove_display_async(client: &session::SharedVirtualDisplay, id: u32) {
+    let _guard = DISPLAY_CORRELATION_LOCK.lock().await;
+    remove_display_now(client, id).await;
+}
+
+/// The same, for the one caller that is already inside the correlation lock.
+async fn remove_display_now(client: &session::SharedVirtualDisplay, id: u32) {
     let client = client.clone();
     let _ = tokio::task::spawn_blocking(move || client.remove_display(id)).await;
 }
@@ -1772,18 +1992,34 @@ async fn restore_displays(displays: Vec<session::LiveDisplay>) {
 /// was applied, so the caller can fall back to the epoch bump.
 pub async fn apply_scale_live(
     sessions: &session::SharedSessions,
-    ip: &str,
+    join: &str,
     effective: u32,
 ) -> bool {
-    let Some(display) = session::get_live_display(sessions, ip) else {
+    let Some(display) = session::get_live_display(sessions, join) else {
         return false;
     };
     apply_display_scale(&display.device_name, effective).await;
     let mut updated = display.clone();
     updated.scale = effective.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
-    session::set_live_display(sessions, ip, updated);
-    tprintln!("display scale for {ip} applied live at {effective}% (no rejoin)");
+    session::set_live_display(sessions, join, updated);
+    tprintln!("display scale for join {join} applied live at {effective}% (no rejoin)");
     true
+}
+
+/// The same, for every display one device is driving. A per-device scale change lands on all of
+/// them.
+pub async fn apply_scale_live_for_device(
+    sessions: &session::SharedSessions,
+    token: &str,
+    effective: u32,
+) -> usize {
+    let mut applied = 0usize;
+    for join in session::joins_for_token(sessions, token) {
+        if apply_scale_live(sessions, &join, effective).await {
+            applied += 1;
+        }
+    }
+    applied
 }
 
 async fn apply_display_scale(device_name: &str, percent: u32) {
@@ -2014,12 +2250,15 @@ mod tests {
         }
     }
 
+    /// `holders` are device tokens; each is given one join holding one display.
     fn state_with(cap: Option<usize>, holders: &[&str]) -> AppState {
         let sessions: session::SharedSessions = Default::default();
-        for ip in holders {
+        for (i, token) in holders.iter().enumerate() {
+            let join = format!("join-{i}");
+            session::open_session(&sessions, &join, token, "192.168.1.5");
             session::set_live_display(
                 &sessions,
-                ip,
+                &join,
                 session::LiveDisplay {
                     display_id: 1,
                     device_name: "1".into(),
@@ -2040,28 +2279,31 @@ mod tests {
 
     #[test]
     fn an_uncapped_backend_never_turns_anyone_away() {
-        let state = state_with(None, &["10.0.0.1", "10.0.0.2"]);
-        assert!(!state.display_slot_unavailable("10.0.0.9"));
+        let state = state_with(None, &["token-a", "token-b"]);
+        assert!(!state.display_slot_unavailable(Some("token-c")));
+        assert!(!state.display_slot_unavailable(None));
         assert_eq!(state.display_capacity(), (None, 2));
     }
 
     #[test]
     fn a_single_display_backend_turns_away_a_second_device() {
-        let state = state_with(Some(1), &["10.0.0.1"]);
-        assert!(state.display_slot_unavailable("10.0.0.2"));
+        let state = state_with(Some(1), &["token-a"]);
+        assert!(state.display_slot_unavailable(Some("token-b")));
         assert_eq!(state.display_capacity(), (Some(1), 1));
     }
 
     #[test]
     fn the_device_already_holding_the_display_is_never_blocked() {
-        let state = state_with(Some(1), &["10.0.0.1"]);
-        assert!(!state.display_slot_unavailable("10.0.0.1"));
+        // Keyed by device token, so the same device reconnecting — in a new tab, from a new
+        // address — is recognised as the one that already holds the slot.
+        let state = state_with(Some(1), &["token-a"]);
+        assert!(!state.display_slot_unavailable(Some("token-a")));
     }
 
     #[test]
     fn the_slot_frees_up_when_the_holder_leaves() {
         let state = state_with(Some(1), &[]);
-        assert!(!state.display_slot_unavailable("10.0.0.2"));
+        assert!(!state.display_slot_unavailable(Some("token-b")));
         assert_eq!(state.display_capacity(), (Some(1), 0));
     }
 
@@ -2072,9 +2314,9 @@ mod tests {
     #[test]
     fn only_a_one_display_backend_can_turn_a_device_away() {
         for cap in [Some(2), Some(3), Some(8)] {
-            let state = state_with(cap, &["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
+            let state = state_with(cap, &["token-a", "token-b", "token-c"]);
             assert!(
-                !state.display_slot_unavailable("10.0.0.9"),
+                !state.display_slot_unavailable(Some("token-d")),
                 "cap {cap:?}: an uncapped backend must never serve at-capacity.html"
             );
             assert_eq!(
@@ -2088,10 +2330,10 @@ mod tests {
     #[test]
     fn the_holders_adapter_is_identifiable_for_keeping_its_server_up() {
         let sessions: session::SharedSessions = Default::default();
-        session::set_host_ip(&sessions, "10.0.0.1", Some("192.168.1.5".into()));
+        session::set_host_ip(&sessions, "join-1", Some("192.168.1.5".into()));
         session::set_live_display(
             &sessions,
-            "10.0.0.1",
+            "join-1",
             session::LiveDisplay {
                 display_id: 1,
                 device_name: "1".into(),
@@ -2102,7 +2344,7 @@ mod tests {
                 portrait: false,
             },
         );
-        session::set_host_ip(&sessions, "10.0.0.2", Some("192.168.1.9".into()));
+        session::set_host_ip(&sessions, "join-2", Some("192.168.1.9".into()));
 
         assert_eq!(
             session::display_holder_host_ip(&sessions),
@@ -2113,7 +2355,7 @@ mod tests {
     #[test]
     fn no_adapter_is_singled_out_when_nobody_holds_a_display() {
         let sessions: session::SharedSessions = Default::default();
-        session::set_host_ip(&sessions, "10.0.0.1", Some("192.168.1.5".into()));
+        session::set_host_ip(&sessions, "join-1", Some("192.168.1.5".into()));
         assert_eq!(session::display_holder_host_ip(&sessions), None);
     }
 

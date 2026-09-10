@@ -76,9 +76,9 @@ SUBCOMMANDS:
     status                Show session, network, driver and config state
     qr                    Print join QR codes / URLs for a session
     session new           Generate a fresh session id + OTP and print join info
-    devices list          List saved per-device display overrides
-    devices set <ip>      Save display overrides for a device
-    devices reset <ip>    Clear saved overrides for a device
+    devices list          List live joins and saved per-device display overrides
+    devices set <device>  Save display overrides for a device (token, or an IP that resolves)
+    devices reset <device>  Clear saved overrides for a device
     network start <ssid> <password>   Start a hosted Wi-Fi network
     network stop          Stop the hosted network
     network status        Show hosted-network state
@@ -1468,9 +1468,20 @@ mod desktop {
             return;
         };
         for d in parse_saved_devices(&devices) {
+            // Keyed by the device token. A row saved before tokens existed carries none, and
+            // there is nothing to replay it onto until that device joins again and is minted
+            // one — replaying it onto an address would be replaying it onto whoever holds that
+            // address now.
+            let Some(key) = d.token.clone() else {
+                tprintln!(
+                    "[devices] the saved row for {} has no device token, so its settings wait                      for that device to join once more",
+                    d.ip
+                );
+                continue;
+            };
             platform::set_device_override(
                 app.state(),
-                d.ip.clone(),
+                key.clone(),
                 d.scale,
                 d.orientation,
                 d.refresh_rate,
@@ -1480,18 +1491,22 @@ mod desktop {
                 d.dpr,
                 d.audio,
             );
-            platform::set_device_pointer_scope(app.state(), d.ip.clone(), d.pointer_scope.clone());
-            platform::set_device_auto_frame_rate(app.state(), d.ip.clone(), d.auto_frame_rate);
+            platform::set_device_pointer_scope(app.state(), key.clone(), d.pointer_scope.clone());
+            platform::set_device_auto_frame_rate(app.state(), key.clone(), d.auto_frame_rate);
             // Without this a device pinned to a specific host output in the GUI reverts to the
             // default output under `serve`, which is audible rather than theoretical.
             if let Some(output) = d.audio_output {
-                platform::set_device_audio_output(app.state(), d.ip, output);
+                platform::set_device_audio_output(app.state(), key, output);
             }
         }
     }
 
     #[derive(Debug, PartialEq)]
     struct SavedDevice {
+        /// The device this row belongs to. `None` on a row written before device tokens, which
+        /// cannot be replayed until that device joins once more and is minted one.
+        token: Option<String>,
+        /// Where the device was last seen. A label on this row, never its key.
         ip: String,
         scale: u32,
         orientation: String,
@@ -1513,7 +1528,20 @@ mod desktop {
         devices
             .iter()
             .filter_map(|device| {
-                let ip = device.get("ip").and_then(|v| v.as_str())?.to_string();
+                let ip = device
+                    .get("ip")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let token = device
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                if token.is_none() && ip.is_empty() {
+                    return None;
+                }
                 let num = |key: &str, default: u32| {
                     device
                         .get(key)
@@ -1522,6 +1550,7 @@ mod desktop {
                         .unwrap_or(default)
                 };
                 Some(SavedDevice {
+                    token,
                     ip,
                     scale: num("scale", 100),
                     orientation: device
@@ -1644,9 +1673,10 @@ mod desktop {
             println!("  (none connected)");
             return;
         }
-        for (ip, s) in sessions {
+        // Keyed by join id: one row per browser tab, so a device with two open shows two.
+        for (join, s) in sessions {
             println!(
-                "  {ip}: capture={} encoder={} frames={}",
+                "  {join}: capture={} encoder={} frames={}",
                 s.get("capture_backend")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?"),
@@ -1934,6 +1964,105 @@ mod desktop {
 
     // devices
 
+    /// Live joins, asked of the running host over the control socket. Empty when no host is up.
+    fn live_joins(app: &tauri::AppHandle) -> Vec<Value> {
+        live_telemetry(app)
+            .and_then(|t| t.get("joins").cloned())
+            .and_then(|v| match v {
+                Value::Array(a) => Some(a),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn print_live_joins(joins: &[Value]) {
+        println!("Live sessions (one per browser tab):");
+        if joins.is_empty() {
+            println!("  (none connected)");
+            return;
+        }
+        println!(
+            "  {:<34} {:<34} {:<16} {:<20} DISPLAY",
+            "JOIN", "DEVICE TOKEN", "IP", "NAME"
+        );
+        for j in joins {
+            let s = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let display = match j.get("display") {
+                Some(Value::Object(d)) => {
+                    let n = |k: &str| d.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                    format!("{}x{}@{}Hz", n("width"), n("height"), n("refresh"))
+                }
+                _ => "(none)".to_string(),
+            };
+            println!(
+                "  {:<34} {:<34} {:<16} {:<20} {display}",
+                s("joinId"),
+                s("token"),
+                s("ip"),
+                s("name")
+            );
+        }
+    }
+
+    /// Turn whatever the user typed into the device token the settings are stored under.
+    ///
+    /// A token is used as-is. Anything else is treated as an address and resolved against the
+    /// live joins — and only while exactly one device is connected from it, because an address
+    /// is a place and is handed on to the next device that asks for it.
+    fn resolve_device_key(app: &tauri::AppHandle, saved: &[Value], key: &str) -> Option<String> {
+        let key = key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let looks_like_token = key.len() == 32
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if looks_like_token {
+            return Some(key.to_string());
+        }
+        let matching: Vec<String> = live_joins(app)
+            .iter()
+            .filter(|j| j.get("ip").and_then(|v| v.as_str()) == Some(key))
+            .filter_map(|j| j.get("token").and_then(|v| v.as_str()))
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        match matching.len() {
+            1 => {
+                eprintln!(
+                    "note: `{key}` is an address; it resolved to the one device connected from \
+                     it. Pass the token to be certain which device you mean."
+                );
+                return Some(matching[0].clone());
+            }
+            0 => {}
+            n => {
+                eprintln!("error: {n} devices are connected from {key}; pass a device token.");
+                return None;
+            }
+        }
+        // Nothing connected. A saved row that still carries this as its last-seen address is the
+        // only remaining hint, and only while exactly one does.
+        let rows: Vec<String> = saved
+            .iter()
+            .filter(|d| d.get("ip").and_then(|v| v.as_str()) == Some(key))
+            .filter_map(|d| d.get("token").and_then(|v| v.as_str()))
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if rows.len() == 1 {
+            eprintln!(
+                "note: nothing is connected from `{key}`; matched the saved row that was last \
+                 seen there."
+            );
+            return Some(rows[0].clone());
+        }
+        None
+    }
+
     fn run_devices(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
             eprintln!("usage: ScreenExtend devices <list|set|reset>");
@@ -1948,20 +2077,25 @@ mod desktop {
                         _ => None,
                     })
                     .unwrap_or_default();
+                let joins = live_joins(app);
                 if wants_json(sm) {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&Value::Array(devices)).unwrap()
-                    );
+                    let out = serde_json::json!({
+                        "joins": joins,
+                        "devices": Value::Array(devices),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
                     exit(0);
                 }
+                print_live_joins(&joins);
                 if devices.is_empty() {
-                    println!("No saved device overrides.");
+                    println!("\nNo saved device overrides.");
                     exit(0);
                 }
+                println!("\nSaved per-device settings (keyed by device token):");
                 println!(
-                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6} {:>8} {:>8}",
-                    "IP",
+                    "{:<34} {:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6} {:>8} {:>8}",
+                    "TOKEN",
+                    "LAST IP",
                     "SCALE",
                     "ORIENT",
                     "REFRESH",
@@ -1974,6 +2108,10 @@ mod desktop {
                 );
                 for d in &devices {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
+                    let token = match s("token").as_str() {
+                        Some(t) if !t.is_empty() => t.to_string(),
+                        _ => "(none — rejoin once)".to_string(),
+                    };
                     let ip = s("ip").as_str().unwrap_or("").to_string();
                     let scale = s("scale").as_u64().unwrap_or(100);
                     let orient = s("orientation").as_str().unwrap_or("Landscape").to_string();
@@ -1985,7 +2123,7 @@ mod desktop {
                     let pointer = s("pointerScope").as_str().unwrap_or("all").to_string();
                     let auto_fps = s("autoFrameRate").as_bool().unwrap_or(false);
                     println!(
-                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6} {pointer:>8} {:>8}",
+                        "{token:<34} {ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6} {pointer:>8} {:>8}",
                         scale,
                         refresh,
                         vscale,
@@ -1997,8 +2135,9 @@ mod desktop {
                 exit(0);
             }
             "set" => {
-                let Some(ip) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off]");
+                let Some(key) = arg_str(sm, "ip") else {
+                    eprintln!("usage: ScreenExtend devices set <device> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off]");
+                    eprintln!("  <device> is a device token (see `devices list`); an IP is accepted and resolved to whichever device is connected from it");
                     exit(2);
                 };
                 let mut existing = get_nested(&store, "devices")
@@ -2007,13 +2146,21 @@ mod desktop {
                         _ => None,
                     })
                     .unwrap_or_default();
+                let Some(token) = resolve_device_key(app, &existing, &key) else {
+                    eprintln!(
+                        "error: `{key}` names no device. Pass a device token from `devices list`, \
+                         or an IP while exactly one device is connected from it."
+                    );
+                    exit(1);
+                };
                 let mut device = existing
                     .iter()
-                    .find(|d| d.get("ip").and_then(|v| v.as_str()) == Some(ip.as_str()))
+                    .find(|d| d.get("token").and_then(|v| v.as_str()) == Some(token.as_str()))
                     .cloned()
                     .unwrap_or_else(|| {
                         serde_json::json!({
-                            "ip": ip, "name": "", "scale": 100, "orientation": "Landscape",
+                            "token": token, "ip": "", "name": "", "scale": 100,
+                            "orientation": "Landscape",
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
                             "remoteControl": true, "systemAudio": false,
                             "pointerScope": "all", "autoFrameRate": false,
@@ -2021,7 +2168,7 @@ mod desktop {
                         })
                     });
                 let obj = device.as_object_mut().unwrap();
-                obj.insert("ip".into(), Value::String(ip.clone()));
+                obj.insert("token".into(), Value::String(token.clone()));
                 if let Some(v) = arg_str(sm, "scale").and_then(|s| s.parse::<u32>().ok()) {
                     obj.insert("scale".into(), Value::from(v.clamp(25, 200)));
                 }
@@ -2050,20 +2197,21 @@ mod desktop {
                     obj.insert("autoFrameRate".into(), Value::Bool(v == "on"));
                 }
 
-                existing.retain(|d| d.get("ip").and_then(|v| v.as_str()) != Some(ip.as_str()));
+                existing
+                    .retain(|d| d.get("token").and_then(|v| v.as_str()) != Some(token.as_str()));
                 existing.push(device.clone());
                 store.set("devices", Value::Array(existing));
                 if let Err(e) = store.save() {
                     eprintln!("error: failed to save config: {e}");
                     exit(1);
                 }
-                println!("Saved override for {ip}: {device}");
+                println!("Saved override for device {token}: {device}");
                 report_live_apply(app);
                 exit(0);
             }
             "reset" => {
-                let Some(ip) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices reset <ip>");
+                let Some(key) = arg_str(sm, "ip") else {
+                    eprintln!("usage: ScreenExtend devices reset <device>");
                     exit(2);
                 };
                 let mut existing = get_nested(&store, "devices")
@@ -2072,8 +2220,12 @@ mod desktop {
                         _ => None,
                     })
                     .unwrap_or_default();
+                let Some(ip) = resolve_device_key(app, &existing, &key) else {
+                    eprintln!("error: `{key}` names no device.");
+                    exit(1);
+                };
                 let before = existing.len();
-                existing.retain(|d| d.get("ip").and_then(|v| v.as_str()) != Some(ip.as_str()));
+                existing.retain(|d| d.get("token").and_then(|v| v.as_str()) != Some(ip.as_str()));
                 store.set("devices", Value::Array(existing.clone()));
                 if let Err(e) = store.save() {
                     eprintln!("error: failed to save config: {e}");
@@ -3065,21 +3217,27 @@ mod desktop {
         #[test]
         fn saved_devices_fill_gaps_and_carry_the_audio_output_pin() {
             let devices = serde_json::json!([
-                { "ip": "10.0.0.5" },
+                { "token": "tok-a", "ip": "10.0.0.5" },
                 {
+                    "token": "tok-b",
                     "ip": "10.0.0.6", "scale": 150, "orientation": "Portrait",
                     "refreshRate": 120, "videoScale": 80, "videoQuality": 20,
                     "remoteControl": false, "systemAudio": true, "dpr": 2.0,
                     "pointerScope": "display", "autoFrameRate": true,
                     "audioOutputDeviceId": "speaker-1"
                 },
-                { "name": "no ip at all" }
+                { "name": "neither a token nor an address" }
             ]);
             let parsed = parse_saved_devices(devices.as_array().unwrap());
-            assert_eq!(parsed.len(), 2, "an entry with no ip addresses nothing");
+            assert_eq!(
+                parsed.len(),
+                2,
+                "an entry that names no device addresses nothing"
+            );
             assert_eq!(
                 parsed[0],
                 SavedDevice {
+                    token: Some("tok-a".into()),
                     ip: "10.0.0.5".into(),
                     scale: 100,
                     orientation: "Landscape".into(),
@@ -3103,6 +3261,19 @@ mod desktop {
             assert_eq!(parsed[1].pointer_scope, "display");
             assert!(parsed[1].auto_frame_rate);
             assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
+            assert_eq!(parsed[1].token.as_deref(), Some("tok-b"));
+        }
+
+        /// A row written before device tokens existed still parses — it just cannot be replayed
+        /// onto anything, because the only thing it names is an address, and an address is
+        /// handed on to the next device that asks for it.
+        #[test]
+        fn a_saved_row_with_no_token_parses_but_names_no_device() {
+            let devices = serde_json::json!([{ "ip": "10.0.0.5", "scale": 150 }]);
+            let parsed = parse_saved_devices(devices.as_array().unwrap());
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].token, None);
+            assert_eq!(parsed[0].scale, 150);
         }
     }
 }

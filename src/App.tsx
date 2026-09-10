@@ -26,7 +26,7 @@ const Settings = lazy(loadSettings);
 const WalkthroughMount = lazy(() => import("@/components/walkthrough-mount"));
 import { WalkthroughContext, type WalkthroughControl } from "@/components/walkthrough-context";
 
-import { getConfig, getConfigSnapshot, subscribeToConfig, updateConfig, flushConfig, recordKnownDevice, type Device } from "@/components/config-provider";
+import { getConfig, getConfigSnapshot, subscribeToConfig, updateConfig, flushConfig, recordKnownDevice, findSavedDevice, type Device, type ConnectedDevice } from "@/components/config-provider";
 import { loadAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, applyZoom, clampZoom, zoomIn, zoomOut } from "@/lib/zoom";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -135,11 +135,14 @@ function GlobalState({ children }: { children: ReactNode }) {
     []
   );
   const [loaded, setLoaded] = useState(false);
-  const [devices, setDevices] = useState<Device[]>([]);
+  // One entry per live join. A device with two tabs open is two rows sharing one token.
+  const [devices, setDevices] = useState<ConnectedDevice[]>([]);
   const [publicSessionsEnabled, setPublicSessionsEnabled] = useState(true);
   const [avatar, setAvatar] = useState<string | null>(null);
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
-  const [audioOutputsByIp, setAudioOutputsByIp] = useState<Record<string, AudioOutputsInfo>>({});
+  // Keyed by device token: two tabs of one browser enumerate the same speakers and share the
+  // sink the host chooses, so there is one entry per device and not one per join.
+  const [audioOutputsByToken, setAudioOutputsByToken] = useState<Record<string, AudioOutputsInfo>>({});
   const zoomReady = useRef(false);
   const appliedZoom = useRef(DEFAULT_ZOOM);
   const zoomPersist = useRef<number | undefined>(undefined);
@@ -157,7 +160,7 @@ function GlobalState({ children }: { children: ReactNode }) {
     setPublicSessionsEnabled,
     setAvatar,
     setZoom,
-    setAudioOutputsByIp,
+    setAudioOutputsByToken,
   }), []);
 
   const session = useMemo(
@@ -252,7 +255,7 @@ function GlobalState({ children }: { children: ReactNode }) {
       setDevices(prev => {
         let changed = false;
         const next = prev.map(device => {
-          const override = saved.find(d => d.ip === device.ip);
+          const override = findSavedDevice(saved, device.token, device.ip);
           if (!override) return device;
           const differs = DEVICE_OVERRIDE_KEYS.filter(
             key => override[key] !== undefined && override[key] !== device[key]
@@ -332,9 +335,12 @@ function GlobalState({ children }: { children: ReactNode }) {
     const unlisteners: (() => void)[] = [];
     const start_listener = async () => {
       unlisteners.push(await events.deviceJoin.listen(event => {
-        const device = event.payload as Device;
+        const device = event.payload as ConnectedDevice;
         setDevices(prev => {
-          const next = prev.filter(d => d.ip !== device.ip);
+          // By join, so a second tab from the same machine is a second row rather than a
+          // replacement for the first. The filter is still needed: a reconnect on the same
+          // join id re-announces it.
+          const next = prev.filter(d => d.joinId !== device.joinId);
           next.push(device);
           return next;
         });
@@ -364,9 +370,9 @@ function GlobalState({ children }: { children: ReactNode }) {
         );
       }));
       unlisteners.push(await events.deviceModify.listen(event => {
-        const device = event.payload as Device;
+        const device = event.payload as ConnectedDevice;
         setDevices(prev => {
-          const index = prev.findIndex(d => d.ip === device.ip);
+          const index = prev.findIndex(d => d.joinId === device.joinId);
           if (index < 0) return prev;
           // A no-op modify must not allocate a new array: `devices` identity
           // drives an extra IPC burst in Dashboard and Settings.
@@ -381,9 +387,10 @@ function GlobalState({ children }: { children: ReactNode }) {
         // `current` is the sink the client reports it is actually playing on. `null` means
         // this client never said -- an older page, or one that has not posted yet -- which
         // is not the same answer as `""`, the device's default output.
-        setAudioOutputsByIp(prev => ({
+        if (!p.token) return;
+        setAudioOutputsByToken(prev => ({
           ...prev,
-          [p.ip]: {
+          [p.token]: {
             supported: p.supported,
             outputs: p.outputs,
             selected: p.selected,
@@ -393,10 +400,12 @@ function GlobalState({ children }: { children: ReactNode }) {
         }));
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {
-        const device = event.payload as Device;
-        const known = devicesRef.current.find(d => d.ip === device.ip);
-        const name = known?.name || device.name || device.ip;
-        setDevices(prev => prev.filter(d => d.ip !== device.ip));
+        const device = event.payload as ConnectedDevice;
+        // One join ended; the device may still hold others, and the row that goes is that
+        // join's alone.
+        const known = devicesRef.current.find(d => d.joinId === device.joinId);
+        const name = known?.name || device.name || known?.ip || device.ip;
+        setDevices(prev => prev.filter(d => d.joinId !== device.joinId));
         void notifyIfUnfocused(
           t("notifications.deviceRemove.title"),
           t("notifications.deviceRemove.body", { name }),
@@ -491,7 +500,7 @@ function GlobalState({ children }: { children: ReactNode }) {
       <SessionContext.Provider value={session}>
         <QrValuesContext.Provider value={qrValues}>
           <DevicesContext.Provider value={devices}>
-            <AudioOutputsContext.Provider value={audioOutputsByIp}>
+            <AudioOutputsContext.Provider value={audioOutputsByToken}>
               <AvatarContext.Provider value={avatar}>
                 <ZoomContext.Provider value={zoom}>
                   <ClosingContext.Provider value={closing}>

@@ -53,16 +53,36 @@ pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_device_pointer_scope(_state: tauri::State<'_, AppState>, _ip: String, _scope: String) {}
-
-#[tauri::command]
-#[specta::specta]
-pub fn set_device_auto_frame_rate(_state: tauri::State<'_, AppState>, _ip: String, _enabled: bool) {
+pub fn set_device_pointer_scope(
+    _state: tauri::State<'_, AppState>,
+    _device: String,
+    _scope: String,
+) {
 }
 
 #[tauri::command]
 #[specta::specta]
-pub fn refresh_device_stream(_state: tauri::State<'_, AppState>, _ip: String) -> bool {
+pub fn set_device_auto_frame_rate(
+    _state: tauri::State<'_, AppState>,
+    _device: String,
+    _enabled: bool,
+) {
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn refresh_device_stream(
+    _state: tauri::State<'_, AppState>,
+    _device: String,
+    _join_id: Option<String>,
+) -> bool {
+    false
+}
+
+/// End one live session by its join id. UNVERIFIED: this module does not compile today.
+#[tauri::command]
+#[specta::specta]
+pub fn disconnect_session(_state: tauri::State<'_, AppState>, _join_id: String) -> bool {
     false
 }
 
@@ -70,7 +90,7 @@ pub fn refresh_device_stream(_state: tauri::State<'_, AppState>, _ip: String) ->
 #[specta::specta]
 pub fn set_device_audio_output(
     _state: tauri::State<'_, AppState>,
-    _ip: String,
+    _device: String,
     _device_id: String,
 ) {
 }
@@ -79,7 +99,7 @@ pub fn set_device_audio_output(
 #[specta::specta]
 pub fn get_device_audio_outputs(
     _state: tauri::State<'_, AppState>,
-    _ip: String,
+    _device: String,
 ) -> crate::streamer::session::AudioOutputsReport {
     crate::streamer::session::AudioOutputsReport::default()
 }

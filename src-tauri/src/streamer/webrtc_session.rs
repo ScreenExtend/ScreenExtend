@@ -225,7 +225,9 @@ pub struct AudioParams {
     pub locality: SessionLocality,
     pub hub: SharedAudioHub,
     pub overrides: SharedDeviceOverrides,
-    pub device_key: String,
+    /// The device this session belongs to. `overrides` is keyed by token, so this is the token —
+    /// two tabs of one browser share it, and therefore share the audio toggle.
+    pub device_token: String,
 }
 
 /// Loss at which duplicating the previous frame starts paying for itself.
@@ -266,7 +268,7 @@ impl AudioParams {
     fn audio_enabled_now(&self) -> bool {
         self.overrides
             .lock_recover()
-            .get(&self.device_key)
+            .get(&self.device_token)
             .map(|o| o.audio_enabled)
             .unwrap_or(false)
     }
@@ -755,6 +757,21 @@ pub struct SessionHandle {
     resource_id: String,
 }
 
+/// How long `close` will wait for the injector thread to notice it has no work left.
+const INJECTOR_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Wait for the injector to leave, but not forever. `true` when it did.
+fn join_injector(join: std::thread::JoinHandle<()>) -> bool {
+    let start = std::time::Instant::now();
+    while !join.is_finished() {
+        if start.elapsed() >= INJECTOR_JOIN_DEADLINE {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    join.join().is_ok()
+}
+
 impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
@@ -768,13 +785,33 @@ impl SessionHandle {
                 teprintln!("closing media socket: {e}");
             }
         }
-        // Dropping the last sender is what tells the injector thread to leave its `select!`.
+        // The connection's own handlers each hold a clone of the injector's sender — the input
+        // data channel's `on_message`, and the state-change handler that releases held keys —
+        // so the channel cannot disconnect while the connection is alive, whatever this handle
+        // does with its own copy. Letting the connection go is what actually abandons it.
+        //
+        // Without this the join below waited on a thread that had no way to leave, and it waited
+        // inside the task that removes the display: every clean leave left its virtual display
+        // standing and its transport counted as live. It went unseen because the only other
+        // caller was a session being superseded, which kept its display on purpose.
+        drop(self.pc);
+        if let Some(tx) = self.input_tx.as_ref() {
+            tx.shutdown();
+        }
         drop(self.input_tx.take());
         if let Some(join) = self.input_join.take() {
-            // The injector only ever blocks on the channel it was just told to abandon, so this
-            // is a formality — but a formality worth having, because it is the proof the thread
-            // went away rather than the hope that it did.
-            let _ = tokio::task::spawn_blocking(move || join.join()).await;
+            // The proof that the thread went away rather than the hope that it did — but
+            // bounded, because a session that cannot produce that proof must still give its
+            // display back. A thread that outlives this is parked on a channel nothing can feed;
+            // it costs one idle OS thread, not a screen the user is looking at.
+            let left = tokio::task::spawn_blocking(move || join_injector(join))
+                .await
+                .unwrap_or(false);
+            if !left {
+                teprintln!(
+                    "injector thread did not leave within {INJECTOR_JOIN_DEADLINE:?};                      continuing so the display is released anyway"
+                );
+            }
         }
         LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
     }
@@ -844,7 +881,8 @@ impl PendingWhep {
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_whep(
     offer_sdp: String,
-    device_key: &str,
+    join_id: &str,
+    device_token: &str,
     ice_servers: Vec<RTCIceServer>,
     locality: SessionLocality,
     video: negotiate::NegotiatedVideo,
@@ -1015,8 +1053,8 @@ pub async fn prepare_whep(
 
     // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
     // not been given, and a failed negotiation must not leave an entry behind.
-    let resource_id = mint_resource_id();
-    register_trickle(&resource_id, device_key, &pc);
+    let resource_id = join_id.to_string();
+    register_trickle(&resource_id, join_id, device_token, &pc);
 
     Ok(PendingWhep {
         pc,
@@ -1670,7 +1708,8 @@ pub async fn activate_whep(
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_whep_offer(
     offer_sdp: String,
-    device_key: &str,
+    join_id: &str,
+    device_token: &str,
     pipeline: &Pipeline,
     ice_servers: Vec<RTCIceServer>,
     closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1682,7 +1721,8 @@ pub async fn handle_whep_offer(
 ) -> Result<(String, SessionHandle)> {
     let pending = prepare_whep(
         offer_sdp,
-        device_key,
+        join_id,
+        device_token,
         ice_servers,
         locality,
         video,
@@ -2287,7 +2327,7 @@ mod tests {
             locality,
             hub: crate::streamer::audio::AudioHub::new(),
             overrides: Arc::new(std::sync::Mutex::new(Default::default())),
-            device_key: "test".to_string(),
+            device_token: "test".to_string(),
         }
     }
 
@@ -2384,11 +2424,14 @@ mod tests {
     }
 
     #[test]
-    fn a_resource_answers_only_to_the_peer_that_opened_it_and_only_while_it_lives() {
+    fn a_resource_answers_only_to_the_device_that_opened_it_and_only_while_it_lives() {
         // The registry is the whole of the authority check, so it is asserted without a peer
         // connection: `trickle_owner` is what `DELETE` resolves through, and `PATCH` applies the
-        // same two tests before it touches ICE.
+        // same two tests before it touches ICE. The second factor is the device token, not the
+        // peer address: an address moves under a live session and is recycled between devices.
         let id = "0123456789abcdef0123456789abcdef";
+        let mine = "aaaaaaaabbbbbbbbccccccccdddddddd";
+        let theirs = "11111111222222223333333344444444";
         {
             let mut guard = TRICKLE_SESSIONS.lock_recover();
             let map = guard.get_or_insert_with(Default::default);
@@ -2397,25 +2440,31 @@ mod tests {
                 TrickleEntry {
                     // A dangling `Weak` is exactly the state a finished session leaves behind.
                     pc: std::sync::Weak::new(),
-                    device_key: "192.168.1.7".to_string(),
+                    join_id: id.to_string(),
+                    device_token: mine.to_string(),
                     fragments: 0,
                 },
             );
         }
         assert_eq!(
-            trickle_owner(id, "192.168.1.8"),
+            trickle_owner(id, theirs),
             None,
-            "another peer must not resolve someone else's resource"
+            "another device must not resolve someone else's resource"
         );
         assert_eq!(
-            trickle_owner("ffffffffffffffffffffffffffffffff", "192.168.1.7"),
+            trickle_owner(id, ""),
+            None,
+            "a caller presenting no token must not resolve anything"
+        );
+        assert_eq!(
+            trickle_owner("ffffffffffffffffffffffffffffffff", mine),
             None,
             "an id that was never minted must not resolve"
         );
         assert_eq!(
-            trickle_owner(id, "192.168.1.7"),
+            trickle_owner(id, mine),
             None,
-            "a resource whose session is gone must not resolve, even to its own peer"
+            "a resource whose session is gone must not resolve, even to its own device"
         );
         unregister_trickle(id);
         assert!(TRICKLE_SESSIONS
@@ -2714,10 +2763,16 @@ struct TrickleEntry {
     /// `Weak`, so a session that ends drops out of here without anything having to remember to
     /// remove it — and so this map can never be the thing that keeps a peer connection alive.
     pc: std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>,
-    /// The device key the join came in on. The resource id is a 128-bit capability, but it is
+    /// The session this resource is. Identical to the resource id today; kept as its own field
+    /// so a caller reads a name rather than an assumption.
+    join_id: String,
+    /// The device that opened the join. The resource id is a 128-bit capability, but it is
     /// handed out in a `Location` header that travels in cleartext on the HTTP listener, which is
-    /// the listener most LAN joins use — so the id alone is not the authority.
-    device_key: String,
+    /// the listener most LAN joins use — so the id alone is not the authority. The second factor
+    /// is the device token rather than the peer's address: an address moves under a live session
+    /// and is recycled between devices, so it identified nothing and broke trickle for a peer
+    /// that had merely roamed.
+    device_token: String,
     /// Fragments accepted so far, against `MAX_TRICKLE_FRAGMENTS`.
     fragments: u32,
 }
@@ -2738,14 +2793,10 @@ pub enum TrickleLookup {
     Exhausted,
 }
 
-fn mint_resource_id() -> String {
-    let bytes: [u8; 16] = rand::random();
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn register_trickle(
     id: &str,
-    device_key: &str,
+    join_id: &str,
+    device_token: &str,
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
 ) {
     let mut guard = TRICKLE_SESSIONS.lock_recover();
@@ -2755,7 +2806,8 @@ fn register_trickle(
         id.to_string(),
         TrickleEntry {
             pc: Arc::downgrade(pc),
-            device_key: device_key.to_string(),
+            join_id: join_id.to_string(),
+            device_token: device_token.to_string(),
             fragments: 0,
         },
     );
@@ -2767,18 +2819,17 @@ fn unregister_trickle(id: &str) {
     }
 }
 
-/// The device key a live resource belongs to, when it belongs to `device_key`.
+/// The join a live resource names, when it belongs to `device_token`.
 ///
-/// `DELETE` needs this because the session is keyed by the device, not by the resource: without
-/// it the handler can only trust the caller's own address, which makes the id — the whole point of
-/// RFC 9725 §4.4 — carry no authority at all.
-pub fn trickle_owner(id: &str, device_key: &str) -> Option<String> {
+/// `DELETE` needs this so the id — the whole point of RFC 9725 §4.4 — carries authority: the
+/// resource must be live and the caller must present the device token that opened it.
+pub fn trickle_owner(id: &str, device_token: &str) -> Option<String> {
     let guard = TRICKLE_SESSIONS.lock_recover();
     let e = guard.as_ref()?.get(id)?;
-    if e.pc.strong_count() == 0 || e.device_key != device_key {
+    if e.pc.strong_count() == 0 || e.device_token.is_empty() || e.device_token != device_token {
         return None;
     }
-    Some(e.device_key.clone())
+    Some(e.join_id.clone())
 }
 
 /// One `a=candidate:` line's worth of trickled ICE, as RFC 9725 sends it.
@@ -2826,10 +2877,11 @@ pub fn parse_trickle_fragment(body: &str) -> TrickleFragment {
 
 /// Feed trickled candidates to a live session.
 ///
-/// The resource must be live *and* belong to `device_key`, and the session's fragment budget must
-/// not be spent — the id is a capability, but it rides a cleartext header on the HTTP listener, so
-/// it is not the only thing standing between an observer and a media-redirection primitive.
-pub async fn add_trickled_candidates(id: &str, device_key: &str, body: &str) -> TrickleLookup {
+/// The resource must be live *and* belong to `device_token`, and the session's fragment budget
+/// must not be spent — the id is a capability, but it rides a cleartext header on the HTTP
+/// listener, so it is not the only thing standing between an observer and a media-redirection
+/// primitive.
+pub async fn add_trickled_candidates(id: &str, device_token: &str, body: &str) -> TrickleLookup {
     use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
     // The budget is charged under the same lock that resolves the session, so concurrent
@@ -2839,7 +2891,7 @@ pub async fn add_trickled_candidates(id: &str, device_key: &str, body: &str) -> 
         let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(id)) else {
             return TrickleLookup::Unknown;
         };
-        if entry.device_key != device_key {
+        if entry.device_token.is_empty() || entry.device_token != device_token {
             return TrickleLookup::Unknown;
         }
         let Some(pc) = entry.pc.upgrade() else {

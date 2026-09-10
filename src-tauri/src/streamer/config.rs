@@ -178,6 +178,9 @@ pub struct Config {
     pub device_reporter: Option<SharedDeviceReporter>,
     pub device_overrides: Option<SharedDeviceOverrides>,
     pub sessions: Option<SharedSessions>,
+    /// The per-device audio sink choice, keyed by device token. Per device rather than per join:
+    /// two tabs of one browser share one set of speakers.
+    pub audio_sinks: Option<crate::streamer::session::SharedAudioSinks>,
     pub disconnect_grace: Option<SharedDisconnectGrace>,
     pub user_turn: Option<SharedTurnConfig>,
     pub banned_devices: Option<SharedBannedDevices>,
@@ -234,6 +237,7 @@ impl Default for Config {
             device_reporter: None,
             device_overrides: None,
             sessions: None,
+            audio_sinks: None,
             disconnect_grace: None,
             user_turn: None,
             banned_devices: None,

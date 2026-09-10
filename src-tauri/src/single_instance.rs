@@ -212,7 +212,15 @@ fn handle_connection<Q, R>(
         }
         Some("QUIT") => quit(app),
         Some("STATS") => {
-            let json = crate::streamer::telemetry::snapshot_json().to_string();
+            // The telemetry registry is keyed by join id and carries no labels, so the session
+            // map supplies the names, addresses and geometry `devices list` prints beside them.
+            let mut snapshot = crate::streamer::telemetry::snapshot_json();
+            if let Some(state) = app.try_state::<crate::AppState>() {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("joins".into(), join_rows(&state.sessions));
+                }
+            }
+            let json = snapshot.to_string();
             let _ = stream.write_all(json.as_bytes());
             let _ = stream.write_all(b"\n");
             let _ = stream.flush();
@@ -325,6 +333,35 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
     stream
         .write_all(format!("{token} {}\n", command.verb()).as_bytes())
         .is_ok()
+}
+
+/// One JSON object per live join, for `ScreenExtend devices list` and `status --json`.
+///
+/// Keyed by the join id, which is the session's identity. The address is a label beside it: it
+/// moves under a live session and it is recycled between devices, so it never names one.
+fn join_rows(sessions: &crate::streamer::session::SharedSessions) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = crate::streamer::session::join_summaries(sessions)
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "joinId": r.join_id,
+                "token": r.device_token,
+                "ip": r.ip,
+                "name": r.name,
+                "screenSize": r.screen_size,
+                "display": r.display.map(|d| serde_json::json!({
+                    "id": d.display_id,
+                    "device": d.device_name,
+                    "width": d.width,
+                    "height": d.height,
+                    "refresh": d.refresh,
+                    "scale": d.scale,
+                    "portrait": d.portrait,
+                })),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
 }
 
 #[cfg(test)]

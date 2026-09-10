@@ -178,3 +178,18 @@ that before it ships.
 `hostedNetworkCredentials.password` and `turnConfig.credential` renders as a row of dots with
 its key name still legible beside it, and hovering or clicking into one reveals it. Editing
 any value and pressing Save Config must write and re-read without an error toast.
+
+## 12. One row per join (rows 338, 339)
+
+A device with two tabs open holds two sessions and two displays, and the Devices page is where
+that has to be legible.
+
+| Check | How | Expected |
+|---|---|---|
+| Two rows, one device | Join from two tabs of one browser | Two rows on **Devices** with the same device name. The header reads "2 Screens Connected". |
+| Told apart | Look at the two row labels | The name carries a suffix: the tab's screen size where the two differ, else `(1)`/`(2)`. A device with only one session shows no suffix at all. |
+| Refresh is per tab | Click the refresh button on one row | Only that tab renegotiates; the other keeps painting. |
+| Settings are per device | Open the sheet on either row and change the video quality | Both tabs reconfigure, and reopening the sheet on the *other* row shows the same value. There is one saved row in `config.json`, keyed by `token`. |
+| Removing the device | "Remove device" on either row | Both sessions end and both rows go. |
+| Trust is by token | Settings -> known devices, with two tabs open | One row for the device, marked Connected. Banning it ends both sessions. |
+| A recycled address | Ban a device, disconnect it, then join from a different device that picks up its address | The new device joins normally and is not marked banned. Its settings are its own. |
