@@ -690,12 +690,13 @@
 
     // `selectAudioOutput()` (Firefox 116+, Chromium behind a flag) is the only permission-free
     // output picker in any engine, and the only one that gives a label without a microphone
-    // grant. It needs transient activation, so it can only ever come from a control the user
-    // clicks — the speaker button beside the fullscreen toggle on the join form. The stage
-    // cannot host it: a live session takes pointer lock on the first gesture, and a click there
-    // goes to the host rather than to a button.
+    // grant. It needs transient activation, so it can only ever come from a gesture the user
+    // makes: the Join button's own click, or — after a host-initiated change the engine
+    // refused — the next tap on the stage. The page has no control of its own for it, and the
+    // stage cannot be one: a live session takes pointer lock on the first gesture and a click
+    // there belongs to the host.
     //
-    // That control is pressed before there is an AudioContext, so the choice is remembered and
+    // The Join click lands before there is an AudioContext, so the choice is remembered and
     // `applyPendingSink` routes it the moment the graph exists. The tier is claimed only once
     // the sink actually moved, because a picker that returns a device the engine then refuses
     // to route to is exactly the silent failure `sinkTier` exists to expose.
