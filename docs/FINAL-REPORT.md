@@ -2048,3 +2048,126 @@ installed"** with only an Exit button. Two defects, both fixed after this report
 every first launch used before the probe existed), and `doctor`'s certificate check asked
 `certutil` for the wrong subject and always reported the signing certificate absent. Both are in
 the final commit and the rebuilt bundles.
+
+## 15.2 Post-report UX changes (owner's rulings)
+
+Everything in §1–§15.1 was written before this section's work existed. Three UX workstreams ran
+after the report was signed off, against rulings the owner gave when the open UI questions were
+put to them. The rulings are recorded here because several of them **contradict statements made
+earlier in this report and in `CLAUDE.md`**, and the code now follows the ruling, not the earlier
+text.
+
+### The rulings
+
+- **The microphone card is shown before the join and waits for an answer.** Enumerating output
+  devices needs a `getUserMedia` grant, and the old flow asked for it opportunistically, mid
+  session. A permission prompt that lands on top of a running picture is worse than one that
+  lands on a form nobody is watching yet. **Nothing interrupts a session that is already
+  streaming** — if the answer did not arrive before the join, the feature stays off for that
+  session rather than stealing focus later.
+- **Trickle ICE is settled before the stage appears.** Candidates are exchanged while the join
+  form is still up; **once the picture is on screen there is no rejoin and no renegotiation.** A
+  session that has shown a frame is not torn down to add a candidate.
+- **"Switch to HTTPS" is offered always**, not only where the page guessed the upgrade would
+  work. The guess was wrong often enough that the honest thing is to offer the action and let it
+  fail visibly.
+- **`at-capacity.html` is served only on the AirPlay tier.** That is the one backend with a real
+  cap (`max_concurrent_displays() == Some(1)`, because macOS owns the display). Every other
+  backend is uncapped and must never turn a device away.
+- **Startup never blocks unless there is no virtual display or no video path.** Anything else
+  that is missing but installable is installed or patched automatically and the app relaunches
+  itself; anything else that is missing and not installable gets **"Continue anyway"**. The gate
+  refuses to open the app only when the two things the product *is* are absent.
+- **All seventeen UI-visible items are applied.** They had been recorded as recommendations
+  during the overhaul precisely because the engagement's own rule forbade changing the UI; that
+  rule is now lifted for these seventeen.
+- **The Firefox output picker is raised from the Join gesture**, and the host's choice and the
+  client's actual sink are **synchronised both ways**.
+- **Every modal suspends input proxying.** A dialog on the client must not be typing into the
+  host behind it.
+
+### What landed, by branch
+
+| Branch | Head | Territory |
+|---|---|---|
+| `ux-host` | `d55783b` | the startup gate (`BareMinimum`, `capability_notes()` per platform, `src/lib/startup-gate.ts`, `pnpm test:gate`), the remediation/relaunch flow in `bootstrap.tsx`, `session::concurrent_display_cap`, `PointerScope` + `set_device_pointer_scope` in all three `*_utils` + `devices set --pointer-scope` |
+| `ux-desktop` | `fcc7fad` | ui17 items 1–6, 8, 11–15; `get_hosted_network_status` + `HostedNetworkReport` in all three `*_utils`; the `ScreenRecordingRevoked` event; `HostedNetworkPanel`; `PermissionLapseDialog`; the walkthrough lazy chunk; `docs/manual-tests/desktop-ui.md` |
+| `ux-client` | `3272cc9` | the client page's mic flow, trickle settle, `current: Option<String>` end to end, and the review-8 fixes |
+
+Ledger rows **309–321** carry the before/after for each. The one number worth repeating here is
+row 310, because it is the only measured saving in this batch: moving `nextstepjs` + `motion`
+behind `React.lazy` took the entry chunk from **567.11 kB / gzip 182.11 kB** — over rollup's
+500 kB warning — to **419.66 kB / gzip 134.56 kB**, i.e. **−147.45 kB (−26.0 %)**, gzip
+**−47.55 kB (−26.1 %)**, with the tour becoming a 151.69 kB chunk fetched on first start. The
+blocker there was structural rather than size: `NextStepReact` renders a
+`div[data-name=nextstep-wrapper]{position:relative}`, and that relative box is the containing
+block for every absolutely-positioned descendant with no nearer positioned ancestor —
+`#innerSidebar` among them — so the two wrapper elements are reproduced statically in `App.tsx`
+and stay in the tree whether or not the tour chunk is ever loaded.
+
+### Review 8
+
+`docs/reviews/client-review-8-ux.md` is the cold read of the client-page half: **1 high,
+5 medium, 12 low**. The high one is worth stating because it is the kind of defect that only
+appears once a feature is wired to a poll: `process_reconfig` puts `audioSink` in **every**
+`/reconfig` body, so `applyReconfig` called `SEAudio.setSpeaker` about once a second; when the
+engine could not route to the host's choice, `setSpeaker` returned `false` on every tick and the
+queued output picker re-armed — reopening on every tap for the rest of the session. All 18 are
+fixed on `ux-client`.
+
+### What is **not** compiled: the macOS side
+
+The Mac was shut down for this pass, so **every macOS-only line in these three branches has never
+been through a compiler.** It is merged, it is gated on Windows, and on macOS it is
+`UNVERIFIED (macOS not compiled — Mac offline)` — which is weaker than every other macOS claim in
+this report, all of which are at least `COMPILE-CHECKED` on the 10.15 box. The ledger rows
+carrying that status are the authoritative list; they are:
+
+- **Row 316** — `get_hosted_network_status` / `HostedNetworkReport` in `macos_utils`. The macOS
+  arm returns no channel, because neither WinRT tier exposes one and the CoreWLAN side was never
+  built against a compiler.
+- **Row 318** — `ScreenRecordingRevoked`, whose only emitter is the **macOS** session watchdog in
+  `macos_utils/permissions.rs`. On Windows the event type exists and nothing raises it, so the
+  Windows gate proves the type compiles and proves nothing about the emitter.
+
+Everything else these branches touch on macOS is a shared file that Windows also compiles.
+
+**The Mac tree is still at `38724f7`** and does not have any of this. Bringing it forward is a
+bundle and a merge, exactly as `docs/dev-workflow.md` describes, and the first thing to run there
+is `cargo check --all-targets`, then the three cargo gates, then `check-macos-dyld.sh` on a
+release build. Until that happens the two trees have diverged for the first time since Phase A.
+
+### Gates on the final tree (Windows only)
+
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` **390 passed /
+0 failed / 13 ignored** and again under `SE_REQUIRE_HW=1`, `pnpm lint` 0 errors, `pnpm build`,
+`check-legacy-webkit.mjs`, `pnpm test:client` 7/7, `pnpm test:gate`, `check-bindings.mjs`
+**50 commands / 11 events**, `check-versions.mjs`, blob checksums **34/34 + 5/5**, and both
+workflow YAMLs parse. `pnpm test:gate` is now a step in `ci.yml`'s `frontend` job.
+
+`bindings.ts` was regenerated from the merged tree after each of the three merges and reproduced
+the merge's own result byte for byte each time.
+
+### The build
+
+`pnpm tauri build` from the repo root, with
+`CARGO_TARGET_DIR=C:/Users/sarve/.cargo/shared_target/ScreenExtend` — which is why the bundle is
+**not** under `src-tauri/target/`, as `CLAUDE.md`'s command list would otherwise suggest.
+
+Release profile compiled in **7m 41s**; both installers were produced; the run then exited **1**
+on the one acceptable failure:
+
+```
+Error A public key has been found, but no private key. Make sure to set
+`TAURI_SIGNING_PRIVATE_KEY` environment variable.
+```
+
+That is the updater signing step, which runs after bundling and needs a key nobody on this
+project holds. Nothing else in the run failed.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 13,897,728 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,815,774 |
+| `…/release/ScreenExtend.exe` | 29,921,792 |
+
