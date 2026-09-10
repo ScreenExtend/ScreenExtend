@@ -204,7 +204,9 @@
     },
     "permissions": {
       "checkFailedTitle": "Couldn't Check Permissions",
-      "checkFailedDescription": "ScreenExtend couldn't read the current permission status. Try again, or restart the app."
+      "checkFailedDescription": "ScreenExtend couldn't read the current permission status. Try again, or restart the app.",
+      "checkUnreadableTitle": "Couldn't Read Permissions",
+      "checkUnreadableDescription": "ScreenExtend could not read which permissions are granted, so it started without knowing. If a device connects to a blank screen, check Screen Recording in System Settings."
     },
     "driverInstall": {
       "failureTitle": "Couldn't Install Drivers",
@@ -261,6 +263,10 @@
     "compatibility": {
       "saveFailedTitle": "Couldn't Save Your Choice",
       "saveFailedDescription": "This compatibility notice may appear again the next time you open ScreenExtend."
+    },
+    "networkAdapters": {
+      "failureTitle": "Couldn't Read Network Adapters",
+      "failureDescription": "ScreenExtend is running, but it could not list this computer's networks, so no join links are shown. Reopen the Add Device screen to try again."
     }
   },
   "device": {
@@ -356,6 +362,7 @@
   },
   "bootstrap": {
     "starting": "Starting ScreenExtend",
+    "installingDriver": "Installing the display driver",
     "update": {
       "title": "Downloading Update",
       "versionNote": "A new version ({version}) of ScreenExtend is being downloaded and installed.",
@@ -376,7 +383,8 @@
       "installPrompt": "Click the button below to install the missing components.",
       "bodyAfterPrompt": " If this error is recurring, contact support at ",
       "contactSuffix": ".",
-      "install": "Install Drivers"
+      "install": "Install Drivers",
+      "retry": "Try Again"
     },
     "compatibility": {
       "blockingTitle": "Unsupported Operating System",
@@ -387,7 +395,9 @@
       "limitedIntro": "The following platform APIs are unavailable. ScreenExtend can continue, but these features will be limited or non-functional:",
       "apiRequires": "(requires {version})",
       "upgradeBefore": "Please upgrade your operating system or contact support at ",
-      "upgradeSuffix": "."
+      "upgradeSuffix": ".",
+      "cannotStartTitle": "ScreenExtend Can't Start on This Computer",
+      "cannotStartIntro": "ScreenExtend needs to create a display and send video, and this computer cannot do either right now. Everything that could be installed automatically has been tried. What is missing:"
     },
     "permissions": {
       "title": "Permissions Required",

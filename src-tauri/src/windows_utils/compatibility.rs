@@ -11,7 +11,7 @@ use wmi::{COMLibrary, WMIConnection};
 use super::hosted_network::{probe_backend, HostedNetworkBackend};
 use super::streamer::{select_vendor, Vendor};
 use super::virtual_display::{probe_display_backend, DisplayBackend};
-use crate::{CompatibilityReport, UnsupportedApi};
+use crate::{api_key, BareMinimum, CompatibilityReport, UnsupportedApi};
 
 /// Windows 10 20H1. Kept for the "minimum required" line the compatibility panel shows; the
 /// decision of whether this host is supported is made by probing the capture backends.
@@ -289,34 +289,31 @@ fn amd_backend_name(same_adapter: bool) -> String {
     }
 }
 
-#[tauri::command]
-#[specta::specta]
-pub fn check_system_requirements() -> CompatibilityReport {
-    let (os_version, build_num) = read_os_info();
-
-    let probes = run_probes();
-    // Supported means "a capture backend actually works here", not "the build number is high
-    // enough". The build number stays as the text we show.
-    let os_supported = probes.wgc || probes.dxgi;
+/// Turn what was probed into the capability notes the report carries.
+///
+/// Pure, and separate from [`check_system_requirements`], because the severities are a policy
+/// question — *which* missing capability is allowed to stop startup — and a policy is only
+/// worth anything if it can be tested against a machine that does not have the fault.
+fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
     let mut unsupported: Vec<UnsupportedApi> = Vec::new();
 
+    // The only bare-minimum row this platform can produce: with neither backend there is no
+    // picture to send, and no fallback left to try. One of the two missing is not a verdict —
+    // the other one streams — so it is `optional` and the user is offered "Continue anyway".
     if !probes.wgc && !probes.dxgi {
-        unsupported.push(UnsupportedApi {
-            name: "Screen Capture (Windows Graphics Capture / DXGI Desktop Duplication)"
-                .to_string(),
-            description: "Captures the screen to stream to connected devices.".to_string(),
-            required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "blocking".to_string(),
-        });
+        unsupported.push(UnsupportedApi::blocking(
+            BareMinimum::Capture,
+            "Screen Capture (Windows Graphics Capture / DXGI Desktop Duplication)",
+            "Captures the screen to stream to connected devices.",
+            "Windows 10 20H1 (build 19041)",
+        ));
     } else if !probes.wgc {
-        unsupported.push(UnsupportedApi {
-            name: "Windows Graphics Capture".to_string(),
-            description:
-                "Preferred screen capture backend; falling back to DXGI Desktop Duplication."
-                    .to_string(),
-            required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::CAPTURE_PREFERRED,
+            "Windows Graphics Capture",
+            "Preferred screen capture backend; falling back to DXGI Desktop Duplication.",
+            "Windows 10 20H1 (build 19041)",
+        ));
     }
 
     match probes.display_backend {
@@ -326,71 +323,80 @@ pub fn check_system_requirements() -> CompatibilityReport {
         // every fresh install, whose pre-uninstall hook removes the previous driver) goes
         // through. `installable` keeps the row visible to `doctor` and `status` without the
         // desktop UI treating a missing driver as an unsupported operating system.
-        DisplayBackend::DriverNotInstalled => unsupported.push(UnsupportedApi {
-            name: "Virtual Display Driver".to_string(),
-            description:
-                "Not installed. Each connected device needs one; install the driver to continue."
-                    .to_string(),
-            required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "installable".to_string(),
-        }),
-        DisplayBackend::DriverNotResponding => unsupported.push(UnsupportedApi {
-            name: "Virtual Display Driver".to_string(),
-            description:
-                "Installed but not answering. Reinstall the driver, or restart this machine."
-                    .to_string(),
-            required_version: "Windows 10 20H1 (build 19041)".to_string(),
-            severity: "installable".to_string(),
-        }),
+        DisplayBackend::DriverNotInstalled => unsupported.push(UnsupportedApi::installable(
+            api_key::DISPLAY_DRIVER,
+            "Virtual Display Driver",
+            "Not installed. Each connected device needs one; install the driver to continue.",
+            "Windows 10 20H1 (build 19041)",
+        )),
+        DisplayBackend::DriverNotResponding => unsupported.push(UnsupportedApi::installable(
+            api_key::DISPLAY_DRIVER_UNRESPONSIVE,
+            "Virtual Display Driver",
+            "Installed but not answering. Reinstall the driver, or restart this machine.",
+            "Windows 10 20H1 (build 19041)",
+        )),
     }
 
+    // A WARP-only machine is slow, not incapable: x264 encodes what WARP composes, so this
+    // costs latency and CPU rather than the ability to stream.
     if probes.encoder.software_adapter_only {
-        unsupported.push(UnsupportedApi {
-            name: "Hardware graphics adapter".to_string(),
-            description: "Only a software rasteriser (WARP) was found; expect high latency and \
-                          high CPU use."
-                .to_string(),
-            required_version: "any GPU".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::GPU_ADAPTER,
+            "Hardware graphics adapter",
+            "Only a software rasteriser (WARP) was found; expect high latency and high CPU use.",
+            "any GPU",
+        ));
     }
 
     if probes.audio_backend == "none" {
-        unsupported.push(UnsupportedApi {
-            name: "System Audio Capture".to_string(),
-            description: "No default audio output device, so there is nothing to capture."
-                .to_string(),
-            required_version: "Windows 10".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::AUDIO,
+            "System Audio Capture",
+            "No default audio output device, so there is nothing to capture.",
+            "Windows 10",
+        ));
     }
 
     if !probes.wifi_radios {
-        unsupported.push(UnsupportedApi {
-            name: "WinRT Wi-Fi Radios".to_string(),
-            description: "Detecting and toggling the Wi-Fi radio state.".to_string(),
-            required_version: "Windows 10".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::WIFI_RADIOS,
+            "WinRT Wi-Fi Radios",
+            "Detecting and toggling the Wi-Fi radio state.",
+            "Windows 10",
+        ));
     }
 
     if probes.hosted_network == HostedNetworkBackend::Unsupported {
-        unsupported.push(UnsupportedApi {
-            name: "Wi-Fi Direct / Mobile Hotspot".to_string(),
-            description: "Hosting a Wi-Fi hotspot for devices to join.".to_string(),
-            required_version: "Windows 10".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::HOSTED_NETWORK,
+            "Wi-Fi Direct / Mobile Hotspot",
+            "Hosting a Wi-Fi hotspot for devices to join.",
+            "Windows 10",
+        ));
     }
 
     if !probes.wmi {
-        unsupported.push(UnsupportedApi {
-            name: "WMI (Windows Management Instrumentation)".to_string(),
-            description: "Enumerating network adapters and IP addresses.".to_string(),
-            required_version: "Windows".to_string(),
-            severity: "optional".to_string(),
-        });
+        unsupported.push(UnsupportedApi::optional(
+            api_key::WMI,
+            "WMI (Windows Management Instrumentation)",
+            "Enumerating network adapters and IP addresses.",
+            "Windows",
+        ));
     }
+
+    unsupported
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn check_system_requirements() -> CompatibilityReport {
+    let (os_version, build_num) = read_os_info();
+
+    let probes = run_probes();
+    // Supported means "a capture backend actually works here", not "the build number is high
+    // enough". The build number stays as the text we show.
+    let os_supported = probes.wgc || probes.dxgi;
+    let unsupported = capability_notes(&probes);
 
     if build_num != 0 && build_num < MIN_BUILD {
         tprintln!(
@@ -417,6 +423,183 @@ pub fn check_system_requirements() -> CompatibilityReport {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn healthy() -> Probes {
+        Probes {
+            wgc: true,
+            dxgi: true,
+            wifi_radios: true,
+            wmi: true,
+            audio_backend: "wasapi",
+            capture_backend: "WindowsGraphicsCapture",
+            encoder: EncoderProbe {
+                backend: "nvenc".to_string(),
+                software_adapter_only: false,
+            },
+            display_backend: DisplayBackend::IddDriver,
+            hosted_network: HostedNetworkBackend::WiFiDirect,
+        }
+    }
+
+    fn keys(notes: &[UnsupportedApi], severity: &str) -> Vec<String> {
+        notes
+            .iter()
+            .filter(|a| a.severity == severity)
+            .map(|a| a.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_healthy_host_has_nothing_to_report() {
+        assert!(capability_notes(&healthy()).is_empty());
+    }
+
+    /// The rule the owner set: only a host that cannot create a display, cannot capture, or
+    /// cannot encode may be stopped. Everything else is a degraded feature and the user gets
+    /// "Continue anyway", so no combination of the optional faults may produce a blocking row.
+    #[test]
+    fn no_optional_fault_can_stop_startup() {
+        let cases: Vec<(&str, Probes)> = vec![
+            (
+                "WGC absent, DXGI present",
+                Probes {
+                    wgc: false,
+                    ..healthy()
+                },
+            ),
+            (
+                "no default audio endpoint",
+                Probes {
+                    audio_backend: "none",
+                    ..healthy()
+                },
+            ),
+            (
+                "no Wi-Fi radios",
+                Probes {
+                    wifi_radios: false,
+                    ..healthy()
+                },
+            ),
+            (
+                "no hosted network",
+                Probes {
+                    hosted_network: HostedNetworkBackend::Unsupported,
+                    ..healthy()
+                },
+            ),
+            (
+                "no WMI",
+                Probes {
+                    wmi: false,
+                    ..healthy()
+                },
+            ),
+            (
+                "WARP only",
+                Probes {
+                    encoder: EncoderProbe {
+                        backend: "x264".to_string(),
+                        software_adapter_only: true,
+                    },
+                    ..healthy()
+                },
+            ),
+            (
+                "every optional fault at once",
+                Probes {
+                    wgc: false,
+                    wifi_radios: false,
+                    wmi: false,
+                    audio_backend: "none",
+                    hosted_network: HostedNetworkBackend::Unsupported,
+                    encoder: EncoderProbe {
+                        backend: "x264".to_string(),
+                        software_adapter_only: true,
+                    },
+                    ..healthy()
+                },
+            ),
+        ];
+        for (what, probes) in cases {
+            let notes = capability_notes(&probes);
+            assert!(
+                !notes.is_empty(),
+                "{what}: a degraded capability must still be reported"
+            );
+            assert!(
+                keys(&notes, crate::SEVERITY_BLOCKING).is_empty(),
+                "{what}: produced a blocking row {:?}; only the bare minimum may block",
+                keys(&notes, crate::SEVERITY_BLOCKING)
+            );
+        }
+    }
+
+    /// The two driver states are the app's own to fix, so they are `installable` and the
+    /// bootstrap remediates them before it decides anything. They must stay distinguishable:
+    /// a missing driver is installed, one that is not answering is reinstalled.
+    #[test]
+    fn the_driver_states_are_installable_and_distinct() {
+        let missing = capability_notes(&Probes {
+            display_backend: DisplayBackend::DriverNotInstalled,
+            ..healthy()
+        });
+        assert_eq!(
+            keys(&missing, crate::SEVERITY_INSTALLABLE),
+            vec![api_key::DISPLAY_DRIVER.to_string()]
+        );
+        assert!(keys(&missing, crate::SEVERITY_BLOCKING).is_empty());
+
+        let mute = capability_notes(&Probes {
+            display_backend: DisplayBackend::DriverNotResponding,
+            ..healthy()
+        });
+        assert_eq!(
+            keys(&mute, crate::SEVERITY_INSTALLABLE),
+            vec![api_key::DISPLAY_DRIVER_UNRESPONSIVE.to_string()]
+        );
+    }
+
+    /// No capture backend at all is the one thing that genuinely cannot be worked around.
+    #[test]
+    fn losing_every_capture_backend_is_the_bare_minimum() {
+        let notes = capability_notes(&Probes {
+            wgc: false,
+            dxgi: false,
+            capture_backend: "none",
+            ..healthy()
+        });
+        assert_eq!(
+            keys(&notes, crate::SEVERITY_BLOCKING),
+            vec![api_key::CAPTURE.to_string()]
+        );
+    }
+
+    /// `bare_minimum_missing` is what the startup gate asks, so an `installable` row must
+    /// never answer it — that is the whole point of the severity.
+    #[test]
+    fn an_installable_row_is_not_a_verdict() {
+        let mut report = CompatibilityReport {
+            os_name: "Windows".into(),
+            os_version: "test".into(),
+            min_os_version: "test".into(),
+            os_supported: true,
+            unsupported_apis: capability_notes(&Probes {
+                display_backend: DisplayBackend::DriverNotInstalled,
+                ..healthy()
+            }),
+            audio_backend: "wasapi".into(),
+            display_backend: "none".into(),
+            capture_backend: "WindowsGraphicsCapture".into(),
+            encoder_backend: "nvenc".into(),
+            hosted_network_backend: "WiFiDirect".into(),
+            input_backend: "SendInput".into(),
+        };
+        assert!(!report.bare_minimum_missing());
+        assert_eq!(report.installable().count(), 1);
+        report.os_supported = false;
+        assert!(report.bare_minimum_missing());
+    }
 
     /// The compatibility report and the capture path must answer the same question the same way.
     ///

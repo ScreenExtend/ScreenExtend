@@ -5,7 +5,7 @@ use objc2_foundation::NSProcessInfo;
 
 use crate::macos_utils::hosted_network::{probe_hosted_network_backend, HostedNetworkBackend};
 use crate::macos_utils::virtual_display::{probe_display_backend, DisplayBackend};
-use crate::{CompatibilityReport, UnsupportedApi};
+use crate::{api_key, BareMinimum, CompatibilityReport, UnsupportedApi};
 
 const MIN_MAJOR: isize = 10;
 const MIN_MINOR: isize = 15;
@@ -54,6 +54,116 @@ pub fn hosted_network_backend() -> &'static str {
     probe_hosted_network_backend().as_str()
 }
 
+/// What was probed, so [`capability_notes`] can be exercised for a fault this Mac does not have.
+struct Probes {
+    at_least_min: bool,
+    sck_available: bool,
+    display_backend: DisplayBackend,
+    hostap: HostedNetworkBackend,
+    injects_input: bool,
+    audio_unsupported: bool,
+}
+
+/// Turn what was probed into the capability notes the report carries.
+///
+/// The severities encode one rule: `blocking` is only for a host that cannot create a display,
+/// cannot capture, or cannot encode. On this platform that leaves exactly one blocking row — an
+/// OS below the app's own floor, where `CGVirtualDisplay` is not reachable at all. Everything
+/// else here is a degraded feature: the audio tier, the hosted network, Accessibility (which
+/// only gates remote input), the AirPlay display cap, and ScreenCaptureKit-versus-CGDisplayStream
+/// where both capture.
+///
+/// Screen Recording is deliberately absent. It is a *permission*, it is reported through
+/// `check_permissions` as `required`, and the permission gate runs before this report is ever
+/// asked for — reporting it twice would let one surface contradict the other.
+fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
+    let mut unsupported: Vec<UnsupportedApi> = Vec::new();
+
+    if !probes.at_least_min {
+        unsupported.push(UnsupportedApi::blocking(
+            BareMinimum::Display,
+            "CGVirtualDisplay (Virtual Displays)",
+            "Creating a display for each connected device.",
+            "macOS 10.15 Catalina",
+        ));
+        unsupported.push(UnsupportedApi::optional(
+            api_key::AUDIO,
+            "System Audio Capture",
+            "Streams this Mac's audio output to connected devices.",
+            "macOS 10.15 Catalina",
+        ));
+    } else if !probes.sck_available {
+        unsupported.push(UnsupportedApi::optional(
+            api_key::CAPTURE_PREFERRED,
+            "ScreenCaptureKit",
+            "Preferred screen capture backend; falling back to CGDisplayStream.",
+            "macOS 12.3",
+        ));
+    }
+
+    // No display backend at all. `probe_display_backend` does not return this today — it falls
+    // back to AirPlay — but `new_shared_controller` answers `None` for it, which is a host that
+    // cannot give a joining device anything to look at. That is bare minimum, and the arm exists
+    // so a future tier that probes its way to `Unsupported` is classified rather than silently
+    // reported as a working host.
+    if probes.at_least_min && probes.display_backend == DisplayBackend::Unsupported {
+        unsupported.push(UnsupportedApi::blocking(
+            BareMinimum::Display,
+            "Virtual Displays",
+            "No way to create a display for a connected device was found on this Mac.",
+            "macOS 10.14.4",
+        ));
+    }
+
+    // The AirPlay tier is capped at one display by macOS itself. Reported as a backend name only,
+    // that limit surfaced when the user connected a second device and it failed.
+    if probes.display_backend == DisplayBackend::AirPlayFallback {
+        unsupported.push(UnsupportedApi::optional(
+            api_key::DISPLAY_CAPPED,
+            "CGVirtualDisplay",
+            "Displays are created over AirPlay instead, which macOS limits to one connected \
+             device at a time.",
+            "macOS 10.14.4",
+        ));
+    }
+
+    if probes.hostap == HostedNetworkBackend::Unsupported {
+        unsupported.push(UnsupportedApi::optional(
+            api_key::HOSTED_NETWORK,
+            "Wi-Fi HostAP",
+            "Creating a Wi-Fi network from this Mac so a device can join without a router. \
+             Connect both devices to the same network instead.",
+            "not available on this Mac",
+        ));
+    }
+
+    // Not granted means every `CGEventPost` is dropped by the OS with no error the process can
+    // observe, so a client with remote control enabled sees a host that simply never moves.
+    // Reported through the list that already exists rather than a new UI surface; the
+    // `request_permission` / `open_permission_settings` commands are what act on it. Optional,
+    // and it must stay optional: this Mac still extends a display without it.
+    if probes.at_least_min && !probes.injects_input {
+        unsupported.push(UnsupportedApi::optional(
+            api_key::INPUT_ACCESSIBILITY,
+            "Accessibility (Remote Control)",
+            "Letting a connected device drive this Mac's keyboard and pointer. Enable \
+             ScreenExtend in System Settings > Privacy & Security > Accessibility.",
+            "permission not granted",
+        ));
+    }
+
+    if probes.at_least_min && probes.audio_unsupported {
+        unsupported.push(UnsupportedApi::optional(
+            api_key::AUDIO,
+            "System Audio Capture",
+            "Streams this Mac's audio output to connected devices.",
+            "macOS 10.15 Catalina",
+        ));
+    }
+
+    unsupported
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn check_system_requirements() -> CompatibilityReport {
@@ -62,79 +172,16 @@ pub fn check_system_requirements() -> CompatibilityReport {
     let display_backend = probe_display_backend();
     let hostap_backend = probe_hosted_network_backend();
     let input_backend = crate::streamer::input::probe_backend();
-
-    let mut unsupported: Vec<UnsupportedApi> = Vec::new();
-
-    if !at_least_min {
-        unsupported.push(UnsupportedApi {
-            name: "CGVirtualDisplay (Virtual Displays)".to_string(),
-            description: "Creating a display for each connected device.".to_string(),
-            required_version: "macOS 10.15 Catalina".to_string(),
-            severity: "blocking".to_string(),
-        });
-        unsupported.push(UnsupportedApi {
-            name: "System Audio Capture".to_string(),
-            description: "Streams this Mac's audio output to connected devices.".to_string(),
-            required_version: "macOS 10.15 Catalina".to_string(),
-            severity: "optional".to_string(),
-        });
-    } else if !sck_available {
-        unsupported.push(UnsupportedApi {
-            name: "ScreenCaptureKit".to_string(),
-            description: "Preferred screen capture backend; falling back to CGDisplayStream."
-                .to_string(),
-            required_version: "macOS 12.3".to_string(),
-            severity: "optional".to_string(),
-        });
-    }
-
-    // The AirPlay tier is capped at one display by macOS itself. Reported as a backend name only,
-    // that limit surfaced when the user connected a second device and it failed.
-    if display_backend == DisplayBackend::AirPlayFallback {
-        unsupported.push(UnsupportedApi {
-            name: "CGVirtualDisplay".to_string(),
-            description: "Displays are created over AirPlay instead, which macOS limits to one \
-                          connected device at a time."
-                .to_string(),
-            required_version: "macOS 10.14.4".to_string(),
-            severity: "optional".to_string(),
-        });
-    }
-
-    if hostap_backend == HostedNetworkBackend::Unsupported {
-        unsupported.push(UnsupportedApi {
-            name: "Wi-Fi HostAP".to_string(),
-            description: "Creating a Wi-Fi network from this Mac so a device can join without a \
-                          router. Connect both devices to the same network instead."
-                .to_string(),
-            required_version: "not available on this Mac".to_string(),
-            severity: "optional".to_string(),
-        });
-    }
-
-    // Not granted means every `CGEventPost` is dropped by the OS with no error the process can
-    // observe, so a client with remote control enabled sees a host that simply never moves.
-    // Reported through the list that already exists rather than a new UI surface; the
-    // `request_permission` / `open_permission_settings` commands are what act on it.
-    if at_least_min && !input_backend.injects() {
-        unsupported.push(UnsupportedApi {
-            name: "Accessibility (Remote Control)".to_string(),
-            description: "Letting a connected device drive this Mac's keyboard and pointer.                           Enable ScreenExtend in System Settings > Privacy & Security >                           Accessibility."
-                .to_string(),
-            required_version: "permission not granted".to_string(),
-            severity: "optional".to_string(),
-        });
-    }
-
     let audio_backend = super::audio::probe_audio_backend();
-    if at_least_min && audio_backend == super::audio::AudioBackend::Unsupported {
-        unsupported.push(UnsupportedApi {
-            name: "System Audio Capture".to_string(),
-            description: "Streams this Mac's audio output to connected devices.".to_string(),
-            required_version: "macOS 10.15 Catalina".to_string(),
-            severity: "optional".to_string(),
-        });
-    }
+
+    let unsupported = capability_notes(&Probes {
+        at_least_min,
+        sck_available,
+        display_backend,
+        hostap: hostap_backend,
+        injects_input: input_backend.injects(),
+        audio_unsupported: audio_backend == super::audio::AudioBackend::Unsupported,
+    });
 
     tprintln!(
         "[compat] {} — capture {}, display {}, audio {}, hosted network {}, input {}",
@@ -182,5 +229,113 @@ mod tests {
             capture_backend(),
             "ScreenCaptureKit" | "CGDisplayStream"
         ));
+    }
+
+    fn healthy() -> Probes {
+        Probes {
+            at_least_min: true,
+            sck_available: true,
+            display_backend: DisplayBackend::CgVirtualDisplay,
+            hostap: HostedNetworkBackend::HostApSpi,
+            injects_input: true,
+            audio_unsupported: false,
+        }
+    }
+
+    fn blocking_keys(notes: &[UnsupportedApi]) -> Vec<String> {
+        notes
+            .iter()
+            .filter(|a| a.is_blocking())
+            .map(|a| a.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_healthy_mac_has_nothing_to_report() {
+        assert!(capability_notes(&healthy()).is_empty());
+    }
+
+    /// The rule the owner set: a Mac that can create a display and capture it starts, whatever
+    /// else is missing. Accessibility in particular gates only remote input, and no combination
+    /// of these faults may take "Continue anyway" away.
+    #[test]
+    fn no_optional_fault_can_stop_startup() {
+        let cases: Vec<(&str, Probes)> = vec![
+            (
+                "no ScreenCaptureKit",
+                Probes {
+                    sck_available: false,
+                    ..healthy()
+                },
+            ),
+            (
+                "AirPlay display tier",
+                Probes {
+                    display_backend: DisplayBackend::AirPlayFallback,
+                    ..healthy()
+                },
+            ),
+            (
+                "no hosted network",
+                Probes {
+                    hostap: HostedNetworkBackend::Unsupported,
+                    ..healthy()
+                },
+            ),
+            (
+                "Accessibility not granted",
+                Probes {
+                    injects_input: false,
+                    ..healthy()
+                },
+            ),
+            (
+                "no audio tier",
+                Probes {
+                    audio_unsupported: true,
+                    ..healthy()
+                },
+            ),
+            (
+                "every optional fault at once",
+                Probes {
+                    at_least_min: true,
+                    sck_available: false,
+                    display_backend: DisplayBackend::AirPlayFallback,
+                    hostap: HostedNetworkBackend::Unsupported,
+                    injects_input: false,
+                    audio_unsupported: true,
+                },
+            ),
+        ];
+        for (what, probes) in cases {
+            let notes = capability_notes(&probes);
+            assert!(!notes.is_empty(), "{what}: nothing was reported");
+            assert!(
+                blocking_keys(&notes).is_empty(),
+                "{what}: produced {:?}; only the bare minimum may block",
+                blocking_keys(&notes)
+            );
+        }
+    }
+
+    /// Below the app's own floor there is no display API to reach for, which is the one thing
+    /// on this platform that cannot be continued past.
+    #[test]
+    fn an_os_below_the_floor_is_the_bare_minimum() {
+        let notes = capability_notes(&Probes {
+            at_least_min: false,
+            ..healthy()
+        });
+        assert_eq!(blocking_keys(&notes), vec![api_key::DISPLAY.to_string()]);
+    }
+
+    #[test]
+    fn no_display_backend_at_all_is_the_bare_minimum() {
+        let notes = capability_notes(&Probes {
+            display_backend: DisplayBackend::Unsupported,
+            ..healthy()
+        });
+        assert_eq!(blocking_keys(&notes), vec![api_key::DISPLAY.to_string()]);
     }
 }
