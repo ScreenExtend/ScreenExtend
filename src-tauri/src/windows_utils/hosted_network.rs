@@ -58,6 +58,22 @@ impl HostedNetworkBackend {
             Self::Unsupported => "Unsupported",
         }
     }
+
+    /// The authentication every Windows tier actually negotiates. All three take the
+    /// passphrase `validate_passphrase` has already required to be 8..=63 ASCII characters
+    /// and none of them can be asked to drop it, so — unlike macOS, whose HostAP SPI can
+    /// refuse every secured `securityType` and fall through to an open AP — Windows never
+    /// brings up an unencrypted network. `netsh wlan show hostednetwork` prints
+    /// `Authentication : WPA2-Personal` for the legacy tier; the WinRT tiers expose no
+    /// property to read, so this is what they are documented and observed to configure.
+    pub fn security(self) -> Option<&'static str> {
+        match self {
+            Self::MobileHotspot => Some("WPA2-Personal"),
+            Self::WiFiDirect => Some("WPA2-Personal (Wi-Fi Direct legacy AP)"),
+            Self::NetshLegacy => Some("WPA2-Personal (netsh hosted network)"),
+            Self::Unsupported => None,
+        }
+    }
 }
 
 /// What we know about the hosted network right now. `advertised` means the platform accepted
@@ -793,6 +809,54 @@ pub fn stop_hosted_network(app: AppHandle, state: State<'_, AppState>) -> bool {
     }
     *state.hosted_network_running.lock().unwrap() = !stopped;
     stopped
+}
+
+/// Everything the network card can show: the tri-state, the backend, the band and the
+/// authentication. It re-reads liveness through `is_hosted_network` first so a hotspot the
+/// OS took down on its own is not still reported as advertised.
+#[tauri::command]
+#[specta::specta]
+pub fn get_hosted_network_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> crate::HostedNetworkReport {
+    let live = is_hosted_network(app, state);
+    let status = hosted_network_status();
+    let advertised = live && status.advertised;
+    crate::HostedNetworkReport {
+        state: if !advertised {
+            crate::HostedNetworkReport::NOT_STARTED.to_string()
+        } else if status.host_ipv4.is_some() {
+            crate::HostedNetworkReport::VERIFIED.to_string()
+        } else {
+            crate::HostedNetworkReport::ADVERTISED.to_string()
+        },
+        backend: advertised
+            .then(|| status.backend.map(|b| b.as_str().to_string()))
+            .flatten(),
+        ssid: if advertised {
+            status.ssid
+        } else {
+            String::new()
+        },
+        // Neither WinRT tier exposes the channel it picked, and asking `netsh` for it would
+        // put a process spawn on a path the UI polls. The band is what we do know.
+        channel: None,
+        band: advertised
+            .then(|| status.band.map(str::to_string))
+            .flatten(),
+        security: advertised
+            .then(|| {
+                status
+                    .backend
+                    .and_then(|b| b.security())
+                    .map(str::to_string)
+            })
+            .flatten(),
+        secured: advertised,
+        host_ipv4: if advertised { status.host_ipv4 } else { None },
+        peer: None,
+    }
 }
 
 /// Whether the hosted network is up. Reads the platform object we already hold — it must not

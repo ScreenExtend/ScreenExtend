@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useNextStep } from "nextstepjs";
 
 import { Power, Trash2, RotateCcw, Compass } from "lucide-react";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
@@ -15,7 +14,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 
 import { updateConfig, flushConfig, useConfig } from "@/components/config-provider";
-import { WALKTHROUGH_TOUR } from "@/components/walkthrough";
+import { WALKTHROUGH_TOUR, useWalkthrough } from "@/components/walkthrough-context";
 import { useAvatar, useClosing, useGlobalSetters } from "@/components/global-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -29,7 +28,7 @@ export function ProfileMenu() {
   const [background, setBackground] = useState(false);
   const name = useConfig()?.name ?? "";
   const navigate = useNavigate();
-  const { startNextStep } = useNextStep();
+  const { start: startWalkthrough } = useWalkthrough();
   const { t } = useTranslation();
 
   const replayTour = async () => {
@@ -46,7 +45,7 @@ export function ProfileMenu() {
       return;
     }
     navigate("/dashboard");
-    startNextStep(WALKTHROUGH_TOUR);
+    startWalkthrough(WALKTHROUGH_TOUR);
   };
 
   return (
