@@ -78,6 +78,7 @@ impl DeviceReporter for TauriDeviceReporter {
                 })
                 .collect(),
             selected: report.selected,
+            current: report.current,
         };
         if let Err(e) = ev.emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceAudioOutputs failed: {e:?}");
