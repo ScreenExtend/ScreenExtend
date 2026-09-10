@@ -482,9 +482,9 @@ function DeviceDetailsBody({
                   }}
                   disabled={inProgress}
                 />
-                <label htmlFor="pointerScopeRestricted" className="cursor-pointer">
-                  <Label className="cursor-pointer">{t("device.pointerScope.label")}</Label>
-                </label>
+                <Label htmlFor="pointerScopeRestricted" className="cursor-pointer">
+                  {t("device.pointerScope.label")}
+                </Label>
               </div>
               <p className="mt-2 text-sm text-muted-foreground">
                 {t("device.pointerScope.help")}
@@ -739,9 +739,9 @@ function DeviceDetailsBody({
                 }}
                 disabled={inProgress}
               />
-              <label htmlFor="autoFrameRate" className="cursor-pointer">
-                <Label className="cursor-pointer">{t("device.autoFrameRate.label")}</Label>
-              </label>
+              <Label htmlFor="autoFrameRate" className="cursor-pointer">
+                {t("device.autoFrameRate.label")}
+              </Label>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
               {t("device.autoFrameRate.help")}
