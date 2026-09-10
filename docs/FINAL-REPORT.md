@@ -2171,3 +2171,64 @@ project holds. Nothing else in the run failed.
 | `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,815,774 |
 | `…/release/ScreenExtend.exe` | 29,921,792 |
 
+
+## 15.3 Post-report fix: the Settings config.json editor
+
+The owner opened Settings → Advanced on the shipped build and found the editor unusable: one
+error in the Problems panel (`Property stunUrls is not allowed`, 153 lines, "Schema applied"),
+no syntax colouring at all, line numbers in the body text colour with no gutter, and scrolling
+that felt wrong. Two unrelated regressions from this engagement, and neither was visible to
+`tsc`, to eslint, to any existing gate, or in `pnpm dev` — the second one only exists in the
+*packaged* app.
+
+**What was broken.**
+
+1. `6f49444` added `stunUrls` to the TS `Config` and to `defaultConfig`. `src/lib/config-schema.ts`
+   is `additionalProperties: false` and never learned the key, so the editor validated every
+   user's own config as invalid and Save refused to write the document.
+
+2. `affd5a2` added a two-rule inline `<style>` to `index.html` to paint the theme background
+   before the 50 KB render-blocking stylesheet arrives. Tauri answers an inline stylesheet by
+   adding `'nonce-…'` to `style-src`, and CSP **ignores** `'unsafe-inline'` as soon as a nonce
+   is present. Monaco does not ship its theme as a stylesheet: `defineTheme` writes 123 KB of
+   `.mtk*` token colours, codicon glyphs and every `--vscode-*` variable into a single
+   `<style class="monaco-colors">` it appends at runtime — which carries no nonce and was
+   therefore dropped whole. The editor kept working and only *looked* broken, which is why
+   nothing logged anything. Measured in the running app: `style.monaco-colors` held 123,115
+   characters and its `.sheet` was `null`.
+
+**The fix.** `stunUrls` is in the schema, with a `stun:`/`stuns:` pattern and a description
+saying it is read at launch. The background is now set from the same head script that resolves
+the theme — a CSSOM write is not subject to `style-src` — so `index.html` carries no `<style>`
+at all and Tauri adds no nonce; `ThemeProvider` keeps the value in step on a theme change. An
+unknown key became a warning rather than a save blocker, since `readStore` drops any key it
+does not know on the way in and refusing the whole document over an inert one is the worse
+failure. The config shape moved to `src/lib/config-defaults.ts` (a module with no imports) so
+plain `node` can hold the schema and the type side by side.
+
+**What guards it.** `pnpm test:config` — `scripts/test-config-editor.mjs`, 27 assertions, in the
+CI frontend job. It cross-checks `defaultConfig`'s keys against the schema's `properties` and
+its `required` list, parses `Device`/`KnownDevice`'s members out of the type text, validates a
+sanitized copy of the owner's real `config.json` to zero errors, pins the secret-masking column
+spans against the actual characters of each token, and asserts that neither `index.html` nor
+`dist/index.html` contains a `<style>` element, that the policy still says `'unsafe-inline'`
+with no nonce, and that monaco's CSS ships as its own asset rather than injected. Both defects
+fail it when reverted. `monaco-setup.ts` also gained `assertThemeStylesApplied()`, called from
+the editor preload, so a rejected theme sheet becomes a `console.error` on the log bus instead
+of a purely visual failure.
+
+**Verification.** Reproduced and then re-verified in the built app itself, driven over the
+WebView2 remote-debugging port (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`),
+against the owner's own `config.json`:
+
+| | Before | After |
+|---|---|---|
+| Served `style-src` | `'self' 'unsafe-inline' 'nonce-1694412283715723311'` | `'self' 'unsafe-inline'` |
+| `style.monaco-colors`'s `.sheet` | `null` (rejected) | 781 rules |
+| Distinct token colours in the editor | 1 | 6 |
+| `.line-numbers` colour | `rgb(248,250,252)` — the body text | `rgb(148,163,184)` — the theme's |
+| Problems | `Property stunUrls is not allowed` at 145:3 | none; the badge reads **Valid** |
+| Save Config | refused the document | "Configuration saved", store round-trips intact |
+
+Ledger: `docs/OPTIMIZATIONS.md` §UX-D. Manual test: `docs/manual-tests/desktop-ui.md` §11 —
+and it says to run it on a *built* app, because on the dev server this defect does not exist.
