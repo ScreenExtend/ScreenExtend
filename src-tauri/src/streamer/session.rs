@@ -71,7 +71,12 @@ pub struct AudioOutput {
 pub struct AudioOutputsReport {
     pub supported: bool,
     pub outputs: Vec<AudioOutput>,
+    /// What the host last asked this device to play on.
     pub selected: String,
+    /// What the device reports it is *actually* playing on. The two diverge the moment the
+    /// user changes the output in the browser's own UI, which only the client can see; empty
+    /// means the device never said, which is what every client built before this field does.
+    pub current: String,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
@@ -243,6 +248,7 @@ pub struct DeviceSessionState {
     pub audio_outputs: Vec<AudioOutput>,
     pub audio_outputs_supported: bool,
     pub selected_audio_output: Option<String>,
+    pub current_audio_output: Option<String>,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -443,11 +449,16 @@ pub fn set_audio_outputs(
     ip: &str,
     supported: bool,
     outputs: Vec<AudioOutput>,
+    current: Option<String>,
 ) {
     let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
     entry.audio_outputs_supported = supported;
     entry.audio_outputs = outputs;
+    // A client that does not report one must not erase what a newer one did.
+    if current.is_some() {
+        entry.current_audio_output = current;
+    }
 }
 
 pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputsReport {
@@ -458,6 +469,7 @@ pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputs
             supported: s.audio_outputs_supported,
             outputs: s.audio_outputs.clone(),
             selected: s.selected_audio_output.clone().unwrap_or_default(),
+            current: s.current_audio_output.clone().unwrap_or_default(),
         })
         .unwrap_or_default()
 }

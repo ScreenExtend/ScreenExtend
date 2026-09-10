@@ -214,11 +214,29 @@ sessionIdChange: "session-id-change"
 /** user-defined types **/
 
 export type AudioOutput = { id: string; label: string }
-export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
+export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; 
+/**
+ * What the host last asked this device to play on.
+ */
+selected: string; 
+/**
+ * What the device reports it is *actually* playing on. The two diverge the moment the
+ * user changes the output in the browser's own UI, which only the client can see; empty
+ * means the device never said, which is what every client built before this field does.
+ */
+current: string }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
-export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
+export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; 
+/**
+ * What the host last asked this device to play on.
+ */
+selected: string; 
+/**
+ * What the device says it is actually playing on right now; empty when it never said.
+ */
+current: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceRemove = Device

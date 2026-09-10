@@ -62,7 +62,7 @@ const prelude = `
   function showError(m) { calls.push('showError:' + m); }
   function linkLost(m) { calls.push('linkLost:' + m); }
   function start(again) { calls.push('start:' + !!again); }
-  function offerPermModalNow() { return false; }
+  function queueOutputPicker(id) { calls.push('queueOutputPicker:' + id); }
   function nowMs() { return clock; }
 `;
 
