@@ -441,9 +441,9 @@ impl CursorOverlay {
 
     fn save_undo(&mut self, slot: usize, r: Rect) -> Result<()> {
         if r.w > MAX_UNDO_DIM || r.h > MAX_UNDO_DIM {
-            // Refuse rather than allocate without bound. The sprite is still drawn; it is the
-            // *erase* that will not happen, so the next recompose leaves a trail — which is why
-            // this also says so once.
+            // Refuse rather than allocate without bound, and refuse *before* drawing: a sprite
+            // that cannot be saved cannot be erased either, so drawing it would smear a trail of
+            // pointers across the picture and leave them there. No pointer is the lesser fault.
             bail!(
                 "cursor sprite is {}x{} destination pixels, past the {MAX_UNDO_DIM} px undo cap",
                 r.w,
