@@ -110,6 +110,18 @@ async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
+/**
+ * Where a pointer-locked client may drive this host's cursor: `"display"` (its own screen,
+ * the default) or `"all"` (every screen, including the host's real monitors).
+ * 
+ * Its own command rather than another `set_device_override` argument: that one is at specta's
+ * ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
+ * no live display to touch. The injector reads the scope when the session is built, so a
+ * change applies to the next connection, exactly like remote control itself.
+ */
+async setDevicePointerScope(ip: string, scope: string) : Promise<void> {
+    await TAURI_INVOKE("set_device_pointer_scope", { ip, scope });
+},
 async refreshDeviceStream(ip: string) : Promise<boolean> {
     return await TAURI_INVOKE("refresh_device_stream", { ip });
 },
@@ -217,7 +229,12 @@ export type AudioOutput = { id: string; label: string }
 export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[]; selected: string }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
-export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
+/**
+ * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
+ * See `streamer::input::PointerScope`.
+ */
+pointerScope: string; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; selected: string }
 export type DeviceJoin = Device
 export type DeviceModify = Device
@@ -247,7 +264,11 @@ relaunch_required: boolean }
 export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
-export type UnsupportedApi = { name: string; description: string; required_version: string; severity: string }
+export type UnsupportedApi = { 
+/**
+ * Stable id from [`api_key`]. The severity says how bad it is; this says what it is.
+ */
+key: string; name: string; description: string; required_version: string; severity: string }
 
 /** tauri-specta globals **/
 
