@@ -642,6 +642,119 @@ non-`VERIFIED` item appears in exactly one guide.
 
 ---
 
+## User-facing stream quality: freezes, cursor stalls, stale-cursor frames
+
+Everything above this section was measured with `probe`, which paints a full-frame animation into
+a borderless window and never involves a browser. On that content **every frame is a changed
+frame**, so it cannot see a pipeline that drops the frames the compositor calls unchanged, and
+there is no client in it to demote itself, ask for a keyframe, or fall behind. The repository
+owner reported the opposite of what those tables say — "the cursor gets frozen way more often and
+the cursor is painted on stale frames", then "my system is so much slower and laggier" — and both
+statements are true at the same time as the tables. They measure different things.
+
+`scripts/measure-stream.ps1` is the measurement that was missing: a real `serve` host, a real
+Chrome join over HTTPS driven through the DevTools protocol, a `SendInput` pointer sweep on the
+virtual display, and one row a second of what the **client** reports — painted frames,
+host-capture-to-paint percentiles, keyframe requests, the degradation bits, and the tier it is
+actually on. It also records the client window at 60 fps and counts the interval between frames
+that *changed*, which is what a viewer calls a freeze, and samples the host's CPU and the
+desktop's own animation cadence while it happens.
+
+**The scene** is the one the owner described and the one `probe` cannot produce: the pointer swept
+in a circle across an **otherwise empty** virtual display, stepped every 8 ms, with nothing else
+on that screen moving. Windows 11 26200, RTX 3080 Ti Laptop + Intel UHD, Chrome on the host's own
+1920x1080 panel, 30 s per run, **median of three**, saved device rows cleared for the run.
+
+### The size of the problem, from the host's own log
+
+This part needs no client and has no run-to-run variance. Both binaries, same box, same clean
+device state:
+
+| | `271aa01` | after |
+|---|---|---|
+| virtual display created | `3840x2160@360` | `1920x1080@60` |
+| encoder session | `3840x2160@360, bitrate_bps=30000000` | `1920x1080@60` |
+
+The client's screen is 1920x1080 and its `devicePixelRatio` is 1. It asked for a **360 Hz**
+display because that is what its own `requestAnimationFrame` measurement returned during page
+load, and the host built one: four times the pixels of the client's screen at six times the rate
+it can consume — **24x the pixel rate**, on an integrated GPU that is also composing the real
+desktop. A device row saved from an earlier session pinned it there for every later join.
+
+### What the client saw
+
+| | `271aa01` | after |
+|---|---|---|
+| painted frames/s (median of three) | **6.5** (5.9 / 6.5 / 8.1) | **53.6** (15.0 / 53.6 / 54.0) |
+| host capture → paint, p50 | 12.2 ms | 19.0 ms |
+| host capture → paint, p99 | 53.3 ms | 27.1 ms |
+| keyframe requests the host received / 30 s | **65** (43 / 65 / 190) | **0** (0 / 0 / 0) |
+| IDRs emitted / 30 s | 5 (1 / 5 / 9) | 2 (2 / 2 / 2) |
+| host CPU, % of all 16 cores | 0.1 % | 0.2 – 0.4 % |
+
+### Freezes, from the recording
+
+60 fps `gdigrab` of the client window through `mpdecimate` with its thresholds at the floor, so a
+32x32 pointer sprite moving one pixel counts as a change. The interval between successive
+**changed** frames is the freeze.
+
+| | `271aa01` | after |
+|---|---|---|
+| changed frames/s | 6.4 | 5.9 |
+| gap p50 | 166 ms | 100 ms |
+| gap p99 | 284 ms | 534 ms |
+| freezes ≥ 100 ms per minute | 285 | 190 |
+
+**Read this table against the one above it, not on its own.** The painted rate went up more than
+eightfold and the *changed* rate did not move, and that is the honest headline of this whole
+section: the pipeline now holds its cadence, but on a still virtual display most of what it emits
+is a repeat carrying the pointer where it already was. See "What is not fixed".
+
+### The host's own desktop
+
+The complaint that the machine itself goes slow has a number: the animation cadence of an ordinary
+window on the host's screen, sampled by a second small always-visible page, before the join and
+again while streaming.
+
+| | `271aa01` | after |
+|---|---|---|
+| idle, host running | 59.9 fps, p99 17.1 ms | 59.9 fps, p99 17.2 ms |
+| while streaming | 59.9 fps, p99 16.9 ms, 0 hitches/min | 59.9 fps, p99 17.1 ms, 0 hitches/min |
+
+Neither build stutters the desktop **once the display it builds is the right size**. The 357 fps →
+59.9 fps collapse this section was started to explain was measured while the host was driving a
+3840x2160@360 virtual display, which is the condition row 325 removes; with a 1920x1080@60 display
+the compositor is not short of anything and the two builds are indistinguishable here. The GPU
+scheduling class (row 330) could not be separated from that on this box, and the owner's own
+verdict on the priority changes was that they "didn't make much difference" — which agrees.
+
+### What is not fixed
+
+- **WGC does not deliver a frame for pointer-only motion on this box's indirect display.** With
+  the pointer sweeping continuously, 30 s of capture produced 2 – 10 *real* frames a second in
+  **either** binary; everything else emitted is a keepalive repeat, and a repeat carries the
+  pointer wherever WGC last composited it. That is why the changed-frame rate in the recording did
+  not move. Nothing in this change causes it and nothing in this change fixes it: the fix is to
+  stop asking WGC to composite the pointer (`CursorCaptureSettings::WithoutCursor`) and to draw it
+  ourselves from `GetCursorInfo` into the ring slot, reusing the sprite renderer
+  `windows_utils/streamer/dxgi/cursor.rs` already has for exactly this. It is the single largest
+  remaining item for the owner's original complaint and it is **not in this change**.
+- **The client's refresh-rate measurement runs during page load**, where Chrome fires
+  `requestAnimationFrame` faster than vsync; the page's own later refinement logs
+  `[refresh] refined to 60 Hz from 360`. Row 325 bounds the damage from the host side, which is
+  where a number the host did not measure has to be bounded, but the client should not be
+  reporting it.
+- **`ice_gathering_timed_out` on the client**, on the current tree and not on `271aa01`. It
+  appeared in four of the six runs here and it is not caused by anything in this change; the
+  suspect is `56fe583`, which stopped offering STUN to a same-subnet peer. It is worth a look
+  before release.
+- **The harness is not a silent instrument.** Chrome's own processes, the 60 fps recording and the
+  desktop probe page all run on the machine being measured, and the client's video tier flapped
+  between `webcodecs+canvas` and the `<video>` fallback between runs on **both** builds — three of
+  six runs here demoted, with `wake_lock_refused` alongside, which is what a page that is not the
+  visible window reports. Single runs are not comparable; every number above is a median of three,
+  and the host-log rows are the ones with no variance at all.
+
 ## Honesty
 
 ### The probe-display trap, and what it cost this pass

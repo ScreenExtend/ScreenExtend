@@ -1097,7 +1097,8 @@ async fn start_session(
     let detected_refresh = if req.refresh_rate == 0 {
         60
     } else {
-        req.refresh_rate.clamp(MIN_REFRESH_RATE, DEFAULT_MAX_AUTO_REFRESH)
+        req.refresh_rate
+            .clamp(MIN_REFRESH_RATE, DEFAULT_MAX_AUTO_REFRESH)
     };
     if req.refresh_rate > detected_refresh {
         tprintln!(

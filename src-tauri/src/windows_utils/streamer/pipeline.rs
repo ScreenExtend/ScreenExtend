@@ -225,9 +225,7 @@ impl CursorProbe {
     fn changed(&mut self) -> bool {
         use windows::Win32::Foundation::POINT;
         use windows::Win32::Graphics::Gdi::{MonitorFromPoint, HMONITOR, MONITOR_DEFAULTTONULL};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetCursorInfo, CURSORINFO, CURSOR_SHOWING,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
         if self.broken {
             return false;
@@ -246,8 +244,7 @@ impl CursorProbe {
             y: info.ptScreenPos.y,
         };
         let mine = HMONITOR(self.monitor as *mut core::ffi::c_void);
-        let on_monitor =
-            showing && unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) } == mine;
+        let on_monitor = showing && unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONULL) } == mine;
         let handle = info.hCursor.0 as isize;
 
         let changed = if on_monitor {
