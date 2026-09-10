@@ -111,16 +111,40 @@ On a Mac in that band, open a device sheet and turn **System Audio** on.
 this macOS has no audio-only capture. It must **not** appear on 14.2+ (Process Tap), on 10.15–12.x
 (the driver tier) or on Windows.
 
-## 9. Pointer range (row 320)
+## 9. Restrict cursor to this display (rows 320, 344)
 
-The control is in the device sheet under Remote Control and only shows while remote control is on.
+The control is in the device sheet under Remote Control and only shows while remote control is
+on. It is a **checkbox**, and the default is **unchecked**: mouse and keyboard reach every
+desktop, which is the shipped behaviour and the owner's ruling.
 
-**Expect today:** choosing "This display only" persists — reopen the sheet, and `config.json`'s
-`devices[].pointerScope`, to confirm. It does **not** yet change where the cursor can go: the
-`set_device_override` parameter is the other workstream's half, and both call sites carry an
-`INTEGRATOR:` comment naming the one-line change. Re-run this test as a behaviour test once that
-lands: with `display`, a pointer-locked client moving the mouse hard left/right must not be able
-to walk the host cursor onto a monitor it cannot see.
+1. Open the sheet on a device that has never had the setting saved. The box must be clear and
+   the helper text under it must say the cursor reaches every screen.
+2. Tick it, Save, reopen: still ticked, and `config.json`'s `devices[].pointerScope` reads
+   `"display"`. Untick, Save, reopen: clear, and the key reads `"all"`.
+3. **The migration.** Delete `pointerScope` from a device entry in `config.json` by hand and
+   relaunch. The box must come back *clear* — an upgraded install must not find its devices
+   silently fenced in. (`ScreenExtend devices list` shows `all` in the POINTER column for the
+   same entry.)
+
+The behaviour half — that ticking it actually stops the cursor at the display's edge — is
+`docs/manual-tests/startup-gate.md` §4, which needs a second physical monitor.
+
+## 9b. Automatic frame rate (row 345)
+
+Directly under the Refresh Rate slider, a **checkbox**, default **unchecked**.
+
+1. Unchecked is the shipped state: the helper text must say the stream runs at the rate above
+   and never lowers it. Save with it clear and `config.json`'s `devices[].autoFrameRate` reads
+   `false`; a device saved before the setting existed carries no key at all and must still read
+   as unchecked.
+2. Tick it, Save, reopen: still ticked, key reads `true`. `ScreenExtend devices list` shows it
+   in the AUTOFPS column, and `ScreenExtend devices set <ip> --auto-framerate off` clears it
+   (with a host running, the "(The running host reloaded its configuration.)" line confirms the
+   `RELOAD` replay reached `AppState`).
+
+**Not covered here:** what the pipeline does with the flag. Delivering at a fixed cadence and
+repeating an unchanged frame is the stream-regression workstream's half; this test only proves
+the setting is stored, replayed and reaches `DeviceOverride`.
 
 ## 10. The client's actual audio sink (row 321)
 
