@@ -728,7 +728,6 @@ pub fn run() {
             permissions::open_permission_settings,
             permissions::relaunch_app,
             setup,
-            //            get_devices,
             set_session_credentials,
             register_cloud_session,
             unregister_cloud_session,

@@ -74,7 +74,7 @@ Linting: ESLint 9 flat config in `eslint.config.js`, scoped to `src/` (`src-taur
 `src/lib/bindings.ts` and `src/lib/next-navigation-stub.ts` are ignored) with `react-hooks`
 (rules-of-hooks as an error), `react-refresh` and `typescript-eslint`, plus a Node-globals
 block for `scripts/**/*.mjs`. Type-aware linting is on (`parserOptions.project`), which is what
-`@typescript-eslint/no-floating-promises` needs. It passes with 0 errors and ~27 non-blocking
+`@typescript-eslint/no-floating-promises` needs. It passes with 0 errors and ~30 non-blocking
 warnings. TypeScript strictness is additionally enforced by `tsc` in `pnpm build`.
 
 ### Tests
@@ -440,7 +440,8 @@ Cross-platform core, OS-independent:
   cross-origin isolation headers (COOP `same-origin` + COEP `require-corp`) that make
   `crossOriginIsolated` true on a secure context, which is what lets the audio ring be a real
   `SharedArrayBuffer`; over plain HTTP they are inert and the client falls back. `at_capacity_page`
-  serves `static/at-capacity.html` when the display backend is full.
+  serves `static/at-capacity.html` when the display backend is at its cap — which, per
+  `session::concurrent_display_cap`, is only ever the macOS AirPlay tier.
   `server.rs` also owns the DPR ladder: `dpr_mode_ladder` builds one resolution per ratio in
   `platform::display_dpr_ladder()`, sorted and deduped, and hands it to
   `create_display_with_modes`; **each backend adds the transposes** (Windows in
@@ -773,7 +774,8 @@ one on the fast path (`docs/TELEMETRY.md`).
   orientation / DPR reporting, and kick handling. It owns the two tier enums:
   `VIDEO_PATH = { webcodecsCanvas, webcodecsVideo, videoElement }` and
   `AUDIO_PATH = { workletSab, workletPort, workletPost, opusTrack }`.
-- `at-capacity.html` — served instead of the join form when the display backend is full.
+- `at-capacity.html` — served instead of the join form when the display backend is at its cap.
+  Only the macOS AirPlay tier has one; every other backend is uncapped and never serves it.
 - `transform-worker.js` — the WebCodecs video path, over `RTCRtpScriptTransform` where it exists
   and the legacy `createEncodedStreams` where it does not (`TRANSPORT` tiers), rendering either
   into a canvas or through a `VideoTrackGenerator` (`renderTier`). It recovers each frame's
