@@ -977,11 +977,11 @@ mod desktop {
         // Only when this host actually holds a relay client. Registering one here on a host
         // started with `--no-cloud`, or with public sessions turned off in the UI, would put a
         // session on the internet that nobody asked to publish.
-        let public = {
-            let state = app.state::<platform::AppState>();
-            let holds = state.cloud.lock_recover().is_some();
-            holds
-        };
+        let public = app
+            .state::<platform::AppState>()
+            .cloud
+            .lock_recover()
+            .is_some();
         if public {
             platform::register_cloud_session(app.clone(), app.state(), session_id.to_string());
         }
