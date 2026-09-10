@@ -2936,3 +2936,82 @@ Verified both ways on this box: restoring the identical JSON with a BOM comes ba
 `devices=1 knownDevices=11` and stays. Written with `[IO.File]::WriteAllText(..., UTF8Encoding
 $false)` now. The harness still does not put the rows back at the end of a run, which is a
 separate (and documented) gap — `config.json.before` in the run directory is the copy.
+
+## UX-LOCK: the lockfile stopped naming the tauri CLI's binary — `VERIFIED`
+
+### What was wrong
+
+`pnpm-lock.yaml` recorded `@tauri-apps/cli@2.6.2` with no `optionalDependencies`: the `packages:`
+section had no `@tauri-apps/cli-win32-x64-msvc`, no `cli-darwin-*`, no `cli-linux-*`, and the
+snapshot entry was the empty `'@tauri-apps/cli@2.6.2': {}`.
+
+`@tauri-apps/cli` is a JS wrapper around a napi binary that ships as one npm package per platform,
+listed in the wrapper's own `optionalDependencies`; `index.js` `require()`s the matching one at
+startup. A lockfile that names the wrapper and not the list installs only the wrapper. So
+`pnpm install --frozen-lockfile` on a fresh clone succeeds — exit 0, no warning — and the next
+`pnpm tauri` anything dies with `Cannot find module '@tauri-apps/cli-win32-x64-msvc'`.
+
+The reason nobody saw it for two days is the reason this class of defect is worth a guard: it does
+not fail on the machine that made it. The Windows box's pnpm store and `node_modules/.pnpm`
+already held `@tauri-apps+cli-win32-x64-msvc@2.6.2` from an install predating the break, so every
+local command kept working. CI would not have been so lucky — `ci.yml` runs
+`pnpm install --frozen-lockfile` in all five jobs and `build-release.yml` runs plain
+`pnpm install`, and neither has a warm store.
+
+### Where it came from
+
+`9a181cb` (2026-09-08, *"chore: refresh the lockfile after the nine dropped dependencies"*), one
+commit, `8 insertions(+), 383 deletions(-)`. Walking every revision of `pnpm-lock.yaml` back to
+`ae7cde3` (2024-02-03), that commit is the only one where the count of `cli-win32-x64-msvc`
+mentions goes to zero; its parent `1e77f12` has three. Seventeen packages went out with it and
+none of them were dependencies anybody dropped:
+
+- the eleven `@tauri-apps/cli-*` platform packages,
+- `@esbuild/netbsd-arm64`, `@esbuild/openbsd-arm64`, `@esbuild/openharmony-arm64`,
+- `@rollup/rollup-linux-loongarch64-gnu`, `@rollup/rollup-linux-powerpc64le-gnu`,
+- `@pkgjs/parseargs` (jackspeak's).
+
+Eight lines were *added* in their place, and they are the same defect seen from the other side:
+three peer-dependency suffix keys lost a peer each (`vite@6.3.5(...)(jiti@1.21.7)` for
+`…(jiti@1.21.7)(yaml@2.9.0)`, and `nextstepjs@2.3.0` lost its `react-router` peer). The commit
+under-resolved and wrote the result out as if it were a refresh.
+
+### The fix
+
+`pnpm install --lockfile-only --fix-lockfile`. Plain `--lockfile-only` does **not** repair it and
+neither does `--force`: pnpm reads the existing lockfile as satisfying `package.json`, reports
+`Done in 382ms` and changes nothing. `--fix-lockfile` re-resolves and re-fills.
+
+The diff is exactly the inverse of `9a181cb`: `179 insertions(+), 8 deletions(-)`, the seventeen
+packages back with `optional: true`, the wrapper's `optionalDependencies` block back in the
+snapshot, and the three peer suffixes restored. Comparing the full set of `name@version` keys
+before and after: **17 added, 0 removed, 0 changed** — no version of anything moved.
+
+### Proved on a fresh clone, both ways
+
+`git clone --no-local` into `%TEMP%`, `pnpm install --frozen-lockfile`, store left as it is:
+
+| | before | after |
+|---|---|---|
+| install exit code | 0 | 0 |
+| `node_modules/.pnpm/@tauri-apps+cli-win32-x64-msvc@2.6.2` | absent | present |
+| `pnpm tauri --version` | `Error: Cannot find module '@tauri-apps/cli-win32-x64-msvc'` | `tauri-cli 2.6.2` |
+
+The warm store did not rescue the broken clone, which settles the question of whether this was
+only a local-symlink accident: `--frozen-lockfile` installs the lockfile, and a package the
+lockfile does not name is not installed however many copies of it the store holds.
+
+### The guard
+
+`scripts/check-lockfile.mjs`, no dependencies, wired into `package.json` as `pnpm test:lockfile`
+and into `ci.yml`'s `frontend` job immediately after `pnpm install --frozen-lockfile`. For every
+directory in `node_modules/.pnpm` it reads that package's *own* `package.json`, and for each name
+in its `optionalDependencies` asserts the lockfile's snapshot for that package records it. That
+direction matters: the assertion is anchored in what the package itself declares, not in a list
+of names somebody remembered to keep up to date, so a native-binding dependency added next year
+is covered the day it lands.
+
+Run against the unfixed tree it names all seventeen, grouped by parent, and exits 1; against the
+fixed tree it reports `5 packages declare optionalDependencies; all are recorded`. `KNOWN_ABSENT`
+is an empty allowlist for the one legitimate case (an optional dep the registry cannot serve),
+and it is empty on purpose.
