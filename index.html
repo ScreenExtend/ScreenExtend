@@ -5,19 +5,27 @@
     <link rel="icon" type="image/svg+xml" href="/src/assets/logo.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ScreenExtend</title>
-    <!-- The two literal values of `--background` in src/index.css (`:root` and `.dark`).
-         They live here because the stylesheet that defines the token is render-blocking
-         and 50 KB, so until it arrives the window paints the WebView's default white
-         canvas in both themes. Only `html` is painted: `body` takes `bg-background` from
-         the stylesheet and covers the viewport, so this never competes with the token.
-         Keep the two values in step. No `color-scheme` declaration -- that would also
-         restyle the native form controls. -->
-    <style>
-      html { background: hsl(0 0% 100%); }
-      html.dark { background: hsl(222.2 84% 4.9%); }
-    </style>
+    <!-- NEVER add a <style> element to this file. Tauri rewrites the CSP of the page it
+         serves, and an inline stylesheet makes it add a `'nonce-...'` to `style-src`; CSP
+         then *ignores* the `'unsafe-inline'` this app's policy declares, and every
+         stylesheet injected at runtime without that nonce is silently dropped. Monaco
+         builds its entire theme that way -- 123 KB of `.mtk*` token colours, codicon
+         glyphs and `--vscode-*` variables in one `<style class="monaco-colors">` -- so the
+         config editor loses every colour, its gutter and its scrollbars while reporting no
+         error anywhere. `node scripts/check-csp.mjs` fails the build if one comes back.
+         The background below is therefore set from script (CSSOM writes are not subject to
+         style-src) rather than from a rule. -->
     <script>
       (function () {
+        // The two literal values of `--background` in src/index.css (`:root` and `.dark`).
+        // The stylesheet that defines the token is render-blocking and 50 KB, so until it
+        // arrives the window paints the WebView's default white canvas in both themes.
+        // Only `html` is painted: `body` takes `bg-background` from the stylesheet and
+        // covers the viewport, so this never competes with the token. Keep the two values
+        // in step with src/index.css. No `color-scheme` -- that would also restyle the
+        // native form controls.
+        var LIGHT = "hsl(0 0% 100%)";
+        var DARK = "hsl(222.2 84% 4.9%)";
         try {
           // The user's choice lives in tauri-plugin-store's config.json, which is read
           // asynchronously over IPC; `se-theme` is a synchronous paint hint written by
@@ -32,8 +40,10 @@
                 ? "dark"
                 : "light";
           document.documentElement.classList.add(resolved);
+          document.documentElement.style.background = resolved === "dark" ? DARK : LIGHT;
         } catch (e) {
           document.documentElement.classList.add("light");
+          document.documentElement.style.background = LIGHT;
         }
       })();
     </script>

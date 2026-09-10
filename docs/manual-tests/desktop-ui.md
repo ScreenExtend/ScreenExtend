@@ -131,3 +131,26 @@ without a gesture.
 amber with "still playing on X — its browser needs a tap" when the client is on a different sink
 from the one the host applied. With a client that does not report the field, no line appears at
 all — that is "the client did not say", not "the default".
+
+## 11. The config.json editor renders as an editor (UX-D)
+
+Settings → Advanced → Configuration File, in a **built** app, not `pnpm dev`: the defect this
+guards against only exists in the packaged page, because it is Tauri's CSP rewriting that
+triggers it.
+
+**Expect:** JSON syntax colouring (keys, strings, numbers and punctuation in different
+colours), line numbers in a dimmer colour than the text with a visible gutter, a working
+scrollbar inside the editor, and the status line reading "Valid" with `0 error(s)`.
+
+**The failure it replaces:** every character the same near-white, line numbers flush against
+the text in the body colour, and one error, `Property stunUrls is not allowed`. If the
+colours are gone again, open the devtools console — the editor preload logs "monaco's theme
+stylesheet was rejected by the page's Content-Security-Policy" — or check the served policy:
+`style-src` must read `'self' 'unsafe-inline'` with **no** `nonce-`. A nonce there means
+something re-introduced an inline `<style>` into `index.html`; `pnpm test:config` fails on
+that before it ships.
+
+**Also check while you are there:** each `devices[].token`, `knownDevices[].token`,
+`hostedNetworkCredentials.password` and `turnConfig.credential` renders as a row of dots with
+its key name still legible beside it, and hovering or clicking into one reveals it. Editing
+any value and pressing Save Config must write and re-read without an error toast.
