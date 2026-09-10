@@ -46,6 +46,15 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # A native-binding package ships one npm package per platform and lists them all as
+      # optionalDependencies. If the lockfile records the parent without that list -- which is
+      # how 9a181cb shipped, dropping all eleven @tauri-apps/cli-* entries -- the install above
+      # succeeds and produces a JS shim with no binary behind it, so `pnpm tauri` dies at
+      # require() time on a runner while the machine that wrote the lockfile keeps working off
+      # its warm store. Runs first because every job below it needs the install to be real.
+      - name: lockfile carries the platform packages
+        run: pnpm test:lockfile
+
       - name: eslint
         run: pnpm lint
 
