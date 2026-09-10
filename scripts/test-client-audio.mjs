@@ -232,9 +232,133 @@ bv.setUint16(HDR, 999, true); // claims more primary bytes than the frame holds
 send(bad);
 eq('a truncated redundant frame decodes nothing', decoded.length, 0);
 
+// ── audio.js: when the microphone is asked for at all ───────────────────────────────────
+//
+// The rule is that a permission prompt is the last resort, not the first: enumerating the
+// outputs is tried without any grant, and only an enumeration that produced *nothing* is
+// answered with the card. Unlabelled ids are a working list — `setSinkId` takes the bare id —
+// so a laptop that reports four nameless outputs is never prompted, and the host is told the
+// names are this page's own numbering instead.
+//
+// audio.js is an IIFE that assigns `window.SEAudio`, so it is run whole against stubbed
+// `navigator` surfaces and asked directly.
+{
+  const audioSrc = fs.readFileSync(STATIC + '/audio.js', 'utf8');
+
+  // `enumerateDevices` is the only thing each case varies; everything else is the shape of a
+  // browser with `setSinkId` and no `selectAudioOutput` — the majority case, and the one the
+  // old rule prompted on.
+  function speakersFor(enumerate, opts) {
+    const o = opts || {};
+    const win = {
+      AudioContext: function () {},
+      isSecureContext: true,
+    };
+    win.AudioContext.prototype = { audioWorklet: {}, setSinkId() {} };
+    const nav = {
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      platform: 'Win32',
+      maxTouchPoints: 0,
+      permissions: { query: async () => ({ state: o.micGranted ? 'granted' : 'prompt' }) },
+      mediaDevices: {
+        enumerateDevices: enumerate,
+        addEventListener() {},
+        ondevicechange: null,
+      },
+    };
+    if (o.hasSelectOut) nav.mediaDevices.selectAudioOutput = async () => null;
+    const c = {
+      console: { log() {}, warn() {}, error() {} },
+      performance: { now: () => 0, timeOrigin: 0 },
+      // Unref'd: `startDeviceWatch()` arms a 30 s device poll that is right in a browser and
+      // would otherwise hold this process open long after the assertions have run.
+      setTimeout: (fn, ms) => { const t = setTimeout(fn, ms); if (t.unref) t.unref(); return t; },
+      setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
+      clearTimeout, clearInterval,
+      Promise, Float32Array, Int32Array, Uint8Array, ArrayBuffer, DataView, JSON, Math, Date,
+      fetch: async () => ({ ok: true }),
+      navigator: nav,
+      document: { visibilityState: 'visible', createElement: () => ({ setAttribute() {}, play: () => Promise.resolve(), style: {} }), body: { appendChild() {} } },
+      HTMLMediaElement: function () {},
+    };
+    c.HTMLMediaElement.prototype = { setSinkId() {} };
+    Object.assign(c, win);
+    c.window = c;
+    c.self = c;
+    vm.createContext(c);
+    vm.runInContext(audioSrc, c, { filename: 'audio.js' });
+    return c.SEAudio;
+  }
+
+  const outs = (n) => Array.from({ length: n }, (_, i) => ({ kind: 'audiooutput', deviceId: i ? 'id' + i : 'default', label: '' }));
+
+  // 1. Outputs came back — nameless, but four of them. Nothing is asked.
+  {
+    const A = speakersFor(async () => outs(4));
+    const need = await A.needsMicPermission();
+    if (need === false) ok('an enumeration that returns unlabelled outputs asks for no microphone');
+    else fail('unlabelled outputs still asked for the microphone');
+    const cache = await A.enumerateBeforeJoin(() => { fail('the card was raised for a list that already worked'); });
+    eq('and the list it built has one entry per output', cache.outputs.length, 4);
+    if (cache.outputs.every((o) => !!o.label)) ok('every entry carries a name the host can render');
+    else fail('an entry was posted with no label at all: ' + JSON.stringify(cache.outputs));
+    if (cache.outputs[0].label === 'Default output') ok('the default device is named as what it is');
+    else fail('the default device was named ' + cache.outputs[0].label);
+    if (A.getSyncInfo().labelsUnavailable === true) ok('and the host is told the names are generic (degraded bit 9)');
+    else fail('generic names were reported as real ones');
+  }
+
+  // 2. Labelled outputs: nothing is asked, and nothing is renamed.
+  {
+    const A = speakersFor(async () => [{ kind: 'audiooutput', deviceId: 'default', label: 'Speakers (Realtek)' }]);
+    const need = await A.needsMicPermission();
+    if (need === false) ok('a labelled enumeration asks for no microphone either');
+    else fail('a labelled enumeration asked for the microphone');
+    const cache = await A.enumerateBeforeJoin(() => { fail('the card was raised for a labelled list'); });
+    eq('the real name is kept', cache.outputs[0].label, 'Speakers (Realtek)');
+    if (A.getSyncInfo().labelsUnavailable === false) ok('and the host is told the names are real');
+    else fail('real names were reported as generic');
+  }
+
+  // 3. Zero outputs: this is the case a grant can actually change.
+  {
+    const A = speakersFor(async () => []);
+    const need = await A.needsMicPermission();
+    if (need === true) ok('an enumeration that returns no outputs at all does ask');
+    else fail('an empty enumeration did not ask for the microphone');
+    let raised = 0;
+    await A.enumerateBeforeJoin((_cont, skip) => { raised++; skip(); });
+    eq('and the card is raised exactly once', raised, 1);
+  }
+
+  // 4. Enumeration unsupported — it throws — is the same answer.
+  {
+    const A = speakersFor(async () => { throw new Error('not supported here'); });
+    const need = await A.needsMicPermission();
+    if (need === true) ok('an enumeration that throws asks, the same as one that returns nothing');
+    else fail('a throwing enumeration did not ask for the microphone');
+  }
+
+  // 5. A permission-free picker is never asked, whatever the enumeration says.
+  {
+    const A = speakersFor(async () => [], { hasSelectOut: true });
+    const need = await A.needsMicPermission();
+    if (need === false) ok('an engine with selectAudioOutput() is never asked, even with no outputs');
+    else fail('a selectAudioOutput engine was asked for the microphone');
+  }
+
+  // 6. A grant already given is not asked for again.
+  {
+    const A = speakersFor(async () => [], { micGranted: true });
+    const need = await A.needsMicPermission();
+    if (need === false) ok('a microphone already granted is not asked for a second time');
+    else fail('an existing grant was asked for again');
+  }
+}
+
 if (failures) {
   console.log('\n' + failures + ' audio-worker assertion(s) failed');
   process.exitCode = 1;
 } else {
-  console.log('\nall client audio-worker assertions passed');
+  console.log('\nall client audio assertions passed');
 }

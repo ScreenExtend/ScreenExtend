@@ -193,6 +193,10 @@
         firstDeviceChange: true,
         debounceTimer: 0,
         appliedSink: null,
+        // Whether the enumeration the host's list was built from carried real device names.
+        // `null` until something has enumerated. Posted to the host so a list of "Output 1",
+        // "Output 2" is not mistaken for what the operating system calls them.
+        outputsLabelled: null,
         sinkWatched: false,
         msd: null,
         sinkEl: null,
@@ -299,21 +303,36 @@
     }
 
 
-    async function needsMicPermission() {
+    // The microphone is asked for only when enumerating the outputs produced *nothing*.
+    //
+    // It used to be asked whenever the ids came back unlabelled, which is most laptops and
+    // most phones — a permission prompt, on a device that needed no help, to put nicer text
+    // beside ids that already work: `setSinkId` takes the bare id, so an unlabelled list
+    // routes exactly as well as a labelled one. The host is told the names are generic
+    // (`labelled: false` on `/audio-outputs`, `degraded` bit 9) and shows them as "Output 1",
+    // which is the honest version of what a grant would have bought.
+    //
+    // So: outputs found — labelled or not — no card. Zero outputs, or an enumeration that
+    // threw or timed out, is the one case where the grant is the difference between a list
+    // and nothing at all, and only then is the card raised. `selectAudioOutput()` engines are
+    // never asked either way; they have a permission-free picker.
+    //
+    // `known` is the enumeration the caller has already paid for, so the join costs one
+    // `enumerateDevices()` rather than two.
+    async function needsMicPermission(known) {
         initSpeakers();
         speakers.wantPrime = false;
-        if (!speakers.canSink && !(speakers.hasEarpiece && !speakers.hasAudioSession)) return false;
-        // Firefox 116+ enumerates outputs with labels and offers a permission-free picker,
-        // so there is nothing a microphone grant would add.
+        const wantsEarpieceHold = speakers.hasEarpiece && !speakers.hasAudioSession;
+        if (!speakers.canSink && !wantsEarpieceHold) return false;
         if (speakers.hasSelectOut) return false;
         try {
             const p = await navigator.permissions.query({ name: 'microphone' });
             speakers.micGranted = !!(p && p.state === 'granted');
         } catch (_) { note(); }
         if (speakers.canSink) {
-            const devs = await listOutputs();
-            if (devs.some((d) => d.label)) {
-                speakers._lastEnum = devs;
+            const devs = known || await listOutputs();
+            if (devs.length) {
+                if (devs.some((d) => d.label)) speakers._lastEnum = devs;
                 return false;
             }
         }
@@ -321,17 +340,15 @@
         return !speakers.micGranted;
     }
 
-    // Enumeration is for the host's device panel, never for playback — but it runs *before*
-    // the join, because the one browser mechanism that reveals output labels is a microphone
-    // grant and a permission prompt is an interruption. Nothing may interrupt a live session,
-    // so this is the only moment the card is ever raised and the join waits for the answer.
+    // Enumeration is for the host's device panel, never for playback. It runs *before* the
+    // join because the only thing on this page that can raise a permission prompt is here, and
+    // a prompt over a live second screen is an interruption — so if one is needed at all it is
+    // needed now, once, with the join waiting on the answer.
     //
-    // It is still free on every browser that needs no grant: an engine with
-    // `selectAudioOutput()` is answered by `needsMicPermission()` without a prompt, so is one
-    // where the labels are already visible, and the microphone hold is stopped the instant the
-    // second enumeration returns. A decline costs device *labels* in the host's picker and
-    // nothing else — the sink change itself still works on unlabelled ids — and is reported as
-    // `degraded` bit 9 for the rest of the session. It is never re-offered.
+    // On almost every device it needs nothing: see `needsMicPermission()`. A decline costs
+    // device *labels* in the host's picker and nothing else — the sink change itself works on
+    // bare ids — and is reported as `degraded` bit 9 for the rest of the session. It is never
+    // re-offered.
     let enumStarted = false;
     async function enumerateBeforeJoin(showPermModal) {
         if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
@@ -354,17 +371,16 @@
                 speakers._lastEnum = enumerated;
             }
         }
+        noteOutputLabels(enumerated);
         speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
         startDeviceWatch();
 
+        // Note the order: bit 9 tracks the *labels*, not the prompt. An enumeration that
+        // worked and came back with bare ids is exactly the case that now asks nothing and
+        // still has to be reported, or the host cannot tell "Output 1" from a device name.
         let need = false;
-        try { need = await needsMicPermission(); } catch (_) { note(); }
-        if (!need) {
-            speakers.labelsUnavailable = false;
-            return speakers._cache;
-        }
-        speakers.labelsUnavailable = true;
-        if (typeof showPermModal !== 'function') return speakers._cache;
+        try { need = await needsMicPermission(enumerated); } catch (_) { note(); }
+        if (!need || typeof showPermModal !== 'function') return speakers._cache;
 
         const granted = await new Promise((resolve) => {
             showPermModal(() => resolve(true), () => resolve(false));
@@ -372,11 +388,11 @@
         if (!granted) return speakers._cache;
         try {
             await primeMicPermission();
-            const withLabels = speakers.canSink ? await listOutputs() : [];
-            if (withLabels.some((d) => d.label)) {
-                speakers._lastEnum = withLabels;
-                speakers.labelsUnavailable = false;
-                speakers._cache = { supported: speakers.supported, outputs: buildOutputs(withLabels) };
+            const withGrant = speakers.canSink ? await listOutputs() : [];
+            if (withGrant.length) {
+                if (withGrant.some((d) => d.label)) speakers._lastEnum = withGrant;
+                noteOutputLabels(withGrant);
+                speakers._cache = { supported: speakers.supported, outputs: buildOutputs(withGrant) };
             }
         } catch (_) { note(); }
         releasePrimedStream();
@@ -402,6 +418,16 @@
         }
     }
 
+    // Bare ids are routable but unreadable, and the host's picker is a list a person chooses
+    // from. Rather than spend a microphone prompt on the names, name them here — the default
+    // device by what it is, the rest by position — and tell the host they are generic so it
+    // never presents them as what the operating system calls the hardware.
+    function noteOutputLabels(enumerated) {
+        if (!speakers.canSink) return;
+        speakers.outputsLabelled = enumerated.some((d) => d.label);
+        speakers.labelsUnavailable = !speakers.outputsLabelled;
+    }
+
     function buildOutputs(enumerated) {
         const out = [];
         if (speakers.canCategory) {
@@ -409,7 +435,15 @@
             out.push({ id: SE_EARPIECE, label: 'Earpiece' });
         }
         if (speakers.canSink) {
-            for (const d of enumerated) out.push(d);
+            let n = 0;
+            for (const d of enumerated) {
+                if (d.label) { out.push(d); continue; }
+                n++;
+                out.push({
+                    id: d.id,
+                    label: (d.id === 'default' || d.id === '') ? 'Default output' : 'Output ' + n,
+                });
+            }
         }
         return out;
     }
@@ -554,6 +588,7 @@
                     speakers._lastEnum = enumerated;
                 }
             }
+            noteOutputLabels(enumerated);
             speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
             postOutputs();
         } catch (_) { note(); }
@@ -584,6 +619,10 @@
                 // `JSON.stringify` drops an `undefined` value: the host keeps `None`, and the
                 // UI can tell "this client never said" from `''`, the device's default output.
                 current: speakers.appliedSink === null ? undefined : speakers.appliedSink,
+                // False means the names above are this page's own — "Output 1", "Output 2" —
+                // because the browser withheld the real ones. Omitted until something has
+                // enumerated, so the host can tell "not said" from "generic".
+                labelled: speakers.outputsLabelled === null ? undefined : speakers.outputsLabelled,
             });
             // The list is identical on all but a handful of ticks in a session, and the host
             // does the same work whether or not it changed. Re-POSTing it was a request per
