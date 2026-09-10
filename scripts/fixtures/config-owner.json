@@ -148,5 +148,11 @@
     "configEditor": false,
     "editDevice": false,
     "editNetwork": false
+  },
+  "driverRepair": {
+    "boot": "",
+    "install": 0,
+    "reinstall": 0,
+    "relaunch": 0
   }
 }

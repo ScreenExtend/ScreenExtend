@@ -8,7 +8,8 @@
     "quit": "Quit",
     "dontShowAgain": "Don't show this message again",
     "supportEmail": "support@screenextend.app",
-    "back": "Back"
+    "back": "Back",
+    "retry": "Try Again"
   },
   "app": {
     "closing": "Closing"
@@ -267,6 +268,10 @@
     "networkAdapters": {
       "failureTitle": "Couldn't Read Network Adapters",
       "failureDescription": "ScreenExtend is running, but it could not list this computer's networks, so no join links are shown. Reopen the Add Device screen to try again."
+    },
+    "driverBusy": {
+      "quitFailedTitle": "Couldn't Quit the Other Copy",
+      "quitFailedDescription": "The copy holding the display driver did not answer. Close it yourself — check the taskbar, or any terminal running ScreenExtend — then press Try Again."
     }
   },
   "device": {
@@ -433,7 +438,8 @@
       "upgradeBefore": "Please upgrade your operating system or contact support at ",
       "upgradeSuffix": ".",
       "cannotStartTitle": "ScreenExtend Can't Start on This Computer",
-      "cannotStartIntro": "ScreenExtend needs to create a display and send video, and this computer cannot do either right now. Everything that could be installed automatically has been tried. What is missing:"
+      "cannotStartIntro": "ScreenExtend needs to create a display and send video, and this computer cannot do either right now. Everything that could be installed automatically has been tried. What is missing:",
+      "driverRestartHint": "ScreenExtend has already tried installing the driver once since this computer started, so it will not ask for administrator approval again. Try Again re-checks; if it still fails, restart Windows and open ScreenExtend once more."
     },
     "permissions": {
       "title": "Permissions Required",
@@ -451,6 +457,13 @@
       "revokedSteps": "Re-approve ScreenExtend under System Settings → Privacy & Security → Screen Recording, then restart it and reconnect the device. macOS gives a newly granted permission only to a freshly launched app.",
       "openSettings": "Open Settings",
       "dismiss": "Dismiss"
+    },
+    "driverBusy": {
+      "title": "ScreenExtend Is Already Running",
+      "body": "Another copy of ScreenExtend is using the virtual display driver on this computer. Only one can use it at a time. Quit the other one and try again.",
+      "bodyWithPid": "Another copy of ScreenExtend (process {pid}) is using the virtual display driver on this computer. Only one can use it at a time. Quit that one and try again.",
+      "hint": "This can also be a ScreenExtend window you have already open, or one started from a terminal with `ScreenExtend serve`. Nothing is wrong with the driver and nothing needs reinstalling.",
+      "quitOther": "Quit the Other Copy"
     }
   },
   "configEditor": {

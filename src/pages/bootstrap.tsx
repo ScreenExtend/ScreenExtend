@@ -24,7 +24,16 @@ import {
 import { useGlobalSetters, useLoaded } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus, type UnsupportedApi } from "@/lib/bindings";
 import { generateOtp, readQrValues } from "@/lib/utils";
-import { classifyCompat, driverRemediation, offersDriverInstall } from "@/lib/startup-gate";
+import {
+  classifyCompat,
+  driverRemediation,
+  mayAttempt,
+  offersDriverInstall,
+  recordAttempt,
+  repairForBoot,
+  type DriverRepair,
+  type RepairAttempt,
+} from "@/lib/startup-gate";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
 import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { useTranslation } from "@/i18n";
@@ -62,9 +71,10 @@ function blocks(p: PermissionStatus): boolean {
   return p.required && p.state === "denied";
 }
 
-// A relaunch that does not fix the driver would relaunch again on the next launch, forever. One
-// attempt per window is enough to cover "the OS wanted a fresh process", and the window is long
-// enough that a user who quits and reopens does not trip it either.
+// A repair that does not fix the driver would be tried again on the next launch, forever, and
+// two of the three ask for elevation. `driverRepair` in the config store is the record that
+// stops that; this is a second, cheaper belt across one launch, because the store is written
+// asynchronously and a relaunch can beat the write to disk.
 const RELAUNCH_MEMO_KEY = "se.driverRelaunchAt";
 const RELAUNCH_WINDOW_MS = 10 * 60 * 1000;
 
@@ -86,6 +96,11 @@ function rememberRelaunch(): void {
     /* see relaunchAlreadyTried */
   }
 }
+
+// How long to wait after asking another instance to quit before probing again. It closes its
+// window, broadcasts BYE to every connected device and removes their virtual displays on the
+// way out, which is what has to finish before the driver is ours to open.
+const HOLDER_QUIT_SETTLE_MS = 2500;
 
 function needsRelaunch(perms: PermissionStatus[] | null): boolean {
   return (perms ?? []).some(p => p.relaunch_required);
@@ -129,6 +144,11 @@ export default function Bootstrap() {
   // host has a driver to install instead of guessing from the platform name.
   const [lastReport, setLastReport] = useState<CompatibilityReport | null>(null);
   const [remediating, setRemediating] = useState(false);
+  // The display driver is held by another ScreenExtend process. Its own dialog, because the
+  // only two useful actions -- quit that process, try again -- are neither "continue" nor
+  // "exit", and because nothing here may install anything.
+  const [busyRows, setBusyRows] = useState<UnsupportedApi[] | null>(null);
+  const [busyPid, setBusyPid] = useState<number | null>(null);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const [permReport, setPermReport] = useState<PermissionStatus[] | null>(null);
   const [updating, setUpdating] = useState(false);
@@ -247,7 +267,11 @@ export default function Bootstrap() {
         void loadDevices();
         void loadSettings();
       } else {
-        if (tryInstall) {
+        // `setup()` failing is the last place an install can still help, and the only one where
+        // the budget is consulted rather than the gate's own classification -- there is no
+        // report here to say what went wrong. Without the budget this was a second elevation
+        // prompt on top of whatever the gate had already spent.
+        if (tryInstall && (await spendRepair("install"))) {
           await commands.installDrivers();
           await new Promise(resolve => setTimeout(resolve, 5000));
           await runSetup(false);
@@ -362,6 +386,36 @@ export default function Bootstrap() {
     }
   };
 
+  // The boot the repair budget is scoped to, from the last report. Empty until one arrives, and
+  // empty on the platforms that do not report one -- `repairForBoot` treats both as "this boot".
+  const bootId = useRef("");
+
+  // Take one attempt out of the budget, or refuse. Persisted before the attempt runs, not
+  // after: a relaunch never comes back to write it down, and an install the user cancels at the
+  // UAC prompt has still been offered once.
+  const spendRepair = async (what: RepairAttempt): Promise<boolean> => {
+    let repair: DriverRepair;
+    try {
+      repair = repairForBoot((await getConfig())?.driverRepair, bootId.current);
+    } catch (e) {
+      // The store is unreadable. Refuse: an unbounded loop of elevation prompts is the failure
+      // this budget exists to prevent, and every route out of the modal still works.
+      console.error("[bootstrap] the driver repair record is unreadable; not repairing", e);
+      return false;
+    }
+    if (!mayAttempt(repair, what)) {
+      console.log(`[bootstrap] the display driver has already been given one ${what} this boot`);
+      return false;
+    }
+    try {
+      await updateConfig({ driverRepair: recordAttempt(repair, what) });
+    } catch (e) {
+      console.error("[bootstrap] the driver repair record could not be written", e);
+      return false;
+    }
+    return true;
+  };
+
   // Install what can be installed, then say whether the caller should carry on deciding.
   // `false` means this launch is over -- the only route to it is a relaunch that has already
   // been started, which is why the caller must not fall through to the dashboard behind it.
@@ -370,6 +424,10 @@ export default function Bootstrap() {
     // An installable row nothing here knows how to install. Carry on and decide: it survives
     // the pass, so the user is shown it rather than left on a spinner forever.
     if (!action) return true;
+    // One per boot, and the modal that follows says to restart. Without this the same pass ran
+    // again on the next launch, and again after the relaunch it started, each time asking for
+    // elevation twice -- against a driver that was never the problem.
+    if (!(await spendRepair(action))) return true;
     setRemediating(true);
     try {
       if (action === "reinstall") {
@@ -384,10 +442,10 @@ export default function Bootstrap() {
       // The driver enumerates asynchronously; the probe below reads the same thing the
       // installer just changed, so it has to be given the moment the old flow gave it.
       await new Promise(resolve => setTimeout(resolve, 5000));
-      if (!installed && action === "reinstall" && !relaunchAlreadyTried()) {
+      if (!installed && action === "reinstall" && !relaunchAlreadyTried() && (await spendRepair("relaunch"))) {
         // A driver that is present but silent is often one this process opened before the
-        // reinstall. A fresh process is the cheapest thing left to try, and it is bounded so
-        // it cannot become a relaunch loop.
+        // reinstall. A fresh process is the cheapest thing left to try, and it is bounded
+        // twice over so it cannot become a relaunch loop.
         rememberRelaunch();
         console.log("[bootstrap] relaunching so the reinstalled display driver is opened fresh");
         await commands.relaunchApp();
@@ -407,6 +465,28 @@ export default function Bootstrap() {
     }
   };
 
+  // Ask the instance holding the driver to quit, then probe again. `quitDriverHolder` only ever
+  // reaches one that answers on the control socket, so a `false` means "close it yourself".
+  const quitHolderAndRetry = async () => {
+    let quit = false;
+    try {
+      quit = await commands.quitDriverHolder();
+    } catch (e) {
+      console.error("asking the other instance to quit failed", e);
+    }
+    if (!quit) {
+      toast({
+        variant: "destructive",
+        title: t("toasts.driverBusy.quitFailedTitle"),
+        description: t("toasts.driverBusy.quitFailedDescription"),
+      });
+      return;
+    }
+    setBusyRows(null);
+    await new Promise(resolve => setTimeout(resolve, HOLDER_QUIT_SETTLE_MS));
+    await proceed();
+  };
+
   const proceed = async (remediated = false) => {
     try {
       if ((await ensurePermissions()) === "blocked") return;
@@ -421,9 +501,14 @@ export default function Bootstrap() {
         return;
       }
       setLastReport(report);
+      bootId.current = report.boot_id;
       const dontShowAgain = (await getConfig())?.dontShowAgain?.compatibility === true;
       const gate = classifyCompat(report, { remediated, dontShowAgain });
       switch (gate.kind) {
+        case "busy":
+          setBusyRows(gate.rows);
+          setBusyPid(report.display_driver_holder_pid);
+          return;
         case "remediate":
           if (await remediate(gate.rows)) {
             await proceed(true);
@@ -658,6 +743,60 @@ export default function Bootstrap() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {/* Another ScreenExtend has the display driver. Nothing is broken, so there is no install
+          button and no "Can't Start on This Computer" -- just the two things that help. */}
+      <AlertDialog open={busyRows !== null}>
+        <AlertDialogContent className="max-w-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("bootstrap.driverBusy.title")}</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3 text-left">
+                <div>
+                  {busyPid === null
+                    ? t("bootstrap.driverBusy.body")
+                    : withBold(t("bootstrap.driverBusy.bodyWithPid"), String(busyPid))}
+                </div>
+                <div>{t("bootstrap.driverBusy.hint")}</div>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction
+              className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
+            >
+              {t("common.quit")}
+            </AlertDialogAction>
+            <button
+              className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+              onClick={() => { void quitHolderAndRetry(); }}
+            >
+              {t("bootstrap.driverBusy.quitOther")}
+            </button>
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white"
+              onClick={async () => {
+                setBusyRows(null);
+                try {
+                  await proceed();
+                } catch {
+                  setError(true);
+                }
+              }}
+            >
+              {t("common.retry")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <AlertDialog open={compatReport !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
@@ -694,6 +833,13 @@ export default function Bootstrap() {
                     </ul>
                   </div>
                 )}
+                {/* A driver row that survived its own repair. The app has spent its one
+                    install and its one relaunch for this boot and will not ask for elevation
+                    again, so the two things left are Try Again and a restart -- and the user
+                    has to be told that, or the modal reads as a dead end. */}
+                {compatBlocking && offersDriverInstall(compatReport) && (
+                  <div>{t("bootstrap.compatibility.driverRestartHint")}</div>
+                )}
                 <div>
                   {t("bootstrap.compatibility.upgradeBefore")}
                   <a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>
@@ -719,6 +865,20 @@ export default function Bootstrap() {
             </div>
           )}
           <AlertDialogFooter>
+            {/* The one action a blocked driver row still has. It re-probes, and the repair
+                budget guarantees it cannot turn into another elevation prompt -- so it is safe
+                to offer, which the old modal's single Exit button was not. */}
+            {compatBlocking && offersDriverInstall(compatReport) && (
+              <button
+                className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+                onClick={() => {
+                  setCompatReport(null);
+                  proceed().catch(() => setError(true));
+                }}
+              >
+                {t("common.retry")}
+              </button>
+            )}
             {!compatBlocking && (
               <AlertDialogAction
                 className="bg-blue-600 hover:bg-blue-700 text-white"

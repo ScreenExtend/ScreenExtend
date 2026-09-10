@@ -278,7 +278,7 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `get_network_adapters`, `watch_for_network_changes`, `start_hosted_network`,
 `stop_hosted_network`, `is_hosted_network`, `get_hosted_network_status`, `is_wifi_on`,
 `turn_on_wifi`, `install_drivers`,
-`remove_drivers`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
+`remove_drivers`, `quit_driver_holder`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
 `set_device_auto_frame_rate`, `refresh_device_stream`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
@@ -849,7 +849,8 @@ name, theme, devices[], knownDevices[], sessionPassword, publicSessionsEnabled, 
 disableGpuEncode, legacyVolumeKeyProxy, walkthroughCompleted, disconnectGraceSecs,
 serverPorts{http,https}, hostedNetworkCredentials{name,password},
 turnConfig{urls,username,credential}, stunUrls,
-dontShowAgain{editDevice,editNetwork,compatibility,configEditor}
+dontShowAgain{editDevice,editNetwork,compatibility,configEditor},
+driverRepair{boot,install,reinstall,relaunch}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,

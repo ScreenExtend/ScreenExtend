@@ -125,6 +125,7 @@ export const configJsonSchema: JsonSchema = {
     "turnConfig",
     "stunUrls",
     "dontShowAgain",
+    "driverRepair",
   ],
   additionalProperties: false,
   properties: {
@@ -220,6 +221,18 @@ export const configJsonSchema: JsonSchema = {
         editNetwork: bool("Suppress the warning shown before restarting the hosted network with new credentials.", false),
         compatibility: bool("Suppress the compatibility report shown at startup.", false),
         configEditor: bool("Suppress the \"unsaved changes\" warning when leaving Settings with unsaved edits in this editor.", false),
+      },
+    },
+    driverRepair: {
+      type: "object",
+      description: "What ScreenExtend has already tried to do about the Windows display driver since this machine last booted. It gets one install, one reinstall and one restart per boot, so a repair that did not work is not repeated behind another administrator prompt. Clearing the counts here offers those attempts again without a restart.",
+      required: ["boot", "install", "reinstall", "relaunch"],
+      additionalProperties: false,
+      properties: {
+        boot: str("Identifies the boot these counts belong to. Counts from an earlier boot are ignored, so a restart clears them; empty means the platform does not report one."),
+        install: int("Times the driver has been installed this boot.", 0, 99, 0),
+        reinstall: int("Times the driver has been removed and installed again this boot.", 0, 99, 0),
+        relaunch: int("Times ScreenExtend has restarted itself this boot to reopen the driver.", 0, 99, 0),
       },
     },
   },

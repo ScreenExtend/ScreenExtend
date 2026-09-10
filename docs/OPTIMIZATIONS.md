@@ -2614,6 +2614,50 @@ and is `"all"` from row 323 on), pushed
 with `commands.setDevicePointerScope(ip, scope)`. `package.json` gained `test:gate`, which is not
 yet in `.github/workflows/ci.yml`.
 
+## UX-F: a busy display driver is not a broken one (post-report)
+
+The owner hit a loop of UAC prompts followed by **"Can't Start on This Computer — Virtual Display
+Driver: Installed but not answering"** with only an Exit button, and minutes later the app
+"randomly restarted and worked". `probe_display_backend` had two states for a driver it could not
+open, and neither was "somebody else has it": B7's remediation therefore removed and reinstalled a
+healthy signed driver, asked for elevation twice doing it, re-probed into the same state, and its
+bounded self-relaunch was what eventually appeared to fix things — after the other process had
+gone.
+
+**What the driver actually does, measured on the dev box** (Windows 11 26200, bundled IDD, new
+`report_second_client_behaviour` harness). Twelve concurrent `DriverClient`s connect in ~0.6 ms
+each while it is idle, so "one client at a time" is not the mechanism. What *is* available to
+fail is the 5 s `request_state` deadline in `driver_ipc`, and `report_mode_change_cost` already
+measured a display create at 4874 ms. A probe that lands in one of those windows times out and
+came back as `DriverNotResponding`, which is `installable` — the loop.
+
+| # | Change | Status |
+|---|---|---|
+| F1 | **`DisplayBackend::DriverBusy { holder: Option<u32> }`**, wire name `"DriverBusy"` (the pid rides beside it, never in the string). Reached from `ERROR_PIPE_BUSY`/`ERROR_SEM_TIMEOUT` on the connect, and from a handshake timeout whenever another of our own processes is alive to be holding it — reinstalling cannot help while one is. | `VERIFIED` (`an_occupied_pipe_is_busy_and_a_silent_one_is_not_responding` stands a real one-instance named pipe up, occupies it, and asserts the classification; `only_the_pipe_busy_errors_mean_occupied` pins the error-code mapping) |
+| F2 | **`Path::exists()` is gone from the probe**, and it was wrong in the one direction that mattered: `std::fs::metadata` opens the file, so a pipe whose instances are all taken reports **not found**. The absent case is now `ERROR_FILE_NOT_FOUND` from the connect itself. | `VERIFIED` (the same test: the busy pipe classified as `DriverNotInstalled` before this) |
+| F3 | **Naming the holder.** `PING` answers `OK <pid>` — a prefix-stable suffix, `is_ok_reply` accepts both forms — and `single_instance::remember_ctrl_path`, called at the top of `cli::dispatch`, is what lets a probe with no `AppHandle` ask. Falls back to enumerating processes running this same executable (`EnumProcesses` + `QueryFullProcessImageNameW`, no new windows-crate feature). Never answers with our own pid: by the time the desktop UI probes, the control file may name this process. | `VERIFIED` (live: beside `ScreenExtend serve` at pid 26972, `driver_pipe_holder()` → `Some(26972)`) |
+| F4 | **`display-driver-busy`, severity `optional`.** Not installable — there is nothing to install — and not blocking, because quitting the other instance fixes it. `classifyCompat` gains a `busy` kind returned ahead of everything but an unsupported OS, and `driverRemediation` can never see the key. | `VERIFIED` (`a_busy_driver_is_reported_but_never_installed`, 5 gate assertions) |
+| F5 | **The repair budget.** One install, one reinstall and one relaunch **per boot**, in `config.json`'s new `driverRepair`, keyed on `CompatibilityReport.boot_id` (Windows: wall clock minus `GetTickCount64`, in ten-second buckets; empty elsewhere). Consulted before `removeDrivers`/`installDrivers`, before the self-relaunch, and before the install `runSetup` used to make on its own account. A restart is the advice the modal gives, so a restart is what restores it. | `VERIFIED` (4 gate assertions over `repairForBoot`/`mayAttempt`/`recordAttempt`) |
+| F6 | **The two dialogs.** A busy driver gets its own — *ScreenExtend Is Already Running*, naming the pid, with **Quit the Other Copy** (the new `quit_driver_holder` command, which only ever reaches an instance answering on the control socket and never this one) and **Try Again**. A genuinely unresponsive one keeps its modal but gains **Try Again** and a line saying the app will not ask for elevation again and that restarting Windows is the next step — it used to offer Exit alone. | `COMPILE-CHECKED` (the dev box's driver is healthy; neither modal can be induced here) |
+| F7 | `doctor`/`status` print **"installed, in use by ScreenExtend (pid N)"** and `drivers.virtualDisplayHolderPid` joins the JSON. The line is a free function so its wording is asserted without a running host. The driver row contributes no exit code — `optional` keeps `bareMinimumMissing` false, so `doctor` stays 0. | `VERIFIED` (`the_driver_line_distinguishes_busy_from_dead`; live `doctor --json` beside a running host → `IddDriver`, exit 0) |
+
+**What could not be reproduced here, and what that means.** The busy state cannot be induced
+against the shipped driver on this box: it answers a second client in under a millisecond and
+keeps answering right through a monitor attach (`report_mode_change_cost` churning displays beside
+14 consecutive `doctor --json` runs → `IddDriver`, exit 0, every time). So the two halves are
+verified separately — the classification against a named pipe of the test's own, and the holder
+lookup against a live `ScreenExtend serve` — and `report_driver_holder` is the `#[ignore]`d
+harness that prints both plus the sentence `doctor` would show. The end-to-end line stays
+`COMPILE-CHECKED`. Even if some third cause put the owner's driver into a state neither of these
+covers, F5 alone ends the loop: it is enforced regardless of what the probe concluded.
+
+**For the integrator.** `bindings.ts` is regenerated (52 commands, 11 events, `check-bindings`
+passes); its whole diff is `quitDriverHolder` plus two additive `CompatibilityReport` fields
+(`display_driver_holder_pid`, `boot_id`). `config.json` gained a required `driverRepair` object —
+`scripts/fixtures/config-owner.json` and `config-schema.ts` moved with it, and existing installs
+need no migration because `readStore` merges over `defaultConfig`. `quit_driver_holder` lives in
+`lib.rs` beside `exit_app`, so it needed no per-OS arm.
+
 ## UX-D: the Settings config.json editor (post-report)
 
 The owner reported the editor as "100% broken": one error in the Problems panel
