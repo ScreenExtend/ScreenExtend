@@ -2501,18 +2501,25 @@ holding 324; the three documents that named a shifted number moved with them.
 
 ### Two things this does not fix
 
-- **WGC delivers 2–10 real frames a second for pointer-only motion on this box's indirect
+> **Both of these bullets have since been overtaken, and the first of them was wrong.** They are
+> left standing rather than quietly edited, because what they claimed is the reason two later
+> workstreams were commissioned. Read them against **§15.9** and **§15.8**.
+
+- ~~**WGC delivers 2–10 real frames a second for pointer-only motion on this box's indirect
   display — in both builds.** Everything else it emits is a keepalive repeat, and a repeat carries
   the pointer wherever WGC last composited it. That is why the painted rate went up more than
   eightfold and the *changed*-frame rate in the recording did not move, and it is the direct
-  mechanism behind "the cursor is painted on stale frames". Nothing in this change causes it and
-  nothing in this change fixes it. The fix is to stop asking WGC to composite the pointer
-  (`CursorCaptureSettings::WithoutCursor`) and draw it ourselves from `GetCursorInfo` into the ring
-  slot, reusing the sprite renderer `windows_utils/streamer/dxgi/cursor.rs` already has for exactly
-  this. **It is the single largest remaining item for the owner's original complaint.**
-- **`ice_gathering_timed_out` on the client, in four of six runs, absent at `271aa01`.** Not caused
-  by anything in this change; the suspect is `56fe583`, which stopped offering STUN to a
-  same-subnet peer. Worth a look before release.
+  mechanism behind "the cursor is painted on stale frames".~~ **Withdrawn — see §15.9.** The
+  pointer was never moving: the harness's `SendInput` had a 48-byte `INPUT` struct where the OS
+  wants 40 and failed with `ERROR_INVALID_PARAMETER` on every call, unchecked. "2–10 frames a
+  second" is what WGC delivers for a display on which **nothing at all** is moving. Re-measured
+  with a pointer that really sweeps, **WGC delivers 51 frames a second** for pointer-only motion on
+  this box. The remedy the bullet asked for was built anyway and is correct and kept — as a probed
+  tier, not as a speed-up.
+- ~~**`ice_gathering_timed_out` on the client, in four of six runs, absent at `271aa01`.** … the
+  suspect is `56fe583`, which stopped offering STUN to a same-subnet peer.~~ **Both halves of that
+  framing were wrong — see §15.8.** `56fe583` is exonerated by measurement, and bit 15 could not
+  have been reported at `271aa01` at all. The bit was real; what it named was not gathering.
 
 ### Gates, build and the device row
 
@@ -2539,3 +2546,176 @@ Before relaunching, the row the measurement left behind was cleared — `ScreenE
 172.16.11.76`, which is the saved `refreshRate 360` / `dpr 2` that root cause 1 exists to stop
 being written in the first place. `devices list` now shows only `172.16.11.81` at 120 Hz, untouched,
 and the ten `knownDevices` rows are unchanged. The app was then relaunched detached.
+
+## 15.7 Post-report fix: a busy display driver is not a broken one
+
+The owner hit a loop of UAC prompts ending in **"Can't Start on This Computer — Virtual Display
+Driver: Installed but not answering"**, with only an Exit button; minutes later the app "randomly
+restarted and worked". Nothing was broken. Another copy of ScreenExtend had the driver's pipe.
+
+`probe_display_backend` had two states for a driver it could not open — installed and healthy, or
+installed and dead — and no state for "somebody else has it". So §15.2's startup gate did the one
+thing that cannot help: it removed and reinstalled a healthy signed driver, asked for elevation
+twice doing it, re-probed into the same state, and looped. The bounded self-relaunch is what
+eventually appeared to fix it, after the other process had gone.
+
+**The mechanism, measured rather than assumed.** Twelve concurrent `DriverClient`s connect in
+~0.6 ms each on this box while the driver is idle, so "one client at a time" is *not* how it
+fails. What is available to fail is the 5 s `request_state` deadline in `driver_ipc` — and
+`report_mode_change_cost` had already measured a display create at 4874 ms. A probe landing in one
+of those windows timed out and came back `DriverNotResponding`, which the gate classifies as
+*installable*. That is the loop.
+
+Worse, the probe's own presence check was wrong in the one direction that mattered:
+`Path::exists()` calls `std::fs::metadata`, which **opens** the file, so a named pipe whose
+instances are all taken reports **not found**. An occupied driver could be reported as one that
+was never installed.
+
+### What changed
+
+- **`DisplayBackend::DriverBusy { holder: Option<u32> }`** — reached from `ERROR_PIPE_BUSY` /
+  `ERROR_SEM_TIMEOUT` on the connect, and from a handshake timeout whenever another of our own
+  processes is alive to be holding it. The pid rides beside the variant, never inside the string.
+- **`Path::exists()` is gone.** Absence is now `ERROR_FILE_NOT_FOUND` from the connect itself.
+- **The holder is named.** `PING` answers `OK <pid>` — a prefix-stable suffix, so an older reader
+  still parses it — and falls back to enumerating processes running this same executable. It never
+  answers with our own pid.
+- **`display-driver-busy`, severity `optional`**: not installable, because there is nothing to
+  install, and not blocking, because quitting the other copy fixes it. The remediation path can
+  never see the key.
+- **A per-boot repair budget.** One install, one reinstall and one relaunch *per boot*, in
+  `config.json`'s new `driverRepair`, keyed on `CompatibilityReport.boot_id`. A restart is the
+  advice the modal gives, so a restart is what restores it. This is the belt-and-braces half: it
+  ends the loop **regardless of what the probe concluded**.
+- **Two dialogs instead of one.** A busy driver gets *ScreenExtend Is Already Running*, naming the
+  pid, with **Quit the Other Copy** (the new `quit_driver_holder` command, which only ever reaches
+  an instance answering on the control socket, never this one) and **Try Again**. A genuinely
+  unresponsive driver keeps its modal but gains **Try Again** and a line saying the app will not
+  ask for elevation again and that restarting Windows is the next step — it used to offer Exit
+  alone.
+- **`doctor` and `status` say so**: "installed, in use by ScreenExtend (pid N)", plus
+  `drivers.virtualDisplayHolderPid` in the JSON. The row contributes no exit code, so `doctor`
+  stays 0.
+
+### Verification, and its one honest gap
+
+`VERIFIED` on this box: the classification against a real one-instance named pipe the test stands
+up and occupies (which the old `Path::exists()` gate called *not installed*); the error-code
+mapping; the holder lookup against a live `ScreenExtend serve` (pid 26972 → `Some(26972)`); the
+`optional` severity and its five gate assertions; the four assertions over the repair budget; and
+the `doctor` line. `test:gate` is **21/21**.
+
+What could not be reproduced is the busy state itself against the shipped driver — it answers a
+second client in under a millisecond and keeps answering right through a monitor attach (14
+consecutive `doctor --json` runs beside a display-churning harness, `IddDriver` and exit 0 every
+time). So the two halves are verified separately and the end-to-end line stays
+**`COMPILE-CHECKED`**, with `report_driver_holder` as the `#[ignore]`d harness that prints both.
+Ledger: `docs/OPTIMIZATIONS.md` §UX-F; the gate's own script is `docs/manual-tests/startup-gate.md`
+§1a/§1b.
+
+## 15.8 Post-report fix: what `ice_gathering_timed_out` was actually reporting
+
+§15.6 left this open with a named suspect. **Both halves of that framing were wrong**, and the
+measurements say so directly.
+
+**`56fe583` is exonerated.** A bare `RTCPeerConnection` over CDP on this box, sixteen trials,
+Chrome 141 / Windows 11 26200: with `iceServers: []` gathering reaches `complete` in
+**165 – 1205 ms** and emits the null candidate in the same task; with one Google STUN server,
+175 – 1062 ms. Removing STUN does not stop, slow, or change the shape of gathering. The shipped
+page agrees — 22 instrumented joins show `icegatheringstatechange → complete` *plus* the null
+candidate at **+126 ms**, while the WHEP POST trickle had already sent was still in flight.
+
+**"Never at `271aa01`" was not evidence either.** At `271aa01` the client page had no degradation
+bitfield at all — `degraded` was a boolean link-state flag. Bit 15 could not be reported there.
+
+So the bit was real and what it named was not gathering. On the trickle tier nothing waits for
+gathering, so bit 15 means exactly one thing: the trickle sender did not `settle()` within 8 s of
+`holdStageForIce()`. Three ways that happens, all read out of the shipped code, all now closed:
+
+1. **The deadline covered the WHEP round trip.** It was armed when the offer was created — but the
+   sender can PATCH nothing until the answer names its resource, and that answer creates a virtual
+   display whose attach poll alone is 5 s and is serialised process-wide. `WHEP_TIMEOUT_MS` is
+   **10 s**, i.e. *longer than the 8 s deadline that structurally depended on it*. A merely slow
+   host therefore made the page report a **gathering** failure for a join that then succeeded, and
+   hold the picture for 8 s to do it.
+2. **`startTrickle` never listened for `icegatheringstatechange`**, though the comment above
+   `ICE_SETTLE_DEADLINE_MS` says the deadline exists for a browser emitting neither signal. It
+   waited on the null candidate alone — and Chrome dispatches the state change *first*.
+3. **A sender that PATCHes nothing never settles.** Every candidate already in the offer, or no
+   candidate at all, means an empty batch, an early return, and a silent 8 s hold.
+
+The fix is client-only: gathering ends on **either** signal and is checked once at construction;
+the deadline is armed at `localTrickle.open()` rather than at `holdStageForIce()`; and the hold is
+released as soon as ICE reaches connected, with `iceEverConnected` latching it so a session that
+connected and later degraded still cannot rejoin behind a picture. Nine new assertions in
+`scripts/test-client-ice.mjs`, five of which fail against the unfixed page.
+
+**Measured and reported as not-a-win:** client-visible join is 6.32 s before, 6.31 s after — that
+number is dominated by the WebCodecs 5 s no-frame watchdog, which fires on every join in this
+harness. What the change removes is an 8 s hold that does not happen on every join and so never
+appears in a median. **Not reproduced here, said plainly:** bit 15 did not appear once across 22
+instrumented joins and six full harness runs today, because every one of them demoted at the
+watchdog and the demotion cancels the very deadline that sets the bit.
+
+### The bug found while putting the box back
+
+`scripts/measure-stream.ps1` cleared the saved device rows by round-tripping `config.json` through
+`Set-Content -Encoding UTF8`, which on PowerShell 5.1 **writes a BOM**. `tauri-plugin-store` cannot
+parse a BOM: the host reads the file, fails, falls back to `defaultConfig` and rewrites it. So
+clearing one device row silently discarded **every stored setting** — devices, known devices,
+ports, TURN, STUN, theme — at the host's next launch, which is also when nobody is watching.
+Verified both ways: with a BOM, `devices=0 knownDevices=0` after a relaunch; without,
+`devices=1 knownDevices=11` and it stays. Now written with
+`[IO.File]::WriteAllText(…, UTF8Encoding $false)`. Ledger: §UX-ICE.
+
+## 15.9 Post-report correction: the harness never moved the pointer
+
+§15.6's largest open item — "WGC delivers 2–10 real frames a second for pointer-only motion, in
+both builds" — was an artefact of the instrument. It is **withdrawn**, and §15.6 now says so where
+it stands.
+
+**The pointer never moved.** `measure-stream.ps1` declared the Win32 `INPUT` struct with two
+trailing pad ints, making `Marshal.SizeOf` **48** bytes where the OS wants **40**. `SendInput`
+validates `cbSize` against its own `sizeof` and returns 0 for anything else; nothing checked the
+return. Every `MoveTo` in every run of the cursor scene failed with `ERROR_INVALID_PARAMETER`, and
+the pointer sat at the centre of the host's own panel for the whole run. Measured directly:
+`Marshal.SizeOf` 48, `sent=0 err=87`; with the pads removed, 40, `sent=1`, and the pointer moves.
+A second defect compounded it — `-offset_x` / `-offset_y` / `-video_size` sat *after* `-i desktop`,
+where ffmpeg treats them as output options and ignores them, so the 60 fps recording captured all
+3840x1080 of the desktop instead of the client's 1280x800 window and counted a clock ticking
+elsewhere as a changed frame. Both are fixed, and the scene now proves the sweep with a
+move-and-read-back and **refuses to run** if the pointer did not move (ledger 334, 335).
+
+**Re-measured, with a pointer that really sweeps**, same box, same empty virtual display, WGC
+cursor capture on:
+
+| | frames / 30 s | of those, keepalive repeats | WGC frames a second |
+|---|---|---|---|
+| pointer stationary | 1248 | 1246 | **0.07** |
+| pointer sweeping | 1720 | 186 | **51** |
+
+The compositor does produce a frame for a pointer that moves. "2 – 10" was the first row of that
+table being mistaken for the second.
+
+**The remedy was built anyway, and it is kept.** `windows_utils/streamer/cursor_overlay.rs` turns
+WGC's cursor off on the ring path and blends a sprite built from `GetCursorInfo`'s `HCURSOR` onto
+each ring slot on the GPU, redrawing it on a slot the encode thread is already holding; the tier is
+probed by building it, gated on `wgc_features().cursor_toggle`, and a fork addition
+(`GraphicsCaptureApiHandler::cursor_capture_override`, recorded in `FORK.md`) lets the handler
+overrule the capture settings after they exist. It costs **29 – 50 µs per frame**.
+
+It is **`VERIFIED` as correct, not as faster**, and the report says which. Before and after are
+*indistinguishable* — painted 71.8 vs 68.8 fps, gap p50 17 ms both, `capture_to_socket` p50 9.44 ms
+both — and the spread inside each triple is wider than the gap between them. What it buys is two
+properties the old path does not have: a keepalive repeat now carries the **current** pointer
+rather than wherever WGC last composited it (which is the literal mechanism behind "the cursor is
+painted on stale frames"; stale repeats fall 12 % → 8 %), and the pointer's update rate no longer
+depends on the compositor delivering a frame at all — with the pointer held still WGC delivers
+0.07 frames a second. Neither is worth much on Windows 11 26200, whose compositor is generous;
+both are worth more on the builds `guides/windows-legacy.md` covers, which is exactly where this is
+unverified. The AMF ring arm and the classic non-ring path are `COMPILE-CHECKED`.
+
+**Verified by looking**, which is the check that matters most here and which no counter can make: a
+frame extracted from the client's own recording shows the Windows arrow with the right shape, the
+right alpha, and its tip on the pointer's coordinate. The first implementation of this passed every
+host counter while drawing nothing at all, because `MonitorFromPoint` never matched.
