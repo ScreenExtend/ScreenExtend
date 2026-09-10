@@ -3056,3 +3056,147 @@ it. Script and expected readings: `docs/manual-tests/core-closeout.md` §9.
 have needed no new verb — and it would be wrong twice: the id is a credential with a process
 lifetime, not a setting, and a file cannot tell you whether anything is currently serving it,
 which is the question every one of these commands is really asking.
+
+
+## UX-XNET: a relayed join was never classified cross-network — `VERIFIED`
+
+The owner reported that joining from a phone on 5G through the public relay
+`https://session.screenextend.app/?id=…` used to work with **no TURN server configured**, and
+that it stopped somewhere in the engagement's ~440 commits. `ScreenExtend turn show` says
+`TURN relay: not configured`, and `cloud.rs`'s module doc and CLAUDE.md both said cross-network
+joins *require* a user TURN server. Measured against the live relay, that claim is wrong, and
+the thing that actually regressed is elsewhere.
+
+### What the relay actually does — measured, 2026-09-10
+
+Probed from this box against the running host (session `SE7QK4MNPX2W`, `serve -v`, no TURN):
+
+| | served by | body |
+|---|---|---|
+| `GET /` | the **relay**, not the host | 61 442 bytes — its own copy of the client page, a vintage with no trickle, no `locality`, no `se_join`, no `OP::STATS`. The repo's page is 184 591 bytes and never reaches a relayed client |
+| `GET /ice-config` | the relay | `{"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]}` — STUN, **no TURN** |
+| `GET /net-config` | the relay | `{"httpsPort":443}` — **no `trickleIce`** |
+| `POST /whep`, `GET /reconfig`, `POST /leave` | tunnelled to the host | `cloud.rs::dispatch`; `PATCH /whep/{id}` is not tunnelled and answers 404 |
+
+So there is no TURN on the relayed path and there never was. It works — when it works — on
+**server-reflexive candidates from Google STUN on both ends**, which is exactly what the owner
+described. A relayed join completed from here: `POST /whep` → 200, `application/sdp`,
+`x-device-token` issued, and the host's answer carried a reflexive candidate:
+
+```
+a=candidate:3223334278 1 udp 1694498815 73.93.177.73 59008 typ srflx raddr 0.0.0.0 rport 59008
+```
+
+`56fe583` (no STUN for a same-subnet peer) does **not** misfire here — a relay client id does not
+parse as an address, so `locality_for` never reaches the same-subnet branch and the full STUN list
+is served. The media socket (`SCREENEXTEND_MEDIA_SOCKET`) is opt-in and off, so muxed mode never
+suppresses reflexive gathering either. Both suspects cleared.
+
+### The defect
+
+`JoinOrigin::relayed(client_id)` puts the relay's opaque client id in `peer_ip` — the field is
+documented as a label and a rate-limit bucket, never an address — and `start_session` classified
+the session with `state.locality_for(client_ip)`, which begins `client_ip.parse::<IpAddr>()`.
+For `c_zDdpnGuxTv62iyxVFsLXJg` that parse always fails, so the function returned `Unknown` on its
+first line and **every** locality-driven decision fell through to its `_` arm — which is the LAN
+arm:
+
+| | `Unknown` (what a relayed join got) | `CrossNetwork` (what it is) |
+|---|---|---|
+| RTP payload MTU | `RTP_PAYLOAD_MTU_LAN` 1188 | `RTP_PAYLOAD_MTU_RELAY` 1012 |
+| `playout_delay_max` | 0 ms | `PLAYOUT_DELAY_MAX_RELAY` 200 ms |
+| pacing | `PacingMode::Light` | `PacingMode::Full` — its own doc comment reads "Relayed or cross-network" |
+
+The running host had been printing the contradiction once per relayed join, and nothing read it:
+
+```
+session transport: locality=Unknown mtu=1188 pacing=Light playout_delay_max=0ms
+session locality was pre-classified Unknown but the nominated candidate pair says CrossNetwork;
+transport constants for this session were chosen for the former
+```
+
+### Measured cost, same host, overlapping in time
+
+A relayed session and a direct LAN session ran concurrently on the one host, same capture backend
+(`wgc`), same encoder (`nvenc-zero-copy-ring`), same 1920x1080:
+
+| | relayed (`55963e7b…`) | direct LAN (`5e2a5b03…`) |
+|---|---|---|
+| frames | 5092 | 1352 |
+| `idrs_sent` | **365** | **2** |
+| `keyframe_requests` | 366 (~3.2/s, sustained) | 0 |
+| `client_keyframe_requests` | 0 — so RTCP PLI/FIR, not the in-band opcode | 0 |
+| `nacks_received` | 0 | 0 |
+
+`keyframe_requests_suppressed` stayed at 1 throughout: at ~3.2/s the requests are spaced wider
+than `keyframe.rs`'s `MIN_IDR_INTERVAL_MS` 200, so the storm gate never fires. On a link with
+bandwidth to spare this is only waste. On a cellular uplink, 3.2 full IDRs per second at 1080p
+with a 12.4 Mbps start bitrate is the whole budget, and every IDR that is too big for the path
+MTU costs another one.
+
+### The fix
+
+`AppState::locality_for_origin(JoinOrigin)` reads the **route** instead of parsing an id: a join
+that arrived through the cloud tunnel is cross-network by construction, because the relay exists
+only to carry clients that cannot reach the host directly. Direct joins are unchanged and still
+classify by address. `start_session` is the only caller that changes.
+
+Second defect found on the same path and fixed with it: **`/reconfig` over the tunnel was inert.**
+The relay's deployed page predates the join id, so it polls `/reconfig` with no `?join=`, and
+`process_reconfig(state, "")` matched no session and answered `{"epoch":0,"kick":0}` for the life
+of every relayed session — a kick raised in the desktop UI never arrived, and neither did a
+display-scale, orientation, refresh-rate or audio-output change. Confirmed live: 49 consecutive
+polls, all `{"audioSink":"","epoch":0,"kick":0}`. `process_relay_reconfig` falls back to
+`joins_for_relay_client`, which is the mapping `/leave` already uses and is a relay identity, not
+an address — so the "no address fallback on a request path" rule is kept.
+
+### Tests
+
+`streamer::server::tests` gains four: a relayed origin is `CrossNetwork` however its client id is
+spelled (including one that *would* parse as a LAN address), a direct origin still classifies by
+address, the relayed ICE list matches `ice_for(CrossNetwork)` exactly, and a relayed `/reconfig`
+naming no join finds its session while an unknown relay client still gets nothing.
+`scripts/test-client-ice.mjs` gains the shape the public relay actually forwards, captured live —
+no TURN, no `locality`, no `trickleIce` — and pins `netConfig.trickleIce === true` as a strict
+comparison, because `PATCH /whep/{id}` is the one route the tunnel does not carry and a truthiness
+test there would post an offer that can never be completed.
+
+### Still unproven
+
+Neither dev box can be a true cross-network client: the browser used here shares a public IP with
+the host, so ICE nominated a local pair and the MTU was never the binding constraint. What is
+proven is the classification, the constants it selected, and the keyframe rate that came with
+them. The MTU and playout-delay half of the fix needs the owner's phone on cellular —
+`docs/manual-tests/client-page.md` §"A phone on cellular, through the public relay" has the
+procedure and the exact log lines.
+
+### What changed on the relayed path since `271aa01`, and what is still unattributed
+
+Read out of the diff, for a **relayed** client specifically:
+
+| | `271aa01` | before this row | note |
+|---|---|---|---|
+| RTP payload MTU | 1188 (one constant for everyone) | 1188 | unchanged — the new 1012 tier existed but was unreachable |
+| playout delay | `PlayoutDelayExtension::new(0, 0)` for everyone | 0 | unchanged, same reason |
+| pacing | no pacer at all | `Light` | new, but measured `pace_wait` p50 0.00 ms / max 0.26 ms — not material |
+| `cfg.intra_refresh` | **absent** — every shipped session encoded without it | `true`, forced in `server.rs` by `56fe583` | **new, and unmeasured on this path** |
+| `/reconfig` key | the relay's `client_id` — worked | the join id, which the relay's page never sends — inert | regression, fixed above |
+| packetizer, `repair.rs`/LTR, TWCC congestion control | absent | present | new, unmeasured on this path |
+
+So the transport constants a relayed client received did **not** get worse between `271aa01` and
+today; they simply never improved, which is what this row fixes. The one *functional* regression
+found is `/reconfig`. The keyframe storm is real and measured, but it is not yet attributed to a
+commit: `intra_refresh` is the strongest remaining candidate, because it is the only shipped-path
+encode change in the window and it changes exactly how a decoder recovers a reference chain.
+
+### Why the A/B against `271aa01` did not run
+
+A `271aa01` host binary was built for it
+(`.claude/worktrees/xnet-old`, `CARGO_TARGET_DIR=…/ScreenExtend-xnetold`, builds clean with the
+current `dist/` copied in). It could not be started: `serve` takes the single-instance lock at
+both revisions, so the comparison needs the running host stopped, and overriding `LOCALAPPDATA`
+does not move the lock because Tauri resolves `app_local_data_dir` through
+`SHGetKnownFolderPath`, not the environment. Stopping the owner's host was not something this
+session was permitted to do. The binary is left in place so the comparison is one `stop` away:
+run it on `--http-port 8090 --https-port 8453` with its own session id, join through the relay,
+and compare `idrs_sent` against `frames_encoded` for a two-minute static session.
