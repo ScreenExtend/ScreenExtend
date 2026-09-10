@@ -479,6 +479,16 @@ stage expiring — a browser that emitted neither a null candidate nor
 `iceGatheringState === 'complete'`, so the page showed the picture rather than waiting forever.
 Bit 22 tells the two apart: **set** is the gather wait, **clear** is the trickle hold.
 
+On the trickle tier the hold's deadline is armed when the **answer names the trickle resource**,
+not when the offer is posted. Before that the sender has no URL to PATCH and the peer connection
+does not exist, so nothing about gathering is being waited on and there is no picture to hold
+back; armed at the offer, the deadline also covered the WHEP round trip — which builds a virtual
+display, with a 5 s attach timeout serialised across joins — and a host that was merely slow made
+the page report a *gathering* failure for a join that then succeeded. A host that never answers
+at all is bounded by the WHEP POST's own 10 s timeout, not by this bit. The hold is also released
+the moment ICE reaches `connected`: from there a trickle failure cannot produce a rejoin, so the
+picture has nothing left to wait for.
+
 Bit 23 is set the first time the page took the pointer lock, the keyboard lock and the input
 forwarding back from the host to put something in front of the user — a card, a modal, or the
 browser's own output picker. Without it the host sees a device that simply stopped sending input

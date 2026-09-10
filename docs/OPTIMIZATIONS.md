@@ -2767,3 +2767,102 @@ hunk to conflict with the other two branches and take both sides. The desktop pa
 UX-C's and is deliberately not made here: `AudioOutputsInfo` wants `labelled?: boolean | null`
 carried through the two places that rebuild it in `App.tsx` and `device-details.tsx`, and
 `labelled === false` means render the names as generic.
+
+## UX-ICE: `ice_gathering_timed_out`, and what it was actually reporting (post-report)
+
+`docs/FINAL-REPORT.md` §15.6 left this open: the client set `ice_gathering_timed_out` in four of
+six real Chrome joins on the Windows box and never at `271aa01`, with `56fe583` — "no STUN for a
+same-subnet peer" — named as the suspect. Both halves of that framing turned out to be wrong, and
+the measurements say so directly.
+
+### `56fe583` is not the cause, measured twice
+
+A bare `RTCPeerConnection` driven over CDP on this box, sixteen trials, Chrome 141 / Windows 11
+26200: with `iceServers: []` gathering reaches `complete` in **165 / 179 / 194 / 257 / 526 / 1161 /
+1205 ms** and emits the null candidate in the same task; with one Google STUN server it is
+**175 – 1062 ms**. Removing STUN does not stop, slow or change the shape of gathering. The same
+holds in the shipped page: instrumenting `RTCPeerConnection` and `fetch` on the real join form
+(22 instrumented joins, `serve` host over HTTPS) shows `pc.new` with an empty server list,
+four UDP host candidates at +2 ms, four TCP host candidates at +140 ms, and
+`icegatheringstatechange → complete` **plus** the null candidate at **+126 ms** — while the WHEP
+POST, which trickle had already sent, was still in flight.
+
+### "never at `271aa01`" is not evidence either
+
+At `271aa01` the client page had **no degradation bitfield at all** — `degraded` was a boolean
+link-state flag, and `DEG` / `ICE_GATHERING_DEADLINE` were introduced afterwards by `5f6042c`.
+Bit 15 could not be reported there. The 8 s stage hold that reports it on the trickle tier came
+later still, in `44f3f6d`.
+
+### What bit 15 actually meant on that tier
+
+Nothing waits for gathering on the trickle tier, so bit 15 there is exactly one thing: the trickle
+sender did not call `settle()` within 8 s of `holdStageForIce()`. Three ways that happens, all of
+them found by reading the shipped code and all of them now closed:
+
+1. **The deadline covered the WHEP round trip.** It was armed when the offer was created, but the
+   sender cannot PATCH anything until the answer names its resource — and that answer creates a
+   virtual display, whose attach poll alone is `DISPLAY_ATTACH_TIMEOUT` = 5 s and is serialised
+   process-wide by `DISPLAY_CORRELATION_LOCK`. `WHEP_TIMEOUT_MS` is **10 s**, i.e. *longer than
+   the 8 s deadline that structurally depended on it*. A host that was merely slow therefore made
+   the page report a **gathering** failure for a join that then succeeded, and hold the picture
+   for 8 s to do it. Measured on this box: hold armed → settle is 2.93 s on a cold host
+   (`display=1970–2283 ms`) and 0.43 s on a warm one, so the margin was ~5 s — and §"Honesty" of
+   `docs/RESULTS.md` records the same box in a state where display attach was **3× slower**,
+   which is the state the §15.6 runs were taken in.
+2. **`startTrickle` never listened for `icegatheringstatechange`**, although both the ledger row
+   that introduced the hold and the comment above `ICE_SETTLE_DEADLINE_MS` say the deadline exists
+   for "a browser that emits neither a null candidate nor `iceGatheringState === 'complete'`". It
+   waited on the null candidate alone. Chrome dispatches the state change *first*, so the page was
+   waiting on the later of the two signals and had no cover at all if the earlier one was the only
+   one it got.
+3. **A sender that PATCHes nothing never settles.** With `ended` never set, `flush()` returns early
+   whenever the batch is empty — every candidate already carried in the offer, or no candidate at
+   all — and `open()`'s first-ack timer deliberately stays quiet when `attempts === 0`. Both are
+   correct on their own terms and together they are a silent 8 s hold.
+
+### The change — `VERIFIED` (client), no host change
+
+- `startTrickle` now also ends gathering on `iceGatheringState === 'complete'`, checks it once at
+  construction (the sender is built one task after `setLocalDescription`, so gathering can already
+  be over and no further event will fire), and removes both listeners in `quiesce()`.
+- `holdStageForIce()` no longer starts the deadline. `armIceSettleDeadline()` does, and the page
+  calls it where `localTrickle.open()` is called — the first moment the sender can do anything and
+  the first moment a frame is possible. Before that the hold holds nothing back and gathering is
+  not what is being waited on; a host that never answers is bounded by `WHEP_TIMEOUT_MS`.
+- The hold is released as soon as ICE reaches `connected`/`completed`. From there a trickle failure
+  cannot produce a rejoin, so the picture has nothing to wait for. `iceEverConnected` latches that
+  for the life of the peer connection and `trickleFailed` reads the latch, so a session that
+  connected and later degraded still cannot rejoin behind a picture — the invariant the hold
+  exists for is unchanged, and is now enforced by a latch rather than by an instantaneous read.
+
+`scripts/test-client-ice.mjs` grew nine assertions over the shipped page: gathering completing
+with no null candidate settles the sender; a sender built after gathering already finished settles;
+a duplicate-only batch sends no PATCH and still settles; a session with no candidates at all
+settles; both listeners are removed; and four on the hold itself — `holdStageForIce()` alone never
+expires, `armIceSettleDeadline()` starts a deadline that reports bit 15 and releases the stage, a
+settle inside it cancels it, and arming twice does not restart it. Against the unfixed page five of
+them fail (and the arm function is simply absent), so they hold the change up rather than describe
+it.
+
+### Measured, on 6+6 joins each side
+
+Client-visible join (Connect → the join form hidden), eight joins per binary, same box, saved
+device rows cleared, first join excluded as the cold-Chrome outlier (Chrome's *first*
+`createOffer()` in a fresh profile measured 13–25 s on this box): **before 6.32 s median
+(5.87–6.41), after 6.31 s median**. That number is dominated by something this change does not
+touch — the WebCodecs path's 5 s no-frame watchdog fires on every join in this harness and the
+page demotes to `<video>` and rejoins — and it is reported here so the number is not read as a win
+it is not. Host `join stages` is unchanged and unchangeable by a client edit:
+`display=0 ms pipeline=305–478 ms handshake=305–479 ms` warm, `display=1970–2283 ms` cold. What the
+change removes is an 8 s hold that never appears in a median because it does not happen on every
+join.
+
+**Not reproduced here, and said plainly:** across 22 instrumented joins and six full
+`scripts/measure-stream.ps1` runs (three with the 60 fps recording, exactly as §15.6 was taken)
+bit 15 did **not** appear once on this box today; every run demoted to `<video>` at the 5 s
+watchdog, and `fallbackToVideo` → `teardownSession()` → `releaseIceHold()` **cancels the very
+deadline that sets the bit**. That is consistent with §15.6's own numbers — bit 15 in four of six
+runs, a demotion in three — bit 15 belongs to the runs where the page stayed on the fast path long
+enough for the deadline to run. The three defects above are read out of the shipped code and are
+each proved by a failing assertion; which of them fired in §15.6's runs is not proved.
