@@ -3064,3 +3064,103 @@ whole of §UX-SESSION, demonstrated on the running system:
 "hostRunning": true, "hostReportedSession": true,
 "sessionId": "SE7QK4MNPX2W", "sessionIdSource": "host"
 ```
+
+## 15.13 Post-report attribution: the keyframe storm was the gate's window, not intra refresh
+
+§15.12 closed the relayed join's locality but left the symptom that started the investigation
+unattributed: through the public relay the host emitted **3.2 full 1080p IDRs a second**,
+indefinitely, on a static screen. It named `intra_refresh = true` as the strongest remaining
+candidate and said the A/B had not run. It has now, four ways, and it clears `intra_refresh`
+entirely.
+
+### The four runs
+
+Chrome on the host box joining through the live relay, tab backgrounded, ~5000-frame window,
+1920x1080, WGC + `nvenc-zero-copy-ring`, no TURN. Same machine, same relay, and — because the
+relay serves its own older copy of the client page to every run — the same client, which is what
+makes the four comparable at all.
+
+| run | build | frames | client PLI/FIR | IDRs sent | suppressed | intra refresh |
+|---|---|---|---|---|---|---|
+| A | `271aa01` | 5022 | 4703 | **23** | n/a (no gate) | off |
+| B | `c1fe9d6` (§15.12's head) | 5117 | 373 | **347** | 1 | on |
+| C | `xnet2` | 5038 | 487 | **113** | 375 | on |
+| D | `xnet2` + `SE_INTRA_REFRESH=0` | 5021 | 488 | **114** | 378 | off |
+
+**Intra refresh is exonerated.** C and D differ by that one knob and nothing else: 113 IDRs
+against 114, 487 PLIs against 488. It was the only shipped-path encode change in the window and it
+turns out to have no measurable effect on a relayed session's keyframe traffic. The
+`SE_INTRA_REFRESH` override built for this measurement is kept, because that answer was not
+derivable by reading and would not be re-derivable later without it.
+
+**The locality fix was not enough either.** Run B already ran
+`locality=CrossNetwork mtu=1012 pacing=Full playout_delay_max=200ms` — confirmed in its own log —
+and still sent 347 IDRs. The transport constants never produced the storm.
+
+### What did
+
+`KeyframeGate`'s window was `clamp(2 × RTT, 200, 1000)` ms, and **RTT is the wrong instrument for
+this path**. The relayed session's nominated ICE pair was short, so the clamp landed on the 200 ms
+floor, and a client asking every ~300 ms was answered every single time — `suppressed` sat at **1**
+for the whole of run B. The gate was working exactly as written; the window was simply a LAN
+window on a link that is not a LAN.
+
+Run A is the counter-example that keeps this honest. `271aa01` answered **0.5 %** of its client's
+requests — 23 of 4703 — and the picture still came up. So the fix is not "answer more". It is one
+event per window, with the window chosen for the path.
+
+### The fix
+
+`KeyframeGate::for_locality` takes the clamp from the session's locality instead of using one pair
+of constants for every link. **Same-subnet is unchanged at 200–1000 ms** — that is the case where
+waiting would be felt and a burst is absorbable. `Unknown` gets 500–2000, `CrossNetwork`
+1000–3000. The ordering of the three floors is a `const _: () = assert!(…)`, so it is the
+compiler's business rather than a test somebody could delete alongside the constant it guards.
+
+It stays a **window, not a filter**, and the tests enforce both directions: a 10 s 3.2/s PLI storm
+must cost **≤ 11** IDRs *and* **≥ 8**, so suppression cannot quietly become starvation. A client
+that genuinely lost its reference chain still gets a keyframe inside every window; what it can no
+longer do is convert a backlog of PLIs — all describing the same loss — into one IDR each. Where
+the encoder holds a long-term reference, `repair.rs` answers the loss with a P-frame before a PLI
+is ever emitted; the gate is what is left when it cannot.
+
+Measured, run B to run C: **347 IDRs → 113**, 3.2/s → 0.56/s, on the path where an IDR is 5–20× a
+P-frame and is the frame most likely to overflow the link that has just dropped something.
+
+Ledger §UX-XNET2. Four new tests in `streamer::keyframe::tests`: a relayed gate is not unlocked by
+a short RTT; the storm bound in both directions; each tier's floor and cap; and a same-subnet
+window byte-for-byte the one it had before.
+
+### Not covered
+
+Every run was Chrome on the host box with the tab backgrounded, so the *client's* PLI rate is not a
+phone's. What the four isolate is the **host's response** to whatever rate arrives, which is the
+part this repository controls. The owner's phone on cellular remains the arbiter;
+`docs/manual-tests/client-page.md` has the procedure and `idrs_sent` against `frames_encoded` is
+the number to read.
+
+### Gates, build and the restarted host
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **429 passed,
+0 failed, 17 ignored**, identical under `SE_REQUIRE_HW=1`; `cargo build --features probe`;
+`pnpm lint` 0 errors; `pnpm build`; `check-legacy-webkit`; `pnpm test:client` 7/7;
+`pnpm test:gate`; `pnpm test:config`; `pnpm test:lockfile`; `check-bindings` 53 commands /
+11 events; `check-versions` 0.6.3; `sha256sum -c` 34/34 and 5/5. The ledger is 298 rows with no
+duplicates; this row is prose (§UX-XNET2), so no row number moved.
+
+`pnpm tauri build`: release profile in **14m 21s**, both installers, exit **1** on the updater
+signing step alone.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 14,012,416 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,892,065 |
+| `…/release/ScreenExtend.exe` | 30,212,608 |
+
+The headless host was stopped for the build and restarted on the same credentials, registering:
+
+```
+[cloud] registered; clients can join at https://session.screenextend.app/?id=SE7QK4MNPX2W
+```
+
+with `qr -t cloud --json` reporting `"sessionId": "SE7QK4MNPX2W"`, `"sessionIdSource": "host"`.
