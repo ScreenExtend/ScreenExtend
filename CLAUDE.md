@@ -577,7 +577,15 @@ Cross-platform core, OS-independent:
 - `cloud.rs` — cross-network relay control channel (WebSocket via `tokio-tungstenite`) to
   `wss://session.screenextend.app/host/v1/connect`, protocol version 1, 45 s heartbeat timeout,
   exponential backoff to 30 s, `CloudState` surfaced to the UI via `CloudStatusChange`.
-  Cross-network joins require a configured TURN server.
+  A cross-network join does **not** require a configured TURN server, and saying so was wrong:
+  measured against the live relay, `/ice-config` there serves Google STUN and no TURN, and a
+  relayed session connects on server-reflexive candidates from both ends. TURN is what rescues
+  the one topology reflexive candidates cannot cross (carrier-grade NAT on the client with a
+  symmetric NAT on the host). Note also that the relay serves its **own** older copy of the
+  client page, so nothing in `streamer/static/` reaches a relayed client, and it tunnels only
+  `POST /whep`, `GET /reconfig` and `POST /leave` — `PATCH /whep/{id}` has nowhere to land, which
+  is why the trickle decision is a strict `trickleIce === true`. See `docs/OPTIMIZATIONS.md`
+  UX-XNET.
 - `input/` — remote keyboard/mouse/clipboard injection: `protocol.rs` (wire format, including the
   `PING`/`PONG` pair, `STATS`, `KEYFRAME_REQUEST` and the batched pointer frames),
   `scancode.rs`, and a per-OS backend selected with `#[path]` (`windows.rs`, `macos.rs`,

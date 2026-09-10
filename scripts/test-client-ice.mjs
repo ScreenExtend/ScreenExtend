@@ -153,6 +153,46 @@ for (const [cfg, want, msg] of relayCases) {
   else ok(msg);
 }
 
+// --- the shape the public relay actually forwards -------------------------------------------
+// Captured from https://session.screenextend.app on 2026-09-10. The relay does not tunnel
+// `/ice-config` or `/net-config` to the host at all — `cloud.rs::dispatch` answers only `/whep`,
+// `/reconfig` and `/leave` — so a client that joined through the relay is reading the relay
+// service's own answers, not this host's. Those answers are a third-party contract this repo
+// cannot change and does not build, which is exactly why they belong in a test: they carry no
+// `locality`, no TURN and no `trickleIce`, and every one of those absences has to land on the
+// conservative branch rather than on a fast path the relay cannot support.
+
+const RELAY_ICE_CONFIG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
+const RELAY_NET_CONFIG = { httpsPort: 443 };
+
+if (ctx.relayNeeded(RELAY_ICE_CONFIG) !== false) {
+  fail('the relay serves STUN and no TURN, so there is no relay candidate to wait for');
+} else {
+  ok('a relay-forwarded /ice-config with no TURN does not arm the relay wait');
+}
+
+if (RELAY_ICE_CONFIG.locality !== undefined) {
+  fail('the captured relay /ice-config was expected to carry no locality field');
+} else {
+  ok('the relay /ice-config carries no locality, so the client stays on the honest unknown branch');
+}
+
+// `trickleIce` decides whether the offer may leave before gathering finishes, and the whole
+// trickle exchange is `PATCH /whep/{id}` — a route the relay tunnel does not carry. An absent
+// field must therefore read as "no trickle", which is what the strict `=== true` buys. A
+// truthiness test here would turn every relayed join into one that posts early and then trickles
+// its candidates into a 404.
+if (!/netConfig\.trickleIce\s*===\s*true/.test(page)) {
+  fail('the trickle decision must compare `trickleIce === true`, so an absent field is not trickle');
+} else {
+  ok('an absent trickleIce (the relay omits it) cannot enable trickle');
+}
+if (RELAY_NET_CONFIG.trickleIce !== undefined) {
+  fail('the captured relay /net-config was expected to carry no trickleIce field');
+} else {
+  ok('the relay /net-config omits trickleIce, so a relayed join gathers before it posts');
+}
+
 // --- the pure gating table -----------------------------------------------------------------
 
 const HOST = ctx.__grace.host;

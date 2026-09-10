@@ -246,6 +246,33 @@ impl AppState {
         SessionLocality::CrossNetwork
     }
 
+    /// The locality of a join, decided from where it arrived rather than from a parse.
+    ///
+    /// A join tunnelled through the cloud relay has no peer address at all: the relay forwards
+    /// its own opaque client id (`c_Lu6CRIn28D7GxgD8qMpTow`), and [`JoinOrigin::relayed`] puts
+    /// that in `peer_ip` for the log and the rate-limit bucket. It is not an address and never
+    /// parses as one, so [`AppState::locality_for`] returned `Unknown` on its first line and
+    /// every locality-driven decision took its `_` arm — which is the LAN arm. A relayed session
+    /// was handed the same-subnet MTU, no playout delay and `PacingMode::Light`, on the one path
+    /// in this app that is cross-network by definition. The running host said so itself, once per
+    /// relayed join:
+    ///
+    /// ```text
+    /// session transport: locality=Unknown mtu=1188 pacing=Light playout_delay_max=0ms
+    /// session locality was pre-classified Unknown but the nominated candidate pair says
+    /// CrossNetwork; transport constants for this session were chosen for the former
+    /// ```
+    ///
+    /// The relay exists only to carry clients that cannot reach this host directly, so a relayed
+    /// join is cross-network by construction. That is a fact about the route, not a guess about
+    /// an address, and it is read here instead of being inferred.
+    pub fn locality_for_origin(&self, origin: JoinOrigin<'_>) -> SessionLocality {
+        if origin.relay_client.is_some() {
+            return SessionLocality::CrossNetwork;
+        }
+        self.locality_for(origin.peer_ip)
+    }
+
     pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
         self.ice_servers.as_ref().clone()
     }
@@ -921,6 +948,34 @@ pub fn process_reconfig(state: &AppState, join: &str) -> String {
     serde_json::json!({ "epoch": epoch, "kick": kick, "audioSink": audio_sink }).to_string()
 }
 
+/// `/reconfig` for a tunnelled client that named no join.
+///
+/// The join id reaches a direct client in the answer's `Location`, and a relayed one only in the
+/// `x-join-id` header this host added for it. The relay's deployed client page predates both, so
+/// it polls `/reconfig` with no `?join=` and the epoch lookup was made against the empty string —
+/// which matches no session and answers `{"epoch":0,"kick":0}` for the life of every relayed
+/// session. A kick never arrived, and neither did a display-scale, orientation, refresh-rate or
+/// audio-output change: the desktop UI's controls were inert for exactly the devices that joined
+/// over the internet.
+///
+/// The relay does know which of its clients this is, and `relay_client` maps that onto the join
+/// without touching an address — the same fallback `/leave` already takes. A client that does
+/// send a join id is answered on it, so a page that learns the id loses nothing.
+pub fn process_relay_reconfig(state: &AppState, join: &str, client_id: &str) -> String {
+    if !join.is_empty() {
+        return process_reconfig(state, join);
+    }
+    let resolved = state.config.sessions.as_ref().and_then(|s| {
+        session::joins_for_relay_client(s, client_id)
+            .into_iter()
+            .next()
+    });
+    match resolved.as_deref() {
+        Some(j) => process_reconfig(state, j),
+        None => process_reconfig(state, join),
+    }
+}
+
 pub fn process_leave(state: &AppState, join: &str) {
     if let Some(s) = state.config.sessions.as_ref() {
         tprintln!("leave beacon for join {join}; tearing down session");
@@ -1289,7 +1344,7 @@ async fn start_session(
             &format!("{}x{}", req.width, req.height),
         );
     }
-    let locality = state.locality_for(client_ip);
+    let locality = state.locality_for_origin(origin);
     let client = state
         .config
         .virtual_display
@@ -2213,6 +2268,101 @@ mod tests {
             SessionLocality::Unknown,
             "an unparseable key must not be optimistically treated as local"
         );
+    }
+
+    #[test]
+    fn a_relayed_join_is_cross_network_however_its_client_id_is_spelled() {
+        // The regression this pins: the relay forwards an opaque client id, never an address,
+        // and classifying a join by parsing that id put every cross-network client on the
+        // same-subnet transport constants. The id's spelling is the relay's business — it has
+        // been `c-1` and `c_Lu6CRIn28D7GxgD8qMpTow` — so nothing here may depend on it.
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        for id in ["c_Lu6CRIn28D7GxgD8qMpTow", "c-1", "", "192.168.1.44"] {
+            assert_eq!(
+                s.locality_for_origin(JoinOrigin::relayed(id)),
+                SessionLocality::CrossNetwork,
+                "a join through the cloud tunnel is cross-network by construction, not by \
+                 whatever `{id}` happens to parse as"
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_join_still_classifies_by_address() {
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("192.168.1.44")),
+            SessionLocality::SameNetwork
+        );
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("203.0.113.9")),
+            SessionLocality::CrossNetwork
+        );
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("192.168.9.7")),
+            SessionLocality::Unknown
+        );
+    }
+
+    #[test]
+    fn a_relayed_join_is_offered_the_full_ice_list() {
+        // `cloud.rs` builds the relayed list as `ice_with_turn(fallback_ice_servers())`, and the
+        // direct handler builds it as `ice_for(locality)`. Now that a relayed join classifies as
+        // cross-network the two must agree, or a tunnelled client and a direct one would gather
+        // against different servers.
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        let relayed = s.ice_with_turn(s.fallback_ice_servers());
+        let direct = s.ice_for(SessionLocality::CrossNetwork);
+        assert_eq!(relayed.len(), direct.len());
+        assert!(
+            !relayed.is_empty(),
+            "a relayed client with no STUN cannot produce a reflexive candidate, and without a \
+             TURN server that is the only kind of candidate that can reach it"
+        );
+        assert!(relayed
+            .iter()
+            .zip(direct.iter())
+            .all(|(a, b)| a.urls == b.urls));
+    }
+
+    #[test]
+    fn a_relayed_reconfig_that_names_no_join_still_finds_its_session() {
+        // The relay's deployed client page polls `/reconfig` with no `?join=`, so the lookup was
+        // made against "" — which matches nothing and answers epoch 0 / kick 0 for ever. A kick
+        // raised in the desktop UI never reached a device that joined over the internet.
+        let sessions: session::SharedSessions =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let state = AppState::new(Config {
+            sessions: Some(Arc::clone(&sessions)),
+            ..Config::default()
+        });
+        let join = session::mint_join_id();
+        session::open_session_via(&sessions, &join, "tok", "c-7", Some("c-7"));
+        session::bump_kick_epoch(&sessions, &join);
+
+        let blind: serde_json::Value =
+            serde_json::from_str(&process_reconfig(&state, "")).expect("json");
+        assert_eq!(
+            blind["kick"], 0,
+            "the empty join is what the old page asks with, and it matches no session"
+        );
+
+        let answered: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, "", "c-7")).expect("json");
+        assert_eq!(
+            answered["kick"], 1,
+            "the relay client id maps onto the join without needing an address"
+        );
+
+        // A client that does know its join id is still answered on it, not on the fallback.
+        let named: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, &join, "c-7")).expect("json");
+        assert_eq!(named["kick"], 1);
+
+        // An unknown relay client is not silently mapped onto somebody else's session.
+        let stranger: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, "", "c-99")).expect("json");
+        assert_eq!(stranger["kick"], 0);
     }
 
     #[test]
