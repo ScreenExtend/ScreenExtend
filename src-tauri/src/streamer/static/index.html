@@ -416,14 +416,34 @@
             // The deadline is a net for a browser that emits neither a null candidate nor
             // `iceGatheringState === 'complete'`, not a budget: it is well past any real
             // gathering, including a TURN allocation, and it reports itself as bit 15.
+            //
+            // It is armed when the answer names the trickle resource, not when the offer is
+            // posted. Nothing the sender does can happen before that — it has no URL to PATCH —
+            // and neither can a frame, because the peer connection does not exist until the
+            // answer is set. So the window before the answer is one where the hold is holding
+            // nothing back and gathering is not what is being waited on. Armed at the offer, the
+            // deadline covered the WHEP round trip as well, and that round trip creates a virtual
+            // display: `DISPLAY_ATTACH_TIMEOUT` alone is 5 s and `DISPLAY_CORRELATION_LOCK`
+            // serialises it across joins, so a host that was merely slow reported a *gathering*
+            // failure for a join that then succeeded — and held the picture for 8 s to do it.
+            // `WHEP_TIMEOUT_MS` (10 s) is what bounds a host that never answers.
             const ICE_SETTLE_DEADLINE_MS = 8000;
             let icePending = false;
             let liveHeld = false;
             let iceSettleTimer = 0;
+            // Latched for the life of one peer connection: once ICE has come up, a trickle
+            // failure must not rejoin, however the connection is doing afterwards. Without the
+            // latch a session that connected and later degraded could answer a refused PATCH
+            // with a rejoin behind the picture the user is watching, which is the one thing the
+            // hold exists to prevent.
+            let iceEverConnected = false;
             function holdStageForIce() {
                 icePending = true;
                 liveHeld = false;
-                if (iceSettleTimer) clearTimeout(iceSettleTimer);
+                if (iceSettleTimer) { clearTimeout(iceSettleTimer); iceSettleTimer = 0; }
+            }
+            function armIceSettleDeadline() {
+                if (!icePending || iceSettleTimer) return;
                 iceSettleTimer = setTimeout(function () {
                     iceSettleTimer = 0;
                     if (!icePending) return;
@@ -1461,12 +1481,29 @@
                     flush();
                 }
 
+                // The end of gathering has two signals and the page must accept either. Waiting
+                // only for the null candidate made the whole sender depend on one event: a
+                // browser that reports completion through the state alone, or one whose null
+                // candidate landed in the task before this listener was attached, never sets
+                // `ended`, never sends `a=end-of-candidates`, and therefore never settles — and
+                // the page then holds the streaming stage for the full deadline and reports a
+                // gathering timeout on a session that gathered perfectly well. Measured on
+                // Chrome 141/Windows: `icegatheringstatechange` to `complete` is dispatched
+                // *before* the null candidate, so this is also the earlier of the two.
+                function onGathering() {
+                    if (closed) return;
+                    if (peer.iceGatheringState !== 'complete') return;
+                    ended = true;
+                    flush();
+                }
+
                 function quiesce() {
                     if (closed) return;
                     closed = true;
                     queue.length = 0;
                     if (ackTimer) { clearTimeout(ackTimer); ackTimer = 0; }
                     try { peer.removeEventListener('icecandidate', onCandidate); } catch (_) { noteSuppressed(); }
+                    try { peer.removeEventListener('icegatheringstatechange', onGathering); } catch (_) { noteSuppressed(); }
                 }
 
                 // "This sender will send nothing more", whichever way it got there: the final
@@ -1550,6 +1587,11 @@
                 }
 
                 peer.addEventListener('icecandidate', onCandidate);
+                peer.addEventListener('icegatheringstatechange', onGathering);
+                // Gathering can already be over by the time this runs — the sender is built one
+                // task after `setLocalDescription` resolves — and a state that is already
+                // `complete` fires no further event.
+                onGathering();
                 return {
                     // `offerSdp` is the offer as it went out, not `localDescription` as it reads
                     // later — that one keeps growing as candidates are gathered.
@@ -1590,6 +1632,7 @@
             function teardownSession() {
                 startGen++;
                 releaseIceHold();
+                iceEverConnected = false;
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -1640,8 +1683,8 @@
                 // next join needs. The test is the *current* peer connection, not `isLive`: a
                 // reconfigure keeps the old picture on screen while the new connection is still
                 // negotiating, and that one does need the rejoin.
-                const connected = !!pc && (pc.connectionState === 'connected'
-                    || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
+                const connected = iceEverConnected || (!!pc && (pc.connectionState === 'connected'
+                    || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed'));
                 if (connected) return;
                 console.warn('[ice] rejoining with a gathered offer');
                 // No `/leave` and no `DELETE` first, deliberately: `start_session` stops the
@@ -2321,6 +2364,14 @@
                         if (pc !== localPc) return;
                         const s = pc.iceConnectionState;
                         if (s === 'connected' || s === 'completed') {
+                            // A pair is nominated, so a trickle failure can no longer produce a
+                            // rejoin (`trickleFailed` returns early on a connected session, and
+                            // `iceEverConnected` keeps that true for the rest of this one). The
+                            // hold exists only to keep a rejoin in front of the join form, so
+                            // from here it protects nothing and the picture should not wait on
+                            // the last PATCH being acknowledged.
+                            iceEverConnected = true;
+                            iceSettled();
                             armTransformWatchdog();
                             if (usingFallback || !canWebCodecs) onStreamLive();
                         } else if (s === 'failed') {
@@ -2418,6 +2469,9 @@
                     if (localTrickle) {
                         if (trickleResource) {
                             localTrickle.open(trickleResource, offerSdp);
+                            // Only now can the sender do anything, so only now is there
+                            // something for a deadline to be a deadline on.
+                            armIceSettleDeadline();
                         } else {
                             // The host said it takes trickled candidates and then handed back no
                             // resource — a proxy that strips the header, or the cloud relay,
