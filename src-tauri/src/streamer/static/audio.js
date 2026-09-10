@@ -193,6 +193,7 @@
         firstDeviceChange: true,
         debounceTimer: 0,
         appliedSink: null,
+        sinkWatched: false,
         msd: null,
         sinkEl: null,
         micHold: null,
@@ -200,6 +201,12 @@
         micGranted: false,
         primedStream: null,
         wantPrime: null,
+        // A sink to route once there is a graph to route it through, as
+        // `{ id, fromPicker }`. Two things write it: `pickOutput`, whose choice the user made
+        // in the browser's own chooser, and `setSpeaker` when the host commands a sink before
+        // `attachWorklet` has finished. Only the first may claim `SINK_TIER.selectAudioOutput`,
+        // which is why the provenance is carried rather than inferred.
+        pendingSink: null,
         sessionId: '',
         deviceToken: '',
         labelsUnavailable: false,
@@ -314,35 +321,41 @@
         return !speakers.micGranted;
     }
 
-    // Enumeration is for the host's device panel, never for playback, so it happens after
-    // the picture is up. Where the browser hides output labels behind a microphone grant,
-    // the prompt is offered here — it used to stand in front of the join for up to twelve
-    // seconds, gating ICE, which gated WHEP, which gated the host creating the display.
-    // The prompt is lazy and optional: the picture never waits for it and a decline costs
-    // nothing but device *labels* in the host's picker. But "the page went fullscreen while the
-    // card was up" is not a decline, and treating it as one made it terminal — a session that
-    // entered fullscreen (the default) could never get labels again, however many times the
-    // host asked to change the sink. A deferral is remembered as a deferral, and
-    // `offerOutputLabels` is what asks again when there is now a reason to.
-    let lazyEnumStarted = false;
-    let lazyEnumDeferred = false;
-    async function enumerateLazily(showPermModal) {
-        if (typeof showPermModal === 'function') speakers.permModal = showPermModal;
-        if (lazyEnumStarted && !lazyEnumDeferred) {
-            return speakers._cache || { supported: speakers.supported, outputs: [] };
-        }
-        lazyEnumStarted = true;
-        lazyEnumDeferred = false;
+    // Enumeration is for the host's device panel, never for playback — but it runs *before*
+    // the join, because the one browser mechanism that reveals output labels is a microphone
+    // grant and a permission prompt is an interruption. Nothing may interrupt a live session,
+    // so this is the only moment the card is ever raised and the join waits for the answer.
+    //
+    // It is still free on every browser that needs no grant: an engine with
+    // `selectAudioOutput()` is answered by `needsMicPermission()` without a prompt, so is one
+    // where the labels are already visible, and the microphone hold is stopped the instant the
+    // second enumeration returns. A decline costs device *labels* in the host's picker and
+    // nothing else — the sink change itself still works on unlabelled ids — and is reported as
+    // `degraded` bit 9 for the rest of the session. It is never re-offered.
+    let enumStarted = false;
+    async function enumerateBeforeJoin(showPermModal) {
+        if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
+        enumStarted = true;
         initSpeakers();
         if (!speakers.supported) return { supported: false, outputs: [] };
 
-        // Post whatever is visible without any permission first: on Firefox and on any
-        // browser where the grant already exists that is the whole answer.
+        // Whatever is visible without any permission first: on Firefox and on any browser
+        // where the grant already exists that is the whole answer.
+        //
+        // Guarded the way `reEnumerateAndPost` is: on the picker path this runs *after* a
+        // granted `selectAudioOutput()` has already cached a labelled list, so an enumeration
+        // that comes back empty or unlabelled must not be allowed to downgrade it.
         let enumerated = speakers.canSink ? await listOutputs() : [];
-        if (enumerated.some((d) => d.label)) speakers._lastEnum = enumerated;
+        if (speakers.canSink) {
+            const hasLabels = enumerated.some((d) => d.label);
+            if ((!enumerated.length || !hasLabels) && speakers._lastEnum && speakers._lastEnum.length) {
+                enumerated = speakers._lastEnum;
+            } else if (hasLabels) {
+                speakers._lastEnum = enumerated;
+            }
+        }
         speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
         startDeviceWatch();
-        postOutputs();
 
         let need = false;
         try { need = await needsMicPermission(); } catch (_) { note(); }
@@ -353,38 +366,21 @@
         speakers.labelsUnavailable = true;
         if (typeof showPermModal !== 'function') return speakers._cache;
 
-        await new Promise((resolve) => {
-            // The skip callback is told whether the user answered or the page simply could not
-            // show the card. Only the first is a decision.
-            showPermModal(() => resolve('granted'), (deferred) => resolve(deferred ? 'deferred' : 'declined'));
-        }).then(async (outcome) => {
-            if (outcome === 'deferred') { lazyEnumDeferred = true; return; }
-            if (outcome !== 'granted') return;
+        const granted = await new Promise((resolve) => {
+            showPermModal(() => resolve(true), () => resolve(false));
+        });
+        if (!granted) return speakers._cache;
+        try {
             await primeMicPermission();
             const withLabels = speakers.canSink ? await listOutputs() : [];
             if (withLabels.some((d) => d.label)) {
                 speakers._lastEnum = withLabels;
                 speakers.labelsUnavailable = false;
                 speakers._cache = { supported: speakers.supported, outputs: buildOutputs(withLabels) };
-                postOutputs();
             }
-            releasePrimedStream();
-        }, note);
+        } catch (_) { note(); }
+        releasePrimedStream();
         return speakers._cache;
-    }
-
-    // Ask again, now that something needs the answer — the host changing this device's output,
-    // or the user opening the picker. Does nothing when the labels are already known or when
-    // the user actually declined; a decline stays declined for the session.
-    function offerOutputLabels(showPermModal) {
-        const cached = function () {
-            return Promise.resolve(speakers._cache || { supported: speakers.supported, outputs: [] });
-        };
-        if (!speakers.supported || !speakers.labelsUnavailable) return cached();
-        if (lazyEnumStarted && !lazyEnumDeferred) return cached();
-        const modal = (typeof showPermModal === 'function') ? showPermModal : speakers.permModal;
-        if (typeof modal !== 'function') return cached();
-        return enumerateLazily(modal);
     }
 
     // Firefox only resolves enumerateDevices() once the document has focus, so a
@@ -507,7 +503,47 @@
         } catch (_) { note(); }
     }
 
+    // Where the audio is *actually* playing, which is not always where the host last asked for
+    // it: the user can change it in the browser's own UI (Firefox's per-tab output control, or
+    // `selectAudioOutput()` again), and the engine then moves the sink underneath us. Read back
+    // rather than assumed, so the host's per-device picker can show what is true.
+    function readCurrentSink() {
+        try {
+            if (state.path === 'netEQ' && state.audioEl && typeof state.audioEl.sinkId === 'string') {
+                return state.audioEl.sinkId;
+            }
+            if (speakers.sinkEl && typeof speakers.sinkEl.sinkId === 'string') return speakers.sinkEl.sinkId;
+            // `AudioContext.sinkId` is a string for a device id and an object for the
+            // silent sink, which is not a device and must not be reported as one.
+            if (state.ctx && typeof state.ctx.sinkId === 'string') return state.ctx.sinkId;
+        } catch (_) { note(); }
+        return null;
+    }
+
+    function syncCurrentSink() {
+        const live = readCurrentSink();
+        if (live === null) return false;
+        const norm = (live === 'default') ? '' : live;
+        if (norm === speakers.appliedSink) return false;
+        speakers.appliedSink = norm;
+        postOutputs();
+        return true;
+    }
+
+    // `sinkchange` fires on the context whose sink the engine moved; where it does not exist the
+    // device poll below is the floor and picks the same change up within its period.
+    function watchSinkChanges() {
+        if (speakers.sinkWatched) return;
+        speakers.sinkWatched = true;
+        try {
+            if (state.ctx && state.ctx.addEventListener) {
+                state.ctx.addEventListener('sinkchange', () => { syncCurrentSink(); });
+            }
+        } catch (_) { note(); }
+    }
+
     async function reEnumerateAndPost() {
+        syncCurrentSink();
         try {
             let enumerated = speakers.canSink ? await listOutputs() : [];
             if (speakers.canSink) {
@@ -525,6 +561,11 @@
 
     let lastPostedOutputs = null;
     function postOutputs(force) {
+        // Enumeration now happens before the join, so there is a window in which there is no
+        // session for the host to attach a list to. The identity is set the moment the answer
+        // lands and `setSpeakerIdentity` clears the change detection, so the first real post
+        // is the one that goes out.
+        if (!speakers.sessionId) return;
         try {
             const cache = speakers._cache || { supported: speakers.supported, outputs: [] };
             const body = JSON.stringify({
@@ -533,6 +574,16 @@
                 supported: cache.supported,
                 outputs: cache.outputs,
                 selected: speakers.appliedSink || '',
+                // What this device is playing on. The client posts the same value in both
+                // fields — it only ever knows one — and the separation is the *host's*:
+                // `selected` there is what `set_device_audio_output` asked for and the posted
+                // `selected` is ignored, so this is the only channel by which a change the user
+                // made in the browser's own output control reaches the host at all.
+                //
+                // Omitted entirely until something has actually applied a sink, because
+                // `JSON.stringify` drops an `undefined` value: the host keeps `None`, and the
+                // UI can tell "this client never said" from `''`, the device's default output.
+                current: speakers.appliedSink === null ? undefined : speakers.appliedSink,
             });
             // The list is identical on all but a handful of ticks in a session, and the host
             // does the same work whether or not it changed. Re-POSTing it was a request per
@@ -552,11 +603,15 @@
     const SINK_TIER = { none: 0, ctxSetSinkId: 1, elementSetSinkId: 2, audioSession: 3, selectAudioOutput: 4 };
     let sinkTier = SINK_TIER.none;
 
+    // Resolves `true` when the audio actually moved, `false` when a mechanism was tried and
+    // refused (which is what makes the picker re-offer in index.html correct rather than a
+    // guess), and `null` when there is nothing to route yet — the graph is built lazily, so a
+    // sink commanded before it exists is remembered and applied by `applyPendingSink`.
     async function setSpeaker(deviceId) {
         initSpeakers();
         const raw = deviceId || '';
         const id = (raw === 'default') ? '' : raw;
-        if (speakers.appliedSink === id) return;
+        if (speakers.appliedSink === id) return true;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
             if (state.path === 'netEQ') { try { await revertSink(); } catch (_) { note(); } }
@@ -574,7 +629,8 @@
                 releaseMicHold();
             }
             speakers.appliedSink = id;
-            return;
+            postOutputs();
+            return true;
         }
 
         applySession('playback');
@@ -582,18 +638,24 @@
 
         try {
             if (state.path === 'netEQ' && state.audioEl) {
-                if (typeof state.audioEl.setSinkId === 'function') {
-                    await state.audioEl.setSinkId(id);
-                    speakers.appliedSink = id;
-                }
-                return;
+                if (typeof state.audioEl.setSinkId !== 'function') return false;
+                await state.audioEl.setSinkId(id);
+                speakers.appliedSink = id;
+                postOutputs();
+                return true;
             }
-            if (!state.ctx || !state.gain) return;
+            // Nothing is playing yet, so nothing has refused: remember it instead of
+            // reporting a failure the caller would answer with a picker.
+            if (!state.ctx || !state.gain) {
+                speakers.pendingSink = { id: raw, fromPicker: false };
+                return null;
+            }
 
             if (id === '') {
                 await revertSink();
                 speakers.appliedSink = '';
-                return;
+                postOutputs();
+                return true;
             }
 
             // Its own try, so a NotFoundError on a device that has gone away — or a
@@ -612,7 +674,8 @@
                     // was right for the old one is not right for this one.
                     state.outputLatencyEmaMs = null;
                     maybeUpdateTarget();
-                    return;
+                    postOutputs();
+                    return true;
                 }
             }
 
@@ -640,27 +703,71 @@
                 sinkTier = SINK_TIER.elementSetSinkId;
                 state.outputLatencyEmaMs = null;
                 maybeUpdateTarget();
-                return;
+                postOutputs();
+                return true;
             }
         } catch (_) { note(); }
+        return false;
     }
 
-    // Firefox 116+ is the only engine with a permission-free output picker. It needs transient
-    // activation, so it is exposed for a user gesture rather than called from the host's
-    // reconfigure poll — and this page has no control to hang that gesture on, which is why
-    // `SINK_TIER.selectAudioOutput` is a tier nothing can currently report. Adding an
-    // affordance is a visible change to the client page and is deliberately not made here; it
-    // is written up under "W11 UI-visible recommendations" in docs/OPTIMIZATIONS.md. Kept
-    // rather than deleted because the moment a control exists this is the whole implementation.
-    async function pickOutput() {
+    // `selectAudioOutput()` (Firefox 116+, Chromium behind a flag) is the only permission-free
+    // output picker in any engine, and the only one that gives a label without a microphone
+    // grant. It needs transient activation, so it can only ever come from a gesture the user
+    // makes: the Join button's own click, or — after a host-initiated change the engine
+    // refused — the next tap on the stage. The page has no control of its own for it, and the
+    // stage cannot be one: a live session takes pointer lock on the first gesture and a click
+    // there belongs to the host.
+    //
+    // The Join click lands before there is an AudioContext, so the choice is remembered and
+    // `applyPendingSink` routes it the moment the graph exists. The tier is claimed only once
+    // the sink actually moved, because a picker that returns a device the engine then refuses
+    // to route to is exactly the silent failure `sinkTier` exists to expose.
+    function applyPendingSink() {
+        const pending = speakers.pendingSink;
+        if (!pending) return Promise.resolve(false);
+        speakers.pendingSink = null;
+        const raw = pending.id;
+        const want = (raw === 'default') ? '' : raw;
+        return Promise.resolve(setSpeaker(raw)).then(function () {
+            if (speakers.appliedSink !== want) return false;
+            // Only a sink the user picked in the chooser is tier 4. A host-commanded one that
+            // merely arrived before the graph existed took whatever rung `setSpeaker` reached,
+            // and `setSpeaker` has already recorded it.
+            if (pending.fromPicker) sinkTier = SINK_TIER.selectAudioOutput;
+            return true;
+        }, function () { note(); return false; });
+    }
+
+    function canPickOutput() {
+        initSpeakers();
+        return !!speakers.hasSelectOut;
+    }
+
+    // `preferredId` pre-selects a device in the picker — the spec's `AudioOutputOptions` — which
+    // is what makes the re-offer after a failed host-initiated change land on the device the
+    // host actually asked for rather than on a bare list.
+    //
+    // A dismissed picker is not an error: it resolves `null`, the caller carries on with the
+    // default output, and `sinkTier` keeps saying whatever is true.
+    async function pickOutput(preferredId) {
         initSpeakers();
         if (!speakers.hasSelectOut) return null;
+        const md = navigator.mediaDevices;
         try {
-            const info = await navigator.mediaDevices.selectAudioOutput();
+            // One call, and only one. A rejection — the user dismissed it, or the engine does
+            // not know `preferredId` — is the end of it: a second `selectAudioOutput()` would
+            // need the transient activation the first one has already consumed, so a retry can
+            // only ever reject too.
+            const info = preferredId
+                ? await md.selectAudioOutput({ deviceId: preferredId })
+                : await md.selectAudioOutput();
             if (!info || !info.deviceId) return null;
-            await setSpeaker(info.deviceId);
-            sinkTier = SINK_TIER.selectAudioOutput;
+            speakers.pendingSink = { id: info.deviceId, fromPicker: true };
+            if (state.ctx || state.audioEl) await applyPendingSink();
+            // A granted pick is what exposes output labels on these engines, so this is the
+            // enumeration worth reporting: the full labelled list plus the sink now in use.
             await reEnumerateAndPost();
+            speakers.labelsUnavailable = false;
             return { id: info.deviceId, label: info.label || '' };
         } catch (_) { note(); return null; }
     }
@@ -870,6 +977,10 @@
             state.node.connect(state.gain).connect(state.ctx.destination);
             state.prepared = true;
             offerRingPort();
+            watchSinkChanges();
+            // A device chosen from the picker on the Join gesture, or a sink the host commanded
+            // before there was a graph to route it through.
+            try { const p = applyPendingSink(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
             return true;
         } catch (e) {
             console.warn('[audio] prepare failed:', e);
@@ -1162,6 +1273,7 @@
             decoderFailed: state.decoderFailed,
             labelsUnavailable: !!speakers.labelsUnavailable,
             sinkTier: sinkTier,
+            currentSink: speakers.appliedSink,
         };
     }
 
@@ -1200,11 +1312,11 @@
         activePath,
         teardown,
         initSpeakers,
-        enumerateLazily,
+        enumerateBeforeJoin,
         needsMicPermission,
         primeMicPermission,
+        canPickOutput,
         pickOutput,
-        offerOutputLabels,
         postOutputs,
         setSpeaker,
         setSpeakerIdentity,

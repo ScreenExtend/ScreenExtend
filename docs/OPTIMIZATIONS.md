@@ -2295,7 +2295,282 @@ The five items the first pass could not reach while W4b and W15 were landing, al
   `RELOAD`/`PING`/`LOGS` verbs were already carried in by W4b and W13b-code respectively.
 - **The WGC predicate** is row 305 above.
 
-### UX-B: the startup gate, at-capacity, and the pointer-lock clamp (post-report)
+## UX-A: the client web page, post-report owner rulings
+
+Six changes, all in `src-tauri/src/streamer/static/` except the host-side field in the last row.
+Every one is `UNVERIFIED` in the strict sense: neither development machine can run the client
+page at all (the Windows box is the same-device case, the Mac's Safari is 13.1, below every fast
+path), so what is claimed here is a reading of the code plus the seven Node harnesses, which pass.
+`docs/manual-tests/client-page.md` §3, §5, §7a and §9 carry the scripts that close them.
+
+### The microphone card goes back in front of the join, and the join waits — `UNVERIFIED`
+
+The engagement had moved the card *after* the picture, because the pre-engagement flow put a
+12 s `micReady()` cap in front of ICE, which gated WHEP, which gated the host creating the
+display. That fixed a real cost and bought a worse one: a permission prompt over a live second
+screen — and on the default fullscreen path, one the user could not click at all (see the
+suspension row below). The owner's ruling is that nothing interrupts a live session, so the card
+is raised once, before ICE exists, and the join proceeds on the answer.
+
+**Kept from the engagement, because none of it prompts.** `needsMicPermission()` still answers
+*no* for an engine with `selectAudioOutput()` (Firefox, flagged Chromium) and for one whose
+`enumerateDevices()` already returns labels, so those devices see no card and pay one
+`enumerateDevices()`. The primed stream is still stopped the moment the second enumeration
+returns, rather than held for the session.
+
+**Removed.** `enumerateLazily`/`offerOutputLabels`, the `lazyEnumDeferred` deferral, the
+fullscreen auto-skip and the `fullscreenchange`-watching modal wrapper (`permModalIfVisible`,
+`offerPermModalNow`) — about 90 lines. They existed to make a *mid-session* card survive the page
+going fullscreen underneath it; there is no mid-session card any more. A decline is now terminal
+for the session and reported as `degraded` bit 9, and `applyReconfig` applies the host's sink
+choice silently on whatever ids the device has.
+
+**No timer.** `getUserMedia` settles on every engine when the browser's own prompt is dismissed
+(`NotAllowedError`), so waiting on the user cannot hang the join the way a missing worklet module
+could — which is why `AUDIO_PREPARE_DEADLINE_MS` is still there and this is not.
+
+### The streaming stage is not shown until the candidates have settled — `UNVERIFIED`
+
+Trickle ICE keeps its whole win — the offer still leaves with no candidates at all — but its
+*outcome* is now resolved before the picture. All three failure paths (`Location` absent, `PATCH`
+refused with 403/405/415/501, nothing acknowledged in 2 s) end in a rejoin with a gathered offer,
+and a rejoin behind a picture the user is already using is what the ruling forbids.
+
+`startTrickle` gained an `onSettled` callback, fired from a single `settle()` that every exit
+reaches: the final batch carrying `a=end-of-candidates` acknowledged, a 404 (the session is
+over), or `dead()` — which calls `onDead` *first*, so a rejoin replaces the gate rather than
+racing it. `onStreamLive()` now stands its watchdogs down and then returns, latching `liveHeld`,
+until that settle arrives. `ICE_SETTLE_DEADLINE_MS` (8 s) is the net for a browser that emits
+neither a null candidate nor `iceGatheringState === 'complete'`; it reports itself as bit 15,
+which already means "gathering ran to its deadline".
+
+Cost: on a trickling join the picture now waits for the last `PATCH` to be acknowledged rather
+than appearing on the first decoded frame. On a LAN that is milliseconds. On a relayed join it is
+the TURN allocation — which is exactly the wait trickle was introduced to take off the critical
+path, so this gives part of it back, deliberately, in exchange for never rejoining behind a
+picture.
+
+### Every renegotiation the page could start on its own account — `UNVERIFIED`
+
+Audited all of them. Three were self-started and are gone or made seamless; the host's own stay,
+because the owner asked for them.
+
+- **The audio step-down** (`SEVideo.onAudioFastLost`) rebuilt the peer connection to ask for an
+  Opus track. It is now unreachable against any host in this repo: `abandonWebCodecsAudio` already
+  prefers the spare track `wantsFallbackTrack` put in the answer, so the step-down is seamless and
+  costs nothing. Against a host too old to send one, audio now stays off for the session with
+  `degraded` bit 6 set, rather than tearing a live screen down for it.
+- **The refresh-rate refinement** (`noteRefinedRefreshRate`) forced a rebuild about a second after
+  the picture arrived whenever the join-time measurement was off by more than the clamp step —
+  which is the background-tab case. It now only updates `joinData`, so the corrected rate rides
+  the next reconfigure that happens for a reason of its own. The regression this reintroduces is
+  the one the engagement noted: a stationary tablet that never rotates and whose host settings
+  never change keeps the wrong rate for the session. That is the trade the ruling asks for.
+- **The orientation change** (`relayGeomChange`) stays: the user rotated the device, the display
+  must follow, and deferring it means a wrongly-oriented picture forever.
+- **`applyReconfig`** stays, unchanged in what it does.
+
+**And the black stage under all of them is gone.** A canvas whose control has been transferred to
+a worker cannot be reused, so every WebCodecs rebuild has to replace the element — and
+`canvas.replaceWith()` took the picture with it for the length of the rebuild. `freshCanvas()`
+now inserts the replacement *before* the old canvas and re-classes the old one `.stale`, so it
+keeps painting on top (same box, one DOM position later, no z-index needed); `onStreamLive()`,
+`showVideo()` and `showError()` drop it. The 15 s reconfigure watchdog is still the backstop for
+a rebuild that never renders.
+
+### No input proxying while a dialog is open — `UNVERIFIED`
+
+The owner could not click the mid-session microphone card and had to answer it from devtools.
+Three things were wrong at once: the pointer was locked to the stage so there was no cursor, the
+keyboard was locked so Esc and Tab went to the host, and every click was being forwarded — and in
+fullscreen the modal is not even rendered, because a fullscreen element renders only its own
+subtree and the modals are its siblings.
+
+`beginModal()`/`endModal()`/`withModal()` in `index.html` now wrap every dialog on the page (the
+microphone card, the HTTPS upsell, the limited-browser modal, the same-device warning) and the
+output picker. They leave fullscreen, drop pointer lock, unlock the keyboard, and call
+`RemoteInput.setSuspended(true)`, which gates every listener installed through `on()`, sends
+`FOCUS_STATE false` so the host releases held modifiers, and sends `POINTERLOCK_STATE false`
+because `pointerlockchange` is dispatched in a later task by which time the listener is itself
+gated off. `PING` and `STATS` keep flowing, so a suspended client is still distinguishable from a
+wedged one. The gesture handler stands down for the duration, so the tap that dismisses a dialog
+is not also the tap that re-enters fullscreen; the next one is, which is the path Esc already
+takes.
+
+New `degraded` bit 23, `input_suspended_for_modal` in `CLIENT_DEGRADED_NAMES`. It is set only
+where a session was actually forwarding, so the card raised before the join reports nothing.
+
+### The output picker is reachable, and sink tier 4 is finally reportable — `UNVERIFIED`
+
+`MediaDevices.selectAudioOutput()` is the only permission-free output picker in any engine and
+the only one that hands back a *label* without a microphone grant. It needs transient activation.
+`SEAudio.pickOutput()` had been written and left unreachable — there was no gesture on the page
+to hang it from — which is why `SINK_TIER.selectAudioOutput` was a value in the enum, a column in
+`docs/TELEMETRY.md`, and something nothing could ever report.
+
+The Join click is that gesture. `pickOutput()` is started from the submit handler before anything
+that would consume the activation (fullscreen and the keyboard lock come much later, from
+`startLock`), and awaited alongside the capability probe and the refresh measurement rather than
+in front of them. A dismissed picker is not an error: the join carries on with the default
+output. Considered and rejected: a control on the stage (a live session takes pointer lock on the
+first gesture, so a click there belongs to the host) and a button on the join form (it works, but
+it is a new element the owner did not ask for, and the choice would have had to be parked until
+there was a graph to route it through anyway).
+
+`setSpeaker()` now resolves `true` when the audio moved, `false` when a mechanism was tried and
+refused, and `null` when there is no graph yet — the third case is what stops a sink commanded
+before `prepare()` from being read as a refusal. On a `false`, `queueOutputPicker()` arms a
+one-shot `pointerdown`/`keydown`/`touchend` listener and opens the picker from that gesture,
+pre-selected to the host's choice via `AudioOutputOptions.deviceId`, under `withModal`.
+
+### The sink the client is actually on, reported to the host — `UNVERIFIED` (macOS not compiled — Mac offline)
+
+`selected` on the host has always meant "what the host asked for". It stops being true the moment
+the user changes the output in the browser's own control, and only the client can see that. A new
+**`current`** field carries it: `/audio-outputs` (`#[serde(default)] Option<String>`, so a client
+built before the field still parses), `session::DeviceSessionState.current_audio_output`,
+`AudioOutputsReport.current`, and the `DeviceAudioOutputs` event. A `None` never erases what a
+newer client wrote. The desktop control that displays it is not in this branch.
+
+Client side, `speakers.appliedSink` is kept honest by `readCurrentSink()`/`syncCurrentSink()` —
+`AudioContext.sinkId` (string only; the silent sink is an object and is not a device),
+`HTMLMediaElement.sinkId` — driven by the `sinkchange` event where it exists and by the existing
+device poll where it does not, and `postOutputs()` now fires on every successful `setSpeaker`.
+`SEAudio.getSyncInfo().currentSink` is the console read.
+
+`bindings.ts` was regenerated from a debug build with no arguments; the diff is the two type rows
+and nothing else. `macos_utils/device_reporter.rs` gained the same one-line field and is
+**not compiled** — the Mac is offline for this engagement.
+
+### The "Switch to HTTPS" offer goes back to being unconditional — `VERIFIED` (by reading)
+
+The engagement had made the two WebCodecs rows' `httpsFixable` conditional on
+`!window.isSecureContext`, so that an iPhone on https would not be told HTTPS would restore an
+`AudioDecoder` its Safari has never shipped. Reading the gate, the change was inert: the flag is
+only consulted when `location.protocol === 'http:'`, and `isSecureContext` is false there — so
+both forms filter identically, on http and on https alike. The owner asked for the switch to be
+offered on every system; the flag is back to a literal `true` and the computation is gone. The
+corrected modal body text (the "sucre" typo and the raw `-->`) is untouched.
+
+### UX-A: cold review 8 (`docs/reviews/client-review-8-ux.md`) — 1 high, 5 medium, 12 low
+
+Everything actionable is fixed. The four left alone are judgement calls and are written out
+below rather than silently dropped.
+
+**H-1, the queued picker re-armed on every poll tick — `UNVERIFIED`, asserted by harness.**
+`process_reconfig` puts `audioSink` in every `/reconfig` body, so `applyReconfig` asked the
+engine for the same sink about once a second and an engine that cannot route to it answered
+`false` about once a second. Each of those armed the picker again: after the first offer the
+stage swallowed every gesture (`pickerGestureArmed` stands the gesture handler down) and threw
+a browser chooser at the user on each one, forever — the ruling inverted. The offer is now
+latched on the requested id (`lastOfferedSinkId`), cleared with `cancelQueuedPicker()` when the
+session ends, and the `console.warn` for engines with no picker sits behind the same latch
+rather than running at 1 Hz. `scripts/test-client-reconfig.mjs` cases 9-11 drive the real
+`applyReconfig` with a stubbed `setSpeaker` and assert one offer across ten ticks of the same
+sink, one more for a different sink, none for a sink that applied, and none for `null` — which
+means "the graph does not exist yet", not "refused".
+
+**M-2, dialogs were revealed before the locks had actually gone — `UNVERIFIED`.** `beginModal()`
+starts an asynchronous release (pointer-lock exit arrives on `pointerlockchange`, fullscreen on
+`fullscreenchange`, and `webkitExitFullscreen` returns nothing at all) and the callers revealed
+their dialog in the same task. A page modal is a sibling of `#stage`, so while the fullscreen
+element is still `#stage` it is not rendered — an invisible dialog with the input suspended and
+nothing to un-suspend it. This branch had deleted the net along with `permModalIfVisible` and
+`offerPermModalNow`; it is back as `whenInputReleased()`, watching both event families with the
+same 1500 ms fallback, and `withModal` reveals from it. `withModal(fn, true)` is the exception
+for UI the *browser* draws — the output picker is not a page subtree, needs no fullscreen exit
+to be visible, and must run inside the gesture's transient activation rather than a task later.
+
+**M-3, `sinkTier` 4 was claimed for sinks the picker never chose — `UNVERIFIED`.**
+`speakers.pendingSink` has two writers: `pickOutput`, and `setSpeaker` when the host commands a
+sink before `attachWorklet` has finished. `applyPendingSink` promoted the tier for both, so a
+host-commanded sink that merely arrived early reported a picker that was never opened —
+contradicting the paragraph this branch added to `docs/TELEMETRY.md` and exactly the silent
+mis-report `sinkTier` exists to prevent. The pending sink now carries its provenance
+(`{ id, fromPicker }`) and only the picker's own choice promotes.
+
+**M-4, the join had no deadline on `selectAudioOutput()` — `UNVERIFIED`.** Every other promise
+on the join path is bounded; the chooser was not, and `enumPromise` chains behind it, so a
+chooser left open in a backgrounded tab parked the join on the spinner with no error — and
+because `endModal()` only ran from the settle handlers, `modalSuspend` stayed set and no later
+session could take fullscreen or pointer lock either. `pickOutputBounded()` races it against
+15 s, resolves `null`, calls `endModal` from whichever outcome is first, and notes the timeout.
+The microphone card stays unbounded on purpose: the owner ruled the join waits for the user's
+answer, and a card with two buttons cannot be left unanswered by accident the way a chooser can.
+
+**M-5, the key that opened the picker reached the host first — `UNVERIFIED`.** `input.js` binds
+`keydown` on `window` in the capture phase during `setup()`, i.e. before `queueOutputPicker`
+binds its own, so `onKeyDown` ran first with `suspended` still false and the keystroke landed on
+the host's desktop — possibly a modifier, possibly something destructive. `keydown` is dropped
+from `PICKER_GESTURES`; a tap is a sufficient gesture and the stage is the thing being tapped.
+`pointerdown`/`touchend` are safe because input.js binds those on `#stage` in the bubble phase.
+
+**M-1, `current` was plumbed to the UI and dropped there.** Fixed after the merge — see the row
+below.
+
+**Lows fixed.** L-1: `enumerateBeforeJoin` now guards its cache write with `_lastEnum` the way
+`reEnumerateAndPost` does, so the enumeration that runs after a granted pick cannot downgrade a
+labelled list. L-2: the pre-selected `selectAudioOutput({deviceId})` is the only call it makes —
+the fallback to a bare call could only ever reject, because the first call has already spent the
+activation. L-3: `httpsFixable` is back to a computed value, but on the one condition that
+matters — `http:` **and not** a secure context — so `http://localhost`, the same-device join,
+keeps its two rows instead of having them suppressed for an HTTPS switch that would fix nothing.
+L-6: `start()` re-asserts `RemoteInput.setSuspended(modalSuspend)` after `setup()`, because
+`teardown()` clears input.js's own flag and a session built while a dialog is up would otherwise
+forward input with the page still believing it suspended. L-9: `docs/TELEMETRY.md` says bit 15
+now covers two waits and that bit 22 tells them apart. L-10: coverage added on both sides — the
+three `applyReconfig` cases above, and four `startTrickle` cases asserting the settle callback
+fires once on an acknowledged `a=end-of-candidates`, after `onDead` on a dead sender, on a 404,
+and not at all for a call site that passes no callback. L-11: the two five-cell rows in the
+fallback ladder are four cells again and the lead-in counts six. L-12: `CLAUDE.md` named a
+remote-control permission modal the page has never had.
+
+**L-4, the ICE hold makes auto-fullscreen less likely — accepted, documented.** `startLock()`
+runs from `onStreamLive`, which the hold can defer by up to 8 s, and Chromium's activation
+window is 5 s from the Join click — which `selectAudioOutput()` has already spent on the engines
+that have it. So expect `degraded` bit 0 more often and one extra tap before the session goes
+fullscreen. Fixing it properly means requesting fullscreen from the Join click and keeping it
+across the hold, which is a bigger change than the ruling asked for and would put a fullscreen
+transition in front of a join that may yet fail. The gesture handler is the net, so this is a UX
+cost rather than a break; `docs/manual-tests/client-page.md` §7a carries a row so a tester does
+not file it as a defect.
+
+**L-5, `#unmute` does not go through `beginModal` — accepted.** It is the same failure class:
+an affordance over a pointer-locked stage that a mouse cannot reach. It is not fixed here
+because it is only shown when `video.play()` rejects, the element is `muted`, and the whole
+`<video>` path is the fallback — so the combination is close to unreachable, and routing it
+through `beginModal` would drop fullscreen and the locks on a path where the user's next action
+is a single tap that the gesture handler would answer anyway. Worth doing if the mute toggle
+ever becomes user-facing; noted so the next reader does not have to rediscover it.
+
+**L-7, a tab closed during the ICE hold sends no `/leave` — accepted.** `sendLeave` returns
+early on `!isLive`, and the held branch of `onStreamLive` returns before `isLive = true`. The
+host falls back to `disconnect_grace`, so this is a delay of a few seconds in tearing a display
+down, not a leak, and it is bounded by the same 8 s deadline. Setting `isLive` before the stage
+is shown would arm the reconfigure poll, the link evaluation and the geometry relay against a
+session the page is still deciding whether to keep — a worse trade for a narrower window.
+
+**M-1, `current` was plumbed to the UI and dropped there — `VERIFIED` (build + tests).** UX-C had
+already built the display half of this against a field that did not exist yet, reading it through
+a cast with a note saying to drop the cast when it landed. Merging the two makes it real, and the
+merge changed the type on the way: `AudioOutputsReport.current` and `DeviceAudioOutputs.current`
+are `Option<String>`, not `String`. `None` is "this client never said" — an older page, or one
+that has not posted yet — and `Some("")` is "playing on the device's default output". Collapsing
+them into an empty string would have hidden the one case worth showing: a host that asked for a
+specific sink and a client still sitting on its default. The client now omits the field entirely
+until something has applied a sink, so `None` means what it says. Both casts in `App.tsx` and
+`device-details.tsx` are gone; `bindings.ts` was regenerated from the merged tree (50 commands,
+11 events) and its whole diff against `latency-overhaul` is those two type rows.
+
+**L-8, `current` and `selected` are the same value on the wire — accepted, comment corrected.**
+The client posts `speakers.appliedSink` as both. The separation is real on the *host* side, where
+`selected` comes from `set_device_audio_output` and the posted `selected` is ignored entirely, so
+the behaviour is right; what was wrong was a client comment claiming a distinction the client
+does not draw. Posting the raw `readCurrentSink()` as `current` would make them differ only in
+the instant between an engine-side change and the next `syncCurrentSink()`, which is not worth a
+second field's worth of divergence. The comment now says what the client actually sends.
+
+## UX-B: the startup gate, at-capacity, and the pointer-lock clamp (post-report)
 
 Four owner rulings on `docs/FINAL-REPORT.md` §7.8 items 7, 9, 10 and 17. Windows was exercised;
 the Mac was powered off for this engagement, so every macOS branch below is written and reasoned

@@ -36,6 +36,32 @@ html, body {
     -webkit-user-select: none;
 }
 
+/* The picture the previous session left behind, held on screen while the next one negotiates.
+   A canvas whose control has been transferred to a worker cannot be reused, so every WebCodecs
+   rebuild has to replace the element; without this the stage went black for the whole of a
+   host-initiated reconfigure, an orientation flip or a demotion. Same box as #canvas — it is
+   the same picture, one session older — and removed by the first frame the new session paints. */
+#stage canvas.stale {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+    display: block;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#stage.stalled canvas.stale {
+    opacity: .45;
+    transition: opacity .25s ease;
+}
+
 #linkStatus {
     position: fixed;
     top: 14px;

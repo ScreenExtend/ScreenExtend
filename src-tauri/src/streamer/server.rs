@@ -720,6 +720,11 @@ struct AudioOutputsRequest {
     supported: bool,
     #[serde(default)]
     outputs: Vec<AudioOutputEntry>,
+    /// The sink the client is playing on right now, which is not always the one the host
+    /// asked for: the user can change it in the browser's own output control. Optional, so a
+    /// client built before the field still parses.
+    #[serde(default)]
+    current: Option<String>,
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -746,8 +751,12 @@ async fn audio_outputs(
         })
         .collect();
 
+    let current = req
+        .current
+        .map(|c| truncate_chars(&c, MAX_AUDIO_OUTPUT_STR));
+
     if let Some(s) = state.config.sessions.as_ref() {
-        session::set_audio_outputs(s, &ip, req.supported, outputs);
+        session::set_audio_outputs(s, &ip, req.supported, outputs, current);
         if let Some(reporter) = state.config.device_reporter.as_ref() {
             let report = session::audio_outputs_report(s, &ip);
             reporter.report_audio_outputs(ip.clone(), report);

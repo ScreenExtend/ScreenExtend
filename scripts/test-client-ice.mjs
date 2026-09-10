@@ -378,6 +378,77 @@ async function trickle() {
     t.stop();
   }
 
+  // ── the settle callback ────────────────────────────────────────────────────────────────
+  // The page holds the streaming stage back until the sender says it will send nothing more,
+  // so that a rejoin with a gathered offer can only ever happen in front of the join form.
+  // Every exit has to reach it, or the picture never appears.
+
+  // The happy path: the last batch carries `a=end-of-candidates` and is acknowledged.
+  {
+    patches.length = 0;
+    let settles = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, null, () => { settles++; });
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    await settle();
+    if (settles) fail('the sender settled while candidates were still coming');
+    else ok('a sender with candidates in flight has not settled');
+    pc.emit({ candidate: null });
+    for (let i = 0; i < 6; i++) await settle();
+    const last = patches[patches.length - 1];
+    if (!last || last.opts.body.indexOf('a=end-of-candidates') < 0) fail('no end-of-candidates was sent');
+    else if (settles !== 1) fail('the acknowledged end-of-candidates settled ' + settles + ' times');
+    else ok('an acknowledged end-of-candidates settles the sender exactly once');
+  }
+
+  // A dead sender settles too — after `onDead`, so a rejoin replaces the gate rather than
+  // racing it, and the page is never left holding a stage for a sender that gave up.
+  {
+    patches.length = 0;
+    nextPatchStatus = 405;
+    const order = [];
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, () => order.push('dead'), () => order.push('settle'));
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    for (let i = 0; i < 6; i++) await settle();
+    if (order.join(',') !== 'dead,settle') fail('a dead sender ran ' + order.join(',') + ', expected dead,settle');
+    else ok('a dead sender reports the failure first and settles after it');
+    nextPatchStatus = 204;
+    t.stop();
+    if (order.filter((x) => x === 'settle').length !== 1) fail('stop() settled a dead sender a second time');
+    else ok('settling is once-only however many exits are taken');
+  }
+
+  // The session is over: 404 is not a transport failure, but it is still the end of sending.
+  {
+    patches.length = 0;
+    nextPatchStatus = 404;
+    let settles = 0;
+    let deadReason = null;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; }, () => { settles++; });
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    for (let i = 0; i < 6; i++) await settle();
+    if (deadReason) fail('a 404 was reported as a transport failure: ' + deadReason);
+    else if (settles !== 1) fail('a 404 settled ' + settles + ' times');
+    else ok('a 404 settles the sender without blaming the endpoint');
+    nextPatchStatus = 204;
+  }
+
+  // An older call site passes no callback at all; the sender must not throw on its way out.
+  {
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc);
+    t.open('/whep/abc', '');
+    pc.emit({ candidate: null });
+    for (let i = 0; i < 4; i++) await settle();
+    ok('a sender with no settle callback finishes without throwing');
+    t.stop();
+  }
+
   // The golden vector the Rust parser is tested against. It is produced by the *shipped*
   // `trickleFragment`, not by a copy of it, so a change to the client body either updates this
   // file — and the Rust test then parses the new bytes — or fails here. A hand-written literal on

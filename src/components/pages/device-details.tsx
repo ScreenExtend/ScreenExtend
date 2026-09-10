@@ -204,12 +204,14 @@ function DeviceDetailsBody({
     (async () => {
       try {
         const r = await commands.getDeviceAudioOutputs(device.ip);
-        // See the matching note in App.tsx: `current` is the client-reported sink and is
-        // read defensively until the Rust payload carries it.
-        const current = (r as unknown as { current?: string | null }).current;
         setAudioOutputsByIp((prev) => ({
           ...prev,
-          [device.ip]: { supported: r.supported, outputs: r.outputs, selected: r.selected, current },
+          [device.ip]: {
+            supported: r.supported,
+            outputs: r.outputs,
+            selected: r.selected,
+            current: r.current,
+          },
         }));
       } catch (e) {
         console.error("failed to read the device audio outputs", e);
