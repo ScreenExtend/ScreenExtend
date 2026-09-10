@@ -46,11 +46,32 @@ function takeFunction(name) {
   throw new Error('function ' + name + ' is unbalanced');
 }
 
+function takeLet(name) {
+  const m = new RegExp('\\blet\\s+' + name + '\\s*=\\s*[^;]+;').exec(page);
+  if (!m) throw new Error('let ' + name + ' not found in index.html');
+  return m[0];
+}
+
+// The stage hold's real deadline is 8 s, which is not a thing to sit through in a unit suite.
+// Its *value* is asserted from the page below; only the lifted copy is shortened, and the
+// rewrite has to match or this throws rather than silently testing nothing.
+const HOLD_DEADLINE_MS = 120;
+function takeShortenedDeadline() {
+  const src = takeConst('ICE_SETTLE_DEADLINE_MS');
+  const shortened = src.replace(/=\s*\d+\s*;/, '= ' + HOLD_DEADLINE_MS + ';');
+  if (shortened === src) throw new Error('could not shorten ICE_SETTLE_DEADLINE_MS: ' + src);
+  return shortened;
+}
+
 const source = [
   takeConst('ICE_HOST_GRACE_MS'),
   takeConst('ICE_RELAY_GRACE_MS'),
   takeConst('TRICKLE_MAX_BATCH'),
   takeConst('TRICKLE_FIRST_ACK_MS'),
+  takeShortenedDeadline(),
+  takeLet('icePending'),
+  takeLet('liveHeld'),
+  takeLet('iceSettleTimer'),
   takeFunction('trickleIsFatal'),
   takeFunction('iceCandidateType'),
   takeFunction('iceGraceFor'),
@@ -60,14 +81,24 @@ const source = [
   takeFunction('localIceUfrag'),
   takeFunction('trickleFragment'),
   takeFunction('startTrickle'),
+  takeFunction('holdStageForIce'),
+  takeFunction('armIceSettleDeadline'),
+  takeFunction('releaseIceHold'),
+  takeFunction('iceSettled'),
   // `const` is lexically scoped to the script and never reaches the context object.
   'this.__grace = { host: ICE_HOST_GRACE_MS, relay: ICE_RELAY_GRACE_MS };',
   'this.__maxBatch = TRICKLE_MAX_BATCH;',
   'this.__firstAckMs = TRICKLE_FIRST_ACK_MS;',
+  'this.holdStageForIce = holdStageForIce;',
+  'this.armIceSettleDeadline = armIceSettleDeadline;',
+  'this.releaseIceHold = releaseIceHold;',
+  'this.iceSettled = iceSettled;',
+  'this.__holdPending = function () { return icePending; };',
 ].join('\n');
 
 let deadlineBits = 0;
 let suppressed = 0;
+let liveShown = 0;
 const patches = [];
 let nextPatchStatus = 204;
 const ctx = {
@@ -79,6 +110,7 @@ const ctx = {
   DEG: { ICE_GATHERING_DEADLINE: 1 << 15, TRICKLE_ICE_UNAVAILABLE: 1 << 22 },
   degrade(bit) { deadlineBits |= bit; },
   noteSuppressed() { suppressed++; },
+  onStreamLive() { liveShown++; },
   fetch(url, opts) {
     patches.push({ url, opts });
     // A request that is accepted by the socket and then never answered — the case the
@@ -438,6 +470,89 @@ async function trickle() {
     nextPatchStatus = 204;
   }
 
+  // ── the end of gathering has two signals, and either one has to be enough ──────────────
+  // Waiting only for the null candidate makes the whole sender — and with it the streaming
+  // stage — depend on one event. A browser that reports completion through the state alone,
+  // or one whose null candidate landed in the task before the listener was attached, then
+  // never sends `a=end-of-candidates`, never settles, and the page reports a gathering
+  // timeout on a session that gathered in a hundred milliseconds.
+  {
+    patches.length = 0;
+    let settles = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, null, () => { settles++; });
+    t.open('/whep/abc', '');
+    pc.emitCandidate('host');
+    await settle();
+    pc.complete();
+    for (let i = 0; i < 6; i++) await settle();
+    const last = patches[patches.length - 1];
+    if (!last || last.opts.body.indexOf('a=end-of-candidates') < 0) {
+      fail('gathering completing without a null candidate sent no end-of-candidates');
+    } else if (settles !== 1) {
+      fail('gathering completing without a null candidate settled ' + settles + ' times');
+    } else ok('iceGatheringState "complete" ends the sender even with no null candidate');
+    if (pc.listenerCount() !== 0) fail('the sender left ' + pc.listenerCount() + ' listeners behind');
+    else ok('both of the sender listeners are removed on the way out');
+    t.stop();
+  }
+
+  // Gathering that was already over before the sender existed fires no further event: the
+  // sender is built one task after `setLocalDescription` resolves, so this is a real ordering,
+  // not a hypothetical one.
+  {
+    patches.length = 0;
+    let settles = 0;
+    const pc = fakePc();
+    pc.iceGatheringState = 'complete';
+    const t = ctx.startTrickle(pc, null, () => { settles++; });
+    t.open('/whep/abc', '');
+    for (let i = 0; i < 6; i++) await settle();
+    if (!patches.length || patches[0].opts.body.indexOf('a=end-of-candidates') < 0) {
+      fail('a sender built after gathering finished sent no end-of-candidates');
+    } else if (settles !== 1) fail('it settled ' + settles + ' times');
+    else ok('a sender built after gathering already completed still settles');
+    t.stop();
+  }
+
+  // Every candidate was already in the offer, so the batch is empty. Without an end-of-
+  // gathering signal that is a sender which PATCHes nothing, reports nothing and never
+  // settles — and `open()`'s first-ack timer deliberately stays quiet, because nothing was
+  // attempted. The stage would then wait out the whole deadline for a healthy session.
+  {
+    patches.length = 0;
+    let settles = 0;
+    let deadReason = null;
+    const inOffer = 'candidate:1 1 udp 2 10.0.0.1 5000 typ host';
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, (r) => { deadReason = r; }, () => { settles++; });
+    pc.emit({ candidate: cand(inOffer) });
+    t.open('/whep/abc', 'v=0\r\na=' + inOffer + '\r\n');
+    await settle();
+    if (patches.length) fail('a duplicate-only batch was PATCHed anyway');
+    else ok('a batch of nothing but duplicates sends no PATCH');
+    pc.complete();
+    for (let i = 0; i < 6; i++) await settle();
+    if (settles !== 1) fail('a duplicate-only sender settled ' + settles + ' times');
+    else if (deadReason) fail('it was blamed on the endpoint: ' + deadReason);
+    else ok('a sender whose only candidates were already in the offer still settles');
+    t.stop();
+  }
+
+  // A network that produces no candidate at all: no PATCH, nothing to blame, and still an end.
+  {
+    patches.length = 0;
+    let settles = 0;
+    const pc = fakePc();
+    const t = ctx.startTrickle(pc, null, () => { settles++; });
+    t.open('/whep/abc', '');
+    pc.complete();
+    for (let i = 0; i < 6; i++) await settle();
+    if (settles !== 1) fail('a session with no candidates settled ' + settles + ' times');
+    else ok('a session that gathered no candidates at all still settles');
+    t.stop();
+  }
+
   // An older call site passes no callback at all; the sender must not throw on its way out.
   {
     const pc = fakePc();
@@ -502,6 +617,76 @@ async function trickle() {
     else if (t.count() !== n) fail('the sent count is ' + t.count() + ', expected ' + n);
     else ok('a burst larger than one batch is split and every candidate still goes out');
     t.stop();
+  }
+}
+
+// --- the streaming stage's hold ------------------------------------------------------------
+// The hold keeps the picture back until the trickle sender says it will send nothing more, so
+// that a rejoin with a gathered offer can only ever happen in front of the join form. Its
+// deadline is the net under that. What this section pins is *when the net is armed*: at the
+// offer it also covered the WHEP round trip, and that round trip builds a virtual display —
+// `DISPLAY_ATTACH_TIMEOUT` is 5 s on its own and the correlation lock serialises it across
+// joins — so a host that was merely slow made the page report `ice_gathering_timed_out` for a
+// join that then succeeded, and hold the picture for 8 s to do it.
+
+async function stageHold() {
+  const shipped = /=\s*(\d+)\s*;/.exec(takeConst('ICE_SETTLE_DEADLINE_MS'));
+  const whep = /=\s*(\d+)\s*;/.exec(takeConst('WHEP_TIMEOUT_MS'));
+  if (!shipped || Number(shipped[1]) !== 8000) fail('the shipped settle deadline is ' + (shipped && shipped[1]));
+  else ok('the shipped settle deadline is 8000 ms (tested here at ' + HOLD_DEADLINE_MS + ')');
+  if (!whep) fail('WHEP_TIMEOUT_MS is not a plain number any more');
+  else ok('the WHEP POST has its own ' + whep[1] + ' ms timeout, which is what bounds a host that never answers');
+
+  // Armed at the offer, this is where the false timeout came from: the sender cannot PATCH
+  // before the answer names its resource, so every millisecond the host spends creating a
+  // display counted against a deadline about ICE.
+  {
+    deadlineBits = 0;
+    liveShown = 0;
+    ctx.holdStageForIce();
+    await sleep(HOLD_DEADLINE_MS * 3);
+    if (deadlineBits & ctx.DEG.ICE_GATHERING_DEADLINE) fail('the hold expired while the WHEP POST was still in flight');
+    else ok('holding the stage does not start the deadline — nothing can settle before the answer');
+    if (!ctx.__holdPending()) fail('the hold released itself with no settle');
+    else ok('the hold is still in force while the answer is outstanding');
+  }
+
+  // Armed when the resource is opened, it is a real deadline again.
+  {
+    deadlineBits = 0;
+    liveShown = 0;
+    ctx.armIceSettleDeadline();
+    await sleep(HOLD_DEADLINE_MS + 120);
+    if (!(deadlineBits & ctx.DEG.ICE_GATHERING_DEADLINE)) fail('the armed deadline never fired');
+    else ok('once the resource is open the deadline runs, and reports bit 15');
+    if (ctx.__holdPending()) fail('the expired deadline left the stage held');
+    else ok('the expired deadline releases the stage rather than holding it for ever');
+  }
+
+  // A settle inside the deadline cancels it, and shows a picture that was waiting on it.
+  {
+    deadlineBits = 0;
+    liveShown = 0;
+    ctx.holdStageForIce();
+    ctx.armIceSettleDeadline();
+    ctx.iceSettled();
+    await sleep(HOLD_DEADLINE_MS * 3);
+    if (deadlineBits & ctx.DEG.ICE_GATHERING_DEADLINE) fail('a settled hold still reported a timeout');
+    else ok('a settle inside the deadline cancels it and reports nothing');
+  }
+
+  // Re-arming is idempotent: `armIceSettleDeadline` is called once per join, but a second call
+  // must not restart the clock and give a wedged sender another eight seconds.
+  {
+    deadlineBits = 0;
+    ctx.holdStageForIce();
+    ctx.armIceSettleDeadline();
+    await sleep(HOLD_DEADLINE_MS * 0.6);
+    ctx.armIceSettleDeadline();
+    await sleep(HOLD_DEADLINE_MS * 0.6 + 80);
+    if (!(deadlineBits & ctx.DEG.ICE_GATHERING_DEADLINE)) fail('a second arm restarted the deadline');
+    else ok('arming twice does not restart the deadline');
+    ctx.releaseIceHold();
   }
 }
 
@@ -626,6 +811,7 @@ async function run() {
   }
 
   await trickle();
+  await stageHold();
   await measure();
 
   if (failures) {
