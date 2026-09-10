@@ -341,8 +341,10 @@
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
                     // The session is over, so the frozen frame the rebuild was holding on to is
-                    // no longer standing in for anything.
+                    // no longer standing in for anything, and a picker armed for a sink that
+                    // session was going to use would open on the next click of the join form.
                     dropStaleCanvas();
+                    cancelQueuedPicker();
                     stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
@@ -1124,7 +1126,16 @@
             // is armed at a time; a newer host choice replaces the id it will open on.
             let queuedPickerId = null;
             let pickerGestureArmed = false;
+            let pickerGestureFire = null;
             const PICKER_GESTURES = ['pointerdown', 'keydown', 'touchend'];
+            function cancelQueuedPicker() {
+                queuedPickerId = null;
+                if (!pickerGestureFire) return;
+                const fn = pickerGestureFire;
+                pickerGestureFire = null;
+                pickerGestureArmed = false;
+                PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fn, true));
+            }
             function queueOutputPicker(preferredId) {
                 let can = false;
                 try { can = !!(window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()); } catch (_) { noteSuppressed(); }
@@ -1140,6 +1151,7 @@
                 const fire = () => {
                     PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fire, true));
                     pickerGestureArmed = false;
+                    pickerGestureFire = null;
                     const want = queuedPickerId;
                     queuedPickerId = null;
                     withModal((close) => {
@@ -1152,6 +1164,7 @@
                         }, noteSuppressed).then(close, close);
                     });
                 };
+                pickerGestureFire = fire;
                 PICKER_GESTURES.forEach((ev) => window.addEventListener(ev, fire, true));
             }
 
@@ -2903,18 +2916,27 @@
                 //
                 // It runs alongside the three promises above rather than in front of them, so
                 // the refresh-rate measurement and the decoder probe are done by the time the
-                // card is answered.
+                // card is answered — but *behind* the picker where there is one. A granted pick
+                // is what exposes the labels, and an enumeration that started before it would
+                // finish afterwards and overwrite the labelled list with the unlabelled one it
+                // read. The two never both raise UI: an engine with the picker is exactly the
+                // engine `needsMicPermission()` answers no for.
                 let enumPromise = Promise.resolve(null);
                 try {
                     if (window.SEAudio) {
                         SEAudio.initSpeakers();
-                        enumPromise = SEAudio.enumerateBeforeJoin(micCard);
+                        const runEnum = () => {
+                            try { return SEAudio.enumerateBeforeJoin(micCard); } catch (_) { noteSuppressed(); return null; }
+                        };
+                        enumPromise = pickPromise
+                            ? pickPromise.then(runEnum, runEnum)
+                            : Promise.resolve(runEnum());
                         SEAudio._enumPromise = enumPromise;
                     }
                 } catch (_) { noteSuppressed(); }
 
                 const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
-                if (pickPromise) { try { await pickPromise; } catch (_) { noteSuppressed(); } }
+                // Transitively awaits the picker where there is one.
                 try { await enumPromise; } catch (_) { noteSuppressed(); }
 
                 if (results[0]) {

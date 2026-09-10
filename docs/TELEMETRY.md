@@ -412,6 +412,12 @@ one on the fast path rather than looking identical to it.
 | keyframe (74) | **cannot ask** | `sendKeyFrameRequest()` | `KEYFRAME_REQUEST` (`0x64`) on the input channel | | |
 | audio sink (75) | none | `AudioContext.setSinkId` | `HTMLMediaElement.setSinkId` | `navigator.audioSession` | `selectAudioOutput()` |
 
+Sink tier 4 is reachable from the Join button's click: `selectAudioOutput()` needs transient
+activation, and until the join handler spent that click on it there was no gesture on the page to
+hang it from, so the tier existed in this table and nothing could ever report it. It is claimed
+only once the picked device is actually routed — a picker that returns a device the engine then
+refuses to play on leaves the tier at whatever is true.
+
 A keyframe tier of 0 with a transport tier of 2 is the Chrome 94–140 case: the legacy transform
 runs instead of libwebrtc's reference finder, so nothing downstream emits a PLI and the client
 has no way at all to ask for an IDR.
@@ -454,6 +460,13 @@ host. The field is a union of the page's own bits and the audio module's.
 | 20 | `requestVideoFrameCallback` unavailable |
 | 21 | Keyboard Lock unavailable |
 | 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
+| 23 | input was suspended so the user could reach a dialog on the page |
+
+Bit 23 is set the first time the page took the pointer lock, the keyboard lock and the input
+forwarding back from the host to put something in front of the user — a card, a modal, or the
+browser's own output picker. Without it the host sees a device that simply stopped sending input
+and cannot tell a dialog from a wedge. It is only set where a session was actually forwarding:
+the microphone card raised before the join suspends nothing and reports nothing.
 
 Bit 22 is set when `/net-config` did not say `trickleIce: true` (an older host, or the cloud
 relay, which tunnels `/whep` but not `/net-config`), and in the cases the client cannot detect
