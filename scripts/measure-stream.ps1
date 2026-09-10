@@ -74,13 +74,17 @@ public static class SEInput {
     [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr extra; }
     [StructLayout(LayoutKind.Sequential)]
-    struct INPUT { public uint type; public MOUSEINPUT mi; public int pad0, pad1; }
+    // Exactly the OS layout: 40 bytes on x64, 28 on x86. Two trailing pad ints used to sit
+    // here and made Marshal.SizeOf 48, so every SendInput returned 0 with ERROR_INVALID_PARAMETER
+    // and the pointer never moved - a cursor scene with a stationary cursor.
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
     [DllImport("user32.dll", SetLastError = true)]
     static extern uint SendInput(uint n, INPUT[] p, int cb);
     const uint MOVE = 0x0001, ABSOLUTE = 0x8000, VIRTUALDESK = 0x4000;
     // Absolute coordinates are 0..65535 across the whole virtual desktop, so the caller passes
     // desktop pixels and the mapping happens here against the metrics the OS reports.
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    public static int Metric(int i) { return GetSystemMetrics(i); }
     public static void MoveTo(int x, int y) {
         int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
         int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
@@ -91,6 +95,26 @@ public static class SEInput {
         inp[0].mi.dy = (int)(((double)(y - vy) * 65535.0) / (vh - 1));
         inp[0].mi.dwFlags = MOVE | ABSOLUTE | VIRTUALDESK;
         SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+
+    // Moves the pointer and reads it back. A cursor scene whose cursor does not move is not a
+    // failed measurement, it is a measurement of something else that looks exactly like one, so
+    // the caller refuses to run rather than report it.
+    public static string SelfTest(int x, int y) {
+        POINT before; GetCursorPos(out before);
+        MoveTo(x, y);
+        System.Threading.Thread.Sleep(120);
+        POINT after; GetCursorPos(out after);
+        MoveTo(before.x, before.y);
+        int dx = after.x - x, dy = after.y - y;
+        if (dx < -2 || dx > 2 || dy < -2 || dy > 2) {
+            return "asked for " + x + "," + y + " and the pointer is at " + after.x + "," + after.y
+                 + " (INPUT is " + Marshal.SizeOf(typeof(INPUT)) + " bytes)";
+        }
+        return null;
     }
 
     // System.Windows.Forms.Screen.AllScreens caches its answer for the life of the process, so a
@@ -532,7 +556,15 @@ if ($rafSession) {
 # --------------------------------------------------------------------------------------------
 # The sweep. A circle rather than a line so the pointer never rests and never leaves the display,
 # stepped at 8 ms so the motion is finer than any plausible compose cadence.
+#
+# Proved before it is trusted: a stationary pointer produces a plausible-looking run of an
+# entirely different scene, and every number in it would be wrong about the thing the scene
+# exists to measure.
 # --------------------------------------------------------------------------------------------
+$sweepFault = [SEInput]::SelfTest($vb.X + [int]($vb.Width / 2), $vb.Y + [int]($vb.Height / 2))
+if ($sweepFault) { throw "the pointer cannot be moved, so the sweep would measure a still desktop: $sweepFault" }
+Step 'pointer sweep self-test passed'
+
 $mover = Start-Job -ArgumentList $vb.X, $vb.Y, $vb.Width, $vb.Height, ($Seconds + 6) -ScriptBlock {
     param($bx, $by, $bw, $bh, $secs)
     Add-Type @'
@@ -542,7 +574,10 @@ public static class SEInput2 {
     [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr extra; }
     [StructLayout(LayoutKind.Sequential)]
-    struct INPUT { public uint type; public MOUSEINPUT mi; public int pad0, pad1; }
+    // Exactly the OS layout: 40 bytes on x64, 28 on x86. Two trailing pad ints used to sit
+    // here and made Marshal.SizeOf 48, so every SendInput returned 0 with ERROR_INVALID_PARAMETER
+    // and the pointer never moved - a cursor scene with a stationary cursor.
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] p, int cb);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
     public static void MoveTo(int x, int y) {
@@ -575,9 +610,16 @@ if (-not $NoRecord) {
     if ($ff) {
         # -draw_mouse 0 so the only pointer in the recording is the one the host composited into
         # the video. qp 0 because mpdecimate is about to be asked whether a 32x32 sprite moved.
+        #
+        # The crop is an *input* option and has to precede `-i`. After it, ffmpeg parses it as an
+        # output option and silently ignores it, and gdigrab records the whole virtual desktop -
+        # so every "changed frame" counted below is a clock ticking somewhere else on screen and
+        # the freeze numbers describe the desktop rather than the stream. The coordinates are
+        # desktop coordinates, matching `--window-position=0,0 --window-size=1280,800` above.
         $ffmpeg = Start-Process -FilePath $ff.Source -PassThru -WindowStyle Hidden -ArgumentList @(
             '-y', '-f', 'gdigrab', '-framerate', '60', '-draw_mouse', '0',
-            '-i', 'desktop', '-offset_x', '0', '-offset_y', '0', '-video_size', '1280x800',
+            '-offset_x', '0', '-offset_y', '0', '-video_size', '1280x800',
+            '-i', 'desktop',
             '-t', "$Seconds", '-c:v', 'libx264', '-preset', 'ultrafast', '-qp', '0',
             $recording) -RedirectStandardError (Join-Path $runDir 'ffmpeg.log')
     } else {
@@ -630,6 +672,10 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
 $sw.Stop()
 
 if ($ffmpeg) { $ffmpeg.WaitForExit(20000) | Out-Null }
+if ($ffmpeg -and -not (Test-Path $recording)) {
+    # Missing, not zero. A recording that never started reads downstream as "no freezes".
+    Write-Warning "no recording was produced; the freeze numbers are absent. $(Join-Path $runDir 'ffmpeg.log') says why"
+}
 Stop-Job $mover -ErrorAction SilentlyContinue
 Remove-Job $mover -Force -ErrorAction SilentlyContinue
 

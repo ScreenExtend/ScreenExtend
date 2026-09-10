@@ -21,7 +21,7 @@ use windows_future::AsyncActionCompletedHandler;
 use super::d3d11::{self, create_d3d_device, AdapterInfo};
 use super::frame::Frame;
 use super::graphics_capture_api::{self, GraphicsCaptureApi, InternalCaptureControl};
-use super::settings::{GraphicsCaptureItemType, Settings};
+use super::settings::{CursorCaptureSettings, GraphicsCaptureItemType, Settings};
 use super::winrt::WinRT;
 
 const fn dispatcher_queue_options() -> DispatcherQueueOptions {
@@ -342,11 +342,14 @@ pub trait GraphicsCaptureApiHandler: Sized {
         let callback = Arc::new(Mutex::new(
             Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
         ));
-        let (buffers, stale_frames) = {
+        let (buffers, stale_frames, cursor) = {
             let handler = callback.lock();
             (
                 handler.frame_pool_buffers(),
                 handler.stale_frame_counter().unwrap_or_default(),
+                handler
+                    .cursor_capture_override()
+                    .unwrap_or(settings.cursor_capture_settings),
             )
         };
 
@@ -358,7 +361,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 .try_into()
                 .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
             callback,
-            settings.cursor_capture_settings,
+            cursor,
             settings.draw_border_settings,
             settings.secondary_window_settings,
             settings.minimum_update_interval_settings,
@@ -451,11 +454,14 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 let callback = Arc::new(Mutex::new(
                     Self::new(ctx).map_err(GraphicsCaptureApiError::NewHandlerError)?,
                 ));
-                let (buffers, stale_frames) = {
+                let (buffers, stale_frames, cursor) = {
                     let handler = callback.lock();
                     (
                         handler.frame_pool_buffers(),
                         handler.stale_frame_counter().unwrap_or_default(),
+                        handler
+                            .cursor_capture_override()
+                            .unwrap_or(settings.cursor_capture_settings),
                     )
                 };
 
@@ -467,7 +473,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                         .try_into()
                         .map_err(|_| GraphicsCaptureApiError::ItemConvertFailed)?,
                     callback.clone(),
-                    settings.cursor_capture_settings,
+                    cursor,
                     settings.draw_border_settings,
                     settings.secondary_window_settings,
                     settings.minimum_update_interval_settings,
@@ -572,6 +578,21 @@ pub trait GraphicsCaptureApiHandler: Sized {
     /// to the newest one. Returning `None` means nobody is watching and the count is thrown away.
     #[inline]
     fn stale_frame_counter(&self) -> Option<Arc<AtomicU32>> {
+        None
+    }
+
+    /// Lets a handler overrule `Settings::cursor_capture_settings` once it has been constructed.
+    ///
+    /// The cursor setting is the one capture property whose right value is not knowable until the
+    /// handler exists: a handler that draws the pointer itself wants
+    /// [`CursorCaptureSettings::WithoutCursor`], but whether it *can* is only decided while it
+    /// builds its encoder, and getting that wrong in the other direction means a stream with no
+    /// pointer at all. Returning `None` — the default, and what every handler that does not care
+    /// does — leaves the settings value alone.
+    ///
+    /// Read once, alongside [`Self::frame_pool_buffers`], before the session is configured.
+    #[inline]
+    fn cursor_capture_override(&self) -> Option<CursorCaptureSettings> {
         None
     }
 

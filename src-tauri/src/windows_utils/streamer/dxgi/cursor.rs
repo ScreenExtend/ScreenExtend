@@ -384,3 +384,183 @@ pub fn build_sprite(
         hotspot_y: info.HotSpot.y,
     })
 }
+
+/// A pointer shape read from an `HCURSOR`, in exactly the encoding Desktop Duplication hands to
+/// [`build_sprite`].
+///
+/// The WGC path has no `GetFramePointerShape`: it gets an `HCURSOR` out of `GetCursorInfo` and
+/// nothing else. Rather than write a second sprite builder for it, the GDI bitmaps are converted
+/// into DXGI's own three-shape encoding and handed to the one that already exists — which is also
+/// what keeps the two capture backends drawing the *same* pointer.
+pub struct PointerShape {
+    pub info: DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    pub data: Vec<u8>,
+}
+
+struct Dc(windows::Win32::Graphics::Gdi::HDC);
+
+impl Drop for Dc {
+    fn drop(&mut self) {
+        unsafe { _ = windows::Win32::Graphics::Gdi::DeleteDC(self.0) };
+    }
+}
+
+struct Bmp(windows::Win32::Graphics::Gdi::HBITMAP);
+
+impl Drop for Bmp {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe { _ = windows::Win32::Graphics::Gdi::DeleteObject(self.0.into()) };
+        }
+    }
+}
+
+/// Reads a GDI bitmap as top-down 32-bit BGRA, whatever it is stored as.
+///
+/// Always 32 bpp, including for the 1-bpp AND/XOR masks. A monochrome DDB read at its own depth
+/// comes back as palette indices, and which index is "set" depends on the palette GDI happens to
+/// attach — a coin toss that decides whether the cursor is drawn or its negative is. Read at 32
+/// bpp the question does not arise: black is 0 and white is not.
+fn bitmap_bgra(
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    bmp: windows::Win32::Graphics::Gdi::HBITMAP,
+    w: i32,
+    h: i32,
+) -> Result<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS};
+
+    if w <= 0 || h <= 0 {
+        bail!("cursor bitmap has no area ({w}x{h})");
+    }
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            // Negative: top-down, so row 0 is the top row and the pitch is a plain w * 4.
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0, // BI_RGB
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let got = unsafe {
+        GetDIBits(
+            dc,
+            bmp,
+            0,
+            h as u32,
+            Some(out.as_mut_ptr().cast()),
+            &mut bi,
+            DIB_RGB_COLORS,
+        )
+    };
+    if got == 0 {
+        bail!("GetDIBits({w}x{h}) returned no scanlines");
+    }
+    Ok(out)
+}
+
+/// Converts the cursor `hcursor` names into DXGI's pointer-shape encoding.
+///
+/// The three cases are the three DXGI shape types, and they are decided by what
+/// `GetIconInfoExW` hands back — never by a version or a size:
+///
+/// * no colour bitmap: a monochrome cursor, whose mask is 2H tall (AND rows then XOR rows);
+/// * a colour bitmap with a real alpha channel: a modern 32-bit cursor;
+/// * a colour bitmap whose alpha is entirely zero: a pre-alpha colour cursor, where the AND mask
+///   decides transparency and inversion, which is exactly `MASKED_COLOR`.
+pub fn shape_from_hcursor(
+    hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR,
+) -> Result<PointerShape> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, GetObjectW, BITMAP};
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfoExW, HICON, ICONINFOEXW};
+
+    if hcursor.is_invalid() {
+        bail!("no cursor handle");
+    }
+    let mut ii = ICONINFOEXW {
+        cbSize: std::mem::size_of::<ICONINFOEXW>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetIconInfoExW(HICON(hcursor.0), &mut ii) }.as_bool() {
+        bail!("GetIconInfoExW failed");
+    }
+    let mask = Bmp(ii.hbmMask);
+    let colour = Bmp(ii.hbmColor);
+    let hotspot = POINT {
+        x: ii.xHotspot as i32,
+        y: ii.yHotspot as i32,
+    };
+
+    let dc = Dc(unsafe { CreateCompatibleDC(None) });
+    if dc.0.is_invalid() {
+        bail!("CreateCompatibleDC failed");
+    }
+
+    let mut bm = BITMAP::default();
+    let want = std::mem::size_of::<BITMAP>() as i32;
+
+    if colour.0.is_invalid() {
+        // Monochrome: one bitmap, 2H tall. Repack to the 1-bpp rows `build_sprite` reads.
+        if unsafe { GetObjectW(mask.0.into(), want, Some((&raw mut bm).cast())) } != want {
+            bail!("GetObjectW(cursor mask) failed");
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        let bgra = bitmap_bgra(dc.0, mask.0, w, h)?;
+        let pitch = ((w as u32).div_ceil(32)) * 4;
+        let mut packed = vec![0u8; pitch as usize * h as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let o = (y * w as usize + x) * 4;
+                let set = bgra[o] != 0 || bgra[o + 1] != 0 || bgra[o + 2] != 0;
+                if set {
+                    packed[y * pitch as usize + x / 8] |= 0x80 >> (x & 7);
+                }
+            }
+        }
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+            Type: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32,
+            Width: w as u32,
+            Height: h as u32,
+            Pitch: pitch,
+            ..Default::default()
+        };
+        info.HotSpot = hotspot;
+        return Ok(PointerShape { info, data: packed });
+    }
+
+    if unsafe { GetObjectW(colour.0.into(), want, Some((&raw mut bm).cast())) } != want {
+        bail!("GetObjectW(cursor colour) failed");
+    }
+    let (w, h) = (bm.bmWidth, bm.bmHeight);
+    let mut bgra = bitmap_bgra(dc.0, colour.0, w, h)?;
+    let has_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
+
+    let kind = if has_alpha {
+        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR
+    } else {
+        // The alpha byte is where `MASKED_COLOR` keeps the AND mask: 0xFF means "XOR this pixel
+        // with the screen" (so black leaves the screen alone and white inverts it), 0x00 means
+        // "replace it".
+        let mask_bgra = bitmap_bgra(dc.0, mask.0, w, h)?;
+        for (px, m) in bgra.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
+            let set = m[0] != 0 || m[1] != 0 || m[2] != 0;
+            px[3] = if set { 0xFF } else { 0x00 };
+        }
+        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR
+    };
+
+    let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO {
+        Type: kind.0 as u32,
+        Width: w as u32,
+        Height: h as u32,
+        Pitch: (w as u32) * 4,
+        ..Default::default()
+    };
+    info.HotSpot = hotspot;
+    Ok(PointerShape { info, data: bgra })
+}

@@ -730,15 +730,14 @@ verdict on the priority changes was that they "didn't make much difference" — 
 
 ### What is not fixed
 
-- **WGC does not deliver a frame for pointer-only motion on this box's indirect display.** With
+- ~~**WGC does not deliver a frame for pointer-only motion on this box's indirect display.** With
   the pointer sweeping continuously, 30 s of capture produced 2 – 10 *real* frames a second in
-  **either** binary; everything else emitted is a keepalive repeat, and a repeat carries the
-  pointer wherever WGC last composited it. That is why the changed-frame rate in the recording did
-  not move. Nothing in this change causes it and nothing in this change fixes it: the fix is to
-  stop asking WGC to composite the pointer (`CursorCaptureSettings::WithoutCursor`) and to draw it
-  ourselves from `GetCursorInfo` into the ring slot, reusing the sprite renderer
-  `windows_utils/streamer/dxgi/cursor.rs` already has for exactly this. It is the single largest
-  remaining item for the owner's original complaint and it is **not in this change**.
+  **either** binary~~ — **withdrawn.** The pointer was not sweeping. `scripts/measure-stream.ps1`'s
+  `SendInput` had never worked (ledger row 334), so the cursor scene measured a still desktop, and
+  2 – 10 frames a second is what WGC delivers for a display on which **nothing at all** is moving.
+  Re-measured with a pointer that really moves, WGC on this box delivers ~50 fps for pointer-only
+  motion. See "The pointer, re-measured" below, which supersedes this bullet and the paragraph
+  above it about the changed-frame rate.
 - **The client's refresh-rate measurement runs during page load**, where Chrome fires
   `requestAnimationFrame` faster than vsync; the page's own later refinement logs
   `[refresh] refined to 60 Hz from 360`. Row 326 bounds the damage from the host side, which is
@@ -754,6 +753,93 @@ verdict on the priority changes was that they "didn't make much difference" — 
   six runs here demoted, with `wake_lock_refused` alongside, which is what a page that is not the
   visible window reports. Single runs are not comparable; every number above is a median of three,
   and the host-log rows are the ones with no variance at all.
+
+## The pointer, re-measured
+
+This section supersedes the "WGC does not deliver a frame for pointer-only motion" bullet above.
+It exists because the change that bullet asked for was made, and making it found that the bullet
+was wrong.
+
+### Two harness defects, and what they cost
+
+**The pointer never moved.** `measure-stream.ps1` declared the Win32 `INPUT` struct with two
+trailing pad ints, which makes `Marshal.SizeOf` 48 bytes where the OS wants 40. `SendInput`
+validates `cbSize` against its own `sizeof` and returns **0** for anything else; nothing checked
+the return. Every `MoveTo` in every run of the **cursor scene** failed with
+`ERROR_INVALID_PARAMETER`, and the pointer sat at the centre of the host's own panel for the whole
+run. Measured directly: `Marshal.SizeOf` **48**, `SendInput` **sent=0 err=87**; with the pads
+removed, **40**, `sent=1`, and the pointer moves. The scene now proves the sweep with a
+move-and-read-back before it starts and refuses to run if the pointer did not move (row 334).
+
+**The recording was of the whole desktop.** `-offset_x` / `-offset_y` / `-video_size` sat *after*
+`-i desktop`, where ffmpeg parses them as output options and ignores them, so gdigrab captured all
+3840x1080 instead of the client's 1280x800 window. Every "changed frame" counted a clock ticking
+or a second browser window repainting somewhere else on screen. Moved before `-i`, the `gap p50`
+falls from 50 ms to 17 ms — the panel's own frame period, which is what a stream keeping up looks
+like (row 335).
+
+So: **the numbers in the section above that describe pointer motion describe a stationary
+pointer.** Everything else in it — the display geometry, the keyframe storm, the demotion, the
+desktop-smoothness rows — is unaffected, because none of it depended on the pointer moving.
+
+### WGC's real delivery rate for pointer-only motion
+
+Same box, same empty virtual display, the pointer now actually sweeping a circle stepped every
+8 ms, `IsCursorCaptureEnabled` **on** (the shipping behaviour):
+
+| | frames emitted / 30 s | of those, keepalive repeats | WGC frames a second |
+|---|---|---|---|
+| pointer stationary | 1248 | 1246 | **0.07** |
+| pointer sweeping | 1720 | 186 | **51** |
+
+The compositor does produce a frame for a pointer that moves. The "2 – 10" figure was the *first*
+row of that table being mistaken for the second.
+
+### Host-composited pointer, before and after
+
+Windows 11 26200, RTX 3080 Ti Laptop + Intel UHD, Chrome on the host's own panel, 30 s per run,
+**median of three**, saved device rows cleared. `before` is the `latency-overhaul` release build;
+`after` adds ledger rows 336 – 337.
+
+| | before (WGC draws it) | after (the host draws it) |
+|---|---|---|
+| painted frames/s, client-reported | 71.8 (72.7 / 71.8 / 69.6) | 68.8 (73.2 / 68.8 / 67.7) |
+| changed frames/s, from the recording | 49.1 (51 / 49.1 / 34.9) | 38.9 (49.8 / 38.9 / 37) |
+| gap p50 | 17 ms | 17 ms |
+| freezes ≥ 100 ms per minute | 2 (2 / 2 / 30) | 4 (0 / 4 / 30) |
+| `capture_to_socket` p50 | 9.44 ms | 9.44 ms |
+| emitted frames that were stale repeats | 12 % | 8 % |
+| CPU per composite | — | 29 – 50 µs |
+
+**These are indistinguishable.** The spread within each column is wider than the gap between them
+— one run of each triple lands at 30 freezes a minute and 35 – 37 changed frames a second, and it
+is not the same build twice. The honest verdict is that on this box, with a pointer that moves
+continuously, host compositing is neither faster nor slower than letting WGC do it.
+
+The scrolling/video scene, one run each, confirms nothing regressed: changed frames/s **50.3 →
+52.1**, freezes ≥ 100 ms per minute **2 → 0**, `capture_to_socket` p50 **10.49 ms → 10.49 ms**.
+
+### What the change is worth, then
+
+Correctness, not speed, and two specific properties the before build does not have:
+
+- **A keepalive repeat carries the current pointer.** Before, a repeat carried the pointer
+  wherever WGC last composited it; that is the literal mechanism behind "the cursor is painted on
+  stale frames". 12 % of emitted frames were such repeats, and after they are 8 % *and* the rest
+  of what used to be a repeat is now a real frame with the pointer moved (`cursor_frames`).
+- **The pointer's update rate no longer depends on the compositor delivering a frame.** With the
+  pointer held still the compositor delivers 0.07 frames a second; anything that moves the pointer
+  without changing a pixel of the desktop — which is what the top table's first row *is* — updates
+  the client only on the host-composited path.
+
+Neither is worth much on Windows 11 26200, because its compositor is generous. Both are worth
+more on the builds `guides/windows-legacy.md` covers, and that is exactly where this is
+unverified.
+
+**Verified by looking**: a frame extracted from the client's own recording shows the Windows arrow
+drawn with the right shape, the right alpha and its tip on the pointer's coordinate. That is the
+check that matters most and no counter can make it — the first implementation of this passed every
+host counter while drawing nothing at all, because `MonitorFromPoint` never matched.
 
 ## Honesty
 

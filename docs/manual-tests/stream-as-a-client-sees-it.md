@@ -54,6 +54,23 @@ per-second sample), the host's own log, the client's console, and the recording.
 5. **Nothing skips a frame carrying the pointer.** `frames_skipped_unchanged` must be **0** with
    `autoFrameRate` off, which is the default. If it is not, the WGC dirty-region skip is running
    when it should not be.
+6. **The pointer is drawn, and the host is drawing it.** `host.log` carries one line per session:
+   `cursor: composited by the host on N ring slots; WGC asked for the desktop without a pointer.
+   display WxH at X,Y (hmonitor …) -> encode WxH, cursor dpi factor D`. The rectangle must be the
+   *virtual* display's, not `0,0` — a virtual display sits at a negative x beside the panel, and
+   `0,0` means `GetMonitorInfoW` failed and the pointer will be tested against the wrong screen.
+   `cursor_frames` in the host summary must be non-zero once the pointer has moved, and any
+   `[cursor] no pointer drawn:` line names which test rejected it and where the pointer was.
+   Where the overlay could not be built the line instead says WGC keeps the pointer, which is the
+   old behaviour and not a failure.
+7. **Look at the picture.** Extract a frame from the recording and check there is a pointer in it,
+   the right shape, with its tip where the sweep should have put it:
+   ```powershell
+   ffmpeg -y -ss 18 -i <run>\client.mkv -frames:v 1 -vf "crop=640:420:60:140,scale=1280:840" f.png
+   ```
+   Nothing else in this test can catch a pointer that is not being drawn: the first version of the
+   host-composited path passed every host-side counter while drawing nothing, because its
+   `MonitorFromPoint` test never matched.
 
 ## Reading the numbers
 
@@ -72,10 +89,27 @@ per-second sample), the host's own log, the client's console, and the recording.
 
 ## What this cannot tell you
 
-The pointer's own smoothness on an **indirect** display. WGC does not deliver a frame for
-pointer-only motion there — measured at 2-10 real frames a second with the pointer sweeping
-continuously, on both the current build and `271aa01` — so the changed-frame rate is bounded by
-something no host-side pacing can lift. The fix is to stop asking WGC to composite the pointer
-and to draw it from `GetCursorInfo` into the ring slot, reusing
-`windows_utils/streamer/dxgi/cursor.rs`. Until that lands, this test measures everything around
-the pointer rather than the pointer.
+Whether the pointer *looks* right to a person. It can tell you the pointer is being drawn, how
+often it moves and how long the longest stall was; it cannot tell you the hotspot is a pixel out,
+or that the sprite is the wrong size on a display at 200 %. Check 7 is the closest this gets, and
+it is a still frame.
+
+It also cannot tell you anything about a Windows build older than this box's. The compositor's
+willingness to produce a frame for pointer-only motion is the whole question the host-composited
+pointer exists to remove, and it is a per-build behaviour: 26200 delivers ~50 fps for it, and
+nothing here says what 19041 does. `guides/windows-legacy.md` owns that.
+
+### A warning from this test's own history
+
+Both of this harness's oracles were wrong at once, and both looked fine:
+
+- `SendInput` returned 0 for every call because the `INPUT` struct was 48 bytes instead of 40, so
+  the **cursor scene had a stationary cursor** and produced a plausible measurement of an entirely
+  different scene. The conclusion drawn from it — that WGC delivers 2-10 frames a second for
+  pointer-only motion — reached two other documents before anyone moved the pointer.
+- The recording's crop options were output options, so it recorded the whole desktop and counted
+  changes that had nothing to do with the stream.
+
+Both are fixed and the sweep is now self-tested. The lesson is the reason check 7 exists: an
+oracle that cannot fail loudly will eventually agree with you about something that is not
+happening.
