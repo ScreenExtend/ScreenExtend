@@ -3150,31 +3150,46 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             // textures, which only the ring has, so this is where it is probed — by building it.
             // If it does not build, `cursor_capture_override` stays `None` and WGC composites the
             // pointer exactly as it did before, which is a stale cursor but never no cursor.
-            let cursor = match CursorOverlay::new(
-                &ctx.device,
-                &ctx.device_context,
-                textures.slots(),
-                textures.keys(),
-                monitor_handle,
-                (native_w, native_h),
-                (config.width, config.height),
-                Arc::clone(&telemetry),
-            ) {
-                Ok(overlay) => {
-                    tprintln!(
-                        "cursor: composited by the host on {} ring slots; WGC asked for the \
-                         desktop without a pointer. {}",
-                        textures.len(),
-                        overlay.describe()
-                    );
-                    Some(Arc::new(Mutex::new(overlay)))
-                }
-                Err(e) => {
-                    teprintln!(
-                        "cursor: host compositing unavailable ({e:#}); leaving the pointer to \
-                         WGC, which does not redraw it on a static indirect display"
-                    );
-                    None
+            //
+            // `cursor_toggle` is checked first and it is not a formality: a property this build
+            // does not have is *skipped*, not failed, because failing on a missing knob is what
+            // pushes a whole Windows release onto the DXGI fallback. So asking for
+            // `WithoutCursor` on a build that has never heard of `IsCursorCaptureEnabled` leaves
+            // WGC drawing the pointer and this drawing a second one on top of it. Below Windows
+            // 10 2004 the compositor's pointer is the only one there can be.
+            let cursor = if !features.cursor_toggle {
+                tprintln!(
+                    "cursor: left to WGC — this build has no IsCursorCaptureEnabled, so its \
+                     pointer cannot be turned off and drawing another would double it"
+                );
+                None
+            } else {
+                match CursorOverlay::new(
+                    &ctx.device,
+                    &ctx.device_context,
+                    textures.slots(),
+                    textures.keys(),
+                    monitor_handle,
+                    (native_w, native_h),
+                    (config.width, config.height),
+                    Arc::clone(&telemetry),
+                ) {
+                    Ok(overlay) => {
+                        tprintln!(
+                            "cursor: composited by the host on {} ring slots; WGC asked for the \
+                             desktop without a pointer. {}",
+                            textures.len(),
+                            overlay.describe()
+                        );
+                        Some(Arc::new(Mutex::new(overlay)))
+                    }
+                    Err(e) => {
+                        teprintln!(
+                            "cursor: host compositing unavailable ({e:#}); leaving the pointer to \
+                             WGC, which does not redraw it on a static indirect display"
+                        );
+                        None
+                    }
                 }
             };
             let cursor_composited = cursor.is_some();
