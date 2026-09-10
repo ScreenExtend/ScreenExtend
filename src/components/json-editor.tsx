@@ -2,7 +2,12 @@ import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo,
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { monaco, editorOptions, THEME_DARK, THEME_LIGHT } from "@/lib/monaco-setup";
-import { scanJson, type JsonStructure, type JsonStringValue } from "@/lib/json-structure";
+import {
+  maskedSpans,
+  scanJson,
+  type JsonStructure,
+  type MaskedSpan,
+} from "@/lib/json-structure";
 import { cn } from "@/lib/utils";
 
 export interface JsonMarker {
@@ -113,15 +118,10 @@ const toMarker = (diagnostic: LspDiagnostic): Monaco.editor.IMarkerData => ({
 interface MaskedCache {
   structure: JsonStructure;
   paths: string[];
-  entries: { value: JsonStringValue; range: Monaco.Range }[];
+  entries: { value: MaskedSpan; range: Monaco.Range }[];
 }
 
-const ARRAY_INDEX = /\[\d+\]/g;
-
 const LOADING = <div className="text-sm text-muted-foreground">Loading editor…</div>;
-
-const isMasked = (path: string, patterns: string[]) =>
-  patterns.includes(path) || patterns.includes(path.replace(ARRAY_INDEX, "[]"));
 
 const schemaRegistry = new Map<string, Record<string, unknown>>();
 let appliedSchemas: Map<string, Record<string, unknown>> | null = null;
@@ -236,18 +236,10 @@ const JsonEditorBase = forwardRef<JsonEditorHandle, JsonEditorProps>(
       const paths = maskedRef.current;
       const cached = maskedCacheRef.current;
       if (cached && cached.structure === structure && cached.paths === paths) return cached.entries;
-      const entries = structure.strings
-        .filter(value => isMasked(value.path, paths))
-        .map(value => ({
-          value,
-          range: new monaco.Range(
-            value.line,
-            value.startColumn + 1,
-            value.line,
-            value.endColumn - 1
-          ),
-        }))
-        .filter(entry => entry.range.endColumn > entry.range.startColumn);
+      const entries = maskedSpans(structure, paths).map(value => ({
+        value,
+        range: new monaco.Range(value.line, value.startColumn, value.line, value.endColumn),
+      }));
       maskedCacheRef.current = { structure, paths, entries };
       return entries;
     }, []);

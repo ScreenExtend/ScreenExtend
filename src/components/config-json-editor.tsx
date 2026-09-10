@@ -39,7 +39,12 @@ import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
 import { getConfig, getConfigSnapshot, subscribeToConfig, type Config } from "@/components/config-provider";
 import { useZoom } from "@/components/global-provider";
-import { configJsonSchema, validateConfig } from "@/lib/config-schema";
+import {
+  blockingErrors,
+  configJsonSchema,
+  validateConfig,
+  MASKED_CONFIG_PATHS,
+} from "@/lib/config-schema";
 import { applyConfig } from "@/lib/apply-config";
 
 interface Conflict {
@@ -62,12 +67,7 @@ interface ConfigJsonEditorProps {
 
 const serialize = (config: Config) => JSON.stringify(config, null, 2) + "\n";
 
-const MASKED_PATHS = [
-  "hostedNetworkCredentials.password",
-  "devices[].token",
-  "knownDevices[].token",
-  "turnConfig.credential",
-];
+const MASKED_PATHS = MASKED_CONFIG_PATHS;
 
 const formatBytes = (n: number) =>
   n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
@@ -273,10 +273,11 @@ export function ConfigJsonEditor({
         return;
       }
 
-      const invalid = validateConfig(parsed, { minHostedNetworkPasswordLength });
+      const found = validateConfig(parsed, { minHostedNetworkPasswordLength });
+      const invalid = blockingErrors(found);
       if (invalid.length > 0) {
         fail(
-          invalid.map(e => ({ message: e.message, severity: "error" as const })),
+          found.map(e => ({ message: e.message, severity: e.severity })),
           t("toasts.configEditor.invalidTitle"),
           invalid.length === 1
             ? invalid[0].message
@@ -287,6 +288,11 @@ export function ConfigJsonEditor({
         );
         return;
       }
+      // A key the schema does not name does not stop the save: `readStore` drops any key
+      // that is not in `defaultConfig` on the way back in, so it is inert, and a document
+      // that cannot be written at all is the worse failure. The user sees it go: `adopt`
+      // below replaces the text with what the store actually kept.
+      for (const warning of found) console.warn("config.json: " + warning.message);
 
       const applied = await applyConfig(parsed as Config);
       adopt(serialize(getConfigSnapshot() ?? applied));

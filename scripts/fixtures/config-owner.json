@@ -1,0 +1,152 @@
+{
+  "name": "sarve",
+  "theme": "system",
+  "devices": [
+    {
+      "audioOutputDeviceId": "",
+      "audioOutputDeviceLabel": "",
+      "dpr": 2,
+      "ip": "172.16.11.76",
+      "maxDpr": 3,
+      "name": "",
+      "orientation": "Landscape",
+      "os": "Windows",
+      "refreshRate": 360,
+      "remoteControl": true,
+      "scale": 100,
+      "screenSize": "1920x1080",
+      "systemAudio": false,
+      "token": "741eb852fc9630da741eb852fc9630da",
+      "videoQuality": 15,
+      "videoScale": 100
+    },
+    {
+      "audioOutputDeviceId": "",
+      "audioOutputDeviceLabel": "",
+      "dpr": 1,
+      "ip": "172.16.11.81",
+      "maxDpr": 3,
+      "name": "",
+      "orientation": "Landscape",
+      "os": "macOS",
+      "refreshRate": 120,
+      "remoteControl": true,
+      "scale": 100,
+      "screenSize": "1280x800",
+      "systemAudio": false,
+      "token": "eb852fc9630da741eb852fc9630da741",
+      "videoQuality": 15,
+      "videoScale": 100
+    }
+  ],
+  "knownDevices": [
+    {
+      "banned": false,
+      "ip": "172.16.11.94",
+      "lastSeen": 1788403233593,
+      "name": "ugbhjbhj",
+      "os": "macOS",
+      "screenSize": "1440x900",
+      "token": "52fc9630da741eb852fc9630da741eb8"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788421438214,
+      "name": "dccsdscsds",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "c9630da741eb852fc9630da741eb852f"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788463076924,
+      "name": "hbjkgmhvbj",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "30da741eb852fc9630da741eb852fc96"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.76",
+      "lastSeen": 1788508516612,
+      "name": "dsdsscd",
+      "os": "Windows",
+      "screenSize": "1920x1080",
+      "token": "a741eb852fc9630da741eb852fc9630d"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788510903761,
+      "name": "hjbgvbkj",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "1eb852fc9630da741eb852fc9630da74"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788761741575,
+      "name": "bhujnbhj",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "852fc9630da741eb852fc9630da741eb"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788764071902,
+      "name": "ugjbhvghb",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "fc9630da741eb852fc9630da741eb852"
+    },
+    {
+      "banned": false,
+      "ip": "10.0.0.99",
+      "lastSeen": 1788865811662,
+      "name": "measure",
+      "os": "test",
+      "screenSize": "1920x1080",
+      "token": "630da741eb852fc9630da741eb852fc9"
+    },
+    {
+      "banned": false,
+      "ip": "172.16.11.81",
+      "lastSeen": 1788942630578,
+      "name": "vgbhjn",
+      "os": "macOS",
+      "screenSize": "1280x800",
+      "token": "da741eb852fc9630da741eb852fc9630"
+    }
+  ],
+  "sessionPassword": "",
+  "publicSessionsEnabled": true,
+  "zoomFactor": 1,
+  "disableGpuEncode": false,
+  "legacyVolumeKeyProxy": false,
+  "walkthroughCompleted": true,
+  "disconnectGraceSecs": 10,
+  "serverPorts": {
+    "http": 8080,
+    "https": 8443
+  },
+  "hostedNetworkCredentials": {
+    "name": "ScreenExtend-sarve",
+    "password": "Xk8pQm2ZaB7c"
+  },
+  "turnConfig": {
+    "urls": "turn:turn.example.com:3478",
+    "username": "se-user",
+    "credential": "s3cr3t-cred"
+  },
+  "stunUrls": "stun:stun.l.google.com:19302",
+  "dontShowAgain": {
+    "compatibility": false,
+    "configEditor": false,
+    "editDevice": false,
+    "editNetwork": false
+  }
+}

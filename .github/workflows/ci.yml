@@ -72,6 +72,15 @@ jobs:
       - name: startup gate rules
         run: pnpm test:gate
 
+      # The Settings config.json editor. Two of its failures are invisible to every other
+      # gate: a key added to the config type and not to the schema makes the editor reject
+      # the user's own config, and an inline <style> anywhere in index.html makes Tauri
+      # nonce `style-src`, which voids the 'unsafe-inline' monaco's runtime-injected theme
+      # sheet needs -- the editor then renders with no colours and reports nothing. Runs
+      # after `pnpm build` so it can also check dist/.
+      - name: config editor schema, masking and CSP
+        run: pnpm test:config
+
       # bindings.ts is written by whichever debug binary last ran with no CLI arguments, and
       # it carries `// @ts-nocheck`, so a stale binary can revert the whole TS API surface
       # with nothing failing afterwards -- the only symptom is a runtime "command not found"

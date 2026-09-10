@@ -15,6 +15,39 @@ export interface JsonStructure {
   strings: JsonStringValue[];
 }
 
+// The characters of a masked string value, quotes excluded. `startColumn`/`endColumn` are
+// 1-based and half-open the way monaco's Range is, so an empty string yields an empty span
+// and is dropped.
+export interface MaskedSpan {
+  path: string;
+  line: number;
+  startColumn: number;
+  endColumn: number;
+}
+
+const ARRAY_INDEX = /\[\d+\]/g;
+
+// `devices[].token` matches `devices[0].token` and `devices[7].token`. Written as a
+// separate function because it is the half of the masking that is worth testing: it
+// decides which characters get covered, and covering one column too many is how a masked
+// value turns into a line that renders as nothing at all.
+export const isMaskedPath = (path: string, patterns: string[]): boolean =>
+  patterns.includes(path) || patterns.includes(path.replace(ARRAY_INDEX, "[]"));
+
+export function maskedSpans(structure: JsonStructure, patterns: string[]): MaskedSpan[] {
+  if (patterns.length === 0) return [];
+  return structure.strings
+    .filter(value => isMaskedPath(value.path, patterns))
+    .map(value => ({
+      path: value.path,
+      line: value.line,
+      // scanJson reports the span including both quotes; the mask covers the contents.
+      startColumn: value.startColumn + 1,
+      endColumn: value.endColumn - 1,
+    }))
+    .filter(span => span.endColumn > span.startColumn);
+}
+
 interface Frame {
   kind: "object" | "array";
   key: string | null;
