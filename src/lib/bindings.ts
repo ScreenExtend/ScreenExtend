@@ -103,6 +103,18 @@ async installDrivers() : Promise<boolean> {
 async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
+/**
+ * Ask the other ScreenExtend instance that is holding the display driver's pipe to quit.
+ * 
+ * Only ever reaches an instance answering on the single-instance control socket — a desktop
+ * host or a `serve` — and never this process, whose own control server may well be the one
+ * that file names by the time the desktop UI asks. A `probe --live` run, or an instance that
+ * is already on its way out, has no socket to ask: the answer there is `false` and the user is
+ * told to close it themselves rather than being handed a button that silently does nothing.
+ */
+async quitDriverHolder() : Promise<boolean> {
+    return await TAURI_INVOKE("quit_driver_holder");
+},
 async installAudioDriver() : Promise<string> {
     return await TAURI_INVOKE("install_audio_driver");
 },
@@ -268,7 +280,22 @@ current: string | null;
  */
 labelled: boolean | null }
 export type CloudStatusChange = { state: string; detail: string }
-export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
+export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string; 
+/**
+ * The pid holding the display driver, when `display_backend` is `DriverBusy` and we could
+ * name one. The startup gate shows it and offers to quit it; everywhere else it is `None`.
+ */
+display_driver_holder_pid: number | null; 
+/**
+ * An id that changes when this machine reboots, or empty where the platform does not
+ * report one.
+ * 
+ * It is here rather than behind a command of its own because the one thing that needs it
+ * asks for this report at exactly the same moment: the startup gate's repair budget is
+ * "one driver install, one reinstall and one relaunch per boot", and a restart is the
+ * advice it gives when that budget runs out — so the restart has to clear it.
+ */
+boot_id: string }
 export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
 /**
  * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.

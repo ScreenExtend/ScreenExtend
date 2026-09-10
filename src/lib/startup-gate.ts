@@ -23,10 +23,14 @@ export const SEVERITY_INSTALLABLE = "installable";
 // the copy can be reworded without silently turning the remediation off.
 export const DRIVER_KEY = "display-driver";
 export const DRIVER_UNRESPONSIVE_KEY = "display-driver-unresponsive";
+export const DRIVER_BUSY_KEY = "display-driver-busy";
 
 export type CompatGate =
   // Nothing in the way; start.
   | { kind: "ok" }
+  // Another ScreenExtend process has the display driver. Nothing is broken and nothing may be
+  // installed; the only way on is for that process to go.
+  | { kind: "busy"; rows: UnsupportedApi[] }
   // Rows the app can fix by itself. Fix them, re-probe, then decide.
   | { kind: "remediate"; rows: UnsupportedApi[] }
   // The host cannot create a display or send video by any route, and remediation has already
@@ -39,6 +43,14 @@ export function classifyCompat(
   report: CompatibilityReport,
   opts: { remediated: boolean; dontShowAgain: boolean }
 ): CompatGate {
+  // Before anything else, and before any remediation. A driver held by one of our own processes
+  // is not a fault, is not installable and cannot be fixed by installing anything — the old flow
+  // read it as an unresponsive driver, reinstalled a healthy one behind a UAC prompt, re-probed
+  // into the same state and went round. It outranks the optional rows underneath it because
+  // until the other instance is gone nothing else about this host can be established.
+  const busy = report.unsupported_apis.filter(a => a.key === DRIVER_BUSY_KEY);
+  if (busy.length > 0 && report.os_supported) return { kind: "busy", rows: busy };
+
   const installable = report.unsupported_apis.filter(a => a.severity === SEVERITY_INSTALLABLE);
   if (installable.length > 0 && !opts.remediated) {
     return { kind: "remediate", rows: installable };
@@ -62,10 +74,54 @@ export function classifyCompat(
 /// Which rows this launch can act on, and how. A driver that is installed but not answering is
 /// removed before it is installed again — installing over a driver that is already there is
 /// what the old flow did, and it changed nothing.
+///
+/// A busy driver is deliberately absent: it has its own key and its own gate kind, and nothing
+/// here may ever reach for the elevated installer on account of it.
 export function driverRemediation(rows: UnsupportedApi[]): "reinstall" | "install" | null {
   if (rows.some(a => a.key === DRIVER_UNRESPONSIVE_KEY)) return "reinstall";
   if (rows.some(a => a.key === DRIVER_KEY)) return "install";
   return null;
+}
+
+/// What this machine has already tried to do about the display driver since it last booted.
+///
+/// Every field is a count, and the budget for each is one. That is the whole design: an
+/// elevation prompt the user did not ask for is expensive, a *second* one for the same fault is
+/// worse than doing nothing, and a relaunch that does not fix the driver relaunches again on the
+/// next launch forever. Scoped to `boot` because "restart this machine" is the advice given when
+/// the budget runs out, so restarting has to be what restores it.
+export type DriverRepair = {
+  boot: string;
+  install: number;
+  reinstall: number;
+  relaunch: number;
+};
+
+export type RepairAttempt = "install" | "reinstall" | "relaunch";
+
+export const NO_REPAIRS: DriverRepair = { boot: "", install: 0, reinstall: 0, relaunch: 0 };
+
+/// The saved record, or a fresh one if it belongs to a previous boot.
+///
+/// An empty `boot` — every platform but Windows, and Windows if the derivation ever fails — is
+/// treated as "this boot", so the budget still holds within a launch. It cannot survive a
+/// restart there, which costs nothing: no other platform has a driver to install.
+export function repairForBoot(saved: DriverRepair | null | undefined, boot: string): DriverRepair {
+  if (!saved || saved.boot !== boot) return { ...NO_REPAIRS, boot };
+  return {
+    boot,
+    install: saved.install || 0,
+    reinstall: saved.reinstall || 0,
+    relaunch: saved.relaunch || 0,
+  };
+}
+
+export function mayAttempt(repair: DriverRepair, what: RepairAttempt): boolean {
+  return repair[what] < 1;
+}
+
+export function recordAttempt(repair: DriverRepair, what: RepairAttempt): DriverRepair {
+  return { ...repair, [what]: repair[what] + 1 };
 }
 
 /// Whether the "Install drivers" control has anything to install.

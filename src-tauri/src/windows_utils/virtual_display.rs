@@ -931,6 +931,44 @@ mod test {
         drop(open);
     }
 
+    /// Who this machine says is holding the driver, and what the busy line would read.
+    ///
+    /// The shipped driver will not enter the busy state on demand — it answers a state request
+    /// in under a millisecond and keeps answering while a monitor attaches — so the two halves
+    /// of the busy report are checked separately: the classification against a pipe of our own
+    /// (`an_occupied_pipe_is_busy_and_a_silent_one_is_not_responding`), and the holder lookup
+    /// here, against whatever host is really running. Start `ScreenExtend serve` first and this
+    /// prints its pid. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "reports which process holds the display driver; start a host first; run with --ignored --nocapture"]
+    fn report_driver_holder() {
+        // `cli::dispatch` does this in a real process; a test binary never gets there.
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let path = std::path::Path::new(&local)
+                .join("app.screenextend.desktop")
+                .join(crate::single_instance::CTRL_FILE);
+            println!(
+                "control file: {} (exists: {})",
+                path.display(),
+                path.exists()
+            );
+            crate::single_instance::remember_ctrl_path(path);
+        }
+        println!("this process:            {}", std::process::id());
+        println!(
+            "control socket answers:  {:?}",
+            crate::single_instance::running_instance_pid()
+        );
+        println!("driver_pipe_holder():    {:?}", driver_pipe_holder());
+        let backend = DisplayBackend::DriverBusy {
+            holder: driver_pipe_holder(),
+        };
+        println!(
+            "the doctor line would read: {}",
+            crate::cli::driver_line(backend)
+        );
+    }
+
     #[cfg(test)]
     fn raw_os_error_of(e: &InitError) -> Option<i32> {
         match e {
