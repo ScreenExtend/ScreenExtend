@@ -3200,3 +3200,76 @@ does not move the lock because Tauri resolves `app_local_data_dir` through
 session was permitted to do. The binary is left in place so the comparison is one `stop` away:
 run it on `--http-port 8090 --https-port 8453` with its own session id, join through the relay,
 and compare `idrs_sent` against `frames_encoded` for a two-minute static session.
+
+## UX-XNET2: the keyframe gate answered a relayed client's every PLI — `VERIFIED`
+
+`UX-XNET` fixed the relayed join's locality but left the symptom that started the investigation:
+through the public relay the host emitted **3.2 full 1080p IDRs a second**, indefinitely, on a
+static screen. Four runs against the live relay settle where that came from.
+
+### The A/B
+
+Chrome on the host box, joining `https://session.screenextend.app/?id=…`, tab backgrounded,
+~5000-frame window, 1920x1080, WGC + `nvenc-zero-copy-ring`, no TURN configured. Same machine,
+same relay, same client page — the relay serves its own older copy to every run, which is what
+makes these four comparable at all.
+
+| run | build | frames | client PLI/FIR | IDRs sent | suppressed | intra refresh | profile |
+|---|---|---|---|---|---|---|---|
+| A | `271aa01` | 5022 | 4703 | **23** | n/a (no gate) | off | Baseline |
+| B | `c1fe9d6` (current) | 5117 | 373 | **347** | 1 | on | High |
+| C | `xnet2` (this row) | 5038 | 487 | **113** | 375 | on | High |
+| D | `xnet2` + `SE_INTRA_REFRESH=0` | 5021 | 488 | **114** | 378 | off | High |
+
+### What that says
+
+**Intra refresh is exonerated.** C and D differ by one knob and by nothing else — 113 IDRs vs
+114, 487 PLIs vs 488. `cfg.intra_refresh = true` was the only shipped-path encode change in the
+window and it turns out to have no measurable effect on a relayed session's keyframe traffic.
+The `SE_INTRA_REFRESH` override added for this measurement stays, because that answer was not
+derivable by reading and would not be re-derivable later without it.
+
+**The locality fix was not enough.** B already runs `locality=CrossNetwork mtu=1012 pacing=Full
+playout_delay_max=200ms` — confirmed in its log — and still sent 347 IDRs. The transport
+constants were never what produced the storm.
+
+**The gate was.** `KeyframeGate`'s window is `clamp(2 x RTT, 200, 1000)` ms, and RTT is the wrong
+instrument for this path: the relayed session's ICE pair was short, the clamp landed on the 200 ms
+floor, and a client asking every ~300 ms was answered every single time — `suppressed` sat at 1
+for the whole of run B. The gate was working exactly as written and the window was simply wrong
+for the link.
+
+Run A is the counter-example that keeps this honest: `271aa01` answered **0.5 %** of its client's
+requests (23 of 4703) and the picture still came up. So the fix is not "answer more"; it is one
+event per window, with the window chosen for the path.
+
+### The fix
+
+`KeyframeGate::for_locality` sets the clamp from the session's locality instead of using one pair
+of constants for every link. Same-subnet keeps 200-1000 ms exactly as before — that is the case
+where waiting would be felt and the burst is absorbable. `Unknown` gets 500-2000, `CrossNetwork`
+1000-3000. The ordering between the three floors is a `const _: () = assert!(…)`, so it is the
+compiler's business rather than a test that could be deleted alongside the constant it guards.
+
+It stays a **window, not a filter**. A client that genuinely lost its reference chain still gets a
+keyframe inside every window; what it cannot do is convert a backlog of PLIs — all describing the
+same loss — into one IDR each. Where the encoder holds a long-term reference `repair.rs` answers
+the loss with a P-frame before a PLI is ever emitted; the gate is what is left when it cannot.
+
+Measured effect, run B to run C: **347 IDRs → 113**, 3.2/s → 0.56/s, on the path where an IDR is
+5-20x a P-frame and is the frame most likely to overflow the link that just dropped something.
+
+### Tests
+
+`streamer::keyframe::tests` gains four: a relayed gate is not unlocked by a short RTT; a 10 s
+3.2/s storm costs ≤ 11 IDRs **and ≥ 8**, so suppression cannot quietly become starvation; each
+locality's floor and cap are what the tier says; and a same-subnet session's window is
+byte-for-byte the one it had before this change.
+
+### Not covered
+
+Every run was Chrome on the host box with the tab backgrounded, so the client's own PLI rate is
+not a phone's. What the four runs isolate is the **host's response** to whatever rate arrives,
+which is the part this repo controls. The owner's phone on cellular remains the arbiter —
+`docs/manual-tests/client-page.md` has the procedure, and `idrs_sent` against `frames_encoded` is
+the number to read.
