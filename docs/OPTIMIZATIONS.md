@@ -3127,3 +3127,34 @@ proven is the classification, the constants it selected, and the keyframe rate t
 them. The MTU and playout-delay half of the fix needs the owner's phone on cellular —
 `docs/manual-tests/client-page.md` §"A phone on cellular, through the public relay" has the
 procedure and the exact log lines.
+
+### What changed on the relayed path since `271aa01`, and what is still unattributed
+
+Read out of the diff, for a **relayed** client specifically:
+
+| | `271aa01` | before this row | note |
+|---|---|---|---|
+| RTP payload MTU | 1188 (one constant for everyone) | 1188 | unchanged — the new 1012 tier existed but was unreachable |
+| playout delay | `PlayoutDelayExtension::new(0, 0)` for everyone | 0 | unchanged, same reason |
+| pacing | no pacer at all | `Light` | new, but measured `pace_wait` p50 0.00 ms / max 0.26 ms — not material |
+| `cfg.intra_refresh` | **absent** — every shipped session encoded without it | `true`, forced in `server.rs` by `56fe583` | **new, and unmeasured on this path** |
+| `/reconfig` key | the relay's `client_id` — worked | the join id, which the relay's page never sends — inert | regression, fixed above |
+| packetizer, `repair.rs`/LTR, TWCC congestion control | absent | present | new, unmeasured on this path |
+
+So the transport constants a relayed client received did **not** get worse between `271aa01` and
+today; they simply never improved, which is what this row fixes. The one *functional* regression
+found is `/reconfig`. The keyframe storm is real and measured, but it is not yet attributed to a
+commit: `intra_refresh` is the strongest remaining candidate, because it is the only shipped-path
+encode change in the window and it changes exactly how a decoder recovers a reference chain.
+
+### Why the A/B against `271aa01` did not run
+
+A `271aa01` host binary was built for it
+(`.claude/worktrees/xnet-old`, `CARGO_TARGET_DIR=…/ScreenExtend-xnetold`, builds clean with the
+current `dist/` copied in). It could not be started: `serve` takes the single-instance lock at
+both revisions, so the comparison needs the running host stopped, and overriding `LOCALAPPDATA`
+does not move the lock because Tauri resolves `app_local_data_dir` through
+`SHGetKnownFolderPath`, not the environment. Stopping the owner's host was not something this
+session was permitted to do. The binary is left in place so the comparison is one `stop` away:
+run it on `--http-port 8090 --https-port 8453` with its own session id, join through the relay,
+and compare `idrs_sent` against `frames_encoded` for a two-minute static session.
