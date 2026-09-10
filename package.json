@@ -15,6 +15,7 @@
     "test:client": "node scripts/test-client.mjs",
     "test:gate": "node scripts/test-startup-gate.mjs",
     "test:config": "node scripts/test-config-editor.mjs",
+    "test:lockfile": "node scripts/check-lockfile.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

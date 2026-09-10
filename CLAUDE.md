@@ -115,8 +115,14 @@ numbers and passes, which is how a new runner tells you what to paste back.
 
 ### Checkers
 
-Four static checks, all runnable locally in seconds, all run by CI:
+Five static checks, all runnable locally in seconds, all run by CI:
 
+- `node scripts/check-lockfile.mjs` (`pnpm test:lockfile`) — asserts that every installed package
+  declaring `optionalDependencies` has that list recorded in `pnpm-lock.yaml`. A package whose
+  payload is a native binary (`@tauri-apps/cli`, `esbuild`, `rollup`) ships one npm package per
+  platform and reaches it that way, so a lockfile missing the list installs a JS shim with no
+  binary behind it — and only the machine that wrote the lockfile keeps working, off its warm
+  store. Runs after `pnpm install --frozen-lockfile`, which is what it reads the manifests from.
 - `node scripts/check-bindings.mjs` — cross-checks the `collect_commands!` / `collect_events!`
   lists in `lib.rs` against what `src/lib/bindings.ts` exports. **Needs no build**, which is the
   point: the generated file carries `// @ts-nocheck`, so a stale binary can revert the whole TS
@@ -915,8 +921,8 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   deliberately none in this file either.
 - **CI** (`.github/workflows/ci.yml`) runs on **every push to any branch** and on pull requests,
   so it runs whenever the repository owner pushes. Jobs:
-  - `frontend` (ubuntu) — `pnpm lint`, `pnpm build`, `check-legacy-webkit.mjs`,
-    `pnpm test:client`, `check-bindings.mjs`, `check-versions.mjs`.
+  - `frontend` (ubuntu) — `pnpm test:lockfile`, `pnpm lint`, `pnpm build`,
+    `check-legacy-webkit.mjs`, `pnpm test:client`, `check-bindings.mjs`, `check-versions.mjs`.
   - `rust` (windows-latest, macos-13, macos-14, macos-15) — `pnpm build` first because
     `tauri_build` embeds `../dist` at compile time, then `cargo fmt --check`,
     `cargo clippy --all-targets -- -D warnings`, and a plain `cargo test` with **no `--skip`**:
