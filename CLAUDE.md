@@ -275,7 +275,8 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `register_cloud_session`, `unregister_cloud_session`, `get_cloud_status`, `exit_app`,
 `set_window_zoom`, `get_username`, `set_avatar`, `get_avatar`, `remove_avatar`,
 `get_network_adapters`, `watch_for_network_changes`, `start_hosted_network`,
-`stop_hosted_network`, `is_hosted_network`, `is_wifi_on`, `turn_on_wifi`, `install_drivers`,
+`stop_hosted_network`, `is_hosted_network`, `get_hosted_network_status`, `is_wifi_on`,
+`turn_on_wifi`, `install_drivers`,
 `remove_drivers`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `refresh_device_stream`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
@@ -285,8 +286,8 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `set_log_streaming`, `log_frontend_error`.
 
 Registered events: `DeviceJoin`, `DeviceAudioOutputs`, `DeviceModify`, `DeviceRemove`,
-`NetworkChange`, `HostedNetworkNoPassword`, `CloudStatusChange`, `SessionIdChange`,
-`JoinAttemptsPaused`, `LogLine`.
+`NetworkChange`, `HostedNetworkNoPassword`, `ScreenRecordingRevoked`, `CloudStatusChange`,
+`SessionIdChange`, `JoinAttemptsPaused`, `LogLine`.
 
 Shared types worth knowing: `CompatibilityReport` (os name/version/floor/supported, the
 `unsupported_apis` list, and the six probed backend names — audio, display, capture, encoder,
@@ -844,8 +845,8 @@ dontShowAgain{editDevice,editNetwork,compatibility,configEditor}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
-remoteControl, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os, screenSize, dpr,
-maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
+remoteControl, pointerScope, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os,
+screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
 
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,
