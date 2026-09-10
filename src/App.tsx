@@ -47,6 +47,7 @@ import {
   type QrValue,
 } from "@/components/global-provider";
 import { ThemeProvider } from "@/components/theme-provider";
+import { PermissionLapseDialog } from "@/components/permission-lapse-dialog";
 import { commands, events } from "@/lib/bindings";
 import { buildQrValues } from "@/lib/utils";
 import { toast } from "@/components/ui/use-toast";
@@ -377,9 +378,14 @@ function GlobalState({ children }: { children: ReactNode }) {
       }));
       unlisteners.push(await events.deviceAudioOutputs.listen(event => {
         const p = event.payload;
+        // INTEGRATOR: `current` -- the sink the client reports it is actually playing on --
+        // is being added to this payload by the client-page workstream. The read is written
+        // defensively so this build works either way; drop the cast once the Rust event and
+        // `bindings.ts` carry the field.
+        const current = (p as unknown as { current?: string | null }).current;
         setAudioOutputsByIp(prev => ({
           ...prev,
-          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected },
+          [p.ip]: { supported: p.supported, outputs: p.outputs, selected: p.selected, current },
         }));
       }));
       unlisteners.push(await events.deviceRemove.listen(event => {
@@ -532,6 +538,7 @@ function App() {
         <WalkthroughContext.Provider value={walkthrough}>
           <WalkthroughFrame>
             <RouterProvider router={router} />
+            <PermissionLapseDialog />
             <ClosingOverlay />
           </WalkthroughFrame>
           {run && (

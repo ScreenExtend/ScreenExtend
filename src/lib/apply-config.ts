@@ -1,5 +1,6 @@
 import { commands } from "@/lib/bindings";
 import {
+  DEFAULT_POINTER_SCOPE,
   flushConfig,
   updateConfig,
   type Config,
@@ -23,6 +24,7 @@ const resolveDevice = (device: Device): Device => ({
   videoScale: device.videoScale ?? 100,
   videoQuality: device.videoQuality ?? 23,
   remoteControl: device.remoteControl ?? false,
+  pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
   systemAudio: device.systemAudio ?? false,
   audioOutputDeviceId: device.audioOutputDeviceId ?? "",
   dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -62,6 +64,11 @@ export async function applyConfig(config: Config): Promise<Config> {
 
   for (const device of applied.devices) {
     await at(`devices[${device.ip}]`, async () => {
+      // INTEGRATOR: `pointerScope` is persisted and replayed by `serve`/`RELOAD` through
+      // config.json, but it is not on this command's argument list yet -- UX-B owns the
+      // Rust half of `set_device_override`. Append `device.pointerScope` here (and in
+      // `device-details.tsx`'s submit) once that parameter lands and the bindings are
+      // regenerated.
       await commands.setDeviceOverride(
         device.ip,
         device.scale,

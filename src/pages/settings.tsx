@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Avatar as AvatarWrapper } from "@/components/ui/avatar";
 import { AvatarCropModal } from "@/components/avatar-crop-modal";
-import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown, QrCode, Ban, Trash2 } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Camera, Minus, Plus, RotateCcw, ChevronDown, QrCode, Ban, Trash2, ShieldAlert } from "lucide-react";
 import defaultLogo from "@/assets/default.svg";
 import {
   InputOTP,
@@ -51,7 +51,7 @@ const ConfigJsonEditor = lazy(() =>
 import { useTheme, type Theme } from "@/components/theme-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
-import { commands, type ServerPorts } from "@/lib/bindings";
+import { commands, type HostedNetworkReport, type ServerPorts } from "@/lib/bindings";
 import { cn, buildQrValues, buildWifiQrValue, generateOtp } from "@/lib/utils";
 import { saveAvatar, clearAvatar } from "@/lib/avatar";
 import { DEFAULT_ZOOM, MIN_ZOOM, MAX_ZOOM, clampZoom, zoomIn, zoomOut, formatZoom } from "@/lib/zoom";
@@ -170,6 +170,110 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
     </Table>
   );
 });
+
+/// Cheap enough to poll: `get_hosted_network_status` reads the WinRT publisher we already
+/// hold (macOS: the interface mode) and never spawns a process. The interval is only there
+/// to catch an AP the OS takes down on its own, which is the case the toggle cannot see.
+const HOSTED_STATUS_POLL_MS = 10000;
+
+const HOSTED_STATE_STYLE: Record<string, string> = {
+  advertised: "bg-amber-500/15 text-amber-500 border-amber-500/30",
+  verified: "bg-green-500/15 text-green-500 border-green-500/30",
+};
+
+// The hosted network's real state, which until now only existed in the log. Three things
+// come together here because they answer the same question -- "why will my phone not join
+// this":
+//
+//   * the NotStarted / Advertised / Verified tri-state. Both platforms have collected it
+//     since W6/W14 and neither could report it: `advertised` means the radio accepted the
+//     SSID and nothing more, and an AP whose adapter never got an IPv4 is visible to a
+//     phone and unjoinable, because nothing is serving DHCP.
+//   * the channel, band and security the ladder settled on.
+//   * whether the network is encrypted at all. On macOS the HostAP SPI can refuse every
+//     secured `securityType` and the fallback brings up an open AP; the only signal for
+//     that used to be a destructive toast, which is transient where the network is not --
+//     it stays up for the session with the join URL, session id and OTP readable by
+//     anyone in range who associates.
+function HostedNetworkPanel({ running }: { running: boolean }) {
+  const { t } = useTranslation();
+  const [report, setReport] = useState<HostedNetworkReport | null>(null);
+
+  useEffect(() => {
+    if (!running) {
+      setReport(null);
+      return;
+    }
+    let cancelled = false;
+    const read = () => {
+      commands
+        .getHostedNetworkStatus()
+        .then(r => { if (!cancelled) setReport(r); })
+        .catch(e => console.error("reading the hosted network status failed", e));
+    };
+    read();
+    const timer = window.setInterval(read, HOSTED_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [running]);
+
+  if (!report || report.state === "notStarted") return null;
+
+  const verified = report.state === "verified";
+  const rows: { label: string; value: string }[] = [];
+  if (report.backend) rows.push({ label: t("network.details.backend"), value: report.backend });
+  if (report.channel !== null) rows.push({ label: t("network.details.channel"), value: String(report.channel) });
+  if (report.band) rows.push({ label: t("network.details.band"), value: report.band });
+  if (report.security) rows.push({ label: t("network.details.security"), value: report.security });
+  if (report.host_ipv4) rows.push({ label: t("network.details.address"), value: report.host_ipv4 });
+
+  return (
+    <div className="border-b py-3">
+      <div className="flex flex-wrap items-center">
+        <span
+          title={verified ? t("network.state.verifiedTip") : t("network.state.advertisedTip")}
+          className={cn(
+            "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium",
+            HOSTED_STATE_STYLE[report.state] ?? HOSTED_STATE_STYLE.advertised
+          )}
+        >
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
+          <span className="pr-1" />
+          {verified ? t("network.state.verified") : t("network.state.advertised")}
+        </span>
+        {report.ssid && (
+          <span className="ml-2 text-sm text-muted-foreground">{report.ssid}</span>
+        )}
+      </div>
+      {!report.secured && (
+        <div className="mt-3 flex items-start rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm">
+          <ShieldAlert className="mt-0.5 mr-2 h-4 w-4 shrink-0 text-red-500" />
+          <div>
+            <span className="font-semibold">{t("network.open.title")}</span>{" "}
+            {t("network.open.body")}
+          </div>
+        </div>
+      )}
+      {rows.length > 0 && (
+        <dl className="mt-3 text-sm">
+          {rows.map(row => (
+            <div key={row.label} className="flex items-baseline justify-between py-0.5">
+              <dt className="text-muted-foreground">{row.label}</dt>
+              <dd className="ml-4 text-right break-all">{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {report.peer && (
+        <p className="mt-2 text-sm text-muted-foreground">
+          {t("network.state.peer", { ip: report.peer })}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function Settings() {
   const { otp, sessionId, publicSessionsEnabled, hostedNetworkOn } = useSession();
@@ -907,6 +1011,7 @@ export default function Settings() {
                   }}
                 />
               </div>
+              <HostedNetworkPanel running={hostedNetworkOn} />
               <div
                 className={cn(
                   "flex items-center space-x-4 p-3 px-0 mt-2",
