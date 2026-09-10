@@ -2902,3 +2902,165 @@ rather than a broken link. `pnpm test:lockfile`, `pnpm lint` (0 errors), `pnpm b
 `check-bindings` (53 commands / 11 events) and `check-versions` (0.6.3) all pass. No Rust changed,
 so nothing was rebuilt and the running host was left alone. Ledger: `docs/OPTIMIZATIONS.md`
 §UX-LOCK; the workflow note is `docs/dev-workflow.md` §`pnpm-lock.yaml`.
+
+## 15.12 Post-report fixes: the CLI's session id, and the relayed join that was never cross-network
+
+Two workstreams, both starting from something the owner tried to do and could not.
+
+### The CLI minted a session id nobody was serving
+
+Measured beside a running host: `qr -t all --json` printed `793LNG2XGM4V`, `session new --json`
+printed `MQZ8VLBXBZPH`, a second `qr` printed `WE9CK24666Q3` — while the host's log showed the
+relay registered as `WLZ7JHNBC2RG`. Three invocations, three ids, none of them the one being
+served, and `status --json` carried no session id at all. Every URL and every QR those commands
+printed was for a session that does not exist, and it only surfaced on the client, as
+`WHEP POST failed: 503 host offline`.
+
+The cause is structural. A session id is a **per-run credential** — minted at bootstrap or at
+`serve` startup, held in `AppState.session_auth`, deliberately never written to `config.json`.
+`qr`, `status` and `session new` each run in their own process, and they had `--session-id`, a
+random generator, and no way to ask the host. `unwrap_or_else(generate_session_id)` was the whole
+resolution policy, and it could not tell "no host" from "a host is right there".
+
+**`SESSION` is a new control verb, both ways.** Bare, it answers one line of JSON: the live id,
+the OTP, whether the host holds a relay client, and that relay's state. `SESSION <id> <otp>`
+applies new credentials to the running `AppState`, re-registers the relay under the new id **only
+if the host already holds one**, and emits `SessionIdChange`. `qr` and `status` now read the live
+id and mint only when nothing answered, reporting **which** (`sessionIdSource`: `flag` | `host` |
+`generated`) — and "a host is running" and "a host told me its session" are separate fields,
+because a host still starting, or one predating the verb, is up and reports nothing, and a minted
+id must never be presented as the considered answer. `session new` applies what it mints, waits up
+to 8 s for the relay to leave `connecting`, **reads the credentials back**, and only then prints
+URLs; against a host that cannot take them it exits 1 and changes nothing, because a credential
+the host never heard of is worse than none.
+
+The read-back is not ceremony. `SessionIdChange` had to grow an `otp` field (empty meaning
+"unchanged") because the desktop UI mirrors both in React state and pushes its own copy back
+through `set_session_credentials` — so setting a new pair on a GUI host emitted the change, the UI
+took the id, and the effect pushed the **old OTP** straight back over the new one. That is the
+whole `bindings.ts` diff for this branch: one field, still 53 commands / 11 events.
+
+Ledger §UX-SESSION. Linux and macOS stubs are `UNVERIFIED (not compiled)` — the Mac remains
+offline.
+
+### A relayed join was never classified cross-network
+
+The owner reported that joining from a phone on 5G through the public relay used to work with **no
+TURN server configured**, and had stopped somewhere in ~440 commits. Two things came out of
+measuring it, and the smaller one is a documentation correction that had been actively misleading.
+
+**A cross-network join requires no TURN server.** `cloud.rs`'s module doc and `CLAUDE.md` both said
+it did. Probed against the live relay, `/ice-config` there serves **Google STUN and no TURN**, and
+a relayed join completed from this box on a server-reflexive candidate
+(`a=candidate:… typ srflx …`). Both suspects for the regression were cleared by measurement:
+`56fe583` cannot misfire here (a relay client id does not parse as an address, so the same-subnet
+branch is never reached) and the media socket is opt-in and off.
+
+**The defect.** `JoinOrigin::relayed(client_id)` puts the relay's opaque client id in `peer_ip` — a
+field documented as a label and a rate-limit bucket, never an address — and `start_session`
+classified with `locality_for(client_ip)`, which begins `client_ip.parse::<IpAddr>()`. For
+`c_zDdpnGuxTv62iyxVFsLXJg` that parse always fails, so the function returned `Unknown` on its
+first line and every locality-driven decision fell through to its `_` arm, which is the **LAN**
+arm:
+
+| | `Unknown` (what a relayed join got) | `CrossNetwork` (what it is) |
+|---|---|---|
+| RTP payload MTU | 1188 | 1012 |
+| `playout_delay_max` | 0 ms | 200 ms |
+| pacing | `Light` | `Full` — whose own doc reads "Relayed or cross-network" |
+
+The host had been printing the contradiction once per relayed join and nothing read it. **Measured
+cost**, a relayed and a direct session running concurrently on one host, same capture backend, same
+encoder, same resolution:
+
+| | relayed | direct LAN |
+|---|---|---|
+| frames | 5092 | 1352 |
+| `idrs_sent` | **365** | **2** |
+| `keyframe_requests` | 366 (~3.2/s, sustained) | 0 |
+
+`keyframe_requests_suppressed` stayed at 1: at ~3.2/s the requests are spaced wider than
+`MIN_IDR_INTERVAL_MS`, so the storm gate never fires. On a link with room to spare that is only
+waste; on a cellular uplink, 3.2 full IDRs a second at 1080p is the entire budget.
+
+`locality_for_origin(JoinOrigin)` now reads the **route** rather than parsing an id: a join that
+arrived through the tunnel is cross-network by construction, because the relay exists only to carry
+clients that cannot reach the host directly. A second defect on the same path went with it —
+**`/reconfig` over the tunnel was inert**: the relay's deployed page predates the join id, so it
+polls with no `?join=`, and `process_reconfig(state, "")` matched nothing and answered
+`{"epoch":0,"kick":0}` for the life of every relayed session (confirmed live over 49 consecutive
+polls). A kick raised in the desktop UI never arrived, and neither did a scale, orientation,
+refresh-rate or audio-output change. It resolves through `joins_for_relay_client` now — a relay
+identity, not an address, so the "no address fallback on a request path" rule is kept.
+
+Four new tests plus the relay's real forwarded shape captured live into
+`scripts/test-client-ice.mjs`. Ledger §UX-XNET.
+
+### Two things the owner needs to decide, not the code
+
+- **The relay serves its own copy of the client page, and it is old.** `GET /` through
+  `session.screenextend.app` returns **61,442 bytes** from the *relay*; the repo's page is
+  **184,591 bytes**. The deployed vintage has no trickle ICE, no `locality`, no `se_join`, no
+  `OP::STATS`. So **every client-page fix in this engagement — §15.8's ICE deadline, §15.10's join
+  ids, the whole `static/` review series — reaches LAN clients and never reaches a relayed
+  phone**, and the `/reconfig` defect above exists only because that page is old. This is a
+  deployment question: the relay should serve the host's page, or be redeployed from this tree
+  whenever `static/` changes. Nothing in this repository can fix it.
+- **`intra_refresh = true` is the remaining unattributed candidate for the keyframe storm.**
+  Reading the diff for a *relayed* client specifically, the transport constants did not get worse
+  between `271aa01` and today — they simply never improved, which is what this pass fixes. The one
+  functional regression found is `/reconfig`. The storm is real and measured but is not yet
+  attributed to a commit, and `intra_refresh` is the strongest candidate: it is the only
+  shipped-path encode change in the window, absent at `271aa01`, forced on in `server.rs` by
+  `56fe583`, and it changes exactly how a decoder recovers a reference chain. **The A/B did not
+  run.** A `271aa01` host binary was built for it and left in place at
+  `.claude/worktrees/xnet-old` (its own `CARGO_TARGET_DIR`, `…/ScreenExtend-xnetold`), but `serve`
+  takes the single-instance lock at both revisions and overriding `LOCALAPPDATA` does not move it —
+  Tauri resolves `app_local_data_dir` through `SHGetKnownFolderPath`, not the environment — so the
+  comparison needs the owner's host stopped. It is one `stop` away: run the old binary on
+  `--http-port 8090 --https-port 8453` with its own session id, join through the relay, and compare
+  `idrs_sent` against `frames_encoded` over a two-minute static session.
+
+### Still unproven
+
+Neither dev box can be a true cross-network client — the browser here shares a public IP with the
+host, so ICE nominated a local pair and the MTU was never the binding constraint. What is proven is
+the classification, the constants it selected, and the keyframe rate that came with them. The MTU
+and playout-delay half needs the owner's phone on cellular;
+`docs/manual-tests/client-page.md` §"A phone on cellular, through the public relay" has the
+procedure and the exact log lines.
+
+### Gates, build and the restarted host
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **426 passed,
+0 failed, 17 ignored**, identical under `SE_REQUIRE_HW=1`; `cargo build --features probe`;
+`pnpm lint` 0 errors; `pnpm build`; `check-legacy-webkit`; `pnpm test:client` 7/7;
+`pnpm test:gate`; `pnpm test:config`; `pnpm test:lockfile`; `check-versions` 0.6.3; `sha256sum -c`
+34/34 and 5/5. `bindings.ts` regenerated from the merged tree and unchanged by it — 53 commands,
+11 events.
+
+One conflict across the two merges, in `docs/OPTIMIZATIONS.md`: both branches append a section at
+the end of the ledger. Both were kept, UX-SESSION then UX-XNET — 298 rows, no duplicates, max 342.
+
+`pnpm tauri build`: release profile in **6m 45s**, both installers, exit **1** on the updater
+signing step alone.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 14,012,416 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,888,787 |
+| `…/release/ScreenExtend.exe` | 30,212,096 |
+
+The headless host was stopped for the build and restarted on the same credentials. It registered:
+
+```
+[cloud] registered; clients can join at https://session.screenextend.app/?id=SE7QK4MNPX2W
+```
+
+and `qr -t cloud --json` now answers from the host rather than inventing an id — which is the
+whole of §UX-SESSION, demonstrated on the running system:
+
+```json
+"hostRunning": true, "hostReportedSession": true,
+"sessionId": "SE7QK4MNPX2W", "sessionIdSource": "host"
+```
