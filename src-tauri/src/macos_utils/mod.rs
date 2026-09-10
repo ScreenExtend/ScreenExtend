@@ -238,7 +238,8 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                 };
 
                 if airplay_tier && airplay::take_geometry_changed() {
-                    let joins: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    let joins: Vec<String> =
+                        state.sessions.lock().unwrap().keys().cloned().collect();
                     if !joins.is_empty() {
                         tprintln!(
                             "[airplay] macOS changed the display geometry; asking {} session(s) \
@@ -278,7 +279,8 @@ fn start_session_watchdog(app_handle: tauri::AppHandle) {
                         session::ByeReason::Kicked,
                         crate::BYE_FLUSH_TIMEOUT,
                     );
-                    let joins: Vec<String> = state.sessions.lock().unwrap().keys().cloned().collect();
+                    let joins: Vec<String> =
+                        state.sessions.lock().unwrap().keys().cloned().collect();
                     let ended = joins.len() as u32;
                     for join in joins {
                         session::bump_kick_epoch(&state.sessions, &join);
@@ -444,7 +446,9 @@ pub fn resolve_device(state: &AppState, key: &str) -> Option<String> {
 
 /// What [`crate::streamer::session::mint_device_token`] produces: 128 bits as lowercase hex.
 fn is_device_token(s: &str) -> bool {
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
@@ -589,11 +593,9 @@ pub fn get_device_audio_outputs(
     device: String,
 ) -> crate::streamer::session::AudioOutputsReport {
     match resolve_device(&state, &device) {
-        Some(token) => session::device_audio_outputs_report(
-            &state.sessions,
-            &state.audio_sinks,
-            &token,
-        ),
+        Some(token) => {
+            session::device_audio_outputs_report(&state.sessions, &state.audio_sinks, &token)
+        }
         None => Default::default(),
     }
 }

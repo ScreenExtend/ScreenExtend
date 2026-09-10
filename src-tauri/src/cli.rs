@@ -1982,8 +1982,8 @@ mod desktop {
             return;
         }
         println!(
-            "  {:<34} {:<34} {:<16} {:<20} {}",
-            "JOIN", "DEVICE TOKEN", "IP", "NAME", "DISPLAY"
+            "  {:<34} {:<34} {:<16} {:<20} DISPLAY",
+            "JOIN", "DEVICE TOKEN", "IP", "NAME"
         );
         for j in joins {
             let s = |k: &str| j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2197,7 +2197,8 @@ mod desktop {
                     obj.insert("autoFrameRate".into(), Value::Bool(v == "on"));
                 }
 
-                existing.retain(|d| d.get("token").and_then(|v| v.as_str()) != Some(token.as_str()));
+                existing
+                    .retain(|d| d.get("token").and_then(|v| v.as_str()) != Some(token.as_str()));
                 existing.push(device.clone());
                 store.set("devices", Value::Array(existing));
                 if let Err(e) = store.save() {
@@ -3228,7 +3229,11 @@ mod desktop {
                 { "name": "neither a token nor an address" }
             ]);
             let parsed = parse_saved_devices(devices.as_array().unwrap());
-            assert_eq!(parsed.len(), 2, "an entry that names no device addresses nothing");
+            assert_eq!(
+                parsed.len(),
+                2,
+                "an entry that names no device addresses nothing"
+            );
             assert_eq!(
                 parsed[0],
                 SavedDevice {

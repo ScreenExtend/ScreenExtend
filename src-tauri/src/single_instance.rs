@@ -335,28 +335,6 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
         .is_ok()
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    /// `PING` grew a pid on the end of its reply. A reader that predates it must still see an
-    /// `OK`, and a reader that wants the pid must not be confused by one that has none.
-    #[test]
-    fn the_ping_reply_is_prefix_stable() {
-        assert!(is_ok_reply("OK"));
-        assert!(is_ok_reply("OK\n"));
-        assert!(is_ok_reply("OK 71848\n"));
-        assert!(!is_ok_reply("OKAY"));
-        assert!(!is_ok_reply(""));
-        assert!(!is_ok_reply("ERR nope"));
-
-        assert_eq!(ping_pid("OK 71848\n"), Some(71848));
-        assert_eq!(ping_pid("OK"), None);
-        assert_eq!(ping_pid("OK not-a-pid"), None);
-        assert_eq!(ping_pid("ERR 71848"), None);
-    }
-}
-
 /// One JSON object per live join, for `ScreenExtend devices list` and `status --json`.
 ///
 /// Keyed by the join id, which is the session's identity. The address is a label beside it: it
@@ -384,4 +362,26 @@ fn join_rows(sessions: &crate::streamer::session::SharedSessions) -> serde_json:
         })
         .collect();
     serde_json::Value::Array(rows)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `PING` grew a pid on the end of its reply. A reader that predates it must still see an
+    /// `OK`, and a reader that wants the pid must not be confused by one that has none.
+    #[test]
+    fn the_ping_reply_is_prefix_stable() {
+        assert!(is_ok_reply("OK"));
+        assert!(is_ok_reply("OK\n"));
+        assert!(is_ok_reply("OK 71848\n"));
+        assert!(!is_ok_reply("OKAY"));
+        assert!(!is_ok_reply(""));
+        assert!(!is_ok_reply("ERR nope"));
+
+        assert_eq!(ping_pid("OK 71848\n"), Some(71848));
+        assert_eq!(ping_pid("OK"), None);
+        assert_eq!(ping_pid("OK not-a-pid"), None);
+        assert_eq!(ping_pid("ERR 71848"), None);
+    }
 }

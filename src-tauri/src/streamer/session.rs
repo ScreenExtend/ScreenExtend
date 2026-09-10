@@ -1316,7 +1316,11 @@ mod tests {
         let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
         bump_reconfig_epoch(&sessions, "join-a");
         bump_reconfig_epoch(&sessions, "join-a");
-        assert_eq!(kick_epoch(&sessions, "join-a"), 0, "a reconfig is not a kick");
+        assert_eq!(
+            kick_epoch(&sessions, "join-a"),
+            0,
+            "a reconfig is not a kick"
+        );
         bump_kick_epoch(&sessions, "join-a");
         assert_eq!(kick_epoch(&sessions, "join-a"), 1);
         assert_eq!(
