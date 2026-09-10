@@ -27,7 +27,8 @@ src-tauri/                  Rust core (crate `screenextend`, lib `screenextend_l
   src/cli.rs                the shipped command-line interface + the `probe` harness
   src/lib.rs                Tauri app: command/event registry, setup, lifecycle
   src/logbus.rs             tprintln!/teprintln! log bus (writer thread + backlog + LogLine event)
-  src/single_instance.rs    lockfile + loopback control server (focus/quit/stats/ping/reload/logs)
+  src/single_instance.rs    lockfile + loopback control server
+                            (focus/quit/stats/ping/reload/logs/session)
   src/test_support.rs       cfg(test) only: the skip convention, percentiles, measurement output
   src/streamer/             OS-independent streaming core + the client web page
   src/windows_utils/        Windows backend
@@ -225,13 +226,26 @@ Notes:
 - **Secrets do not go on argv**, which every process on the machine can read: the OTP and the
   session id are read from `SCREENEXTEND_OTP` / `SCREENEXTEND_SESSION_ID`, from `--otp-file`, or
   from stdin with `-`. `--otp` still works and still says so.
+- **A session id lives in the host's memory, so the CLI asks the host for it.** It is minted at
+  bootstrap (the desktop app) or at startup (`serve`) and never written to `config.json` — it is
+  a per-run credential, not a setting. `qr` and `status` read the live id over the control
+  server's `SESSION` verb and only mint one when nothing answered, saying so in the output
+  (`sessionIdSource` is `flag` | `host` | `generated`, and `hostRunning` and
+  `hostReportedSession` are separate questions: a host still starting, or one predating the verb,
+  is running but reports nothing). `session new` mints a pair, **applies it to the running host**
+  with `SESSION <id> <otp>`, waits up to 8 s for the relay to leave `connecting`, reads the
+  credentials back — the desktop UI mirrors both values and can push its own copy back — and only
+  then prints URLs. With no host up it prints the `SCREENEXTEND_SESSION_ID` /
+  `SCREENEXTEND_OTP` pair for `serve` to consume; with a host that cannot take them it fails and
+  changes nothing rather than printing a credential nobody is serving.
 - Most read commands accept `--json`. `doctor` uses its exit code as the verdict (0 fine,
   1 unsupported OS, 3 a required permission is missing), which is what CI asserts against.
 - `network start/stop/status` are Windows-only; on macOS they print an explanatory error because
   the hosted network is owned by the running host process.
-- `stop`, `status`, `logs` and the config replay all talk to the running instance over
-  `single_instance`'s loopback control server (`STATS` / `PING` / `RELOAD` / `LOGS` / `FOCUS` /
-  `QUIT`, each authenticated with the token in `screenextend.ctrl`).
+- `stop`, `status`, `qr`, `session new`, `logs` and the config replay all talk to the running
+  instance over `single_instance`'s loopback control server (`STATS` / `PING` / `RELOAD` /
+  `LOGS` / `FOCUS` / `QUIT` / `SESSION`, each authenticated with the token in
+  `screenextend.ctrl`).
 - On Windows the binary is GUI-subsystem in release (`windows_subsystem = "windows"` in
   `main.rs`), so `attach_console()` (`AttachConsole(ATTACH_PARENT_PROCESS)`) is what makes CLI
   output visible in the parent shell.
@@ -330,8 +344,26 @@ An exclusive `fs4` lock on `screenextend.lock` in `app_local_data_dir` is the in
 running instance also listens on an ephemeral loopback TCP port whose address **and a random
 token** are written to `screenextend.ctrl`, so another process can send `FOCUS`, `QUIT`, `STATS`
 (one line of telemetry JSON), `PING` (liveness without taking the lock, which is racy), `RELOAD`
-(re-read `config.json` into the running `AppState`) or `LOGS` (the backlog). The token is
-compared in constant time, the same as the join OTP.
+(re-read `config.json` into the running `AppState`), `LOGS` (the backlog) or `SESSION`. The token
+is compared in constant time, the same as the join OTP.
+
+`SESSION` goes both ways. Bare, it answers one line of JSON — the live session id, the OTP,
+whether the host holds a relay client, and that relay's state — because a session id exists only
+in the host's memory and every reporting command runs in its own process. `SESSION <id> <otp>`
+applies new credentials to the running `AppState` (`set_session_credentials`), re-registers the
+cloud session under the new id **only when the host already holds a relay client** (registering
+one here would publish a session nobody asked to publish), and emits `SessionIdChange` — which
+carries the OTP too, because the desktop UI mirrors both values and pushes its own copy back
+whenever either changes. Credentials are validated (non-empty, ≤64 chars, `[A-Za-z0-9_-]`) before
+they can replace ones the host can serve. The two `AppState` halves live in `cli.rs`
+(`live_session_info` / `apply_session_credentials`, with Linux stubs) so `single_instance.rs`
+stays OS-independent, the same way `RELOAD` is a callback.
+
+**The OTP is on that wire deliberately.** The socket is loopback-only and every request carries
+the 128-bit token from a user-only file, and whoever can read that file can already `QUIT` the
+host or *set* its credentials — so the OTP is inside the trust boundary, not outside it. It is
+there so a setter can read back what it applied; no shipped command prints it (`session new`
+prints the OTP it minted itself, and `status` deliberately does not).
 
 ### Logging (`logbus.rs`)
 
