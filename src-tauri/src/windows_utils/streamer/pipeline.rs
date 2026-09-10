@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 
 use super::amd::encoder::Encoder as AmfEncoder;
 use super::capture::{select_monitor, select_monitor_by_device_name, MonitorInfo};
+use super::cursor_overlay::CursorOverlay;
 use super::dxgi::{Duplicator, PollStatus};
 use super::intel::encoder::Encoder as IntelEncoder;
 use super::nvidia::encoder::{
@@ -34,6 +35,7 @@ use super::scaler::{ReadbackFormat, Scaler, TextureReader};
 use super::tuning;
 use super::x264::encoder::X264Encoder;
 use crate::streamer::config::{Config, H264Profile, ScalePercent};
+use crate::streamer::lock::LockExt;
 use crate::streamer::platform::BitrateApplied;
 use crate::streamer::telemetry::{FrameTiming, SessionTelemetry, SharedTelemetry};
 use crate::windows_capture::monitor::Monitor;
@@ -1786,6 +1788,9 @@ struct LiveCapture {
     dirty_region_reporting: bool,
     unchanged_streak: u32,
     cursor: CursorProbe,
+    /// True when this session draws the pointer itself and WGC was therefore asked not to. Read
+    /// once by [`GraphicsCaptureApiHandler::cursor_capture_override`], before the session starts.
+    cursor_composited: bool,
     /// Off — the default — means `config.fps` is a promise: no frame is skipped for being
     /// unchanged and the keepalive holds the cadence.
     auto_frame_rate: bool,
@@ -2054,10 +2059,20 @@ enum RingTextures {
 
 impl RingTextures {
     fn len(&self) -> usize {
+        self.slots().len()
+    }
+
+    fn slots(&self) -> &[ID3D11Texture2D] {
         match self {
-            RingTextures::Shared { textures, .. } | RingTextures::Local { textures } => {
-                textures.len()
-            }
+            RingTextures::Shared { textures, .. } | RingTextures::Local { textures } => textures,
+        }
+    }
+
+    /// The per-slot keys, or an empty slice for a ring that has none.
+    fn keys(&self) -> &[IDXGIKeyedMutex] {
+        match self {
+            RingTextures::Shared { mutexes, .. } => mutexes,
+            RingTextures::Local { .. } => &[],
         }
     }
 }
@@ -2066,6 +2081,10 @@ struct AsyncEncodeRing {
     textures: RingTextures,
     igpu_context: ID3D11DeviceContext,
     scaler: Option<Scaler>,
+    /// Draws the pointer onto each staged slot, when the host is compositing it rather than WGC.
+    /// Shared with the encode thread, which redraws it on the slot it holds when the pointer
+    /// moves and no frame arrives — see [`cursor_overlay`].
+    cursor: Option<Arc<Mutex<CursorOverlay>>>,
     free_slots: crossbeam_channel::Sender<usize>,
     free_recv: crossbeam_channel::Receiver<usize>,
     ready: crossbeam_channel::Sender<ReadyMsg>,
@@ -2090,6 +2109,7 @@ impl AsyncEncodeRing {
         textures: RingTextures,
         igpu_context: ID3D11DeviceContext,
         scaler: Option<Scaler>,
+        cursor: Option<Arc<Mutex<CursorOverlay>>>,
         tx: broadcast::Sender<EncodedFrame>,
         target_bitrate: Arc<AtomicU32>,
         initial_bitrate: u32,
@@ -2123,6 +2143,7 @@ impl AsyncEncodeRing {
             let args = RingEncodeArgs {
                 encoder,
                 auto_frame_rate,
+                cursor: cursor.clone(),
                 ready_rx,
                 free_tx: free_tx.clone(),
                 tx,
@@ -2154,6 +2175,7 @@ impl AsyncEncodeRing {
             textures,
             igpu_context,
             scaler,
+            cursor,
             free_slots: free_tx,
             free_recv: free_rx,
             ready: ready_tx,
@@ -2211,6 +2233,14 @@ impl AsyncEncodeRing {
             return Ok(false);
         };
 
+        // One lock for the whole GPU sequence below. D3D11 serialises individual context calls,
+        // not a set-state-then-draw run, and the ring encode thread draws the pointer on the slot
+        // it is holding — a different slot, but the same immediate context. The handle is cloned
+        // out first so the guard borrows a local rather than `self`, which the drop paths below
+        // still need mutably.
+        let overlay = self.cursor.clone();
+        let mut cursor = overlay.as_ref().map(|c| c.lock_recover());
+
         match &self.textures {
             RingTextures::Shared { textures, mutexes } => {
                 let mutex = &mutexes[slot];
@@ -2234,6 +2264,11 @@ impl AsyncEncodeRing {
                             Ok(())
                         }
                     };
+                    // After the scale, so the pointer is drawn at destination resolution and is
+                    // not resampled; before the flush, so it costs no extra submit.
+                    if let Some(c) = cursor.as_mut() {
+                        c.compose_fresh(slot);
+                    }
                     self.igpu_context.Flush();
                     r
                 };
@@ -2266,6 +2301,9 @@ impl AsyncEncodeRing {
                             Ok(())
                         }
                     };
+                    if let Some(c) = cursor.as_mut() {
+                        c.compose_fresh(slot);
+                    }
                     self.igpu_context.Flush();
                     r
                 };
@@ -2276,6 +2314,7 @@ impl AsyncEncodeRing {
                 }
             }
         }
+        drop(cursor);
 
         timing.mark_scale_done();
         let force_idr = self.frame_index == 0 || self.idr_request.swap(false, Ordering::Relaxed);
@@ -2319,6 +2358,7 @@ struct RingEncodeArgs {
     encoder: RingEncoder,
     /// See the keepalive comment in [`ring_encode_thread`].
     auto_frame_rate: bool,
+    cursor: Option<Arc<Mutex<CursorOverlay>>>,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
     tx: broadcast::Sender<EncodedFrame>,
@@ -2344,17 +2384,23 @@ enum RingEvent {
     WakeClosed,
 }
 
-/// A repeat of the held slot, emitted when the desktop is static.
+/// A re-encode of the held slot, emitted when no new frame has arrived.
 ///
 /// Two things make this the only place a keyframe request can land on an idle desktop: both ring
 /// encoders are configured with an infinite GOP and IDR period, so there is no periodic keyframe
 /// at all, and `AsyncEncodeRing::stage` — the only other reader of `idr_request` — runs only when
 /// WGC delivers a new frame. Without this, a client that joined or lost its reference chain while
 /// nothing was moving waited for the user to move something.
+///
+/// `cursor_frame` says the slot's pixels were changed since the last emit — the pointer was
+/// redrawn on it — so this is a real frame carrying new picture, not a repeat. It is counted
+/// separately and it keeps its capture stamps, because the span from reading the pointer to the
+/// client painting it *is* the latency the user is complaining about when the cursor lags.
 fn ring_keepalive(
     encoder: &mut RingEncoder,
     slot: usize,
     force_idr: bool,
+    cursor_frame: bool,
     tx: &broadcast::Sender<EncodedFrame>,
     telemetry: &SharedTelemetry,
 ) {
@@ -2366,13 +2412,19 @@ fn ring_keepalive(
         // AMF backend can reach this. Sending it would packetize a payloadless access unit.
         Ok(au) if au.is_empty() => {}
         Ok(au) => {
-            let mut timing = FrameTiming::repeating();
+            let mut timing = if cursor_frame {
+                FrameTiming::entering_capture()
+            } else {
+                FrameTiming::repeating()
+            };
             timing.mark_encode_submit();
             timing.mark_encode_done();
-            telemetry
-                .degradation
-                .frames_repeated
-                .fetch_add(1, Ordering::Relaxed);
+            let d = &telemetry.degradation;
+            if cursor_frame {
+                d.cursor_frames.fetch_add(1, Ordering::Relaxed);
+            } else {
+                d.frames_repeated.fetch_add(1, Ordering::Relaxed);
+            }
             if force_idr {
                 telemetry
                     .degradation
@@ -2394,6 +2446,7 @@ fn ring_encode_thread(args: RingEncodeArgs) {
     let RingEncodeArgs {
         mut encoder,
         auto_frame_rate,
+        cursor,
         ready_rx,
         free_tx,
         tx,
@@ -2494,6 +2547,15 @@ fn ring_encode_thread(args: RingEncodeArgs) {
                     held_slot = None;
                     continue;
                 }
+                // The pointer moved and no frame arrived to carry it — which on an indirect
+                // display is the *normal* case, not an edge one, because the compositor does not
+                // produce a frame for pointer-only motion. Redraw it on the slot already held and
+                // treat the result as a real frame: a P-frame covering a 32 px square, a few
+                // hundred bytes, at the rate the device asked for. Without this the pointer only
+                // moves when something else on the desktop does.
+                let cursor_moved = cursor
+                    .as_ref()
+                    .is_some_and(|c| c.lock_recover().recompose(slot));
                 // Read, then claim only if this tick is actually going to emit. The `swap` used
                 // to happen first, so every tick that then fell through the `continue` below —
                 // and, before that, every tick with no held slot — silently threw away a
@@ -2501,7 +2563,10 @@ fn ring_encode_thread(args: RingEncodeArgs) {
                 // a fixed-rate session runs at, it is most of them, and a client that never gets
                 // the keyframe it asked for gives up on the WebCodecs path and demotes itself to
                 // a `<video>` element.
-                if !idr_request.load(Ordering::Relaxed) && last_emit.elapsed() < keepalive {
+                if !idr_request.load(Ordering::Relaxed)
+                    && !cursor_moved
+                    && last_emit.elapsed() < keepalive
+                {
                     continue;
                 }
                 let idr_pending = idr_request.swap(false, Ordering::Relaxed);
@@ -2511,7 +2576,14 @@ fn ring_encode_thread(args: RingEncodeArgs) {
                     &mut current_bitrate,
                     &mut bitrate_warned,
                 );
-                ring_keepalive(&mut encoder, slot, idr_pending, &tx, &telemetry);
+                ring_keepalive(
+                    &mut encoder,
+                    slot,
+                    idr_pending,
+                    cursor_moved,
+                    &tx,
+                    &telemetry,
+                );
                 last_emit = Instant::now();
                 continue;
             }
@@ -3074,6 +3146,38 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             let scaler = ring_scaler()?;
             let path_name = encoder.name();
 
+            // The pointer tier. The overlay needs a render-target view on the encoder's own input
+            // textures, which only the ring has, so this is where it is probed — by building it.
+            // If it does not build, `cursor_capture_override` stays `None` and WGC composites the
+            // pointer exactly as it did before, which is a stale cursor but never no cursor.
+            let cursor = match CursorOverlay::new(
+                &ctx.device,
+                &ctx.device_context,
+                textures.slots(),
+                textures.keys(),
+                monitor_handle,
+                (native_w, native_h),
+                (config.width, config.height),
+                Arc::clone(&telemetry),
+            ) {
+                Ok(overlay) => {
+                    tprintln!(
+                        "cursor: composited by the host ({} ring slots); WGC asked for the \
+                         desktop without a pointer",
+                        textures.len()
+                    );
+                    Some(Arc::new(Mutex::new(overlay)))
+                }
+                Err(e) => {
+                    teprintln!(
+                        "cursor: host compositing unavailable ({e:#}); leaving the pointer to \
+                         WGC, which does not redraw it on a static indirect display"
+                    );
+                    None
+                }
+            };
+            let cursor_composited = cursor.is_some();
+
             super::report_adapter_pairing(&ctx.adapter, Some(encoder.device()));
             telemetry.encoder.set(path_name.into());
             let ring = AsyncEncodeRing::new(
@@ -3081,6 +3185,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 textures,
                 ctx.device_context.clone(),
                 scaler,
+                cursor,
                 tx.clone(),
                 Arc::clone(&target_bitrate),
                 config.bitrate_bps,
@@ -3117,6 +3222,7 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 dirty_region_reporting: features.dirty_region,
                 unchanged_streak: 0,
                 cursor: CursorProbe::new(monitor_handle),
+                cursor_composited,
                 auto_frame_rate,
                 frame_period: frame_duration,
                 last_delivered: None,
@@ -3203,6 +3309,10 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             dirty_region_reporting: features.dirty_region,
             unchanged_streak: 0,
             cursor: CursorProbe::new(monitor_handle),
+            // The classic path encodes the captured texture in place and its repeater re-encodes
+            // the encoder's own held picture, so there is no slot to draw a pointer onto. WGC
+            // keeps compositing it there.
+            cursor_composited: false,
             auto_frame_rate,
             frame_period: frame_duration,
             last_delivered: None,
@@ -3218,6 +3328,11 @@ impl GraphicsCaptureApiHandler for LiveCapture {
 
     fn stale_frame_counter(&self) -> Option<Arc<AtomicU32>> {
         Some(Arc::clone(&self.stale_frames))
+    }
+
+    fn cursor_capture_override(&self) -> Option<CursorCaptureSettings> {
+        self.cursor_composited
+            .then_some(CursorCaptureSettings::WithoutCursor)
     }
 
     fn on_frame_arrived(
@@ -3238,7 +3353,11 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // a dirty region for, so it has to be asked about separately — and it has to be asked
         // *before* either gate below, because both of them would otherwise throw the frame that
         // carries the pointer's new position away. See `CursorProbe`.
-        let cursor_moved = self.cursor.changed();
+        //
+        // Not asked at all when the host draws the pointer itself: there is then no pointer in
+        // the captured surface, so a frame with no dirty region really is a frame with nothing in
+        // it, and the pointer's own motion is answered by the encode thread instead.
+        let cursor_moved = !self.cursor_composited && self.cursor.changed();
 
         // The display may compose faster than the rate this device asked for: `DISPLAY_COMPOSE_HZ`
         // buys a fresher frame by composing at 120 Hz for a 60 Hz client. Freshness is the whole

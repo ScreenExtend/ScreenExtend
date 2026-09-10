@@ -344,6 +344,19 @@ counters! {
     // this device asked for. Not a degradation — it is the cap doing its job — but the two must
     // be distinguishable from each other and from a frame nobody dropped on purpose.
     frames_skipped_cadence => "frames_skipped_cadence",
+    // `cursor_frames`: frames emitted because the *pointer* moved and nothing else did. On an
+    // indirect display the compositor produces no frame for pointer-only motion, so before the
+    // host drew the cursor itself these were not slow frames — they did not exist, and the
+    // keepalive repeat carried the pointer wherever it had last been composited.
+    // `cursor_composites` / `cursor_composite_us`: how many sprite draws happened and the total
+    // CPU time spent submitting them, so the mean per composite is one division. GPU time is not
+    // in it; that shows up in `capture_to_socket`.
+    // `cursor_shape_errors`: cursors whose bitmap could not be converted. A host with a moving
+    // count is drawing no pointer at all for that shape.
+    cursor_frames => "cursor_frames",
+    cursor_composites => "cursor_composites",
+    cursor_composite_us => "cursor_composite_us",
+    cursor_shape_errors => "cursor_shape_errors",
     nacks_received => "nacks_received",
     keyframe_requests => "keyframe_requests",
     keyframe_requests_suppressed => "keyframe_requests_suppressed",
