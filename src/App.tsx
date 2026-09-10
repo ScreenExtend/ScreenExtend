@@ -419,8 +419,14 @@ function GlobalState({ children }: { children: ReactNode }) {
         });
       }));
       unlisteners.push(await events.sessionIdChange.listen(async event => {
-        const newId = (event.payload as { sessionId: string }).sessionId;
+        const payload = event.payload as { sessionId: string; otp?: string };
+        const newId = payload.sessionId;
         if (!newId) return;
+        // An empty otp means only the id moved (the relay rotated one it found taken). When the
+        // host reports a new code too -- `ScreenExtend session new` -- it has to land here, or
+        // the effect that mirrors these two values pushes the old code back over it and the
+        // credential the CLI just printed stops working.
+        if (payload.otp) setOtp(payload.otp);
         setSessionId(newId);
         try {
           const cfg = await getConfig();

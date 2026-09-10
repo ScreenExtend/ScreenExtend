@@ -662,8 +662,26 @@ pub fn reload_config_into_state(_app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The `SESSION` control verb's read half, on a build with no `AppState` to read.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn live_session_info(_app: &tauri::AppHandle) -> crate::single_instance::SessionInfo {
+    crate::single_instance::SessionInfo::default()
+}
+
+/// The `SESSION` control verb's write half, on a build with no `AppState` to write.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn apply_session_credentials(
+    _app: &tauri::AppHandle,
+    _session_id: &str,
+    _otp: &str,
+) -> Result<(), String> {
+    Err("this build has no session state".to_string())
+}
+
 #[cfg(any(windows, target_os = "macos"))]
-pub use desktop::{reload_config_into_state, route, saved_stun_urls};
+pub use desktop::{
+    apply_session_credentials, live_session_info, reload_config_into_state, route, saved_stun_urls,
+};
 
 /// The saved STUN list, on a build with no desktop router. Nothing reads it there.
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -902,6 +920,214 @@ mod desktop {
                 eprintln!("warning: could not test the single-instance lock: {e}");
                 false
             }
+        }
+    }
+
+    // the live session, both ways over the control socket
+
+    /// The `SESSION` control verb's read half, run **inside** the host process.
+    ///
+    /// A session id lives only in memory: the desktop app mints one in its bootstrap and `serve`
+    /// mints or takes one at startup, and neither writes it to `config.json` — it is a
+    /// per-run credential, not a setting. So this is the only place another process can learn
+    /// it, and before it existed `qr`, `status` and `session new` had nothing to read.
+    ///
+    /// An empty `session_id` is the honest answer while a host is still starting: `AppState` is
+    /// managed by `setup`, and the desktop app mints its credentials a moment after that.
+    pub fn live_session_info(app: &tauri::AppHandle) -> single_instance::SessionInfo {
+        let Some(state) = app.try_state::<platform::AppState>() else {
+            return single_instance::SessionInfo::default();
+        };
+        let (cloud_state, cloud_detail) = state.cloud_status.lock_recover().clone();
+        let session_id = state.session_auth.session_id.lock_recover().clone();
+        let otp = state.session_auth.otp.lock_recover().clone();
+        // What "public sessions" means to a *running* host: it holds a relay client. The
+        // persisted `publicSessionsEnabled` is only the intent, and `serve --no-cloud` overrides
+        // it for one run.
+        let public_sessions = state.cloud.lock_recover().is_some();
+        single_instance::SessionInfo {
+            session_id,
+            otp,
+            public_sessions,
+            cloud_state,
+            cloud_detail,
+        }
+    }
+
+    /// The `SESSION` control verb's write half, run **inside** the host process.
+    ///
+    /// Three things have to happen together or the printed credentials are a lie: the host's
+    /// `SessionAuth` has to accept the new pair, the relay has to be re-registered under the new
+    /// id (a client joining the cloud URL for an id nobody registered gets `503 host offline`),
+    /// and the desktop UI has to follow, because it mirrors both values and pushes its own copy
+    /// back through `set_session_credentials` whenever either changes.
+    pub fn apply_session_credentials(
+        app: &tauri::AppHandle,
+        session_id: &str,
+        otp: &str,
+    ) -> Result<(), String> {
+        use tauri_specta::Event;
+
+        if app.try_state::<platform::AppState>().is_none() {
+            return Err("the host is still starting and has no session state yet".to_string());
+        }
+        platform::set_session_credentials(app.state(), session_id.to_string(), otp.to_string());
+
+        // Only when this host actually holds a relay client. Registering one here on a host
+        // started with `--no-cloud`, or with public sessions turned off in the UI, would put a
+        // session on the internet that nobody asked to publish.
+        let public = {
+            let state = app.state::<platform::AppState>();
+            let holds = state.cloud.lock_recover().is_some();
+            holds
+        };
+        if public {
+            platform::register_cloud_session(app.clone(), app.state(), session_id.to_string());
+        }
+
+        let payload = crate::SessionIdChange {
+            session_id: session_id.to_string(),
+            otp: otp.to_string(),
+        };
+        if let Err(e) = payload.emit(app) {
+            teprintln!("[session] failed to emit the session id change event: {e:?}");
+        }
+        tprintln!("[session] credentials replaced from the CLI (public session: {public})");
+        Ok(())
+    }
+
+    /// What the running host says it is serving, asked over the control socket from *another*
+    /// process. `None` when no host is up, when it is too old to know the verb (it closes the
+    /// connection saying nothing), or when it is up but has not minted credentials yet.
+    fn live_session(app: &tauri::AppHandle) -> Option<single_instance::SessionInfo> {
+        let dir = app.path().app_local_data_dir().ok()?;
+        let reply = single_instance::query_running_instance(
+            &dir.join(single_instance::CTRL_FILE),
+            single_instance::Command::Session,
+        )?;
+        let value = serde_json::from_str::<Value>(reply.trim()).ok()?;
+        let info = single_instance::SessionInfo::from_json(&value)?;
+        if info.session_id.is_empty() {
+            return None;
+        }
+        Some(info)
+    }
+
+    /// Where the session id a command is about to print came from.
+    ///
+    /// The whole defect this exists to close is `Generated` being reached while a host is
+    /// running: every URL and QR built on a minted id is for a session that does not exist, and
+    /// the failure only shows up on the client, as `503 host offline` from the relay.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum IdSource {
+        Flag,
+        Host,
+        Generated,
+    }
+
+    impl IdSource {
+        fn as_str(self) -> &'static str {
+            match self {
+                IdSource::Flag => "flag",
+                IdSource::Host => "host",
+                IdSource::Generated => "generated",
+            }
+        }
+    }
+
+    /// The running host wins over a mint, and an explicit `--session-id` wins over both.
+    fn resolve_session_id(
+        flag: Option<String>,
+        live: Option<String>,
+        mint: impl FnOnce() -> String,
+    ) -> (String, IdSource) {
+        match (flag, live) {
+            (Some(id), _) => (id, IdSource::Flag),
+            (None, Some(id)) => (id, IdSource::Host),
+            (None, None) => (mint(), IdSource::Generated),
+        }
+    }
+
+    /// How long `session new` waits for the relay to answer a re-registration.
+    ///
+    /// The point of waiting at all is that the printed "Anywhere (Internet)" URL is only good
+    /// once the relay has the id, and the round trip is over the public internet. The wait is
+    /// bounded and the outcome is printed either way: a timeout says "still connecting", which
+    /// is the truth, rather than presenting an unregistered URL as ready.
+    const CLOUD_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    const CLOUD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Poll the host until its relay leaves `connecting`, or the deadline passes.
+    fn wait_for_cloud(app: &tauri::AppHandle) -> Option<single_instance::SessionInfo> {
+        let deadline = std::time::Instant::now() + CLOUD_SETTLE_TIMEOUT;
+        loop {
+            let info = live_session(app)?;
+            let settled = info.cloud_state != "connecting" && !info.cloud_state.is_empty();
+            if !info.public_sessions || settled || std::time::Instant::now() >= deadline {
+                return Some(info);
+            }
+            std::thread::sleep(CLOUD_POLL_INTERVAL);
+        }
+    }
+
+    /// Hand new credentials to the running host, then read back what it is serving.
+    ///
+    /// The read-back is not ceremony. The desktop UI mirrors the session id and the OTP in React
+    /// state and pushes its own copy back through `set_session_credentials` whenever either
+    /// changes, so a set that returned `OK` can still be overwritten a moment later by a host
+    /// that did not follow the change — which is precisely the shape of the bug this command is
+    /// being fixed for, seen from the other side.
+    fn push_session_credentials(
+        app: &tauri::AppHandle,
+        session_id: &str,
+        otp: &str,
+    ) -> Result<single_instance::SessionInfo, String> {
+        let dir = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| format!("could not resolve the app data directory: {e}"))?;
+        let reply = single_instance::query_running_instance(
+            &dir.join(single_instance::CTRL_FILE),
+            single_instance::Command::SetSession {
+                session_id: session_id.to_string(),
+                otp: otp.to_string(),
+            },
+        )
+        .ok_or_else(|| "the running host did not answer its control socket".to_string())?;
+        let reply = reply.trim();
+        if let Some(detail) = reply.strip_prefix("ERR ") {
+            return Err(detail.to_string());
+        }
+        if !single_instance::is_ok_reply(reply) {
+            return Err(format!(
+                "the running host answered {reply:?} — an older build that does not know the \
+                 SESSION verb. Quit it and start the host from this build."
+            ));
+        }
+        let info = wait_for_cloud(app).ok_or_else(|| {
+            "the host stopped answering while the session was applied".to_string()
+        })?;
+        if info.session_id != session_id || info.otp != otp {
+            return Err(format!(
+                "the host is serving session {} — something replaced the credentials as they \
+                 were applied",
+                info.session_id
+            ));
+        }
+        Ok(info)
+    }
+
+    /// One line about the relay, for `session new`'s human output.
+    fn describe_cloud(info: &single_instance::SessionInfo) -> String {
+        match info.cloud_state.as_str() {
+            "registered" if !info.cloud_detail.is_empty() => info.cloud_detail.clone(),
+            "registered" => "registered".to_string(),
+            "connecting" => {
+                "still connecting — the \"Anywhere (Internet)\" URL is not live yet".to_string()
+            }
+            "" => "not registered".to_string(),
+            other if info.cloud_detail.is_empty() => other.to_string(),
+            other => format!("{other} · {}", info.cloud_detail),
         }
     }
 
@@ -1762,7 +1988,12 @@ mod desktop {
         let store = open_store(app);
         let running = host_running(app);
         let telemetry = if running { live_telemetry(app) } else { None };
-        let session_id = arg_str(m, "session-id");
+        let live = if running { live_session(app) } else { None };
+        // `--session-id` still wins, so a URL can be built for a session this machine is not
+        // serving; otherwise the id is the one the running host answered with. It used to be
+        // the flag or nothing, so `status` beside a live host reported no session at all.
+        let session_id =
+            arg_str(m, "session-id").or_else(|| live.as_ref().map(|info| info.session_id.clone()));
         let http = cfg_u64(&store, "serverPorts.http").unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
         let https =
             cfg_u64(&store, "serverPorts.https").unwrap_or(DEFAULT_HTTPS_PORT as u64) as u16;
@@ -1781,6 +2012,13 @@ mod desktop {
                 .collect();
             let out = serde_json::json!({
                 "hostRunning": running,
+                // The session the host is actually serving, not one this process invented. The
+                // OTP is deliberately absent: it is on the control socket so a setter can read
+                // back what it applied, and `status` output is the kind of thing that gets
+                // pasted into a bug report.
+                "sessionId": session_id,
+                "cloudState": live.as_ref().map(|info| info.cloud_state.clone()),
+                "publicSession": live.as_ref().map(|info| info.public_sessions),
                 "name": cfg_str(&store, "name"),
                 "publicSessionsEnabled": cfg_bool(&store, "publicSessionsEnabled").unwrap_or(true),
                 "serverPorts": {
@@ -1802,6 +2040,12 @@ mod desktop {
             "  Host running:      {}",
             if running { "yes" } else { "no" }
         );
+        if let Some(id) = session_id.as_deref() {
+            println!("  Session:           {id}");
+        }
+        if let Some(info) = live.as_ref() {
+            println!("  Public session:    {}", describe_cloud(info));
+        }
         if let Some(name) = cfg_str(&store, "name") {
             println!("  Account name:      {name}");
         }
@@ -1858,9 +2102,15 @@ mod desktop {
             print_telemetry(t);
         }
         if session_id.is_none() {
-            println!(
-                "\nA session id is issued at runtime. Run `ScreenExtend serve`, or pass --session-id\nto build full join URLs, or `ScreenExtend qr` to generate one."
-            );
+            if running {
+                println!(
+                    "\nThe host is up but has not minted a session yet (the desktop app does that a\nmoment after launch). Run this again, or `ScreenExtend session new` to set one."
+                );
+            } else {
+                println!(
+                    "\nA session id is issued at runtime, by the host that serves it. Run\n`ScreenExtend serve`, or `ScreenExtend session new`, or pass --session-id to build\njoin URLs for a session this machine is not serving."
+                );
+            }
         }
         exit(0);
     }
@@ -1868,7 +2118,15 @@ mod desktop {
     // qr / session
 
     fn run_qr(app: &tauri::AppHandle, m: &Matches) -> ! {
-        let session_id = arg_str(m, "session-id").unwrap_or_else(generate_session_id);
+        // The running host first. `qr` used to mint a fresh id on every invocation and print
+        // join URLs for it, so three runs beside one host printed three ids and none of them was
+        // the one the host was serving.
+        let live = live_session(app);
+        let (session_id, source) = resolve_session_id(
+            arg_str(m, "session-id"),
+            live.as_ref().map(|info| info.session_id.clone()),
+            generate_session_id,
+        );
         let target = arg_str(m, "target").unwrap_or_else(|| "all".to_string());
         let store = app.store(CONFIG_STORE).ok();
         let http = store
@@ -1891,6 +2149,10 @@ mod desktop {
         if wants_json(m) {
             let out = serde_json::json!({
                 "sessionId": session_id,
+                "sessionIdSource": source.as_str(),
+                "hostRunning": live.is_some(),
+                "publicSession": live.as_ref().map(|info| info.public_sessions),
+                "cloudState": live.as_ref().map(|info| info.cloud_state.clone()),
                 "targets": entries.iter().map(|(t, u)| serde_json::json!({"title": t, "url": u})).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -1898,6 +2160,24 @@ mod desktop {
         }
 
         println!("Session: {session_id}");
+        match source {
+            IdSource::Host => println!("  (the session the running host is serving)"),
+            IdSource::Generated => println!(
+                "  NOTE: no host is running, so this id was generated here and nothing is\n  \
+                 serving it yet. Start the host with it:\n    \
+                 SCREENEXTEND_SESSION_ID={session_id} ScreenExtend serve\n  \
+                 or run `ScreenExtend session new`, which also mints the OTP."
+            ),
+            IdSource::Flag => {}
+        }
+        if let Some(info) = live.as_ref() {
+            if !info.public_sessions && (target == "cloud" || target == "all") {
+                println!(
+                    "  NOTE: the running host has no public session registered, so the\n  \
+                     \"Anywhere (Internet)\" URL below will report the host offline."
+                );
+            }
+        }
         if entries.is_empty() {
             println!("No join targets (no local networks found).");
         }
@@ -1922,19 +2202,55 @@ mod desktop {
                     .as_deref()
                     .and_then(|s| cfg_u64(s, "serverPorts.http"))
                     .unwrap_or(DEFAULT_HTTP_PORT as u64) as u16;
-                let cloud = store
-                    .as_deref()
-                    .and_then(|s| cfg_bool(s, "publicSessionsEnabled"))
-                    .unwrap_or(true);
+
+                // Apply them to the running host before printing anything. A credential this
+                // command minted and did not hand over is one the host has never heard of, and
+                // every URL below it would be for a session that does not exist.
+                let applied = if host_running(app) {
+                    match push_session_credentials(app, &session_id, &otp) {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            eprintln!(
+                                "error: could not apply the new session to the running host: {e}"
+                            );
+                            eprintln!(
+                                "The host is still serving its previous session; nothing changed."
+                            );
+                            exit(1);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // With a host up, whether the relay carries this session is a fact about that
+                // host; with none, it is the saved intent the next `serve` will read.
+                let cloud = match applied.as_ref() {
+                    Some(info) => info.public_sessions,
+                    None => store
+                        .as_deref()
+                        .and_then(|s| cfg_bool(s, "publicSessionsEnabled"))
+                        .unwrap_or(true),
+                };
                 let mut entries =
                     lan_entries(&platform::networking::cli_adapters(), http, &session_id);
                 if cloud {
                     entries.push(("Anywhere (Internet)".to_string(), cloud_url(&session_id)));
                 }
+                let cloud_state = applied
+                    .as_ref()
+                    .map(|info| info.cloud_state.clone())
+                    .unwrap_or_default();
+
                 if wants_json(sm) {
                     let out = serde_json::json!({
                         "sessionId": session_id,
                         "otp": otp,
+                        "hostRunning": applied.is_some(),
+                        "applied": applied.is_some(),
+                        "publicSession": cloud,
+                        "cloudState": if cloud_state.is_empty() { Value::Null } else { Value::String(cloud_state.clone()) },
+                        "cloudDetail": applied.as_ref().map(|info| info.cloud_detail.clone()),
                         "targets": entries.iter().map(|(t, u)| serde_json::json!({"title": t, "url": u})).collect::<Vec<_>>(),
                     });
                     println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -1942,17 +2258,28 @@ mod desktop {
                 }
                 println!("Session: {session_id}");
                 println!("OTP:     {otp}");
+                match applied.as_ref() {
+                    Some(info) => {
+                        println!("Applied to the running host.");
+                        if info.public_sessions {
+                            println!("Relay:   {}", describe_cloud(info));
+                        }
+                    }
+                    None => println!("No host is running, so nothing is serving this yet."),
+                }
                 let render = !arg_flag(sm, "no-render");
                 for (title, url) in entries {
                     print_join(&title, &url, render);
                 }
-                // The env-var form is what is printed, because `--otp` on a command line is
-                // readable by every process on the machine and is written to shell history.
-                println!(
-                    "\nThis is a one-off credential for display. Start the host with:\n  \
-                     SCREENEXTEND_SESSION_ID={session_id} SCREENEXTEND_OTP={otp} ScreenExtend serve\n\
-                     (PowerShell: $env:SCREENEXTEND_SESSION_ID='{session_id}'; $env:SCREENEXTEND_OTP='{otp}'; ScreenExtend serve)"
-                );
+                if applied.is_none() {
+                    // The env-var form is what is printed, because `--otp` on a command line is
+                    // readable by every process on the machine and is written to shell history.
+                    println!(
+                        "\nStart the host with these credentials:\n  \
+                         SCREENEXTEND_SESSION_ID={session_id} SCREENEXTEND_OTP={otp} ScreenExtend serve\n\
+                         (PowerShell: $env:SCREENEXTEND_SESSION_ID='{session_id}'; $env:SCREENEXTEND_OTP='{otp}'; ScreenExtend serve)"
+                    );
+                }
                 exit(0);
             }
             other => {
@@ -3180,6 +3507,211 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The measured defect: with the GUI host running and serving `WLZ7JHNBC2RG`,
+        /// `qr -t all --json` printed `793LNG2XGM4V`, `session new --json` printed
+        /// `MQZ8VLBXBZPH` and a second `qr` printed `WE9CK24666Q3` — three ids in three
+        /// invocations, none of them the host's, every URL and QR unjoinable. A minted id may
+        /// only ever be reached when no host answered.
+        #[test]
+        fn a_running_host_is_never_answered_with_an_invented_session_id() {
+            let live = || Some("WLZ7JHNBC2RG".to_string());
+            let bogus = || "793LNG2XGM4V".to_string();
+
+            let (id, source) = resolve_session_id(None, live(), bogus);
+            assert_eq!(id, "WLZ7JHNBC2RG");
+            assert_eq!(source, IdSource::Host);
+
+            // An explicit --session-id is still the operator's call: it builds URLs for a
+            // session this machine need not be serving at all.
+            let (id, source) = resolve_session_id(Some("GIVEN1234567".into()), live(), bogus);
+            assert_eq!(id, "GIVEN1234567");
+            assert_eq!(source, IdSource::Flag);
+
+            // Only with nothing answering is a fresh id the right answer, and the caller has to
+            // be able to say so in the output.
+            let (id, source) = resolve_session_id(None, None, bogus);
+            assert_eq!(id, "793LNG2XGM4V");
+            assert_eq!(source, IdSource::Generated);
+            assert_eq!(source.as_str(), "generated");
+        }
+
+        /// A host that is up but has not minted credentials yet (the desktop app does that a
+        /// moment after `setup`) must read as "no live session", not as an empty id that would
+        /// then be printed into a URL.
+        #[test]
+        fn an_empty_session_id_from_the_host_is_not_a_session() {
+            let info = crate::single_instance::SessionInfo::default();
+            assert!(info.session_id.is_empty());
+            let (id, source) = resolve_session_id(None, None, || "MINTED123456".to_string());
+            assert_eq!((id.as_str(), source), ("MINTED123456", IdSource::Generated));
+        }
+
+        /// What `session new` and `status` print about the relay. "connecting" is not "ready",
+        /// and saying so is the difference between a URL that works and one that 503s.
+        #[test]
+        fn the_relay_line_never_calls_a_pending_registration_ready() {
+            let info = |state: &str, detail: &str| crate::single_instance::SessionInfo {
+                session_id: "MQZ8VLBXBZPH".into(),
+                otp: "418203".into(),
+                public_sessions: true,
+                cloud_state: state.into(),
+                cloud_detail: detail.into(),
+            };
+            assert_eq!(
+                describe_cloud(&info("registered", "Registered · x")),
+                "Registered · x"
+            );
+            assert_eq!(describe_cloud(&info("registered", "")), "registered");
+            assert!(describe_cloud(&info("connecting", "")).contains("not live yet"));
+            assert_eq!(describe_cloud(&info("", "")), "not registered");
+            assert_eq!(
+                describe_cloud(&info("offline", "no route")),
+                "offline · no route"
+            );
+            assert_eq!(describe_cloud(&info("error", "")), "error");
+        }
+
+        /// The shipped binary beside this test binary, or `SE_TEST_BIN`.
+        fn shipped_binary() -> Option<std::path::PathBuf> {
+            if let Ok(explicit) = std::env::var("SE_TEST_BIN") {
+                let path = std::path::PathBuf::from(explicit);
+                return path.exists().then_some(path);
+            }
+            // `…/target/<profile>/deps/screenextend-<hash>.exe` -> `…/target/<profile>/`
+            let exe = std::env::current_exe().ok()?;
+            let profile_dir = exe.parent()?.parent()?;
+            let name = if cfg!(windows) {
+                "ScreenExtend.exe"
+            } else {
+                "ScreenExtend"
+            };
+            let path = profile_dir.join(name);
+            path.exists().then_some(path)
+        }
+
+        fn run_cli(bin: &std::path::Path, args: &[&str]) -> (bool, Value) {
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("running `ScreenExtend {}`: {e}", args.join(" ")));
+            let text = String::from_utf8_lossy(&out.stdout);
+            // The GUI-subsystem binary attaches to the parent console; a child process captures
+            // its stdout normally, so the JSON is the whole of it.
+            let value = serde_json::from_str::<Value>(text.trim()).unwrap_or_else(|e| {
+                panic!(
+                    "`ScreenExtend {}` did not print JSON ({e}):\n{text}\n{}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+            (out.status.success(), value)
+        }
+
+        /// `qr` and `status` against a real `ScreenExtend serve`, end to end.
+        ///
+        /// `#[ignore]` because it cannot run unattended: `serve` takes the single-instance lock,
+        /// initializes the virtual display driver and binds the streaming ports on every
+        /// adapter. It is the only test that proves the whole path — the host mints an id, the
+        /// control socket answers `SESSION` with it, and the two reporting commands print *that*
+        /// id rather than one of their own. The script is in
+        /// `docs/manual-tests/core-closeout.md`.
+        #[test]
+        #[ignore = "spawns a real headless host (single-instance lock, display driver, ports); run with --ignored --nocapture"]
+        fn qr_and_status_report_the_session_a_live_serve_host_is_serving() {
+            let Some(bin) = shipped_binary() else {
+                crate::test_support::skip_because(
+                    "the live serve session check",
+                    "no ScreenExtend binary beside the test executable; build one or set SE_TEST_BIN",
+                );
+                return;
+            };
+            let (_, before) = run_cli(&bin, &["status", "--json"]);
+            if before.get("hostRunning").and_then(|v| v.as_bool()) == Some(true) {
+                crate::test_support::skip_because(
+                    "the live serve session check",
+                    "another ScreenExtend instance holds the single-instance lock",
+                );
+                return;
+            }
+
+            let session_id = generate_session_id();
+            let otp = generate_otp();
+            let mut host = std::process::Command::new(&bin)
+                .args(["serve", "--no-cloud", "--no-qr"])
+                .env("SCREENEXTEND_SESSION_ID", &session_id)
+                .env("SCREENEXTEND_OTP", &otp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawning the headless host");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut status = Value::Null;
+            while std::time::Instant::now() < deadline {
+                let (_, value) = run_cli(&bin, &["status", "--json"]);
+                if value.get("hostRunning").and_then(|v| v.as_bool()) == Some(true)
+                    && value.get("sessionId").and_then(|v| v.as_str()).is_some()
+                {
+                    status = value;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+
+            let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_eq!(
+                    status.get("sessionId").and_then(|v| v.as_str()),
+                    Some(session_id.as_str()),
+                    "`status --json` must report the id `serve` was given: {status}"
+                );
+                let (_, qr) = run_cli(&bin, &["qr", "-t", "lan", "--no-render", "--json"]);
+                assert_eq!(
+                    qr.get("sessionId").and_then(|v| v.as_str()),
+                    Some(session_id.as_str()),
+                    "`qr --json` minted its own id instead of reading the host's: {qr}"
+                );
+                assert_eq!(
+                    qr.get("sessionIdSource").and_then(|v| v.as_str()),
+                    Some("host")
+                );
+                for target in qr["targets"].as_array().unwrap_or(&Vec::new()) {
+                    let url = target["url"].as_str().unwrap_or_default();
+                    assert!(
+                        url.contains(&session_id),
+                        "join URL for another session: {url}"
+                    );
+                }
+
+                // And the write half: `session new` replaces the pair on the running host, and
+                // the next `qr` reads the replacement back.
+                let (ok, minted) = run_cli(&bin, &["session", "new", "--no-render", "--json"]);
+                assert!(ok, "`session new` failed: {minted}");
+                assert_eq!(minted.get("applied").and_then(|v| v.as_bool()), Some(true));
+                let fresh = minted["sessionId"].as_str().expect("a new id").to_string();
+                assert_ne!(fresh, session_id);
+                let (_, qr) = run_cli(&bin, &["qr", "-t", "lan", "--no-render", "--json"]);
+                assert_eq!(
+                    qr.get("sessionId").and_then(|v| v.as_str()),
+                    Some(fresh.as_str()),
+                    "the host did not take the new session: {qr}"
+                );
+            }));
+
+            let _ = std::process::Command::new(&bin).arg("stop").status();
+            let stopped = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while std::time::Instant::now() < stopped {
+                match host.try_wait() {
+                    Ok(Some(_)) => break,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(250)),
+                }
+            }
+            let _ = host.kill();
+            let _ = host.wait();
+            if let Err(panic) = verdict {
+                std::panic::resume_unwind(panic);
+            }
+        }
 
         /// `serve` used to replay only the display overrides, so a headless host started from
         /// the same `config.json` as the GUI un-banned every banned device.
