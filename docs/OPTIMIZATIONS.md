@@ -2714,3 +2714,45 @@ statics are agile, and moving them to a thread of their own would be a behaviour
 nothing measured to justify it. `COMLibrary::without_security()` is not used anywhere — it still
 calls `CoInitializeEx`, which on an already-MTA thread returns `S_FALSE` and leaks a reference the
 `wmi` crate never gives back.
+
+### UX-A: the microphone is asked for only when there is nothing else to try — `UNVERIFIED`
+
+The previous ruling put the microphone card in front of the join. The owner's answer to what
+that looked like in practice: "Even on laptops and other devices it prompts for it." It did, and
+it should not have — the trigger was wrong, not the placement.
+
+A browser withholds output *labels* until a microphone grant exists, but it does not withhold the
+outputs. `enumerateDevices()` returns real `audiooutput` ids with no grant at all on essentially
+every device, and `setSinkId` takes the bare id: an unlabelled list routes exactly as well as a
+labelled one. So the old trigger — "no labels" — was asking for a permission to buy nicer text,
+on the majority of hardware, in front of every join.
+
+The trigger is now "the enumeration produced nothing". Outputs found, labelled or not: no card,
+and the join proceeds. Zero outputs, or an enumeration that threw or timed out: the card, still
+before the join, still awaited, still terminal on a decline. `selectAudioOutput()` engines are
+unchanged and are never asked. `needsMicPermission()` also takes the caller's enumeration now, so
+the join costs one `enumerateDevices()` rather than two.
+
+**What replaces the labels.** `buildOutputs` names the ids itself — "Default output", then
+"Output 1", "Output 2" — so the host's picker is a list a person can choose from rather than a
+row of 64-character hashes. That is the honest version of what a grant would have bought, and the
+host is told which it has: a new **`labelled`** field (`Option<bool>`, `None` = the client never
+said) on the `/audio-outputs` payload, `session::DeviceSessionState.audio_outputs_labelled`,
+`AudioOutputsReport` and the `DeviceAudioOutputs` event, so no UI presents invented names as
+device names. `degraded` bit 9 carries the same fact for the telemetry side and its wording in
+`docs/TELEMETRY.md` changed with it: it means "the names are the page's own", not "the grant was
+refused".
+
+`scripts/test-client-audio.mjs` grew a section that runs the shipped `audio.js` whole against a
+stubbed `navigator` and asks `needsMicPermission()` directly, across all six outcomes: four
+unlabelled outputs (no prompt, four named entries, bit 9 set), a labelled one (no prompt, the
+real name kept, bit 9 clear), zero outputs (prompt, card raised exactly once), an enumeration
+that throws (prompt), `selectAudioOutput()` present (never asked, even with no outputs), and a
+grant already given (not asked again).
+
+**For the integrator.** `bindings.ts` is regenerated here (50 commands, 11 events) and its whole
+diff is the `labelled` field on `AudioOutputsReport` and `DeviceAudioOutputs` — expect that one
+hunk to conflict with the other two branches and take both sides. The desktop panel's read is
+UX-C's and is deliberately not made here: `AudioOutputsInfo` wants `labelled?: boolean | null`
+carried through the two places that rebuild it in `App.tsx` and `device-details.tsx`, and
+`labelled === false` means render the names as generic.

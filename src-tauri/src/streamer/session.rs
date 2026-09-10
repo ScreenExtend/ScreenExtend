@@ -113,6 +113,11 @@ pub struct AudioOutputsReport {
     /// `None` means this client never said — an older one, or one that has not posted yet —
     /// which is a different answer from `Some("")`, the device's default output.
     pub current: Option<String>,
+    /// Whether the labels beside the ids above are the operating system's or this page's own.
+    /// `Some(false)` means the browser withheld the real names and the client numbered them
+    /// ("Output 1", "Output 2") rather than spend a microphone prompt on them, so they must
+    /// not be presented as device names. `None` means the client never said.
+    pub labelled: Option<bool>,
 }
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
@@ -285,6 +290,7 @@ pub struct DeviceSessionState {
     pub audio_outputs_supported: bool,
     pub selected_audio_output: Option<String>,
     pub current_audio_output: Option<String>,
+    pub audio_outputs_labelled: Option<bool>,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -486,6 +492,7 @@ pub fn set_audio_outputs(
     supported: bool,
     outputs: Vec<AudioOutput>,
     current: Option<String>,
+    labelled: Option<bool>,
 ) {
     let mut map = sessions.lock_recover();
     let entry = map.entry(ip.to_string()).or_default();
@@ -494,6 +501,9 @@ pub fn set_audio_outputs(
     // A client that does not report one must not erase what a newer one did.
     if current.is_some() {
         entry.current_audio_output = current;
+    }
+    if labelled.is_some() {
+        entry.audio_outputs_labelled = labelled;
     }
 }
 
@@ -506,6 +516,7 @@ pub fn audio_outputs_report(sessions: &SharedSessions, ip: &str) -> AudioOutputs
             outputs: s.audio_outputs.clone(),
             selected: s.selected_audio_output.clone().unwrap_or_default(),
             current: s.current_audio_output.clone(),
+            labelled: s.audio_outputs_labelled,
         })
         .unwrap_or_default()
 }
