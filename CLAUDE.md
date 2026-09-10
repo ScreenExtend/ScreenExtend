@@ -275,9 +275,11 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `register_cloud_session`, `unregister_cloud_session`, `get_cloud_status`, `exit_app`,
 `set_window_zoom`, `get_username`, `set_avatar`, `get_avatar`, `remove_avatar`,
 `get_network_adapters`, `watch_for_network_changes`, `start_hosted_network`,
-`stop_hosted_network`, `is_hosted_network`, `is_wifi_on`, `turn_on_wifi`, `install_drivers`,
+`stop_hosted_network`, `is_hosted_network`, `get_hosted_network_status`, `is_wifi_on`,
+`turn_on_wifi`, `install_drivers`,
 `remove_drivers`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
-`set_legacy_volume_key_proxy`, `set_device_override`, `refresh_device_stream`,
+`set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
+`refresh_device_stream`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
 `set_device_banned`, `set_device_approved`, `set_disconnect_grace`, `get_disconnect_grace`,
 `get_display_capacity`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
@@ -285,8 +287,8 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `set_log_streaming`, `log_frontend_error`.
 
 Registered events: `DeviceJoin`, `DeviceAudioOutputs`, `DeviceModify`, `DeviceRemove`,
-`NetworkChange`, `HostedNetworkNoPassword`, `CloudStatusChange`, `SessionIdChange`,
-`JoinAttemptsPaused`, `LogLine`.
+`NetworkChange`, `HostedNetworkNoPassword`, `ScreenRecordingRevoked`, `CloudStatusChange`,
+`SessionIdChange`, `JoinAttemptsPaused`, `LogLine`.
 
 Shared types worth knowing: `CompatibilityReport` (os name/version/floor/supported, the
 `unsupported_apis` list, and the six probed backend names — audio, display, capture, encoder,
@@ -848,8 +850,8 @@ dontShowAgain{editDevice,editNetwork,compatibility,configEditor}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
-remoteControl, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os, screenSize, dpr,
-maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
+remoteControl, pointerScope, systemAudio, audioOutputDeviceId, audioOutputDeviceLabel, os,
+screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
 
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,
@@ -987,7 +989,15 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
 - Simultaneous displays are **uncapped**. `VirtualDisplayController::max_concurrent_displays()`
   returns `None` everywhere except the macOS AirPlay tier, which returns `Some(1)` because macOS
   itself owns that display. Do not cap the other backends, and never evict a connected device to
-  make room for a new one; a host that is genuinely full serves `at-capacity.html`.
+  make room for a new one; a host that is genuinely full serves `at-capacity.html`. Read the cap
+  through **`session::concurrent_display_cap`**, never `max_concurrent_displays()` directly: it
+  recognises `Some(1)` and treats any other finite number as uncapped, so `at-capacity.html` and
+  `DisplayCapacity.full` cannot be reached on a backend nobody meant to cap.
+- **A compatibility row may only be `blocking` if the host cannot create a display, cannot
+  capture, or cannot encode.** `UnsupportedApi::blocking` takes a `BareMinimum`, not a string, so
+  that is type-enforced; everything else is `optional` (the user gets "Continue anyway") or
+  `installable` (the bootstrap fixes it and re-probes before deciding). The decision itself is
+  `src/lib/startup-gate.ts`, tested by `pnpm test:gate`.
 - The desktop UI must run on **Safari 13.1** (the WKWebView on the 10.15 floor). Anything
   newer that a dependency reaches for is a hard crash, not a missing feature — monaco alone
   needed six shims, and its MediaQueryList call runs at module scope, so it took down the whole

@@ -1420,6 +1420,7 @@ mod desktop {
                 d.dpr,
                 d.audio,
             );
+            platform::set_device_pointer_scope(app.state(), d.ip.clone(), d.pointer_scope.clone());
             // Without this a device pinned to a specific host output in the GUI reverts to the
             // default output under `serve`, which is audible rather than theoretical.
             if let Some(output) = d.audio_output {
@@ -1439,6 +1440,7 @@ mod desktop {
         control: bool,
         dpr: f64,
         audio: bool,
+        pointer_scope: String,
         audio_output: Option<String>,
     }
 
@@ -1477,6 +1479,13 @@ mod desktop {
                         .get("systemAudio")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
+                    // Absent means the conservative default; the host re-reads it through
+                    // `PointerScope::from_str`, so an unknown string is the default too.
+                    pointer_scope: device
+                        .get("pointerScope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("display")
+                        .to_string(),
                     audio_output: device
                         .get("audioOutputDeviceId")
                         .and_then(|v| v.as_str())
@@ -1883,8 +1892,16 @@ mod desktop {
                     exit(0);
                 }
                 println!(
-                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6}",
-                    "IP", "SCALE", "ORIENT", "REFRESH", "VSCALE", "VQUAL", "CONTROL", "AUDIO"
+                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6} {:>8}",
+                    "IP",
+                    "SCALE",
+                    "ORIENT",
+                    "REFRESH",
+                    "VSCALE",
+                    "VQUAL",
+                    "CONTROL",
+                    "AUDIO",
+                    "POINTER"
                 );
                 for d in &devices {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
@@ -1896,8 +1913,9 @@ mod desktop {
                     let vqual = s("videoQuality").as_u64().unwrap_or(15);
                     let control = s("remoteControl").as_bool().unwrap_or(true);
                     let audio = s("systemAudio").as_bool().unwrap_or(false);
+                    let pointer = s("pointerScope").as_str().unwrap_or("display").to_string();
                     println!(
-                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6}",
+                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6} {pointer:>8}",
                         scale,
                         refresh,
                         vscale,
@@ -1909,7 +1927,7 @@ mod desktop {
             }
             "set" => {
                 let Some(ip) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off]");
+                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all]");
                     exit(2);
                 };
                 let mut existing = get_nested(&store, "devices")
@@ -1926,7 +1944,8 @@ mod desktop {
                         serde_json::json!({
                             "ip": ip, "name": "", "scale": 100, "orientation": "Landscape",
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
-                            "remoteControl": true, "systemAudio": false, "os": "", "screenSize": ""
+                            "remoteControl": true, "systemAudio": false,
+                            "pointerScope": "display", "os": "", "screenSize": ""
                         })
                     });
                 let obj = device.as_object_mut().unwrap();
@@ -1951,6 +1970,9 @@ mod desktop {
                 }
                 if let Some(v) = arg_str(sm, "audio") {
                     obj.insert("systemAudio".into(), Value::Bool(v == "on"));
+                }
+                if let Some(v) = arg_str(sm, "pointer-scope") {
+                    obj.insert("pointerScope".into(), Value::String(v));
                 }
 
                 existing.retain(|d| d.get("ip").and_then(|v| v.as_str()) != Some(ip.as_str()));
@@ -2582,8 +2604,9 @@ mod desktop {
                     "input": report.input_backend,
                 },
                 "unsupportedApis": report.unsupported_apis.iter().map(|a| serde_json::json!({
-                    "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
+                    "key": a.key, "name": a.name, "description": a.description, "requiredVersion": a.required_version, "severity": a.severity,
                 })).collect::<Vec<_>>(),
+                "bareMinimumMissing": report.bare_minimum_missing(),
                 "permissions": permissions.iter().map(|p| serde_json::json!({
                     "key": p.key, "name": p.name, "state": p.state, "required": p.required,
                     "relaunchRequired": p.relaunch_required, "description": p.description, "detail": p.detail,
@@ -2652,7 +2675,10 @@ mod desktop {
         } else {
             println!("\nCapability notes:");
             for api in &report.unsupported_apis {
-                println!("  [{}] {} — {}", api.severity, api.name, api.description);
+                println!(
+                    "  [{}] {} ({}) — {}",
+                    api.severity, api.name, api.key, api.description
+                );
             }
         }
         println!("\nDrivers:");
@@ -2969,7 +2995,7 @@ mod desktop {
                     "ip": "10.0.0.6", "scale": 150, "orientation": "Portrait",
                     "refreshRate": 120, "videoScale": 80, "videoQuality": 20,
                     "remoteControl": false, "systemAudio": true, "dpr": 2.0,
-                    "audioOutputDeviceId": "speaker-1"
+                    "pointerScope": "all", "audioOutputDeviceId": "speaker-1"
                 },
                 { "name": "no ip at all" }
             ]);
@@ -2987,12 +3013,15 @@ mod desktop {
                     control: true,
                     dpr: 1.0,
                     audio: false,
+                    pointer_scope: "display".into(),
                     audio_output: None,
                 }
             );
             assert_eq!(parsed[1].refresh_rate, 120);
             assert!(!parsed[1].control);
             assert!(parsed[1].audio);
+            // A saved `all` survives the replay; an absent one is the conservative default.
+            assert_eq!(parsed[1].pointer_scope, "all");
             assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
         }
     }

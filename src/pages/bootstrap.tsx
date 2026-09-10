@@ -16,8 +16,9 @@ import { toast } from "@/components/ui/use-toast";
 
 import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
 import { useGlobalSetters, useLoaded } from "@/components/global-provider";
-import { commands, type CompatibilityReport, type PermissionStatus } from "@/lib/bindings";
-import { buildQrValues, generateOtp } from "@/lib/utils";
+import { commands, type CompatibilityReport, type PermissionStatus, type UnsupportedApi } from "@/lib/bindings";
+import { generateOtp, readQrValues } from "@/lib/utils";
+import { classifyCompat, driverRemediation, offersDriverInstall } from "@/lib/startup-gate";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
 import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
 import { useTranslation } from "@/i18n";
@@ -53,6 +54,31 @@ function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): b
 // definite "denied" is allowed to hold up startup.
 function blocks(p: PermissionStatus): boolean {
   return p.required && p.state === "denied";
+}
+
+// A relaunch that does not fix the driver would relaunch again on the next launch, forever. One
+// attempt per window is enough to cover "the OS wanted a fresh process", and the window is long
+// enough that a user who quits and reopens does not trip it either.
+const RELAUNCH_MEMO_KEY = "se.driverRelaunchAt";
+const RELAUNCH_WINDOW_MS = 10 * 60 * 1000;
+
+function relaunchAlreadyTried(): boolean {
+  try {
+    const at = Number(window.localStorage.getItem(RELAUNCH_MEMO_KEY) ?? "");
+    return Number.isFinite(at) && Date.now() - at < RELAUNCH_WINDOW_MS;
+  } catch {
+    // Storage can be unavailable. Treat that as "already tried": a relaunch loop is worse than
+    // a relaunch that never happens, and every other route out of this state still works.
+    return true;
+  }
+}
+
+function rememberRelaunch(): void {
+  try {
+    window.localStorage.setItem(RELAUNCH_MEMO_KEY, String(Date.now()));
+  } catch {
+    /* see relaunchAlreadyTried */
+  }
 }
 
 function needsRelaunch(perms: PermissionStatus[] | null): boolean {
@@ -93,6 +119,10 @@ export default function Bootstrap() {
   const [loading, setLoading] = useState(false);
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
+  // The last report the probe produced, kept so the setup-error dialog can ask it whether this
+  // host has a driver to install instead of guessing from the platform name.
+  const [lastReport, setLastReport] = useState<CompatibilityReport | null>(null);
+  const [remediating, setRemediating] = useState(false);
   const [compatDontShowAgain, setCompatDontShowAgain] = useState(true);
   const [permReport, setPermReport] = useState<PermissionStatus[] | null>(null);
   const [updating, setUpdating] = useState(false);
@@ -145,6 +175,7 @@ export default function Bootstrap() {
             device.dpr ?? device.maxDpr ?? 1,
             device.systemAudio ?? false
           ));
+          replay.push(commands.setDevicePointerScope(device.ip, device.pointerScope ?? "display"));
         }
         for (const known of existing.knownDevices ?? []) {
           const token = known.token ?? "";
@@ -178,7 +209,18 @@ export default function Bootstrap() {
         } else {
           commands.unregisterCloudSession().catch((e: unknown) => { console.error("unregisterCloudSession failed", e); });
         }
-        setQrValues(await buildQrValues(newSessionId, savedPorts?.http));
+        // An empty QR list reads on the dashboard as "no networks were found". When the adapter
+        // read is what failed, that is the wrong thing to tell someone whose host is serving
+        // fine -- so the reason is named here rather than being rendered as an absence.
+        const qr = await readQrValues(newSessionId, savedPorts?.http);
+        if (qr.adaptersUnavailable) {
+          toast({
+            variant: "destructive",
+            title: t("toasts.networkAdapters.failureTitle"),
+            description: t("toasts.networkAdapters.failureDescription"),
+          });
+        }
+        setQrValues(qr.entries);
         setHostedNetworkOn(false);
         const turn = existing.turnConfig;
         if (turn?.urls) {
@@ -260,20 +302,25 @@ export default function Bootstrap() {
     }
   };
 
-  // Returns true when startup must stop and wait for the user. A check that *failed* is
-  // not the same as "nothing was missing", so it says so on the log bus instead of being
-  // reported as a clean pass; startup still proceeds, since refusing to start over an
-  // unreadable probe would be worse.
-  const ensurePermissions = async (): Promise<boolean> => {
+  // A check that *failed* is not the same as "nothing was missing". Both used to return the
+  // same `false`, so an unreadable probe was reported to the user as all-granted. Startup still
+  // proceeds on `unreadable` -- refusing to start over a probe we could not run would be worse,
+  // and capture reports its own failure -- but the user is told which of the two happened.
+  const ensurePermissions = async (): Promise<"ok" | "blocked" | "unreadable"> => {
     let perms: PermissionStatus[];
     try {
       perms = await commands.checkPermissions();
     } catch (e) {
-      console.error("the permission check failed; continuing as if nothing were missing", e);
-      return false;
+      console.error("the permission check failed; starting without knowing what was granted", e);
+      toast({
+        variant: "destructive",
+        title: t("toasts.permissions.checkUnreadableTitle"),
+        description: t("toasts.permissions.checkUnreadableDescription"),
+      });
+      return "unreadable";
     }
     const missing = perms.filter(blocks);
-    if (missing.length === 0) return false;
+    if (missing.length === 0) return "ok";
     for (const p of missing) {
       try {
         await commands.requestPermission(p.key);
@@ -286,7 +333,7 @@ export default function Bootstrap() {
     } catch {
       setPermReport(perms);
     }
-    return true;
+    return "blocked";
   };
 
   const recheckPermissions = async () => {
@@ -308,34 +355,82 @@ export default function Bootstrap() {
     }
   };
 
-  const proceed = async () => {
+  // Install what can be installed, then say whether the caller should carry on deciding.
+  // `false` means this launch is over -- the only route to it is a relaunch that has already
+  // been started, which is why the caller must not fall through to the dashboard behind it.
+  const remediate = async (rows: UnsupportedApi[]): Promise<boolean> => {
+    const action = driverRemediation(rows);
+    // An installable row nothing here knows how to install. Carry on and decide: it survives
+    // the pass, so the user is shown it rather than left on a spinner forever.
+    if (!action) return true;
+    setRemediating(true);
     try {
-      if (await ensurePermissions()) return;
+      if (action === "reinstall") {
+        // Installed but not answering. Installing over it changes nothing -- the driver is
+        // already there -- so it comes out first. A removal that fails is not fatal: the
+        // install below is still the flow that used to run on its own.
+        if (!(await commands.removeDrivers())) {
+          console.log("[bootstrap] removing the unresponsive display driver did not complete");
+        }
+      }
+      const installed = await commands.installDrivers();
+      // The driver enumerates asynchronously; the probe below reads the same thing the
+      // installer just changed, so it has to be given the moment the old flow gave it.
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      if (!installed && action === "reinstall" && !relaunchAlreadyTried()) {
+        // A driver that is present but silent is often one this process opened before the
+        // reinstall. A fresh process is the cheapest thing left to try, and it is bounded so
+        // it cannot become a relaunch loop.
+        rememberRelaunch();
+        console.log("[bootstrap] relaunching so the reinstalled display driver is opened fresh");
+        await commands.relaunchApp();
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.error("installing the display driver failed", e);
+      toast({
+        variant: "destructive",
+        title: t("toasts.driverInstall.failureTitle"),
+        description: t("toasts.driverInstall.failureDescription"),
+      });
+      return true;
+    } finally {
+      setRemediating(false);
+    }
+  };
+
+  const proceed = async (remediated = false) => {
+    try {
+      if ((await ensurePermissions()) === "blocked") return;
       let report: CompatibilityReport;
       try {
         report = await commands.checkSystemRequirements();
-      } catch {
+      } catch (e) {
+        // The probe itself failed, which says nothing about the machine. Start; `setup()` is
+        // the real test and reports its own failure.
+        console.error("the compatibility probe failed; starting anyway", e);
         await runSetup(true);
         return;
       }
-      // "installable" rows (the virtual display driver) are not a compatibility verdict:
-      // runSetup(true) installs the driver through the elevated installer and retries, the
-      // same first-launch flow as before the probe existed. Only the rest can block or warn.
-      const visible = report.unsupported_apis.filter(api => api.severity !== "installable");
-      const hasBlocking =
-        !report.os_supported ||
-        visible.some(api => api.severity === "blocking");
-      if (hasBlocking) {
-        setCompatReport({ ...report, unsupported_apis: visible });
-        setCompatBlocking(true);
-        return;
+      setLastReport(report);
+      const dontShowAgain = (await getConfig())?.dontShowAgain?.compatibility === true;
+      const gate = classifyCompat(report, { remediated, dontShowAgain });
+      switch (gate.kind) {
+        case "remediate":
+          if (await remediate(gate.rows)) {
+            await proceed(true);
+          }
+          return;
+        case "blocked":
+        case "warn":
+          setCompatReport({ ...report, unsupported_apis: gate.rows });
+          setCompatBlocking(gate.kind === "blocked");
+          return;
+        case "ok":
+          await runSetup(true);
+          return;
       }
-      if (visible.length > 0 && !(await getConfig())?.dontShowAgain?.compatibility) {
-        setCompatReport({ ...report, unsupported_apis: visible });
-        setCompatBlocking(false);
-        return;
-      }
-      await runSetup(true);
     } catch (e) {
       console.error("startup failed", e);
       setError(true);
@@ -493,23 +588,46 @@ export default function Bootstrap() {
         </AlertDialogContent>
       </AlertDialog>
       <Loader2 className="animate-spin mb-4" size={48} />
-      <p className="text-xl font-semibold">{t("bootstrap.starting")}</p>
+      <p className="text-xl font-semibold">
+        {remediating ? t("bootstrap.installingDriver") : t("bootstrap.starting")}
+      </p>
       <AlertDialog open={error}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("bootstrap.setupError.title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t("bootstrap.setupError.bodyBeforePrompt")}<b>{t("bootstrap.setupError.installPrompt")}</b>{t("bootstrap.setupError.bodyAfterPrompt")}<a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>{t("common.supportEmail")}</a>{t("bootstrap.setupError.contactSuffix")}
+              {t("bootstrap.setupError.bodyBeforePrompt")}
+              {offersDriverInstall(lastReport) && <b>{t("bootstrap.setupError.installPrompt")}</b>}
+              {t("bootstrap.setupError.bodyAfterPrompt")}<a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>{t("common.supportEmail")}</a>{t("bootstrap.setupError.contactSuffix")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
+            <AlertDialogAction
+              className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
+            >
+              {t("common.quit")}
+            </AlertDialogAction>
+            {/* Shown only where there is a driver to install. It used to be shown on macOS
+                too, where `install_drivers` returns `true` without doing anything, so the
+                copy told the user to press a button that could not help. */}
             <AlertDialogAction
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
               onClick={async () => {
                 setLoading(true);
                 try {
-                  await commands.installDrivers();
-                  await new Promise(resolve => setTimeout(resolve, 5000));
+                  if (offersDriverInstall(lastReport)) {
+                    await commands.installDrivers();
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                  }
                 } catch (e) {
                   console.error("driver install failed", e);
                   toast({
@@ -526,7 +644,9 @@ export default function Bootstrap() {
               }}
               disabled={loading}
             >
-              {t("bootstrap.setupError.install")}
+              {offersDriverInstall(lastReport)
+                ? t("bootstrap.setupError.install")
+                : t("bootstrap.setupError.retry")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -534,8 +654,15 @@ export default function Bootstrap() {
       <AlertDialog open={compatReport !== null}>
         <AlertDialogContent className="max-w-2xl">
           <AlertDialogHeader>
+            {/* Blocking no longer only means "this OS is too old". It also means the app tried
+                to install what was missing and the machine still cannot create a display or
+                send video, which is not a verdict on the operating system. */}
             <AlertDialogTitle>
-              {compatBlocking ? t("bootstrap.compatibility.blockingTitle") : t("bootstrap.compatibility.limitedTitle")}
+              {!compatBlocking
+                ? t("bootstrap.compatibility.limitedTitle")
+                : compatReport?.os_supported
+                  ? t("bootstrap.compatibility.cannotStartTitle")
+                  : t("bootstrap.compatibility.blockingTitle")}
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-3 text-left">
@@ -546,9 +673,11 @@ export default function Bootstrap() {
                 </div>
                 {compatReport && compatReport.unsupported_apis.length > 0 && (
                   <div>
-                    {compatBlocking
-                      ? t("bootstrap.compatibility.blockingIntro")
-                      : t("bootstrap.compatibility.limitedIntro")}
+                    {!compatBlocking
+                      ? t("bootstrap.compatibility.limitedIntro")
+                      : compatReport.os_supported
+                        ? t("bootstrap.compatibility.cannotStartIntro")
+                        : t("bootstrap.compatibility.blockingIntro")}
                     <ul className="list-disc pl-5 mt-2 space-y-1">
                       {compatReport.unsupported_apis.map(api => (
                         <li key={api.name}>

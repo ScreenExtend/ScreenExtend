@@ -42,7 +42,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, type Device } from "@/components/config-provider";
+import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_POINTER_SCOPE, type Device, type PointerScope } from "@/components/config-provider";
 import { useAudioOutputs, useGlobalSetters } from "@/components/global-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -170,6 +170,13 @@ function DeviceDetailsBody({
   const audioNeedsInstall = audioBackend === "needs_driver_install";
   const audioUnsupported = audioBackend === "unsupported";
   const audioActiveLegacy = audioBackend === "virtual_device";
+  // macOS 13.0-14.1. The Process Tap arrives in 14.2 and the driver tier covers everything
+  // below 13.0, so in that band ScreenCaptureKit is the only native backend -- and SCK has
+  // no audio-only mode, so ScreenExtend runs a 2x2 1 fps screen stream purely to receive
+  // sound. macOS lights the menu-bar recording indicator for the whole session, including
+  // when this device has audio on and video off, where it appears for no reason the user
+  // can see. Saying so where the toggle is is the whole fix.
+  const audioLightsIndicator = audioBackend === "screencapturekit";
 
   const volumeKeyProxy = useConfig()?.legacyVolumeKeyProxy ?? false;
   const [proxyBusy, setProxyBusy] = useState(false);
@@ -177,6 +184,21 @@ function DeviceDetailsBody({
   const audioOutputsByIp = useAudioOutputs();
   const { setAudioOutputsByIp } = useGlobalSetters();
   const audioOutputs = audioOutputsByIp[device.ip];
+  // `current` is what the client reports it is playing on; `selected` is what the host has
+  // asked for. `undefined` means the client never said, which is not the same as "the
+  // default" -- only a string (empty for the device's default output) is an answer.
+  const clientSink = typeof audioOutputs?.current === "string" ? audioOutputs.current : null;
+  // Compared against the host's *applied* choice, not the unsaved form value, so editing
+  // the picker does not flash a warning about a change that has not been sent yet.
+  const sinkMismatch = clientSink !== null && !!audioOutputs && clientSink !== audioOutputs.selected;
+  const sinkLabel = (id: string): string =>
+    id === ""
+      ? t("device.audioOutput.default")
+      : id === "se:earpiece"
+        ? t("device.audioOutput.earpiece")
+        : id === "se:loudspeaker"
+          ? t("device.audioOutput.speaker")
+          : audioOutputs?.outputs.find((o) => o.id === id)?.label || id.slice(0, 8);
   useEffect(() => {
     if (!open) return;
     (async () => {
@@ -184,7 +206,12 @@ function DeviceDetailsBody({
         const r = await commands.getDeviceAudioOutputs(device.ip);
         setAudioOutputsByIp((prev) => ({
           ...prev,
-          [device.ip]: { supported: r.supported, outputs: r.outputs, selected: r.selected },
+          [device.ip]: {
+            supported: r.supported,
+            outputs: r.outputs,
+            selected: r.selected,
+            current: r.current,
+          },
         }));
       } catch (e) {
         console.error("failed to read the device audio outputs", e);
@@ -230,16 +257,25 @@ function DeviceDetailsBody({
     }
   };
 
-  const deviceDetails = useFormik({
-    enableReinitialize: !open,
-    initialValues: {
+  // One shape for `initialValues`, for every `resetForm` and for the dirty check, so a
+  // device saved to config.json before a field existed still yields a fully-typed form and
+  // does not read as modified the moment the sheet opens.
+  const formValues = React.useMemo(
+    () => ({
       ...device,
       dpr: Math.min(device.dpr ?? device.maxDpr ?? 1, device.maxDpr ?? device.dpr ?? 1),
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
+      pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
       systemAudio: device.systemAudio ?? false,
       audioOutputDeviceId: device.audioOutputDeviceId ?? "",
       audioOutputDeviceLabel: device.audioOutputDeviceLabel ?? "",
-    },
+    }),
+    [device]
+  );
+
+  const deviceDetails = useFormik({
+    enableReinitialize: !open,
+    initialValues: formValues,
     onSubmit: async (values) => {
       setInProgress(true);
       const normalized: Device = {
@@ -262,9 +298,21 @@ function DeviceDetailsBody({
           normalized.dpr,
           normalized.systemAudio
         );
+        // Its own command, not a tenth argument to `setDeviceOverride`: that one is already
+        // at specta's ten-parameter ceiling.
+        await commands.setDevicePointerScope(
+          normalized.ip,
+          normalized.pointerScope ?? DEFAULT_POINTER_SCOPE
+        );
         await commands.setDeviceAudioOutput(normalized.ip, normalized.audioOutputDeviceId);
         await saveDeviceSettings(normalized);
-        await events.deviceModify.emit(normalized);
+        // The event's `Device` comes from Rust, where `pointerScope` is not optional; the
+        // config-file `Device` makes it optional because devices saved before the field
+        // exist. Resolve the default on the way out rather than lying in either type.
+        await events.deviceModify.emit({
+          ...normalized,
+          pointerScope: normalized.pointerScope ?? DEFAULT_POINTER_SCOPE,
+        });
         toast({
           title: t("toasts.device.updatedTitle"),
           description: t("toasts.device.updatedDescription"),
@@ -293,13 +341,13 @@ function DeviceDetailsBody({
   };
 
   const closeOrWarn = async () => {
-    if (JSON.stringify(deviceDetails.values) === JSON.stringify(device)) {
+    if (JSON.stringify(deviceDetails.values) === JSON.stringify(formValues)) {
       setOpen(false);
       return;
     }
     if (await skipUnsavedWarning()) {
       setOpen(false);
-      deviceDetails.resetForm({ values: device });
+      deviceDetails.resetForm({ values: formValues });
     } else {
       setWarningDialogOpen(true);
     }
@@ -417,6 +465,29 @@ function DeviceDetailsBody({
               disabled={inProgress}
             />
           </div>
+          {deviceDetails.values.remoteControl && (
+            <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
+              <TipLabel text={t("device.pointerScope.tip")}>
+                <Label>{t("device.pointerScope.label")}</Label>
+              </TipLabel>
+              <Select
+                name="pointerScope"
+                value={deviceDetails.values.pointerScope}
+                onValueChange={(value) => {
+                  deviceDetails.setFieldValue("pointerScope", value as PointerScope);
+                }}
+                disabled={inProgress}
+              >
+                <SelectTrigger className="w-[55%] border-2">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="cursor-pointer">
+                  <SelectItem value="display">{t("device.pointerScope.display")}</SelectItem>
+                  <SelectItem value="all">{t("device.pointerScope.all")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
             <TipLabel
               text={
@@ -445,6 +516,12 @@ function DeviceDetailsBody({
               disabled={inProgress || audioInstalling || audioUnsupported}
             />
           </div>
+          {audioLightsIndicator && deviceDetails.values.systemAudio && (
+            <p className="mt-2 flex items-start text-sm text-muted-foreground">
+              <Info className="mt-0.5 mr-2 h-4 w-4 shrink-0 text-amber-600" />
+              <span>{t("device.screenRecordingIndicator.note")}</span>
+            </p>
+          )}
           <AlertDialog open={installPromptOpen} onOpenChange={setInstallPromptOpen}>
             <AlertDialogContent>
               <AlertDialogHeader>
@@ -541,6 +618,24 @@ function DeviceDetailsBody({
                     {t("device.audioOutput.waiting")}
                   </p>
                 )}
+              {/* What the client says it is *actually* playing on. `setSinkId` needs
+                  transient activation in some engines, so a change made here while nobody
+                  is touching the phone does not take effect until the next tap -- and
+                  Firefox's own picker can move it without the host ever asking. Silently
+                  showing the host's stored choice as if it had applied is the failure this
+                  removes. */}
+              {clientSink !== null && (
+                <p
+                  className={cn(
+                    "mt-2 text-sm",
+                    sinkMismatch ? "text-amber-600" : "text-muted-foreground"
+                  )}
+                >
+                  {sinkMismatch
+                    ? t("device.audioOutput.mismatch", { label: sinkLabel(clientSink) })
+                    : t("device.audioOutput.playingOn", { label: sinkLabel(clientSink) })}
+                </p>
+              )}
             </div>
           )}
           <div className="mt-4">
@@ -710,7 +805,10 @@ function DeviceDetailsBody({
                 try {
                   await commands.removeDeviceOverride(device.ip);
                   await removeSavedDevice(device.ip);
-                  await events.deviceRemove.emit(device);
+                  await events.deviceRemove.emit({
+                    ...device,
+                    pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
+                  });
                   toast({
                     title: t("toasts.device.removedTitle"),
                     description: t("toasts.device.removedDescription"),
@@ -792,7 +890,7 @@ function DeviceDetailsBody({
                 } finally {
                   setWarningDialogOpen(false);
                   setOpen(false);
-                  deviceDetails.resetForm({ values: device });
+                  deviceDetails.resetForm({ values: formValues });
                 }
               }}
             >

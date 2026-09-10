@@ -83,6 +83,14 @@ async stopHostedNetwork() : Promise<boolean> {
 async isHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("is_hosted_network");
 },
+/**
+ * Everything the network card can show: the tri-state, the backend, the band and the
+ * authentication. It re-reads liveness through `is_hosted_network` first so a hotspot the
+ * OS took down on its own is not still reported as advertised.
+ */
+async getHostedNetworkStatus() : Promise<HostedNetworkReport> {
+    return await TAURI_INVOKE("get_hosted_network_status");
+},
 async isWifiOn() : Promise<boolean> {
     return await TAURI_INVOKE("is_wifi_on");
 },
@@ -109,6 +117,18 @@ async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
 },
 async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
+},
+/**
+ * Where a pointer-locked client may drive this host's cursor: `"display"` (its own screen,
+ * the default) or `"all"` (every screen, including the host's real monitors).
+ * 
+ * Its own command rather than another `set_device_override` argument: that one is at specta's
+ * ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
+ * no live display to touch. The injector reads the scope when the session is built, so a
+ * change applies to the next connection, exactly like remote control itself.
+ */
+async setDevicePointerScope(ip: string, scope: string) : Promise<void> {
+    await TAURI_INVOKE("set_device_pointer_scope", { ip, scope });
 },
 async refreshDeviceStream(ip: string) : Promise<boolean> {
     return await TAURI_INVOKE("refresh_device_stream", { ip });
@@ -193,6 +213,7 @@ hostedNetworkNoPassword: HostedNetworkNoPassword,
 joinAttemptsPaused: JoinAttemptsPaused,
 logLine: LogLine,
 networkChange: NetworkChange,
+screenRecordingRevoked: ScreenRecordingRevoked,
 sessionIdChange: SessionIdChange
 }>({
 cloudStatusChange: "cloud-status-change",
@@ -204,6 +225,7 @@ hostedNetworkNoPassword: "hosted-network-no-password",
 joinAttemptsPaused: "join-attempts-paused",
 logLine: "log-line",
 networkChange: "network-change",
+screenRecordingRevoked: "screen-recording-revoked",
 sessionIdChange: "session-id-change"
 })
 
@@ -221,27 +243,64 @@ export type AudioOutputsReport = { supported: boolean; outputs: AudioOutput[];
 selected: string; 
 /**
  * What the device reports it is *actually* playing on. The two diverge the moment the
- * user changes the output in the browser's own UI, which only the client can see; empty
- * means the device never said, which is what every client built before this field does.
+ * user changes the output in the browser's own UI, which only the client can see.
+ * `None` means this client never said — an older one, or one that has not posted yet —
+ * which is a different answer from `Some("")`, the device's default output.
  */
-current: string }
+current: string | null }
 export type CloudStatusChange = { state: string; detail: string }
 export type CompatibilityReport = { os_name: string; os_version: string; min_os_version: string; os_supported: boolean; unsupported_apis: UnsupportedApi[]; audio_backend: string; display_backend: string; capture_backend: string; encoder_backend: string; hosted_network_backend: string; input_backend: string }
-export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
+/**
+ * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
+ * See `streamer::input::PointerScope`.
+ */
+pointerScope: string; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; 
 /**
  * What the host last asked this device to play on.
  */
 selected: string; 
 /**
- * What the device says it is actually playing on right now; empty when it never said.
+ * What the device says it is actually playing on right now. `None` when it never said,
+ * which is not the same as `Some("")` — the device's default output.
  */
-current: string }
+current: string | null }
 export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceRemove = Device
 export type DisplayCapacity = { max: number | null; in_use: number; full: boolean; backend: string }
 export type HostedNetworkNoPassword = null
+/**
+ * Everything the UI can say about the hosted network without opening the log terminal.
+ * 
+ * `state` is the tri-state both platforms already collect and neither could report:
+ * - `notStarted` — nothing is being advertised.
+ * - `advertised` — the platform accepted the start, and that is all that is known. An AP
+ * in this state is visible to a phone and may still be unjoinable, because nothing is
+ * serving DHCP.
+ * - `verified` — the AP interface holds a routable IPv4, i.e. something is serving
+ * addresses, so a client that associates can actually get on.
+ * 
+ * `secured` is what item 6 of the UI recommendations needs: on macOS the HostAP SPI can
+ * refuse every secured `securityType` and the fallback brings up an *unencrypted* AP,
+ * which stays up for the session while the join URL, session id and OTP are readable by
+ * anyone in range who associates. A toast cannot carry that; a badge on the card can.
+ */
+export type HostedNetworkReport = { state: string; backend: string | null; ssid: string; channel: number | null; band: string | null; 
+/**
+ * The security type as it was logged, e.g. `WPA2` or `securityType 2 (open — no
+ * encryption)`. `None` when nothing is up.
+ */
+security: string | null; 
+/**
+ * False means the network carries no encryption at all.
+ */
+secured: boolean; host_ipv4: string | null; 
+/**
+ * A client seen on the AP's own subnet. macOS only; `None` elsewhere.
+ */
+peer: string | null }
 export type JoinAttemptsPaused = { retryAfterSecs: number }
 export type LogLine = string
 export type NetworkChange = null
@@ -262,10 +321,29 @@ detail: string; required: boolean;
  * the user has just ticked can only reach a freshly launched copy.
  */
 relaunch_required: boolean }
+/**
+ * macOS revoked Screen Recording while a session was live. The watchdog in
+ * `macos_utils::start_session_watchdog` ends the sessions on a definite
+ * `Some(true) -> Some(false)` edge; this is the half that tells the person at the host,
+ * who would otherwise only find it in the log. Windows and Linux never emit it.
+ */
+export type ScreenRecordingRevoked = { 
+/**
+ * The permission key the UI should re-check, matching `PermissionStatus.key`.
+ */
+key: string; 
+/**
+ * How many live sessions were ended because of it.
+ */
+sessions_ended: number }
 export type ServerPorts = { http: number; https: number }
 export type SessionIdChange = { sessionId: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
-export type UnsupportedApi = { name: string; description: string; required_version: string; severity: string }
+export type UnsupportedApi = { 
+/**
+ * Stable id from [`api_key`]. The severity says how bad it is; this says what it is.
+ */
+key: string; name: string; description: string; required_version: string; severity: string }
 
 /** tauri-specta globals **/
 

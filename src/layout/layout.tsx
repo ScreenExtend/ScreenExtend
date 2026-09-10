@@ -14,11 +14,27 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const { otp, sessionId } = useSession();
 
   return (
-    <div className="flex h-screen w-full">
+    <div className="flex h-screen w-full overflow-hidden">
+      {/* This used to transition `width` from 275 to 0 over 300 ms. `width` is a layout
+          property and the sibling is the whole page -- the QR carousel, the device table,
+          the settings form -- so every frame of the collapse reflowed all of it on the
+          main thread of a process that is simultaneously capturing, scaling and encoding
+          a display. `transform` and `opacity` are composited: the panel's own subtree
+          never re-lays-out, and the reserved 275 px flips once per toggle rather than on
+          every frame, so the page below reflows once instead of ~18 times.
+
+          The panel slides rather than clips, which is a different animation from the old
+          one and the reason this was held back until it was signed off. `overflow-visible`
+          plus `z-10` are what let it slide across the content pane while the space is
+          already given back. */}
       <div
         id="sidebar"
-        className="relative h-screen shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out"
-        style={{ width: sidebarOpen ? SIDEBAR_WIDTH : 0 }}
+        className="relative z-10 h-screen shrink-0 transition-[transform,opacity] duration-300 ease-in-out"
+        style={{
+          width: sidebarOpen ? SIDEBAR_WIDTH : 0,
+          transform: sidebarOpen ? "translateX(0)" : `translateX(-${SIDEBAR_WIDTH}px)`,
+          opacity: sidebarOpen ? 1 : 0,
+        }}
       >
         <div className="h-full" style={{ width: SIDEBAR_WIDTH }}>
           <Sidebar />
