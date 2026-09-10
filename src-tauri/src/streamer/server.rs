@@ -246,6 +246,33 @@ impl AppState {
         SessionLocality::CrossNetwork
     }
 
+    /// The locality of a join, decided from where it arrived rather than from a parse.
+    ///
+    /// A join tunnelled through the cloud relay has no peer address at all: the relay forwards
+    /// its own opaque client id (`c_Lu6CRIn28D7GxgD8qMpTow`), and [`JoinOrigin::relayed`] puts
+    /// that in `peer_ip` for the log and the rate-limit bucket. It is not an address and never
+    /// parses as one, so [`AppState::locality_for`] returned `Unknown` on its first line and
+    /// every locality-driven decision took its `_` arm — which is the LAN arm. A relayed session
+    /// was handed the same-subnet MTU, no playout delay and `PacingMode::Light`, on the one path
+    /// in this app that is cross-network by definition. The running host said so itself, once per
+    /// relayed join:
+    ///
+    /// ```text
+    /// session transport: locality=Unknown mtu=1188 pacing=Light playout_delay_max=0ms
+    /// session locality was pre-classified Unknown but the nominated candidate pair says
+    /// CrossNetwork; transport constants for this session were chosen for the former
+    /// ```
+    ///
+    /// The relay exists only to carry clients that cannot reach this host directly, so a relayed
+    /// join is cross-network by construction. That is a fact about the route, not a guess about
+    /// an address, and it is read here instead of being inferred.
+    pub fn locality_for_origin(&self, origin: JoinOrigin<'_>) -> SessionLocality {
+        if origin.relay_client.is_some() {
+            return SessionLocality::CrossNetwork;
+        }
+        self.locality_for(origin.peer_ip)
+    }
+
     pub fn fallback_ice_servers(&self) -> Vec<RTCIceServer> {
         self.ice_servers.as_ref().clone()
     }
@@ -1289,7 +1316,7 @@ async fn start_session(
             &format!("{}x{}", req.width, req.height),
         );
     }
-    let locality = state.locality_for(client_ip);
+    let locality = state.locality_for_origin(origin);
     let client = state
         .config
         .virtual_display
@@ -2213,6 +2240,61 @@ mod tests {
             SessionLocality::Unknown,
             "an unparseable key must not be optimistically treated as local"
         );
+    }
+
+    #[test]
+    fn a_relayed_join_is_cross_network_however_its_client_id_is_spelled() {
+        // The regression this pins: the relay forwards an opaque client id, never an address,
+        // and classifying a join by parsing that id put every cross-network client on the
+        // same-subnet transport constants. The id's spelling is the relay's business — it has
+        // been `c-1` and `c_Lu6CRIn28D7GxgD8qMpTow` — so nothing here may depend on it.
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        for id in ["c_Lu6CRIn28D7GxgD8qMpTow", "c-1", "", "192.168.1.44"] {
+            assert_eq!(
+                s.locality_for_origin(JoinOrigin::relayed(id)),
+                SessionLocality::CrossNetwork,
+                "a join through the cloud tunnel is cross-network by construction, not by \
+                 whatever `{id}` happens to parse as"
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_join_still_classifies_by_address() {
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("192.168.1.44")),
+            SessionLocality::SameNetwork
+        );
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("203.0.113.9")),
+            SessionLocality::CrossNetwork
+        );
+        assert_eq!(
+            s.locality_for_origin(JoinOrigin::direct("192.168.9.7")),
+            SessionLocality::Unknown
+        );
+    }
+
+    #[test]
+    fn a_relayed_join_is_offered_the_full_ice_list() {
+        // `cloud.rs` builds the relayed list as `ice_with_turn(fallback_ice_servers())`, and the
+        // direct handler builds it as `ice_for(locality)`. Now that a relayed join classifies as
+        // cross-network the two must agree, or a tunnelled client and a direct one would gather
+        // against different servers.
+        let s = state_with_local_ips(&["192.168.1.10"]);
+        let relayed = s.ice_with_turn(s.fallback_ice_servers());
+        let direct = s.ice_for(SessionLocality::CrossNetwork);
+        assert_eq!(relayed.len(), direct.len());
+        assert!(
+            !relayed.is_empty(),
+            "a relayed client with no STUN cannot produce a reflexive candidate, and without a \
+             TURN server that is the only kind of candidate that can reach it"
+        );
+        assert!(relayed
+            .iter()
+            .zip(direct.iter())
+            .all(|(a, b)| a.urls == b.urls));
     }
 
     #[test]
