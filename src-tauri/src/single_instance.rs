@@ -19,10 +19,15 @@ pub enum Command {
     /// runs in a separate process from the host, so this is the only way it can report
     /// per-session counters that exist only in the host's memory.
     Stats,
-    /// "Are you there?" — answered with `OK`. This is what lets another process test for a
+    /// "Are you there?" — answered with `OK <pid>`. This is what lets another process test for a
     /// running host without taking the lock, which is inherently racy: the GUI is not holding
     /// it between `acquire_lock` and `std::mem::forget`, so a concurrent lock test can win it
     /// and make the starting instance believe it is the second one.
+    ///
+    /// The pid is a suffix rather than a second line, so a reader that only knows about the
+    /// bare `OK` still reads the answer it expects — the prefix-stable rule the client's
+    /// telemetry frames follow. It is what lets the display-driver probe say *which* process is
+    /// holding the driver's pipe instead of calling a busy driver a broken one.
     Ping,
     /// Re-read `config.json` and replay it into the running host's `AppState`, so a change
     /// made by `devices set` / `turn set` / `config set` applies live instead of at the next
@@ -213,7 +218,7 @@ fn handle_connection<Q, R>(
             let _ = stream.flush();
         }
         Some("PING") => {
-            let _ = stream.write_all(b"OK\n");
+            let _ = stream.write_all(format!("OK {}\n", std::process::id()).as_bytes());
             let _ = stream.flush();
         }
         Some("RELOAD") => {
@@ -266,6 +271,42 @@ pub fn query_running_instance(ctrl_path: &Path, command: Command) -> Option<Stri
     Some(reply)
 }
 
+/// Where this process's control file lives, remembered once so code with no `AppHandle` in
+/// reach can still ask whether a host is up and which pid it is.
+///
+/// The display-driver probe is the caller that needs it: it runs inside
+/// `check_system_requirements`, a plain Tauri command, and the answer it wants — "is the pipe
+/// held by one of ours, and which?" — is exactly what the control socket knows.
+static CTRL_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn remember_ctrl_path(path: PathBuf) {
+    let _ = CTRL_PATH.set(path);
+}
+
+/// Whether a `PING` reply says a host is up. `OK` and `OK <pid>` both do.
+pub fn is_ok_reply(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply == "OK" || reply.starts_with("OK ")
+}
+
+/// The pid in a `PING` reply, or `None` if the reply carried no pid or was not an `OK`.
+fn ping_pid(reply: &str) -> Option<u32> {
+    reply.trim().strip_prefix("OK")?.trim().parse().ok()
+}
+
+/// The pid of the instance answering on the control socket named by `ctrl_path`.
+pub fn running_instance_pid_at(ctrl_path: &Path) -> Option<u32> {
+    ping_pid(&query_running_instance(ctrl_path, Command::Ping)?)
+}
+
+/// The pid of the instance answering on *this* process's control socket, if one is.
+///
+/// That may be this process itself, once its own control server is up. Callers deciding whether
+/// somebody else is in the way must compare against `std::process::id()`.
+pub fn running_instance_pid() -> Option<u32> {
+    running_instance_pid_at(CTRL_PATH.get()?)
+}
+
 pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
     let Ok(contents) = std::fs::read_to_string(ctrl_path) else {
         return false;
@@ -284,4 +325,26 @@ pub fn signal_running_instance(ctrl_path: &Path, command: Command) -> bool {
     stream
         .write_all(format!("{token} {}\n", command.verb()).as_bytes())
         .is_ok()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `PING` grew a pid on the end of its reply. A reader that predates it must still see an
+    /// `OK`, and a reader that wants the pid must not be confused by one that has none.
+    #[test]
+    fn the_ping_reply_is_prefix_stable() {
+        assert!(is_ok_reply("OK"));
+        assert!(is_ok_reply("OK\n"));
+        assert!(is_ok_reply("OK 71848\n"));
+        assert!(!is_ok_reply("OKAY"));
+        assert!(!is_ok_reply(""));
+        assert!(!is_ok_reply("ERR nope"));
+
+        assert_eq!(ping_pid("OK 71848\n"), Some(71848));
+        assert_eq!(ping_pid("OK"), None);
+        assert_eq!(ping_pid("OK not-a-pid"), None);
+        assert_eq!(ping_pid("ERR 71848"), None);
+    }
 }

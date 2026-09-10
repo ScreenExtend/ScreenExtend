@@ -60,5 +60,7 @@ pub fn check_system_requirements() -> CompatibilityReport {
         encoder_backend: "unsupported".to_string(),
         hosted_network_backend: "unsupported".to_string(),
         input_backend: crate::streamer::input::probe_backend().as_str().to_string(),
+        display_driver_holder_pid: None,
+        boot_id: crate::boot_id(),
     }
 }

@@ -179,6 +179,11 @@ pub mod api_key {
     pub const DISPLAY_DRIVER: &str = "display-driver";
     /// The virtual display driver is installed but not answering. Installable (reinstall).
     pub const DISPLAY_DRIVER_UNRESPONSIVE: &str = "display-driver-unresponsive";
+    /// The virtual display driver is installed and healthy, and another process of ours is
+    /// already using it. Deliberately **not** installable: there is nothing to install, and
+    /// reinstalling a driver whose pipe is merely occupied is what produced the loop of
+    /// elevation prompts this key exists to end.
+    pub const DISPLAY_DRIVER_BUSY: &str = "display-driver-busy";
     /// Displays work, but this backend can only drive one at a time.
     pub const DISPLAY_CAPPED: &str = "display-capped";
     pub const GPU_ADAPTER: &str = "gpu-adapter";
@@ -291,6 +296,17 @@ pub struct CompatibilityReport {
     pub encoder_backend: String,
     pub hosted_network_backend: String,
     pub input_backend: String,
+    /// The pid holding the display driver, when `display_backend` is `DriverBusy` and we could
+    /// name one. The startup gate shows it and offers to quit it; everywhere else it is `None`.
+    pub display_driver_holder_pid: Option<u32>,
+    /// An id that changes when this machine reboots, or empty where the platform does not
+    /// report one.
+    ///
+    /// It is here rather than behind a command of its own because the one thing that needs it
+    /// asks for this report at exactly the same moment: the startup gate's repair budget is
+    /// "one driver install, one reinstall and one relaunch per boot", and a restart is the
+    /// advice it gives when that budget runs out — so the restart has to clear it.
+    pub boot_id: String,
 }
 
 impl CompatibilityReport {
@@ -412,6 +428,60 @@ fn exit_app(app: tauri::AppHandle) {
         remove_all_displays(&state.virtual_display);
     }
     app.exit(0);
+}
+
+/// An id that changes when this machine reboots.
+///
+/// Derived rather than read from anywhere authoritative: wall clock now, minus the monotonic
+/// uptime, bucketed to ten seconds so the tick granularity and a small clock correction do not
+/// change it inside one boot. A large clock step would, and what that costs is one extra driver
+/// repair attempt — which is why nothing but the repair budget may key on this.
+#[cfg(windows)]
+pub fn boot_id() -> String {
+    let uptime_ms = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    format!("b{}", now_ms.saturating_sub(uptime_ms) / 10_000)
+}
+
+/// Empty off Windows: the repair budget exists for the bundled display driver, and no other
+/// platform has one to install.
+#[cfg(not(windows))]
+pub fn boot_id() -> String {
+    String::new()
+}
+
+/// Ask the other ScreenExtend instance that is holding the display driver's pipe to quit.
+///
+/// Only ever reaches an instance answering on the single-instance control socket — a desktop
+/// host or a `serve` — and never this process, whose own control server may well be the one
+/// that file names by the time the desktop UI asks. A `probe --live` run, or an instance that
+/// is already on its way out, has no socket to ask: the answer there is `false` and the user is
+/// told to close it themselves rather than being handed a button that silently does nothing.
+#[tauri::command]
+#[specta::specta]
+fn quit_driver_holder(app: tauri::AppHandle) -> bool {
+    let Ok(dir) = app.path().app_local_data_dir() else {
+        return false;
+    };
+    let ctrl_path = dir.join(single_instance::CTRL_FILE);
+    match single_instance::running_instance_pid_at(&ctrl_path) {
+        Some(pid) if pid != std::process::id() => {
+            tprintln!(
+                "[drivers] asking the instance holding the display driver (pid {pid}) to quit"
+            );
+            single_instance::signal_running_instance(&ctrl_path, single_instance::Command::Quit)
+        }
+        _ => {
+            teprintln!(
+                "[drivers] the process holding the display driver does not answer on the \
+                 control socket; it has to be closed by hand"
+            );
+            false
+        }
+    }
 }
 
 #[tauri::command]
@@ -761,6 +831,7 @@ pub fn run() {
             hosted_network::turn_on_wifi,
             install_drivers,
             remove_drivers,
+            quit_driver_holder,
             install_audio_driver,
             uninstall_audio_driver,
             audio_driver_status,
