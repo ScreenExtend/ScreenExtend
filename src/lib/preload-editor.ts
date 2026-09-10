@@ -29,7 +29,8 @@ export function preloadConfigEditor(): Promise<void> {
 async function run(): Promise<void> {
   try {
     await import("@/components/config-json-editor");
-    const { monaco, editorOptions, THEME_DARK, THEME_LIGHT } = await import("@/lib/monaco-setup");
+    const { monaco, editorOptions, THEME_DARK, THEME_LIGHT, assertThemeStylesApplied } =
+      await import("@/lib/monaco-setup");
 
     void monaco.languages.json
       .getWorker()
@@ -53,6 +54,10 @@ async function run(): Promise<void> {
     // let it lay out and paint once, which is where the font measuring and first
     // tokenization happen, then throw it away -- the caches it filled are global
     await new Promise(resolve => window.setTimeout(resolve, 0));
+    // The throwaway editor is what makes the theme service write its stylesheet, so this
+    // is the first moment the check is meaningful -- and it runs before Settings is ever
+    // opened, which is the point.
+    assertThemeStylesApplied();
     editor.getModel()?.dispose();
     editor.dispose();
     host.remove();

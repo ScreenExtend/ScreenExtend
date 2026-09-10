@@ -1,4 +1,7 @@
-import { DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT } from "@/components/config-provider";
+// Deliberately the plain-data module and not `@/components/config-provider`: this file is
+// imported under bare `node` by scripts/test-config-editor.mjs, which can strip types but
+// cannot parse JSX or resolve React.
+import { DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT } from "./config-defaults.ts";
 
 type JsonSchema = Record<string, unknown>;
 
@@ -119,6 +122,7 @@ export const configJsonSchema: JsonSchema = {
     "serverPorts",
     "hostedNetworkCredentials",
     "turnConfig",
+    "stunUrls",
     "dontShowAgain",
   ],
   additionalProperties: false,
@@ -198,6 +202,13 @@ export const configJsonSchema: JsonSchema = {
         credential: str("Password or credential for the TURN server."),
       },
     },
+    stunUrls: str(
+      "STUN servers offered to a device that is not already known to be on this subnet, as a comma-separated list. Empty means no STUN at all, which is a valid setting for a host that is only ever joined from the local network. Read once when the host starts, so a change here applies from the next launch; also writable with `ScreenExtend stun set|clear`.",
+      {
+        pattern: "^( *stuns?:.*)?$",
+        patternErrorMessage: "Must start with \"stun:\" or \"stuns:\", or be empty to disable STUN.",
+      }
+    ),
     dontShowAgain: {
       type: "object",
       description: "Confirmation dialogs the user has chosen to suppress.",
@@ -213,10 +224,31 @@ export const configJsonSchema: JsonSchema = {
   },
 };
 
+// Every value in config.json worth hiding from a shoulder or a screen share. Paths are the
+// ones `scanJson` produces, with `[]` standing for any array index. It lives beside the
+// schema rather than in the editor component so the node test can check it against a real
+// config without loading React.
+export const MASKED_CONFIG_PATHS = [
+  "hostedNetworkCredentials.password",
+  "devices[].token",
+  "knownDevices[].token",
+  "turnConfig.credential",
+];
+
 export interface ConfigError {
   path: string;
   message: string;
+  // A key the schema does not name is reported but does not stop a save. `config.json` is
+  // written by three parties -- this editor, `ScreenExtend config set <dotted.key>`, and
+  // whichever version of the app last ran -- and `readStore` drops any key that is not in
+  // `defaultConfig` on the way in, so an unrecognised key is inert rather than harmful.
+  // Refusing to write the whole document because of one made the editor unusable after a
+  // key was added to the config type and not to this schema.
+  severity: "error" | "warning";
 }
+
+export const blockingErrors = (errors: ConfigError[]): ConfigError[] =>
+  errors.filter(error => error.severity === "error");
 
 const label = (path: string) => (path === "" ? "(root)" : path);
 
@@ -249,6 +281,7 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
     errors.push({
       path,
       message: `${label(path)}: expected ${type}, got ${typeOf(value)}`,
+      severity: "error",
     });
     return;
   }
@@ -258,6 +291,7 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
     errors.push({
       path,
       message: `${label(path)}: ${JSON.stringify(value)} is not one of ${allowed.map(v => JSON.stringify(v)).join(", ")}`,
+      severity: "error",
     });
     return;
   }
@@ -265,10 +299,10 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
   if (typeof value === "number") {
     const { minimum, maximum } = schema as { minimum?: number; maximum?: number };
     if (minimum !== undefined && value < minimum) {
-      errors.push({ path, message: `${label(path)}: ${value} is below the minimum of ${minimum}` });
+      errors.push({ path, message: `${label(path)}: ${value} is below the minimum of ${minimum}`, severity: "error" });
     }
     if (maximum !== undefined && value > maximum) {
-      errors.push({ path, message: `${label(path)}: ${value} is above the maximum of ${maximum}` });
+      errors.push({ path, message: `${label(path)}: ${value} is above the maximum of ${maximum}`, severity: "error" });
     }
   }
 
@@ -279,10 +313,10 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
       pattern?: string;
     };
     if (minLength !== undefined && value.length < minLength) {
-      errors.push({ path, message: `${label(path)}: must be at least ${minLength} characters` });
+      errors.push({ path, message: `${label(path)}: must be at least ${minLength} characters`, severity: "error" });
     }
     if (maxLength !== undefined && value.length > maxLength) {
-      errors.push({ path, message: `${label(path)}: must be at most ${maxLength} characters` });
+      errors.push({ path, message: `${label(path)}: must be at most ${maxLength} characters`, severity: "error" });
     }
     if (pattern !== undefined && !new RegExp(pattern).test(value)) {
       const hint = (schema as { patternErrorMessage?: string }).patternErrorMessage;
@@ -291,6 +325,7 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
         message: hint
           ? `${label(path)}: ${hint}`
           : `${label(path)}: ${JSON.stringify(value)} does not match ${pattern}`,
+        severity: "error",
       });
     }
   }
@@ -305,7 +340,7 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
     const record = value as Record<string, unknown>;
     for (const key of (schema.required as string[] | undefined) ?? []) {
       if (!(key in record)) {
-        errors.push({ path, message: `${label(path)}: missing required key "${key}"` });
+        errors.push({ path, message: `${label(path)}: missing required key "${key}"`, severity: "error" });
       }
     }
     for (const [key, child] of Object.entries(record)) {
@@ -313,7 +348,7 @@ function walk(schema: JsonSchema, value: unknown, path: string, errors: ConfigEr
       const childSchema = properties[key];
       if (!childSchema) {
         if (schema.additionalProperties === false) {
-          errors.push({ path: childPath, message: `${label(path)}: "${key}" is not a known key` });
+          errors.push({ path: childPath, message: `${label(path)}: "${key}" is not a known key`, severity: "warning" });
         }
         continue;
       }
@@ -328,7 +363,9 @@ export function validateConfig(
 ): ConfigError[] {
   const errors: ConfigError[] = [];
   walk(configJsonSchema, value, "", errors);
-  if (errors.length > 0) return errors;
+  // Only a real error means the shape below cannot be indexed into; an unknown key is a
+  // warning and must not suppress the cross-field checks that follow it.
+  if (blockingErrors(errors).length > 0) return errors;
 
   const config = value as {
     serverPorts: { http: number; https: number };
@@ -340,6 +377,7 @@ export function validateConfig(
     errors.push({
       path: "serverPorts.https",
       message: "serverPorts: the HTTP and HTTPS ports must differ",
+      severity: "error",
     });
   }
 
@@ -349,6 +387,7 @@ export function validateConfig(
     errors.push({
       path: "hostedNetworkCredentials.password",
       message: `hostedNetworkCredentials.password: must be empty or at least ${minPassword} characters on this platform`,
+      severity: "error",
     });
   }
 
@@ -358,6 +397,7 @@ export function validateConfig(
       errors.push({
         path: `devices[${i}].ip`,
         message: `devices[${i}]: duplicate entry for ${device.ip}`,
+        severity: "error",
       });
     }
     seen.add(device.ip);
@@ -365,6 +405,7 @@ export function validateConfig(
       errors.push({
         path: `devices[${i}].dpr`,
         message: `devices[${i}]: dpr ${device.dpr} is above the device's maxDpr of ${device.maxDpr}`,
+        severity: "error",
       });
     }
   });

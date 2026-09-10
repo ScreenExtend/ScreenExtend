@@ -2599,3 +2599,30 @@ host extends a display without it.
 writes is `pointerScope` on the TS `Device` (`"display" | "all"`, default `"display"`), pushed
 with `commands.setDevicePointerScope(ip, scope)`. `package.json` gained `test:gate`, which is not
 yet in `.github/workflows/ci.yml`.
+
+## UX-D: the Settings config.json editor (post-report)
+
+The owner reported the editor as "100% broken": one error in the Problems panel
+(`Property stunUrls is not allowed`), no syntax colours at all, line numbers rendered in the
+body text colour with no gutter, and scrolling that behaved oddly. Two independent
+regressions from this engagement, both invisible to `tsc`, eslint, every existing gate and
+the dev-mode Vite server. Reproduced against the owner's real `config.json` in the built
+app over the WebView2 remote-debugging port, then fixed and re-verified the same way.
+
+| # | Change | Status |
+|---|---|---|
+| D1 | **`stunUrls` reached the config type and never reached the schema.** `6f49444` added it to `Config`/`defaultConfig`; `config-schema.ts` has `additionalProperties: false`, so every user's config now failed its own validator and the Save button refused the document. Added, with a `stun:`/`stuns:` pattern and a description saying it is read at launch. | `VERIFIED` (live: 1 error → 0 in the built app, editor saves) |
+| D2 | **An inline `<style>` in index.html silently killed monaco's theme.** `affd5a2` added a two-rule `<style>` to paint the right background before the 50 KB stylesheet lands. Tauri answers an inline stylesheet by adding `'nonce-…'` to `style-src` — and CSP *ignores* `'unsafe-inline'` once a nonce is present. Monaco does not ship its theme as a stylesheet: `defineTheme` writes 123 KB of `.mtk*` token colours, codicon glyphs and `--vscode-*` variables into one `<style class="monaco-colors">` at runtime, which then carries no nonce and is dropped whole. The editor kept working and only *looked* broken. The background is now set from the same head script (a CSSOM write is not subject to `style-src`) and `ThemeProvider` keeps it in step. | `VERIFIED` (live: `style-src 'self' 'unsafe-inline' 'nonce-…'` → no nonce; `style.monaco-colors`'s `.sheet` null → a real stylesheet; colours, gutter and scrollbars back) |
+| D3 | An unknown key is a **warning**, not a save blocker. `ConfigError` carries a severity and `blockingErrors()` is what `commit()` gates on. `config.json` is written by three parties — the editor, `ScreenExtend config set <dotted.key>` and whichever version last ran — and `readStore` drops any key not in `defaultConfig` on the way in, so an unrecognised key is inert. Refusing to write the whole document over one is exactly the failure D1 produced. | `VERIFIED` (`pnpm test:config`) |
+| D4 | The config shape moved to `src/lib/config-defaults.ts`, a module with no imports; `config-provider.tsx` re-exports it and `config-schema.ts` imports the two port constants from it. That is what lets plain `node` — type stripping only, no JSX, no bundler — hold the schema and the type side by side. | `VERIFIED` (`tsc`, `pnpm build`) |
+| D5 | The masking's pure half is `maskedSpans()`/`isMaskedPath()` in `json-structure.ts`; `json-editor.tsx` only maps the spans onto `monaco.Range`. The reported symptom "the token line renders blank" did not reproduce — masking is correct, and the discs were invisible for the D2 reason (no theme sheet) rather than a wrong span — but the span arithmetic is now pinned: every secret in a real config is covered exactly, quotes, comma and key name excluded. | `VERIFIED` (`pnpm test:config`, 7 masking assertions incl. a credential made of JSON metacharacters) |
+| D6 | **The guards.** `pnpm test:config` (`scripts/test-config-editor.mjs`, in the CI frontend job) cross-checks `defaultConfig`'s keys against the schema's properties *and* its `required` list, parses `Device`/`KnownDevice`'s members out of the type text, validates the owner's real config to zero errors, and asserts index.html carries no `<style>`, that the policy still says `'unsafe-inline'`, that `dist/index.html` carries none either and that monaco's CSS ships as its own asset. `monaco-setup.ts` also gained `assertThemeStylesApplied()`, called from the editor preload, which turns a dropped theme sheet into a `console.error` on the log bus instead of a purely visual failure. | `VERIFIED` (both defects fail the new test when reverted) |
+
+**Rejected.** `dangerousDisableAssetCspModification: ["style-src"]` in `tauri.conf.json` would
+also work and would survive a future inline `<style>`, but it hides the served policy from
+the one in the config file and reads as a security relaxation when the actual fix is to stop
+producing the trigger. The static check does the same job with no config surface.
+
+**Not fixed, named instead.** `stunUrls` is read once at `setup` and `apply_saved_config`
+does not replay it, so neither the editor nor `RELOAD` applies it to a running host. That is
+pre-existing and needs a Rust command; the schema description now says when it takes effect.
