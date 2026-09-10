@@ -330,6 +330,25 @@ fn capability_notes(probes: &Probes) -> Vec<UnsupportedApi> {
             "Not installed. Each connected device needs one; install the driver to continue.",
             "Windows 10 20H1 (build 19041)",
         )),
+        // Installed, healthy, and somebody else has it. `optional`, not `installable`: there is
+        // nothing here to install, and the bootstrap must not reach for the elevated installer
+        // against a driver whose only problem is that another one of our own processes got
+        // there first. Not `blocking` either — quitting that process fixes it, so this is not a
+        // verdict on the machine.
+        DisplayBackend::DriverBusy { holder } => unsupported.push(UnsupportedApi::optional(
+            api_key::DISPLAY_DRIVER_BUSY,
+            "Virtual Display Driver",
+            match holder {
+                Some(pid) => format!(
+                    "Installed and working, but another ScreenExtend instance (pid {pid}) is \
+                     already using it. Quit that one, then try again."
+                ),
+                None => "Installed and working, but another ScreenExtend instance is already \
+                         using it. Quit that one, then try again."
+                    .to_string(),
+            },
+            "Windows 10 20H1 (build 19041)",
+        )),
         DisplayBackend::DriverNotResponding => unsupported.push(UnsupportedApi::installable(
             api_key::DISPLAY_DRIVER_UNRESPONSIVE,
             "Virtual Display Driver",
@@ -418,6 +437,8 @@ pub fn check_system_requirements() -> CompatibilityReport {
         encoder_backend: probes.encoder.backend.to_string(),
         hosted_network_backend: probes.hosted_network.as_str().to_string(),
         input_backend: crate::streamer::input::probe_backend().as_str().to_string(),
+        display_driver_holder_pid: probes.display_backend.holder(),
+        boot_id: crate::boot_id(),
     }
 }
 
@@ -507,6 +528,15 @@ mod test {
                 },
             ),
             (
+                "the display driver is in use by another instance",
+                Probes {
+                    display_backend: DisplayBackend::DriverBusy {
+                        holder: Some(71848),
+                    },
+                    ..healthy()
+                },
+            ),
+            (
                 "every optional fault at once",
                 Probes {
                     wgc: false,
@@ -561,6 +591,51 @@ mod test {
         );
     }
 
+    /// A driver whose pipe is merely taken is the one display-driver state that must **not** be
+    /// remediated. It used to arrive here as `DriverNotResponding`, which is `installable`, so
+    /// the bootstrap removed and reinstalled a healthy signed driver — one elevation prompt per
+    /// pass — probed again, found the pipe still held by the other process, and went round.
+    #[test]
+    fn a_busy_driver_is_reported_but_never_installed() {
+        for holder in [Some(71848u32), None] {
+            let notes = capability_notes(&Probes {
+                display_backend: DisplayBackend::DriverBusy { holder },
+                ..healthy()
+            });
+            assert_eq!(
+                notes.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(),
+                vec![api_key::DISPLAY_DRIVER_BUSY],
+                "the busy driver must be reported, and be the only row"
+            );
+            assert!(
+                keys(&notes, crate::SEVERITY_INSTALLABLE).is_empty(),
+                "a busy driver is not installable: there is nothing to install"
+            );
+            assert!(
+                keys(&notes, crate::SEVERITY_BLOCKING).is_empty(),
+                "a busy driver is not a verdict either: quitting the other instance fixes it"
+            );
+            if let Some(pid) = holder {
+                assert!(
+                    notes[0].description.contains(&pid.to_string()),
+                    "the row must name the process to quit: {}",
+                    notes[0].description
+                );
+            }
+        }
+    }
+
+    /// `DriverBusy` is a value of an existing string field, so nothing on the wire changed
+    /// shape — but the value itself is compared against a literal on the other side.
+    #[test]
+    fn the_busy_backend_reports_its_holder_separately() {
+        let backend = DisplayBackend::DriverBusy {
+            holder: Some(71848),
+        };
+        assert_eq!(backend.as_str(), "DriverBusy");
+        assert_eq!(backend.holder(), Some(71848));
+    }
+
     /// No capture backend at all is the one thing that genuinely cannot be worked around.
     #[test]
     fn losing_every_capture_backend_is_the_bare_minimum() {
@@ -595,6 +670,8 @@ mod test {
             encoder_backend: "nvenc".into(),
             hosted_network_backend: "WiFiDirect".into(),
             input_backend: "SendInput".into(),
+            display_driver_holder_pid: None,
+            boot_id: String::new(),
         };
         assert!(!report.bare_minimum_missing());
         assert_eq!(report.installable().count(), 1);

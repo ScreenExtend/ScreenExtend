@@ -104,6 +104,16 @@ export type Config = {
     editNetwork: boolean,
     compatibility: boolean,
     configEditor?: boolean
+  },
+  // What has already been tried about the display driver since this machine last booted, so a
+  // repair that did not work is not tried again behind another elevation prompt. Bookkeeping
+  // rather than a preference, but it is persisted here rather than in localStorage because
+  // losing it is what turns "one attempt" into "one attempt per launch, forever".
+  driverRepair: {
+    boot: string,
+    install: number,
+    reinstall: number,
+    relaunch: number
   }
 };
 
@@ -142,5 +152,11 @@ export const defaultConfig: Config = {
     editNetwork: false,
     compatibility: false,
     configEditor: false
+  },
+  driverRepair: {
+    boot: "",
+    install: 0,
+    reinstall: 0,
+    relaunch: 0
   }
 };
