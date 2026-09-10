@@ -46,6 +46,16 @@ const deviceSchema: JsonSchema = {
     videoScale: int("Percentage of the display resolution actually encoded and streamed. Lower values trade sharpness for bandwidth.", 10, 100, 100),
     videoQuality: int("H.264 quantiser (QP). Lower means better quality and a larger stream; 1 is near-lossless, 51 is worst.", 1, 51, 23),
     remoteControl: bool("Let this device control the host with its keyboard, mouse and touch input.", false),
+    pointerScope: {
+      type: "string",
+      description: "How far this device's pointer may travel when it has taken pointer lock. Only meaningful when remoteControl is on.",
+      enum: ["display", "all"],
+      enumDescriptions: [
+        "Clamp the cursor to the display created for this device — it cannot reach a monitor the device's user cannot see.",
+        "Clamp to the union of every attached display, so the cursor can cross onto the host's own monitors. Needed to drag a window back off the virtual display.",
+      ],
+      default: "display",
+    },
     systemAudio: bool("Stream the host's system audio to this device.", false),
     audioOutputDeviceId: str("Identifier of the audio output on the device that system audio is played through. Empty means the device's default output."),
     audioOutputDeviceLabel: str("Human-readable label for audioOutputDeviceId, shown in the device settings."),
