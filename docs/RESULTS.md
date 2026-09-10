@@ -741,7 +741,7 @@ verdict on the priority changes was that they "didn't make much difference" — 
   remaining item for the owner's original complaint and it is **not in this change**.
 - **The client's refresh-rate measurement runs during page load**, where Chrome fires
   `requestAnimationFrame` faster than vsync; the page's own later refinement logs
-  `[refresh] refined to 60 Hz from 360`. Row 325 bounds the damage from the host side, which is
+  `[refresh] refined to 60 Hz from 360`. Row 326 bounds the damage from the host side, which is
   where a number the host did not measure has to be bounded, but the client should not be
   reporting it.
 - **`ice_gathering_timed_out` on the client**, on the current tree and not on `271aa01`. It

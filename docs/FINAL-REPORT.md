@@ -2444,3 +2444,98 @@ is one command once that workstream is finished:
 ```powershell
 Start-Process 'C:\Users\sarve\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe'
 ```
+
+## 15.6 Post-report regression: freezes, the stale cursor, and "so much slower"
+
+The owner's verdict on the built app was the opposite of every table in §2 and `RESULTS.md`: "the
+cursor gets frozen way more often and the cursor is painted on stale frames", then "my system is so
+much slower and laggier". Both statements were true at the same time as the tables, because the
+tables measure something else. `probe` paints a full-frame animation into a borderless window —
+**every frame is a changed frame**, there is no browser in it, and nothing in it can demote itself,
+ask for a keyframe or fall behind. The scene the owner described is the one `probe` cannot produce:
+a pointer sweeping across an otherwise empty virtual display.
+
+`scripts/measure-stream.ps1` is the measurement that was missing — a real `serve` host, a real
+Chrome join over HTTPS driven through the DevTools protocol, a `SendInput` pointer sweep on the
+virtual display, one row a second of what the **client** reports, a 60 fps recording of the client
+window counted through `mpdecimate`, and a second page sampling the host desktop's own animation
+cadence while it all happens. Windows 11 26200, RTX 3080 Ti Laptop + Intel UHD, 30 s per run,
+median of three, saved device rows cleared. `docs/RESULTS.md` §"User-facing stream quality" carries
+the full tables and the method; `docs/manual-tests/stream-as-a-client-sees-it.md` is the script for
+re-running it.
+
+### Before and after
+
+| | `271aa01` | after |
+|---|---|---|
+| painted frames/s, client-reported | **6.5** | **53.6** |
+| keyframe requests the host received / 30 s | **65** | **0** |
+| virtual display created | `3840x2160@360` | `1920x1080@60` |
+| freezes ≥ 100 ms per minute, from the recording | 285 | 190 |
+| host desktop while streaming | 59.9 fps | 59.9 fps |
+
+The last row is the answer to "my system is so much slower": the host's own desktop holds 59.9 fps
+in **both** builds once the display it is driving is the right size. The 3840x2160@360 display is
+what made the machine slow, not the priority changes — a client whose screen is 1920x1080 at DPR 1
+asked for a 360 Hz display because its own `requestAnimationFrame` measurement said so during page
+load, and the host built one: four times the pixels at six times the rate, **24x the pixel rate**,
+on an integrated GPU also composing the real desktop. A saved device row pinned it there for every
+later join.
+
+### The eight root causes
+
+| # | Cause | Fix | Ledger | Commit |
+|---|---|---|---|---|
+| 1 | A client could claim any refresh rate for itself, and the saved row replayed it forever | `DEFAULT_MAX_AUTO_REFRESH` (60) caps what a device may claim, in the join path and in `Device::defaults`; the per-device slider still reaches `MAX_REFRESH_RATE` (500) | 326 | `b0183dd` |
+| 2 | The WGC unchanged-frame skip ate pointer-only motion: an empty dirty region with a moved cursor is a changed picture | `CursorProbe` asks `GetCursorInfo` whether the pointer moved, changed shape, or entered or left this monitor, and any of those counts as a change; with `autoFrameRate` off (the default) the skip is not consulted at all | 327 | `b0183dd` |
+| 3 | The display was forced to at least `DISPLAY_COMPOSE_HZ` and delivered at whatever rate it composed | The virtual display is created at the rate the device asked for, and delivery is capped there (`frames_skipped_cadence`) | 328 | `b0183dd` |
+| 4 | A client's PLI was answered with a long-term-reference repair — a P-frame predicted from a picture a decoder that has never seen a keyframe does not hold | A keyframe request that came from the **client** (PLI, FIR, or the in-band `0x64`) is answered with an IDR, full stop; the repair path keeps only the losses the transport itself detected | 329 | `3e6e6b9` |
+| 5 | The session's opening IDR went out before the peer connection existed, so the decoder started without one and every later request was suppressed as redundant | The first RTP that actually reaches the wire asks for a keyframe, through the gate | 330 | `3e6e6b9` |
+| 6 | The client declared a decoder backlog off a count that reads acceptance, not output, and tore itself down at two frames in flight | A backlog is declared only after `BACKLOG_STALL_MS` (66 ms) with **no output** *and* the in-flight count over the cap; the cap rises from 2 to 6 | 332 | `b0183dd` |
+| 7 | The encoder ran at GPU scheduling class `REALTIME` (5), above the compositor | Class `ABOVE_NORMAL` (3); `SE_GPU_SCHED_CLASS` overrides it with a raw class number and `2` turns it off | 331 | `b0183dd` |
+| 8 | `set_device_override` took two `lock_recover()` guards inside one struct literal — both alive to the end of the statement, on a non-reentrant mutex — so `serve` hung at startup for any host with a saved device | Both carried fields are read under one guard before the literal | 325 | `b0183dd` |
+
+The harness itself is ledger row 333 (`65a9cff`, extended in `3e6e6b9`). Rows 325–333 arrived
+numbered 324–332 on the branch and were shifted by one here, the `labelled` row of §15.5 already
+holding 324; the three documents that named a shifted number moved with them.
+
+### Two things this does not fix
+
+- **WGC delivers 2–10 real frames a second for pointer-only motion on this box's indirect
+  display — in both builds.** Everything else it emits is a keepalive repeat, and a repeat carries
+  the pointer wherever WGC last composited it. That is why the painted rate went up more than
+  eightfold and the *changed*-frame rate in the recording did not move, and it is the direct
+  mechanism behind "the cursor is painted on stale frames". Nothing in this change causes it and
+  nothing in this change fixes it. The fix is to stop asking WGC to composite the pointer
+  (`CursorCaptureSettings::WithoutCursor`) and draw it ourselves from `GetCursorInfo` into the ring
+  slot, reusing the sprite renderer `windows_utils/streamer/dxgi/cursor.rs` already has for exactly
+  this. **It is the single largest remaining item for the owner's original complaint.**
+- **`ice_gathering_timed_out` on the client, in four of six runs, absent at `271aa01`.** Not caused
+  by anything in this change; the suspect is `56fe583`, which stopped offering STUN to a
+  same-subnet peer. Worth a look before release.
+
+### Gates, build and the device row
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **396 passed,
+0 failed, 14 ignored**, identical under `SE_REQUIRE_HW=1`; `pnpm lint` 0 errors; `pnpm build`;
+`check-legacy-webkit`; `pnpm test:client` 7/7; `pnpm test:gate`; `pnpm test:config`;
+`check-bindings` **51 commands / 11 events** (regenerated from the merged tree and unchanged by it
+— the branch's two new counters ride the `STATS` verb, not specta); `check-versions` 0.6.3;
+`sha256sum -c` 34/34 and 5/5. The merge itself was conflict-free, and the two things an
+auto-merge could have quietly lost — the self-deadlock fix inside the block `dev-settings` added,
+in both `windows_utils/mod.rs` and `macos_utils/mod.rs` — were read back by hand rather than
+assumed.
+
+`pnpm tauri build`: release profile in **8m 19s**, both installers produced, exit **1** on the
+updater signing step alone.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 13,918,208 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,831,250 |
+| `…/release/ScreenExtend.exe` | 29,960,704 |
+
+Before relaunching, the row the measurement left behind was cleared — `ScreenExtend devices reset
+172.16.11.76`, which is the saved `refreshRate 360` / `dpr 2` that root cause 1 exists to stop
+being written in the first place. `devices list` now shows only `172.16.11.81` at 120 Hz, untouched,
+and the ten `knownDevices` rows are unchanged. The app was then relaunched detached.
