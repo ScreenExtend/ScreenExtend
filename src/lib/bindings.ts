@@ -127,8 +127,8 @@ async audioDriverStatus() : Promise<string> {
 async setLegacyVolumeKeyProxy(enabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_legacy_volume_key_proxy", { enabled });
 },
-async setDeviceOverride(ip: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_device_override", { ip, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
+async setDeviceOverride(device: string, scale: number, orientation: string, refreshRate: number, videoScale: number, videoQuality: number, controlEnabled: boolean, dpr: number, audioEnabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_override", { device, scale, orientation, refreshRate, videoScale, videoQuality, controlEnabled, dpr, audioEnabled });
 },
 /**
  * Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
@@ -139,8 +139,8 @@ async setDeviceOverride(ip: string, scale: number, orientation: string, refreshR
  * no live display to touch. The injector reads the scope when the session is built, so a
  * change applies to the next connection, exactly like remote control itself.
  */
-async setDevicePointerScope(ip: string, scope: string) : Promise<void> {
-    await TAURI_INVOKE("set_device_pointer_scope", { ip, scope });
+async setDevicePointerScope(device: string, scope: string) : Promise<void> {
+    await TAURI_INVOKE("set_device_pointer_scope", { device, scope });
 },
 /**
  * Whether this device's stream may drop below its chosen refresh rate on its own.
@@ -151,20 +151,29 @@ async setDevicePointerScope(ip: string, scope: string) : Promise<void> {
  * is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
  * a change applies to the next connection.
  */
-async setDeviceAutoFrameRate(ip: string, enabled: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_device_auto_frame_rate", { ip, enabled });
+async setDeviceAutoFrameRate(device: string, enabled: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_auto_frame_rate", { device, enabled });
 },
-async refreshDeviceStream(ip: string) : Promise<boolean> {
-    return await TAURI_INVOKE("refresh_device_stream", { ip });
+async refreshDeviceStream(device: string, joinId: string | null) : Promise<boolean> {
+    return await TAURI_INVOKE("refresh_device_stream", { device, joinId });
 },
-async setDeviceAudioOutput(ip: string, deviceId: string) : Promise<void> {
-    await TAURI_INVOKE("set_device_audio_output", { ip, deviceId });
+/**
+ * End one live session without touching the device's settings or its trust.
+ * 
+ * The per-join counterpart to `remove_device_override`: a device with two tabs open can have one
+ * of them disconnected.
+ */
+async disconnectSession(joinId: string) : Promise<boolean> {
+    return await TAURI_INVOKE("disconnect_session", { joinId });
 },
-async getDeviceAudioOutputs(ip: string) : Promise<AudioOutputsReport> {
-    return await TAURI_INVOKE("get_device_audio_outputs", { ip });
+async setDeviceAudioOutput(device: string, deviceId: string) : Promise<void> {
+    await TAURI_INVOKE("set_device_audio_output", { device, deviceId });
 },
-async removeDeviceOverride(ip: string) : Promise<void> {
-    await TAURI_INVOKE("remove_device_override", { ip });
+async getDeviceAudioOutputs(device: string) : Promise<AudioOutputsReport> {
+    return await TAURI_INVOKE("get_device_audio_outputs", { device });
+},
+async removeDeviceOverride(device: string) : Promise<void> {
+    await TAURI_INVOKE("remove_device_override", { device });
 },
 async setDeviceBanned(token: string, ip: string, banned: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_banned", { token, ip, banned });
@@ -296,7 +305,21 @@ display_driver_holder_pid: number | null;
  * advice it gives when that budget runs out — so the restart has to clear it.
  */
 boot_id: string }
-export type Device = { ip: string; token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
+export type Device = { 
+/**
+ * The live session this row is — one browser tab. A device with two tabs open produces two
+ * rows with one `token` between them. Empty on a row that describes only a device.
+ */
+joinId: string; 
+/**
+ * Where the device was when it last spoke. A label: it changes under a live session and it
+ * is recycled between devices, so nothing is keyed by it.
+ */
+ip: string; 
+/**
+ * The device. Every per-device setting, and the `config.json` row, is keyed by this.
+ */
+token: string; name: string; scale: number; orientation: string; refreshRate: number; videoScale: number; videoQuality: number; remoteControl: boolean; 
 /**
  * `"display"` or `"all"` — how far a pointer-locked client may drive this host's cursor.
  * See `streamer::input::PointerScope`.
@@ -307,7 +330,15 @@ pointerScope: string;
  * is a promise: see `streamer::session::DeviceOverride::auto_frame_rate`.
  */
 autoFrameRate: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
-export type DeviceAudioOutputs = { ip: string; supported: boolean; outputs: AudioOutput[]; 
+export type DeviceAudioOutputs = { 
+/**
+ * The join that reported this list. One browser tab.
+ */
+joinId: string; 
+/**
+ * The device the join belongs to, and what the UI keys its row by.
+ */
+token: string; supported: boolean; outputs: AudioOutput[]; 
 /**
  * What the host last asked this device to play on.
  */

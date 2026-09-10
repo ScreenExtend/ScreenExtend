@@ -384,7 +384,7 @@ export function validateConfig(
   const config = value as {
     serverPorts: { http: number; https: number };
     hostedNetworkCredentials: { password: string };
-    devices: { ip: string; dpr: number; maxDpr: number }[];
+    devices: { token?: string; ip: string; dpr: number; maxDpr: number }[];
   };
 
   if (config.serverPorts.http === config.serverPorts.https) {
@@ -405,16 +405,21 @@ export function validateConfig(
     });
   }
 
+  // Two rows for one device is the shape that makes a setting silently unreachable: whichever
+  // the host replays last wins and the other is dead weight. The identity is the token; a row
+  // written before tokens existed names only its address, so that is what it is checked by.
   const seen = new Set<string>();
   config.devices.forEach((device, i) => {
-    if (seen.has(device.ip)) {
+    const key = device.token ? `token:${device.token}` : `ip:${device.ip}`;
+    const label = device.token || device.ip;
+    if (seen.has(key)) {
       errors.push({
-        path: `devices[${i}].ip`,
-        message: `devices[${i}]: duplicate entry for ${device.ip}`,
+        path: device.token ? `devices[${i}].token` : `devices[${i}].ip`,
+        message: `devices[${i}]: duplicate entry for ${label}`,
         severity: "error",
       });
     }
-    seen.add(device.ip);
+    seen.add(key);
     if (device.dpr !== undefined && device.maxDpr !== undefined && device.dpr > device.maxDpr) {
       errors.push({
         path: `devices[${i}].dpr`,

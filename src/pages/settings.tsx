@@ -90,12 +90,12 @@ function formatLastSeen(ts: number): string {
 // the connected set does.
 const PastDevicesTable = React.memo(function PastDevicesTable({
   devices,
-  connectedIps,
+  connectedTokens,
   onBan,
   onForget,
 }: {
   devices: KnownDevice[];
-  connectedIps: Set<string>;
+  connectedTokens: Set<string>;
   onBan: (device: { token?: string; ip: string }, banned: boolean) => Promise<boolean>;
   onForget: (device: { token?: string; ip: string }) => Promise<void>;
 }) {
@@ -126,13 +126,13 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
             <TableCell className="font-medium">
               <div className="flex items-center space-x-2">
                 <span>{device.name || "Unknown device"}</span>
-                {connectedIps.has(device.ip) && (
+                {connectedTokens.has(device.token ?? "") && (
                   <span className="inline-flex items-center space-x-1 text-xs text-green-600">
                     <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
                     Connected
                   </span>
                 )}
-                {!device.banned && !connectedIps.has(device.ip) && (
+                {!device.banned && !connectedTokens.has(device.token ?? "") && (
                   <span className="text-xs text-muted-foreground">Auto-join</span>
                 )}
                 {device.banned && (
@@ -478,7 +478,12 @@ export default function Settings() {
   // A `Set` rather than the linear `connectedDevices.some(...)` this replaced: the sort
   // comparator below calls it twice per comparison, so the sort was O(n log n * m) in the
   // number of known and connected devices.
-  const connectedIps = useMemo(() => new Set(connectedDevices.map(d => d.ip)), [connectedDevices]);
+  // By token, not by address: the address a device had this morning belongs to whatever holds
+  // the lease now, so a "connected" badge keyed by it lights up beside the wrong row.
+  const connectedTokens = useMemo(
+    () => new Set(connectedDevices.map(d => d.token).filter(Boolean)),
+    [connectedDevices]
+  );
 
   const applyBan = async (device: { token?: string; ip: string }, banned: boolean): Promise<boolean> => {
     const token = device.token ?? "";
@@ -546,10 +551,11 @@ export default function Settings() {
   const sortedKnownDevices = useMemo(
     () =>
       [...knownDevices].sort((a, b) => {
-        const connectedDelta = Number(connectedIps.has(b.ip)) - Number(connectedIps.has(a.ip));
+        const connectedDelta =
+          Number(connectedTokens.has(b.token)) - Number(connectedTokens.has(a.token));
         return connectedDelta !== 0 ? connectedDelta : b.lastSeen - a.lastSeen;
       }),
-    [knownDevices, connectedIps]
+    [knownDevices, connectedTokens]
   );
 
   const saveDisconnectGrace = async () => {
@@ -1190,7 +1196,7 @@ export default function Settings() {
               </div>
               <PastDevicesTable
                 devices={sortedKnownDevices}
-                connectedIps={connectedIps}
+                connectedTokens={connectedTokens}
                 onBan={applyBan}
                 onForget={forgetDevice}
               />

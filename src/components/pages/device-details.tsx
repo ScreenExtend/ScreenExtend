@@ -42,7 +42,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_AUTO_FRAME_RATE, DEFAULT_POINTER_SCOPE, type Device } from "@/components/config-provider";
+import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_AUTO_FRAME_RATE, DEFAULT_POINTER_SCOPE, type Device, type ConnectedDevice } from "@/components/config-provider";
 import { useAudioOutputs, useGlobalSetters } from "@/components/global-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -93,7 +93,7 @@ function TipLabel({
 // `data-[state=closed]:duration-300` in ui/sheet.tsx.
 const SHEET_EXIT_MS = 500;
 
-export function DeviceDetails({ device }: { device: Device }) {
+export function DeviceDetails({ device }: { device: ConnectedDevice }) {
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
   // The Sheet root owns `onOpenChange`, but the unsaved-changes prompt needs the formik
@@ -133,7 +133,7 @@ function DeviceDetailsBody({
   setOpen,
   closeRequest,
 }: {
-  device: Device;
+  device: ConnectedDevice;
   open: boolean;
   setOpen: (open: boolean) => void;
   closeRequest: React.MutableRefObject<() => void>;
@@ -181,9 +181,11 @@ function DeviceDetailsBody({
   const volumeKeyProxy = useConfig()?.legacyVolumeKeyProxy ?? false;
   const [proxyBusy, setProxyBusy] = useState(false);
 
-  const audioOutputsByIp = useAudioOutputs();
-  const { setAudioOutputsByIp } = useGlobalSetters();
-  const audioOutputs = audioOutputsByIp[device.ip];
+  // Keyed by device token, because two tabs of one browser share one set of speakers and the
+  // sink the host picks applies to both.
+  const audioOutputsByToken = useAudioOutputs();
+  const { setAudioOutputsByToken } = useGlobalSetters();
+  const audioOutputs = audioOutputsByToken[device.token];
   // `current` is what the client reports it is playing on; `selected` is what the host has
   // asked for. `undefined` means the client never said, which is not the same as "the
   // default" -- only a string (empty for the device's default output) is an answer.
@@ -219,10 +221,10 @@ function DeviceDetailsBody({
     if (!open) return;
     (async () => {
       try {
-        const r = await commands.getDeviceAudioOutputs(device.ip);
-        setAudioOutputsByIp((prev) => ({
+        const r = await commands.getDeviceAudioOutputs(device.token);
+        setAudioOutputsByToken((prev) => ({
           ...prev,
-          [device.ip]: {
+          [device.token]: {
             supported: r.supported,
             outputs: r.outputs,
             selected: r.selected,
@@ -234,7 +236,7 @@ function DeviceDetailsBody({
         console.error("failed to read the device audio outputs", e);
       }
     })();
-  }, [open, device.ip, setAudioOutputsByIp]);
+  }, [open, device.token, setAudioOutputsByToken]);
 
   const runAudioInstall = async () => {
     setInstallPromptOpen(false);
@@ -305,8 +307,11 @@ function DeviceDetailsBody({
         dpr: Number(values.dpr),
       };
       try {
+        // Every command below takes the *device*, which is its token. The address was the key
+        // until it turned out to be recycled between machines and to move under a live
+        // session; it is a label on this sheet now and nothing more.
         await commands.setDeviceOverride(
-          normalized.ip,
+          normalized.token,
           normalized.scale,
           normalized.orientation,
           normalized.refreshRate,
@@ -319,20 +324,23 @@ function DeviceDetailsBody({
         // Their own commands, not an eleventh and twelfth argument to `setDeviceOverride`:
         // that one is already at specta's ten-parameter ceiling.
         await commands.setDevicePointerScope(
-          normalized.ip,
+          normalized.token,
           normalized.pointerScope ?? DEFAULT_POINTER_SCOPE
         );
         await commands.setDeviceAutoFrameRate(
-          normalized.ip,
+          normalized.token,
           normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE
         );
-        await commands.setDeviceAudioOutput(normalized.ip, normalized.audioOutputDeviceId);
+        await commands.setDeviceAudioOutput(normalized.token, normalized.audioOutputDeviceId);
         await saveDeviceSettings(normalized);
         // The event's `Device` comes from Rust, where neither field is optional; the
         // config-file `Device` makes them optional because devices saved before they existed
         // exist. Resolve the defaults on the way out rather than lying in either type.
         await events.deviceModify.emit({
           ...normalized,
+          // The row this sheet was opened from. The settings are the device's and reach every
+          // tab it has open; the row the dashboard replaces is this one.
+          joinId: device.joinId,
           pointerScope: normalized.pointerScope ?? DEFAULT_POINTER_SCOPE,
           autoFrameRate: normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
         });
@@ -845,10 +853,11 @@ function DeviceDetailsBody({
               onClick={async () => {
                 setInProgress(true);
                 try {
-                  await commands.removeDeviceOverride(device.ip);
-                  await removeSavedDevice(device.ip);
+                  await commands.removeDeviceOverride(device.token);
+                  await removeSavedDevice(device.token, device.ip);
                   await events.deviceRemove.emit({
                     ...device,
+                    joinId: device.joinId,
                     pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
                     autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
                   });
