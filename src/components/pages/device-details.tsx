@@ -42,7 +42,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_POINTER_SCOPE, type Device, type PointerScope } from "@/components/config-provider";
+import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_AUTO_FRAME_RATE, DEFAULT_POINTER_SCOPE, type Device } from "@/components/config-provider";
 import { useAudioOutputs, useGlobalSetters } from "@/components/global-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -266,6 +266,7 @@ function DeviceDetailsBody({
       dpr: Math.min(device.dpr ?? device.maxDpr ?? 1, device.maxDpr ?? device.dpr ?? 1),
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
       pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
+      autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
       systemAudio: device.systemAudio ?? false,
       audioOutputDeviceId: device.audioOutputDeviceId ?? "",
       audioOutputDeviceLabel: device.audioOutputDeviceLabel ?? "",
@@ -298,20 +299,25 @@ function DeviceDetailsBody({
           normalized.dpr,
           normalized.systemAudio
         );
-        // Its own command, not a tenth argument to `setDeviceOverride`: that one is already
-        // at specta's ten-parameter ceiling.
+        // Their own commands, not an eleventh and twelfth argument to `setDeviceOverride`:
+        // that one is already at specta's ten-parameter ceiling.
         await commands.setDevicePointerScope(
           normalized.ip,
           normalized.pointerScope ?? DEFAULT_POINTER_SCOPE
         );
+        await commands.setDeviceAutoFrameRate(
+          normalized.ip,
+          normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE
+        );
         await commands.setDeviceAudioOutput(normalized.ip, normalized.audioOutputDeviceId);
         await saveDeviceSettings(normalized);
-        // The event's `Device` comes from Rust, where `pointerScope` is not optional; the
-        // config-file `Device` makes it optional because devices saved before the field
-        // exist. Resolve the default on the way out rather than lying in either type.
+        // The event's `Device` comes from Rust, where neither field is optional; the
+        // config-file `Device` makes them optional because devices saved before they existed
+        // exist. Resolve the defaults on the way out rather than lying in either type.
         await events.deviceModify.emit({
           ...normalized,
           pointerScope: normalized.pointerScope ?? DEFAULT_POINTER_SCOPE,
+          autoFrameRate: normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
         });
         toast({
           title: t("toasts.device.updatedTitle"),
@@ -466,26 +472,23 @@ function DeviceDetailsBody({
             />
           </div>
           {deviceDetails.values.remoteControl && (
-            <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
-              <TipLabel text={t("device.pointerScope.tip")}>
-                <Label>{t("device.pointerScope.label")}</Label>
-              </TipLabel>
-              <Select
-                name="pointerScope"
-                value={deviceDetails.values.pointerScope}
-                onValueChange={(value) => {
-                  deviceDetails.setFieldValue("pointerScope", value as PointerScope);
-                }}
-                disabled={inProgress}
-              >
-                <SelectTrigger className="w-[55%] border-2">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="cursor-pointer">
-                  <SelectItem value="display">{t("device.pointerScope.display")}</SelectItem>
-                  <SelectItem value="all">{t("device.pointerScope.all")}</SelectItem>
-                </SelectContent>
-              </Select>
+            <div className="mt-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="pointerScopeRestricted"
+                  checked={deviceDetails.values.pointerScope === "display"}
+                  onCheckedChange={(checked) => {
+                    deviceDetails.setFieldValue("pointerScope", checked === true ? "display" : "all");
+                  }}
+                  disabled={inProgress}
+                />
+                <Label htmlFor="pointerScopeRestricted" className="cursor-pointer">
+                  {t("device.pointerScope.label")}
+                </Label>
+              </div>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {t("device.pointerScope.help")}
+              </p>
             </div>
           )}
           <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
@@ -727,6 +730,22 @@ function DeviceDetailsBody({
               step={5}
               disabled={inProgress}
             />
+            <div className="mt-3 flex items-center space-x-2">
+              <Checkbox
+                id="autoFrameRate"
+                checked={deviceDetails.values.autoFrameRate}
+                onCheckedChange={(checked) => {
+                  deviceDetails.setFieldValue("autoFrameRate", checked === true);
+                }}
+                disabled={inProgress}
+              />
+              <Label htmlFor="autoFrameRate" className="cursor-pointer">
+                {t("device.autoFrameRate.label")}
+              </Label>
+            </div>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t("device.autoFrameRate.help")}
+            </p>
           </div>
           <div className="mt-4">
             <TipLabel text="Resolution of the streamed video. Lower uses less bandwidth." className="my-2">
@@ -808,6 +827,7 @@ function DeviceDetailsBody({
                   await events.deviceRemove.emit({
                     ...device,
                     pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
+                    autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
                   });
                   toast({
                     title: t("toasts.device.removedTitle"),
