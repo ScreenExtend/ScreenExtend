@@ -52,12 +52,14 @@ client page must never be replaced by it and `ScreenExtend status --json` must n
 Two devices' worth of setup: one joined client with remote control on, and the host's own
 physical second monitor to the right of the first.
 
-1. Default (`pointerScope: "display"`, or the field absent). On the client, click the video to
-   take pointer lock, then push the mouse hard to the right for several seconds. The host cursor
-   must stop at the right edge of the *virtual display this client is streaming* and stay there.
-2. `ScreenExtend devices set <ip> --pointer-scope all`, then have the client reconnect — the scope
-   is read when the session is built, exactly like remote control, so it does not apply live.
-   Repeat the push. The cursor must now cross onto the host's real monitor, and the client can
-   click on a screen it cannot see. That is the previous behaviour of every build before this.
+1. Default (`pointerScope: "all"`, or **the field absent**, which is every device saved before
+   the setting existed). On the client, click the video to take pointer lock, then push the
+   mouse hard to the right for several seconds. The cursor must cross onto the host's real
+   monitor: reaching every desktop is the intended behaviour, not a leak.
+2. `ScreenExtend devices set <ip> --pointer-scope display` (or tick "Restrict cursor to this
+   display" in the device sheet), then have the client reconnect — the scope is read when the
+   session is built, exactly like remote control, so it does not apply live. Repeat the push.
+   The host cursor must now stop at the right edge of the *virtual display this client is
+   streaming* and stay there.
 3. `ScreenExtend devices list` shows the value in the POINTER column; `devices reset <ip>` clears
-   it back to `display`.
+   it back to `all`.

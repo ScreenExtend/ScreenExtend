@@ -62,6 +62,38 @@ pub struct DeviceOverride {
     /// Where a pointer-locked client's relative motion may go. Read at join, like
     /// `control_enabled`.
     pub pointer_scope: crate::streamer::input::PointerScope,
+    /// Whether the pipeline may drop below `refresh_rate` on its own.
+    ///
+    /// Off — the default — means `refresh_rate` is a promise, not a ceiling: the stream is
+    /// delivered at exactly the rate the user picked, an unchanged frame is repeated at that
+    /// cadence rather than skipped, and no controller may lower it. On, the pipeline is free to
+    /// let the rate fall (a static screen costs nothing to leave alone; a congested link is
+    /// better served by fewer, better frames). The user asked for a fixed rate to be fixed, so
+    /// the adaptive behaviour is opt-in per device.
+    ///
+    /// Read by `windows_utils::streamer::pipeline` through `Config::auto_frame_rate`, which
+    /// `server.rs` copies out of this at join.
+    pub auto_frame_rate: bool,
+}
+
+impl DeviceOverride {
+    /// The values the join path would have used, for the single-field commands
+    /// (`set_device_pointer_scope`, `set_device_auto_frame_rate`) when nothing is saved for a
+    /// device yet. Writing one field must not silently pin a resolution or a refresh rate.
+    pub fn join_defaults() -> Self {
+        Self {
+            scale: 100,
+            orientation_portrait: false,
+            refresh_rate: 60,
+            video_scale: 100,
+            video_quality: 15,
+            control_enabled: true,
+            dpr: 1.0,
+            audio_enabled: false,
+            pointer_scope: crate::streamer::input::PointerScope::default(),
+            auto_frame_rate: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]

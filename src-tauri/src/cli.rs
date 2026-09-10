@@ -1421,6 +1421,7 @@ mod desktop {
                 d.audio,
             );
             platform::set_device_pointer_scope(app.state(), d.ip.clone(), d.pointer_scope.clone());
+            platform::set_device_auto_frame_rate(app.state(), d.ip.clone(), d.auto_frame_rate);
             // Without this a device pinned to a specific host output in the GUI reverts to the
             // default output under `serve`, which is audible rather than theoretical.
             if let Some(output) = d.audio_output {
@@ -1441,6 +1442,7 @@ mod desktop {
         dpr: f64,
         audio: bool,
         pointer_scope: String,
+        auto_frame_rate: bool,
         audio_output: Option<String>,
     }
 
@@ -1479,13 +1481,19 @@ mod desktop {
                         .get("systemAudio")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    // Absent means the conservative default; the host re-reads it through
-                    // `PointerScope::from_str`, so an unknown string is the default too.
+                    // Absent means the default, which is the unrestricted reach: a device saved
+                    // before the setting existed must not be fenced in by the upgrade. The host
+                    // re-reads it through `PointerScope::from_str`, so an unknown string is the
+                    // default too.
                     pointer_scope: device
                         .get("pointerScope")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("display")
+                        .unwrap_or("all")
                         .to_string(),
+                    auto_frame_rate: device
+                        .get("autoFrameRate")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     audio_output: device
                         .get("audioOutputDeviceId")
                         .and_then(|v| v.as_str())
@@ -1892,7 +1900,7 @@ mod desktop {
                     exit(0);
                 }
                 println!(
-                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6} {:>8}",
+                    "{:<16} {:>6} {:<10} {:>8} {:>6} {:>8} {:>8} {:>6} {:>8} {:>8}",
                     "IP",
                     "SCALE",
                     "ORIENT",
@@ -1901,7 +1909,8 @@ mod desktop {
                     "VQUAL",
                     "CONTROL",
                     "AUDIO",
-                    "POINTER"
+                    "POINTER",
+                    "AUTOFPS"
                 );
                 for d in &devices {
                     let s = |k: &str| d.get(k).cloned().unwrap_or(Value::Null);
@@ -1913,21 +1922,23 @@ mod desktop {
                     let vqual = s("videoQuality").as_u64().unwrap_or(15);
                     let control = s("remoteControl").as_bool().unwrap_or(true);
                     let audio = s("systemAudio").as_bool().unwrap_or(false);
-                    let pointer = s("pointerScope").as_str().unwrap_or("display").to_string();
+                    let pointer = s("pointerScope").as_str().unwrap_or("all").to_string();
+                    let auto_fps = s("autoFrameRate").as_bool().unwrap_or(false);
                     println!(
-                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6} {pointer:>8}",
+                        "{ip:<16} {:>5}% {orient:<10} {:>6}Hz {:>5}% {vqual:>8} {:>8} {:>6} {pointer:>8} {:>8}",
                         scale,
                         refresh,
                         vscale,
                         if control { "on" } else { "off" },
-                        if audio { "on" } else { "off" }
+                        if audio { "on" } else { "off" },
+                        if auto_fps { "on" } else { "off" }
                     );
                 }
                 exit(0);
             }
             "set" => {
                 let Some(ip) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all]");
+                    eprintln!("usage: ScreenExtend devices set <ip> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off]");
                     exit(2);
                 };
                 let mut existing = get_nested(&store, "devices")
@@ -1945,7 +1956,8 @@ mod desktop {
                             "ip": ip, "name": "", "scale": 100, "orientation": "Landscape",
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
                             "remoteControl": true, "systemAudio": false,
-                            "pointerScope": "display", "os": "", "screenSize": ""
+                            "pointerScope": "all", "autoFrameRate": false,
+                            "os": "", "screenSize": ""
                         })
                     });
                 let obj = device.as_object_mut().unwrap();
@@ -1973,6 +1985,9 @@ mod desktop {
                 }
                 if let Some(v) = arg_str(sm, "pointer-scope") {
                     obj.insert("pointerScope".into(), Value::String(v));
+                }
+                if let Some(v) = arg_str(sm, "auto-framerate") {
+                    obj.insert("autoFrameRate".into(), Value::Bool(v == "on"));
                 }
 
                 existing.retain(|d| d.get("ip").and_then(|v| v.as_str()) != Some(ip.as_str()));
@@ -2995,7 +3010,8 @@ mod desktop {
                     "ip": "10.0.0.6", "scale": 150, "orientation": "Portrait",
                     "refreshRate": 120, "videoScale": 80, "videoQuality": 20,
                     "remoteControl": false, "systemAudio": true, "dpr": 2.0,
-                    "pointerScope": "all", "audioOutputDeviceId": "speaker-1"
+                    "pointerScope": "display", "autoFrameRate": true,
+                    "audioOutputDeviceId": "speaker-1"
                 },
                 { "name": "no ip at all" }
             ]);
@@ -3013,15 +3029,19 @@ mod desktop {
                     control: true,
                     dpr: 1.0,
                     audio: false,
-                    pointer_scope: "display".into(),
+                    pointer_scope: "all".into(),
+                    auto_frame_rate: false,
                     audio_output: None,
                 }
             );
             assert_eq!(parsed[1].refresh_rate, 120);
             assert!(!parsed[1].control);
             assert!(parsed[1].audio);
-            // A saved `all` survives the replay; an absent one is the conservative default.
-            assert_eq!(parsed[1].pointer_scope, "all");
+            // A saved restriction survives the replay; an absent one is the default, which is
+            // the unrestricted reach — a device saved before the setting existed must not be
+            // fenced in by the upgrade.
+            assert_eq!(parsed[1].pointer_scope, "display");
+            assert!(parsed[1].auto_frame_rate);
             assert_eq!(parsed[1].audio_output.as_deref(), Some("speaker-1"));
         }
     }
