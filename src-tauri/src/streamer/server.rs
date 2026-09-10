@@ -592,7 +592,10 @@ async fn index(
 /// A join id as it is allowed to appear on the wire: exactly what [`session::mint_join_id`]
 /// produces. Anything else is discarded rather than used as a map key.
 fn valid_join_id(raw: &str) -> bool {
-    raw.len() == 32 && raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    raw.len() == 32
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn cookie_join(headers: &HeaderMap) -> Option<String> {
@@ -990,9 +993,9 @@ async fn whep(
         if let Ok(value) = header::HeaderValue::from_str(resource) {
             headers.insert("x-join-id", value);
         }
-        if let Ok(value) =
-            header::HeaderValue::from_str(&format!("{JOIN_COOKIE}={resource}; Path=/; SameSite=Lax"))
-        {
+        if let Ok(value) = header::HeaderValue::from_str(&format!(
+            "{JOIN_COOKIE}={resource}; Path=/; SameSite=Lax"
+        )) {
             headers.insert(header::SET_COOKIE, value);
         }
     }
