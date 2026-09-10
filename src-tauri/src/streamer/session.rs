@@ -59,6 +59,9 @@ pub struct DeviceOverride {
     pub control_enabled: bool,
     pub dpr: f64,
     pub audio_enabled: bool,
+    /// Where a pointer-locked client's relative motion may go. Read at join, like
+    /// `control_enabled`.
+    pub pointer_scope: crate::streamer::input::PointerScope,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
@@ -682,9 +685,44 @@ pub trait VirtualDisplayController: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// How many displays this backend can drive at once, when it is capped at all.
+    ///
+    /// Read it through [`concurrent_display_cap`], never directly: the cap is the input to a
+    /// user-visible refusal, and exactly one backend is allowed to produce one.
     fn max_concurrent_displays(&self) -> Option<usize> {
         None
     }
+}
+
+/// The only capped display backend in the product is the macOS AirPlay tier, which macOS itself
+/// limits to one display because macOS owns that display. Every other backend is uncapped, and
+/// the product rule is that a host is never told it is full: it never evicts a connected device,
+/// and it never serves `at-capacity.html`.
+///
+/// So this is the one place the cap is read, and it recognises exactly one value. A backend that
+/// reports any other finite number is a bug — a capacity nobody designed, arriving as a refusal
+/// the user cannot act on — so it is logged once and treated as uncapped, and the join that
+/// would have been turned away proceeds and reports whatever really goes wrong.
+pub fn concurrent_display_cap(client: &dyn VirtualDisplayController) -> Option<usize> {
+    match client.max_concurrent_displays() {
+        None => None,
+        Some(1) => Some(1),
+        Some(other) => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                teprintln!(
+                    "[display] {client:?} reports a concurrent-display cap of {other}; only the \
+                     one-at-a-time AirPlay tier may cap, so this host is treated as uncapped"
+                );
+            });
+            None
+        }
+    }
+}
+
+/// [`concurrent_display_cap`] for the shared handle the host actually carries.
+pub fn shared_display_cap(client: &SharedVirtualDisplay) -> Option<usize> {
+    concurrent_display_cap(client.as_ref())
 }
 
 pub fn set_host_ip(sessions: &SharedSessions, ip: &str, host_ip: Option<String>) {

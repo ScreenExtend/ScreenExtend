@@ -161,6 +161,9 @@ pub struct InputParams {
     /// macOS host. Empty when the client did not say.
     pub client_os: String,
     pub control_enabled: bool,
+    /// How far a pointer-locked client may drive the cursor. Read from the device override at
+    /// join, like `control_enabled`, so a change applies to the next connection.
+    pub pointer_scope: input::PointerScope,
     pub control_rx: Option<session::ControlReceiver>,
 }
 
@@ -1037,11 +1040,13 @@ pub async fn activate_whep(
         device: input_device,
         client_os,
         control_enabled,
+        pointer_scope,
         control_rx,
     } = input;
     let client = input::ClientProfile {
         device_name: input_device,
         platform: input::ClientPlatform::from_reported(&client_os),
+        pointer_scope,
     };
     let (input_tx, input_join) = input::spawn(client, Arc::clone(&pipeline.telemetry));
     {

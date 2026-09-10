@@ -44,7 +44,7 @@ use super::protocol::{
     SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
-use super::{ClientProfile, DisplayRect};
+use super::{ClientProfile, DisplayRect, PointerScope};
 
 pub const NAME: &str = "windows-sendinput+syntheticpointer";
 
@@ -139,6 +139,8 @@ pub struct Injector {
     /// accumulate `MOUSEEVENTF_MOVE` for us, but then it applies its own pointer ballistics on
     /// top of the curve the client already applied, and there is no position to clamp.
     rel_pos: Option<POINT>,
+    /// What that clamp is against: this session's own display, or the whole desktop.
+    pointer_scope: PointerScope,
     scratch: Vec<INPUT>,
     touch_scratch: Vec<POINTER_TYPE_INFO>,
 }
@@ -146,7 +148,11 @@ pub struct Injector {
 impl Injector {
     pub fn new(client: ClientProfile) -> Self {
         // The scancode table is layout-neutral, so nothing here depends on the client platform.
-        let ClientProfile { device_name, .. } = client;
+        let ClientProfile {
+            device_name,
+            pointer_scope,
+            ..
+        } = client;
         let pen_dev = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }
             .map_err(|e| teprintln!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
             .ok();
@@ -173,6 +179,7 @@ impl Injector {
             // cursor already was.
             mouse_relative: false,
             rel_pos: None,
+            pointer_scope,
             scratch: Vec::with_capacity(16),
             touch_scratch: Vec::with_capacity(MAX_TOUCH_COUNT as usize),
         }
@@ -373,12 +380,28 @@ impl Injector {
         self.buttons = buttons;
     }
 
-    /// Move the tracked relative position and clamp it to the virtual desktop.
+    /// The rectangle a pointer-locked cursor may not leave.
     ///
-    /// Clamped to the desktop rather than to the client's own display, which is what macOS has
-    /// always done — deliberately, so the two backends agree. Whether a locked client should be
-    /// confined to the display it is streaming is a product question, not a technical one, and
-    /// it has not been answered: confining it would need the session's own monitor rect here.
+    /// `PointerScope::Display` is this session's own monitor, which is what the client is
+    /// looking at; `All` is the whole virtual desktop, including the host's real monitors. The
+    /// display rect is only known once `refresh_geometry` has resolved the device name, so an
+    /// unresolved target falls back to the desktop rather than trapping the cursor in a guess.
+    fn pointer_bounds(&self) -> DisplayRect {
+        match (self.pointer_scope, self.target) {
+            (PointerScope::Display, Some(r)) => r,
+            _ => DisplayRect {
+                left: self.virt.left,
+                top: self.virt.top,
+                width: self.virt.width as u32,
+                height: self.virt.height as u32,
+            },
+        }
+    }
+
+    /// Move the tracked relative position and clamp it to [`Self::pointer_bounds`].
+    ///
+    /// Both backends clamp the same way and to the same choice of rectangle, so a client that
+    /// crosses to the host's desktop on one OS crosses on the other.
     fn advance_rel(&mut self, dx: i32, dy: i32) -> POINT {
         let base = match self.rel_pos {
             Some(p) => p,
@@ -391,9 +414,10 @@ impl Injector {
                 }
             },
         };
+        let b = self.pointer_bounds();
         let p = POINT {
-            x: (base.x + dx).clamp(self.virt.left, self.virt.left + self.virt.width - 1),
-            y: (base.y + dy).clamp(self.virt.top, self.virt.top + self.virt.height - 1),
+            x: (base.x + dx).clamp(b.left, b.left + b.width as i32 - 1),
+            y: (base.y + dy).clamp(b.top, b.top + b.height as i32 - 1),
         };
         self.rel_pos = Some(p);
         p
@@ -1140,5 +1164,52 @@ mod tests {
             batched.as_secs_f64() * 1e6 / REPS as f64,
         );
         assert!(batched < per_sample);
+    }
+
+    /// The pointer-lock clamp, without injecting anything.
+    ///
+    /// A locked client accumulates `MOUSE_DELTA` into a position we track, and the whole
+    /// question item 17 asked is what that position may not leave. `Display` is the session's
+    /// own monitor; `All` is the virtual desktop, which is what every build before this did.
+    #[test]
+    fn a_locked_pointer_is_clamped_to_the_scope_it_was_given() {
+        let target = DisplayRect {
+            left: 1920,
+            top: 0,
+            width: 1280,
+            height: 720,
+        };
+
+        let mut inj = Injector::new(ClientProfile::default());
+        inj.target = Some(target);
+
+        inj.pointer_scope = PointerScope::Display;
+        assert_eq!(inj.pointer_bounds(), target);
+
+        inj.pointer_scope = PointerScope::All;
+        let desktop = inj.pointer_bounds();
+        assert_eq!(desktop.left, inj.virt.left);
+        assert_eq!(desktop.width, inj.virt.width as u32);
+        assert_ne!(
+            desktop, target,
+            "the desktop must be wider than one monitor"
+        );
+
+        // The device name has not resolved to a monitor yet. Falling back to the desktop is
+        // the only honest answer: the alternative is trapping the cursor inside a guess.
+        inj.target = None;
+        inj.pointer_scope = PointerScope::Display;
+        assert_eq!(inj.pointer_bounds(), desktop);
+    }
+
+    #[test]
+    fn an_unknown_pointer_scope_is_the_conservative_one() {
+        assert_eq!(PointerScope::from_str("all"), PointerScope::All);
+        assert_eq!(PointerScope::from_str("All"), PointerScope::All);
+        assert_eq!(PointerScope::from_str("display"), PointerScope::Display);
+        assert_eq!(PointerScope::from_str("everything"), PointerScope::Display);
+        assert_eq!(PointerScope::from_str(""), PointerScope::Display);
+        assert_eq!(PointerScope::default(), PointerScope::Display);
+        assert_eq!(PointerScope::All.as_str(), "all");
     }
 }
