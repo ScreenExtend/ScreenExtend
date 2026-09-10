@@ -1,7 +1,7 @@
 # Manual tests — core close-out (W2 / W8 / W9 / W10)
 
-Seven changes landed whose acceptance test needs hardware, an OS locale, or a link that neither dev
-box has. Each is written down here with the exact command and the exact expected reading, so
+Changes landed whose acceptance test needs hardware, an OS locale, an unheld single-instance lock,
+or a link that neither dev box has. Each is written down here with the exact command and the exact expected reading, so
 whoever has the machine can settle it in minutes rather than re-deriving the setup.
 
 Everything here is `COMPILE-CHECKED` or unit-tested; none of it is `VERIFIED`. Ledger rows:
@@ -155,3 +155,49 @@ did not give the main thread an STA — but it is worth reporting, because the w
 from what wry does today. A host that reports `RPC_E_CHANGED_MODE` at all is a regression: the
 helper asks before it initializes, so the only way to produce one is a call site that stopped
 going through it.
+
+## 9. The CLI's session, against a live `serve` host (UX-SESSION, either OS)
+
+`qr`, `status` and `session new` used to mint a session id per invocation, so every URL and QR
+they printed was for a session nobody was serving. They now read the running host's id over the
+control server's `SESSION` verb. The unit half is covered — `a_session_query_reads_back_what_a_
+session_set_wrote` drives the whole exchange over a real loopback socket — but the half that
+needs a real host is `#[ignore]`d, because it takes the single-instance lock, initializes the
+display driver and binds the streaming ports.
+
+**With no other ScreenExtend running**, from `src-tauri/`:
+
+```sh
+cargo test qr_and_status_report_the_session_a_live_serve_host_is_serving -- --ignored --nocapture
+```
+
+It spawns `ScreenExtend serve --no-cloud --no-qr` with a known `SCREENEXTEND_SESSION_ID` /
+`SCREENEXTEND_OTP`, waits for the host, and asserts that `status --json` and `qr --json` both
+report *that* id, that `sessionIdSource` is `host`, that every join URL carries it, and that
+`session new --json` replaces the pair on the running host so the next `qr` reads the replacement
+back. It stops the host on the way out, including when an assertion fails. It needs the built
+binary beside the test executable (`cargo build` first, or `SE_TEST_BIN=<path>`), and it **skips
+with a reason** when another instance holds the lock — which is what it does on a machine where
+the owner's host is already up.
+
+The relay is the one part that harness does not cover (`--no-cloud`, so the numbers are
+deterministic and no session is published). To settle it by hand, with public sessions enabled:
+
+```sh
+SCREENEXTEND_SESSION_ID=TESTSESSION1 SCREENEXTEND_OTP=424242 ScreenExtend serve --no-qr
+# in another shell:
+ScreenExtend qr -t cloud --no-render --json     # sessionId TESTSESSION1, cloudState "registered"
+ScreenExtend session new --json                 # applied true, a new id, cloudState "registered"
+```
+
+**Expect:** the second command's `sessionId` is `TESTSESSION1` and its `cloudState` is
+`registered`, which is `serve` having registered the relay under the id it was given rather than
+one of its own; and `session new` re-registers under the id it just minted, so the printed
+"Anywhere (Internet)" URL is joinable the moment it appears. A `cloudState` of `connecting` after
+`session new` means the 8 s bound expired — the command says so rather than presenting the URL as
+ready, and that is a network reading, not a failure.
+
+Beside a host from a build that predates the verb the CLI degrades and says so, which is worth
+reading once: `qr` prints `hostRunning: true` with `hostReportedSession: false` and a note that
+the id shown is not the one being served, and `session new` fails with exit 1 and changes
+nothing. (Verified on the Windows dev box against a running `serve` from the previous build.)

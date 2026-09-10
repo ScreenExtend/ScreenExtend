@@ -3015,3 +3015,44 @@ Run against the unfixed tree it names all seventeen, grouped by parent, and exit
 fixed tree it reports `5 packages declare optionalDependencies; all are recorded`. `KNOWN_ABSENT`
 is an empty allowlist for the one legitimate case (an optional dep the registry cannot serve),
 and it is empty on purpose.
+
+## UX-SESSION: the CLI minted a session id nobody was serving (post-report)
+
+Measured on the Windows dev box beside a running host: `ScreenExtend qr -t all --json` printed
+`793LNG2XGM4V`, `session new --json` printed `MQZ8VLBXBZPH` with an OTP, a second `qr` printed
+`WE9CK24666Q3` — while the host's own log showed the relay registered as `WLZ7JHNBC2RG`. Three
+invocations, three ids, none of them the one being served, and `status --json` carried no session
+id at all. Every URL and every QR those commands printed was for a session that does not exist,
+and the failure only surfaced on the client, as `WHEP POST failed: 503 host offline`.
+
+**The cause is structural, not a typo.** A session id is a per-run credential: it is minted at
+bootstrap (the desktop app) or at startup (`serve`), lives in `AppState.session_auth`, and is
+deliberately never written to `config.json`. `qr`, `status` and `session new` each run in their
+own process. They had `--session-id` and a random generator and nothing else — no verb existed to
+ask the host — so `unwrap_or_else(generate_session_id)` was the whole resolution policy, and it
+could not tell "no host" from "a host is right there".
+
+| # | Change | Status |
+|---|---|---|
+| S1 | **`SESSION`, a new control verb, both ways.** Bare, it answers one line of JSON: the live session id, the OTP, whether the host holds a relay client, and that relay's state. `SESSION <id> <otp>` applies new credentials to the running `AppState`, re-registers the relay under the new id **only when the host already holds one**, and emits `SessionIdChange`. Credentials are validated (non-empty, ≤64, `[A-Za-z0-9_-]`) before they can replace ones that work; a one-argument `SESSION x` parses as a set with an empty OTP and is refused, never as a query. | `VERIFIED` (`a_session_query_reads_back_what_a_session_set_wrote` runs the whole exchange over a real loopback socket with the shipped ctrl file, client, parser and reply shapes; 4 more tests pin the framing) |
+| S2 | **The OTP is on that wire, on purpose.** The socket is loopback-only and every request carries the 128-bit token from a user-only `screenextend.ctrl` — and whoever can read that file can already `QUIT` the host or *set* its credentials, so the OTP is inside the trust boundary rather than outside it. It is there so a setter can read back what it applied. No shipped command prints it: `session new` prints the OTP it minted itself, and `status` deliberately does not, because `status --json` is what gets pasted into a bug report. | `VERIFIED` (the decision is documented at `Command::Session` and in `CLAUDE.md`; `status --json` carries `sessionId` and no `otp`) |
+| S3 | **`qr` and `status` read the live id**, and mint only when nothing answered. `resolve_session_id` returns the source with the id (`flag` \| `host` \| `generated`) and the output says which. "A host is running" and "a host told me its session" are separate fields (`hostRunning`, `hostReportedSession`), because a host that is still starting — or one predating the verb — is up and reports nothing, and a minted id must never be presented as the considered answer. | `VERIFIED` (`a_running_host_is_never_answered_with_an_invented_session_id`; live beside a host from the previous build: `hostRunning: true`, `hostReportedSession: false`, and the note saying the printed id is not the one being served) |
+| S4 | **`session new` applies what it mints.** It sends `SESSION <id> <otp>`, waits up to 8 s (250 ms poll) for the relay to leave `connecting`, **reads the credentials back**, and only then prints URLs. With no host it prints the `SCREENEXTEND_SESSION_ID` / `SCREENEXTEND_OTP` pair for `serve`. With a host that cannot take them it fails, exits 1 and changes nothing — a credential the host never heard of is worse than no credential. | `VERIFIED` for the refusal path (live, against the previous build's host: `error: … the running host answered "" — an older build that does not know the SESSION verb`, exit 1, nothing printed); `COMPILE-CHECKED` for the applied path (`#[ignore]`d harness, below) |
+| S5 | **The read-back is not ceremony.** The desktop UI mirrors the session id and the OTP in React state and pushes its own copy back through `set_session_credentials` whenever either changes — so setting a new pair on a GUI host emitted `SessionIdChange`, the UI took the id, and the effect pushed the *old* OTP straight back over the new one. `SessionIdChange` therefore carries the OTP, empty meaning "unchanged" (the relay-rotation case), and `App.tsx` sets both. The read-back in S4 catches it happening anyway. | `COMPILE-CHECKED` (the clobber is a code-path argument; the GUI host on this box is from an older build and cannot be driven by the new verb) |
+| S6 | **`serve` needed no change and gets one property free.** It already reads `SCREENEXTEND_SESSION_ID` / `SCREENEXTEND_OTP` and hands the resolved id to `register_cloud_session`. Now that `qr`/`status` read `session_auth` rather than minting, they also follow a **relay rotation**: when the cloud finds an id taken it picks another, updates `session_auth` and emits `SessionIdChange`, so `qr` prints the rotated id while `serve`'s already-printed banner is stale. | `COMPILE-CHECKED` (rotation needs a colliding id on the live relay) |
+
+**Where the verb lives.** `single_instance.rs` stays OS-independent: it parses and frames, and the
+two halves that touch `AppState` are `cli::live_session_info` / `cli::apply_session_credentials`,
+with Linux stubs — the same shape `RELOAD` already had. `parse_request` is now a pure function
+returning a `Request<'_>`, which is what makes the round trip testable without a Tauri app.
+
+**What is not verified, and the one command that would settle it.** The full live path needs the
+single-instance lock, and the dev box had a host running throughout. The harness is
+`qr_and_status_report_the_session_a_live_serve_host_is_serving`, `#[ignore]`d because it spawns a
+real headless host, and it **skips with a reason** when the lock is held rather than fighting for
+it. Script and expected readings: `docs/manual-tests/core-closeout.md` §9.
+
+**Rejected.** Persisting the session id to `config.json` so the CLI could read it there. It would
+have needed no new verb — and it would be wrong twice: the id is a credential with a process
+lifetime, not a setting, and a file cannot tell you whether anything is currently serving it,
+which is the question every one of these commands is really asking.

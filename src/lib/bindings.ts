@@ -424,7 +424,17 @@ key: string;
  */
 sessions_ended: number }
 export type ServerPorts = { http: number; https: number }
-export type SessionIdChange = { sessionId: string }
+/**
+ * The host's join credentials changed under the desktop UI, which mirrors both values.
+ * 
+ * Two things emit it: the cloud relay rotating an id it found taken, and `ScreenExtend session
+ * new` replacing the pair through the single-instance control socket. An **empty `otp` means
+ * the OTP did not change** — the rotation case — and the frontend must leave its copy alone
+ * rather than clearing it. Without the field the UI would show the new id beside the old code
+ * and then push that stale pair back through `set_session_credentials`, undoing the half of the
+ * change it could not see.
+ */
+export type SessionIdChange = { sessionId: string; otp: string }
 export type TurnConfig = { urls: string; username: string; credential: string }
 export type UnsupportedApi = { 
 /**
