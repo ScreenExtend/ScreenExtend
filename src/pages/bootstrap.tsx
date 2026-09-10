@@ -355,11 +355,14 @@ export default function Bootstrap() {
     }
   };
 
-  // Install what can be installed, then say whether it is worth re-probing. Returns false when
-  // there was nothing this launch could do, so the caller stops rather than looping.
+  // Install what can be installed, then say whether the caller should carry on deciding.
+  // `false` means this launch is over -- the only route to it is a relaunch that has already
+  // been started, which is why the caller must not fall through to the dashboard behind it.
   const remediate = async (rows: UnsupportedApi[]): Promise<boolean> => {
     const action = driverRemediation(rows);
-    if (!action) return false;
+    // An installable row nothing here knows how to install. Carry on and decide: it survives
+    // the pass, so the user is shown it rather than left on a spinner forever.
+    if (!action) return true;
     setRemediating(true);
     try {
       if (action === "reinstall") {
