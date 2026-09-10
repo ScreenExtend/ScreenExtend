@@ -1144,6 +1144,11 @@ mod desktop {
         if let Some(store) = store.as_deref() {
             apply_saved_config(app, store);
         }
+        // The last thing before the session id and the join banner. It is here because the step
+        // *above* it hung with no output at all — `set_device_override` deadlocked on itself once
+        // there was a device row to replay — and a host that stops between two silent steps gives
+        // nobody anything to go on.
+        tprintln!("[serve] saved configuration applied");
 
         let session_id = match read_credential(m, "session-id", "SCREENEXTEND_SESSION_ID", None) {
             Ok(Some(id)) => id,

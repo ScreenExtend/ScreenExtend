@@ -346,6 +346,19 @@ pub fn set_device_override(
     } else {
         1.0
     };
+    // Both of the carried-over fields are read under **one** guard, before the struct literal.
+    // Two `lock_recover()` calls inside one struct literal are two guards alive at the same time
+    // on the same non-reentrant mutex — the temporaries live to the end of the statement, not to
+    // the end of their line — so the second one deadlocked the caller. `serve` calls this once
+    // per saved device at startup, which is why a host with any device in `config.json` hung
+    // before it ever printed a join URL.
+    let (carried_scope, carried_auto_frame_rate) = {
+        let overrides = state.device_overrides.lock_recover();
+        match overrides.get(&ip) {
+            Some(o) => (o.pointer_scope, o.auto_frame_rate),
+            None => (Default::default(), false),
+        }
+    };
     let next = DeviceOverride {
         scale: scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE),
         orientation_portrait: orientation == "Portrait",
@@ -360,18 +373,8 @@ pub fn set_device_override(
         // `set_device_pointer_scope` and `set_device_auto_frame_rate` own them, and a device
         // with no saved value keeps the default rather than being reset by an unrelated
         // display change.
-        pointer_scope: state
-            .device_overrides
-            .lock_recover()
-            .get(&ip)
-            .map(|o| o.pointer_scope)
-            .unwrap_or_default(),
-        auto_frame_rate: state
-            .device_overrides
-            .lock_recover()
-            .get(&ip)
-            .map(|o| o.auto_frame_rate)
-            .unwrap_or(false),
+        pointer_scope: carried_scope,
+        auto_frame_rate: carried_auto_frame_rate,
     };
     // Which overrides need the session rebuilt, and which only need the display touched. The
     // client answers a reconfig epoch bump by tearing the whole session down — peer connection,

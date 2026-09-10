@@ -53,9 +53,23 @@ const KEY_WAIT_GIVE_UP_MS = 8000;
 
 // decodeQueueSize counts *acceptance*, not completion: it drops as soon as the control
 // message is handed toward the codec, so it can read zero with frames still in flight. The
-// real backpressure signal is how many decodes have not yet produced an output, and the
-// target for a live stream is one.
-const MAX_IN_FLIGHT = 2;
+// real backpressure signal is how many decodes have not yet produced an output.
+//
+// The cap used to be 2, on the reasoning that a live stream wants one frame in flight. That is
+// what a decoder that has *fallen behind* looks like; it is also what a hardware decoder looks
+// like when it is keeping up perfectly, because it is pipelined — a Windows Media Foundation
+// H.264 decoder holds several pictures even with `optimizeForLatency`. Tripping on the count
+// alone therefore fired constantly on a healthy session, and the response is severe: every
+// delta is thrown away until a keyframe arrives, and the host gates keyframes to one per
+// 200 ms, so each false trip is a 200 ms freeze and a full-size IDR. Measured on the Windows
+// dev box against a Chrome client, the host was emitting 74 IDRs in 30 s.
+//
+// So the count is now the cheap half of the test and `BACKLOG_STALL_MS` is the load-bearing
+// half: a decoder that is producing outputs is keeping up however many pictures it is holding.
+const MAX_IN_FLIGHT = 6;
+// No output at all for this long, with the queue over the cap, is a decoder that has stopped
+// rather than one that is pipelined. Two frame periods at 30 fps, so it cannot fire on jitter.
+const BACKLOG_STALL_MS = 66;
 let inFlight = 0;
 let backlogStreak = 0;
 // The counter is only repaid by an output, and a decoder may accept a chunk and silently
@@ -795,7 +809,9 @@ function startPump(readable) {
       }
 
       if (renderedOnce && !waitingForKey && decoder && type !== 'key') {
-        if (inFlight > MAX_IN_FLIGHT) {
+        var outputStalled = lastOutputAtMs !== 0 &&
+          (performance.now() - lastOutputAtMs) > BACKLOG_STALL_MS;
+        if (inFlight > MAX_IN_FLIGHT && outputStalled) {
           backlogStreak++;
           framesDroppedBacklog++;
           if (backlogStreak >= 2) {
