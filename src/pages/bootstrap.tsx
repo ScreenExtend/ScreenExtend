@@ -14,7 +14,13 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "@/components/ui/use-toast";
 
-import { createConfig, getConfig, updateConfig } from "@/components/config-provider";
+import {
+  createConfig,
+  getConfig,
+  updateConfig,
+  DEFAULT_AUTO_FRAME_RATE,
+  DEFAULT_POINTER_SCOPE,
+} from "@/components/config-provider";
 import { useGlobalSetters, useLoaded } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus, type UnsupportedApi } from "@/lib/bindings";
 import { generateOtp, readQrValues } from "@/lib/utils";
@@ -175,7 +181,8 @@ export default function Bootstrap() {
             device.dpr ?? device.maxDpr ?? 1,
             device.systemAudio ?? false
           ));
-          replay.push(commands.setDevicePointerScope(device.ip, device.pointerScope ?? "display"));
+          replay.push(commands.setDevicePointerScope(device.ip, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
+          replay.push(commands.setDeviceAutoFrameRate(device.ip, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
         }
         for (const known of existing.knownDevices ?? []) {
           const token = known.token ?? "";

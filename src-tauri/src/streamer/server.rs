@@ -1133,6 +1133,11 @@ async fn start_session(
         cfg.scale = ScalePercent::new(o.video_scale);
         cfg.quality_qp = Some(o.video_quality);
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
+        // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise:
+        // the pipeline holds the cadence and repeats an unchanged frame rather than letting the
+        // rate sag. Copied here, once, so nothing downstream has to reach back into the
+        // override map on a frame path.
+        cfg.auto_frame_rate = o.auto_frame_rate;
     }
 
     // What the client's offer says it can decode, read before the encoder is built because the

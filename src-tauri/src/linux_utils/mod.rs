@@ -57,6 +57,11 @@ pub fn set_device_pointer_scope(_state: tauri::State<'_, AppState>, _ip: String,
 
 #[tauri::command]
 #[specta::specta]
+pub fn set_device_auto_frame_rate(_state: tauri::State<'_, AppState>, _ip: String, _enabled: bool) {
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn refresh_device_stream(_state: tauri::State<'_, AppState>, _ip: String) -> bool {
     false
 }
