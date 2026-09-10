@@ -23,6 +23,7 @@ const resolveDevice = (device: Device): Device => ({
   videoScale: device.videoScale ?? 100,
   videoQuality: device.videoQuality ?? 23,
   remoteControl: device.remoteControl ?? false,
+  pointerScope: device.pointerScope ?? "display",
   systemAudio: device.systemAudio ?? false,
   audioOutputDeviceId: device.audioOutputDeviceId ?? "",
   dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -73,6 +74,7 @@ export async function applyConfig(config: Config): Promise<Config> {
         device.dpr,
         device.systemAudio
       );
+      await commands.setDevicePointerScope(device.ip, device.pointerScope ?? "display");
       await commands.setDeviceAudioOutput(device.ip, device.audioOutputDeviceId);
     });
   }

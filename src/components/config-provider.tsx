@@ -12,6 +12,11 @@ export type Device = {
   videoScale: number;
   videoQuality: number;
   remoteControl: boolean;
+  // How far this device may drive the host cursor while it holds pointer lock: "display"
+  // confines it to the screen it is streaming, "all" lets it cross onto the host's real
+  // monitors. A config saved before this existed has no value; every reader defaults it to
+  // "display", and so does the host for anything it does not recognise.
+  pointerScope: "display" | "all";
   systemAudio: boolean;
   audioOutputDeviceId: string;
   audioOutputDeviceLabel: string;
