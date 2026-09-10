@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod com;
 pub mod compatibility;
 pub mod device_reporter;
 pub mod driver_ipc;

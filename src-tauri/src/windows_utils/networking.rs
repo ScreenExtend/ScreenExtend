@@ -10,7 +10,7 @@ use tauri_plugin_store::StoreExt;
 use tauri_specta::Event;
 use wmi::{COMLibrary, WMIConnection};
 
-use super::AppState;
+use super::{com, AppState};
 
 /// How long to keep collecting change notifications before re-enumerating, so a burst
 /// (an adapter appearing usually fires several) costs one WMI round trip.
@@ -84,17 +84,17 @@ fn hosted_network_name(app: &AppHandle) -> String {
     stored_name.unwrap_or_else(|| "ScreenExtend".to_string())
 }
 
-/// COM must be live on the calling thread before any WMI call. Tauri's worker threads are
-/// not initialized by anything in this crate, so initialize here and only fall back to the
-/// "somebody else already did it" assumption when `CoInitializeEx` refuses (an STA thread).
-fn com_for_this_thread() -> COMLibrary {
-    match COMLibrary::new() {
-        Ok(com) => com,
-        Err(e) => {
-            teprintln!("[network] CoInitializeEx failed ({e}); assuming COM is already up");
-            unsafe { COMLibrary::assume_initialized() }
-        }
-    }
+/// COM must be live on the calling thread before any WMI call, and this is reached from three
+/// kinds of thread: a Tauri command (already in Tauri's STA), the watcher thread the app spawns
+/// (no apartment), and a `spawn_blocking` worker under `link_medium_for_local_ip` (likewise).
+///
+/// It used to be `COMLibrary::new()` — an unconditional `CoInitializeEx(MTA)` — with a fallback
+/// to `assume_initialized()` when that was refused. On a Tauri thread it always was:
+/// `[network] CoInitializeEx failed (0x80010106)` is `RPC_E_CHANGED_MODE`, and it appeared once
+/// per enumeration in the log of a perfectly healthy host. Ask first instead; see
+/// `windows_utils::com`.
+fn com_for_this_thread(site: &'static str) -> Result<(com::ComScope, COMLibrary), String> {
+    com::wmi_for_this_thread(site).map_err(|e| format!("{e:#}"))
 }
 
 /// Enumerate the host's usable network adapters. `hosted_network_label` names the Wi-Fi Direct
@@ -103,7 +103,9 @@ fn com_for_this_thread() -> COMLibrary {
 /// Returns `Err` rather than an empty list when the enumeration itself failed: an empty list is
 /// load-bearing (it stops every streamer) and must not be produced by a transient WMI hiccup.
 fn enumerate_adapters(hosted_network_label: Option<&str>) -> Result<Vec<NetworkInfo>, String> {
-    let com_con = com_for_this_thread();
+    // The scope is declared first so it outlives the connection: Rust drops locals in reverse,
+    // and releasing the apartment before the WMI proxy would be releasing it under a live object.
+    let (_com, com_con) = com_for_this_thread("network")?;
     let wmi_con = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con)
         .map_err(|e| format!("WMI connect to root\\StandardCimv2 failed: {e}"))?;
 
@@ -203,7 +205,13 @@ pub fn cli_adapters() -> Vec<NetworkInfo> {
 pub fn hosted_network_ipv4() -> Vec<String> {
     const ANY_ADAPTER: &str = "SELECT InterfaceIndex, Name, DriverDescription FROM MSFT_NetAdapter";
 
-    let com_con = com_for_this_thread();
+    let (_com, com_con) = match com_for_this_thread("hosted-network") {
+        Ok(pair) => pair,
+        Err(e) => {
+            teprintln!("[hosted-network] {e}");
+            return Vec::new();
+        }
+    };
     let wmi_con = match WMIConnection::with_namespace_path("root\\StandardCimv2", com_con) {
         Ok(connection) => connection,
         Err(e) => {
@@ -341,7 +349,15 @@ pub fn watch_for_network_changes(app: AppHandle) {
     );
 
     std::thread::spawn(move || {
-        let _com = com_for_this_thread();
+        // This thread is the app's own, so it is the one that owns the apartment; every
+        // `enumerate_adapters` below then finds it already up and does nothing.
+        let _com = match com::ensure_for_this_thread("network-watcher", com::Apartment::Mta) {
+            Ok(scope) => scope,
+            Err(e) => {
+                teprintln!("[network-watcher] {e}");
+                return;
+            }
+        };
 
         let mut previous = match enumerate_adapters(hosted_label(&app).as_deref()) {
             Ok(adapters) => adapters,
@@ -444,7 +460,7 @@ const MEDIUM_QUERY: &str =
 pub fn link_medium_for_local_ip(ip: &str) -> Option<crate::streamer::platform::LinkMedium> {
     use crate::streamer::platform::LinkMedium;
 
-    let com_con = com_for_this_thread();
+    let (_com, com_con) = com_for_this_thread("link-medium").ok()?;
     let wmi_con = WMIConnection::with_namespace_path("root\\StandardCimv2", com_con).ok()?;
     let ips: Vec<NetIPAddress> = wmi_con.raw_query(IP_QUERY).ok()?;
     let index = ips.iter().find_map(|entry| {
