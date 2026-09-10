@@ -526,10 +526,20 @@
                     // graph exists answers `null` and is applied when it does. Where the engine
                     // refused there is one thing left to try, and it needs a gesture, so it is
                     // queued for the next one rather than raised over the picture.
+                    //
+                    // `audioSink` is in *every* `/reconfig` body, so this runs about once a
+                    // second and `false` is answered about once a second too — the engine that
+                    // refused the id refuses it again on the next tick. The offer is therefore
+                    // latched on the id: one re-offer per sink the host asks for, which is what
+                    // the ruling says. Without the latch the picker re-armed on every tick and
+                    // the stage swallowed every gesture for the rest of the session.
                     try {
                         if (window.SEAudio) {
                             Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
-                                if (ok === false) queueOutputPicker(j.audioSink);
+                                if (ok !== false) return;
+                                if (j.audioSink === lastOfferedSinkId) return;
+                                lastOfferedSinkId = j.audioSink;
+                                queueOutputPicker(j.audioSink);
                             }, noteSuppressed);
                         }
                     } catch (_) { noteSuppressed(); }
@@ -1110,13 +1120,49 @@
                     if (window.RemoteInput && RemoteInput.setSuspended) RemoteInput.setSuspended(false);
                 } catch (_) { noteSuppressed(); }
             }
+            // `beginModal()` only *starts* the release: a pointer-lock exit is delivered on
+            // `pointerlockchange` and a fullscreen exit on `fullscreenchange`, both in a later
+            // task, and `webkitExitFullscreen` returns nothing at all. A page modal is a sibling
+            // of `#stage`, so revealing it while the fullscreen element is still `#stage` shows
+            // the user nothing — which is the failure this whole mechanism exists to fix. So the
+            // dialog is revealed from the confirmation, under the same 1500 ms fallback the
+            // deleted `offerPermModalNow` carried: an exit that never lands must not strand the
+            // caller with an invisible dialog and the input still suspended.
+            const MODAL_RELEASE_MS = 1500;
+            const MODAL_RELEASE_EVENTS = ['fullscreenchange', 'webkitfullscreenchange',
+                'mozfullscreenchange', 'MSFullscreenChange', 'pointerlockchange',
+                'mozpointerlockchange', 'webkitpointerlockchange'];
+            function inputReleased() {
+                return !currentFullscreenEl() && !document.pointerLockElement;
+            }
+            function whenInputReleased(cb) {
+                const run = () => { try { cb(); } catch (_) { noteSuppressed(); } };
+                if (inputReleased()) { run(); return; }
+                let settled = false;
+                let timer = 0;
+                const check = () => { if (inputReleased()) finish(); };
+                function finish() {
+                    if (settled) return;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    MODAL_RELEASE_EVENTS.forEach((ev) => document.removeEventListener(ev, check));
+                    run();
+                }
+                MODAL_RELEASE_EVENTS.forEach((ev) => document.addEventListener(ev, check));
+                timer = setTimeout(finish, MODAL_RELEASE_MS);
+            }
             // Wraps anything that puts UI in front of the user. `fn` is handed a `done` callback
             // it must call exactly once; the counter tolerates being unbalanced only downwards.
-            function withModal(fn) {
+            // `immediate` is for UI the *browser* draws — the output picker — which is not a
+            // subtree of the page, so no fullscreen exit has to have landed for it to be
+            // visible, and which must run inside the gesture's transient activation rather than
+            // a task later.
+            function withModal(fn, immediate) {
                 beginModal();
                 let closed = false;
                 const done = () => { if (closed) return; closed = true; endModal(); };
-                try { fn(done); } catch (_) { noteSuppressed(); done(); }
+                const body = () => { try { fn(done); } catch (_) { noteSuppressed(); done(); } };
+                if (immediate) body(); else whenInputReleased(body);
             }
 
             // The host asked this device to play somewhere and the engine refused it outright —
@@ -1125,11 +1171,49 @@
             // the user's next tap or key rather than being raised over the picture. One request
             // is armed at a time; a newer host choice replaces the id it will open on.
             let queuedPickerId = null;
+            let lastOfferedSinkId = null;
             let pickerGestureArmed = false;
             let pickerGestureFire = null;
-            const PICKER_GESTURES = ['pointerdown', 'keydown', 'touchend'];
+            // No `keydown`. `input.js` binds its own on `window` in the capture phase during
+            // `setup()`, i.e. before this one, so it would run first with `suspended` still
+            // false and the key that summons the dialog would land on the host's desktop —
+            // possibly a modifier, possibly something destructive. A tap is a sufficient
+            // gesture, and the stage is the thing being tapped. `pointerdown`/`touchend` are
+            // safe because input.js binds those on `#stage` in the bubble phase, so this
+            // window-capture listener wins.
+            const PICKER_GESTURES = ['pointerdown', 'touchend'];
+            // A browser chooser can be left open indefinitely — a backgrounded tab, an engine
+            // that resolves neither way — and everything downstream of it waits on it settling.
+            // Every other promise on the join path is bounded; this one is too.
+            const PICKER_DEADLINE_MS = 15000;
+            function pickOutputBounded(preferredId, onSettled) {
+                let settled = false;
+                let timer = 0;
+                const finish = (chosen) => {
+                    if (settled) return null;
+                    settled = true;
+                    if (timer) { clearTimeout(timer); timer = 0; }
+                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
+                    return chosen || null;
+                };
+                // Synchronous, inside the gesture: the activation this depends on is spent by
+                // the first await, not by anything above it.
+                let p = null;
+                try { p = SEAudio.pickOutput(preferredId); } catch (_) { noteSuppressed(); }
+                return new Promise((resolve) => {
+                    timer = setTimeout(function () {
+                        timer = 0;
+                        noteSuppressed();
+                        resolve(finish(null));
+                    }, PICKER_DEADLINE_MS);
+                    Promise.resolve(p).then(
+                        (chosen) => resolve(finish(chosen)),
+                        () => { noteSuppressed(); resolve(finish(null)); });
+                });
+            }
             function cancelQueuedPicker() {
                 queuedPickerId = null;
+                lastOfferedSinkId = null;
                 if (!pickerGestureFire) return;
                 const fn = pickerGestureFire;
                 pickerGestureFire = null;
@@ -1141,7 +1225,8 @@
                 try { can = !!(window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()); } catch (_) { noteSuppressed(); }
                 if (!can) {
                     // Nothing left to offer. `sinkTier` staying 0 after a change the host asked
-                    // for is what says so, and it already does.
+                    // for is what says so, and it already does. Behind the caller's id latch,
+                    // so this is once per sink the host asks for, not once a second.
                     console.warn('[audio] the host asked for an output this browser will not route to');
                     return;
                 }
@@ -1155,14 +1240,10 @@
                     const want = queuedPickerId;
                     queuedPickerId = null;
                     withModal((close) => {
-                        let p = null;
-                        // Synchronous inside the gesture: the activation this depends on is
-                        // spent by the first await, not by beginModal().
-                        try { p = SEAudio.pickOutput(want); } catch (_) { noteSuppressed(); }
-                        Promise.resolve(p).then((chosen) => {
+                        pickOutputBounded(want, close).then((chosen) => {
                             if (chosen) console.log('[audio] output re-selected: ' + (chosen.label || chosen.id));
-                        }, noteSuppressed).then(close, close);
-                    });
+                        }, noteSuppressed);
+                    }, true);
                 };
                 pickerGestureFire = fire;
                 PICKER_GESTURES.forEach((ev) => window.addEventListener(ev, fire, true));
@@ -1965,7 +2046,15 @@
                     }
                     pc = new RTCPeerConnection(pcConfig);
                     const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
-                    try { if (window.RemoteInput) RemoteInput.setup(pc); } catch (_) { noteSuppressed(); }
+                    try {
+                        if (window.RemoteInput) {
+                            RemoteInput.setup(pc);
+                            // `teardown()` clears input.js's own flag, so a session built while
+                            // a dialog is still up would forward input with `modalSuspend` set
+                            // and the page's two notions of suspension would disagree.
+                            if (modalSuspend && RemoteInput.setSuspended) RemoteInput.setSuspended(true);
+                        }
+                    } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
                         if (audioFast) {
                             pc.ondatachannel = (ev) => {
@@ -2654,16 +2743,22 @@
                 }
                 // `httpsFixable` is read by the compat gate below and only ever on an http
                 // page, where it means "do not list this row; offer the switch to HTTPS
-                // instead". The switch is offered on every system, deliberately: a secure
-                // context is the precondition for both fast paths whether or not this
-                // particular engine would then have them, and an offer that is right for
-                // almost every device beats a per-engine guess.
+                // instead". The switch itself is offered on every system, deliberately: a
+                // secure context is the precondition for both fast paths whether or not this
+                // particular engine would then have them, and an offer that is right for almost
+                // every device beats a per-engine guess.
+                //
+                // The one exception is `http://localhost`, which *is* a secure context — so the
+                // fast paths are missing there for some other reason, and suppressing the rows
+                // would hide the only explanation the user gets. That is the same-device join.
+                const httpsFixable = location.protocol === 'http:' &&
+                    !(typeof window.isSecureContext === 'boolean' && window.isSecureContext);
                 if (!canWebCodecs) {
                     unsupported.push({
                         name: 'WebCodecs video',
                         description: 'Enables the lowest-latency video path. Without it, playback uses a higher-latency compatibility mode and audio can no longer be lined up with the picture.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsFixable,
                     });
                 }
                 // One row, gated on the pair, and the original wording: this modal's rendered
@@ -2677,7 +2772,7 @@
                         name: 'WebCodecs audio and AudioWorklet',
                         description: 'Enable the lowest-latency audio path. Without them the system audio the host sends still plays, but over a standard audio track the browser buffers on its own.',
                         severity: 'optional',
-                        httpsFixable: true,
+                        httpsFixable: httpsFixable,
                     });
                 }
                 const hasDataChannel = typeof RTCPeerConnection !== 'undefined' &&
@@ -2841,23 +2936,17 @@
                 //
                 // Dismissing it is not an error: the join carries on with the default output.
                 let pickPromise = null;
-                let pickerOpened = false;
                 try {
                     if (window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()) {
                         beginModal();
-                        pickerOpened = true;
-                        let p = null;
-                        try { p = SEAudio.pickOutput(); } catch (_) { noteSuppressed(); }
-                        pickPromise = Promise.resolve(p).then(
-                            (chosen) => { endModal(); return chosen; },
-                            () => { endModal(); noteSuppressed(); return null; });
+                        // Bounded, and `endModal` runs from whichever of the three outcomes
+                        // arrives first. Nothing may leave the page suspended: `modalSuspend`
+                        // gates the gesture handler, so a stuck one costs fullscreen and pointer
+                        // lock for the rest of the session — and the join is itself gated on
+                        // this settling.
+                        pickPromise = pickOutputBounded(null, endModal);
                     }
-                } catch (_) {
-                    noteSuppressed();
-                    // Nothing may leave the page suspended: `modalSuspend` gates the gesture
-                    // handler, so a stuck one costs fullscreen and pointer lock for the session.
-                    if (pickerOpened && !pickPromise) endModal();
-                }
+                } catch (_) { noteSuppressed(); }
 
                 const g0 = screenGeom();
                 joinData = {
