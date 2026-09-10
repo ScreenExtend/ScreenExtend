@@ -130,6 +130,23 @@ logged via `teprintln!` rather than swallowed silently.
 - `Settings::with_gpu_preference` (`:142-152`).
 - `GraphicsCaptureItemType` collapsed to the `Monitor` variant (`:13-16`); see below.
 
+### `winrt.rs`
+
+- **`WinRT::new()` asks before it initializes.** Upstream calls
+  `RoInitialize(RO_INIT_MULTITHREADED)` unconditionally. `Handler::start` runs on the *caller's*
+  thread, and in this app that caller can be one Tauri already put in an STA — where an
+  unconditional multithreaded initialize returns `RPC_E_CHANGED_MODE` and takes the whole capture
+  down with `FailedToInitWinRT`. It now goes through
+  `windows_utils::com::apartment_of_this_thread()` and initializes only a thread with no apartment
+  of its own, `RoUninitialize`ing only what it took. `start_free_threaded` — the path the live
+  pipeline uses — spawns its own thread and is unchanged.
+- **`keep_process_com_alive()` on entry.** This type's `CoIncrementMTAUsage` is balanced on drop,
+  so on a host where capture is the only COM user the last stop drops the process's last COM
+  reference — while `windows-core`'s `FactoryCache` keeps WGC's agile activation factories in
+  process-wide raw pointers that outlive it, and the next capture start reads a dead factory. One
+  unmatched `CoIncrementMTAUsage`, taken once for the process, holds the floor. See
+  `docs/OPTIMIZATIONS.md` UX-E5.
+
 ## Removed
 
 | What | Size | Why |
