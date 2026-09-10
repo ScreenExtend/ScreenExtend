@@ -452,7 +452,7 @@ host. The field is a union of the page's own bits and the audio module's.
 | 12 | `transferControlToOffscreen` unavailable |
 | 13 | demoted to the `<video>` element |
 | 14 | `getCoalescedEvents` unavailable |
-| 15 | ICE gathering ran to its deadline instead of settling |
+| 15 | an ICE wait ran to its deadline instead of settling |
 | 16 | no H.264 `fmtp` in the answer to pin the decoder to |
 | 17 | no hardware decoder for the negotiated configuration |
 | 18 | refresh rate was measured with rAF, not reported by the browser |
@@ -461,6 +461,13 @@ host. The field is a union of the page's own bits and the audio module's.
 | 21 | Keyboard Lock unavailable |
 | 22 | trickle ICE unavailable — the offer waited for gathering before it was posted |
 | 23 | input was suspended so the user could reach a dialog on the page |
+
+Bit 15 covers two different waits, both of which mean "ICE did not finish on its own". On the
+gather-then-post tier it is the wait in front of the offer (`waitForIceGathering`). On the
+trickle tier nothing waits for gathering at all, and it is instead the 8 s hold on the streaming
+stage expiring — a browser that emitted neither a null candidate nor
+`iceGatheringState === 'complete'`, so the page showed the picture rather than waiting forever.
+Bit 22 tells the two apart: **set** is the gather wait, **clear** is the trickle hold.
 
 Bit 23 is set the first time the page took the pointer lock, the keyboard lock and the input
 forwarding back from the host to put something in front of the user — a card, a modal, or the
