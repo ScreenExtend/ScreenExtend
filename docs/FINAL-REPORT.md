@@ -2206,7 +2206,7 @@ does not know on the way in and refusing the whole document over an inert one is
 failure. The config shape moved to `src/lib/config-defaults.ts` (a module with no imports) so
 plain `node` can hold the schema and the type side by side.
 
-**What guards it.** `pnpm test:config` — `scripts/test-config-editor.mjs`, 27 assertions, in the
+**What guards it.** `pnpm test:config` — `scripts/test-config-editor.mjs`, 25 assertions, in the
 CI frontend job. It cross-checks `defaultConfig`'s keys against the schema's `properties` and
 its `required` list, parses `Device`/`KnownDevice`'s members out of the type text, validates a
 sanitized copy of the owner's real `config.json` to zero errors, pins the secret-masking column
