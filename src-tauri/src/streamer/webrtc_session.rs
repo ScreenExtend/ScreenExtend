@@ -1099,7 +1099,7 @@ pub async fn activate_whep(
         twcc_offered,
         locality,
     } = pending;
-    let keyframe_gate = Arc::new(KeyframeGate::new());
+    let keyframe_gate = Arc::new(KeyframeGate::for_locality(locality));
     let keyframes = KeyframeRequester {
         pipeline: pipeline.clone(),
         gate: Arc::clone(&keyframe_gate),

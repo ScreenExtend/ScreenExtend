@@ -1379,7 +1379,14 @@ async fn start_session(
     // that had just demonstrated it could not carry the previous burst. With a refresh wave the
     // decoder rebuilds over a few frames instead, and a client that missed the session's opening
     // keyframe recovers on its own rather than sitting black behind an infinite GOP.
-    cfg.intra_refresh = true;
+    // `SE_INTRA_REFRESH=0` turns it back off. There is no shipped flag for it — the probe
+    // harness's `--intra-refresh` never reaches a real join — so without this the one encode
+    // change made in this window cannot be A/B'd against a live client, which is exactly what
+    // was needed to decide whether it had anything to do with the relayed path's keyframe rate.
+    cfg.intra_refresh = !matches!(
+        std::env::var("SE_INTRA_REFRESH").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    );
     let device_settings = state
         .config
         .device_overrides
