@@ -354,16 +354,23 @@ pub fn set_device_override(
         control_enabled,
         dpr,
         audio_enabled,
-        // Not an argument here: `set_device_override` is already at specta's ten-argument
-        // ceiling, and unlike everything above it, pointer scope needs no rebuild verdict.
-        // `set_device_pointer_scope` owns it, and a device with no saved scope keeps the
-        // default rather than being reset by an unrelated display change.
+        // Neither of these is an argument here: `set_device_override` is already at specta's
+        // ten-argument ceiling, and unlike everything above them they need no rebuild verdict.
+        // `set_device_pointer_scope` and `set_device_auto_frame_rate` own them, and a device
+        // with no saved value keeps the default rather than being reset by an unrelated
+        // display change.
         pointer_scope: state
             .device_overrides
             .lock_recover()
             .get(&ip)
             .map(|o| o.pointer_scope)
             .unwrap_or_default(),
+        auto_frame_rate: state
+            .device_overrides
+            .lock_recover()
+            .get(&ip)
+            .map(|o| o.auto_frame_rate)
+            .unwrap_or(false),
     };
     // Which overrides need the session rebuilt, and which only need the display touched. The
     // client answers a reconfig epoch bump by tearing the whole session down — peer connection,
@@ -405,8 +412,8 @@ pub fn set_device_override(
     }
 }
 
-/// Where a pointer-locked client may drive this host's cursor: `"display"` (its own screen,
-/// the default) or `"all"` (every screen, including the host's real monitors).
+/// Where a pointer-locked client may drive this host's cursor: `"all"` (every screen, including
+/// the host's real monitors — the default) or `"display"` (only the screen it is streaming).
 ///
 /// Its own command rather than another `set_device_override` argument: that one is at specta's
 /// ten-argument ceiling, and this needs none of its machinery — no clamp, no rebuild verdict,
@@ -420,26 +427,47 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, ip: String, scope: S
     match overrides.get_mut(&ip) {
         Some(existing) => existing.pointer_scope = parsed,
         None => {
-            // Nothing saved for this device yet. Everything else takes the same defaults the
-            // join path would have used, so saving a scope cannot silently pin a resolution.
             overrides.insert(
                 ip.clone(),
                 DeviceOverride {
-                    scale: 100,
-                    orientation_portrait: false,
-                    refresh_rate: 60,
-                    video_scale: 100,
-                    video_quality: 15,
-                    control_enabled: true,
-                    dpr: 1.0,
-                    audio_enabled: false,
                     pointer_scope: parsed,
+                    ..DeviceOverride::join_defaults()
                 },
             );
         }
     }
     drop(overrides);
     tprintln!("[input] pointer scope for {ip} is now {}", parsed.as_str());
+}
+
+/// Whether this device's stream may drop below its chosen refresh rate on its own.
+///
+/// Off is the default and the owner's ruling: the rate the user picked is the rate the stream
+/// runs at, an unchanged frame is repeated rather than skipped, and no controller lowers it.
+/// A separate command for the same reason as `set_device_pointer_scope` — `set_device_override`
+/// is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
+/// a change applies to the next connection.
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_auto_frame_rate(state: State<'_, AppState>, ip: String, enabled: bool) {
+    let mut overrides = state.device_overrides.lock_recover();
+    match overrides.get_mut(&ip) {
+        Some(existing) => existing.auto_frame_rate = enabled,
+        None => {
+            overrides.insert(
+                ip.clone(),
+                DeviceOverride {
+                    auto_frame_rate: enabled,
+                    ..DeviceOverride::join_defaults()
+                },
+            );
+        }
+    }
+    drop(overrides);
+    tprintln!(
+        "[stream] automatic frame rate for {ip} is now {}",
+        if enabled { "on" } else { "off" }
+    );
 }
 
 #[tauri::command]

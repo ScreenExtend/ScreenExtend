@@ -124,7 +124,8 @@
                 { "name": "video-quality", "takesValue": true, "description": "Encoder quality 1 (best) to 51 (worst)." },
                 { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." },
                 { "name": "audio", "takesValue": true, "possibleValues": ["on", "off"], "description": "System audio streaming." },
-                { "name": "pointer-scope", "takesValue": true, "possibleValues": ["display", "all"], "description": "How far a pointer-locked client may drive the cursor: its own display, or every screen." }
+                { "name": "pointer-scope", "takesValue": true, "possibleValues": ["display", "all"], "description": "How far a pointer-locked client may drive the cursor: every screen (default), or only its own display." },
+                { "name": "auto-framerate", "takesValue": true, "possibleValues": ["on", "off"], "description": "Let the stream drop below the chosen refresh rate on its own. Off (default) holds the rate." }
               ]
             },
             "reset": {

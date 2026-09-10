@@ -29,16 +29,18 @@ pub struct ClientProfile {
 ///
 /// The arguments are balanced — a user who granted control of the screen they can see has not
 /// obviously granted the desktop they cannot, but dragging a window back off the virtual display
-/// requires crossing the boundary — so it is a per-device choice rather than a rule. The default
-/// is the conservative one: the client can reach exactly what it is looking at. Blast radius is
-/// bounded by `control_enabled` either way, and the setting is read at join, like remote control
-/// itself, so a change applies to the next connection.
+/// requires crossing the boundary — so it is a per-device choice rather than a rule. The owner's
+/// ruling is that the unrestricted reach is the intended product behaviour: a second monitor whose
+/// keyboard and mouse stop at its own edge is not a second monitor, so `All` is the default and
+/// `Display` is the opt-in restriction. Blast radius is bounded by `control_enabled` either way,
+/// and the setting is read at join, like remote control itself, so a change applies to the next
+/// connection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PointerScope {
     /// Confine the locked cursor to the display this session is streaming.
-    #[default]
     Display,
     /// Let it cross onto the host's real monitors, i.e. the whole virtual desktop.
+    #[default]
     All,
 }
 
@@ -50,11 +52,12 @@ impl PointerScope {
         }
     }
 
-    /// Anything unrecognised is the safe answer, which is also the default.
+    /// Only the explicit restriction restricts; anything unrecognised — and anything absent,
+    /// which is every device saved before the setting existed — is the default.
     pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "all" => Self::All,
-            _ => Self::Display,
+            "display" => Self::Display,
+            _ => Self::All,
         }
     }
 }
