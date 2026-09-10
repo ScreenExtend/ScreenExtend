@@ -569,7 +569,7 @@ async fn dispatch(
         ("GET", "/reconfig") => (
             200,
             "application/json",
-            server::process_reconfig(state, &relay_join),
+            server::process_relay_reconfig(state, &relay_join, client_id),
             None,
             None,
         ),

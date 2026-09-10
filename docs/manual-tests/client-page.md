@@ -324,3 +324,83 @@ Fill in the `Status` column of the "Client …" rows in `docs/CAPABILITY-TIERS.m
 `hostToPaint` percentiles from §4 into `docs/OPTIMIZATIONS.md` rows 28-37. A tier you did not
 reach stays `UNVERIFIED` — an untested tier and a working one must not look the same in the
 ledger, which is the whole reason the telemetry exists.
+
+## A phone on cellular, through the public relay
+
+Neither development machine can be a genuine cross-network client — a browser on the host box
+shares its public IP, so ICE nominates a local pair and the relay path is never actually
+exercised. This is the one test that needs a second network, and a phone on mobile data is the
+cheapest one there is.
+
+**No TURN server is needed and none should be configured.** `ScreenExtend turn show` reporting
+`TURN relay: not configured` is the correct starting state: the relay serves Google STUN and no
+TURN, and a relayed join connects on server-reflexive candidates from both ends. If this test
+only passes with TURN set, that is a finding, not a workaround.
+
+### Setup
+
+On the host, with the desktop UI closed:
+
+```sh
+SCREENEXTEND_SESSION_ID=<12 chars> SCREENEXTEND_OTP=<6 digits> \
+  ScreenExtend serve --no-qr -v
+```
+
+Wait for `[cloud] registered; clients can join at https://session.screenextend.app/?id=<id>`.
+Open exactly that URL on the phone **with Wi-Fi off**, and join with the session id and OTP.
+
+### What to look for in the host log
+
+The one line that decides whether this fix is live. It is printed once per join:
+
+```
+session transport: locality=CrossNetwork mtu=1012 pacing=Full playout_delay_max=200ms
+```
+
+`locality=Unknown mtu=1188 pacing=Light playout_delay_max=0ms` is the defect — the join was
+classified from the relay's opaque client id instead of from the route it arrived on.
+
+This line must **not** appear at all:
+
+```
+session locality was pre-classified Unknown but the nominated candidate pair says CrossNetwork;
+transport constants for this session were chosen for the former
+```
+
+The answer must carry a reflexive candidate, or a peer on another network has nothing to pair
+with. Look for `typ srflx` with your public address in:
+
+```
+ICE candidates in remote offer (browser): …
+```
+
+and confirm the nominated pair in the `ICE pair [Succeeded] nominated=true` dump if the
+connection fails.
+
+### What to look for in `ScreenExtend status --json`
+
+Let it run two minutes on a mostly static screen, then read `telemetry.sessions.<join>`:
+
+| field | expected | what a bad number means |
+|---|---|---|
+| `degradation.idrs_sent` | single digits | hundreds is the keyframe storm; compare against `frames_encoded` — one IDR per ~14 frames is the shape the relayed path used to show |
+| `degradation.keyframe_requests` | near 0 | sustained ~3/s is Chrome asking for a keyframe it never gets to keep |
+| `degradation.client_keyframe_requests` | 0 | non-zero means the request came in-band from the page, not over RTCP — a different path |
+| `degradation.nacks_received` | any | a lossy cellular link produces these; that is the link, not a defect |
+| `client` | `null` | expected. The relay serves its own older copy of the client page, which does not send `OP::STATS` — so no client-side tier is visible on a relayed join, and that is a property of the relay deployment, not of this host |
+
+### Kick and live settings
+
+With the phone connected, change the display scale from the host's device panel, then press
+disconnect. Both must reach the phone. They ride `/reconfig`, which the relay tunnels with no
+`?join=`; before the `process_relay_reconfig` fallback the host answered
+`{"audioSink":"","epoch":0,"kick":0}` to every poll for the life of the session and neither
+control did anything.
+
+### If it does not connect at all
+
+Carrier-grade NAT on the phone plus a symmetric NAT on the host is the one combination
+server-reflexive candidates cannot cross, and it is the only case where TURN is genuinely
+required. Distinguish it from a defect by the log: candidates gathered and offered on both sides,
+`ICE pair [Failed]` on every pair, no `nominated=true`. That is a network topology result and
+belongs in the report as one.

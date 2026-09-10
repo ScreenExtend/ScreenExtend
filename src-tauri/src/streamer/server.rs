@@ -948,6 +948,34 @@ pub fn process_reconfig(state: &AppState, join: &str) -> String {
     serde_json::json!({ "epoch": epoch, "kick": kick, "audioSink": audio_sink }).to_string()
 }
 
+/// `/reconfig` for a tunnelled client that named no join.
+///
+/// The join id reaches a direct client in the answer's `Location`, and a relayed one only in the
+/// `x-join-id` header this host added for it. The relay's deployed client page predates both, so
+/// it polls `/reconfig` with no `?join=` and the epoch lookup was made against the empty string —
+/// which matches no session and answers `{"epoch":0,"kick":0}` for the life of every relayed
+/// session. A kick never arrived, and neither did a display-scale, orientation, refresh-rate or
+/// audio-output change: the desktop UI's controls were inert for exactly the devices that joined
+/// over the internet.
+///
+/// The relay does know which of its clients this is, and `relay_client` maps that onto the join
+/// without touching an address — the same fallback `/leave` already takes. A client that does
+/// send a join id is answered on it, so a page that learns the id loses nothing.
+pub fn process_relay_reconfig(state: &AppState, join: &str, client_id: &str) -> String {
+    if !join.is_empty() {
+        return process_reconfig(state, join);
+    }
+    let resolved = state.config.sessions.as_ref().and_then(|s| {
+        session::joins_for_relay_client(s, client_id)
+            .into_iter()
+            .next()
+    });
+    match resolved.as_deref() {
+        Some(j) => process_reconfig(state, j),
+        None => process_reconfig(state, join),
+    }
+}
+
 pub fn process_leave(state: &AppState, join: &str) {
     if let Some(s) = state.config.sessions.as_ref() {
         tprintln!("leave beacon for join {join}; tearing down session");
@@ -2295,6 +2323,46 @@ mod tests {
             .iter()
             .zip(direct.iter())
             .all(|(a, b)| a.urls == b.urls));
+    }
+
+    #[test]
+    fn a_relayed_reconfig_that_names_no_join_still_finds_its_session() {
+        // The relay's deployed client page polls `/reconfig` with no `?join=`, so the lookup was
+        // made against "" — which matches nothing and answers epoch 0 / kick 0 for ever. A kick
+        // raised in the desktop UI never reached a device that joined over the internet.
+        let sessions: session::SharedSessions =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let state = AppState::new(Config {
+            sessions: Some(Arc::clone(&sessions)),
+            ..Config::default()
+        });
+        let join = session::mint_join_id();
+        session::open_session_via(&sessions, &join, "tok", "c-7", Some("c-7"));
+        session::bump_kick_epoch(&sessions, &join);
+
+        let blind: serde_json::Value =
+            serde_json::from_str(&process_reconfig(&state, "")).expect("json");
+        assert_eq!(
+            blind["kick"], 0,
+            "the empty join is what the old page asks with, and it matches no session"
+        );
+
+        let answered: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, "", "c-7")).expect("json");
+        assert_eq!(
+            answered["kick"], 1,
+            "the relay client id maps onto the join without needing an address"
+        );
+
+        // A client that does know its join id is still answered on it, not on the fallback.
+        let named: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, &join, "c-7")).expect("json");
+        assert_eq!(named["kick"], 1);
+
+        // An unknown relay client is not silently mapped onto somebody else's session.
+        let stranger: serde_json::Value =
+            serde_json::from_str(&process_relay_reconfig(&state, "", "c-99")).expect("json");
+        assert_eq!(stranger["kick"], 0);
     }
 
     #[test]
