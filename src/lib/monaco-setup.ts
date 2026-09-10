@@ -230,6 +230,26 @@ export const editorOptions: monaco.editor.IStandaloneEditorConstructionOptions =
   },
 };
 
+// Monaco does not ship its theme as a stylesheet: `defineTheme` writes every `.mtk*` token
+// colour, every codicon glyph and every `--vscode-*` variable into one `<style
+// class="monaco-colors">` it appends to the head at runtime. That element carries no CSP
+// nonce, so any policy that nonces `style-src` -- which is what Tauri does the moment
+// index.html contains an inline <style> -- drops it whole, with no error anywhere: the
+// editor still renders, still validates and still saves, and only *looks* broken (no
+// syntax colours, an unstyled gutter, unstyled scrollbars). That shipped once. A style
+// element the browser refused leaves `.sheet` null, which is the one observable difference,
+// so say so where `error-reporting.ts` will carry it into the log bus.
+function assertThemeStylesApplied(): void {
+  const blocked = [...document.querySelectorAll<HTMLStyleElement>("style.monaco-colors")]
+    .filter(style => style.textContent && style.sheet === null);
+  if (blocked.length === 0) return;
+  console.error(
+    "monaco's theme stylesheet was rejected by the page's Content-Security-Policy " +
+      "(style-src is nonced, so 'unsafe-inline' is ignored): the editor will render " +
+      "without syntax colours, gutter or scrollbar styling. See index.html."
+  );
+}
+
 loader.config({ monaco });
 
-export { monaco };
+export { monaco, assertThemeStylesApplied };
