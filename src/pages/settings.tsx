@@ -171,9 +171,9 @@ const PastDevicesTable = React.memo(function PastDevicesTable({
   );
 });
 
-/// Cheap enough to poll: `get_hosted_network_status` reads the WinRT publisher we already
-/// hold (macOS: the interface mode) and never spawns a process. The interval is only there
-/// to catch an AP the OS takes down on its own, which is the case the toggle cannot see.
+// Cheap enough to poll: `get_hosted_network_status` reads the WinRT publisher we already
+// hold (macOS: the interface mode) and never spawns a process. The interval is only there
+// to catch an AP the OS takes down on its own, which is the case the toggle cannot see.
 const HOSTED_STATUS_POLL_MS = 10000;
 
 const HOSTED_STATE_STYLE: Record<string, string> = {
