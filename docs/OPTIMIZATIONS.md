@@ -2626,3 +2626,88 @@ producing the trigger. The static check does the same job with no config surface
 **Not fixed, named instead.** `stunUrls` is read once at `setup` and `apply_saved_config`
 does not replay it, so neither the editor nor `RELOAD` applies it to a running host. That is
 pre-existing and needs a Rust command; the schema description now says when it takes effect.
+
+## UX-E: COM initialization on Windows (post-report)
+
+The owner's rule: **`CoInitializeEx` is called by Tauri; any Rust code inside Tauri must assume
+COM is already up and not call it again.** A second `CoInitializeEx`/`RoInitialize` on a thread
+Tauri owns, with a different concurrency model, returns `RPC_E_CHANGED_MODE` and initializes
+nothing — and whatever runs next (WMI, WASAPI, DXGI/D3D enumeration, a WinRT activation) either
+fails or degrades on somebody else's apartment with a success code in the log.
+
+It was not hypothetical. The shipped build said so, once per adapter enumeration, in the log bus
+of a healthy host:
+
+```
+[network] CoInitializeEx failed (HRESULT Call failed with: 0x80010106); assuming COM is already up
+```
+
+`0x80010106` is `RPC_E_CHANGED_MODE`.
+
+### The thread map (measured, not read)
+
+`windows_utils::com` logs one line per (call site, apartment) pair the first time it sees it, so
+the table below is what the running host reports rather than a reading of the source. Measured on
+Windows 11 26200 from `ScreenExtend serve -v`, `probe --audio`, `probe --capture` and the built
+GUI.
+
+| Thread | Who spawns it | Apartment | Who initializes it | COM/WinRT used there |
+|---|---|---|---|---|
+| Tauri main thread, **GUI** | tao/wry | STA (`OleInitialize` for WebView2) | **Tauri** | every sync `#[tauri::command]`: `get_network_adapters`, `is_wifi_on`/`turn_on_wifi` (WinRT `Radio`), `start`/`stop_hosted_network` (WinRT tethering / Wi-Fi Direct), the shell + dialog plugins |
+| Tauri main thread, **`serve` / `probe`** | — | none until we ask | **us**, via the helper | same call sites, reached from the CLI before any window exists |
+| `network-watcher` | `std::thread::spawn` | MTA | **us** (owns it for the process lifetime) | WMI `MSFT_NetAdapter` / `NetIPAddress` / `NetConnectionProfile` |
+| compatibility probe | `std::thread::spawn` in `run_probes` | MTA | **us** | WMI, `ApiInformation`, `GraphicsCaptureSession::IsSupported`, tethering + Wi-Fi Direct probes, `CoCreateInstance(MMDeviceEnumerator)` |
+| `audio-loopback` (MMCSS "Pro Audio") | `std::thread::Builder` | MTA | **us** | WASAPI: `MMDeviceEnumerator`, `IAudioClient`, `ActivateAudioInterfaceAsync` |
+| `audio-silence` companion | `std::thread::Builder` | MTA | **us** | WASAPI render + `IAudioClient3` |
+| WGC capture thread | `thread::spawn` in `start_free_threaded` | MTA | **us**, via `WinRT` | `Direct3D11CaptureFramePool`, `GraphicsCaptureSession`, `IGraphicsCaptureItemInterop`, `CreateDispatcherQueueController` |
+| `spawn_blocking` workers | tokio | MTA per call | **us**, released on return | `link_medium_for_local_ip` (two WMI queries), the display/pipeline calls (no COM) |
+| transport runtime workers (`MAX_TRANSPORT_WORKERS` = 4) | tokio | never initialized | — | none: `tune_transport_thread` touches no COM, and every COM-using call from a handler is already on `spawn_blocking` |
+| `se-adapter-<ip>` | `std::thread::Builder` | never initialized | — | none (axum on the shared runtime) |
+| `IMMNotificationClient` callback | Windows audio service | whatever the OS gives it | the OS | nothing: it only `try_send`s to the capture thread |
+| iphlpapi change callbacks | Windows thread pool | — | — | nothing: `try_send` only |
+
+Two threads deserve their own note. `is_wifi_on` blocks on `Radio::RequestAccessAsync().join()`
+from Tauri's **STA** — safe only because the `Radio` statics are agile and the completion runs on
+a thread-pool thread rather than being marshalled back into an STA with no pump. And
+`run_probes` spawns its own thread precisely so it gets an MTA: it is the only reason the
+compatibility report does not depend on who asked for it.
+
+### The changes
+
+| # | Change | Status |
+|---|---|---|
+| E1 | **`windows_utils/com.rs`, the "ask first" helper.** `ensure_for_this_thread(site, apartment)` reads `CoGetApartmentType`: a thread with an apartment **of its own** is reported and left alone (`ComScope { owned: false }`, no `CoUninitialize` — that would decrement a reference this crate never took); a thread with none is initialized and the scope releases it on drop. `ComScope` is `!Send`, and its doc says to declare it before any COM object it covers, because Rust drops locals in reverse. `changed_mode_refusals()` counts `RPC_E_CHANGED_MODE` so a test can assert zero rather than merely assert success. | `VERIFIED` (6 tests; `serve -v` reports the map above with no refusals) |
+| E2 | **`COMLibrary::new()` is gone from both call sites.** `wmi_for_this_thread(site)` takes the scope and hands back `assume_initialized()`, which is now an assumption the scope actually backs. `networking.rs`'s four entry points (`enumerate_adapters`, `hosted_network_ipv4`, `link_medium_for_local_ip`, the watcher thread) and `compatibility::run_probes` go through it. The `[network] CoInitializeEx failed` line cannot be produced any more. | `VERIFIED` (`doctor --json` byte-identical before/after; adapters and `status --json` unchanged) |
+| E3 | **`CoInitializeSecurity` is called once, from one place.** `COMLibrary::new()` used to call it from whichever thread reached WMI first — or never, on runs where every WMI call landed on a Tauri thread and the initialization was refused. It is now a `Once` in `com.rs` with the same parameters `wmi` used, and `RPC_E_TOO_LATE` (WebView2 usually marshals first) is logged as the answer, not as a failure. | `VERIFIED` (`[com] process COM security initialized (impersonate)`, once) |
+| E4 | **`windows_capture::winrt::WinRT` asks first too.** Upstream calls `RoInitialize(RO_INIT_MULTITHREADED)` unconditionally. `Handler::start` runs on the *caller's* thread, and `ScreenExtend probe --capture` calls it from the Tauri main thread — where an unconditional multithreaded initialize is `RPC_E_CHANGED_MODE` and takes the whole capture down with `FailedToInitWinRT`. It now initializes only a thread with no apartment of its own, and `RoUninitialize`s only what it took. The live path (`start_free_threaded`) is unchanged: its thread is the app's own and still gets the MTA. `FORK.md` records both divergences. | `VERIFIED` (`probe --capture` on both paths; live capture unchanged) |
+| E5 | **`keep_process_com_alive()` — found by the test, not by reading.** `windows-core`'s `FactoryCache` stores every *agile* WinRT activation factory in a process-wide `AtomicPtr` and never releases it, so `GraphicsCaptureSession::IsSupported()` and friends are answered from a raw pointer after the first call. Those pointers die with the apartment behind them. The first scope that actually called `CoUninitialize` therefore killed a later `wgc_supported()` with `STATUS_ACCESS_VIOLATION` on an unrelated thread — and the same shape was already reachable in the shipped build, where `WinRT` balances its `CoIncrementMTAUsage` on drop and a host that stops capturing with no other MTA thread alive drops the process's last COM reference. One unmatched `CoIncrementMTAUsage`, taken once, holds the floor; the cost is one idle MTA keeper thread. | `VERIFIED` (the crash reproduces when the pin is removed; `[com] process MTA pinned…`) |
+| E6 | **The implicit MTA is not an apartment of one's own.** `ThreadApartment::is_explicit()` treats `APTTYPEQUALIFIER_IMPLICIT_MTA` as "no apartment yet", so the audio and capture threads take a real MTA regardless of whether some other subsystem pinned the process floor first. Without that distinction the answer for the hottest threads in the product would depend on call ordering. | `VERIFIED` (`an_app_spawned_thread_is_initialized_and_released`) |
+
+### Tests
+
+`src-tauri/src/windows_utils/com.rs`, `mod test` — six, plus an `#[ignore]`d apartment report:
+
+- `a_thread_that_already_has_an_apartment_is_never_re_initialized` — an STA thread (what wry gives
+  the main thread) and an MTA thread both come back `owns_initialization() == false`, with
+  `changed_mode_refusals()` unchanged.
+- `an_app_spawned_thread_is_initialized_and_released` — a bare thread gets an explicit MTA and
+  gives it back, leaving the process floor exactly as it found it.
+- `only_the_outermost_scope_owns_the_apartment` — nesting, which is the shape of every call site.
+- `adapter_enumeration_agrees_across_apartments` — `cli_adapters()` returns the same interface
+  indices from an STA, an MTA and an app-spawned thread (skips, through `test_support::skip`, on a
+  machine with no adapters).
+- `the_capture_and_hosted_network_probes_agree_across_apartments` — `wgc_supported()` and
+  `probe_backend(None)` likewise. Without a scope, a thread with no apartment answers `false` to
+  the first, which is indistinguishable from a machine without WGC and is cached process-wide by
+  `wgc_features()`.
+- `the_compatibility_report_does_not_depend_on_the_callers_apartment` — the six probed backend
+  strings plus `os_supported`, identical from all three, with no `RPC_E_CHANGED_MODE`.
+
+### Not changed, and why
+
+`is_wifi_on`/`turn_on_wifi` and the hosted-network commands keep running WinRT on Tauri's STA:
+that is the apartment Tauri provided and the one the rule says to use, the `Radio` and tethering
+statics are agile, and moving them to a thread of their own would be a behaviour change with
+nothing measured to justify it. `COMLibrary::without_security()` is not used anywhere — it still
+calls `CoInitializeEx`, which on an already-MTA thread returns `S_FALSE` and leaks a reference the
+`wmi` crate never gives back.

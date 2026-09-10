@@ -951,6 +951,15 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
 - Use `tprintln!`/`teprintln!`, not `println!`/`eprintln!`, in the Rust core.
 - Take streamer-core mutexes with `lock_recover()`; keep critical sections short and never hold
   one across `.await`.
+- **COM is initialized by Tauri.** wry gives the main thread an STA for WebView2, and every sync
+  `#[tauri::command]` runs there — so Rust inside Tauri must assume an apartment already exists.
+  A second `CoInitializeEx`/`RoInitialize` with a different model returns `RPC_E_CHANGED_MODE`,
+  initializes nothing, and leaves WMI/WASAPI/DXGI/WinRT to fail or degrade quietly. Ask with
+  `CoGetApartmentType`, never re-initialize on a Tauri thread, and never `CoUninitialize` one.
+  Only threads the app spawns itself may initialize, and only through
+  `windows_utils::com::ensure_for_this_thread` (`wmi_for_this_thread` for the `wmi` crate —
+  `COMLibrary::new()` is banned); the returned `ComScope` releases exactly what it took. The
+  measured thread map is in `docs/OPTIMIZATIONS.md` UX-E.
 - **Probe the capability, never the version number.** Every tiered subsystem in this repo picks
   its tier by attempting the thing — `AnyClass::get`, `dlsym`, `GetProcAddress`, a trial API call,
   a feature-level query — because a version number says nothing about a machine whose hardware,
