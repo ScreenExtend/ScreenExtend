@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 use super::protocol::{
     btn, positions_cursor, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
-use super::{ClientPlatform, ClientProfile, DisplayRect};
+use super::{ClientPlatform, ClientProfile, DisplayRect, PointerScope};
 
 pub const NAME: &str = "macos-cgevent";
 
@@ -314,6 +314,8 @@ pub struct Injector {
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
+    /// What a locked cursor is clamped against: this session's own display, or every screen.
+    pointer_scope: PointerScope,
     warned_drop: bool,
     /// Last probed injection tier. TCC can be granted or revoked while we run, and the check
     /// used to happen once in the constructor — which is why its own warning told the user to
@@ -326,6 +328,7 @@ impl Injector {
         let ClientProfile {
             device_name,
             platform,
+            pointer_scope,
         } = client;
         let apple_client = platform.is_apple();
         if platform == ClientPlatform::Unknown {
@@ -370,6 +373,7 @@ impl Injector {
             // all — every tap becomes `mouse_pointer(.., Phase::Down)` — a touch client's
             // opening tap landed wherever the host cursor already was.
             mouse_relative: false,
+            pointer_scope,
             warned_drop: false,
             tier,
         }
@@ -505,16 +509,24 @@ impl Injector {
         self.buttons = buttons;
     }
 
+    /// The rectangle a pointer-locked cursor may not leave.
+    ///
+    /// `PointerScope::Display` is this session's own screen — what the client is looking at —
+    /// and `All` is every screen attached to this Mac. An unresolved display rect falls back to
+    /// the desktop rather than trapping the cursor inside a guess. The Windows backend clamps
+    /// against the same choice, so the two agree.
+    fn pointer_bounds(&self) -> DisplayRect {
+        match (self.pointer_scope, self.target) {
+            (PointerScope::Display, Some(r)) => r,
+            _ => self.desktop,
+        }
+    }
+
     fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
         self.mouse_relative = true;
-        let nx = (self.pos.x + dx as f64).clamp(
-            self.desktop.left as f64,
-            (self.desktop.left + self.desktop.width as i32) as f64,
-        );
-        let ny = (self.pos.y + dy as f64).clamp(
-            self.desktop.top as f64,
-            (self.desktop.top + self.desktop.height as i32) as f64,
-        );
+        let b = self.pointer_bounds();
+        let nx = (self.pos.x + dx as f64).clamp(b.left as f64, (b.left + b.width as i32) as f64);
+        let ny = (self.pos.y + dy as f64).clamp(b.top as f64, (b.top + b.height as i32) as f64);
         let pos = CGPoint { x: nx, y: ny };
         self.motion(pos, self.buttons, dx as i64, dy as i64);
         self.button_transitions(self.buttons, buttons, pos);
