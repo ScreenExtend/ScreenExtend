@@ -2281,3 +2281,33 @@ The five items the first pass could not reach while W4b and W15 were landing, al
   is what verifies them. `serve --encoder`, the `AsyncEncodeRing` arms, `amd/sps.rs` and the
   `RELOAD`/`PING`/`LOGS` verbs were already carried in by W4b and W13b-code respectively.
 - **The WGC predicate** is row 305 above.
+
+### UX-B: the startup gate, at-capacity, and the pointer-lock clamp (post-report)
+
+Four owner rulings on `docs/FINAL-REPORT.md` §7.8 items 7, 9, 10 and 17. Windows was exercised;
+the Mac was powered off for this engagement, so every macOS branch below is written and reasoned
+but not compiled.
+
+| # | Change | Status |
+|---|---|---|
+| B1 | **Only the bare minimum may stop startup.** `UnsupportedApi` gains a stable `key` and three constructors; `blocking` takes a `BareMinimum` (display / capture / encoder) rather than a string, so a capability outside those three cannot be given the one severity that removes "Continue anyway". Each platform's rows come from a pure `capability_notes()` over what was probed. | `VERIFIED` (Windows: 6 unit tests over synthetic probe values, `cargo test --lib compatibility`) / `UNVERIFIED (macOS not compiled — Mac offline)` |
+| B2 | The audit B1 makes testable. Windows was already compliant. macOS gained the arm it was missing: `DisplayBackend::Unsupported` — for which `new_shared_controller()` answers `None` — is bare minimum and was reported as a working host. Linux reported `os_supported: true` with an empty list while implementing no display, capture or encode backend at all; it now names all three. | `COMPILE-CHECKED` (Windows) / `UNVERIFIED` (macOS, Linux does not build) |
+| B3 | **At capacity is an AirPlay-only state.** `session::concurrent_display_cap()` is the single read of `max_concurrent_displays()` and recognises exactly one value, `Some(1)`. Any other finite cap is logged once and dropped, so `at-capacity.html`, `DisplayCapacity.full` and the macOS slot-holder lookup cannot be reached on an uncapped backend, and a join that would have been refused proceeds and reports its real error. | `VERIFIED` (`only_a_one_display_backend_can_turn_a_device_away`, plus the four existing capacity tests) |
+| B4 | **Item 17, pointer scope.** `PointerScope::{Display, All}` per device, default `Display`: a pointer-locked client is confined to the display it is streaming. `All` is the previous behaviour — the clamp against the whole virtual desktop. Both backends clamp through one `pointer_bounds()`, and an unresolved display rect falls back to the desktop rather than trapping the cursor in a guess. | `VERIFIED` (Windows: `a_locked_pointer_is_clamped_to_the_scope_it_was_given`) / `UNVERIFIED` (macOS) |
+| B5 | Pointer scope is `set_device_pointer_scope`, **not** an eleventh `set_device_override` argument: specta's `SpectaFn` is implemented to ten, and `set_device_override` is already at ten. It also needs none of that command's machinery — no clamp, no rebuild verdict, no live display to touch. Wired through the TS config type + schema, `applyConfig`, the bootstrap replay, `devices set --pointer-scope`, the `devices list` column and the `serve`/`RELOAD` replay. | `VERIFIED` (CLI round-trip on the dev box; `saved_devices_fill_gaps_and_carry_the_audio_output_pin`) |
+| B6 | **Item 10 / the gate itself.** `src/lib/startup-gate.ts` is the decision, and `pnpm test:gate` is twelve assertions over it — Node 25 strips the types, so the function under test is the shipping one. Every launch probes, remediates what is `installable`, re-probes, then decides. Only a row that survives its own remediation, or a `blocking` row, gets a modal with no way past it. | `VERIFIED` (12/12) |
+| B7 | Driver remediation now distinguishes the two states: a missing driver is installed, one that is installed but not answering is **removed and installed again** (installing over a driver that is already there was a no-op), and if it still will not answer the app relaunches itself — once per ten minutes, memoised in `localStorage`, because a relaunch that does not fix it would otherwise loop forever. | `COMPILE-CHECKED` — the dev box's driver is healthy and `drivers remove` needs Administrator, so neither branch was executed |
+| B8 | **Item 7.** "Install drivers" is offered when the report carries an installable display-driver row, not when `type() !== "macos"`. On a Mac, where `install_drivers` returns `true` without doing anything, the setup-error dialog now offers Try Again and Quit rather than a button whose own copy told the user to press it. | `VERIFIED` (`offersDriverInstall` assertions) |
+| B9 | **Item 9.** `buildQrValues` returning `[]` had two causes and one message; `readQrValues` reports which, so a failed adapter read is named rather than rendered as "no networks were found" on a host that is serving fine. `ensurePermissions` was the same shape — a check that *failed* returned the same `false` as "nothing was missing", so an unreadable probe reached the user as all-granted. It is tri-state now; startup still proceeds, because refusing to start over a probe we could not run would be worse and capture reports its own failure, but the user is told which happened. | `COMPILE-CHECKED` (both are error paths the dev box cannot induce) |
+
+**Rejected.** Item 10 asked for a "Continue anyway" on the *permission* gate as well. The owner's
+rule supersedes it: a Screen Recording denial means video cannot be sent by any route, which is
+bare minimum, so that modal keeps Quit / Re-check / Restart and no escape hatch. Accessibility is
+already `required: false` and has never opened the gate — it gates remote input only, and the
+host extends a display without it.
+
+**What the integrator must know.** `bindings.ts` was regenerated (49 commands, 10 events;
+`check-bindings.mjs` passes). The desktop UI's device sheet needs one control, and the field it
+writes is `pointerScope` on the TS `Device` (`"display" | "all"`, default `"display"`), pushed
+with `commands.setDevicePointerScope(ip, scope)`. `package.json` gained `test:gate`, which is not
+yet in `.github/workflows/ci.yml`.
