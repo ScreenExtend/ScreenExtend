@@ -3164,3 +3164,133 @@ The headless host was stopped for the build and restarted on the same credential
 ```
 
 with `qr -t cloud --json` reporting `"sessionId": "SE7QK4MNPX2W"`, `"sessionIdSource": "host"`.
+
+## 15.14 Post-report: a host that vanished during a settings change, and the evidence that did not exist
+
+The owner changed one connected device's **frame rate and pixel ratio** in the device sheet. The
+device "glitched, then disconnected", and the host GUI process (pid 22456, release build of
+`20b5b0e`) was afterwards simply gone — `ScreenExtend logs` said no running instance.
+
+Two separate findings came out of it. The disappearance **did not reproduce**; the user-visible
+half did, and it was a real defect with nothing to do with exiting.
+
+### The exit was clean, and that is evidence
+
+There was **no Application-log crash event and no WER dump** — not in `%LOCALAPPDATA%\CrashDumps`,
+not in the WER archive or queue. That absence is a finding rather than an oversight, because WER on
+that machine logs faults for other processes freely: `lhm_reader.exe`, `Cloudflare WARP.exe`, and
+this repo's own test binary `screenextend_lib-*.exe` on 9 Sep, all with Event ID 1000 and a 1001
+bucket. So the host exited **cleanly** — an `exit(0)`, a window close, or a `TerminateProcess` from
+outside — and not through a panic-abort or a fault.
+
+It did not reproduce under worse conditions than were reported. Three hosts survived:
+`serve -v` with 120 Hz + DPR 1.5 replayed through `RELOAD` (two rebuilds, then steady); the GUI
+with 120 Hz + DPR 2.25 clicked in the device sheet (display became 4320x2430@120); and the GUI with
+both sliders at maximum, DPR 3× and 485 Hz (5760x3240, NVENC clamping to 4096x3240). Every suspect
+was *read and cleared* rather than merely left untested — `quit_driver_holder` guards
+`pid != std::process::id()`; `probe_display_backend` short-circuits on a `CONNECTED` `OnceLock`, so
+the sheet's requirements check never re-opens a pipe a live display holds; `ComScope` only
+uninitializes an apartment it created; `set_display_mode` returns `Err` and every caller is a
+`spawn_blocking` whose `JoinError` is logged; the updater is reachable only from `runSetup`; and
+nothing in `src/` calls `window.close()`.
+
+### The defect that did reproduce: a settings change renamed the device
+
+`serve -v`, Chrome joining, then a refresh-rate + DPR change replayed into the running host. The
+epoch bumped, the client tore down and rejoined — and the log said:
+
+```
+join request: device="ChromeTest", session=…, screen=1920x1080
+issued a new device token to 172.16.11.76 after successful OTP
+virtual display created (id=1, 1920x1080@60)
+```
+
+**1920x1080@60 — not the 120 Hz and not the 1.5× that had just been written.** Per-device settings
+are keyed by the device token, and `POST /whep` minted a **fresh token on every successful OTP
+join**. So the rejoin that the settings change itself provoked came back as a *different device*
+wearing the defaults, and the override the user had just saved was orphaned the instant it was
+used. From the client that is precisely "it glitched and then came back wrong".
+
+It was invisible in the desktop app only because `App.tsx`'s `deviceJoin` handler calls
+`setDeviceApproved(token)`, which puts the next join on the pre-approved path where the presented
+token *is* kept. `serve` writes no such approval, so under the headless host it happened on every
+single reconfigure.
+
+`session::is_known_device` now keeps a presented token when it is well-formed (32 lowercase hex,
+the shape `mint_device_token` produces) **and already has a per-device override on this host**.
+Continuity is granted on the host's own record and never on the client's word, because every trust
+map is keyed by that string — a device that could name itself could name itself something already
+approved. Measured end to end on the release build with the same page and the same saved override:
+before, `issued a new device token …` and `1920x1080@60`; after,
+`re-presented a device token this host has settings for; keeping it` and
+`virtual display created (id=0, 2880x1620@120)`.
+
+### The deliverable for the part that could not be diagnosed
+
+What made the original report un-diagnosable is that **a host quit from the menu and a host
+terminated from outside leave identical evidence**: an in-memory log ring that dies with the
+process, a lock file that is `mem::forget`ed and never touched again, and no OS record at all for a
+clean exit.
+
+`src-tauri/src/exit_reason.rs` closes that gap. Every deliberate route names itself before it goes
+— `exit_app`, `quit_main_window` (the control server's `QUIT`), `relaunch_app` on all three
+platforms, and `serve`'s Ctrl+C — and `lib.rs`'s run loop records the two events that previously
+passed in silence: the main window's `CloseRequested`, which is what a restart manager, a session
+logoff or an Alt+F4 looks like from inside, and `RunEvent::ExitRequested`. The **first** reason
+wins, because the routes chain and the one that started it is the informative one.
+
+The reason is written to `screenextend.exit` beside the lock, read into the next launch's log and
+then deleted, so the breadcrumb on disk always describes the running process — and **its absence is
+itself the finding**. `ScreenExtend logs` with nothing running now prints one of two sentences:
+
+```
+The last host (pid 22456) ended deliberately: exit_app: the desktop UI asked the host to quit
+```
+```
+The last host left no exit record, so it did not end through any route ScreenExtend owns:
+it was terminated from outside, or it faulted.
+```
+
+Both were read back off the release build: `ScreenExtend stop` produced the first, naming the
+control server's `QUIT` and the pid; `taskkill /F` produced the second; and the next launch logged
+`[exit] the previous host (pid 46840) ended deliberately: …` once and cleared the file. Seven tests
+cover the line format, the newline flattening (a reason containing `\n` would otherwise write a
+line the parser never sees), the junk cases, first-reason-wins, and the token-continuity rule.
+
+### What the owner should do if it happens again
+
+**Run `ScreenExtend logs` immediately, and read the first lines of the next launch.** Those two
+sentences are the whole diagnosis: the first names the route and closes the question; the second
+says the process was killed or faulted, and `docs/manual-tests/desktop-ui.md` §13 has the next
+three checks. Until this build, that question had no answer available at all.
+
+The one-line touch to `macos_utils/permissions.rs` is **`UNVERIFIED` (not compiled)** — the
+development Mac has been offline since §15.4.
+
+### Gates, build and the relaunched GUI
+
+`cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` **436 passed,
+0 failed, 17 ignored**, identical under `SE_REQUIRE_HW=1`; `cargo build --features probe`;
+`pnpm lint` 0 errors; `pnpm build`; `check-legacy-webkit`; `pnpm test:client` 7/7;
+`pnpm test:gate`; `pnpm test:config`; `pnpm test:lockfile`; `check-bindings` **53 commands /
+11 events** (unchanged — this branch adds no command and no event); `check-versions` 0.6.3;
+`sha256sum -c` 34/34 and 5/5.
+
+`pnpm tauri build`: release profile in **16m 14s**, both installers, exit **1** on the updater
+signing step alone.
+
+| Artifact | Bytes |
+|---|---|
+| `…/release/bundle/msi/ScreenExtend_0.6.3_x64_en-US.msi` | 14,016,512 |
+| `…/release/bundle/nsis/ScreenExtend_0.6.3_x64-setup.exe` | 9,889,453 |
+| `…/release/ScreenExtend.exe` | 30,226,432 |
+
+The GUI was stopped for the build and relaunched detached. `qr -t all --json` reports the new
+session from the host itself — `"sessionId": "UY5PQWHEGLYR"`, `"sessionIdSource": "host"`,
+`"hostReportedSession": true` — which is §15.12's fix still holding.
+
+One thing worth noting about this particular launch, because it is the mechanism behaving correctly
+rather than a gap: the log carries **no** `[exit]` line and there is no `screenextend.exit` file.
+The host it replaced was the previous release, built before `exit_reason.rs` existed, so it could
+not have left a breadcrumb. Every launch from this build onwards will either name its predecessor's
+exit route or say plainly that there was no record.
