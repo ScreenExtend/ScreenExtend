@@ -39,7 +39,7 @@ param(
     [int]$Window = 8,
     [int]$CdpPort = 0,
     [string]$OutDir = "$env:TEMP\se-measure-input",
-    # Busy-loop on ProcessorCount-2 cores plus a GPU-ish canvas loop for the whole run.
+    # Busy-loop on half the logical processors for the whole run.
     [switch]$Load
 )
 
@@ -396,7 +396,12 @@ Step "host up: $base session=$sessionId"
 # --------------------------------------------------------------------------------------------
 $loadJobs = @()
 if ($Load) {
-    $n = [Math]::Max(1, [Environment]::ProcessorCount - 2)
+    # Half the logical processors, not all-but-two. The harness drives the browser over CDP with a
+    # 20 s timeout, and a box with fourteen of sixteen cores spinning cannot answer `Runtime.evaluate`
+    # inside it -- the run then fails as a harness error rather than reporting a slow number, which
+    # measures nothing. Half is enough contention to move the percentiles and still leaves the host,
+    # the encoder and Chrome somewhere to run.
+    $n = [Math]::Max(1, [int]([Environment]::ProcessorCount / 2))
     for ($i = 0; $i -lt $n; $i++) {
         $loadJobs += Start-Job -ScriptBlock {
             $sw = [Diagnostics.Stopwatch]::StartNew(); $x = 0.0
