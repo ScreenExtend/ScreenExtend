@@ -13,12 +13,66 @@ use self::protocol::InputEvent;
 /// What the injector needs to know about the client driving it.
 ///
 /// The display name is which virtual display its coordinates address; the platform decides the
-/// modifier layout on macOS, and is ignored everywhere else.
+/// modifier layout on macOS, and is ignored everywhere else. `live` carries the two settings the
+/// user can move while the session is running.
 #[derive(Clone, Debug, Default)]
 pub struct ClientProfile {
     pub device_name: Option<String>,
     pub platform: ClientPlatform,
-    pub pointer_scope: PointerScope,
+    pub live: SharedLiveInput,
+}
+
+/// The two input settings a live session re-reads rather than captures.
+///
+/// Remote control and the pointer scope are cosmetic to the *stream* — neither is an encoder
+/// session parameter and neither changes a single byte the client decodes — but both were read
+/// once, when the session was built. The only way to apply a change was therefore to rebuild the
+/// whole session, which is the most disruptive answer available to the least disruptive edit, and
+/// it is what made "I turned remote control off" disconnect a device. Two relaxed atomics on the
+/// injector's dispatch path instead: the command writes them, every live join of that device sees
+/// the next event routed the new way, and nothing renegotiates.
+#[derive(Debug)]
+pub struct LiveInput {
+    control: std::sync::atomic::AtomicBool,
+    /// A `PointerScope` as `u8`; the enum is `Copy` and two-valued, so the round trip is total.
+    scope: std::sync::atomic::AtomicU8,
+}
+
+pub type SharedLiveInput = Arc<LiveInput>;
+
+impl Default for LiveInput {
+    fn default() -> Self {
+        Self::new(true, PointerScope::default())
+    }
+}
+
+impl LiveInput {
+    pub fn new(control_enabled: bool, scope: PointerScope) -> Self {
+        Self {
+            control: std::sync::atomic::AtomicBool::new(control_enabled),
+            scope: std::sync::atomic::AtomicU8::new(scope.as_u8()),
+        }
+    }
+
+    pub fn shared(control_enabled: bool, scope: PointerScope) -> SharedLiveInput {
+        Arc::new(Self::new(control_enabled, scope))
+    }
+
+    pub fn control_enabled(&self) -> bool {
+        self.control.load(Ordering::Relaxed)
+    }
+
+    pub fn set_control_enabled(&self, enabled: bool) {
+        self.control.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn pointer_scope(&self) -> PointerScope {
+        PointerScope::from_u8(self.scope.load(Ordering::Relaxed))
+    }
+
+    pub fn set_pointer_scope(&self, scope: PointerScope) {
+        self.scope.store(scope.as_u8(), Ordering::Relaxed);
+    }
 }
 
 /// How far a pointer-locked client's relative motion is allowed to travel.
@@ -33,8 +87,8 @@ pub struct ClientProfile {
 /// ruling is that the unrestricted reach is the intended product behaviour: a second monitor whose
 /// keyboard and mouse stop at its own edge is not a second monitor, so `All` is the default and
 /// `Display` is the opt-in restriction. Blast radius is bounded by `control_enabled` either way,
-/// and the setting is read at join, like remote control itself, so a change applies to the next
-/// connection.
+/// and both are read per event out of [`LiveInput`], so a change reaches the pointer that is
+/// moving now without renegotiating anything.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PointerScope {
     /// Confine the locked cursor to the display this session is streaming.
@@ -57,6 +111,22 @@ impl PointerScope {
     pub fn from_str(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "display" => Self::Display,
+            _ => Self::All,
+        }
+    }
+
+    /// For [`LiveInput`]'s atomic. Same rule as `from_str`: only the restriction restricts, so an
+    /// unexpected byte reads as the default rather than as a lockdown nobody asked for.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Display => 1,
+            Self::All => 0,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Display,
             _ => Self::All,
         }
     }

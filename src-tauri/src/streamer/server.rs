@@ -63,6 +63,19 @@ struct JoinRequest {
     otp: String,
     #[serde(default, rename = "deviceToken")]
     device_token: String,
+    /// The session this tab already holds, when the client is renegotiating in place rather than
+    /// joining fresh.
+    ///
+    /// A reconfigure — a display-affecting settings change, a rotation, a demotion to `<video>` —
+    /// tears the peer connection down and offers again. Without this it minted a new session
+    /// every time: a new join id, a *new virtual display*, a `DeviceRemove` and a `DeviceJoin` on
+    /// the dashboard, and every window the user had on the old display shuffled back to the
+    /// primary monitor. The id is a 128-bit capability the host handed this tab at `POST /whep`
+    /// and is what `PATCH`/`DELETE /whep/{id}`, `/reconfig` and `/leave` are already addressed
+    /// by, so presenting it is the same authority; it is honoured only when the session is still
+    /// live and belongs to the same device token.
+    #[serde(default, rename = "joinId")]
+    join_id: String,
     #[serde(default, rename = "audioCapabilities")]
     audio_capabilities: AudioCapabilities,
     #[serde(
@@ -1338,6 +1351,41 @@ pub async fn process_whep(
     }
 }
 
+/// Whether this offer continues a session that is already open, or starts a new one.
+///
+/// The client presents the join id it holds when it is renegotiating in place — a display
+/// setting moved, the device rotated, the video path stepped down a tier. Honouring it is what
+/// keeps the virtual display, the dashboard row and the windows the user has arranged on that
+/// display; minting a fresh id instead removed one display and built another, which is what the
+/// owner saw as "the client disconnects and everything goes weird".
+///
+/// The id is a 128-bit capability the host itself handed that tab, and it is already what
+/// `PATCH`/`DELETE /whep/{id}`, `/reconfig` and `/leave` are addressed by — but it is honoured
+/// only for a session that is still open *and* belongs to the device token this join
+/// authenticated as, so a leaked or stale id buys nothing. Anything else is a new join, which is
+/// always safe: the worst case is the cost this change exists to avoid.
+fn continuing_join(
+    sessions: &session::SharedSessions,
+    claimed: &str,
+    device_token: &str,
+) -> Option<String> {
+    let claimed = claimed.trim();
+    if claimed.is_empty() || device_token.is_empty() {
+        return None;
+    }
+    match session::device_token_for(sessions, claimed) {
+        Some(t) if t == device_token => Some(claimed.to_string()),
+        Some(_) => {
+            teprintln!(
+                "join presented session {claimed}, which belongs to another device; treating it \
+                 as a new join"
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 async fn start_session(
     state: &AppState,
     req: &JoinRequest,
@@ -1349,7 +1397,24 @@ async fn start_session(
     // One join, one name. The WHEP resource id *is* the session's identity, so `PATCH`,
     // `DELETE`, `/reconfig`, `/leave` and `/audio-outputs` all address the same thing, and two
     // tabs of one browser — same device, same token, same address — are two of them.
-    let join_id = session::mint_join_id();
+    //
+    // A tab that is renegotiating presents the id it already holds, and then this is the *same*
+    // session: the display it created stays up, the dashboard row stays put, and the sequence
+    // number below is what tells the outgoing session's teardown task that it has been
+    // superseded rather than ended. Only a live session owned by this same device qualifies —
+    // an unknown id, or one belonging to another device, is a fresh join.
+    let continuing = state
+        .config
+        .sessions
+        .as_ref()
+        .and_then(|s| continuing_join(s, &req.join_id, device_token));
+    let join_id = match &continuing {
+        Some(join) => {
+            tprintln!("join {join} is renegotiating in place; keeping its session and display");
+            join.clone()
+        }
+        None => session::mint_join_id(),
+    };
     if let Some(s) = state.config.sessions.as_ref() {
         session::open_session_via(s, &join_id, device_token, client_ip, origin.relay_client);
         session::set_session_labels(
@@ -1372,6 +1437,18 @@ async fn start_session(
         .as_ref()
         .map(|s| session::next_session_seq(s, &join_id))
         .unwrap_or(0);
+
+    // The outgoing session's capture is still running against the display this one is about to
+    // reuse. Its own teardown task will find the entry replaced and stand down, so stopping it
+    // here is the only thing that does.
+    if continuing.is_some() {
+        if let Some(s) = state.config.sessions.as_ref() {
+            if let Some(stop) = session::take_active_capture(s, &join_id) {
+                tprintln!("stopping the previous capture for join {join_id} before renegotiating");
+                let _ = tokio::task::spawn_blocking(stop).await;
+            }
+        }
+    }
 
     let detected_refresh = if req.refresh_rate == 0 {
         60
@@ -1407,8 +1484,15 @@ async fn start_session(
         .device_overrides
         .as_ref()
         .and_then(|o| o.lock_recover().get(device_token).copied());
-    let control_enabled = device_settings.map(|o| o.control_enabled).unwrap_or(true);
-    let pointer_scope = device_settings.map(|o| o.pointer_scope).unwrap_or_default();
+    // Shared with the injector rather than copied into it, so `set_device_override` and
+    // `set_device_pointer_scope` reach a session that is already running.
+    let live_input = crate::streamer::input::LiveInput::shared(
+        device_settings.map(|o| o.control_enabled).unwrap_or(true),
+        device_settings.map(|o| o.pointer_scope).unwrap_or_default(),
+    );
+    if let Some(s) = state.config.sessions.as_ref() {
+        session::set_live_input(s, &join_id, std::sync::Arc::clone(&live_input));
+    }
     let audio_params = match (
         state.config.audio_hub.as_ref(),
         state.config.device_overrides.as_ref(),
@@ -1499,19 +1583,58 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
-    // A join is new by construction — its id was minted a few lines ago — so there is never a
-    // display to reuse or a previous orientation to carry. Reusing one is what a rejoin from the
-    // same address used to do, and it is exactly what made a second tab replace the first.
-    let existing: Option<session::LiveDisplay> = None;
-    let existed_before = false;
+    // A fresh join has no display to reuse — that is what made a second tab replace the first
+    // when sessions were keyed by address. A tab renegotiating on its own id does, and reusing it
+    // is the whole point: the mode changes under a display that never goes away.
+    let existing: Option<session::LiveDisplay> = match (&continuing, state.config.sessions.as_ref())
+    {
+        (Some(join), Some(s)) => session::get_live_display(s, join),
+        _ => None,
+    };
+    let existed_before = existing.is_some();
     let client_portrait = height > width;
-    let portrait = client_portrait;
-    if let Some(overrides) = state.config.device_overrides.as_ref() {
-        if let Some(o) = overrides.lock_recover().get_mut(device_token) {
-            o.orientation_portrait = client_portrait;
+    // The saved orientation is honoured for as long as the device is holding the same session.
+    // Overwriting it on every join, which is what happened while every join was new, made the
+    // per-device orientation setting inert: it was saved, replayed and then immediately replaced
+    // by whichever way round the phone happened to be. A device that has physically rotated
+    // since its last offer is believed, because that is a statement about the hardware and not a
+    // setting.
+    let prev_client_portrait = existing.as_ref().map(|p| p.height > p.width);
+    let device_rotated = prev_client_portrait == Some(!client_portrait);
+    let honor_device = existing.is_none() || device_rotated;
+    let portrait = if honor_device {
+        client_portrait
+    } else {
+        device_settings
+            .map(|o| o.orientation_portrait)
+            .unwrap_or(client_portrait)
+    };
+    if honor_device {
+        if let Some(overrides) = state.config.device_overrides.as_ref() {
+            if let Some(o) = overrides.lock_recover().get_mut(device_token) {
+                o.orientation_portrait = client_portrait;
+            }
         }
     }
     let swap_axes = portrait != client_portrait;
+
+    // Record what this join is actually running at, for a device the host holds no settings for
+    // yet. Without it the override map has no row until the first save, so that save had nothing
+    // to compare against and was classified as a change to everything — which is how renaming a
+    // freshly joined device rebuilt its session. The values are exactly `Device::defaults`, which
+    // is what the sheet is showing the user, so an untouched save now compares equal.
+    if let Some(overrides) = state.config.device_overrides.as_ref() {
+        overrides
+            .lock_recover()
+            .entry(device_token.to_string())
+            .or_insert(session::DeviceOverride {
+                orientation_portrait: client_portrait,
+                refresh_rate: detected_refresh,
+                dpr,
+                ..session::DeviceOverride::join_defaults()
+            });
+    }
+
     let base_scale = device_settings
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
@@ -1829,8 +1952,7 @@ async fn start_session(
         webrtc_session::InputParams {
             device: Some(device_name.clone()),
             client_os: req.os.trim().to_string(),
-            control_enabled,
-            pointer_scope,
+            live: std::sync::Arc::clone(&live_input),
             control_rx: Some(control_rx),
         },
         audio_params,
@@ -2252,6 +2374,164 @@ mod tests {
             stun_urls: vec!["stun:stun.l.google.com:19302".to_string()],
             ..Config::default()
         })
+    }
+
+    /// One display-affecting edit, end to end across the two halves of the mechanism: the host
+    /// bumps the epoch, the client offers again on the id it already holds, and the host
+    /// recognises that offer as the same session.
+    ///
+    /// The three things asserted are the three the owner watched go wrong: the join id does not
+    /// change, the display id does not change, and the mode change is one mode change rather
+    /// than a removal and a create.
+    #[test]
+    fn a_display_change_keeps_the_join_and_re_drives_the_same_display() {
+        let sessions = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            session::DeviceSessionState,
+        >::new()));
+        let token = session::mint_device_token();
+        let join = session::mint_join_id();
+        session::open_session(&sessions, &join, &token, "192.168.1.44");
+        let before = session::LiveDisplay {
+            display_id: 11,
+            device_name: "DISPLAY7".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh: 60,
+            scale: 100,
+            portrait: false,
+        };
+        session::set_live_display(&sessions, &join, before.clone());
+
+        // The desktop UI raised the device's refresh rate: a class-(d) edit, so every tab of
+        // this device is told to renegotiate.
+        assert_eq!(
+            session::bump_reconfig_epoch_for_device(&sessions, &token),
+            1
+        );
+
+        // The client answers by offering again and presenting the id it holds.
+        let continued = continuing_join(&sessions, &join, &token);
+        assert_eq!(
+            continued.as_deref(),
+            Some(join.as_str()),
+            "a renegotiation must land on the session it came from, not on a new one"
+        );
+
+        // Which means `start_session` finds a display to reuse rather than creating one.
+        let existing = session::get_live_display(&sessions, &join).expect("the display survives");
+        assert_eq!(existing.display_id, before.display_id);
+
+        // One mode change: the geometry the client asked for is unchanged, so only the refresh
+        // rate moves and `display_params()` — what decides whether the display is touched at
+        // all — reports exactly that difference.
+        let desired = session::LiveDisplay {
+            refresh: 120,
+            ..existing.clone()
+        };
+        assert_ne!(existing.display_params(), desired.display_params());
+        assert_eq!(
+            session::LiveDisplay {
+                display_id: existing.display_id,
+                device_name: existing.device_name.clone(),
+                ..desired.clone()
+            }
+            .display_params(),
+            desired.display_params(),
+            "the display keeps its identity across the mode change"
+        );
+        session::set_live_display(&sessions, &join, desired);
+
+        // And nothing ended: same join, same display id, no kick.
+        assert_eq!(
+            session::joins_for_token(&sessions, &token),
+            vec![join.clone()]
+        );
+        assert_eq!(
+            session::get_live_display(&sessions, &join)
+                .map(|d| d.display_id)
+                .unwrap(),
+            11
+        );
+        assert_eq!(session::kick_epoch(&sessions, &join), 0);
+    }
+
+    /// The join id is a capability, and it is honoured as one: only for a session that is still
+    /// open and only for the device that owns it.
+    #[test]
+    fn a_presented_join_is_honoured_only_for_the_device_that_owns_it() {
+        let sessions = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            session::DeviceSessionState,
+        >::new()));
+        let mine = session::mint_device_token();
+        let theirs = session::mint_device_token();
+        let join = session::mint_join_id();
+        session::open_session(&sessions, &join, &mine, "192.168.1.44");
+
+        assert_eq!(
+            continuing_join(&sessions, &join, &mine).as_deref(),
+            Some(join.as_str())
+        );
+        assert_eq!(
+            continuing_join(&sessions, &join, &theirs),
+            None,
+            "another device presenting this id must not inherit the session or its display"
+        );
+        assert_eq!(
+            continuing_join(&sessions, &session::mint_join_id(), &mine),
+            None,
+            "an id naming no live session is a fresh join, not a failure"
+        );
+        assert_eq!(
+            continuing_join(&sessions, "", &mine),
+            None,
+            "a first join presents nothing"
+        );
+        assert_eq!(
+            continuing_join(&sessions, &join, ""),
+            None,
+            "a join that authenticated as no device cannot claim one"
+        );
+
+        // Once the session is gone the id is worth nothing, which is what makes a stale id in a
+        // reloaded tab harmless.
+        session::remove_session(&sessions, &join);
+        assert_eq!(continuing_join(&sessions, &join, &mine), None);
+    }
+
+    /// A class-(c) change is visible in `/reconfig` without moving either epoch, which is the
+    /// whole reason it costs no renegotiation.
+    #[test]
+    fn an_audio_output_change_reaches_the_client_without_moving_an_epoch() {
+        let sessions = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            session::DeviceSessionState,
+        >::new()));
+        let sinks = session::new_shared_audio_sinks();
+        let token = session::mint_device_token();
+        let join = session::mint_join_id();
+        session::open_session(&sessions, &join, &token, "192.168.1.44");
+        let state = AppState::new(Config {
+            sessions: Some(sessions.clone()),
+            audio_sinks: Some(sinks.clone()),
+            ..Config::default()
+        });
+
+        let first: serde_json::Value =
+            serde_json::from_str(&process_reconfig(&state, &join)).expect("json");
+        assert_eq!(first["epoch"], 0);
+        assert_eq!(first["audioSink"], "");
+
+        session::set_device_audio_sink(&sinks, &token, Some("sink-7".to_string()));
+        let after: serde_json::Value =
+            serde_json::from_str(&process_reconfig(&state, &join)).expect("json");
+        assert_eq!(after["audioSink"], "sink-7");
+        assert_eq!(
+            after["epoch"], 0,
+            "choosing an output device must not renegotiate anything"
+        );
+        assert_eq!(after["kick"], 0);
     }
 
     #[test]

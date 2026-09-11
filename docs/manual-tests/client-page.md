@@ -404,3 +404,26 @@ server-reflexive candidates cannot cross, and it is the only case where TURN is 
 required. Distinguish it from a defect by the log: candidates gathered and offered on both sides,
 `ICE pair [Failed]` on every pair, no `nominated=true`. That is a network topology result and
 belongs in the report as one.
+
+## Renegotiating in place (UX-RECONFIG)
+
+The page answers a reconfig-epoch bump by offering again — not by leaving and joining. What
+distinguishes the two is one field in the `POST /whep` body, and the whole user-visible
+difference rides on it.
+
+Connect a phone, open the desktop device sheet, and for each row watch the client's console
+(`chrome://inspect` over USB, or Safari's Web Inspector) alongside `ScreenExtend logs`.
+
+| Check | How | Expected |
+|---|---|---|
+| The join id survives a rebuild | Move **Video quality**, Save | The client's next `POST /whep` carries `joinId` set to the id it already held, and the host answers `join … is renegotiating in place; keeping its session and display`. `sessionStorage['se.joinId']` is the same string before and after. |
+| No leave beacon goes out | Same, with the Network panel filtered to `/leave` | Nothing. A `/leave` here is the defect: it tells the host to take the display down while the replacement join is creating one. |
+| The picture holds | Same, watching the screen | The last decoded frame stays up until the new session paints. A black flash, a spinner, or the join form reappearing all mean the rebuild went through a full rejoin. |
+| A kick still releases | Remove the device from the host | `/leave?join=…` **does** go out, the id is cleared, and the page shows "You have been removed from this session." |
+| A reload is not a rebuild | Reload the tab | `releaseStaleJoin` beacons the old id at load and the page joins fresh with an empty `joinId` — a new session and a new display, which is correct: the old one is gone. |
+| Two tabs stay two | Open the page in a second tab of the same browser | Two distinct `se.joinId` values (it is `sessionStorage`, which is per tab) and two displays on the host. The device token in `localStorage` is shared, which is what makes both tabs one device. |
+| The sink is applied on change | Change the host's output device, then leave it alone for a minute | `SEAudio.setSpeaker` runs **once**, not once per `/reconfig` poll. `audioSink` is in every body, so the page latches the value it applied; an engine that *refuses* clears the latch and the next poll retries. |
+
+**What a failure looks like.** A new join id after a settings save, a `/leave` on the
+renegotiation path, or a second display on the host. All three are the same bug: the page treated
+a renegotiation as a departure.
