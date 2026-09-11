@@ -1347,6 +1347,10 @@ mod desktop {
             }
         };
         let _ = std::fs::create_dir_all(&lock_dir);
+        // Same as the desktop branch: a headless host that vanishes must leave a reason behind,
+        // and the reason the *last* one left belongs in this one's log.
+        crate::exit_reason::set_dir(lock_dir.clone());
+        crate::exit_reason::report_previous(&lock_dir);
         let lock_path = lock_dir.join(single_instance::LOCK_FILE);
         match single_instance::acquire_lock(&lock_path) {
             single_instance::LockOutcome::Acquired(file) => std::mem::forget(file), // process lifetime
@@ -1504,6 +1508,7 @@ mod desktop {
         let _ = rx.recv();
 
         println!("\nStopping…");
+        crate::exit_reason::record("serve: Ctrl+C");
         telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         single_instance::clear_control_file(&ctrl_path);
         crate::streamer::session::broadcast_bye(
@@ -3389,6 +3394,15 @@ mod desktop {
                  The backlog lives in the host process; start one with `ScreenExtend serve` \
                  or open the app."
             );
+            // The backlog died with the host, but the reason it ended did not. Without this
+            // line, a host that quit on request and one that vanished read identically here.
+            match crate::exit_reason::previous_summary(&dir) {
+                Some(summary) => eprintln!("{summary}"),
+                None => eprintln!(
+                    "The last host left no exit record, so it did not end through any route \
+                     ScreenExtend owns: it was terminated from outside, or it faulted."
+                ),
+            }
             exit(1);
         };
 

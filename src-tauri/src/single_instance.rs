@@ -262,6 +262,10 @@ pub fn wait_for_lock(path: &Path, timeout: Duration) -> LockOutcome {
 /// The headless `serve` host has no window, so it passes its own quit closure instead —
 /// `app.exit(0)` there would skip the BYE broadcast and leave every virtual display attached.
 pub fn quit_main_window(app: &AppHandle) {
+    crate::exit_reason::record(
+        "control server: another process sent QUIT (`ScreenExtend stop`, a second instance, or \
+         the driver-holder prompt)",
+    );
     match app.get_webview_window("main") {
         Some(window) => {
             let _ = app.run_on_main_thread(move || {

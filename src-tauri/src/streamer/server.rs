@@ -1294,9 +1294,24 @@ pub async fn process_whep(
             }
         }
 
-        let token = session::mint_device_token();
-        tprintln!("issued a new device token to {device_key} after successful OTP");
-        token
+        // A device the host already holds settings for keeps its name. Minting here renamed a
+        // device on every OTP join, and the per-device override map is keyed by that name — so
+        // the rebuild a settings change triggers came back under a token with no settings, and
+        // the change the user had just made was the one thing the reconnect did not carry.
+        match state.config.device_overrides.as_ref() {
+            Some(overrides) if session::is_known_device(overrides, &presented_token) => {
+                tprintln!(
+                    "join accepted: {device_key} re-presented a device token this host has \
+                     settings for; keeping it"
+                );
+                presented_token
+            }
+            _ => {
+                let token = session::mint_device_token();
+                tprintln!("issued a new device token to {device_key} after successful OTP");
+                token
+            }
+        }
     };
 
     match start_session(state, &req, origin, &device_token, ice_servers).await {

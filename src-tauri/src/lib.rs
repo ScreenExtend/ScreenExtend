@@ -14,6 +14,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 #[macro_use]
 mod logbus;
 mod cli;
+mod exit_reason;
 mod single_instance;
 mod streamer;
 #[cfg(test)]
@@ -440,6 +441,7 @@ impl Device {
 #[tauri::command]
 #[specta::specta]
 fn exit_app(app: tauri::AppHandle) {
+    exit_reason::record("exit_app: the desktop UI asked the host to quit");
     if let Some(state) = app.try_state::<AppState>() {
         streamer::session::broadcast_bye(
             &state.sessions,
@@ -990,6 +992,10 @@ pub fn run() {
                         }
                     };
                     let _ = std::fs::create_dir_all(&lock_dir);
+                    // Before anything can exit: every deliberate exit route writes its reason
+                    // here, and this is what reads the previous instance's back into the log.
+                    exit_reason::set_dir(lock_dir.clone());
+                    exit_reason::report_previous(&lock_dir);
                     let lock_path = lock_dir.join(single_instance::LOCK_FILE);
                     let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
 
@@ -1076,6 +1082,31 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // The run loop is where an exit nobody asked for becomes visible. Tauri's default is to
+        // end the process once the last window is gone, so a `WM_CLOSE` from anywhere — a
+        // restart manager replacing the binary, a session logoff, a stray Alt+F4 — produced a
+        // clean exit(0) with no crash dump, no Application-log event and no line anywhere saying
+        // what happened. The window's own close request and the run loop's `ExitRequested` are
+        // recorded here, so the reason survives the process that had it.
+        .run(|_app, event| match &event {
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { .. },
+                ..
+            } => {
+                exit_reason::record(format!(
+                    "window `{label}` was asked to close (the title-bar button, Alt+F4, or \
+                     another process sending WM_CLOSE)"
+                ));
+            }
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                exit_reason::record(format!(
+                    "the run loop was asked to exit (code {code:?}) with no window left and no \
+                     route of ours having named a reason"
+                ));
+            }
+            _ => {}
+        });
 }
