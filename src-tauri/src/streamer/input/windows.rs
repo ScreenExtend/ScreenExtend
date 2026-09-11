@@ -1208,35 +1208,6 @@ mod tests {
     /// question item 17 asked is what that position may not leave. `Display` is the session's
     /// own monitor; `All` is the virtual desktop, which is what every build before this did.
     #[test]
-    /// Exactly one pointer curve, and which side applies it follows the client's flag.
-    ///
-    /// Raw device counts (`unadjustedMovement` granted) go relative so Windows curves them; counts
-    /// the client's own OS has already curved keep the tracked-absolute path so they are not curved
-    /// twice. `PointerScope::Display` overrides both, because clamping to one monitor needs a
-    /// position and `MOUSEEVENTF_MOVE` does not have one.
-    #[test]
-    fn raw_counts_get_the_os_curve_and_already_curved_counts_do_not() {
-        let mut inj = Injector::new(ClientProfile::default());
-
-        inj.live.set_pointer_scope(PointerScope::All);
-        assert!(
-            inj.lets_os_curve(true),
-            "raw counts under the unrestricted scope are Windows' to accelerate"
-        );
-        assert!(
-            !inj.lets_os_curve(false),
-            "counts the client's OS already curved must not be curved again"
-        );
-
-        inj.live.set_pointer_scope(PointerScope::Display);
-        assert!(
-            !inj.lets_os_curve(true),
-            "confining the cursor to one display needs a tracked position to clamp"
-        );
-        assert!(!inj.lets_os_curve(false));
-    }
-
-    #[test]
     fn a_locked_pointer_is_clamped_to_the_scope_it_was_given() {
         let target = DisplayRect {
             left: 1920,
@@ -1265,6 +1236,34 @@ mod tests {
         inj.target = None;
         inj.live.set_pointer_scope(PointerScope::Display);
         assert_eq!(inj.pointer_bounds(), desktop);
+    }
+
+    /// Exactly one pointer curve, and which side applies it follows the client's flag.
+    ///
+    /// Raw device counts (`unadjustedMovement` granted) go relative so Windows curves them; counts
+    /// the client's own OS has already curved keep the tracked-absolute path so they are not curved
+    /// twice. `PointerScope::Display` overrides both, because clamping to one monitor needs a
+    /// position and `MOUSEEVENTF_MOVE` does not have one.
+    #[test]
+    fn raw_counts_get_the_os_curve_and_already_curved_counts_do_not() {
+        let inj = Injector::new(ClientProfile::default());
+
+        inj.live.set_pointer_scope(PointerScope::All);
+        assert!(
+            inj.lets_os_curve(true),
+            "raw counts under the unrestricted scope are Windows' to accelerate"
+        );
+        assert!(
+            !inj.lets_os_curve(false),
+            "counts the client's OS already curved must not be curved again"
+        );
+
+        inj.live.set_pointer_scope(PointerScope::Display);
+        assert!(
+            !inj.lets_os_curve(true),
+            "confining the cursor to one display needs a tracked position to clamp"
+        );
+        assert!(!inj.lets_os_curve(false));
     }
 
     /// Only the explicit restriction restricts. A device saved before the setting existed
