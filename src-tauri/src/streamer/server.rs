@@ -63,6 +63,19 @@ struct JoinRequest {
     otp: String,
     #[serde(default, rename = "deviceToken")]
     device_token: String,
+    /// The session this tab already holds, when the client is renegotiating in place rather than
+    /// joining fresh.
+    ///
+    /// A reconfigure — a display-affecting settings change, a rotation, a demotion to `<video>` —
+    /// tears the peer connection down and offers again. Without this it minted a new session
+    /// every time: a new join id, a *new virtual display*, a `DeviceRemove` and a `DeviceJoin` on
+    /// the dashboard, and every window the user had on the old display shuffled back to the
+    /// primary monitor. The id is a 128-bit capability the host handed this tab at `POST /whep`
+    /// and is what `PATCH`/`DELETE /whep/{id}`, `/reconfig` and `/leave` are already addressed
+    /// by, so presenting it is the same authority; it is honoured only when the session is still
+    /// live and belongs to the same device token.
+    #[serde(default, rename = "joinId")]
+    join_id: String,
     #[serde(default, rename = "audioCapabilities")]
     audio_capabilities: AudioCapabilities,
     #[serde(
@@ -1349,7 +1362,35 @@ async fn start_session(
     // One join, one name. The WHEP resource id *is* the session's identity, so `PATCH`,
     // `DELETE`, `/reconfig`, `/leave` and `/audio-outputs` all address the same thing, and two
     // tabs of one browser — same device, same token, same address — are two of them.
-    let join_id = session::mint_join_id();
+    //
+    // A tab that is renegotiating presents the id it already holds, and then this is the *same*
+    // session: the display it created stays up, the dashboard row stays put, and the sequence
+    // number below is what tells the outgoing session's teardown task that it has been
+    // superseded rather than ended. Only a live session owned by this same device qualifies —
+    // an unknown id, or one belonging to another device, is a fresh join.
+    let continuing = match state.config.sessions.as_ref() {
+        Some(s) if !req.join_id.trim().is_empty() => {
+            let claimed = req.join_id.trim();
+            match session::device_token_for(s, claimed) {
+                Some(t) if t == device_token => Some(claimed.to_string()),
+                Some(_) => {
+                    teprintln!(
+                        "join presented session {claimed}, which belongs to another device;                          treating it as a new join"
+                    );
+                    None
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let join_id = match &continuing {
+        Some(join) => {
+            tprintln!("join {join} is renegotiating in place; keeping its session and display");
+            join.clone()
+        }
+        None => session::mint_join_id(),
+    };
     if let Some(s) = state.config.sessions.as_ref() {
         session::open_session_via(s, &join_id, device_token, client_ip, origin.relay_client);
         session::set_session_labels(
@@ -1372,6 +1413,18 @@ async fn start_session(
         .as_ref()
         .map(|s| session::next_session_seq(s, &join_id))
         .unwrap_or(0);
+
+    // The outgoing session's capture is still running against the display this one is about to
+    // reuse. Its own teardown task will find the entry replaced and stand down, so stopping it
+    // here is the only thing that does.
+    if continuing.is_some() {
+        if let Some(s) = state.config.sessions.as_ref() {
+            if let Some(stop) = session::take_active_capture(s, &join_id) {
+                tprintln!("stopping the previous capture for join {join_id} before renegotiating");
+                let _ = tokio::task::spawn_blocking(stop).await;
+            }
+        }
+    }
 
     let detected_refresh = if req.refresh_rate == 0 {
         60
@@ -1407,8 +1460,15 @@ async fn start_session(
         .device_overrides
         .as_ref()
         .and_then(|o| o.lock_recover().get(device_token).copied());
-    let control_enabled = device_settings.map(|o| o.control_enabled).unwrap_or(true);
-    let pointer_scope = device_settings.map(|o| o.pointer_scope).unwrap_or_default();
+    // Shared with the injector rather than copied into it, so `set_device_override` and
+    // `set_device_pointer_scope` reach a session that is already running.
+    let live_input = crate::streamer::input::LiveInput::shared(
+        device_settings.map(|o| o.control_enabled).unwrap_or(true),
+        device_settings.map(|o| o.pointer_scope).unwrap_or_default(),
+    );
+    if let Some(s) = state.config.sessions.as_ref() {
+        session::set_live_input(s, &join_id, std::sync::Arc::clone(&live_input));
+    }
     let audio_params = match (
         state.config.audio_hub.as_ref(),
         state.config.device_overrides.as_ref(),
@@ -1499,19 +1559,58 @@ async fn start_session(
         format!("ScreenExtend - {}", req.device_name.trim())
     };
 
-    // A join is new by construction — its id was minted a few lines ago — so there is never a
-    // display to reuse or a previous orientation to carry. Reusing one is what a rejoin from the
-    // same address used to do, and it is exactly what made a second tab replace the first.
-    let existing: Option<session::LiveDisplay> = None;
-    let existed_before = false;
+    // A fresh join has no display to reuse — that is what made a second tab replace the first
+    // when sessions were keyed by address. A tab renegotiating on its own id does, and reusing it
+    // is the whole point: the mode changes under a display that never goes away.
+    let existing: Option<session::LiveDisplay> = match (&continuing, state.config.sessions.as_ref())
+    {
+        (Some(join), Some(s)) => session::get_live_display(s, join),
+        _ => None,
+    };
+    let existed_before = existing.is_some();
     let client_portrait = height > width;
-    let portrait = client_portrait;
-    if let Some(overrides) = state.config.device_overrides.as_ref() {
-        if let Some(o) = overrides.lock_recover().get_mut(device_token) {
-            o.orientation_portrait = client_portrait;
+    // The saved orientation is honoured for as long as the device is holding the same session.
+    // Overwriting it on every join, which is what happened while every join was new, made the
+    // per-device orientation setting inert: it was saved, replayed and then immediately replaced
+    // by whichever way round the phone happened to be. A device that has physically rotated
+    // since its last offer is believed, because that is a statement about the hardware and not a
+    // setting.
+    let prev_client_portrait = existing.as_ref().map(|p| p.height > p.width);
+    let device_rotated = prev_client_portrait == Some(!client_portrait);
+    let honor_device = existing.is_none() || device_rotated;
+    let portrait = if honor_device {
+        client_portrait
+    } else {
+        device_settings
+            .map(|o| o.orientation_portrait)
+            .unwrap_or(client_portrait)
+    };
+    if honor_device {
+        if let Some(overrides) = state.config.device_overrides.as_ref() {
+            if let Some(o) = overrides.lock_recover().get_mut(device_token) {
+                o.orientation_portrait = client_portrait;
+            }
         }
     }
     let swap_axes = portrait != client_portrait;
+
+    // Record what this join is actually running at, for a device the host holds no settings for
+    // yet. Without it the override map has no row until the first save, so that save had nothing
+    // to compare against and was classified as a change to everything — which is how renaming a
+    // freshly joined device rebuilt its session. The values are exactly `Device::defaults`, which
+    // is what the sheet is showing the user, so an untouched save now compares equal.
+    if let Some(overrides) = state.config.device_overrides.as_ref() {
+        overrides
+            .lock_recover()
+            .entry(device_token.to_string())
+            .or_insert(session::DeviceOverride {
+                orientation_portrait: client_portrait,
+                refresh_rate: detected_refresh,
+                dpr,
+                ..session::DeviceOverride::join_defaults()
+            });
+    }
+
     let base_scale = device_settings
         .map(|o| o.scale.clamp(MIN_DISPLAY_SCALE, MAX_DISPLAY_SCALE))
         .unwrap_or(100);
@@ -1829,8 +1928,7 @@ async fn start_session(
         webrtc_session::InputParams {
             device: Some(device_name.clone()),
             client_os: req.os.trim().to_string(),
-            control_enabled,
-            pointer_scope,
+            live: std::sync::Arc::clone(&live_input),
             control_rx: Some(control_rx),
         },
         audio_params,

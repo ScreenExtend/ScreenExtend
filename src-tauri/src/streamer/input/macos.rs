@@ -7,7 +7,7 @@ use objc2_core_foundation::CGPoint;
 use super::protocol::{
     btn, positions_cursor, InputEvent, Lifecycle, MoveSample, Phase, SRC_MOUSE, SRC_PEN, SRC_TOUCH,
 };
-use super::{ClientPlatform, ClientProfile, DisplayRect, PointerScope};
+use super::{ClientPlatform, ClientProfile, DisplayRect, PointerScope, SharedLiveInput};
 
 pub const NAME: &str = "macos-cgevent";
 
@@ -314,8 +314,10 @@ pub struct Injector {
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
-    /// What a locked cursor is clamped against: this session's own display, or every screen.
-    pointer_scope: PointerScope,
+    /// The two settings the user can move under a live session: whether remote control is on at
+    /// all, and what a locked cursor is clamped against. Shared with the command that writes
+    /// them, so a change reaches the next event rather than the next join.
+    live: SharedLiveInput,
     warned_drop: bool,
     /// Last probed injection tier. TCC can be granted or revoked while we run, and the check
     /// used to happen once in the constructor — which is why its own warning told the user to
@@ -328,7 +330,7 @@ impl Injector {
         let ClientProfile {
             device_name,
             platform,
-            pointer_scope,
+            live,
         } = client;
         let apple_client = platform.is_apple();
         if platform == ClientPlatform::Unknown {
@@ -373,7 +375,7 @@ impl Injector {
             // all — every tap becomes `mouse_pointer(.., Phase::Down)` — a touch client's
             // opening tap landed wherever the host cursor already was.
             mouse_relative: false,
-            pointer_scope,
+            live,
             warned_drop: false,
             tier,
         }
@@ -516,7 +518,7 @@ impl Injector {
     /// the desktop rather than trapping the cursor inside a guess. The Windows backend clamps
     /// against the same choice, so the two agree.
     fn pointer_bounds(&self) -> DisplayRect {
-        match (self.pointer_scope, self.target) {
+        match (self.live.pointer_scope(), self.target) {
             (PointerScope::Display, Some(r)) => r,
             _ => self.desktop,
         }
