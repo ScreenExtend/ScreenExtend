@@ -544,8 +544,22 @@ Cross-platform core, OS-independent:
   an `existing` live display, changes its mode (or leaves it alone for an encoder-only edit) and
   keeps the join. Same join id, same display id, no `DeviceRemove`, no second display, and the
   windows the user arranged stay where they are. The outgoing session's teardown task finds its
-  `session_seq` superseded and stands down. **Never make an epoch bump a leave-and-rejoin**, and
+  `session_seq` superseded and stands down; so does an *incoming* one that a newer offer has
+  overtaken, at the two checkpoints in `display_and_pipeline` — two saves in quick succession are
+  two attempts on one display, and only the newest may command it. A continuing join reaches the
+  dashboard as **`DeviceModify`, not `DeviceJoin`** (`DeviceReporter::report_modify`): a
+  renegotiation is the row moving, and reported as a join it raised "a device joined" over the
+  desktop every time a refresh rate did. **Never make an epoch bump a leave-and-rejoin**, and
   never widen a class without the table above and its test.
+
+  The client half of the same rule: **only a page that is going away releases its join.**
+  `teardownSession(keepJoin)` beacons `/leave` without it, and that is for `pagehide` and for a
+  kick alone. A lost link — including a rebuild that misses `RECONFIG_DEADLINE_MS` — keeps the
+  join, because the page is still open and still offering to reconnect, and the host's disconnect
+  grace is exactly the mechanism for that. Releasing it there told the host the device had
+  *left*: `DeviceRemove` on the dashboard, the display taken down, and then a reconnect that was
+  a brand-new session with a brand-new display and every window shuffled back onto the primary
+  monitor.
 
   `OtpLimiter` allows `MAX_OTP_ATTEMPTS` 5 per key with a 60 s lockout, plus a global cross-key
   guard (`MAX_GLOBAL_OTP_ATTEMPTS` 20 per 60 s window → 60 s pause) that defeats the cloud
@@ -1099,7 +1113,25 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   number**: resolution x `d`, DPI `100*d`%. Snap `d` with `platform::snap_display_dpr` (Windows
   exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),
   pre-register every ladder mode at create time — a live display cannot be given new ones — and
-  re-apply the DPI *after* the resolution change, which resets it.
+  re-apply the DPI *after* the resolution change, which resets it. **Record what the display
+  actually reached, never what was asked for.** A display reports the band of DPI steps it will
+  take and an IDD monitor's mode list is fixed when it is created, so both the scale and the
+  refresh rate can land somewhere else; `set_display_scale_owned` and `set_display_mode_owned`
+  return what is in effect and `landed_display` is what puts it on the session. A session that
+  records the request instead makes the next edit compare equal, and the change can then never be
+  retried.
+- **A display write names a monitor, never a `\\.\DISPLAYn`.** That name is a *slot*: Windows
+  hands it straight back out when the monitor holding it detaches, so a name cached when a
+  display was created can address a different monitor — the machine's own screen included — by
+  the time a reconfigure sets a mode or a DPI. Every write goes through
+  `pipeline::set_display_mode_owned` / `set_display_scale_owned`, which re-derive the name from
+  the monitor's stable device-interface path immediately before the write and **refuse, with a
+  logged error, if it does not resolve to a display this host created**
+  (`virtual_display::pick_owned_display`). Nothing about how Windows describes a display
+  separates ours from the user's — the bundled IDD monitor reports output technology `HDMI` and
+  an EDID name of `VirtuDisplay+` — so the ownership test is the set of device paths this process
+  watched appear, recorded by `claim_display_identity` at create and dropped by
+  `forget_display_identity` at removal.
 - **Nothing on a request path resolves a peer by its address.** A session is named by the
   `join_id` the host mints at `POST /whep`; a device is named by its token. An address moves
   under a live session and is handed to the next device that asks for one, so keying by it is
