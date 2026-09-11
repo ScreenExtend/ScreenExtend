@@ -3416,24 +3416,23 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // box, a pointer sweep over an otherwise static indirect display had 257 of 475 delivered
         // frames dropped here, and the client painted 59 fps against 85 with the gate absent.
         //
-        // A shorter window rather than none, because "none" is not a rate at all:
-        // `WGC_MIN_UPDATE_INTERVAL` is 4 ms, so an exempt cursor could deliver 250 fps to a client
-        // that asked for 60 and charge it to the device least able to afford the decode.
+        // A cursor-moved frame is exempt, and the bound on it is the compositor's own rate rather
+        // than a second one here. Measured on this box, painted fps for a pointer sweep over an
+        // otherwise static virtual display, against the baseline's 85: **113** exempt, 74 with a
+        // two-thirds-period window, 70 with a half-period one, 59 before any of this. A window
+        // narrower than DWM's compose interval is a worse gate than the one it replaces — it does
+        // not coalesce, it drops every frame that arrives a jitter early, and both bounded variants
+        // land *below* the baseline they were meant to restore.
         //
-        // Two thirds of a period is the baseline's own ceiling, arrived at from the other side: it
-        // asked WGC for `MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)` and had no
-        // gate of its own, and measured 85 fps for a pointer sweep. It has to be looser than the
-        // compositor's actual cadence or it becomes a worse gate than the one it replaces — a half
-        // period is 8.33 ms at 60 fps, DWM composes at very nearly that, and a hard floor against
-        // an equal interval drops every frame that arrives a jitter early: measured 70 fps, below
-        // both the unbounded 113 and the baseline's 85.
-        let window = if cursor_moved {
-            self.frame_period * 2 / 3
-        } else {
-            self.frame_period * CADENCE_NUM / CADENCE_DEN
-        };
+        // The ceiling that remains is `DISPLAY_COMPOSE_HZ`: WGC cannot deliver frames the display
+        // did not compose, and `WGC_MIN_UPDATE_INTERVAL`'s 4 ms only permits a rate, it does not
+        // produce one. If a cap on how much a client is asked to decode is ever wanted, that is
+        // where it belongs — in what the display is driven at, not in a gate that by then cannot
+        // tell a moving cursor from a moving window.
         if let Some(last) = self.last_delivered {
-            if capture.duration_since(last) < window {
+            if !cursor_moved
+                && capture.duration_since(last) < self.frame_period * CADENCE_NUM / CADENCE_DEN
+            {
                 self.telemetry
                     .degradation
                     .frames_skipped_cadence

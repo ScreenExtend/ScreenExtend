@@ -3607,16 +3607,21 @@ arriving sooner than three quarters of a frame period behind the last. Its own c
 cursor has to be asked about *before* both gates "because both of them would otherwise throw the
 frame that carries the pointer's new position away" — and the dirty-region gate below it does
 consult `cursor_moved`, while this one never did. 257 of 475 delivered frames were dropped here in
-the before run. A cursor-moved frame now gets a two-thirds-period window instead of a
-three-quarter one — which is the baseline's own ceiling, arrived at from the other side: it asked
-WGC for `MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)` and had no gate of its own.
+the before run. A cursor-moved frame is now exempt from it.
 
-The window has to be looser than the compositor's real cadence or it becomes a worse gate than the
-one it replaces. A half period is 8.33 ms at 60 fps, DWM composes at very nearly that, and a hard
-floor against an equal interval drops every frame arriving a jitter early — measured at 70 fps,
-below the unbounded 113 *and* below the baseline's 85. An outright exemption is not the answer
-either: `WGC_MIN_UPDATE_INTERVAL` is 4 ms, so an exempt cursor could deliver 250 fps to a client
-that asked for 60 and charge it to the device least able to afford the decode.
+Exempt rather than given a shorter window, and that was measured rather than assumed. Painted fps
+for a pointer sweep over an otherwise static virtual display, against the baseline's 85: **113**
+exempt, 74 with a two-thirds-period window, 70 with a half-period one, 59 before any of this. A
+window narrower than DWM's compose interval is a worse gate than the one it replaces — it does not
+coalesce, it drops every frame that arrives a jitter early, and both bounded variants land *below*
+the baseline they were meant to restore. Two thirds looked like the safe choice because it is the
+number the baseline itself used; the difference is that the baseline applied it inside the
+compositor (`MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)`), where it throttles
+production, rather than after delivery, where it discards.
+
+The ceiling that remains is `DISPLAY_COMPOSE_HZ`: WGC cannot deliver frames the display did not
+compose, and `WGC_MIN_UPDATE_INTERVAL`'s 4 ms only permits a rate, it does not produce one. If a
+cap on how much a client is asked to decode is ever wanted, that is where it belongs.
 
 **3. The keepalive collapsed from 200 ms to the frame period.** That was the polled cursor's only
 clock, so it had to. It also meant nine times the NVENC submissions, keyed-mutex traffic and socket
