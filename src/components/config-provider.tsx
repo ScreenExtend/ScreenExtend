@@ -7,6 +7,7 @@ import {
   type Device,
   type KnownDevice,
 } from "@/lib/config-defaults";
+import { normalizeConfig } from "@/lib/config-normalize";
 
 // The shape and its defaults live in a module with no imports so the Settings editor's
 // schema and the node test that cross-checks them can both see it. Re-exported here
@@ -51,6 +52,25 @@ export const getConfigSnapshot = (): Config | undefined => snapshot;
 
 let reading: Promise<Config | undefined> | null = null;
 
+// Put the corrected values back, so the next reader — the Settings editor, `ScreenExtend config
+// get`, the host's own replay — sees a file in the declared shape rather than repeating this.
+// Only the keys that were actually malformed are written: the rest of the document, including
+// keys this version does not know about, is left exactly as it was found.
+//
+// Deliberately after a successful read and never on a failure to read: a store that could not be
+// opened has nothing to correct, and writing defaults over a file we could not parse would turn
+// a recoverable problem into a lost configuration.
+const rewriteRepaired = async (db: Store, config: Config, keys: string[]): Promise<void> => {
+  try {
+    await Promise.all(keys.map(key => db.set(key, (config as Record<string, unknown>)[key])));
+    await db.save();
+  } catch (e) {
+    // The in-memory config is already correct, so this is not fatal — the file simply stays
+    // wrong until the next successful write.
+    console.error("[migrate] the corrected config could not be written back", e);
+  }
+};
+
 const readStore = async (): Promise<Config | undefined> => {
   const db = await ConfigDB;
   // One `plugin:store|entries` invoke. Reading key by key was one IPC round-trip
@@ -60,11 +80,24 @@ const readStore = async (): Promise<Config | undefined> => {
     publish(undefined);
     return undefined;
   }
-  const config = { ...defaultConfig };
-  for (const [key, value] of entries) {
-    if (value !== undefined && key in defaultConfig) {
-      (config as Record<string, unknown>)[key] = value;
-    }
+  const raw: Record<string, unknown> = {};
+  for (const [key, value] of entries) raw[key] = value;
+  // The one place a stored value of the wrong container type is turned into the declared one.
+  // Every consumer downstream — the bootstrap replay, the dashboard, the Settings page — reads
+  // `config.devices.map(…)` and `config.serverPorts.http` directly, and did so before this: a
+  // `devices` key holding an object took the whole of startup down with `object is not
+  // iterable`, reported as a driver fault. Coercing once here is what makes those reads safe.
+  const { config, notes, repaired } = normalizeConfig(raw);
+  for (const note of notes) console.log(note);
+  if (repaired.length > 0) {
+    // `console.error` is the only console channel wired to the Rust log bus
+    // (`lib/error-reporting.ts`), and a config file the app had to correct is exactly the thing
+    // that has to be visible in `ScreenExtend logs` rather than only in devtools nobody has open.
+    console.error(
+      `[migrate] config.json had ${notes.length} malformed value(s) under ${repaired.join(", ")}; ` +
+      `the declared defaults were used and the file corrected`
+    );
+    await rewriteRepaired(db, config, repaired);
   }
   publish(config);
   return config;
