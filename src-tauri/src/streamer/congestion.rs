@@ -165,10 +165,24 @@ impl SendHistory {
     }
 
     fn lookup(&self, seq: u16) -> Option<SentPacket> {
-        // Sequence numbers are dense and monotonic modulo 2^16, so the ring is sorted by
-        // wrapped sequence; a linear scan from the back finds a recent packet immediately and
-        // the oldest in `SEND_HISTORY` steps, which only happens for feedback we are about to
-        // discard anyway.
+        // `record` claims `next_seq` and increments by one, so the ring is dense: `ring[i].seq` is
+        // always `ring[0].seq + i` modulo 2^16. That makes the position arithmetic rather than a
+        // search, and the verification is the equality check on the slot it names — if the ring is
+        // ever not dense the check fails and the scan below answers instead.
+        //
+        // It used to be only the scan, from the back, on the reasoning that "a linear scan from the
+        // back finds a recent packet immediately". A TWCC report does not start at a recent packet:
+        // it starts at `base_sequence_number`, the *oldest* sequence it has anything to say about,
+        // so the first lookups walked most of the ring's 4096 entries — and `interpret` calls this
+        // twice per reported symbol, with `feedback.history`'s blocking mutex held, on the same
+        // mutex the RTP writer takes once per packet.
+        let front = *self.ring.front()?;
+        let idx = seq.wrapping_sub(front.seq) as usize;
+        if let Some(p) = self.ring.get(idx) {
+            if p.seq == seq {
+                return Some(*p);
+            }
+        }
         self.ring.iter().rev().find(|p| p.seq == seq).copied()
     }
 
@@ -1002,6 +1016,43 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(f.acked_frame_capture_ns(), Some(9_000));
+    }
+
+    /// The indexed lookup has to agree with the scan it replaced on every entry of a full ring,
+    /// across the `u16` wrap, and after a retire has moved the front — which is the only state in
+    /// which index arithmetic can be wrong.
+    #[test]
+    fn the_indexed_lookup_finds_what_a_scan_would() {
+        let e = Instant::now();
+        let mut h = SendHistory::new(e);
+        // Past the wrap and past the ring's capacity, so `next_seq` has wrapped and the front has
+        // moved off zero.
+        for i in 0..(SEND_HISTORY + 5000) {
+            h.record(1200, e, (i / 10) as u32, i as u64);
+        }
+        assert_eq!(h.ring.len(), SEND_HISTORY);
+
+        let scan = |seq: u16| h.ring.iter().rev().find(|p| p.seq == seq).copied();
+        for p in h.ring.iter() {
+            assert_eq!(h.lookup(p.seq), scan(p.seq), "seq {}", p.seq);
+            assert_eq!(h.lookup(p.seq).map(|q| q.seq), Some(p.seq));
+        }
+        // A sequence the ring no longer holds must answer nothing, not the slot its index names.
+        let front = *h.ring.front().unwrap();
+        let gone = front.seq.wrapping_sub(1);
+        assert_eq!(
+            h.lookup(gone),
+            None,
+            "retired sequences are not in the ring"
+        );
+        let unsent = h.ring.back().unwrap().seq.wrapping_add(1);
+        assert_eq!(h.lookup(unsent), None, "unsent sequences are not either");
+
+        // And after a retire, when the front is no longer where it was.
+        h.retire_through(front.seq.wrapping_add(100));
+        for p in h.ring.iter() {
+            assert_eq!(h.lookup(p.seq), scan(p.seq), "after retire, seq {}", p.seq);
+        }
     }
 
     #[test]
