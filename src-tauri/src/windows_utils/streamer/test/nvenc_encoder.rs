@@ -7,7 +7,7 @@
 
 use crate::streamer::config::H264Profile;
 use crate::windows_utils::streamer::nvidia::encoder::{
-    fill_synthetic_bgra, Encoder, EncoderConfig, RefInvalidation,
+    fill_synthetic_bgra, reference_budget, Encoder, EncoderConfig, RefInvalidation,
 };
 
 use super::h264::{is_idr_with_headers, nal_units, parse_sps, starts_with_annexb};
@@ -423,7 +423,15 @@ fn measure_pipelining(w: u32, h: u32) {
 /// IDR on this RTX 3080 Ti. Real screen content is mostly static between frames, where the same
 /// repair should land near a steady P frame. What this pins is that the mechanism works and does
 /// not cost *more* than the keyframe it exists to avoid.
+///
+/// **Ignored, because long-term references are off on this backend** — NVENC's `maxNumRefFrames`
+/// is both the SPS's `max_num_ref_frames` and only the short-term cap, so an enabled LTR set makes
+/// the stream claim fewer reference frames than it holds and a hardware decoder paints the
+/// difference flat green (`docs/OPTIMIZATIONS.md` UX-GREEN). It is kept, rather than deleted,
+/// because it is the measurement the re-enabling work needs: run it with `SE_NVENC_LTR=1` set in
+/// the environment, alongside a decoder that checks conformance.
 #[test]
+#[ignore = "NVENC long-term references are disabled (UX-GREEN); run with SE_NVENC_LTR=1 to measure the repair path"]
 fn nvenc_ltr_repair_is_cheaper_than_an_idr() {
     const W: u32 = 1920;
     const H: u32 = 1080;
@@ -647,4 +655,46 @@ fn nvenc_map_unmap_cost_per_frame() {
         percentile(&repeat, 50),
         percentile(&repeat, 95),
     );
+}
+
+/// The reference budget is shared, and whatever the SPS declares has to cover all of it.
+///
+/// `max_num_ref_frames` is the number of reference pictures the stream promises never to exceed,
+/// and NVENC counts only the *short-term* ones against `maxNumRefFrames` — so a long-term slot
+/// that is not paid for out of the budget is a picture the decoder was never told to keep room
+/// for. It evicts one, the next frame predicting from the slot it freed is reconstructed from a
+/// surface nobody wrote, and a hardware decoder paints that flat green and reports nothing.
+///
+/// Long-term references are off on this backend for exactly that reason (see `configure`), which
+/// makes this the guard on re-enabling them rather than a description of what ships: with
+/// `ltr_frames = 0` it pins today's `4 -> (4, 4)`, and with any other value it requires the
+/// declaration to cover both kinds. No GPU needed — it is arithmetic, and the arithmetic is what
+/// was wrong.
+#[test]
+fn a_long_term_slot_is_paid_for_out_of_the_declared_reference_budget() {
+    for budget in 1u32..=4 {
+        for ltr in 0u32..=2 {
+            let (short, declared) = reference_budget(budget, ltr);
+            assert!(
+                short >= 1,
+                "budget {budget} ltr {ltr}: a P frame needs something to predict from"
+            );
+            assert_eq!(
+                declared,
+                short + ltr,
+                "budget {budget} ltr {ltr}: the SPS must declare both kinds, not only the short-term ones"
+            );
+            if budget > ltr {
+                assert_eq!(
+                    declared, budget,
+                    "budget {budget} ltr {ltr}: a budget that fits must not be grown"
+                );
+            }
+        }
+    }
+    // The shipped configuration, named explicitly so a change to either number is a failing test
+    // and not a silent widening of the DPB.
+    assert_eq!(reference_budget(4, 2), (2, 4));
+    assert_eq!(reference_budget(4, 0), (4, 4));
+    assert_eq!(reference_budget(1, 0), (1, 1));
 }

@@ -3814,3 +3814,55 @@ display that was not ours was exactly where it had been.
 Both belong here rather than in a private note: an investigation that damages the thing it is
 measuring has to say so, and this is the third harness in four passes to touch the owner's live
 state (§15.8's BOM, §15.17's cleared device rows, this).
+
+## 15.19 The stream promised four reference frames and kept six
+
+**The report.** *"The picture on a LAN client flickers green randomly"* — on a static desktop. The
+baseline commit `271aa01` does not do it.
+
+Flat green is the one H.264 artefact that names its own cause: Y=U=V=0 is about RGB(0,135,0), a
+picture reconstructed from a surface nobody wrote. Either the encoder was handed a zeroed frame or
+the decoder was asked to predict from a reference it no longer holds. It was the second, and the
+host is what made the client throw the reference away.
+
+`h264.maxNumRefFrames` goes into the SPS verbatim as `max_num_ref_frames` — what the stream
+promises never to exceed, and what a decoder sizes its DPB from. **NVENC counts only the
+short-term references against it and keeps `ltrNumFrames` more on top.** So there is no value of
+that field which covers an enabled LTR set, and the declaration cannot simply be widened either:
+at 1920x1080 every level these answers carry (4.0-4.2) allows exactly four frames. With two
+long-term slots the stream declared four and held up to six. ffmpeg says so and still calls the
+file clean — `number of reference frames (2+3) exceeds max (4; probably corrupt input),
+discarding one`, `mmco: unref short failure`, `0 decode errors`. That last part is the defect: a
+software decoder conceals, a hardware decoder evicts and paints green, and neither tells the page,
+so no keyframe is ever requested and the artefact persists until something else forces an IDR.
+
+**The fix is to turn long-term references off on NVENC**, which is what `271aa01` did.
+`SE_NVENC_LTR=1` re-enables them as an opt-in for the work that would make them correct — the SPS
+rewritten on the way out so `max_num_ref_frames` covers both kinds, the shape `amd/sps.rs` already
+uses for the VUI. The cost is that a loss is answered with a keyframe again rather than a P frame
+predicted from a long-term reference — exactly what macOS already does, since VideoToolbox's LTR
+is token-based and that pipeline declares zero slots. Reference-picture invalidation is unaffected.
+
+Introduced by `240f9f6` (two LTR slots) on top of `f66a5a7` (one short-term reference to four).
+Neither is wrong alone; `240f9f6` is the one that made the stream overdraw its own promise.
+
+**Measured**, decoding what the host emitted before any network: HEAD, 1 complaint in 4,855
+frames. Cutting the short-term references to two instead — tried first — still gave 1 in 3,307,
+which is what established that the budget cannot be shared at all. LTR off: **0 in 7,502 frames**
+on this build, and 0 in 18,037 on the earlier control. Painted fps is unchanged (36.1 static /
+38.1 motion, against 35.7 / 38.9 with LTR on). `SE_NVENC_NO_ASYNC=1` and intra-refresh-off both
+left the complaint exactly where it was.
+
+**What was not measured.** The green was never reproduced on a client in this room: every client
+this box can drive decodes in software, and a software decoder conceals the eviction — the in-page
+pixel sampler read `greenFrames: 0` at HEAD too, over 180.7 s. The fix is justified by the stream
+being non-conformant and by that non-conformance disappearing, not by a green pixel appearing and
+then not. A hardware-decoder client is what would close that gap.
+
+**The harness synthesizes no input.** An earlier revision swept the real cursor with `SendInput`
+to make motion on the virtual display; every such path is gone, along with the by-name
+`Stop-Process` that would have killed the owner's own host and the `config.json` round trip that
+briefly emptied `devices[]`. Motion is now a small borderless window the script paints and walks
+around the virtual display — the same compositor path a cursor move takes, without touching the
+pointer or the keyboard. The host it stops is matched by full path, and the owner's config is
+read, hashed and never written.
