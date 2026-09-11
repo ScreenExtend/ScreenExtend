@@ -3523,3 +3523,173 @@ Every field on `DeviceOverride` belongs to a class, and the class is in
 `DeviceOverride::reconfig_action` with a row in that test. A field not named there is cosmetic by
 construction, which is the safe default. An epoch bump is a renegotiation **in place** — never a
 leave and a rejoin, never a new join id, never a `DeviceRemove` on the dashboard.
+
+## UX-INPUT — "the client keyboard and mouse feel laggy", measured against the pre-overhaul host — `VERIFIED`
+
+The report: *"since pre-440 commits, the input latency forwarding was not that high. now, the
+latency when i use my native keyboard/mouse is really low thanks to very fast streaming but the
+latency when using the client keyboard/mouse is high."* Baseline `271aa01`, ~440 commits behind
+this tree. Working assumption throughout: **the old code was faster, and the burden of proof is on
+the new code.**
+
+### What it was not
+
+`scripts/measure-input.ps1` drives a real Chrome client over CDP and times four things separately,
+because the fixes for them are different. Two of them cleared the new code immediately.
+
+**The client's send path.** The page hooks `RTCDataChannel.prototype.send` and a capture-phase
+pointer listener on `window`, which runs ahead of the page's own, so "DOM event → bytes on the
+channel" is measured inside the browser with no host involved.
+
+| | baseline | HEAD before |
+|---|---|---|
+| hold, p50 | 0.02 ms | 0.02–0.03 ms |
+| hold, p99 | 0.08–0.26 ms | 0.10–0.28 ms |
+
+Identical, and both negligible. The `MessageChannel` flush gate in `input.js` — the first move of
+each task sent inline, the rest coalesced into one macrotask — is **the same code in both trees**
+and costs nothing measurable. Keys are sent synchronously inside the DOM handler on the `reliable`
+channel in both. Nothing in `input.js` had regressed.
+
+**The forward leg.** Client `send` paired against the host's `input-trace` line, both wall clock on
+one machine:
+
+| sweep | baseline | HEAD before | HEAD after |
+|---|---|---|---|
+| 125 Hz, p50 / p95 / p99 | 0 / 1 / 1 ms | 0 / 1 / 18 ms | 1 / 1 / 1 ms |
+| keys, p50 | 2 ms | 3 ms | 2 ms |
+
+p50 is a millisecond on every build. **The forward leg was never the regression** — and that is the
+most useful negative result here, because it is where the report pointed.
+
+### What it was: the return leg stopped answering a cursor
+
+The decisive measurement is frame production on a desktop where *nothing else is changing*, with
+the client's pointer sweeping and then the host's:
+
+| | baseline | HEAD before | HEAD after |
+|---|---|---|---|
+| static desktop, client paints | 5.0 fps | **46.9 fps** | 4.7 fps |
+| client pointer sweeping | **85.3 fps** | **59.1 fps** | **113.5 fps** |
+| host pointer sweeping | 85.6 fps | 60.2 fps | 117.1 fps |
+| 30 isolated host moves, frames per move | 2.07 | 14.3 | 2.0 |
+| 1 kHz burst, frames reaching `SendInput` | 934 / 1000 | **779 / 1000** | **1000 / 1000** |
+
+Both pointers regressed equally, which is the part the report could not see: the owner judges the
+native mouse on the host's own screen, where DWM draws it at no cost, and the client's through the
+stream. The asymmetry is in where they are looking, not in how the two are injected.
+
+Four causes, all post-baseline, all on the WGC + NVENC/AMF ring path.
+
+**1. WGC stopped compositing the pointer** (`cursor_composited`, merge `8e65d90`). With the host
+drawing it instead, a cursor-only move produces no captured frame at all — it is answered by the
+encode thread's `default(tick)` idle arm, which polls `GetCursorInfo` and re-encodes the held slot.
+Event-driven became polled: quantised to the frame period, skippable when the tick is lost to the
+keyed mutex's 8 ms `AcquireSync`, and in any scene where real frames keep arriving the idle arm
+never fires at all because `select!` re-arms the timer.
+
+The justification for that change **this repo has already withdrawn**: it rests on "WGC delivers
+2–10 fps for pointer-only motion", and `docs/RESULTS.md` records that the harness which produced
+that number declared the `INPUT` struct 48 bytes where the OS wants 40, so every `SendInput`
+returned 0 and the pointer never moved. It was measuring a still desktop. Re-measured end to end
+here: 85 fps with WGC compositing, 59 with the host doing it. The overlay is now off by default and
+reachable with `SE_CURSOR_OVERLAY=1`; what it genuinely buys — a keepalive repeat carrying the
+pointer where it is *now* — is kept, not deleted.
+
+**2. The cadence gate discarded the frame carrying the cursor.** `on_frame_arrived` drops any frame
+arriving sooner than three quarters of a frame period behind the last. Its own comment says the
+cursor has to be asked about *before* both gates "because both of them would otherwise throw the
+frame that carries the pointer's new position away" — and the dirty-region gate below it does
+consult `cursor_moved`, while this one never did. 257 of 475 delivered frames were dropped here in
+the before run. A cursor-moved frame now gets a half-period window instead of a three-quarter one:
+shorter, so an early frame is never thrown away, and still a bound — `WGC_MIN_UPDATE_INTERVAL` is
+4 ms, so an outright exemption would let a moving cursor deliver 250 fps to a client that asked
+for 60.
+
+**3. The keepalive collapsed from 200 ms to the frame period.** That was the polled cursor's only
+clock, so it had to. It also meant nine times the NVENC submissions, keyed-mutex traffic and socket
+writes on a picture nobody was changing — 47 fps of re-encoded static desktop against the
+baseline's 5 — all contending with the capture callback on the same device. With WGC drawing the
+pointer again the keepalive is back to 200 ms, and only the opt-in overlay raises it.
+
+**4. Four transport workers where the baseline had sixteen per adapter.** Tokio has no dedicated
+I/O thread: a worker services the reactor when it parks or every `event_interval` (61) task polls.
+A session steadily occupies the RTP writer, the RTCP/TWCC reader, the bitrate driver's `getStats`,
+the audio forwarder at 200 packets/s and the `/reconfig` poll, so with four workers all four can be
+runnable at once and an arriving pointer frame waits. Measured with `SE_TRANSPORT_WORKERS` on the
+*same binary*: 779 of 1000 frames reached `SendInput` at 4, 1000 of 1000 at 16.
+
+The 48-thread problem that motivated the cap was real, but **one shared runtime had already solved
+it** — 16 total is fewer than a single adapter used to cost. The cap was a second, separate change
+with no measurement behind it, so it goes back to the baseline's width.
+
+The blind spot is worth recording: `route()` stamps `host_recv_ns` *after* that scheduler wait, so
+a stall there leaves every host-side stage histogram clean and surfaces only as motion the client
+never sees. A host whose telemetry is spotless while the user reports lag is diagnostic of this
+shape, not evidence against it.
+
+### Also fixed on the way
+
+**`SendHistory::lookup` was a reverse scan of a 4096-entry ring**, called twice per reported TWCC
+symbol, with `feedback.history`'s blocking mutex held — the same mutex the RTP writer takes once
+per packet, ~2000 times a second. The comment claimed the scan "finds a recent packet immediately";
+a TWCC report starts at `base_sequence_number`, the *oldest* sequence it covers, so it did the
+opposite. `record` claims sequences densely, so the position is arithmetic; the equality check on
+the slot it names is the verification, and the scan remains as the fallback if the ring is ever not
+dense. `COMPILE-CHECKED` for the latency effect — it is below this harness's resolution — and
+`VERIFIED` for correctness by `the_indexed_lookup_finds_what_a_scan_would`, which walks a wrapped,
+full, then partly retired ring against the scan it replaced.
+
+**The pointer lost every acceleration curve it had.** This one is a gain change, not a delay, and
+it is worth separating because it is the other half of what "laggy" can mean. The baseline stacked
+two: the client's OS curved `movementX/Y` (plain `requestPointerLock()`), and Windows curved the
+relative `MOUSEEVENTF_MOVE` the host injected. HEAD asks for `unadjustedMovement: true` *and*
+injects from a tracked absolute position, so with `settings.sensitivity` at its default 1.0 and
+`settings.accel` at 0 there is no curve anywhere — a strict mickey-per-pixel pointer needing two to
+six times the hand movement at ordinary speeds.
+
+"Exactly one curve" is the right rule and the fix keeps it; what it adds is that the side holding
+raw counts is the side that must apply it. Raw counts (`UNADJUSTED` set) now go out as relative
+`MOUSEEVENTF_MOVE`, so Windows' own pointer speed and "enhance pointer precision" apply — the
+user's configured curve, on the machine being driven, which is byte-identical to what the
+pre-overhaul host did. Already-curved counts keep the tracked-absolute path, because there the
+second curve is the one that must not happen. `PointerScope::Display` keeps the tracked path
+either way: confining the cursor to one monitor needs a position to clamp and relative motion has
+none. Tested by `raw_counts_get_the_os_curve_and_already_curved_counts_do_not`.
+
+**macOS is untouched and stays untouched.** `CGEventPost` does not apply the system's pointer
+acceleration to synthetic events, so there is no host curve to hand the motion back to and the
+"one curve" question does not arise; that backend tracks the position in both cases, as it always
+has. The cursor, cadence and keepalive changes are all in `windows_utils/streamer/pipeline.rs` and
+have no macOS counterpart.
+
+### What was left alone, and why
+
+- **The client's `MessageChannel` flush gate.** Measured at 0.02 ms. It is also present at the
+  baseline, byte for byte.
+- **`MAX_IN_FLIGHT` / `BACKLOG_STALL_MS` in `transform-worker.js`.** The thresholds are looser than
+  the baseline's (6 in flight plus 66 ms of no output, twice, against `decodeQueueSize > max(3,
+  fps·0.05)` twice) and that is a real tolerance for ~132 ms of stalled decode. But the loosening
+  has a measurement behind it — 74 IDRs in 30 s on a healthy session with the old test, each a
+  200 ms freeze — and tripping it sooner makes the stall it is trying to avoid more likely, not
+  less. It stays.
+- **`MAX_FAST_AGE_NS` and the reorder gate.** They drop positional frames the baseline would have
+  replayed, and replaying a 50 ms-old cursor position is worse than dropping it. The counters
+  (`input_stale_drops`, `input_reorder_drops`) are what make a transport stall visible at all.
+- **The pacer.** `locality=SameNetwork` on this box, so `PacingMode::Off` and the code path is
+  byte-identical to the baseline. It is a live risk on any LAN the `/24` classifier calls
+  `Unknown`, which is a separate question from this one.
+
+### Harness
+
+`scripts/measure-input.ps1`, and `SE_INPUT_TRACE=1` for the one host-side line it pairs against —
+one `tprintln!` per injected event, printed strictly after `dispatch` returns so it cannot delay
+the event it describes. The stage histograms answer "how long did the host take"; they cannot
+answer "did *this* keystroke reach `SendInput` before or after the frame the user was looking at",
+because a percentile has no events in it.
+
+Two harness traps are recorded in the script because both produce a plausible wrong answer rather
+than an error: PowerShell 5.1's `ConvertFrom-Json` hands back a JSON array as one `Object[]` rather
+than unrolling it, so `@(… | ConvertFrom-Json)` indexes a whole column; and pairing sends to
+injections by index means one dropped frame shifts every later pair by a full inter-event gap,
+which at a 250 ms cadence reports a quarter-second of latency that never happened.
