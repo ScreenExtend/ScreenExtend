@@ -81,7 +81,53 @@ pub struct DeviceOverride {
     pub auto_frame_rate: bool,
 }
 
+/// What one settings edit costs the stream the device is already watching.
+///
+/// The desktop UI writes the whole override on every save, so the interesting question is never
+/// "was `set_device_override` called" but "did any field that the live pipeline reads actually
+/// move". Each variant names a class of field, and the variants are ordered by how much of the
+/// session they disturb so a run of fields folds with `max`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReconfigAction {
+    /// Classes (a), (b) and (c): the name and its labels, remote control, the pointer scope,
+    /// system audio on/off and the output device. None of them is an encoder-session parameter —
+    /// the injector and the audio fan-out read them live — so the stream is told nothing at all.
+    #[default]
+    Nothing,
+    /// Display scale alone. The extended desktop's DPI changes under a stream whose geometry is
+    /// already right, so the host applies it to the live display and the client never hears about
+    /// it.
+    ScaleLive,
+    /// Classes (d) and the rest of (e): geometry, refresh rate, DPR, the encoder's input scale
+    /// and its quality target. These are fixed when the encoder session is built, so the pipeline
+    /// restarts at the new mode and the client renegotiates **in place** — same join id, same
+    /// display, the last frame held until the new one paints.
+    Rebuild,
+}
+
 impl DeviceOverride {
+    /// Which class the difference between two saved overrides falls into.
+    ///
+    /// This is the whole rule in one place, and the unit test beside it is the field→action
+    /// table. Anything not named here is cosmetic by construction: adding a field to
+    /// `DeviceOverride` without adding it to this match means "changing it does nothing to the
+    /// stream", which is the safe default and the one the caller can see.
+    pub fn reconfig_action(old: &Self, new: &Self) -> ReconfigAction {
+        let rebuild = old.orientation_portrait != new.orientation_portrait
+            || old.refresh_rate != new.refresh_rate
+            || old.video_scale != new.video_scale
+            || old.video_quality != new.video_quality
+            || old.auto_frame_rate != new.auto_frame_rate
+            || (old.dpr - new.dpr).abs() > f64::EPSILON;
+        if rebuild {
+            ReconfigAction::Rebuild
+        } else if old.scale != new.scale {
+            ReconfigAction::ScaleLive
+        } else {
+            ReconfigAction::Nothing
+        }
+    }
+
     /// The values the join path would have used, for the single-field commands
     /// (`set_device_pointer_scope`, `set_device_auto_frame_rate`) when nothing is saved for a
     /// device yet. Writing one field must not silently pin a resolution or a refresh rate.
@@ -391,6 +437,10 @@ pub struct DeviceSessionState {
     pub kick_epoch: u64,
     pub session_seq: u64,
     pub live_display: Option<LiveDisplay>,
+    /// The class-(b) input settings this session's injector is reading right now. Kept here so a
+    /// per-device command can reach every tab the device has open without going through the
+    /// transport.
+    pub live_input: Option<crate::streamer::input::SharedLiveInput>,
     pub leave: Option<Arc<LeaveSignal>>,
     pub control: Option<ControlSender>,
     pub active_capture: Option<(u64, CaptureStopper)>,
@@ -647,6 +697,45 @@ pub fn take_live_display(sessions: &SharedSessions, join: &str) -> Option<LiveDi
         .lock_recover()
         .get_mut(join)
         .and_then(|s| s.live_display.take())
+}
+
+/// Hand this session's injector the handle it reads remote control and the pointer scope from.
+pub fn set_live_input(
+    sessions: &SharedSessions,
+    join: &str,
+    live: crate::streamer::input::SharedLiveInput,
+) {
+    sessions
+        .lock_recover()
+        .entry(join.to_string())
+        .or_default()
+        .live_input = Some(live);
+}
+
+/// Apply a class-(b) input change to every live join of one device. Returns how many it reached.
+///
+/// No epoch, no renegotiation, no display work: the injector reads both values per event, so the
+/// change lands on the next pointer move.
+pub fn apply_live_input_for_device(
+    sessions: &SharedSessions,
+    token: &str,
+    control_enabled: bool,
+    scope: crate::streamer::input::PointerScope,
+) -> usize {
+    if token.is_empty() {
+        return 0;
+    }
+    let handles: Vec<crate::streamer::input::SharedLiveInput> = sessions
+        .lock_recover()
+        .values()
+        .filter(|s| s.device_token == token)
+        .filter_map(|s| s.live_input.clone())
+        .collect();
+    for live in &handles {
+        live.set_control_enabled(control_enabled);
+        live.set_pointer_scope(scope);
+    }
+    handles.len()
 }
 
 pub fn bump_reconfig_epoch(sessions: &SharedSessions, join: &str) {
@@ -1614,6 +1703,260 @@ mod tests {
         assert!(
             !is_device_token(&"A".repeat(32)),
             "minted tokens are lowercase hex; accepting uppercase would make one device two"
+        );
+    }
+
+    /// The field → action table, as one test.
+    ///
+    /// The owner's report was that editing something as inert as a device name disconnected the
+    /// client. The cause was that the desktop UI writes the *whole* override on every save and
+    /// the host read "a save happened" as "something changed", so every field was effectively in
+    /// the most expensive class. This asserts the classes are what the classes say they are, one
+    /// field at a time: move exactly one, and the verdict is exactly its class.
+    #[test]
+    fn each_field_costs_the_stream_what_its_class_costs() {
+        use crate::streamer::input::PointerScope;
+        let base = DeviceOverride::join_defaults();
+        let cases: &[(&str, DeviceOverride, ReconfigAction)] = &[
+            // (a)/(b)/(c): nothing the pipeline or the client reads.
+            (
+                "remote control",
+                DeviceOverride {
+                    control_enabled: !base.control_enabled,
+                    ..base
+                },
+                ReconfigAction::Nothing,
+            ),
+            (
+                "pointer scope",
+                DeviceOverride {
+                    pointer_scope: PointerScope::Display,
+                    ..base
+                },
+                ReconfigAction::Nothing,
+            ),
+            (
+                "system audio",
+                DeviceOverride {
+                    audio_enabled: !base.audio_enabled,
+                    ..base
+                },
+                ReconfigAction::Nothing,
+            ),
+            ("nothing at all", base, ReconfigAction::Nothing),
+            // (e) display scale: applied to the live display, the client is never told.
+            (
+                "display scale",
+                DeviceOverride {
+                    scale: base.scale + 25,
+                    ..base
+                },
+                ReconfigAction::ScaleLive,
+            ),
+            // (d) stream parameters and the rest of (e): an encoder session is built from these.
+            (
+                "orientation",
+                DeviceOverride {
+                    orientation_portrait: !base.orientation_portrait,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "refresh rate",
+                DeviceOverride {
+                    refresh_rate: base.refresh_rate + 30,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "dpr",
+                DeviceOverride {
+                    dpr: base.dpr + 1.0,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "video scale",
+                DeviceOverride {
+                    video_scale: 50,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "video quality",
+                DeviceOverride {
+                    video_quality: base.video_quality + 5,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "automatic frame rate",
+                DeviceOverride {
+                    auto_frame_rate: !base.auto_frame_rate,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+        ];
+        for (what, next, want) in cases {
+            assert_eq!(
+                DeviceOverride::reconfig_action(&base, next),
+                *want,
+                "moving {what} should cost the stream {want:?}"
+            );
+        }
+    }
+
+    /// A rebuild must win when both moved: the display is re-driven at the new mode either way,
+    /// so applying the scale live as well would be a second, redundant reconfiguration.
+    #[test]
+    fn a_rebuild_absorbs_a_scale_change_that_rides_with_it() {
+        let base = DeviceOverride::join_defaults();
+        let both = DeviceOverride {
+            scale: base.scale + 25,
+            refresh_rate: base.refresh_rate + 30,
+            ..base
+        };
+        assert_eq!(
+            DeviceOverride::reconfig_action(&base, &both),
+            ReconfigAction::Rebuild
+        );
+    }
+
+    /// The owner's own reproduction. The name is not on `DeviceOverride` at all, so a save that
+    /// only moved it submits an identical row — and the session, its epochs and its display must
+    /// all come out the other side untouched.
+    #[test]
+    fn a_rename_moves_no_epoch_and_ends_no_session() {
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        let join = mint_join_id();
+        open_session(&sessions, &join, &token, "10.0.0.9");
+        set_live_display(
+            &sessions,
+            &join,
+            LiveDisplay {
+                display_id: 4,
+                device_name: "DISPLAY7".to_string(),
+                width: 1920,
+                height: 1080,
+                refresh: 60,
+                scale: 100,
+                portrait: false,
+            },
+        );
+        set_session_labels(&sessions, &join, "old name", "1920x1080");
+        let before = reconfig_epoch(&sessions, &join);
+
+        // What the desktop sheet submits when only the name was edited: the same row back.
+        let saved = DeviceOverride::join_defaults();
+        let submitted = saved;
+        assert_eq!(
+            DeviceOverride::reconfig_action(&saved, &submitted),
+            ReconfigAction::Nothing,
+            "a rename is not a stream change"
+        );
+        set_session_labels(&sessions, &join, "new name", "1920x1080");
+
+        assert_eq!(
+            reconfig_epoch(&sessions, &join),
+            before,
+            "a rename must not move the reconfig epoch"
+        );
+        assert_eq!(
+            kick_epoch(&sessions, &join),
+            0,
+            "a rename must not kick the session"
+        );
+        assert!(
+            get_live_display(&sessions, &join).is_some(),
+            "a rename must not take the display down"
+        );
+        assert_eq!(
+            joins_for_token(&sessions, &token),
+            vec![join],
+            "and the join it was watching on is the join it is still watching on"
+        );
+    }
+
+    /// A device-wide bump reaches every tab and leaves every display alone. This is what a
+    /// display-affecting change does instead of a leave-and-rejoin.
+    #[test]
+    fn a_stream_change_moves_every_tab_without_touching_the_display() {
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        let other = mint_device_token();
+        let (a, b, c) = (mint_join_id(), mint_join_id(), mint_join_id());
+        open_session(&sessions, &a, &token, "10.0.0.9");
+        open_session(&sessions, &b, &token, "10.0.0.9");
+        open_session(&sessions, &c, &other, "10.0.0.11");
+        for join in [&a, &b, &c] {
+            set_live_display(
+                &sessions,
+                join,
+                LiveDisplay {
+                    display_id: 1,
+                    device_name: "d".to_string(),
+                    width: 800,
+                    height: 600,
+                    refresh: 60,
+                    scale: 100,
+                    portrait: false,
+                },
+            );
+        }
+
+        let moved = bump_reconfig_epoch_for_device(&sessions, &token);
+        assert_eq!(moved, 2, "both of this device's tabs, and only those");
+        assert_eq!(reconfig_epoch(&sessions, &a), 1);
+        assert_eq!(reconfig_epoch(&sessions, &b), 1);
+        assert_eq!(
+            reconfig_epoch(&sessions, &c),
+            0,
+            "another device's session is not this device's business"
+        );
+        for join in [&a, &b, &c] {
+            assert!(
+                get_live_display(&sessions, join).is_some(),
+                "an epoch bump is a renegotiation, not a teardown"
+            );
+            assert_eq!(kick_epoch(&sessions, join), 0);
+        }
+    }
+
+    /// Class (b) reaches the injector that is running, not the next one.
+    #[test]
+    fn remote_control_and_the_pointer_scope_apply_to_a_live_session() {
+        use crate::streamer::input::{LiveInput, PointerScope};
+        let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        let other = mint_device_token();
+        let (a, b) = (mint_join_id(), mint_join_id());
+        open_session(&sessions, &a, &token, "10.0.0.9");
+        open_session(&sessions, &b, &other, "10.0.0.11");
+        let live_a = Arc::new(LiveInput::new(true, PointerScope::All));
+        let live_b = Arc::new(LiveInput::new(true, PointerScope::All));
+        set_live_input(&sessions, &a, Arc::clone(&live_a));
+        set_live_input(&sessions, &b, Arc::clone(&live_b));
+
+        let reached = apply_live_input_for_device(&sessions, &token, false, PointerScope::Display);
+        assert_eq!(reached, 1);
+        assert!(!live_a.control_enabled());
+        assert_eq!(live_a.pointer_scope(), PointerScope::Display);
+        assert!(
+            live_b.control_enabled(),
+            "another device's injector is untouched"
+        );
+        assert_eq!(live_b.pointer_scope(), PointerScope::All);
+        assert_eq!(
+            reconfig_epoch(&sessions, &a),
+            0,
+            "class (b) costs no renegotiation"
         );
     }
 }

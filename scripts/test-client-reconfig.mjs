@@ -58,12 +58,12 @@ const prelude = `
   function markAlive() { calls.push('markAlive'); }
   function noteSuppressed() { calls.push('noteSuppressed'); }
   function evaluateLink() { calls.push('evaluateLink'); }
-  function teardownSession() { calls.push('teardownSession'); }
+  function teardownSession(keepJoin) { calls.push('teardownSession:' + !!keepJoin); }
   function stopLock() { calls.push('stopLock'); }
   function showLinkStatus(s) { calls.push('showLinkStatus:' + s); }
   function showError(m) { calls.push('showError:' + m); }
   function linkLost(m) { calls.push('linkLost:' + m); }
-  function start(again) { calls.push('start:' + !!again); }
+  function start(again, keepJoin) { calls.push('start:' + !!again + ':' + !!keepJoin); }
   function queueOutputPicker(id) { calls.push('queueOutputPicker:' + id); }
   function nowMs() { return clock; }
 `;
@@ -74,7 +74,7 @@ const epilogue = `
     clearReconfigWatchdog, withJoin, releaseJoin,
     setJoinId: (v) => { currentJoinId = v || ''; },
     joinId: () => currentJoinId,
-    state: () => ({ reconfigPoll, reconfigEpoch, kickEpoch, reconfiguring, kicked, isLive, refusedStreak, lastOfferedSinkId }),
+    state: () => ({ reconfigPoll, reconfigEpoch, kickEpoch, reconfiguring, kicked, isLive, refusedStreak, lastOfferedSinkId, appliedSinkId }),
     setLive: (v) => { isLive = v; },
     setDegraded: (v) => { degraded = v; },
     setReconfiguring: (v) => { reconfiguring = v; },
@@ -85,6 +85,7 @@ const epilogue = `
 const source = [
   prelude,
   takeConst('lastOfferedSinkId'),
+  takeConst('appliedSinkId'),
   takeConst('PROBE_OK_MS'),
   takeConst('PROBE_FAST_MS'),
   takeConst('REFUSED_MS'),
@@ -175,7 +176,7 @@ response = json({ epoch: 7, kick: 3 });
 await api.startReconfigPoll();
 eq('the first read adopts the reconfig epoch', api.state().reconfigEpoch, 7);
 eq('and the kick epoch', api.state().kickEpoch, 3);
-if (!calls.includes('teardownSession')) ok('adopting the epochs does not tear the session down');
+if (!calls.some((c) => c.startsWith('start:'))) ok('adopting the epochs does not tear the session down');
 else fail('the first /reconfig read rebuilt the session');
 if (api.state().reconfigPoll) ok('the poll is armed after the first read');
 else fail('no poll timer was armed');
@@ -190,14 +191,21 @@ else fail('an unchanged epoch ran ' + calls.join(', '));
 calls.length = 0;
 api.applyReconfig({ epoch: 8, kick: 3 });
 eq('the new epoch is adopted', api.state().reconfigEpoch, 8);
-if (calls.includes('teardownSession') && calls.includes('start:true')) ok('a bumped epoch tears down and restarts the session');
+// `start(true, true)` and not `start(true)`: the second argument is the whole fix for the
+// owner's report. A reconfigure is the same session offering again, so the page presents the
+// join id it already holds, the host keeps that session and its virtual display, and the
+// dashboard never sees a leave followed by a join. Releasing it instead is what made a
+// settings change read as a disconnect.
+if (calls.includes('start:true:true')) ok('a bumped epoch renegotiates on the same join');
 else fail('a bumped epoch ran ' + calls.join(', '));
+if (!calls.includes('teardownSession:false')) ok('and never tears the join down on the way');
+else fail('a reconfigure released its join: ' + calls.join(', '));
 if (api.state().reconfiguring) ok('the page is marked reconfiguring so every recovery path stands down');
 else fail('reconfiguring was not set');
 
 calls.length = 0;
 api.applyReconfig({ epoch: 9, kick: 3 });
-if (!calls.includes('start:true')) ok('a second bump while already reconfiguring does not start a second session');
+if (!calls.some((c) => c.startsWith('start:'))) ok('a second bump while already reconfiguring does not start a second session');
 else fail('a concurrent bump started an overlapping session');
 
 // ── 4. a rebuild that never completes is not left frozen ─────────────────────────────────
@@ -215,11 +223,11 @@ else fail('reconfiguring was still set after the watchdog');
 // ── 5. a bumped kick epoch removes the device and stops everything ───────────────────────
 calls.length = 0;
 api.applyReconfig({ epoch: 9, kick: 4 });
-if (calls.includes('teardownSession') && calls.some((c) => c.startsWith('showError'))) ok('a bumped kick epoch tears the session down and says why');
+if (calls.includes('teardownSession:false') && calls.some((c) => c.startsWith('showError'))) ok('a bumped kick epoch tears the session down and says why');
 else fail('a kick ran ' + calls.join(', '));
 eq('the device is marked kicked', api.state().kicked, true);
 eq('and no longer live', api.state().isLive, false);
-if (!calls.includes('start:true')) ok('a kick does not also try to reconnect');
+if (!calls.some((c) => c.startsWith('start:'))) ok('a kick does not also try to reconnect');
 else fail('a kick restarted the session');
 
 calls.length = 0;
@@ -298,8 +306,9 @@ else fail('a kicked page still ran ' + calls.join(', '));
   const p = makePoller();
   const calls = p.calls;
   sinkResult = false;
-  for (let i = 0; i < 10; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-A' });
-  await settle();
+  // Ten polls a second apart, so each refusal has settled before the next one arrives — the
+  // refusal clears the applied latch, so the request is retried rather than treated as done.
+  for (let i = 0; i < 10; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-A' }); await settle(); }
   const offers = calls.filter((c) => c === 'queueOutputPicker:sink-A');
   eq('ten ticks of the same refused sink offer the picker once', offers.length, 1);
   eq('and every tick still tries to apply it', calls.filter((c) => c === 'setSpeaker:sink-A').length, 10);
@@ -307,8 +316,7 @@ else fail('a kicked page still ran ' + calls.join(', '));
 
   // A different sink is a different request and gets its own single offer.
   calls.length = 0;
-  for (let i = 0; i < 5; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-B' });
-  await settle();
+  for (let i = 0; i < 5; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-B' }); await settle(); }
   eq('a new sink the host asks for is offered once', calls.filter((c) => c === 'queueOutputPicker:sink-B').length, 1);
 }
 
@@ -317,11 +325,22 @@ else fail('a kicked page still ran ' + calls.join(', '));
   const p = makePoller();
   const calls = p.calls;
   sinkResult = true;
-  for (let i = 0; i < 5; i++) p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-C' });
-  await settle();
+  for (let i = 0; i < 5; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-C' }); await settle(); }
   if (!calls.some((c) => c.startsWith('queueOutputPicker'))) ok('a sink that applies is never answered with a picker');
   else fail('a working sink change opened a picker: ' + calls.join(', '));
   eq('and the latch is untouched', p.state().lastOfferedSinkId, null);
+  // Class (c) is applied on change, not on every poll: `audioSink` is in *every* `/reconfig`
+  // body, so without the diff this commanded the audio graph about once a second forever.
+  eq('a sink that has not moved is commanded once, not once a poll', calls.filter((c) => c === 'setSpeaker:sink-C').length, 1);
+  eq('and the applied latch names it', p.state().appliedSinkId, 'sink-C');
+
+  // Class (c) never renegotiates: a sink change on its own leaves the epoch alone, so nothing
+  // above it in `applyReconfig` fires.
+  calls.length = 0;
+  p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-D' });
+  await settle();
+  if (!calls.some((c) => c.startsWith('start:'))) ok('changing the output device renegotiates nothing');
+  else fail('an audio-output change rebuilt the session: ' + calls.join(', '));
 }
 
 // ── 11. `null` is "not yet", not a refusal ───────────────────────────────────────────────

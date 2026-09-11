@@ -44,7 +44,7 @@ use super::protocol::{
     SRC_TOUCH,
 };
 use super::scancode::code_to_scancode;
-use super::{ClientProfile, DisplayRect, PointerScope};
+use super::{ClientProfile, DisplayRect, PointerScope, SharedLiveInput};
 
 pub const NAME: &str = "windows-sendinput+syntheticpointer";
 
@@ -139,8 +139,10 @@ pub struct Injector {
     /// accumulate `MOUSEEVENTF_MOVE` for us, but then it applies its own pointer ballistics on
     /// top of the curve the client already applied, and there is no position to clamp.
     rel_pos: Option<POINT>,
-    /// What that clamp is against: this session's own display, or the whole desktop.
-    pointer_scope: PointerScope,
+    /// The two settings the user can move under a live session: whether remote control is on
+    /// at all, and what a pointer-locked cursor is clamped against. Shared with the command that
+    /// writes them, so a change reaches the next event rather than the next join.
+    live: SharedLiveInput,
     scratch: Vec<INPUT>,
     touch_scratch: Vec<POINTER_TYPE_INFO>,
 }
@@ -149,9 +151,7 @@ impl Injector {
     pub fn new(client: ClientProfile) -> Self {
         // The scancode table is layout-neutral, so nothing here depends on the client platform.
         let ClientProfile {
-            device_name,
-            pointer_scope,
-            ..
+            device_name, live, ..
         } = client;
         let pen_dev = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) }
             .map_err(|e| teprintln!("synthetic pen device unavailable, degrading pen→mouse: {e}"))
@@ -179,7 +179,7 @@ impl Injector {
             // cursor already was.
             mouse_relative: false,
             rel_pos: None,
-            pointer_scope,
+            live,
             scratch: Vec::with_capacity(16),
             touch_scratch: Vec::with_capacity(MAX_TOUCH_COUNT as usize),
         }
@@ -387,7 +387,7 @@ impl Injector {
     /// display rect is only known once `refresh_geometry` has resolved the device name, so an
     /// unresolved target falls back to the desktop rather than trapping the cursor in a guess.
     fn pointer_bounds(&self) -> DisplayRect {
-        match (self.pointer_scope, self.target) {
+        match (self.live.pointer_scope(), self.target) {
             (PointerScope::Display, Some(r)) => r,
             _ => DisplayRect {
                 left: self.virt.left,
@@ -1183,10 +1183,10 @@ mod tests {
         let mut inj = Injector::new(ClientProfile::default());
         inj.target = Some(target);
 
-        inj.pointer_scope = PointerScope::Display;
+        inj.live.set_pointer_scope(PointerScope::Display);
         assert_eq!(inj.pointer_bounds(), target);
 
-        inj.pointer_scope = PointerScope::All;
+        inj.live.set_pointer_scope(PointerScope::All);
         let desktop = inj.pointer_bounds();
         assert_eq!(desktop.left, inj.virt.left);
         assert_eq!(desktop.width, inj.virt.width as u32);
@@ -1198,7 +1198,7 @@ mod tests {
         // The device name has not resolved to a monitor yet. Falling back to the desktop is
         // the only honest answer: the alternative is trapping the cursor inside a guess.
         inj.target = None;
-        inj.pointer_scope = PointerScope::Display;
+        inj.live.set_pointer_scope(PointerScope::Display);
         assert_eq!(inj.pointer_bounds(), desktop);
     }
 

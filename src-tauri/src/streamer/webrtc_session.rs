@@ -197,10 +197,10 @@ pub struct InputParams {
     /// The `os` string the client reported at join, which decides the modifier layout on a
     /// macOS host. Empty when the client did not say.
     pub client_os: String,
-    pub control_enabled: bool,
-    /// How far a pointer-locked client may drive the cursor. Read from the device override at
-    /// join, like `control_enabled`, so a change applies to the next connection.
-    pub pointer_scope: input::PointerScope,
+    /// Whether remote control is on, and how far a pointer-locked client may drive the cursor.
+    /// Both are read per event rather than captured here, so the desktop UI can turn control off
+    /// under a live session without anything renegotiating.
+    pub live: input::SharedLiveInput,
     pub control_rx: Option<session::ControlReceiver>,
 }
 
@@ -1114,14 +1114,13 @@ pub async fn activate_whep(
     let InputParams {
         device: input_device,
         client_os,
-        control_enabled,
-        pointer_scope,
+        live: live_input,
         control_rx,
     } = input;
     let client = input::ClientProfile {
         device_name: input_device,
         platform: input::ClientPlatform::from_reported(&client_os),
-        pointer_scope,
+        live: std::sync::Arc::clone(&live_input),
     };
     let (input_tx, input_join) = input::spawn(client, Arc::clone(&pipeline.telemetry));
     {
@@ -1129,9 +1128,11 @@ pub async fn activate_whep(
         let control_rx = Arc::new(Mutex::new(control_rx));
         let session_telemetry = Arc::clone(&pipeline.telemetry);
         let keyframes_dc = keyframes.clone();
+        let live_for_dc = Arc::clone(&live_input);
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let session_telemetry = Arc::clone(&session_telemetry);
             let keyframes_dc = keyframes_dc.clone();
+            let live_for_dc = Arc::clone(&live_for_dc);
             let label = dc.label().to_string();
             if !matches!(label.as_str(), "fast" | "reliable" | "bulk") {
                 return Box::pin(async {});
@@ -1190,6 +1191,8 @@ pub async fn activate_whep(
                     pong_tx
                 });
                 dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    // Read per message, never captured: turning remote control off is a
+                    // class-(b) edit and must not cost the session a renegotiation.
                     let parsed = match input::protocol::parse(&msg.data) {
                         Ok(parsed) => parsed,
                         Err(e) => {
@@ -1246,7 +1249,7 @@ pub async fn activate_whep(
                                 idr_keyframes.request_keyframe_for_client_quietly();
                             }
                         }
-                        ev if control_enabled => {
+                        ev if live_for_dc.control_enabled() => {
                             tx.route(ev, parsed.fast, parsed.client_ns, parsed.seq)
                         }
                         _ => {}
