@@ -364,9 +364,17 @@
                 }
             }
 
+            // The link went away and the page is offering to reconnect. That is not a departure,
+            // so the join is kept: the host holds the display behind its disconnect grace, the
+            // dashboard row stays where it is, and pressing Connect continues the same session on
+            // the same display with the windows still on it. Beaconing `/leave` here is what made
+            // a settings change that took too long read as "device left, device joined" — a row
+            // that vanished and came back, two notifications, a second display and every window
+            // shuffled onto the primary monitor. Only a page that is actually going away
+            // (`pagehide`) or a session the host has ended (`kickDevice`) releases the join.
             function linkLost(msg) {
                 if (kicked) return;
-                teardownSession();
+                teardownSession(true);
                 usingFallback = false;
                 showLinkStatus('');
                 showError(msg);
@@ -1722,8 +1730,11 @@
             // joined", and every window the user had on that display was shuffled back onto the
             // primary monitor before a brand-new display appeared.
             //
-            // Without `keepJoin` this is a departure: the host takes the display down now
-            // rather than after the disconnect grace, which is what a kick and a lost link want.
+            // Without `keepJoin` this is a departure: the host takes the display down now rather
+            // than after the disconnect grace. Only two things want that — the page going away
+            // (`pagehide`) and a session the host has already ended (`kickDevice`). A lost link
+            // is not one of them: the page is still open and still offering to reconnect, and the
+            // grace is precisely the mechanism for that.
             function teardownSession(keepJoin) {
                 startGen++;
                 if (!keepJoin) releaseJoin();
@@ -2681,9 +2692,14 @@
                 });
             }
 
+            // `true`, so a reconnect after a lost link presents the join this tab still holds
+            // rather than asking for a second display beside the one the host is keeping for it.
+            // It is the empty string on a first join, on a reload (`releaseStaleJoin`) and after
+            // a kick, so those are new joins exactly as before — and an id naming a session this
+            // host does not have, or one belonging to another device, is a new join too.
             function beginStreaming() {
                 if (location.protocol === 'http:' && !canWebCodecs) offerHttpsUpgrade();
-                else start(true);
+                else start(true, true);
             }
 
             let httpsUpgradeOffered = false;

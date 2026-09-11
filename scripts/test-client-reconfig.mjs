@@ -404,6 +404,53 @@ sinkResult = true;
     '11111111222222223333333344444444');
 }
 
+// ── 12. a link that may come back keeps the session ─────────────────────────────────────
+// The owner's report was "when display changes are made, the connected device disappears from
+// my device list, then it reappears". A reconfigure that takes longer than the rebuild deadline
+// ends in `linkLost`, and `linkLost` used to release the join — so the host was told the device
+// had *left*, took the display down, raised `DeviceRemove`, and the reconnect that followed was
+// a brand-new session with a brand-new display and every window shuffled back onto the primary
+// monitor. Only a page that is going away or one the host has kicked releases a join; a lost
+// link is what the disconnect grace exists for.
+{
+  const calls = [];
+  const ctx = vm.createContext({ calls, console });
+  vm.runInContext(
+    [
+      'let kicked = false; let usingFallback = true;',
+      'function teardownSession(keepJoin) { calls.push("teardownSession:" + !!keepJoin); }',
+      'function showLinkStatus(s) { calls.push("showLinkStatus"); }',
+      'function showError(m) { calls.push("showError:" + m); }',
+      'function start(again, keepJoin) { calls.push("start:" + !!again + ":" + !!keepJoin); }',
+      'function offerHttpsUpgrade() { calls.push("offerHttpsUpgrade"); }',
+      'function stopLock() { calls.push("stopLock"); }',
+      'let isLive = true; let canWebCodecs = true;',
+      'const location = { protocol: "https:" };',
+      takeFunction('linkLost'),
+      takeFunction('beginStreaming'),
+      takeFunction('kickDevice'),
+      'this.api = { linkLost, beginStreaming, kickDevice };',
+    ].join('\n'),
+    ctx
+  );
+
+  ctx.api.linkLost('Disconnected, reconnect to continue.');
+  if (calls.includes('teardownSession:true')) ok('a lost link keeps the join the host is holding a display for');
+  else fail('a lost link ran ' + calls.join(', '));
+  if (!calls.includes('teardownSession:false')) ok('and never beacons a departure the page did not mean');
+  else fail('a lost link released the join');
+
+  calls.length = 0;
+  ctx.api.beginStreaming();
+  if (calls.includes('start:true:true')) ok('reconnecting presents the join this tab still holds');
+  else fail('the reconnect ran ' + calls.join(', '));
+
+  calls.length = 0;
+  ctx.api.kickDevice();
+  if (calls.includes('teardownSession:false')) ok('a kick still releases the join, because the host has already ended it');
+  else fail('a kick ran ' + calls.join(', '));
+}
+
 if (failures) {
   console.log('\n' + failures + ' reconfig assertion(s) failed');
   process.exitCode = 1;
