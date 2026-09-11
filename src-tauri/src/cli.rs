@@ -832,49 +832,413 @@ mod desktop {
         Some(crate::streamer::session::parse_stun_urls(&raw))
     }
 
-    fn get_nested(store: &Cfg, key: &str) -> Option<Value> {
+    // the declared shape of config.json
+    //
+    // The container half of `src/lib/config-schema.ts`, and deliberately only that half: types,
+    // no ranges and no enums. The host clamps every value again on its own side, so a second
+    // copy of the ranges would be a second thing to drift; a container type is the one thing a
+    // reader cannot absorb, because an object where an array belongs is not iterable and a
+    // string where an object belongs cannot be indexed.
+    //
+    // `scripts/test-config-editor.mjs` parses the tables below straight out of this file and
+    // asserts them against `configJsonSchema`, so the two cannot disagree about what is an
+    // array. Keep the `const NAME: &Shape = …` / `const NAME_FIELDS: &[(&str, &Shape)] = …`
+    // form — that parser is a regex, not a Rust compiler.
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Shape {
+        Str,
+        Int,
+        Num,
+        Bool,
+        Object(&'static [(&'static str, &'static Shape)]),
+        Array(&'static Shape),
+    }
+
+    const STR: &Shape = &Shape::Str;
+    const INT: &Shape = &Shape::Int;
+    const NUM: &Shape = &Shape::Num;
+    const BOOL: &Shape = &Shape::Bool;
+
+    const DEVICE_FIELDS: &[(&str, &Shape)] = &[
+        ("ip", STR),
+        ("token", STR),
+        ("name", STR),
+        ("scale", INT),
+        ("orientation", STR),
+        ("refreshRate", INT),
+        ("videoScale", INT),
+        ("videoQuality", INT),
+        ("remoteControl", BOOL),
+        ("pointerScope", STR),
+        ("autoFrameRate", BOOL),
+        ("systemAudio", BOOL),
+        ("audioOutputDeviceId", STR),
+        ("audioOutputDeviceLabel", STR),
+        ("os", STR),
+        ("screenSize", STR),
+        ("dpr", NUM),
+        ("maxDpr", NUM),
+    ];
+    const DEVICE: &Shape = &Shape::Object(DEVICE_FIELDS);
+    const DEVICES: &Shape = &Shape::Array(DEVICE);
+
+    const KNOWN_DEVICE_FIELDS: &[(&str, &Shape)] = &[
+        ("token", STR),
+        ("ip", STR),
+        ("name", STR),
+        ("os", STR),
+        ("screenSize", STR),
+        ("lastSeen", INT),
+        ("banned", BOOL),
+    ];
+    const KNOWN_DEVICE: &Shape = &Shape::Object(KNOWN_DEVICE_FIELDS);
+    const KNOWN_DEVICES: &Shape = &Shape::Array(KNOWN_DEVICE);
+
+    const SERVER_PORTS_FIELDS: &[(&str, &Shape)] = &[("http", INT), ("https", INT)];
+    const SERVER_PORTS: &Shape = &Shape::Object(SERVER_PORTS_FIELDS);
+
+    const HOSTED_NETWORK_FIELDS: &[(&str, &Shape)] = &[("name", STR), ("password", STR)];
+    const HOSTED_NETWORK: &Shape = &Shape::Object(HOSTED_NETWORK_FIELDS);
+
+    const TURN_CONFIG_FIELDS: &[(&str, &Shape)] =
+        &[("urls", STR), ("username", STR), ("credential", STR)];
+    const TURN_CONFIG: &Shape = &Shape::Object(TURN_CONFIG_FIELDS);
+
+    const DONT_SHOW_AGAIN_FIELDS: &[(&str, &Shape)] = &[
+        ("editDevice", BOOL),
+        ("editNetwork", BOOL),
+        ("compatibility", BOOL),
+        ("configEditor", BOOL),
+    ];
+    const DONT_SHOW_AGAIN: &Shape = &Shape::Object(DONT_SHOW_AGAIN_FIELDS);
+
+    const DRIVER_REPAIR_FIELDS: &[(&str, &Shape)] = &[
+        ("boot", STR),
+        ("install", INT),
+        ("reinstall", INT),
+        ("relaunch", INT),
+    ];
+    const DRIVER_REPAIR: &Shape = &Shape::Object(DRIVER_REPAIR_FIELDS);
+
+    const CONFIG_FIELDS: &[(&str, &Shape)] = &[
+        ("name", STR),
+        ("theme", STR),
+        ("devices", DEVICES),
+        ("knownDevices", KNOWN_DEVICES),
+        ("sessionPassword", STR),
+        ("publicSessionsEnabled", BOOL),
+        ("zoomFactor", NUM),
+        ("disableGpuEncode", BOOL),
+        ("legacyVolumeKeyProxy", BOOL),
+        ("walkthroughCompleted", BOOL),
+        ("disconnectGraceSecs", INT),
+        ("serverPorts", SERVER_PORTS),
+        ("hostedNetworkCredentials", HOSTED_NETWORK),
+        ("turnConfig", TURN_CONFIG),
+        ("stunUrls", STR),
+        ("dontShowAgain", DONT_SHOW_AGAIN),
+        ("driverRepair", DRIVER_REPAIR),
+    ];
+    const CONFIG: &Shape = &Shape::Object(CONFIG_FIELDS);
+
+    fn config_shape() -> &'static Shape {
+        CONFIG
+    }
+
+    impl Shape {
+        fn field(&'static self, name: &str) -> Option<&'static Shape> {
+            match self {
+                Shape::Object(fields) => fields
+                    .iter()
+                    .find(|(field, _)| *field == name)
+                    .map(|(_, shape)| *shape),
+                _ => None,
+            }
+        }
+
+        fn accepts(&self, value: &Value) -> bool {
+            match self {
+                Shape::Str => value.is_string(),
+                // A whole-number float is still an integer to every reader here; JSON does not
+                // distinguish them and `serde_json` parses `30` and `30.0` differently.
+                Shape::Int => value.as_f64().is_some_and(|n| n.fract() == 0.0),
+                Shape::Num => value.is_number(),
+                Shape::Bool => value.is_boolean(),
+                Shape::Object(_) => value.is_object(),
+                Shape::Array(_) => value.is_array(),
+            }
+        }
+
+        fn article(&self) -> &'static str {
+            match self {
+                Shape::Str => "a string",
+                Shape::Int => "a whole number",
+                Shape::Num => "a number",
+                Shape::Bool => "true or false",
+                Shape::Object(_) => "an object",
+                Shape::Array(_) => "an array",
+            }
+        }
+
+        /// Every place `value` disagrees with this shape, as one `[migrate]`-style sentence per
+        /// problem. Used by the host's replay to say out loud what it is ignoring, and by the
+        /// tests to pin the wording.
+        fn faults(&'static self, value: &Value, label: &str, out: &mut Vec<String>) {
+            if !self.accepts(value) {
+                out.push(format!(
+                    "{label} is not {} ({}); ignoring it",
+                    self.article(),
+                    describe(value)
+                ));
+                return;
+            }
+            match self {
+                Shape::Array(item) => {
+                    if let Value::Array(items) = value {
+                        for (i, entry) in items.iter().enumerate() {
+                            item.faults(entry, &format!("{label}[{i}]"), out);
+                        }
+                    }
+                }
+                Shape::Object(fields) => {
+                    if let Value::Object(map) = value {
+                        for (name, shape) in fields.iter() {
+                            if let Some(child) = map.get(*name) {
+                                shape.faults(child, &format!("{label}.{name}"), out);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// What a JSON value *is*, in the words the `[migrate]` lines use on both sides.
+    fn describe(value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(_) => "a boolean".to_string(),
+            Value::Number(_) => "a number".to_string(),
+            Value::String(_) => "a string".to_string(),
+            Value::Array(items) => format!("an array of {}", items.len()),
+            Value::Object(map) => format!(
+                "an object with {} key{}",
+                map.len(),
+                if map.len() == 1 { "" } else { "s" }
+            ),
+        }
+    }
+
+    /// Walk a dotted path through a snapshot of the store.
+    ///
+    /// A numeric segment indexes an array, because `Value::get("0")` on an array is `None` and
+    /// `config get devices.0.refreshRate` used to answer "key not found" about a row that was
+    /// plainly there — the write half indexes arrays, so the read half has to. Anything whose
+    /// container type does not match the path is simply not there: no error, no panic.
+    fn dig(saved: &Saved, key: &str) -> Option<Value> {
         let mut parts = key.split('.');
         let head = parts.next()?;
-        let mut cur = store.get(head)?;
+        let mut cur = saved.get(head)?.clone();
         for part in parts {
-            cur = cur.get(part)?.clone();
+            cur = match (&cur, part.parse::<usize>()) {
+                (Value::Array(items), Ok(index)) => items.get(index)?.clone(),
+                _ => cur.get(part)?.clone(),
+            };
         }
         Some(cur)
     }
 
-    fn set_nested(store: &Cfg, key: &str, value: Value) {
-        match key.split_once('.') {
-            Some((head, rest)) => {
-                let mut root = store
-                    .get(head)
-                    .unwrap_or_else(|| Value::Object(Default::default()));
-                if !root.is_object() {
-                    root = Value::Object(Default::default());
-                }
-                set_path(&mut root, rest, value);
-                store.set(head, root);
-            }
-            None => store.set(key, value),
-        }
+    fn get_nested(store: &Cfg, key: &str) -> Option<Value> {
+        let head = key.split('.').next()?;
+        let mut one = Saved::new();
+        one.insert(head.to_string(), store.get(head)?);
+        dig(&one, key)
     }
 
-    fn set_path(node: &mut Value, path: &str, value: Value) {
-        match path.split_once('.') {
-            Some((head, rest)) => {
-                let obj = node.as_object_mut().expect("object node");
-                let child = obj
-                    .entry(head.to_string())
-                    .or_insert_with(|| Value::Object(Default::default()));
-                if !child.is_object() {
-                    *child = Value::Object(Default::default());
+    /// Write one dotted key, or refuse and change nothing.
+    ///
+    /// The refusals are the point. `config.json` is written by three parties — the desktop UI,
+    /// this CLI and whichever version of the app last ran — and read by all of them plus
+    /// `serve`. A write that changes a key's **container type** is the one edit no reader can
+    /// absorb: `devices` became `{"0": {"refreshRate": 30}}`, and the bootstrap's
+    /// `for (const d of config.devices ?? [])` threw `object is not iterable`, which the startup
+    /// path then reported to the owner as a missing display driver.
+    ///
+    /// The shape came from here. The old `set_path` created an *object* for every missing
+    /// segment, numeric or not, so `config set devices.0.refreshRate 30` on a store whose
+    /// `devices` key was absent wrote exactly that. Now a numeric segment under an array is an
+    /// index, a segment that would change a container's type is refused, and the value itself
+    /// has to match the type the schema declares.
+    fn set_nested(store: &Cfg, key: &str, value: Value) -> Result<(), String> {
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            return Err(format!("`{key}` has an empty path segment"));
+        }
+        let head = parts[0];
+        let root = plan_set(store.get(head), &parts, value)?;
+        store.set(head, root);
+        Ok(())
+    }
+
+    /// The pure half of [`set_nested`]: given whatever the store currently holds for `path[0]`,
+    /// produce what it should hold afterwards, or say why the write is refused. Split out so the
+    /// index and refusal semantics are testable without a `Store`, an `AppHandle` or a file.
+    fn plan_set(existing: Option<Value>, path: &[&str], value: Value) -> Result<Value, String> {
+        let head = path[0];
+        place(
+            existing,
+            config_shape().field(head),
+            &path[1..],
+            head.to_string(),
+            value,
+        )
+    }
+
+    fn place(
+        node: Option<Value>,
+        shape: Option<&'static Shape>,
+        rest: &[&str],
+        label: String,
+        value: Value,
+    ) -> Result<Value, String> {
+        let Some((segment, tail)) = rest.split_first() else {
+            if let Some(shape) = shape {
+                if !shape.accepts(&value) {
+                    return Err(format!(
+                        "{label} is {}; refusing to write {}",
+                        shape.article(),
+                        describe(&value)
+                    ));
                 }
-                set_path(child, rest, value);
             }
-            None => {
-                node.as_object_mut()
-                    .expect("object node")
-                    .insert(path.to_string(), value);
+            return Ok(value);
+        };
+
+        match shape {
+            Some(Shape::Array(item)) => {
+                let mut items = match node {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Array(items)) => items,
+                    Some(other) => {
+                        return Err(format!(
+                            "{label} is an array, but the config holds {} there; refusing to \
+                             change its type. Clear it first with `ScreenExtend config set \
+                             {label} []`.",
+                            describe(&other)
+                        ))
+                    }
+                };
+                let Ok(index) = segment.parse::<usize>() else {
+                    return Err(format!(
+                        "{label} is an array, so `{segment}` is not a key in it — the next part \
+                         of the path has to be a row number (0 … {}).",
+                        items.len()
+                    ));
+                };
+                if index > items.len() {
+                    return Err(format!(
+                        "{label}[{index}] is past the end of {label}, which holds {} row(s); the \
+                         next free row is {}. An array with a hole in it is not valid JSON \
+                         config.",
+                        items.len(),
+                        items.len()
+                    ));
+                }
+                let current = items.get(index).cloned();
+                let child = place(
+                    current,
+                    Some(item),
+                    tail,
+                    format!("{label}[{index}]"),
+                    value,
+                )?;
+                if index == items.len() {
+                    items.push(child);
+                } else {
+                    items[index] = child;
+                }
+                Ok(Value::Array(items))
             }
+            Some(Shape::Object(fields)) => {
+                let mut map = match node {
+                    None | Some(Value::Null) => serde_json::Map::new(),
+                    Some(Value::Object(map)) => map,
+                    Some(other) => {
+                        return Err(format!(
+                            "{label} is an object, but the config holds {} there; refusing to \
+                             change its type.",
+                            describe(&other)
+                        ))
+                    }
+                };
+                let child_shape = fields
+                    .iter()
+                    .find(|(name, _)| name == segment)
+                    .map(|(_, shape)| *shape);
+                let child = place(
+                    map.get(*segment).cloned(),
+                    child_shape,
+                    tail,
+                    format!("{label}.{segment}"),
+                    value,
+                )?;
+                map.insert((*segment).to_string(), child);
+                Ok(Value::Object(map))
+            }
+            Some(scalar) => Err(format!(
+                "{label} is {}, so `{label}.{segment}` names nothing.",
+                scalar.article()
+            )),
+            // A key the table does not describe. Unknown keys are inert — `readStore` drops
+            // anything not in `defaultConfig` and the editor reports it as a warning — so the
+            // write is allowed, but it still must not turn an array into an object underneath
+            // itself, which is the defect this whole path exists to prevent.
+            None => match node {
+                Some(Value::Array(mut items)) => {
+                    let Ok(index) = segment.parse::<usize>() else {
+                        return Err(format!(
+                            "{label} holds an array, so `{segment}` is not a key in it."
+                        ));
+                    };
+                    if index > items.len() {
+                        return Err(format!(
+                            "{label}[{index}] is past the end of {label}, which holds {} row(s).",
+                            items.len()
+                        ));
+                    }
+                    let current = items.get(index).cloned();
+                    let child = place(current, None, tail, format!("{label}[{index}]"), value)?;
+                    if index == items.len() {
+                        items.push(child);
+                    } else {
+                        items[index] = child;
+                    }
+                    Ok(Value::Array(items))
+                }
+                Some(Value::Object(mut map)) => {
+                    let child = place(
+                        map.get(*segment).cloned(),
+                        None,
+                        tail,
+                        format!("{label}.{segment}"),
+                        value,
+                    )?;
+                    map.insert((*segment).to_string(), child);
+                    Ok(Value::Object(map))
+                }
+                None | Some(Value::Null) => {
+                    let mut map = serde_json::Map::new();
+                    let child = place(None, None, tail, format!("{label}.{segment}"), value)?;
+                    map.insert((*segment).to_string(), child);
+                    Ok(Value::Object(map))
+                }
+                Some(other) => Err(format!(
+                    "{label} holds {}, so `{label}.{segment}` names nothing.",
+                    describe(&other)
+                )),
+            },
         }
     }
 
@@ -1573,20 +1937,87 @@ mod desktop {
     /// made by `devices set` / `turn set` / `config set` from another shell reaches a host that
     /// is already streaming. Server ports and the encoder choice are deliberately absent: they
     /// are read once when the servers and pipelines are built.
+    /// Say out loud every saved value whose container type is not the one the config declares.
+    ///
+    /// Every reader below already survives a malformed value — `cfg_str`, `cfg_u64`, `cfg_bool`
+    /// and the two `Value::Array` matches all fall back to the default — but they did it in
+    /// silence, so a host that had quietly dropped the whole `devices` array looked exactly like
+    /// one that had none. One line per problem, in the same `[migrate]` form the desktop UI's
+    /// normaliser uses, so `ScreenExtend logs` reads the same on both sides.
+    fn config_faults(saved: &Saved) -> Vec<String> {
+        let mut faults = Vec::new();
+        for (key, value) in saved {
+            // Unknown keys are inert: `readStore` drops anything not in `defaultConfig` and the
+            // editor reports it as a warning, not an error.
+            if let Some(shape) = config_shape().field(key) {
+                shape.faults(value, key, &mut faults);
+            }
+        }
+        faults
+    }
+
+    /// A snapshot of the whole store, so the replay below is a pure function of plain JSON and
+    /// can be tested without a `Store`, an `AppHandle` or a file on disk.
+    type Saved = serde_json::Map<String, Value>;
+
+    fn saved_str(saved: &Saved, path: &str) -> Option<String> {
+        dig(saved, path).and_then(|v| v.as_str().map(str::to_string))
+    }
+
+    /// The rows of an array-valued key, or nothing at all when it holds something else.
+    ///
+    /// This is the reader half of the rule: a value of the wrong container type is *absent*,
+    /// never an error and never a panic. `config_faults` has already named it in the log by the
+    /// time anything gets here.
+    fn saved_rows<'a>(saved: &'a Saved, key: &str) -> &'a [Value] {
+        match saved.get(key) {
+            Some(Value::Array(rows)) => rows,
+            _ => &[],
+        }
+    }
+
+    /// Everything `apply_saved_config` pushes into `AppState` that is not a device row. A
+    /// malformed value reads as absent, so every *other* key still applies — which is the whole
+    /// requirement: one bad setting may not cost the user the rest of their configuration.
+    #[derive(Debug, PartialEq)]
+    struct SavedGlobals {
+        turn_urls: String,
+        turn_username: String,
+        turn_credential: String,
+        grace_secs: u64,
+        legacy_volume_key_proxy: bool,
+    }
+
+    fn saved_globals(saved: &Saved) -> SavedGlobals {
+        SavedGlobals {
+            turn_urls: saved_str(saved, "turnConfig.urls").unwrap_or_default(),
+            turn_username: saved_str(saved, "turnConfig.username").unwrap_or_default(),
+            turn_credential: saved_str(saved, "turnConfig.credential").unwrap_or_default(),
+            grace_secs: dig(saved, "disconnectGraceSecs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS),
+            legacy_volume_key_proxy: dig(saved, "legacyVolumeKeyProxy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
     fn apply_saved_config(app: &tauri::AppHandle, store: &Cfg) {
+        let saved: Saved = store.entries().into_iter().collect();
+        for fault in config_faults(&saved) {
+            teprintln!("[migrate] {fault}");
+        }
+        let globals = saved_globals(&saved);
         platform::set_turn_config(
             app.state(),
-            cfg_str(store, "turnConfig.urls").unwrap_or_default(),
-            cfg_str(store, "turnConfig.username").unwrap_or_default(),
-            cfg_str(store, "turnConfig.credential").unwrap_or_default(),
+            globals.turn_urls,
+            globals.turn_username,
+            globals.turn_credential,
         );
-        let grace = cfg_u64(store, "disconnectGraceSecs").unwrap_or(DEFAULT_DISCONNECT_GRACE_SECS);
-        platform::set_disconnect_grace(app.state(), grace as u32);
-        platform::set_legacy_volume_key_proxy(
-            cfg_bool(store, "legacyVolumeKeyProxy").unwrap_or(false),
-        );
-        apply_saved_devices(app, store);
-        apply_saved_trust(app, store);
+        platform::set_disconnect_grace(app.state(), globals.grace_secs as u32);
+        platform::set_legacy_volume_key_proxy(globals.legacy_volume_key_proxy);
+        apply_saved_devices(app, &saved);
+        apply_saved_trust(app, &saved);
     }
 
     /// Replay the ban and auto-join sets from `knownDevices[]`.
@@ -1595,14 +2026,8 @@ mod desktop {
     /// a headless host started from the same `config.json` as the GUI is *less* restrictive
     /// than the GUI: every previously banned device is un-banned and can rejoin with the OTP,
     /// and every approved device has to retype it.
-    fn apply_saved_trust(app: &tauri::AppHandle, store: &Cfg) {
-        let Some(known) = get_nested(store, "knownDevices").and_then(|v| match v {
-            Value::Array(a) => Some(a),
-            _ => None,
-        }) else {
-            return;
-        };
-        let entries = parse_saved_trust(&known);
+    fn apply_saved_trust(app: &tauri::AppHandle, saved: &Saved) {
+        let entries = parse_saved_trust(saved_rows(saved, "knownDevices"));
         let banned = entries.iter().filter(|e| e.banned).count();
         let approved = entries.len() - banned;
         for entry in entries {
@@ -1692,14 +2117,8 @@ mod desktop {
         }
     }
 
-    fn apply_saved_devices(app: &tauri::AppHandle, store: &Cfg) {
-        let Some(devices) = get_nested(store, "devices").and_then(|v| match v {
-            Value::Array(a) => Some(a),
-            _ => None,
-        }) else {
-            return;
-        };
-        for d in parse_saved_devices(&devices) {
+    fn apply_saved_devices(app: &tauri::AppHandle, saved: &Saved) {
+        for d in parse_saved_devices(saved_rows(saved, "devices")) {
             // Keyed by the device token. A row saved before tokens existed carries none, and
             // there is nothing to replay it onto until that device joins again and is minted
             // one — replaying it onto an address would be replaying it onto whoever holds that
@@ -2408,6 +2827,27 @@ mod desktop {
         None
     }
 
+    /// The saved `devices[]` rows, or an empty list if the key holds something else.
+    ///
+    /// Saying so on stderr matters more here than anywhere else: `devices set` writes the list
+    /// back, so a `devices` key holding an object is *replaced* by a proper array with one row
+    /// in it. That is the right repair — nothing could read the object anyway — but it must not
+    /// happen quietly, because the rows in it are settings the user thought they had.
+    fn saved_device_rows(store: &Cfg) -> Vec<Value> {
+        match get_nested(store, "devices") {
+            Some(Value::Array(rows)) => rows,
+            Some(other) => {
+                eprintln!(
+                    "warning: devices is not an array ({}); ignoring it. Writing here replaces \
+                     it with a proper array.",
+                    describe(&other)
+                );
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
     fn run_devices(app: &tauri::AppHandle, m: &Matches) -> ! {
         let Some((name, sm)) = sub(m) else {
             eprintln!("usage: ScreenExtend devices <list|set|reset>");
@@ -2416,12 +2856,7 @@ mod desktop {
         let store = open_store(app);
         match name {
             "list" => {
-                let devices = get_nested(&store, "devices")
-                    .and_then(|v| match v {
-                        Value::Array(a) => Some(a),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+                let devices = saved_device_rows(&store);
                 let joins = live_joins(app);
                 if wants_json(sm) {
                     let out = serde_json::json!({
@@ -2485,12 +2920,7 @@ mod desktop {
                     eprintln!("  <device> is a device token (see `devices list`); an IP is accepted and resolved to whichever device is connected from it");
                     exit(2);
                 };
-                let mut existing = get_nested(&store, "devices")
-                    .and_then(|v| match v {
-                        Value::Array(a) => Some(a),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+                let mut existing = saved_device_rows(&store);
                 let Some(token) = resolve_device_key(app, &existing, &key) else {
                     eprintln!(
                         "error: `{key}` names no device. Pass a device token from `devices list`, \
@@ -2559,12 +2989,7 @@ mod desktop {
                     eprintln!("usage: ScreenExtend devices reset <device>");
                     exit(2);
                 };
-                let mut existing = get_nested(&store, "devices")
-                    .and_then(|v| match v {
-                        Value::Array(a) => Some(a),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
+                let mut existing = saved_device_rows(&store);
                 let Some(ip) = resolve_device_key(app, &existing, &key) else {
                     eprintln!("error: `{key}` names no device.");
                     exit(1);
@@ -2790,7 +3215,16 @@ mod desktop {
                 };
                 let parsed = serde_json::from_str::<Value>(&value)
                     .unwrap_or_else(|_| Value::String(value.clone()));
-                set_nested(&store, &key, parsed);
+                // A refusal changes nothing — not the store's in-memory cache and not the file,
+                // because `store.save()` is below this and never runs. `config set
+                // devices.0.refreshRate 30` on a store with no `devices` array is the write that
+                // produced `{"0": {"refreshRate": 30}}` and took the owner's GUI down at
+                // startup; it now says so and exits 2.
+                if let Err(e) = set_nested(&store, &key, parsed) {
+                    eprintln!("error: {e}");
+                    eprintln!("note: nothing was changed.");
+                    exit(2);
+                }
                 if let Err(e) = store.save() {
                     eprintln!("error: failed to save config: {e}");
                     exit(1);
@@ -3534,6 +3968,266 @@ mod desktop {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // ---- config.json's shape: writers may not change a container's type ----
+
+        fn set(existing: Option<Value>, key: &str, value: Value) -> Result<Value, String> {
+            let parts: Vec<&str> = key.split('.').collect();
+            plan_set(existing, &parts, value)
+        }
+
+        /// The write that took the owner's GUI down.
+        ///
+        /// `ScreenExtend config set devices.0.refreshRate 30` on a store whose `devices` key was
+        /// absent produced `"devices": {"0": {"refreshRate": 30}}` — an object where the schema
+        /// says array — because the old `set_path` created an object for every missing segment,
+        /// numeric or not. The bootstrap then did `for (const d of config.devices ?? [])`, threw
+        /// `object is not iterable`, and the startup path reported it as a missing display
+        /// driver. Two things have to hold: the object shape is never produced, and the write
+        /// that used to produce it now lands in the array as row 0.
+        #[test]
+        fn a_numeric_segment_under_an_array_is_an_index_and_never_an_object_key() {
+            let written = set(None, "devices.0.refreshRate", Value::from(30)).unwrap();
+            assert!(
+                written.is_array(),
+                "devices must stay an array, got {written}"
+            );
+            assert_eq!(written, serde_json::json!([{ "refreshRate": 30 }]));
+            // The exact shape that broke startup, for the record.
+            assert_ne!(written, serde_json::json!({ "0": { "refreshRate": 30 } }));
+        }
+
+        /// An index may land on an existing row or append one, and nothing else. An array with a
+        /// hole in it is not something any reader on either side can be given.
+        #[test]
+        fn an_index_past_the_end_is_refused_rather_than_leaving_a_hole() {
+            let one = serde_json::json!([{ "token": "a", "refreshRate": 60 }]);
+
+            let edited = set(Some(one.clone()), "devices.0.refreshRate", Value::from(30)).unwrap();
+            assert_eq!(
+                edited,
+                serde_json::json!([{ "token": "a", "refreshRate": 30 }])
+            );
+
+            let appended =
+                set(Some(one.clone()), "devices.1.refreshRate", Value::from(90)).unwrap();
+            assert_eq!(
+                appended,
+                serde_json::json!([{ "token": "a", "refreshRate": 60 }, { "refreshRate": 90 }])
+            );
+
+            let hole = set(Some(one), "devices.2.refreshRate", Value::from(90)).unwrap_err();
+            assert!(hole.contains("past the end"), "{hole}");
+            assert!(hole.contains("next free row is 1"), "{hole}");
+        }
+
+        /// A path that would turn one container into another is refused, and refused *before*
+        /// anything is written — `set_nested` returns the error and `store.set` never runs.
+        #[test]
+        fn a_write_may_not_change_a_container_type() {
+            let cases: [(Option<Value>, &str, Value, &str); 6] = [
+                // An array cannot be addressed by name...
+                (
+                    Some(serde_json::json!([])),
+                    "devices.first.refreshRate",
+                    Value::from(30),
+                    "not a key in it",
+                ),
+                // ...and cannot be replaced by an object.
+                (None, "devices", serde_json::json!({ "0": {} }), "an array"),
+                // An object cannot be replaced by an array, or by a scalar.
+                (None, "serverPorts", serde_json::json!([8080]), "an object"),
+                (
+                    None,
+                    "serverPorts",
+                    Value::String("8080".into()),
+                    "an object",
+                ),
+                // A scalar has nothing underneath it.
+                (None, "name.first", Value::from(1), "names nothing"),
+                // And a key whose stored value is the wrong container type is not quietly
+                // rebuilt underneath the caller.
+                (
+                    Some(serde_json::json!({ "0": { "refreshRate": 30 } })),
+                    "devices.0.refreshRate",
+                    Value::from(60),
+                    "refusing to change its type",
+                ),
+            ];
+            for (existing, key, value, expected) in cases {
+                let err = set(existing, key, value).unwrap_err();
+                assert!(err.contains(expected), "`{key}` -> {err}");
+            }
+        }
+
+        /// The value itself has to be what the config declares, or `config set` is a way to write
+        /// a document the editor would reject and the app would have to ignore.
+        #[test]
+        fn the_written_value_has_to_match_the_declared_type() {
+            assert!(set(None, "disconnectGraceSecs", Value::String("ten".into())).is_err());
+            assert!(set(None, "publicSessionsEnabled", Value::from(1)).is_err());
+            assert!(set(None, "stunUrls", serde_json::json!([])).is_err());
+            assert!(set(None, "devices.0.remoteControl", Value::from(1)).is_err());
+            assert!(set(None, "devices.0.scale", Value::from(1.5)).is_err());
+
+            // Accepted: the right types, including a whole-number float, which is what
+            // `serde_json` makes of `150.0` and is still an integer to every reader here.
+            assert!(set(None, "disconnectGraceSecs", Value::from(30)).is_ok());
+            assert!(set(None, "devices.0.scale", Value::from(150.0)).is_ok());
+            assert!(set(None, "zoomFactor", Value::from(1.25)).is_ok());
+            assert!(set(None, "turnConfig.urls", Value::String("turn:x".into())).is_ok());
+        }
+
+        /// A key the table does not name is inert — `readStore` drops it and the editor reports
+        /// it as a warning — so writing one is allowed. It still may not break a container.
+        #[test]
+        fn an_unknown_key_is_writable_but_still_cannot_break_a_container() {
+            assert_eq!(
+                set(None, "somethingNew.nested", Value::from(1)).unwrap(),
+                serde_json::json!({ "nested": 1 })
+            );
+            let err = set(
+                Some(serde_json::json!([1, 2])),
+                "somethingNew.nested",
+                Value::from(1),
+            )
+            .unwrap_err();
+            assert!(err.contains("holds an array"), "{err}");
+        }
+
+        // ---- config.json's shape: readers treat a wrong type as absent ----
+
+        /// The owner's file, as it was: `devices` an object, everything else fine. The replay has
+        /// to apply everything else and say one line about what it dropped. A malformed setting
+        /// is not a reason to lose the rest of the configuration, and it is certainly not a
+        /// reason to stop.
+        #[test]
+        fn a_malformed_key_costs_only_itself() {
+            let saved: Saved = serde_json::from_value(serde_json::json!({
+                "devices": { "0": { "refreshRate": 30 } },
+                "knownDevices": "nope",
+                "turnConfig": { "urls": "turn:relay:3478", "username": "u", "credential": "c" },
+                "disconnectGraceSecs": 45,
+                "legacyVolumeKeyProxy": true,
+            }))
+            .unwrap();
+
+            assert_eq!(
+                saved_globals(&saved),
+                SavedGlobals {
+                    turn_urls: "turn:relay:3478".into(),
+                    turn_username: "u".into(),
+                    turn_credential: "c".into(),
+                    grace_secs: 45,
+                    legacy_volume_key_proxy: true,
+                }
+            );
+            assert!(saved_rows(&saved, "devices").is_empty());
+            assert!(saved_rows(&saved, "knownDevices").is_empty());
+
+            let faults = config_faults(&saved);
+            assert!(
+                faults.contains(
+                    &"devices is not an array (an object with 1 key); ignoring it".to_string()
+                ),
+                "{faults:?}"
+            );
+            assert!(
+                faults
+                    .contains(&"knownDevices is not an array (a string); ignoring it".to_string()),
+                "{faults:?}"
+            );
+            assert_eq!(faults.len(), 2, "{faults:?}");
+        }
+
+        /// Every shape of wrongness, one key at a time, and the defaults that stand in for them.
+        #[test]
+        fn every_malformed_global_falls_back_to_its_default() {
+            let bad = |patch: Value| -> SavedGlobals {
+                saved_globals(&serde_json::from_value(patch).unwrap())
+            };
+            let defaults = SavedGlobals {
+                turn_urls: String::new(),
+                turn_username: String::new(),
+                turn_credential: String::new(),
+                grace_secs: DEFAULT_DISCONNECT_GRACE_SECS,
+                legacy_volume_key_proxy: false,
+            };
+            for patch in [
+                serde_json::json!({}),
+                serde_json::json!({ "turnConfig": [], "disconnectGraceSecs": "45", "legacyVolumeKeyProxy": "yes" }),
+                serde_json::json!({ "turnConfig": null, "disconnectGraceSecs": null, "legacyVolumeKeyProxy": null }),
+                serde_json::json!({ "turnConfig": "turn:x", "disconnectGraceSecs": -1, "legacyVolumeKeyProxy": 1 }),
+            ] {
+                assert_eq!(bad(patch.clone()), defaults, "{patch}");
+            }
+        }
+
+        /// A row of the wrong type inside a well-formed array is named individually, and the
+        /// rows around it still parse. Losing one device's settings is not losing them all.
+        #[test]
+        fn a_bad_row_is_named_and_the_rows_around_it_survive() {
+            let saved: Saved = serde_json::from_value(serde_json::json!({
+                "devices": [
+                    { "token": "a", "refreshRate": 30 },
+                    "not a device",
+                    { "token": "b", "scale": "big" },
+                ],
+            }))
+            .unwrap();
+            let faults = config_faults(&saved);
+            assert_eq!(
+                faults,
+                vec![
+                    "devices[1] is not an object (a string); ignoring it".to_string(),
+                    "devices[2].scale is not a whole number (a string); ignoring it".to_string(),
+                ]
+            );
+            let parsed = parse_saved_devices(saved_rows(&saved, "devices"));
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].token.as_deref(), Some("a"));
+            assert_eq!(parsed[0].refresh_rate, 30);
+            assert_eq!(parsed[1].token.as_deref(), Some("b"));
+            // The bad field falls back to the default rather than taking the row with it.
+            assert_eq!(parsed[1].scale, 100);
+        }
+
+        /// A dotted read walks arrays by index, which is what makes `config get` able to name the
+        /// row `config set` just wrote.
+        #[test]
+        fn a_dotted_read_indexes_arrays() {
+            let saved: Saved = serde_json::from_value(serde_json::json!({
+                "devices": [{ "token": "a" }, { "token": "b" }],
+                "serverPorts": { "http": 8080 },
+            }))
+            .unwrap();
+            assert_eq!(dig(&saved, "devices.1.token"), Some(Value::from("b")));
+            assert_eq!(dig(&saved, "serverPorts.http"), Some(Value::from(8080)));
+            // Absent, wrong-typed and out-of-range paths are all simply not there.
+            assert_eq!(dig(&saved, "devices.9.token"), None);
+            assert_eq!(dig(&saved, "devices.token"), None);
+            assert_eq!(dig(&saved, "serverPorts.http.deeper"), None);
+            assert_eq!(dig(&saved, "nothing.at.all"), None);
+        }
+
+        /// The table is the contract `scripts/test-config-editor.mjs` reads out of this file; a
+        /// duplicate key in it would make one of the two entries unreachable and the cross-check
+        /// would still pass.
+        #[test]
+        fn the_shape_table_names_each_key_once() {
+            fn check(shape: &'static Shape, label: &str) {
+                if let Shape::Object(fields) = shape {
+                    let mut seen = std::collections::HashSet::new();
+                    for (name, child) in fields.iter() {
+                        assert!(seen.insert(*name), "{label}.{name} is listed twice");
+                        check(child, &format!("{label}.{name}"));
+                    }
+                } else if let Shape::Array(item) = shape {
+                    check(item, &format!("{label}[]"));
+                }
+            }
+            check(config_shape(), "config");
+        }
 
         /// The measured defect: with the GUI host running and serving `WLZ7JHNBC2RG`,
         /// `qr -t all --json` printed `793LNG2XGM4V`, `session new --json` printed
