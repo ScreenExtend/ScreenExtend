@@ -1978,16 +1978,17 @@ async fn start_session(
 
         let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
 
-        // `start_on_monitor` is the single heaviest blocking call on the join path: a DWM check,
-        // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
-        // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
-        // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
         if !still_current() {
             bail!(
                 "join {join_id} was superseded by a newer offer before its capture started; \
                  standing down"
             );
         }
+
+        // `start_on_monitor` is the single heaviest blocking call on the join path: a DWM check,
+        // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
+        // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
+        // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
         let t_pipeline = std::time::Instant::now();
         let session = {
             let cfg = cfg.clone();

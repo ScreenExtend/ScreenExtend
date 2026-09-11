@@ -533,6 +533,7 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<u32> {
 /// stale pair that can name somebody else's display by the time the write goes out. A target
 /// that stops resolving ends the loop with an error rather than falling through to another
 /// display.
+///
 /// Returns the scale the display is **actually** at afterwards, which is not always the one that
 /// was asked for: a display reports the band of steps it will take, and a step outside it is a
 /// request it has already refused. Rewriting a refused step until a deadline expires is not a
