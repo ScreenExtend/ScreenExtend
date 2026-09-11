@@ -155,6 +155,28 @@ const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
 /// the pipeline's own pacing decide what to keep.
 const WGC_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
 
+/// Whether the host draws the pointer itself instead of letting WGC composite it.
+///
+/// Off by default, and the reason is a measurement this repo made and then withdrew. The overlay
+/// was built on the finding that WGC delivers only 2–10 fps for pointer-only motion on an indirect
+/// display; that harness declared the `INPUT` struct 48 bytes where the OS wants 40, so every
+/// `SendInput` returned 0 and the pointer never moved — it was measuring a still desktop
+/// (`docs/RESULTS.md`, "WGC's real delivery rate for pointer-only motion"). Re-measured with a
+/// pointer that actually moves, WGC delivers 51 fps for a sweep, and end to end through the client
+/// this box paints **85 fps** for a pointer sweep with WGC compositing against **60** with the host
+/// doing it. The difference is that WGC's pointer is event-driven — a move *is* a frame — while the
+/// host's is polled on the encode thread's idle tick, so it is quantised to the frame period, it is
+/// skippable when the tick is lost to the keyed mutex, and in a scene where real frames keep
+/// arriving the idle arm never fires at all.
+///
+/// What the overlay does buy is a keepalive repeat that carries the pointer where it is *now*
+/// rather than where WGC last saw it, so it is kept and reachable rather than deleted. It is worth
+/// re-measuring on a machine whose compositor behaves differently; `SE_CURSOR_OVERLAY=1` is how.
+fn host_composites_cursor() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SE_CURSOR_OVERLAY").as_deref() == Ok("1"))
+}
+
 /// Frame-pool depth for a handler that encodes inline: one buffer the compositor writes, one we
 /// read. OBS and Sunshine both use 2. The pool is a queue handed out oldest-first, so depth is
 /// latency for anything the consumer cannot keep up with.
@@ -2118,7 +2140,6 @@ impl AsyncEncodeRing {
         repair: Arc<crate::streamer::repair::RepairState>,
         wake_rx: crossbeam_channel::Receiver<()>,
         frame_duration: Duration,
-        auto_frame_rate: bool,
         epoch: Instant,
         telemetry: SharedTelemetry,
     ) -> Self {
@@ -2142,7 +2163,6 @@ impl AsyncEncodeRing {
         let encode_join = {
             let args = RingEncodeArgs {
                 encoder,
-                auto_frame_rate,
                 cursor: cursor.clone(),
                 ready_rx,
                 free_tx: free_tx.clone(),
@@ -2356,8 +2376,6 @@ impl Drop for AsyncEncodeRing {
 
 struct RingEncodeArgs {
     encoder: RingEncoder,
-    /// See the keepalive comment in [`ring_encode_thread`].
-    auto_frame_rate: bool,
     cursor: Option<Arc<Mutex<CursorOverlay>>>,
     ready_rx: crossbeam_channel::Receiver<ReadyMsg>,
     free_tx: crossbeam_channel::Sender<usize>,
@@ -2445,7 +2463,6 @@ fn ring_keepalive(
 fn ring_encode_thread(args: RingEncodeArgs) {
     let RingEncodeArgs {
         mut encoder,
-        auto_frame_rate,
         cursor,
         ready_rx,
         free_tx,
@@ -2480,17 +2497,21 @@ fn ring_encode_thread(args: RingEncodeArgs) {
     let mut bitrate_warned = false;
     // How long the stream may go without emitting anything.
     //
-    // 200 ms is what an *adaptive* rate settles to on a still desktop, and it is what the owner
-    // was watching when the picture "advanced in steps": a pointer moving over a still window
-    // produces no dirty region and, on an indirect display, often no captured frame at all, so
-    // the keepalive repeat is the only thing left emitting and the cadence collapses to 5 Hz.
-    // With `autoFrameRate` off the rate the device asked for is a promise, so the keepalive holds
-    // that cadence instead — a repeat of a static picture is a skip-P of a few dozen bytes, which
-    // is a cheap way to buy a stream that never visibly stalls.
-    let keepalive = if auto_frame_rate {
-        Duration::from_millis(200)
-    } else {
+    // 200 ms unless the host is drawing the pointer, and then the frame period — because in that
+    // configuration the idle tick is the *only* clock the cursor has and a 200 ms keepalive makes
+    // it a 5 Hz cursor. With WGC compositing the pointer, which is the default, a pointer move is
+    // itself a captured frame, so the keepalive is back to being what its name says: the floor
+    // under a picture where genuinely nothing is happening.
+    //
+    // Holding the device's full rate here instead costs what it sounds like. Measured on this box
+    // with a completely static desktop, the client painted 5 fps at the baseline and 47 with the
+    // keepalive collapsed to the frame period — nine times the NVENC submissions, the keyed-mutex
+    // traffic and the socket writes, all of it re-encoding a picture nobody changed, and all of it
+    // contending with the capture callback on the same device.
+    let keepalive = if host_composites_cursor() {
         frame_duration.clamp(Duration::from_millis(4), Duration::from_millis(200))
+    } else {
+        Duration::from_millis(200)
     };
     // Tick at the frame period rather than the keepalive period so a pending IDR is honoured
     // within one frame even when nothing is moving.
@@ -3157,7 +3178,14 @@ impl GraphicsCaptureApiHandler for LiveCapture {
             // `WithoutCursor` on a build that has never heard of `IsCursorCaptureEnabled` leaves
             // WGC drawing the pointer and this drawing a second one on top of it. Below Windows
             // 10 2004 the compositor's pointer is the only one there can be.
-            let cursor = if !features.cursor_toggle {
+            let cursor = if !host_composites_cursor() {
+                tprintln!(
+                    "cursor: composited by WGC. A pointer move is a change the compositor tracks, \
+                     so it produces a frame by itself — measured 85 fps for a pointer sweep on an \
+                     otherwise static indirect display, against 60 with the host drawing it"
+                );
+                None
+            } else if !features.cursor_toggle {
                 tprintln!(
                     "cursor: left to WGC — this build has no IsCursorCaptureEnabled, so its \
                      pointer cannot be turned off and drawing another would double it"
@@ -3210,7 +3238,6 @@ impl GraphicsCaptureApiHandler for LiveCapture {
                 Arc::clone(&repair),
                 wake_rx,
                 frame_duration,
-                auto_frame_rate,
                 epoch,
                 Arc::clone(&telemetry),
             );
@@ -3380,8 +3407,27 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // point, so the extra frames are *coalesced*, not queued — WGC hands over the complete
         // surface every time, so keeping only the newest inside each period loses nothing and the
         // client is not asked to decode at twice the rate it advertised.
+        //
+        // A frame carrying the pointer's new position gets a shorter window, not an exemption. The
+        // comment above says both gates have to know about the cursor and the dirty-region one
+        // below does; this one did not, so a pointer move landing inside three quarters of a frame
+        // period behind an unrelated frame was discarded and the cursor waited for the next one —
+        // the coalescing doing damage to the one signal it was told to protect. Measured on this
+        // box, a pointer sweep over an otherwise static indirect display had 257 of 475 delivered
+        // frames dropped here, and the client painted 59 fps against 85 with the gate absent.
+        //
+        // Half a period rather than none, because "none" is not a rate at all: `WGC_MIN_UPDATE_INTERVAL`
+        // is 4 ms, so an exempt cursor could deliver 250 fps to a client that asked for 60 and pay
+        // for it in decode work on the device least able to afford it. Twice the asked rate is the
+        // ceiling — enough that a frame is never thrown away for arriving merely a little early,
+        // bounded enough that it stays a stream the client agreed to.
+        let window = if cursor_moved {
+            self.frame_period / 2
+        } else {
+            self.frame_period * CADENCE_NUM / CADENCE_DEN
+        };
         if let Some(last) = self.last_delivered {
-            if capture.duration_since(last) * CADENCE_DEN < self.frame_period * CADENCE_NUM {
+            if capture.duration_since(last) < window {
                 self.telemetry
                     .degradation
                     .frames_skipped_cadence
