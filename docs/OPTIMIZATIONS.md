@@ -3523,3 +3523,205 @@ Every field on `DeviceOverride` belongs to a class, and the class is in
 `DeviceOverride::reconfig_action` with a row in that test. A field not named there is cosmetic by
 construction, which is the safe default. An epoch bump is a renegotiation **in place** — never a
 leave and a rejoin, never a new join id, never a `DeviceRemove` on the dashboard.
+
+## UX-DISPLAY — what a display change is allowed to touch — `VERIFIED`
+
+**The report.** "when the display changes occur, audit that workflow. bugs: when display changes
+are made, the connected device disappears from my device list. then, it reappears. it should stay
+there the whole time. when i changed the dpr, the connected display attempted to reconnect,
+froze, then my native display's zoom got changed and backdrop disappeared on my desktop. i had to
+shut down screenextend and restart explorer.exe."
+
+UX-RECONFIG made a settings edit reuse the display instead of replacing it. It left the *writes*
+that edit performs addressed the way they always had been, and it left the client free to hand
+the session back whenever a rebuild took too long.
+
+### The writes: a `\\.\DISPLAYn` is a slot, not a display
+
+Every mode change and every DPI change was addressed by the GDI device name recorded when the
+display was created, and nothing re-checked what that name pointed at. Windows hands a
+`\\.\DISPLAYn` straight back out when the monitor holding it detaches, so the name a session
+cached is not necessarily the display it meant — and the DPI write made the window wider still,
+re-resolving that name to an `adapterId`+`sourceId` pair *after* the mode change, which is exactly
+the interval in which an IDD monitor can depart and re-arrive.
+
+A display write names a monitor now. `claim_display_identity` records the monitor's
+device-interface path when the display attaches — and refuses to record one that was already
+attached before the create, so a mis-correlated join cannot enrol somebody else's screen as ours.
+`pick_owned_display` re-derives the GDI name and the adapter/source pair from that path
+immediately before every write, and refuses, with a logged error, if the path is not attached or
+is not one this process created. `ensure_dpi_at` is then handed the pair from the same
+`QueryDisplayConfig` sweep that proved ownership, so the identity that was checked and the
+identity that is written cannot drift apart.
+
+**What ownership is not.** The obvious test is the output technology, and it is wrong on the
+shipped driver: measured here, the bundled IDD monitor reports
+`DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI` (5) — the same value a real HDMI monitor reports — under
+the EDID name `VirtuDisplay+`, which is the driver's own and not the one the host asked for.
+Nothing about a display *as Windows describes it* separates ours from the user's. What does is
+that this process created it and watched it appear, so that is the set the check runs against.
+
+### The writes: three ways to record something the display never did
+
+**A refused mode still ran the rest of the sequence.** `set_display_mode` failing set
+`mode_applied = false`, logged, and then fell through to a 2 s settle poll on a display that had
+not moved and a 2 s DPI write derived from a resolution it was not at. A refused mode ends the
+sequence now, and the session keeps the mode and the DPI it had.
+
+**An unreachable DPI step was rewritten until a deadline.** Windows reports the band of scale
+steps a display will take, relative to its recommended one, and `set_display_scale` clamped the
+target into that band, wrote it, read it back, found it did not equal what was asked for, and
+wrote again — every 100 ms for two seconds. Every `DisplayConfigSetDeviceInfo(SET_DPI)` is a full
+display reconfiguration: the desktop is rearranged, windows move and the shell repaints. The band
+is not a constant and it is not generous: measured here, the bundled virtual display reports
+`100 %..175 %` at 1920x1080 and `100 %..500 %` at 7680x4320, because Windows recomputes the
+recommended step from the resolution. So whether a DPR is reachable depends on the geometry it
+lands on, and anything outside the band bought about twenty reconfigurations for a step the
+display was never going to take. `plan_dpi` separates "settled at what was asked for" from
+"settled as far as this display goes": at most one write, then a line saying where it stopped.
+
+**A refused refresh rate reported success.** An IDD monitor's mode list is fixed at create time,
+so a rate that was never registered is a `DISP_CHANGE_BADMODE`; the fallback drops
+`DM_DISPLAYFREQUENCY`, applies the resolution at whatever rate the display is already on, and
+returned `Ok`. `set_display_mode_owned` reads the mode back and returns the rate in effect.
+
+All three fed one downstream failure, and `landed_display` is where it is closed: the session
+records what the display *reached*, not what was requested. A session that records the request
+makes the next edit compare equal, decide there is nothing to do, and leave the client at a mode
+and a ratio no display ever held — with no way back, because every later save agrees.
+
+### The session: two saves are two attempts on one display
+
+A second save arriving while the first renegotiation is still running is a second `POST /whep` on
+the same join. Both bumped the sequence number, both commanded the same display in an order
+nobody chose, and the loser's failure path called `remove_session` — deleting the entry the
+winner was about to record its display in, which orphans the display and leaves nothing to reap
+it. `display_and_pipeline` checks its own sequence number before the mode write and before the
+capture starts, and an attempt a newer offer has overtaken stands down; `abandon_failed_attempt`
+leaves the session alone when it is no longer this attempt's to remove.
+
+### The dashboard: a lost link was reported as a departure
+
+`linkLost` — the reconfigure watchdog at `RECONFIG_DEADLINE_MS`, an ICE connection that fails,
+the probe's own drop deadline — called `teardownSession()` with no `keepJoin`, which beacons
+`/leave`. The host reads that as the device having *left*: no disconnect grace, the display
+removed, `DeviceRemove` on the dashboard. The row vanished; the user pressed Connect; the join
+form's `beginStreaming` released the join too, so the reconnect was a brand-new session with a
+brand-new display, and the row came back — with every window shuffled onto the primary monitor.
+That is the first half of the report, in full.
+
+Only a page that is going away (`pagehide`) or one the host has already ended (`kickDevice`)
+releases a join now. A lost link keeps it, because the page is still open and still offering to
+reconnect and the disconnect grace is exactly the mechanism for that; and `beginStreaming`
+presents the id it still holds, so the reconnect continues the same session on the same display.
+
+### The dashboard: `DeviceModify` was declared and never emitted
+
+`collect_events!` has carried `DeviceModify` and `App.tsx` has listened for it, and nothing has
+ever sent one. A continuing join reported a *join*, so the desktop app raised "a device joined"
+over the desktop every time a refresh rate or a DPR moved. `DeviceReporter::report_modify` sends
+`DeviceModify` for a renegotiation and `DeviceJoin` only for an arrival; the front end's handler
+upserts, so a desktop UI reloaded over a running host cannot lose a row it never saw arrive.
+
+The reporter also logs every event it emits, which is the only way to answer "did a display
+change remove a row" without the desktop UI in front of you — `serve` builds the same reporter.
+And `setup` writes an inventory of every attached display (mode, DPI, the band, device path, and
+whether it is ours) before the host touches anything, so the next report of a display that
+changed under a user has a *before* to be checked against rather than a guess.
+
+### Measured
+
+Windows 11 26200, RTX 3080 Ti Laptop, debug `serve -v`, Chrome on the same machine driving a real
+WHEP session against a real virtual display. Counts are taken from the host log over the window
+between the save and the settle; the physical panel is re-read before and after every run.
+
+| Edit | dashboard | renegotiated | display | what the host said |
+|---|---|---|---|---|
+| refresh rate 60 → 120 | 2 modify, 0 join, 0 remove | in place | same id, none created, none removed | `settings changed in place … (1920x1080@120, scale=100%)` |
+| refresh rate 60 → 90 (never registered) | 2 modify, 0 join, 0 remove | in place | same id | `would not run at 90 Hz (its mode list was fixed when it was created); it is at 60 Hz` |
+| DPR 1 → 2 | 1 modify, 0 join, 0 remove | in place | same id | `settings changed in place … (3840x2160@60, scale=200%)` |
+| orientation → Portrait | 2 modify, 0 join, 0 remove | in place | same id | `settings changed in place`, capture restarted at `native=1080x1920` |
+| display scale 100 → 150 | 0 events | **not at all** | same id | `display scale for join … applied live at 150% (no rejoin)` |
+| video quality 15 → 30 | 1 modify, 0 join, 0 remove | in place | same id | `untouched (encoder-only edit)` |
+
+No run produced a `DeviceRemove`, a second `virtual display created`, a `removing display`, a
+`/leave` beacon, or any change to the machine's own panel: `\\.\DISPLAY1` read
+`1920x1080 @100 % DPI at 0,0, primary` before and after every one of them, and the wallpaper path
+was unchanged throughout.
+
+The DPR ladder end to end is `report_display_change_targets`, which needs no browser and is the
+stronger evidence — the browser end of this is flaky on a box where the client shares the machine
+with the host and four virtual adapters. Every step of the ladder landed exactly, mode and scale:
+
+```
+  DPR   requested          landed              scale   reached
+  1     1920x1080@60       1920x1080 @60 Hz    100 %   100 %
+  1.25  2400x1350@60       2400x1350 @60 Hz    125 %   125 %
+  1.5   2880x1620@60       2880x1620 @60 Hz    150 %   150 %
+  1.75  3360x1890@60       3360x1890 @60 Hz    175 %   175 %
+  2     3840x2160@60       3840x2160 @60 Hz    200 %   200 %
+  2.25  4320x2430@60       4320x2430 @60 Hz    225 %   225 %
+  2.5   4800x2700@60       4800x2700 @60 Hz    250 %   250 %
+  3     5760x3240@60       5760x3240 @60 Hz    300 %   300 %
+  3.5   6720x3780@60       6720x3780 @60 Hz    350 %   350 %
+  4     7680x4320@60       7680x4320 @60 Hz    400 %   400 %
+
+  final band: 400 % in 100 %..500 %
+```
+
+and, with the display removed and the target it was using kept — the stale `\\.\DISPLAYn` that
+Windows is free to hand to anything:
+
+```
+  set_display_mode_owned  -> Err(…UID256… was not created by this host; refusing to change its
+                                 mode or its DPI)
+  set_display_scale_owned -> Err(same)
+
+  every display that was not ours is exactly where it was.
+```
+
+### Tests
+
+`windows_utils/virtual_display.rs`: `pick_owned_display` against fabricated `QueryDisplayConfig`
+output — our own display by identity, the identity whose GDI name has moved, the display that has
+departed with the machine's own panel now holding its name, a name with no identity behind it, a
+path we did not create, an empty sweep and a duplicate identity. `pick_new_identity`, which is
+what stops a mis-correlated create enrolling a monitor that was already attached. And
+`report_display_change_targets`, the `#[ignore]`d hardware harness above.
+`windows_utils/streamer/capture.rs`: `plan_dpi`, with the bands measured on this box, so the
+difference between "settled at what was asked for" and "settled as far as this display goes" is a
+row in a table rather than a comment.
+`streamer/server.rs`: `landed_display` — a refused mode records the geometry and the scale the
+display is *at*, and still reads as a difference so the next reconfigure retries it.
+`scripts/test-client-reconfig.mjs`: a lost link keeps the join and beacons nothing; reconnecting
+presents the join the tab still holds; a kick still releases it.
+
+### What this does not reach
+
+**The owner's panel DPI was not reproduced.** Three DPR changes were driven on this machine
+against the code as it stood at `57942c6`, and none of them touched `\\.\DISPLAY1` — its DPI,
+mode, position and primary flag were identical before and after, and the wallpaper path never
+changed. What is demonstrated is the *mechanism*: every write was addressed by a name Windows
+recycles, the DPI write re-resolved that name across the one window in which an IDD monitor can
+depart, and an unreachable scale turned into about twenty full display reconfigurations in two
+seconds. All three are closed; which of them the owner hit is not established.
+
+**A client whose screen size changes still cannot be resized.** `dpr_mode_ladder` registers one
+resolution per DPR step at create time, computed from the CSS size the client reported *then*, and
+an IDD monitor's mode list is fixed for its lifetime. A device that comes back with a different
+`screen.width` asks for a mode that was never registered, and the only way to reach it is to
+recreate the display — the removal-and-create this workflow exists to avoid. It is refused
+cleanly now and says so; it was silently recorded as applied before. Making it work needs either
+`IddCxMonitorUpdateModes` (IddCx 1.0 API, below the 1.2 the bundled INF declares) or a recreate
+with the display's windows preserved, and neither is in this tree.
+
+**Two saves in quick succession is `COMPILE-CHECKED`.** The supersede checkpoints and
+`abandon_failed_attempt` are reasoned from the sequence numbers the teardown path already uses,
+and the race is hard to drive deliberately: the client polls `/reconfig` about once a second, so
+two saves a few hundred milliseconds apart collapse into one renegotiation before the client has
+reacted to either.
+
+**The reconnect is bounded, not instant.** A rebuild that has not painted within
+`RECONFIG_DEADLINE_MS` still shows "Disconnected, reconnect to continue." — it no longer ends the
+session, so Connect lands back on the same display, but the fifteen seconds in front of it are
+ICE renegotiation and this work does not shorten them.
