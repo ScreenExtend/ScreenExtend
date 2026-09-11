@@ -944,20 +944,24 @@ pub fn set_display_resolution(
     reconfigure_display(device_name, width, height, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
+/// Returns the refresh rate actually in effect afterwards, which the Windows sibling reads back
+/// because an IDD monitor can refuse a rate and land on another. Here `reconfigure_display`
+/// either applies the mode it was given or fails, so the answer is the rate that was asked for.
 pub fn set_display_mode(
     device_name: &str,
     width: u32,
     height: u32,
     refresh: u32,
     portrait: bool,
-) -> Result<()> {
+) -> Result<u32> {
     let (w, h) = if portrait {
         (height, width)
     } else {
         (width, height)
     };
     let hidpi = current_hidpi(device_name);
-    reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
+    reconfigure_display(device_name, w, h, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(refresh)
 }
 
 pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> {
@@ -969,18 +973,67 @@ pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> 
     reconfigure_display(device_name, h, w, refresh, hidpi).map_err(|e| anyhow::anyhow!(e))
 }
 
-pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
+/// Returns the scale actually in effect. macOS HiDPI is a binary flag rather than a ladder, so
+/// the answer is only ever 100 or 200 — which is what `platform::snap_display_dpr` already
+/// clamps a requested ratio to there.
+pub fn set_display_scale(device_name: &str, percent: u32) -> Result<u32> {
     let hidpi = if percent >= HIDPI_THRESHOLD_PERCENT {
         1
     } else {
         0
     };
     crate::macos_utils::virtual_display::set_display_hidpi(device_name, hidpi)
-        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(if hidpi == 1 { 200 } else { 100 })
 }
 
 pub fn set_display_topology_extend() -> bool {
     false
+}
+
+// --- the identity-checked display writes -----------------------------------------------------
+//
+// On Windows a display's `\\.\DISPLAYn` is a slot the OS reuses, so a name cached when a display
+// was created can name a different monitor — a physical one included — by the time a reconfigure
+// writes to it, and every write there re-derives its target from the monitor's stable device
+// path. A `device_name` here is the `CGDirectDisplayID` of the display itself, so it *is* the
+// stable identity and the forwarding below is the whole of it: a display that has gone away is
+// not found by `display_by_name`, which is already how these fail.
+//
+// UNVERIFIED (not compiled) — written on Windows, mirroring the Windows surface so
+// `streamer/pipeline.rs` re-exports one set of names.
+
+pub fn attached_display_paths() -> Vec<String> {
+    display::device_names()
+}
+
+pub fn claim_display_identity(device_name: &str, _before: &[String]) -> Option<String> {
+    display::display_by_name(device_name).map(|_| device_name.to_string())
+}
+
+pub fn forget_display_identity(_device_path: &str) {}
+
+pub fn set_display_mode_owned(
+    target: &crate::streamer::session::DisplayTarget,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    portrait: bool,
+) -> Result<u32> {
+    set_display_mode(&target.device_name, width, height, refresh, portrait)
+}
+
+pub fn set_display_scale_owned(
+    target: &crate::streamer::session::DisplayTarget,
+    percent: u32,
+) -> Result<u32> {
+    set_display_scale(&target.device_name, percent)
+}
+
+pub fn monitor_dimensions_owned(
+    target: &crate::streamer::session::DisplayTarget,
+) -> Option<(u32, u32)> {
+    monitor_dimensions(&target.device_name)
 }
 
 #[cfg(test)]

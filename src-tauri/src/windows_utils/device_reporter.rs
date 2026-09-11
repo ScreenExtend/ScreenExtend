@@ -7,7 +7,8 @@ use crate::streamer::session::{
     AudioOutputsReport, DeviceInfo, DeviceReporter, SharedDeviceOverrides,
 };
 use crate::{
-    AudioOutput, Device, DeviceAudioOutputs, DeviceJoin, DeviceRemove, JoinAttemptsPaused,
+    AudioOutput, Device, DeviceAudioOutputs, DeviceJoin, DeviceModify, DeviceRemove,
+    JoinAttemptsPaused,
 };
 
 #[derive(Debug)]
@@ -22,11 +23,13 @@ impl TauriDeviceReporter {
     }
 }
 
-impl DeviceReporter for TauriDeviceReporter {
-    fn report_join(&self, info: DeviceInfo) {
+impl TauriDeviceReporter {
+    /// The dashboard row for one live join, with the device's saved settings folded in.
+    ///
+    /// Settings are the device's, not the join's: two tabs of one browser read the same row.
+    fn row(&self, info: DeviceInfo) -> Device {
         let token = info.token.clone();
         let mut device = Device::defaults(info);
-        // Settings are the device's, not the join's: two tabs of one browser read the same row.
         if let Some(o) = self.overrides.lock().unwrap().get(&token) {
             device.scale = o.scale;
             device.refresh_rate = o.refresh_rate;
@@ -38,12 +41,41 @@ impl DeviceReporter for TauriDeviceReporter {
             device.dpr = o.dpr.min(device.max_dpr);
             device.audio_enabled = o.audio_enabled;
         }
-        if let Err(e) = DeviceJoin(device).emit(&self.app) {
+        device
+    }
+}
+
+impl DeviceReporter for TauriDeviceReporter {
+    fn report_join(&self, info: DeviceInfo) {
+        // What the dashboard is being told, on the record. A display change must move a row, not
+        // remove it and put a new one back, and this is the only place that question can be
+        // answered without the desktop UI in front of you — `serve` builds the same reporter, so
+        // a headless run says exactly what the app's device list would have done.
+        tprintln!(
+            "[dashboard] device joined: join={} token={} ({})",
+            info.join_id,
+            info.token,
+            info.ip
+        );
+        if let Err(e) = DeviceJoin(self.row(info)).emit(&self.app) {
             teprintln!("[device-reporter] emit DeviceJoin failed: {e:?}");
         }
     }
 
+    fn report_modify(&self, info: DeviceInfo) {
+        tprintln!(
+            "[dashboard] device updated in place: join={} token={} ({})",
+            info.join_id,
+            info.token,
+            info.ip
+        );
+        if let Err(e) = DeviceModify(self.row(info)).emit(&self.app) {
+            teprintln!("[device-reporter] emit DeviceModify failed: {e:?}");
+        }
+    }
+
     fn report_remove(&self, join_id: String, token: String) {
+        tprintln!("[dashboard] device removed: join={join_id} token={token}");
         let device = Device::defaults(DeviceInfo {
             join_id,
             token,

@@ -373,7 +373,11 @@ function GlobalState({ children }: { children: ReactNode }) {
         const device = event.payload as ConnectedDevice;
         setDevices(prev => {
           const index = prev.findIndex(d => d.joinId === device.joinId);
-          if (index < 0) return prev;
+          // The host says this join is live, so the row exists whether or not this window was
+          // listening when it arrived — a reload of the desktop UI over a running host has no
+          // rows at all, and dropping the update would leave a connected device invisible until
+          // it left. No notification and no `knownDevices` write: nothing arrived.
+          if (index < 0) return [...prev, device];
           // A no-op modify must not allocate a new array: `devices` identity
           // drives an extra IPC burst in Dashboard and Settings.
           if (deviceEquals(prev[index], device)) return prev;

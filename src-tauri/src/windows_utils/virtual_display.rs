@@ -1,3 +1,5 @@
+use anyhow::bail;
+
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -7,7 +9,7 @@ use crate::driver_ipc::{
     Mode, Monitor, DEFAULT_PIPE_NAME,
 };
 
-use crate::streamer::session::{SharedVirtualDisplay, VirtualDisplayController};
+use crate::streamer::session::{DisplayTarget, SharedVirtualDisplay, VirtualDisplayController};
 
 /// Registered on every display we create so a device can be switched between these rates later
 /// without a hot-unplug (an IDD monitor's mode list is fixed at create time). 120 is kept even
@@ -411,10 +413,236 @@ impl WindowsVirtualDisplay {
 /// `gdi_name` is the `\\.\DISPLAYn` every other Win32 display call wants; `friendly` is the name
 /// out of the monitor's EDID, which for our own virtual displays is the name we asked the driver
 /// to synthesise. Correlating the two is what lets a join skip the monitor-diff poll.
+///
+/// `device_path` is the identity. A GDI name is a *slot*: Windows hands `\\.\DISPLAY3` back out
+/// the moment the monitor holding it detaches, so a name cached when a display was created can
+/// name a different monitor — including a physical one — by the time a later reconfigure writes
+/// to it. The monitor's device-interface path does not move, so every write re-derives the name
+/// from the path rather than trusting the one it was given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayPath {
     pub gdi_name: String,
     pub friendly: String,
+    /// `\\?\DISPLAY#<hardware id>#…` — stable for as long as the monitor exists.
+    pub device_path: String,
+    /// `DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY` for this path's target. Every display this host
+    /// creates is an indirect one; no physical output ever reports these values.
+    pub output_technology: i32,
+    /// The pair `DisplayConfigSetDeviceInfo` addresses a per-display DPI write by.
+    pub adapter_id: (u32, i32),
+    pub source_id: u32,
+}
+
+/// Every monitor this process created, by device path.
+///
+/// This is the ownership test, and it is deliberately not a heuristic. An output-technology check
+/// looked like the obvious one and is wrong on the shipped driver: the bundled IDD monitor
+/// reports `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI` (5), exactly what a real HDMI monitor reports,
+/// so nothing about a display as Windows describes it separates ours from the user's. What does
+/// separate them is that we created ours and watched it appear — so the set is recorded there and
+/// consulted before every write.
+static OWNED_PATHS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn owned_paths() -> std::sync::MutexGuard<'static, Option<std::collections::HashSet<String>>> {
+    OWNED_PATHS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record a monitor as ours. Called once, with the path read back after the display attached.
+pub fn remember_owned_path(device_path: &str) {
+    if device_path.is_empty() {
+        return;
+    }
+    owned_paths()
+        .get_or_insert_with(Default::default)
+        .insert(device_path.to_string());
+}
+
+/// Forget one, when its display is removed, so a write can no longer reach a display this host no
+/// longer owns.
+pub fn forget_display_identity(device_path: &str) {
+    if let Some(set) = owned_paths().as_mut() {
+        set.remove(device_path);
+    }
+}
+
+fn is_owned_path(device_path: &str) -> bool {
+    owned_paths()
+        .as_ref()
+        .is_some_and(|set| set.contains(device_path))
+}
+
+/// A resolved, verified write target: this monitor exists, it is one of ours, and these are the
+/// handles to address it by *right now*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDisplay {
+    pub gdi_name: String,
+    pub adapter_id: (u32, i32),
+    pub source_id: u32,
+}
+
+/// Find the one active path a write to `target` may land on, or refuse.
+///
+/// Split from the Win32 call and from the owned set so the rule is testable against fabricated
+/// input: the live version is [`resolve_owned_display`], which is the only thing
+/// `set_display_mode_owned` and `set_display_scale_owned` are allowed to write through.
+///
+/// The rules, in order:
+/// * whatever the caller names must be a display **this host created** — that, and nothing about
+///   how Windows describes the display, is what separates ours from the user's;
+/// * a recorded device path must name exactly one attached monitor, or the write is refused. A
+///   display that has detached has no name to fall back to, because the name it used to hold has
+///   already been handed to whatever attached next;
+/// * with no recorded path — a display created before one was read back, or a probe harness
+///   calling by name — the GDI name is matched, and then the monitor it landed on must still be
+///   in the owned set.
+pub fn pick_owned_display(
+    paths: &[DisplayPath],
+    target: &DisplayTarget,
+    owned: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<ResolvedDisplay> {
+    let by_path = !target.device_path.is_empty();
+    if by_path && !owned(&target.device_path) {
+        bail!(
+            "{} was not created by this host; refusing to change its mode or its DPI",
+            target.device_path
+        );
+    }
+    let mut matches = paths.iter().filter(|p| {
+        if by_path {
+            p.device_path == target.device_path
+        } else {
+            !target.device_name.is_empty() && p.gdi_name == target.device_name
+        }
+    });
+    let Some(hit) = matches.next() else {
+        if by_path {
+            bail!(
+                "virtual display {} is not attached (it last answered to {}); refusing to write to any display",
+                target.device_path,
+                target.device_name
+            );
+        }
+        bail!(
+            "no active display is named {}; refusing to write to any display",
+            target.device_name
+        );
+    };
+    if matches.next().is_some() {
+        bail!(
+            "more than one active display answers to {}; refusing to write to any of them",
+            if by_path {
+                &target.device_path
+            } else {
+                &target.device_name
+            }
+        );
+    }
+    if !owned(&hit.device_path) {
+        bail!(
+            "{} is {}, which this host did not create; refusing to change its mode or its DPI",
+            target.device_name,
+            if hit.friendly.is_empty() {
+                hit.device_path.as_str()
+            } else {
+                hit.friendly.as_str()
+            }
+        );
+    }
+    if by_path && hit.gdi_name != target.device_name && !target.device_name.is_empty() {
+        tprintln!(
+            "[display] {} now answers to {} (it was {}); writing to the monitor, not the name",
+            target.device_path,
+            hit.gdi_name,
+            target.device_name
+        );
+    }
+    Ok(ResolvedDisplay {
+        gdi_name: hit.gdi_name.clone(),
+        adapter_id: hit.adapter_id,
+        source_id: hit.source_id,
+    })
+}
+
+/// [`pick_owned_display`] against the live `QueryDisplayConfig` state and the live owned set.
+pub fn resolve_owned_display(target: &DisplayTarget) -> anyhow::Result<ResolvedDisplay> {
+    pick_owned_display(&active_display_paths(), target, &is_owned_path)
+}
+
+/// The device-interface path of the monitor answering to `gdi_name`, if it is one that was not
+/// attached before.
+///
+/// `before` is the set of paths attached before the display was created. A name that resolves to
+/// one of those is not the display that just appeared, and answering `None` is what stops a
+/// mis-correlated join from recording somebody else's monitor as ours — which would make every
+/// later ownership check agree with the mistake.
+pub fn pick_new_identity(
+    paths: &[DisplayPath],
+    gdi_name: &str,
+    before: &[String],
+) -> Option<String> {
+    paths
+        .iter()
+        .find(|p| {
+            p.gdi_name == gdi_name
+                && !p.device_path.is_empty()
+                && !before.iter().any(|b| b == &p.device_path)
+        })
+        .map(|p| p.device_path.clone())
+}
+
+/// Read back the identity of a display that has just attached and record it as ours.
+///
+/// `None` when the name resolves to a monitor that was already there, or to none at all — either
+/// way the correlation is not trustworthy and the caller must not drive that display.
+pub fn claim_display_identity(gdi_name: &str, before: &[String]) -> Option<String> {
+    let found = pick_new_identity(&active_display_paths(), gdi_name, before);
+    if let Some(path) = found.as_deref() {
+        remember_owned_path(path);
+    }
+    found
+}
+
+/// Write every attached display's identity, mode and DPI to the log.
+///
+/// A host that is about to start creating displays should say what was on the machine before it
+/// did. The owner's report of this workflow — "my native display's zoom got changed" — could only
+/// be answered by taking a snapshot afterwards and guessing at the before, and one
+/// `QueryDisplayConfig` at startup is the whole cost of never needing to guess again.
+pub fn log_display_inventory(when: &str) {
+    use crate::windows_utils::streamer::capture::{dpi_percent_at, read_dpi_band};
+    let paths = active_display_paths();
+    tprintln!("[display] {when}: {} attached display(s)", paths.len());
+    for p in &paths {
+        let mode = current_display_mode(&p.gdi_name)
+            .map(|(w, h, hz)| format!("{w}x{h}@{hz}"))
+            .unwrap_or_else(|| "?".to_string());
+        let dpi = match read_dpi_band(p.adapter_id, p.source_id) {
+            Some((cur, lo, hi)) => format!(
+                "{}% (band {}%..{}%)",
+                dpi_percent_at(cur),
+                dpi_percent_at(lo),
+                dpi_percent_at(hi)
+            ),
+            None => "?".to_string(),
+        };
+        tprintln!(
+            "[display]   {} {mode} dpi={dpi} friendly={:?} ours={} path={}",
+            p.gdi_name,
+            p.friendly,
+            is_owned_path(&p.device_path),
+            p.device_path
+        );
+    }
+}
+
+/// Every attached monitor's device path. Snapshotted before a create so the identity read back
+/// afterwards can be checked against it.
+pub fn attached_display_paths() -> Vec<String> {
+    active_display_paths()
+        .into_iter()
+        .map(|p| p.device_path)
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 fn wide_to_string(w: &[u16]) -> String {
@@ -479,16 +707,31 @@ pub fn active_display_paths() -> Vec<DisplayPath> {
             },
             ..Default::default()
         };
-        let friendly = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) }
-            == ERROR_SUCCESS.0 as i32
+        let (friendly, device_path, technology) = if unsafe {
+            DisplayConfigGetDeviceInfo(&mut target.header)
+        } == ERROR_SUCCESS.0 as i32
         {
-            wide_to_string(&target.monitorFriendlyDeviceName)
+            (
+                wide_to_string(&target.monitorFriendlyDeviceName),
+                wide_to_string(&target.monitorDevicePath),
+                target.outputTechnology.0,
+            )
         } else {
-            String::new()
+            // Nothing known about the target. The empty device path and the invalid
+            // technology below both fail `pick_owned_display`, which is the safe answer:
+            // a path we cannot identify is never written to.
+            (String::new(), String::new(), i32::MIN)
         };
         out.push(DisplayPath {
             gdi_name: wide_to_string(&source.viewGdiDeviceName),
             friendly,
+            device_path,
+            output_technology: technology,
+            adapter_id: (
+                path.sourceInfo.adapterId.LowPart,
+                path.sourceInfo.adapterId.HighPart,
+            ),
+            source_id: path.sourceInfo.id,
         });
     }
     out
@@ -558,6 +801,16 @@ pub fn set_refresh_rate(device_name: &str, refresh_rate: u32) -> Result<u32, Str
         DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
         ENUM_CURRENT_SETTINGS,
     };
+
+    // Same rule as every other display write: the name is checked against what is attached
+    // *now*, and a name that resolves to anything but one of our own indirect displays is
+    // refused rather than written to.
+    let device_name = &resolve_owned_display(&DisplayTarget {
+        device_path: String::new(),
+        device_name: device_name.to_string(),
+    })
+    .map_err(|e| e.to_string())?
+    .gdi_name;
 
     let wide: Vec<u16> = device_name
         .encode_utf16()
@@ -977,21 +1230,30 @@ mod test {
         }
     }
 
+    /// What the bundled IDD monitor actually reports on the development box: plain HDMI, the same
+    /// value a real HDMI monitor reports. It is here so the tests keep saying out loud that
+    /// nothing in how Windows describes a display tells ours from the user's.
+    const HDMI: i32 = 5;
+    const INTERNAL_PANEL: i32 =
+        windows::Win32::Devices::Display::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL.0;
+
+    fn path(gdi: &str, friendly: &str, device_path: &str, tech: i32, source: u32) -> DisplayPath {
+        DisplayPath {
+            gdi_name: gdi.to_string(),
+            friendly: friendly.to_string(),
+            device_path: device_path.to_string(),
+            output_technology: tech,
+            adapter_id: (0x1234, 0),
+            source_id: source,
+        }
+    }
+
     #[test]
     fn an_ambiguous_friendly_name_resolves_to_nothing() {
         let paths = vec![
-            DisplayPath {
-                gdi_name: r"\\.\DISPLAY1".to_string(),
-                friendly: "ScreenExtend".to_string(),
-            },
-            DisplayPath {
-                gdi_name: r"\\.\DISPLAY2".to_string(),
-                friendly: "ScreenExtend".to_string(),
-            },
-            DisplayPath {
-                gdi_name: r"\\.\DISPLAY3".to_string(),
-                friendly: "Dell U2720Q".to_string(),
-            },
+            path(r"\\.\DISPLAY1", "ScreenExtend", r"\\?\a", HDMI, 0),
+            path(r"\\.\DISPLAY2", "ScreenExtend", r"\\?\b", HDMI, 1),
+            path(r"\\.\DISPLAY3", "Dell U2720Q", r"\\?\c", INTERNAL_PANEL, 2),
         ];
         // Two monitors answer to the same truncated EDID name, so the caller must fall back to
         // the diff rather than be handed one of them at random.
@@ -1002,11 +1264,160 @@ mod test {
         );
         assert_eq!(gdi_name_for_friendly(&paths, "Nothing"), None);
         // An empty EDID name matches nothing, rather than matching everything by prefix.
-        let blank = vec![DisplayPath {
-            gdi_name: r"\\.\DISPLAY1".to_string(),
-            friendly: String::new(),
-        }];
+        let blank = vec![path(r"\\.\DISPLAY1", "", r"\\?\a", HDMI, 0)];
         assert_eq!(gdi_name_for_friendly(&blank, "anything"), None);
+    }
+
+    /// The whole of "a display write may only land on a display we created", against fabricated
+    /// `QueryDisplayConfig` output.
+    ///
+    /// The case that damaged a development machine is the third one: a session recorded
+    /// `\\.\DISPLAY2` when its virtual display was created, that display went away, and Windows
+    /// handed the same name to the laptop's own panel. Every write on the reconfigure path —
+    /// `ChangeDisplaySettingsExW` for the mode, `DisplayConfigSetDeviceInfo` for the DPI —
+    /// addressed the display by that name, so the panel got the virtual display's resolution and
+    /// the virtual display's DPI.
+    #[test]
+    fn a_write_only_ever_lands_on_a_display_we_created() {
+        // Measured on the development box: the IDD monitor reports HDMI, the same output
+        // technology a real HDMI monitor reports, and its EDID name is the driver's own rather
+        // than the one the host asked for. Nothing here distinguishes it from a user's monitor
+        // except that this host created it.
+        let ours = path(
+            r"\\.\DISPLAY9",
+            "VirtuDisplay+",
+            r"\\?\DISPLAY#CHY0000#1&28a6823a&e&UID256",
+            HDMI,
+            8,
+        );
+        let panel = path(
+            r"\\.\DISPLAY1",
+            "",
+            r"\\?\DISPLAY#BOE0A00#4&26d38288&0&UID8388688",
+            INTERNAL_PANEL,
+            0,
+        );
+        let live = vec![panel.clone(), ours.clone()];
+        let mine = ours.device_path.clone();
+        let owned = move |p: &str| p == mine;
+
+        // The ordinary case: the identity is there, and it resolves to the name and the
+        // adapter/source pair a DPI write is addressed by.
+        let target = DisplayTarget {
+            device_path: ours.device_path.clone(),
+            device_name: ours.gdi_name.clone(),
+        };
+        let hit = pick_owned_display(&live, &target, &owned).expect("our own display resolves");
+        assert_eq!(hit.gdi_name, r"\\.\DISPLAY9");
+        assert_eq!(hit.source_id, 8);
+
+        // The name moved while the display stayed. The write follows the monitor.
+        let renamed = vec![
+            path(r"\\.\DISPLAY1", "", &panel.device_path, INTERNAL_PANEL, 0),
+            path(r"\\.\DISPLAY5", "VirtuDisplay+", &ours.device_path, HDMI, 4),
+        ];
+        let hit = pick_owned_display(&renamed, &target, &owned).expect("the monitor is still here");
+        assert_eq!(hit.gdi_name, r"\\.\DISPLAY5");
+        assert_eq!(hit.source_id, 4);
+
+        // The display is gone and the panel has inherited its name. This must refuse, not fall
+        // through onto the panel — which is the whole defect: a mode and a DPI written to the
+        // machine's own screen because a `\\.\DISPLAYn` had been handed on.
+        let recycled = vec![path(
+            r"\\.\DISPLAY9",
+            "",
+            &panel.device_path,
+            INTERNAL_PANEL,
+            0,
+        )];
+        let err =
+            pick_owned_display(&recycled, &target, &owned).expect_err("a departed display refuses");
+        assert!(
+            err.to_string().contains("is not attached"),
+            "unexpected: {err}"
+        );
+
+        // With no identity at all — a name alone, which is how the probe harness calls — the
+        // panel is still refused, because it is not in the owned set.
+        let name_only = DisplayTarget {
+            device_path: String::new(),
+            device_name: r"\\.\DISPLAY9".to_string(),
+        };
+        let err = pick_owned_display(&recycled, &name_only, &owned)
+            .expect_err("a display we did not create refuses");
+        assert!(
+            err.to_string().contains("did not create"),
+            "unexpected: {err}"
+        );
+        // …and the same name against our own display is allowed, which is what keeps the probe
+        // harness and the `--ignored` mode tests working.
+        assert_eq!(
+            pick_owned_display(&live, &name_only, &owned)
+                .expect("ours by name")
+                .gdi_name,
+            r"\\.\DISPLAY9"
+        );
+
+        // A path that is attached but was never created here is refused before the sweep even
+        // runs, so a caller cannot name its way onto another display by holding an identity.
+        let not_ours = DisplayTarget {
+            device_path: panel.device_path.clone(),
+            device_name: panel.gdi_name.clone(),
+        };
+        let err = pick_owned_display(&live, &not_ours, &owned).expect_err("the panel refuses");
+        assert!(
+            err.to_string().contains("was not created by this host"),
+            "unexpected: {err}"
+        );
+
+        // Nothing matches: refuse rather than pick the first display on the machine.
+        let elsewhere = DisplayTarget {
+            device_path: r"\\?\DISPLAY#CHY0000#2&other".to_string(),
+            device_name: r"\\.\DISPLAY7".to_string(),
+        };
+        assert!(pick_owned_display(&live, &elsewhere, &owned).is_err());
+        assert!(pick_owned_display(&[], &target, &owned).is_err());
+
+        // Two paths carrying one identity (a clone topology) is ambiguous, and an ambiguous
+        // answer is worse than none.
+        let cloned = vec![
+            ours.clone(),
+            path(r"\\.\DISPLAY6", "VirtuDisplay+", &ours.device_path, HDMI, 5),
+        ];
+        assert!(pick_owned_display(&cloned, &target, &owned).is_err());
+    }
+
+    /// The correlation records an identity only for a monitor that was not attached before.
+    #[test]
+    fn a_display_that_was_already_attached_is_never_recorded_as_ours() {
+        let panel = path(
+            r"\\.\DISPLAY1",
+            "",
+            r"\\?\DISPLAY#BOE0A00#4&26d38288&0&UID8388688",
+            INTERNAL_PANEL,
+            0,
+        );
+        let fresh = path(
+            r"\\.\DISPLAY9",
+            "VirtuDisplay+",
+            r"\\?\DISPLAY#CHY0000#1&28a6823a&e&UID256",
+            HDMI,
+            8,
+        );
+        let before = vec![panel.device_path.clone()];
+        let after = vec![panel.clone(), fresh.clone()];
+
+        assert_eq!(
+            pick_new_identity(&after, r"\\.\DISPLAY9", &before),
+            Some(fresh.device_path.clone())
+        );
+        // The monitor diff handed back a name that belongs to a display which was already there:
+        // this is the mis-correlation, and it must produce no identity rather than a wrong one.
+        assert_eq!(pick_new_identity(&after, r"\\.\DISPLAY1", &before), None);
+        assert_eq!(pick_new_identity(&after, r"\\.\DISPLAY4", &before), None);
+        // A path Windows could not describe is not an identity either.
+        let nameless = vec![path(r"\\.\DISPLAY9", "", "", HDMI, 8)];
+        assert_eq!(pick_new_identity(&nameless, r"\\.\DISPLAY9", &before), None);
     }
 
     /// Dumps what `QueryDisplayConfig` says about every active display, which is the input the
@@ -1098,6 +1509,179 @@ mod test {
     /// `IddCxMonitorUpdateModes` would replace the second path with an in-place update; it is
     /// IddCx 1.0 API, below the IddCx 1.2 the bundled INF declares, and upstream simply never
     /// used it. This harness is the before half of that comparison. Needs the driver installed;
+    /// Drives every DPR step of the ladder at a real display, and then proves that the writes
+    /// cannot reach anything else.
+    ///
+    /// This is the harness for the report that started this work — "when I changed the DPR, my
+    /// native display's zoom got changed" — and it answers the two halves of it directly. It
+    /// records every *physical* display's mode and DPI band before it starts and checks them
+    /// again at the end, so collateral damage is detected rather than assumed absent. And after
+    /// removing the virtual display it keeps the target it was using and writes to it again:
+    /// that stale `\\.\DISPLAYn` is exactly what Windows hands to whatever attaches next, and
+    /// both writes must be refused rather than landing on a monitor somebody is using.
+    ///
+    /// It also reports what each DPR step actually *reached*, which is the other half of the
+    /// story: a scale above the band the display advertises lands on the closest step it will
+    /// take, and a session that records the request instead of the result can never retry it.
+    #[test]
+    #[ignore = "requires the virtual display driver installed; creates a real display and changes its mode and DPI; run with --ignored --nocapture"]
+    fn report_display_change_targets() {
+        use crate::windows_utils::streamer::capture::{
+            dpi_percent_at, monitor_dimensions_owned, read_dpi_band, set_display_mode_owned,
+            set_display_scale_owned,
+        };
+
+        let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
+            crate::test_support::skip_because(
+                "windows display-change targets",
+                "the virtual display driver is not installed",
+            );
+            return;
+        };
+
+        // Everything on the machine that is not ours, and what it is set to. The `ours` flag is
+        // false for all of them here because nothing has been created yet.
+        /// One display as this harness recorded it: its identity, the mode it was in and the
+        /// DPI band it reported. The three things that have to be identical afterwards.
+        struct Recorded {
+            device_path: String,
+            mode: Option<(u32, u32, u32)>,
+            band: Option<(i32, i32, i32)>,
+        }
+
+        // A path Windows could not name is one that is on its way in or out — a monitor the
+        // driver is still departing, most often — and there is nothing to compare it against
+        // later. It is skipped here for the same reason `pick_owned_display` refuses to write to
+        // one: an unidentifiable display is not a display this harness can reason about.
+        let physical_before: Vec<Recorded> = active_display_paths()
+            .iter()
+            .filter(|p| !p.device_path.is_empty())
+            .map(|p| Recorded {
+                device_path: p.device_path.clone(),
+                mode: current_display_mode(&p.gdi_name),
+                band: read_dpi_band(p.adapter_id, p.source_id),
+            })
+            .collect();
+        log_display_inventory("before the harness");
+
+        const CSS: (u32, u32) = (1920, 1080);
+        let even = |v: f64| (v.round() as u32).clamp(2, 16384) & !1;
+        let ratios = crate::streamer::platform::display_dpr_ladder();
+        let ladder: Vec<(u32, u32)> = ratios
+            .iter()
+            .map(|r| (even(CSS.0 as f64 * r), even(CSS.1 as f64 * r)))
+            .collect();
+
+        let before_paths = attached_display_paths();
+        let id = display
+            .create_display_with_modes(
+                "ScreenExtend dpr probe".to_string(),
+                CSS.0,
+                CSS.1,
+                60,
+                &ladder,
+            )
+            .expect("create display");
+
+        // The name and the identity together, and only then recorded as ours:
+        // `claim_display_identity` is the thing that enrols a path, so it is called once, on the
+        // display this harness actually created, rather than on every candidate it looks at.
+        let mut found = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            let paths = active_display_paths();
+            if let Some(hit) = paths
+                .iter()
+                .find(|p| !p.device_path.is_empty() && !before_paths.contains(&p.device_path))
+            {
+                found = Some((hit.gdi_name.clone(), hit.device_path.clone()));
+                break;
+            }
+        }
+        let Some((name, path)) = found else {
+            display.remove_display(id);
+            println!("the display never attached with an identity of its own");
+            return;
+        };
+        claim_display_identity(&name, &before_paths).expect("the new display has an identity");
+        let target = DisplayTarget {
+            device_path: path.clone(),
+            device_name: name.clone(),
+        };
+        println!("created {name} ({path})");
+
+        println!("\n  DPR   requested         mode landed        scale asked  scale reached");
+        for r in &ratios {
+            let (w, h) = (even(CSS.0 as f64 * r), even(CSS.1 as f64 * r));
+            let want_scale = (r * 100.0).round() as u32;
+            let hz = set_display_mode_owned(&target, w, h, 60, false);
+            std::thread::sleep(Duration::from_millis(250));
+            let landed = monitor_dimensions_owned(&target);
+            let scale = set_display_scale_owned(&target, want_scale);
+            println!(
+                "  {r:<5} {w}x{h}@60   {:?} @{:?}Hz   {want_scale}%   {:?}",
+                landed, hz, scale
+            );
+        }
+
+        // The band this display ended on, for the record: it moves with the resolution, which is
+        // why a DPR that is reachable at one geometry is refused at another.
+        if let Ok(resolved) = resolve_owned_display(&target) {
+            if let Some((cur, lo, hi)) = read_dpi_band(resolved.adapter_id, resolved.source_id) {
+                println!(
+                    "\n  final band: {}% in {}%..{}%",
+                    dpi_percent_at(cur),
+                    dpi_percent_at(lo),
+                    dpi_percent_at(hi)
+                );
+            }
+        }
+
+        // The whole point. Take the display away and keep the target: `\\.\DISPLAYn` is now a
+        // name Windows is free to hand to anything, and both writes must refuse it.
+        display.remove_display(id);
+        forget_display_identity(&path);
+        let gone = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < gone && active_display_paths().iter().any(|p| p.device_path == path)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mode_after_removal = set_display_mode_owned(&target, 1920, 1080, 60, false);
+        let scale_after_removal = set_display_scale_owned(&target, 200);
+        println!("\n  after removal, writing to the stale target:");
+        println!("    set_display_mode_owned  -> {mode_after_removal:?}");
+        println!("    set_display_scale_owned -> {scale_after_removal:?}");
+        assert!(
+            mode_after_removal.is_err(),
+            "a mode write to a removed display must be refused, not land on whatever holds its name"
+        );
+        assert!(
+            scale_after_removal.is_err(),
+            "a DPI write to a removed display must be refused, not land on whatever holds its name"
+        );
+
+        log_display_inventory("after the harness");
+        let now = active_display_paths();
+        for was in &physical_before {
+            let path = &was.device_path;
+            let Some(p) = now.iter().find(|p| &p.device_path == path) else {
+                panic!("{path} is no longer attached; the harness disturbed the desktop");
+            };
+            assert_eq!(
+                current_display_mode(&p.gdi_name),
+                was.mode,
+                "{path} changed mode while the harness drove a virtual display"
+            );
+            assert_eq!(
+                read_dpi_band(p.adapter_id, p.source_id),
+                was.band,
+                "{path} changed DPI while the harness drove a virtual display"
+            );
+        }
+        println!("\n  every display that was not ours is exactly where it was.");
+    }
+
     /// creates a real display for a few seconds. Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "requires the virtual display driver installed; creates a real display; run with --ignored --nocapture"]

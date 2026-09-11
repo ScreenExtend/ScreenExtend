@@ -173,6 +173,16 @@ pub struct AudioOutputsReport {
 
 pub trait DeviceReporter: Send + Sync + std::fmt::Debug {
     fn report_join(&self, device: DeviceInfo);
+    /// The *same* join, offering again after a display change.
+    ///
+    /// A renegotiation is not an arrival: the row is already on the dashboard, the display is
+    /// still up and the user did nothing but change a setting. Reporting it as a join made the
+    /// desktop app raise "a device joined" every time a refresh rate or a DPR moved, which is the
+    /// shape of noise the whole reuse path exists to remove. The default forwards, so a reporter
+    /// that does not care about the distinction keeps its old behaviour.
+    fn report_modify(&self, device: DeviceInfo) {
+        self.report_join(device);
+    }
     /// One join ended. The join id is the identity — the device may still hold other joins, and
     /// its IP is only ever a label.
     fn report_remove(&self, join_id: String, token: String);
@@ -389,6 +399,15 @@ pub fn parse_stun_urls(raw: &str) -> Vec<String> {
 pub struct LiveDisplay {
     pub display_id: u32,
     pub device_name: String,
+    /// The OS's stable name for the *monitor*, as opposed to the slot it occupies.
+    ///
+    /// On Windows `device_name` is a `\\.\DISPLAYn`, which the OS hands straight back out to the
+    /// next display to attach — so a name recorded when this display was created can address a
+    /// different monitor, a physical one included, by the time a reconfigure writes a mode or a
+    /// DPI to it. This is the monitor's device-interface path, and every write re-derives the
+    /// name from it. Empty means "the backend has no such identity", which on Windows refuses
+    /// every write that cannot otherwise prove its target is one of ours.
+    pub device_path: String,
     pub width: u32,
     pub height: u32,
     pub refresh: u32,
@@ -396,7 +415,21 @@ pub struct LiveDisplay {
     pub portrait: bool,
 }
 
+/// What a display write is addressed to: an identity, and the name it last answered to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisplayTarget {
+    pub device_path: String,
+    pub device_name: String,
+}
+
 impl LiveDisplay {
+    pub fn target(&self) -> DisplayTarget {
+        DisplayTarget {
+            device_path: self.device_path.clone(),
+            device_name: self.device_name.clone(),
+        }
+    }
+
     pub fn display_params(&self) -> (u32, u32, u32, u32, bool) {
         (
             self.width,
@@ -1590,6 +1623,7 @@ mod tests {
         let display = |id: u32| LiveDisplay {
             display_id: id,
             device_name: format!("\\\\.\\DISPLAY{id}"),
+            device_path: format!("path-{id}"),
             width: 1920,
             height: 1080,
             refresh: 60,
@@ -1634,6 +1668,7 @@ mod tests {
         let d = LiveDisplay {
             display_id: 4,
             device_name: "4".into(),
+            device_path: "p4".into(),
             width: 1920,
             height: 1080,
             refresh: 120,
@@ -1843,6 +1878,7 @@ mod tests {
             LiveDisplay {
                 display_id: 4,
                 device_name: "DISPLAY7".to_string(),
+                device_path: "p4".into(),
                 width: 1920,
                 height: 1080,
                 refresh: 60,
@@ -1902,6 +1938,7 @@ mod tests {
                 LiveDisplay {
                     display_id: 1,
                     device_name: "d".to_string(),
+                    device_path: "pd".into(),
                     width: 800,
                     height: 600,
                     refresh: 60,
