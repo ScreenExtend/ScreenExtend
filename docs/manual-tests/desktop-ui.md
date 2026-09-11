@@ -215,3 +215,30 @@ save bumps the reconfig epoch, which makes the client rejoin. If that rejoin is 
 token, the settings it was just given belong to nobody and the display comes back at the
 defaults — which reads as "the change did nothing and the screen glitched". That is the bug
 UX-EXIT fixed; this row is what catches it coming back.
+
+## 14. An edit costs the stream only what its class costs (UX-RECONFIG)
+
+The owner's report was that editing a device's *name* disconnected the client. Every row below is
+one class of field from the table in `CLAUDE.md`'s `session.rs` section; read the verdict out of
+`ScreenExtend logs` and the shape of it out of `ScreenExtend devices list --json`, taken before
+and after the save.
+
+Keep a second terminal on `ScreenExtend logs --lines 40` throughout, and note the join id and the
+`joins[].display.id` before each save — those two are what must not move.
+
+| Class | How | Expected |
+|---|---|---|
+| (a) cosmetic | With a device connected, open its sheet, change **only** the name, Save | Nothing in the log but the toast. `joins[]` is unchanged — same join id, same display id, same geometry — and the dashboard row keeps its place rather than disappearing and coming back. The picture does not flicker. |
+| (b) input-only | Toggle **Remote control** off, Save, then move the mouse on the client | `device … settings saved; nothing the live stream reads has changed`. Input stops *immediately*, with no rebuild — this used to need a rejoin to take effect. Toggle it back on and input resumes on the next move. |
+| (b) pointer scope | Change **Pointer scope** to "This display only", Save, then drag with pointer lock held | `[input] pointer scope for device … is now display (1 live session(s))` — the count is the point; a `0` there means it did not reach the running injector. The cursor stops at the streamed display's edge without the session rebuilding. |
+| (c) audio | Change the **Output device**, Save | `/reconfig` carries the new `audioSink` within about a second and the sound moves. **The epoch must not change** — `curl "http://<host>:8080/reconfig?join=<id>"` before and after. A bump here is the defect this row exists for: the sheet pushes this command on every save, so bumping made *every* edit a disconnect. |
+| (e) display scale | Move **Display scale**, Save | `display scale for device … saved` and the extended desktop's DPI changes under a stream that never stops. `joins[].display.scale` is the new value, `.id` is unchanged, and the epoch is unchanged. |
+| (d) stream | Move **Video quality**, Save | `device … changed a stream parameter; 1 live session(s) will renegotiate in place`, then `join … is renegotiating in place; keeping its session and display` and `virtual display id=N untouched (encoder-only edit)`. The join id and display id are unchanged and no new display is created. |
+| (e) display mode | Move **Refresh rate** (or orientation, or pixel ratio), Save | The same two lines, then `virtual display id=N settings changed in place via Windows APIs (WxH@R, scale=S%)`. **One** mode change, not a create and a remove: `ScreenExtend logs \| findstr "virtual display created"` must show no new line, and the windows you had on that display must still be on it. |
+| Two tabs stay two | With the device in two tabs, save any class-(d) edit | `2 live session(s) will renegotiate in place`, two join ids, two display ids, and neither tab inherits the other's display. |
+| A no-op save | Open the sheet and Save without touching anything | `nothing the live stream reads has changed`, and no command reaches the host at all for the fields the sheet knows are unmoved. |
+
+**What a failure looks like.** A `DeviceRemove` followed by a `DeviceJoin` on the dashboard, two
+OS notifications ("device left", "device joined"), a new join id in `devices list --json`, or a
+second `virtual display created` line. Any one of those means the edit took the leave-and-rejoin
+path instead of renegotiating in place.
