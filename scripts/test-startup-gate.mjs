@@ -10,13 +10,17 @@
 // whatever else is missing, and only a host that cannot — after the app has tried to install
 // what it can install — loses "Continue anyway".
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   classifyCompat,
+  classifySetupFailure,
   driverRemediation,
   mayAttempt,
   offersDriverInstall,
+  offersDriverInstallFor,
   recordAttempt,
   repairForBoot,
+  setupErrorBodyKey,
 } from '../src/lib/startup-gate.ts';
 
 let failed = 0;
@@ -230,6 +234,61 @@ test('"Install drivers" is offered only where there is a driver to install', () 
   assert.equal(offersDriverInstall(report([row('input-accessibility', 'optional')])), false);
   assert.equal(offersDriverInstall(report([row('display-driver', 'installable')])), true);
   assert.equal(offersDriverInstall(report([row('display-driver-unresponsive', 'installable')])), true);
+});
+
+console.log('=== what the Setup Error dialog blames ===');
+
+// The defect: `config.json` held `"devices": {"0": {"refreshRate": 30}}`, the bootstrap's replay
+// did `for (const d of config.devices ?? [])`, and the `TypeError: object is not iterable` was
+// caught as a setup failure. The owner was shown "this often occurs due to core drivers or
+// libraries not being installed" about a machine whose drivers were fine, and the dialog's other
+// button offered to install them again.
+
+test('a failing setup() still blames the drivers, and may still offer them', () => {
+  const failure = classifySetupFailure({ setupFailed: true, settingsFailed: false });
+  assert.equal(failure, 'setup');
+  assert.equal(setupErrorBodyKey(failure), 'bootstrap.setupError.bodyBeforePrompt');
+  assert.equal(offersDriverInstallFor(failure, report([row('display-driver', 'installable')])), true);
+});
+
+test('a malformed config is named as settings, never as drivers', () => {
+  const failure = classifySetupFailure({ setupFailed: false, settingsFailed: true });
+  assert.equal(failure, 'settings');
+  assert.equal(setupErrorBodyKey(failure), 'bootstrap.setupError.settingsBody');
+  // The one that matters: no elevation prompt is offered over a configuration file. A driver
+  // install cannot repair a JSON document, and this host carries a driver row that would have
+  // made the button appear under the old, report-only rule.
+  assert.equal(offersDriverInstall(report([row('display-driver', 'installable')])), true);
+  assert.equal(offersDriverInstallFor(failure, report([row('display-driver', 'installable')])), false);
+});
+
+test('anything else in the bootstrap is its own class', () => {
+  const failure = classifySetupFailure({ setupFailed: false, settingsFailed: false });
+  assert.equal(failure, 'internal');
+  assert.equal(setupErrorBodyKey(failure), 'bootstrap.setupError.internalBody');
+  assert.equal(offersDriverInstallFor(failure, report([row('display-driver', 'installable')])), false);
+});
+
+test('setup outranks the settings, because nothing downstream could have worked', () => {
+  assert.equal(classifySetupFailure({ setupFailed: true, settingsFailed: true }), 'setup');
+});
+
+test('every class has its own sentence, and en.json carries all three', () => {
+  const keys = ['setup', 'settings', 'internal'].map(setupErrorBodyKey);
+  assert.equal(new Set(keys).size, 3, keys.join(', '));
+  const strings = JSON.parse(readFileSync(new URL('../src/i18n/locales/en.json', import.meta.url), 'utf8'));
+  const at = key => key.split('.').reduce((node, part) => (node ? node[part] : undefined), strings);
+  for (const key of keys) {
+    assert.equal(typeof at(key), 'string', key + ' is missing from en.json');
+    assert.ok(at(key).length > 0, key + ' is empty');
+  }
+  // The two new ones say the drivers are not the problem, which is the whole point of them.
+  for (const key of ['bootstrap.setupError.settingsBody', 'bootstrap.setupError.internalBody']) {
+    assert.match(at(key), /not a problem with your drivers/i, key);
+  }
+  // And the toast the bootstrap raises when it starts anyway.
+  assert.equal(typeof at('toasts.savedSettings.replayFailedTitle'), 'string');
+  assert.equal(typeof at('toasts.savedSettings.replayFailedDescription'), 'string');
 });
 
 console.log(failed === 0 ? '\nall startup-gate assertions passed' : `\n${failed} failed`);

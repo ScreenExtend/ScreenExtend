@@ -124,6 +124,58 @@ export function recordAttempt(repair: DriverRepair, what: RepairAttempt): Driver
   return { ...repair, [what]: repair[what] + 1 };
 }
 
+/// Why startup stopped, when it stopped — which decides what the Setup Error dialog says.
+///
+/// It used to say one thing: "this often occurs due to core drivers or libraries not being
+/// installed". That sentence was shown for every throw anywhere in the bootstrap, and the one
+/// that reached the owner was `TypeError: object is not iterable` out of the saved-settings
+/// replay, reading a `config.json` whose `devices` key held an object. The machine's drivers
+/// were fine; the dialog sent him to reinstall them.
+///
+/// - `setup` — the Rust `setup` command returned false or threw. Drivers, capture or the
+///   encoder: the original text, and the only class that may offer "Install Drivers".
+/// - `settings` — the saved configuration could not be read or replayed. Nothing is wrong with
+///   the host.
+/// - `internal` — anything else in the bootstrap itself. Not a verdict on the machine either.
+export type SetupFailure = "setup" | "settings" | "internal";
+
+export function classifySetupFailure(what: {
+  setupFailed: boolean;
+  settingsFailed: boolean;
+}): SetupFailure {
+  // `setup` outranks the rest: with no virtual display nothing downstream could have worked
+  // anyway, so blaming the settings for the failure that followed would be the same mistake in
+  // the other direction.
+  if (what.setupFailed) return "setup";
+  if (what.settingsFailed) return "settings";
+  return "internal";
+}
+
+/// The i18n key for the dialog's leading sentence. The rest of the body — the support address
+/// and its punctuation — is shared, so only this part moves.
+export function setupErrorBodyKey(failure: SetupFailure): string {
+  switch (failure) {
+    case "settings":
+      return "bootstrap.setupError.settingsBody";
+    case "internal":
+      return "bootstrap.setupError.internalBody";
+    default:
+      return "bootstrap.setupError.bodyBeforePrompt";
+  }
+}
+
+/// Whether this failure may offer to install the display driver.
+///
+/// Only a failing `setup()` may: a JavaScript error in the bootstrap and a malformed settings
+/// file are both states an elevated driver install cannot improve, and offering it there is how
+/// a config typo turns into a UAC prompt.
+export function offersDriverInstallFor(
+  failure: SetupFailure,
+  report: CompatibilityReport | null
+): boolean {
+  return failure === "setup" && offersDriverInstall(report);
+}
+
 /// Whether the "Install drivers" control has anything to install.
 ///
 /// It used to be offered on every platform, including macOS, where `install_drivers` returns

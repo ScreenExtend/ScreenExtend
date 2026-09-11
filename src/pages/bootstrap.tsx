@@ -16,23 +16,29 @@ import { toast } from "@/components/ui/use-toast";
 
 import {
   createConfig,
+  defaultConfig,
   getConfig,
   updateConfig,
   DEFAULT_AUTO_FRAME_RATE,
   DEFAULT_POINTER_SCOPE,
+  type Config,
 } from "@/components/config-provider";
 import { useGlobalSetters, useLoaded } from "@/components/global-provider";
 import { commands, type CompatibilityReport, type PermissionStatus, type UnsupportedApi } from "@/lib/bindings";
 import { generateOtp, readQrValues } from "@/lib/utils";
 import {
   classifyCompat,
+  classifySetupFailure,
   driverRemediation,
   mayAttempt,
   offersDriverInstall,
+  offersDriverInstallFor,
   recordAttempt,
   repairForBoot,
+  setupErrorBodyKey,
   type DriverRepair,
   type RepairAttempt,
+  type SetupFailure,
 } from "@/lib/startup-gate";
 import { scheduleConfigEditorPreload } from "@/lib/preload-editor";
 import { loadDashboard, loadDevices, loadSettings } from "@/lib/route-chunks";
@@ -136,7 +142,10 @@ export default function Bootstrap() {
   const loaded = useLoaded();
   const { setLoaded, setOtp, setHostedNetworkOn, setSessionId, setQrValues, setPublicSessionsEnabled } = useGlobalSetters();
 
-  const [error, setError] = useState(false);
+  // Why startup stopped, or null while it has not. It was a bare boolean, and the dialog it
+  // opened said "core drivers or libraries" whatever had gone wrong -- including a `TypeError`
+  // out of the saved-settings replay reading a malformed `config.json`.
+  const [failure, setFailure] = useState<SetupFailure | null>(null);
   const [loading, setLoading] = useState(false);
   const [compatReport, setCompatReport] = useState<CompatibilityReport | null>(null);
   const [compatBlocking, setCompatBlocking] = useState(false);
@@ -157,8 +166,120 @@ export default function Bootstrap() {
   const [downloaded, setDownloaded] = useState(0);
   const [total, setTotal] = useState(0);
   const running = useRef(false);
+  // Set by anything in the saved-settings phase that did not work. It does not open a dialog on
+  // its own -- a setting the host would not take is not a reason to refuse to start -- but it is
+  // what lets the dialog name the right cause if startup then fails for another reason.
+  const settingsFailed = useRef(false);
+
+  // Read the saved configuration, creating one on the first run.
+  //
+  // Never throws. A configuration that cannot be read is not one of the three things allowed to
+  // stop the app (`startup-gate.ts`): the host can still create a display, capture and encode,
+  // so it starts on the defaults and says in the log that it did. The old version threw
+  // `config store unreadable after setup` into the catch that opened the driver dialog.
+  const loadSavedSettings = async (): Promise<Config> => {
+    try {
+      let existing = await getConfig();
+      if (!existing) {
+        await createConfig({ name: await commands.getUsername(), theme });
+        existing = await getConfig();
+      }
+      if (existing) return existing;
+      console.error("[bootstrap] the config store is still empty after setup; using the defaults");
+    } catch (e) {
+      console.error("[bootstrap] the saved configuration could not be read; using the defaults", e);
+    }
+    settingsFailed.current = true;
+    // A copy: `defaultConfig` is module-level and shared with every other reader of it.
+    return { ...defaultConfig };
+  };
+
+  // Push the saved configuration into the host. Every step is individually survivable: one
+  // setting the host rejects must not cost the user the other settings, and it must never cost
+  // them the dashboard. What it costs is a line in the log and the toast below.
+  const replaySavedSettings = async (existing: Config): Promise<void> => {
+    const replay: Promise<unknown>[] = [];
+    const step = (what: string, run: () => Promise<unknown>) => {
+      let started: Promise<unknown>;
+      try {
+        started = run();
+      } catch (e) {
+        // A synchronous throw out of a call site, e.g. reading a field off a value the store
+        // held in some shape nothing here anticipated.
+        settingsFailed.current = true;
+        console.error(`[bootstrap] applying ${what} failed`, e);
+        return;
+      }
+      replay.push(started.catch((e: unknown) => {
+        settingsFailed.current = true;
+        console.error(`[bootstrap] applying ${what} failed`, e);
+      }));
+    };
+
+    step("theme", () => setTheme(existing.theme as Theme));
+    const savedPorts = existing.serverPorts;
+    if (savedPorts) {
+      step("serverPorts", () => commands.setServerPorts(savedPorts.http, savedPorts.https));
+    }
+    if (existing.disableGpuEncode) {
+      step("disableGpuEncode", () => commands.setDisableGpuEncode(true));
+    }
+    if (existing.legacyVolumeKeyProxy) {
+      step("legacyVolumeKeyProxy", () => commands.setLegacyVolumeKeyProxy(true));
+    }
+    // Independent per device, so replay them together rather than one IPC round-trip
+    // at a time: with a dozen saved devices the serial version was the longest single
+    // stretch between setup() returning and the dashboard appearing.
+    for (const device of existing.devices) {
+      // Keyed by the device token. A row with none names only an address, which is
+      // recycled between machines, so it waits for that device to join again.
+      if (!device.token) {
+        console.log(`[migrate] saved device ${device.ip} has no token; its settings wait for it to join once more`);
+        continue;
+      }
+      step(`devices[${device.token}]`, () => commands.setDeviceOverride(
+        device.token,
+        device.scale,
+        device.orientation,
+        device.refreshRate,
+        device.videoScale,
+        device.videoQuality,
+        device.remoteControl ?? false,
+        device.dpr ?? device.maxDpr ?? 1,
+        device.systemAudio ?? false
+      ));
+      step(`devices[${device.token}].pointerScope`, () =>
+        commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
+      step(`devices[${device.token}].autoFrameRate`, () =>
+        commands.setDeviceAutoFrameRate(device.token, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
+    }
+    for (const known of existing.knownDevices) {
+      const token = known.token ?? "";
+      if (known.banned) {
+        step(`knownDevices[${token || known.ip}]`, () => commands.setDeviceBanned(token, known.ip, true));
+      } else if (token) {
+        step(`knownDevices[${token}]`, () => commands.setDeviceApproved(token, true));
+      } else {
+        console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
+      }
+    }
+    const turn = existing.turnConfig;
+    if (turn?.urls) {
+      step("turnConfig", () =>
+        commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? ""));
+    }
+    await Promise.all(replay);
+  };
+
+  // The catch-all classifier. `setup()` has its own answer above; everything reaching here is
+  // either a settings phase that already recorded itself or the bootstrap failing on its own.
+  const failStartup = () =>
+    setFailure(classifySetupFailure({ setupFailed: false, settingsFailed: settingsFailed.current }));
 
   const runSetup = async (tryInstall: boolean) => {
+    // Whether `setup()` got as far as answering. Everything after it is the app's own work, and
+    // a failure there is not a verdict on the machine's drivers.
+    let setupAnswered = false;
     try {
       let success;
       if (!loaded) {
@@ -167,60 +288,20 @@ export default function Bootstrap() {
       } else {
         success = loaded;
       }
+      setupAnswered = true;
       if (success) {
-        let existing = await getConfig();
-        if (!existing) {
-          await createConfig({ name: await commands.getUsername(), theme });
-          existing = await getConfig();
-        }
-        if (!existing) throw new Error("config store unreadable after setup");
-        setTheme(existing.theme as Theme);
+        // A retry must not inherit the previous attempt's verdict about the settings.
+        settingsFailed.current = false;
+        const existing = await loadSavedSettings();
         const savedPorts = existing.serverPorts;
-        if (savedPorts) {
-          await commands.setServerPorts(savedPorts.http, savedPorts.https);
+        await replaySavedSettings(existing);
+        if (settingsFailed.current) {
+          toast({
+            variant: "destructive",
+            title: t("toasts.savedSettings.replayFailedTitle"),
+            description: t("toasts.savedSettings.replayFailedDescription"),
+          });
         }
-        if (existing.disableGpuEncode) {
-          await commands.setDisableGpuEncode(true);
-        }
-        if (existing.legacyVolumeKeyProxy) {
-          await commands.setLegacyVolumeKeyProxy(true);
-        }
-        // Independent per device, so replay them together rather than one IPC round-trip
-        // at a time: with a dozen saved devices the serial version was the longest single
-        // stretch between setup() returning and the dashboard appearing.
-        const replay: Promise<unknown>[] = [];
-        for (const device of existing.devices ?? []) {
-          // Keyed by the device token. A row with none names only an address, which is
-          // recycled between machines, so it waits for that device to join again.
-          if (!device.token) {
-            console.log(`[migrate] saved device ${device.ip} has no token; its settings wait for it to join once more`);
-            continue;
-          }
-          replay.push(commands.setDeviceOverride(
-            device.token,
-            device.scale,
-            device.orientation,
-            device.refreshRate,
-            device.videoScale,
-            device.videoQuality,
-            device.remoteControl ?? false,
-            device.dpr ?? device.maxDpr ?? 1,
-            device.systemAudio ?? false
-          ));
-          replay.push(commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
-          replay.push(commands.setDeviceAutoFrameRate(device.token, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
-        }
-        for (const known of existing.knownDevices ?? []) {
-          const token = known.token ?? "";
-          if (known.banned) {
-            replay.push(commands.setDeviceBanned(token, known.ip, true));
-          } else if (token) {
-            replay.push(commands.setDeviceApproved(token, true));
-          } else {
-            console.log(`[migrate] known device ${known.ip} has no trust token; it will need to re-enter the code once`);
-          }
-        }
-        await Promise.all(replay);
         const publicSessionsEnabled = existing.publicSessionsEnabled !== false;
         setPublicSessionsEnabled(publicSessionsEnabled);
 
@@ -255,10 +336,6 @@ export default function Bootstrap() {
         }
         setQrValues(qr.entries);
         setHostedNetworkOn(false);
-        const turn = existing.turnConfig;
-        if (turn?.urls) {
-          await commands.setTurnConfig(turn.urls, turn.username ?? "", turn.credential ?? "");
-        }
         const update = await pendingUpdate();
         if (update) {
           await installUpdate(update);
@@ -282,12 +359,20 @@ export default function Bootstrap() {
           await new Promise(resolve => setTimeout(resolve, 5000));
           await runSetup(false);
         } else {
-          setError(true);
+          setFailure("setup");
         }
       }
     } catch (e) {
+      // `setup()` itself is awaited above and its own failure is `setup`; anything else in here
+      // is either the settings replay (which records itself and does not throw) or the bootstrap
+      // going wrong on its own. The dialog now says which, instead of naming drivers for all
+      // three -- the throw the owner hit was `object is not iterable` out of a malformed
+      // `config.json`, on a machine whose drivers were fine.
       console.error("setup failed", e);
-      setError(true);
+      setFailure(classifySetupFailure({
+        setupFailed: !setupAnswered,
+        settingsFailed: settingsFailed.current,
+      }));
     }
   };
 
@@ -388,7 +473,7 @@ export default function Bootstrap() {
     setPermReport(perms);
     if (!perms.some(blocks)) {
       setPermReport(null);
-      proceed().catch(() => setError(true));
+      proceed().catch(() => failStartup());
     }
   };
 
@@ -530,7 +615,7 @@ export default function Bootstrap() {
       }
     } catch (e) {
       console.error("startup failed", e);
-      setError(true);
+      failStartup();
     }
   };
 
@@ -550,7 +635,7 @@ export default function Bootstrap() {
   useEffect(() => {
     if (running.current) return;
     running.current = true;
-    start().catch(() => setError(true));
+    start().catch(() => failStartup());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -569,7 +654,7 @@ export default function Bootstrap() {
           if (!perms.some(blocks)) {
             stopped = true;
             setPermReport(null);
-            proceed().catch(() => setError(true));
+            proceed().catch(() => failStartup());
           }
         })
         .catch(() => { /* transient; the next tick tries again */ })
@@ -675,7 +760,7 @@ export default function Bootstrap() {
                 try {
                   await proceed();
                 } catch {
-                  setError(true);
+                  failStartup();
                 }
               }}
             >
@@ -688,13 +773,16 @@ export default function Bootstrap() {
       <p className="text-xl font-semibold">
         {remediating ? t("bootstrap.installingDriver") : t("bootstrap.starting")}
       </p>
-      <AlertDialog open={error}>
+      <AlertDialog open={failure !== null}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("bootstrap.setupError.title")}</AlertDialogTitle>
+            {/* Same dialog, same layout, same two buttons -- only the sentence that names the
+                cause moves. Blaming the display driver for a malformed `config.json` is what
+                sent the owner reinstalling a driver that was working. */}
             <AlertDialogDescription>
-              {t("bootstrap.setupError.bodyBeforePrompt")}
-              {offersDriverInstall(lastReport) && <b>{t("bootstrap.setupError.installPrompt")}</b>}
+              {t(setupErrorBodyKey(failure ?? "setup"))}
+              {offersDriverInstallFor(failure ?? "setup", lastReport) && <b>{t("bootstrap.setupError.installPrompt")}</b>}
               {t("bootstrap.setupError.bodyAfterPrompt")}<a href={`mailto:${t("common.supportEmail")}`} target="_blank" style={{ textDecoration: "underline" }}>{t("common.supportEmail")}</a>{t("bootstrap.setupError.contactSuffix")}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -721,7 +809,7 @@ export default function Bootstrap() {
               onClick={async () => {
                 setLoading(true);
                 try {
-                  if (offersDriverInstall(lastReport)) {
+                  if (offersDriverInstallFor(failure ?? "setup", lastReport)) {
                     await commands.installDrivers();
                     await new Promise(resolve => setTimeout(resolve, 5000));
                   }
@@ -736,12 +824,12 @@ export default function Bootstrap() {
                 } finally {
                   setLoading(false);
                 }
-                setError(false);
+                setFailure(null);
                 await runSetup(false);
               }}
               disabled={loading}
             >
-              {offersDriverInstall(lastReport)
+              {offersDriverInstallFor(failure ?? "setup", lastReport)
                 ? t("bootstrap.setupError.install")
                 : t("bootstrap.setupError.retry")}
             </AlertDialogAction>
@@ -793,7 +881,7 @@ export default function Bootstrap() {
                 try {
                   await proceed();
                 } catch {
-                  setError(true);
+                  failStartup();
                 }
               }}
             >
@@ -878,7 +966,7 @@ export default function Bootstrap() {
                 className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
                 onClick={() => {
                   setCompatReport(null);
-                  proceed().catch(() => setError(true));
+                  proceed().catch(() => failStartup());
                 }}
               >
                 {t("common.retry")}
@@ -892,7 +980,7 @@ export default function Bootstrap() {
                   try {
                     await runSetup(true);
                   } catch {
-                    setError(true);
+                    failStartup();
                     return;
                   }
                   try {
