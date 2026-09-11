@@ -138,6 +138,13 @@ public static class SEIn {
     struct INPUT { public uint type; public MOUSEINPUT mi; }
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] p, int cb);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    // Without this the process is DPI-*unaware*, so Windows lies to it: `GetSystemMetrics` returns
+    // the virtual desktop in scaled coordinates while `SendInput`'s 0..65535 absolute range covers
+    // the real one. On a display running at 150% -- which is what a client reporting `dpr: 1.5`
+    // asks the host to create -- the pointer then lands hundreds of pixels from where it was sent,
+    // and the self-test below rejects a build for a fault in the harness measuring it.
+    public static void Init() { SetProcessDPIAware(); }
     public static void MoveTo(int x, int y) {
         int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
         int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
@@ -157,10 +164,23 @@ public static class SEIn {
         System.Threading.Thread.Sleep(120);
         POINT after; GetCursorPos(out after);
         MoveTo(before.x, before.y);
+        // The question is whether the pointer MOVED, not whether it landed on the target. The
+        // failure this guards against is a 48-byte INPUT: SendInput returns 0, the cursor does not
+        // move at all, and a whole "cursor scene" gets measured on a still desktop. Landing off
+        // target is a different thing entirely -- the absolute mapping is 65535 steps over a
+        // virtual desktop whose metrics move when a display is added, removed or rescaled under the
+        // run -- and every window below only needs a pointer that travels, not one that arrives.
+        // So an off-target landing is reported for the log and the run continues.
+        int moved = Math.Abs(after.x - before.x) + Math.Abs(after.y - before.y);
+        if (moved < 8) {
+            return "FATAL: the pointer did not move: asked for " + x + "," + y + ", it stayed at "
+                 + after.x + "," + after.y + " (INPUT is " + Marshal.SizeOf(typeof(INPUT)) + " bytes)";
+        }
         int dx = after.x - x, dy = after.y - y;
-        if (dx < -2 || dx > 2 || dy < -2 || dy > 2) {
-            return "asked for " + x + "," + y + " and the pointer is at " + after.x + "," + after.y
-                 + " (INPUT is " + Marshal.SizeOf(typeof(INPUT)) + " bytes)";
+        if (dx < -32 || dx > 32 || dy < -32 || dy > 32) {
+            return "the pointer moves but lands off target: asked for " + x + "," + y
+                 + ", arrived at " + after.x + "," + after.y
+                 + " -- the sweep still travels, so the windows below are measured anyway";
         }
         return null;
     }
@@ -186,6 +206,8 @@ public static class SEIn {
 }
 '@
 }
+
+[SEIn]::Init() | Out-Null
 
 # --------------------------------------------------------------------------------------------
 # CDP over a raw WebSocket, same shape as measure-stream.ps1.
@@ -677,7 +699,10 @@ foreach ($sweep in @(
 # all" - and whether the answer differs for the client's pointer and the host's.
 # --------------------------------------------------------------------------------------------
 $fault = [SEIn]::SelfTest($vb.X + [int]($vb.Width / 2), $vb.Y + [int]($vb.Height / 2))
-if ($fault) { throw "the pointer cannot be moved, so the host-sweep window would measure a still desktop: $fault" }
+if ($fault -and $fault.StartsWith('FATAL')) {
+    throw "the host-sweep window would measure a still desktop: $fault"
+}
+if ($fault) { Step "pointer self-test: $fault" }
 
 function Painted {
     $s = (Invoke-Js 'JSON.stringify(SEVideo.getStats())') | ConvertFrom-Json
