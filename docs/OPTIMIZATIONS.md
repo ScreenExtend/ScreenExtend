@@ -3607,10 +3607,16 @@ arriving sooner than three quarters of a frame period behind the last. Its own c
 cursor has to be asked about *before* both gates "because both of them would otherwise throw the
 frame that carries the pointer's new position away" — and the dirty-region gate below it does
 consult `cursor_moved`, while this one never did. 257 of 475 delivered frames were dropped here in
-the before run. A cursor-moved frame now gets a half-period window instead of a three-quarter one:
-shorter, so an early frame is never thrown away, and still a bound — `WGC_MIN_UPDATE_INTERVAL` is
-4 ms, so an outright exemption would let a moving cursor deliver 250 fps to a client that asked
-for 60.
+the before run. A cursor-moved frame now gets a two-thirds-period window instead of a
+three-quarter one — which is the baseline's own ceiling, arrived at from the other side: it asked
+WGC for `MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)` and had no gate of its own.
+
+The window has to be looser than the compositor's real cadence or it becomes a worse gate than the
+one it replaces. A half period is 8.33 ms at 60 fps, DWM composes at very nearly that, and a hard
+floor against an equal interval drops every frame arriving a jitter early — measured at 70 fps,
+below the unbounded 113 *and* below the baseline's 85. An outright exemption is not the answer
+either: `WGC_MIN_UPDATE_INTERVAL` is 4 ms, so an exempt cursor could deliver 250 fps to a client
+that asked for 60 and charge it to the device least able to afford the decode.
 
 **3. The keepalive collapsed from 200 ms to the frame period.** That was the polled cursor's only
 clock, so it had to. It also meant nine times the NVENC submissions, keyed-mutex traffic and socket

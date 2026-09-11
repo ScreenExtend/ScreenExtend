@@ -656,8 +656,12 @@ Cross-platform core, OS-independent:
   frame period, and never reached at all in a scene where real frames keep arriving. It measured 59
   fps for a pointer sweep against 85 with WGC drawing it, so it is **off by default** and reachable
   with `SE_CURSOR_OVERLAY=1`. Both frame gates in `on_frame_arrived` must consult `cursor_moved`:
-  the dirty-region one always did, the cadence one did not, and that alone threw away 257 of 475
-  delivered frames. See `docs/OPTIMIZATIONS.md` UX-INPUT.
+  the dirty-region one always did, the cadence one did not, and that alone threw away 982 delivered
+  frames in one run. A cursor-moved frame gets a **two-thirds-period** window, which is the ceiling
+  the baseline reached from the other side (it asked WGC for `frame_duration * 2 / 3` and had no
+  gate). The window has to stay looser than DWM's real cadence: at half a period it drops every
+  frame arriving a jitter early and lands *below* the baseline. See `docs/OPTIMIZATIONS.md`
+  UX-INPUT.
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
   and is otherwise only reached by WGC failing, which is why the probe harness has
   `--capture-backend dxgi` to force it.

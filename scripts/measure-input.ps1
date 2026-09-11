@@ -288,7 +288,48 @@ function Start-OwnerGui {
     if (-not (Test-Path $OwnerGui)) { Write-Warning "the owner's GUI is not built at $OwnerGui"; return }
     if (Se-Hosts | Where-Object { "$($_.Path)" -eq $OwnerGui }) { return }
     $g = Start-Process -FilePath $OwnerGui -PassThru
-    Step "relaunched the owner's GUI, pid $($g.Id)"
+    # Launching it is not the same as it working: a `config.json` the bootstrap cannot replay stops
+    # it at a Setup Error dialog, and "relaunched, pid N" would be a true statement about a host
+    # that never came up. Listening on its ports is the cheapest proof it got past setup.
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 500
+        if ($g.HasExited) { Write-Warning "the owner's GUI exited during startup"; return }
+        $listening = (Get-NetTCPConnection -State Listen -EA SilentlyContinue |
+                Where-Object { $_.LocalPort -in 8080, 8443 }).Count
+        if ($listening -gt 0) { Step "relaunched the owner's GUI, pid $($g.Id) (serving)"; return }
+    }
+    Write-Warning "the owner's GUI (pid $($g.Id)) is running but never served 8080/8443 -- check it reached the dashboard"
+}
+
+# Put the owner's `config.json` back, and never put back something the bootstrap cannot read.
+#
+# Idempotent, and called from the trap as well as the normal exit, because the first version of
+# this harness cleared `devices` and then threw in phase 1 -- which left the file cleared and lost
+# a saved device row. `devices` and `knownDevices` must both come back as JSON *arrays*: an object
+# there ("devices": {"0": {...}}, the shape a dotted `config set` key produces) makes the
+# bootstrap's replay loop throw "object is not iterable" and the GUI stops at a Setup Error. If the
+# backup itself is malformed, the offending key is written as an empty array rather than restored,
+# because handing back a file that cannot be read is worse than handing back one that is empty.
+function Restore-Config {
+    if (-not (Test-Path $storeBackup)) { return }
+    try {
+        $j = Get-Content -Raw $storeBackup | ConvertFrom-Json
+        foreach ($k in 'devices', 'knownDevices') {
+            $v = $j.$k
+            if ($null -ne $v -and $v -isnot [System.Object[]]) {
+                Write-Warning "the saved config's '$k' is a $($v.GetType().Name), not an array; writing [] instead of restoring it"
+                $j.$k = @()
+            }
+        }
+        # No BOM: tauri-plugin-store cannot parse one, and a store it cannot parse is silently
+        # replaced by `defaultConfig` -- which throws away every device, every known device, the
+        # ports, TURN and STUN on the next launch.
+        [IO.File]::WriteAllText($storeFile, ($j | ConvertTo-Json -Depth 12), (New-Object Text.UTF8Encoding $false))
+        $back = Get-Content -Raw $storeFile | ConvertFrom-Json
+        Step ("config restored: devices={0} knownDevices={1}" -f @($back.devices).Count, @($back.knownDevices).Count)
+    } catch {
+        Write-Warning "could not restore the saved config from ${storeBackup}: $_"
+    }
 }
 
 Claim-HostLock
@@ -309,6 +350,16 @@ if (Test-Path $storeFile) {
                 (New-Object Text.UTF8Encoding $false))
         }
     } catch { Write-Warning "could not clear the saved device row: $_" }
+}
+
+# From here the owner's config is modified, so every exit path has to put it back. `trap` fires on
+# any terminating error, which is what the first version of this harness did not have: a throw in
+# phase 1 left `devices` cleared and a saved device row was lost.
+trap {
+    Write-Warning "run failed: $_"
+    Restore-Config
+    Start-OwnerGui
+    break
 }
 
 $alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
@@ -853,7 +904,7 @@ if ($hostProc -and -not $hostProc.HasExited) {
         Stop-Process -Id $hostProc.Id -Force -EA SilentlyContinue
     }
 }
-if (Test-Path $storeBackup) { Copy-Item $storeBackup $storeFile -Force }
+Restore-Config
 Remove-Item Env:\SE_INPUT_TRACE -EA SilentlyContinue
 Start-OwnerGui
 

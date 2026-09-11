@@ -3416,13 +3416,19 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // box, a pointer sweep over an otherwise static indirect display had 257 of 475 delivered
         // frames dropped here, and the client painted 59 fps against 85 with the gate absent.
         //
-        // Half a period rather than none, because "none" is not a rate at all: `WGC_MIN_UPDATE_INTERVAL`
-        // is 4 ms, so an exempt cursor could deliver 250 fps to a client that asked for 60 and pay
-        // for it in decode work on the device least able to afford it. Twice the asked rate is the
-        // ceiling — enough that a frame is never thrown away for arriving merely a little early,
-        // bounded enough that it stays a stream the client agreed to.
+        // A shorter window rather than none, because "none" is not a rate at all:
+        // `WGC_MIN_UPDATE_INTERVAL` is 4 ms, so an exempt cursor could deliver 250 fps to a client
+        // that asked for 60 and charge it to the device least able to afford the decode.
+        //
+        // Two thirds of a period is the baseline's own ceiling, arrived at from the other side: it
+        // asked WGC for `MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)` and had no
+        // gate of its own, and measured 85 fps for a pointer sweep. It has to be looser than the
+        // compositor's actual cadence or it becomes a worse gate than the one it replaces — a half
+        // period is 8.33 ms at 60 fps, DWM composes at very nearly that, and a hard floor against
+        // an equal interval drops every frame that arrives a jitter early: measured 70 fps, below
+        // both the unbounded 113 and the baseline's 85.
         let window = if cursor_moved {
-            self.frame_period / 2
+            self.frame_period * 2 / 3
         } else {
             self.frame_period * CADENCE_NUM / CADENCE_DEN
         };
