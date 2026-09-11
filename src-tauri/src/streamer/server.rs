@@ -2051,7 +2051,7 @@ async fn start_session(
                     remove_display_async(client, display_id).await;
                 }
             }
-            abandon_failed_attempt(&state, &join_id, still_current());
+            abandon_failed_attempt(state, &join_id, still_current());
             return Err(e.context("WHEP handshake"));
         }
     };
@@ -2059,7 +2059,7 @@ async fn start_session(
         Ok(v) => v,
         Err(e) => {
             pending.abandon().await;
-            abandon_failed_attempt(&state, &join_id, still_current());
+            abandon_failed_attempt(state, &join_id, still_current());
             return Err(e);
         }
     };
@@ -2090,7 +2090,7 @@ async fn start_session(
                 }
                 remove_display_async(client, display_id).await;
             }
-            abandon_failed_attempt(&state, &join_id, still_current());
+            abandon_failed_attempt(state, &join_id, still_current());
             return Err(e.context("WHEP activation"));
         }
     };
