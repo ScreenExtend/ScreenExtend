@@ -1644,6 +1644,7 @@ async fn start_session(
     let desired = session::LiveDisplay {
         display_id: 0,
         device_name: String::new(),
+        device_path: String::new(),
         width,
         height,
         refresh,
@@ -1659,21 +1660,56 @@ async fn start_session(
     // handshake term comes out of time-to-first-frame entirely. On a LAN that is 13-20 ms of a
     // ~1600 ms join; on a relayed path, where the host gather runs to its 1500 ms cap against a
     // 1500-2100 ms display term, it is most of the gather.
+    // Whether this attempt is still the one the session is waiting on.
+    //
+    // Two saves in quick succession are two `POST /whep` for the same join, and the second
+    // arrives while the first is still setting a mode and writing a DPI. Both then command the
+    // same display, in an order nobody chose, and the loser's `start_on_monitor` builds an
+    // encoder and a capture session for a mode the winner has already replaced. Each attempt
+    // therefore checks its own sequence number at the points where it is about to spend
+    // something, and the older one stands down — the same rule the teardown task already uses,
+    // moved to where the work is.
+    let still_current = {
+        let sessions = state.config.sessions.clone();
+        let join = join_id.clone();
+        move || {
+            sessions
+                .as_ref()
+                .map(|s| session::is_current_session(s, &join, session_seq))
+                .unwrap_or(true)
+        }
+    };
+
     let t_display = std::time::Instant::now();
     let display_and_pipeline = async {
         let mut mode_applied = true;
-        let (display_id, device_name) = match existing.clone() {
+        // What the display's DPI is actually at when this is done. Not always `scale`: a display
+        // reports the band of steps it will take, so a DPR above that band lands on the closest
+        // step, and the session has to record the truth or the next edit compares against a value
+        // no display ever held. The same goes for the refresh rate: an IDD monitor's mode list is
+        // fixed at create time, so a rate that was never registered is refused and the display
+        // keeps the one it had.
+        let applied_scale;
+        let mut applied_refresh = refresh;
+        let (display_id, device_name, device_path) = match existing.clone() {
             Some(prev) => {
                 let display_changed = prev.display_params() != desired.display_params();
+                let target = prev.target();
+                if display_changed && !still_current() {
+                    bail!(
+                        "join {join_id} was superseded by a newer offer before its mode change; \
+                         standing down"
+                    );
+                }
                 if display_changed {
                     let name = prev.device_name.clone();
-                    let name2 = name.clone();
+                    let write = target.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        pipeline::set_display_mode(&name2, width, height, refresh, swap_axes)
+                        pipeline::set_display_mode_owned(&write, width, height, refresh, swap_axes)
                     })
                     .await;
                     match res {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(hz)) => applied_refresh = hz,
                         Ok(Err(e)) => {
                             mode_applied = false;
                             teprintln!("could not apply display mode to {name}: {e}");
@@ -1683,24 +1719,58 @@ async fn start_session(
                             teprintln!("set-mode task for {name} panicked: {e}");
                         }
                     }
-                    wait_for_display_settle(&name, Some(monitor_dims(width, height, swap_axes)))
+                    // Only what actually landed gets a settle and a DPI write. Running both after
+                    // a refused mode change spent four seconds of the client's reconnect budget
+                    // polling a display that had not moved, and then wrote a DPI derived from a
+                    // resolution the display was not at — with the session already reporting the
+                    // old geometry back, because `mode_applied` is false. The session stays at the
+                    // mode it had and says so.
+                    if mode_applied {
+                        wait_for_display_settle(
+                            &target,
+                            Some(monitor_dims(width, height, swap_axes)),
+                        )
                         .await;
-                    apply_display_scale(&name, scale).await;
-                    tprintln!(
-                    "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{refresh}, scale={scale}%)",
-                    prev.display_id
-                );
+                        applied_scale = apply_display_scale(&target, scale)
+                            .await
+                            .unwrap_or(prev.scale);
+                        tprintln!(
+                            "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{applied_refresh}, scale={applied_scale}%)",
+                            prev.display_id
+                        );
+                        if applied_refresh != refresh {
+                            teprintln!(
+                                "virtual display id={} would not run at {refresh} Hz (its mode \
+                                 list was fixed when it was created); it is at {applied_refresh} Hz",
+                                prev.display_id
+                            );
+                        }
+                    } else {
+                        applied_scale = prev.scale;
+                        applied_refresh = prev.refresh;
+                        teprintln!(
+                            "virtual display id={} refused {width}x{height}@{refresh}; keeping the \
+                             mode and the DPI it already has",
+                            prev.display_id
+                        );
+                    }
                 } else {
+                    applied_scale = prev.scale;
+                    applied_refresh = prev.refresh;
                     tprintln!(
                         "virtual display id={} untouched (encoder-only edit)",
                         prev.display_id
                     );
                 }
-                (prev.display_id, prev.device_name.clone())
+                (
+                    prev.display_id,
+                    prev.device_name.clone(),
+                    prev.device_path.clone(),
+                )
             }
             None => {
                 let extra_modes = dpr_mode_ladder(req.width, req.height);
-                let (display_id, device_name, topology_reset) = {
+                let (display_id, device_name, device_path, topology_reset) = {
                     // Held only for as long as the before/after device-name diff needs exclusivity.
                     // A second device joining seconds after the first used to wait out the first's
                     // whole create-and-attach window — up to `DISPLAY_ATTACH_TIMEOUT` — before its own
@@ -1717,6 +1787,14 @@ async fn start_session(
                     let before = tokio::task::spawn_blocking(pipeline::monitor_device_names)
                         .await
                         .unwrap_or_default();
+                    // The identities attached before the create, so the one that turns up
+                    // afterwards can be checked against them. A correlation that hands back a
+                    // display which was already there is a mis-correlation, and recording it as
+                    // ours would make every later ownership check agree with the mistake.
+                    let paths_before =
+                        tokio::task::spawn_blocking(pipeline::attached_display_paths)
+                            .await
+                            .unwrap_or_default();
 
                     let display_id = {
                         let client = client.clone();
@@ -1762,8 +1840,32 @@ async fn start_session(
                     };
                     match attached {
                         Some(name) => {
-                            tprintln!("virtual display id={display_id} attached as {name}");
-                            (display_id, name, topology_reset)
+                            // The identity, read back while the correlation lock still keeps
+                            // another join from creating a display between the two reads. Every
+                            // later write to this display resolves its name from this, and a
+                            // display whose identity cannot be established is not one we are
+                            // willing to command: it would be commanded by name, and a name is
+                            // exactly what moves.
+                            let ident = {
+                                let n = name.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    pipeline::claim_display_identity(&n, &paths_before)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            };
+                            let Some(device_path) = ident else {
+                                remove_display_now(client, display_id).await;
+                                bail!(
+                                    "virtual display {display_id} attached as {name}, which was \
+                                     already there before the create; refusing to drive it"
+                                );
+                            };
+                            tprintln!(
+                                "virtual display id={display_id} attached as {name} ({device_path})"
+                            );
+                            (display_id, name, device_path, topology_reset)
                         }
                         None => {
                             // Still inside the correlation lock, so this is the unlocked form.
@@ -1786,35 +1888,40 @@ async fn start_session(
                     );
                 }
 
+                let fresh = session::DisplayTarget {
+                    device_path: device_path.clone(),
+                    device_name: device_name.clone(),
+                };
+
                 if !already_at_size {
-                    let name = device_name.clone();
+                    let write = fresh.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        pipeline::set_display_mode(&name, width, height, refresh, swap_axes)
+                        pipeline::set_display_mode_owned(&write, width, height, refresh, swap_axes)
                     })
                     .await;
                     match res {
-                    Ok(Ok(())) => tprintln!(
-                        "virtual display {device_name} set to {width}x{height}@{refresh} (portrait={portrait})"
-                    ),
-                    Ok(Err(e)) => {
-                        mode_applied = false;
-                        teprintln!("could not force {device_name} to {width}x{height}: {e}");
+                        Ok(Ok(hz)) => {
+                            applied_refresh = hz;
+                            tprintln!(
+                            "virtual display {device_name} set to {width}x{height}@{hz} (portrait={portrait})"
+                        );
+                        }
+                        Ok(Err(e)) => {
+                            mode_applied = false;
+                            teprintln!("could not force {device_name} to {width}x{height}: {e}");
+                        }
+                        Err(e) => {
+                            mode_applied = false;
+                            teprintln!("set-mode task for {device_name} panicked: {e}");
+                        }
                     }
-                    Err(e) => {
-                        mode_applied = false;
-                        teprintln!("set-mode task for {device_name} panicked: {e}");
-                    }
-                }
                 }
 
-                if !already_at_size {
-                    wait_for_display_settle(
-                        &device_name,
-                        Some(monitor_dims(width, height, swap_axes)),
-                    )
-                    .await;
+                if !already_at_size && mode_applied {
+                    wait_for_display_settle(&fresh, Some(monitor_dims(width, height, swap_axes)))
+                        .await;
                 }
-                apply_display_scale(&device_name, scale).await;
+                applied_scale = apply_display_scale(&fresh, scale).await.unwrap_or(scale);
                 if topology_reset {
                     if let Some(sessions) = state.config.sessions.as_ref() {
                         let others = session::live_displays_except(sessions, &join_id);
@@ -1823,20 +1930,23 @@ async fn start_session(
                         }
                     }
                 }
-                (display_id, device_name)
+                (display_id, device_name, device_path)
             }
+        };
+        let target = session::DisplayTarget {
+            device_path: device_path.clone(),
+            device_name: device_name.clone(),
         };
 
         if let Some(s) = state.config.sessions.as_ref() {
             session::set_host_ip(s, &join_id, state.config.lan_ip.clone());
-            let landed = if mode_applied {
-                session::LiveDisplay {
-                    display_id,
-                    device_name: device_name.clone(),
-                    ..desired
+            let outcome = if mode_applied {
+                ModeOutcome::Applied {
+                    scale: applied_scale,
+                    refresh: applied_refresh,
                 }
             } else {
-                let actual = read_back_dimensions(&device_name, swap_axes)
+                let actual = read_back_dimensions(&target, swap_axes)
                     .await
                     .or_else(|| existing.as_ref().map(|p| (p.width, p.height)))
                     .unwrap_or((width, height));
@@ -1846,15 +1956,24 @@ async fn start_session(
                     actual.0,
                     actual.1
                 );
-                session::LiveDisplay {
-                    display_id,
-                    device_name: device_name.clone(),
+                ModeOutcome::Refused {
                     width: actual.0,
                     height: actual.1,
-                    ..desired
+                    scale: applied_scale,
+                    refresh: applied_refresh,
                 }
             };
-            session::set_live_display(s, &join_id, landed);
+            session::set_live_display(
+                s,
+                &join_id,
+                landed_display(
+                    &desired,
+                    display_id,
+                    device_name.clone(),
+                    device_path.clone(),
+                    outcome,
+                ),
+            );
         }
 
         let display_ms = t_display.elapsed().as_secs_f64() * 1000.0;
@@ -1863,6 +1982,12 @@ async fn start_session(
         // display enumeration, a D3D11 device, the scaler, an NVENC/oneVPL/x264 session and the
         // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
         // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
+        if !still_current() {
+            bail!(
+                "join {join_id} was superseded by a newer offer before its capture started; \
+                 standing down"
+            );
+        }
         let t_pipeline = std::time::Instant::now();
         let session = {
             let cfg = cfg.clone();
@@ -1920,14 +2045,12 @@ async fn start_session(
                 session.stop();
                 if !existed_before {
                     if let Some(s) = state.config.sessions.as_ref() {
-                        let _ = session::take_live_display(s, &join_id);
+                        forget_display(session::take_live_display(s, &join_id));
                     }
                     remove_display_async(client, display_id).await;
                 }
             }
-            if let Some(s) = state.config.sessions.as_ref() {
-                session::remove_session(s, &join_id);
-            }
+            abandon_failed_attempt(&state, &join_id, still_current());
             return Err(e.context("WHEP handshake"));
         }
     };
@@ -1935,9 +2058,7 @@ async fn start_session(
         Ok(v) => v,
         Err(e) => {
             pending.abandon().await;
-            if let Some(s) = state.config.sessions.as_ref() {
-                session::remove_session(s, &join_id);
-            }
+            abandon_failed_attempt(&state, &join_id, still_current());
             return Err(e);
         }
     };
@@ -1964,13 +2085,11 @@ async fn start_session(
             session.stop();
             if !existed_before {
                 if let Some(s) = state.config.sessions.as_ref() {
-                    let _ = session::take_live_display(s, &join_id);
+                    forget_display(session::take_live_display(s, &join_id));
                 }
                 remove_display_async(client, display_id).await;
             }
-            if let Some(s) = state.config.sessions.as_ref() {
-                session::remove_session(s, &join_id);
-            }
+            abandon_failed_attempt(&state, &join_id, still_current());
             return Err(e.context("WHEP activation"));
         }
     };
@@ -1980,7 +2099,7 @@ async fn start_session(
     );
 
     if let Some(reporter) = state.config.device_reporter.as_ref() {
-        reporter.report_join(DeviceInfo {
+        let info = DeviceInfo {
             join_id: join_id.clone(),
             ip: client_ip.to_string(),
             token: device_token.to_string(),
@@ -1990,7 +2109,15 @@ async fn start_session(
             refresh_rate: detected_refresh,
             portrait,
             dpr: req.dpr,
-        });
+        };
+        // A renegotiation is the row moving, not a device arriving. Reported as a join it was
+        // indistinguishable from one: the dashboard replaced the row — correctly — and then
+        // raised "a device joined" over the desktop, every time a refresh rate or a DPR changed.
+        if continuing.is_some() {
+            reporter.report_modify(info);
+        } else {
+            reporter.report_join(info);
+        }
     }
 
     let leave = state
@@ -2090,7 +2217,7 @@ async fn start_session(
             }
         );
         if let Some(s) = sessions.as_ref() {
-            let _ = session::take_live_display(s, &report_join);
+            forget_display(session::take_live_display(s, &report_join));
             // Keyed by join, the map gains an entry for every tab ever opened unless the last
             // teardown forgets it. Keyed by address it never had to.
             session::remove_session(s, &report_join);
@@ -2102,6 +2229,96 @@ async fn start_session(
     });
 
     Ok((answer, resource_id))
+}
+
+/// Forget a session whose join attempt failed — unless a newer attempt has taken it over.
+///
+/// A failed attempt used to remove the session outright, which is right when it was the only one
+/// and catastrophic when it was not: a second save arriving while the first renegotiation is
+/// still running makes two attempts on one join, and the loser's failure would then delete the
+/// entry the winner is about to record its display in. The session survives, the display it owns
+/// survives with it, and nothing is left holding a display with no session to reap it.
+fn abandon_failed_attempt(state: &AppState, join_id: &str, mine: bool) {
+    let Some(s) = state.config.sessions.as_ref() else {
+        return;
+    };
+    if !mine {
+        tprintln!("join {join_id} failed but a newer offer owns it now; leaving the session alone");
+        return;
+    }
+    session::remove_session(s, join_id);
+}
+
+/// What a mode change actually did, as opposed to what it was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeOutcome {
+    /// The display took the mode. `scale` is the DPI it settled at and `refresh` the rate it is
+    /// running at, neither of which is always the one requested: a display reports the band of
+    /// DPI steps it will take, and an IDD monitor's mode list is fixed when it is created.
+    Applied { scale: u32, refresh: u32 },
+    /// The display refused it and is still where it was. `width`/`height` are what it reports
+    /// now, `scale` the DPI it still holds and `refresh` the rate it kept — no DPI and no rate
+    /// are written when the mode is refused.
+    Refused {
+        width: u32,
+        height: u32,
+        scale: u32,
+        refresh: u32,
+    },
+}
+
+/// What the session records after a mode change.
+///
+/// A refused mode leaves the display exactly where it was, and leaves its DPI alone with it. So
+/// recording the *requested* geometry and the *requested* scale is not a small inaccuracy: it is
+/// what makes the next edit compare equal, decide there is nothing to do, and leave the client
+/// rendering at a mode and a ratio the display has never held — with no way back, because every
+/// subsequent save agrees that the display is already there.
+fn landed_display(
+    desired: &session::LiveDisplay,
+    display_id: u32,
+    device_name: String,
+    device_path: String,
+    outcome: ModeOutcome,
+) -> session::LiveDisplay {
+    let base = session::LiveDisplay {
+        display_id,
+        device_name,
+        device_path,
+        ..desired.clone()
+    };
+    match outcome {
+        ModeOutcome::Applied { scale, refresh } => session::LiveDisplay {
+            scale,
+            refresh,
+            ..base
+        },
+        ModeOutcome::Refused {
+            width,
+            height,
+            scale,
+            refresh,
+        } => session::LiveDisplay {
+            width,
+            height,
+            scale,
+            refresh,
+            ..base
+        },
+    }
+}
+
+/// Stop treating a display as one of ours, so no later write can reach it.
+///
+/// The ownership set is what every mode and DPI write is checked against, and a display that has
+/// been taken down is not one this host may command — its device path is gone and the GDI name it
+/// held belongs to whatever attaches next.
+fn forget_display(taken: Option<session::LiveDisplay>) {
+    if let Some(d) = taken {
+        if !d.device_path.is_empty() {
+            pipeline::forget_display_identity(&d.device_path);
+        }
+    }
 }
 
 /// Remove a display, holding the correlation lock while it happens.
@@ -2146,9 +2363,12 @@ fn monitor_dims(width: u32, height: u32, swap_axes: bool) -> (u32, u32) {
     }
 }
 
-async fn read_back_dimensions(device_name: &str, swap_axes: bool) -> Option<(u32, u32)> {
-    let name = device_name.to_string();
-    let (w, h) = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
+async fn read_back_dimensions(
+    target: &session::DisplayTarget,
+    swap_axes: bool,
+) -> Option<(u32, u32)> {
+    let t = target.clone();
+    let (w, h) = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions_owned(&t))
         .await
         .ok()
         .flatten()?;
@@ -2157,6 +2377,7 @@ async fn read_back_dimensions(device_name: &str, swap_axes: bool) -> Option<(u32
 
 async fn restore_displays(displays: Vec<session::LiveDisplay>) {
     for display in displays {
+        let target = display.target();
         let name = display.device_name.clone();
         if name.is_empty() {
             continue;
@@ -2168,15 +2389,17 @@ async fn restore_displays(displays: Vec<session::LiveDisplay>) {
             display.refresh,
             display.swap_axes(),
         );
-        let name2 = name.clone();
-        let res =
-            tokio::task::spawn_blocking(move || pipeline::set_display_mode(&name2, w, h, hz, swap))
-                .await;
+        let write = target.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            pipeline::set_display_mode_owned(&write, w, h, hz, swap)
+        })
+        .await;
         if let Ok(Err(e)) = res {
             teprintln!("could not restore {name} to {w}x{h}: {e}");
+            continue;
         }
-        wait_for_display_settle(&name, Some(monitor_dims(w, h, swap))).await;
-        apply_display_scale(&name, display.scale).await;
+        wait_for_display_settle(&target, Some(monitor_dims(w, h, swap))).await;
+        apply_display_scale(&target, display.scale).await;
     }
 }
 
@@ -2197,11 +2420,13 @@ pub async fn apply_scale_live(
     let Some(display) = session::get_live_display(sessions, join) else {
         return false;
     };
-    apply_display_scale(&display.device_name, effective).await;
+    let Some(applied) = apply_display_scale(&display.target(), effective).await else {
+        return false;
+    };
     let mut updated = display.clone();
-    updated.scale = effective.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
+    updated.scale = applied.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
     session::set_live_display(sessions, join, updated);
-    tprintln!("display scale for join {join} applied live at {effective}% (no rejoin)");
+    tprintln!("display scale for join {join} applied live at {applied}% (no rejoin)");
     true
 }
 
@@ -2221,17 +2446,35 @@ pub async fn apply_scale_live_for_device(
     applied
 }
 
-async fn apply_display_scale(device_name: &str, percent: u32) {
-    let name = device_name.to_string();
+/// Apply a display's DPI, and report the scale it is actually at afterwards.
+///
+/// `None` means nothing was written — the target could not be identified as one of ours — which
+/// the caller must not paper over, because the alternative reading of a silent failure is
+/// "applied", and that is what let the host tell a client a ratio the display was never set to.
+/// A `Some` that is not the requested percentage is a display that will not go that far, and the
+/// session records what it reached so the next edit compares against the truth.
+async fn apply_display_scale(target: &session::DisplayTarget, percent: u32) -> Option<u32> {
+    let t = target.clone();
+    let name = target.device_name.clone();
     let scale = percent.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
-    let res = tokio::task::spawn_blocking(move || {
-        if let Err(e) = pipeline::set_display_scale(&name, scale) {
-            teprintln!("could not set scale for {name}: {e}");
+    let res =
+        tokio::task::spawn_blocking(move || match pipeline::set_display_scale_owned(&t, scale) {
+            Ok(applied) => Some(applied),
+            Err(e) => {
+                teprintln!("could not set scale for {name}: {e}");
+                None
+            }
+        })
+        .await;
+    match res {
+        Ok(applied) => applied,
+        Err(e) => {
+            teprintln!(
+                "apply-display-scale task for {} panicked: {e}",
+                target.device_name
+            );
+            None
         }
-    })
-    .await;
-    if let Err(e) = res {
-        teprintln!("apply-display-scale task for {device_name} panicked: {e}");
     }
 }
 
@@ -2240,12 +2483,12 @@ async fn apply_display_scale(device_name: &str, percent: u32) {
 /// `expected` is what we asked for, in monitor coordinates. Passing it turns the common case —
 /// the mode landed immediately — from "read, sleep 75 ms, read again, compare" into a single
 /// read, which is 75 ms off every join that touches a display.
-async fn wait_for_display_settle(device_name: &str, expected: Option<(u32, u32)>) {
+async fn wait_for_display_settle(target: &session::DisplayTarget, expected: Option<(u32, u32)>) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut last: Option<(u32, u32)> = None;
     loop {
-        let name = device_name.to_string();
-        let dims = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions(&name))
+        let t = target.clone();
+        let dims = tokio::task::spawn_blocking(move || pipeline::monitor_dimensions_owned(&t))
             .await
             .ok()
             .flatten();
@@ -2395,6 +2638,7 @@ mod tests {
         let before = session::LiveDisplay {
             display_id: 11,
             device_name: "DISPLAY7".to_string(),
+            device_path: r"\?\DISPLAY#TEST7".to_string(),
             width: 1920,
             height: 1080,
             refresh: 60,
@@ -2454,6 +2698,83 @@ mod tests {
             11
         );
         assert_eq!(session::kick_epoch(&sessions, &join), 0);
+    }
+
+    /// A display that refuses the mode it is given leaves the session where it was, in full.
+    ///
+    /// The IDD driver only accepts resolutions that were pre-registered when the display was
+    /// created, so a DPR off that ladder — or one asked for after the client's viewport changed —
+    /// is a `DISP_CHANGE_BADMODE` and nothing moves. Recording the requested geometry and scale
+    /// anyway is what made that unrecoverable: the next save compares equal, decides there is
+    /// nothing to do, and the client keeps rendering at a size the display never had.
+    #[test]
+    fn a_refused_mode_records_what_the_display_is_at_and_not_what_was_asked_for() {
+        let prev = session::LiveDisplay {
+            display_id: 11,
+            device_name: r"\\.\DISPLAY9".to_string(),
+            device_path: r"\\?\DISPLAY#CHY0000#1&virtual".to_string(),
+            width: 1920,
+            height: 1080,
+            refresh: 60,
+            scale: 100,
+            portrait: false,
+        };
+        // A DPR change: twice the geometry, twice the scale.
+        let desired = session::LiveDisplay {
+            width: 3840,
+            height: 2160,
+            scale: 200,
+            ..prev.clone()
+        };
+
+        let applied = landed_display(
+            &desired,
+            prev.display_id,
+            prev.device_name.clone(),
+            prev.device_path.clone(),
+            ModeOutcome::Applied {
+                scale: 200,
+                refresh: 60,
+            },
+        );
+        assert_eq!(applied.display_params(), (3840, 2160, 60, 200, false));
+        assert_eq!(applied.device_path, prev.device_path);
+
+        // The display refused it: it is still 1920x1080 and still at 100 %, and both halves of
+        // that have to survive into the session or the retry never happens.
+        let refused = landed_display(
+            &desired,
+            prev.display_id,
+            prev.device_name.clone(),
+            prev.device_path.clone(),
+            ModeOutcome::Refused {
+                width: 1920,
+                height: 1080,
+                scale: 100,
+                refresh: 60,
+            },
+        );
+        assert_eq!(refused.display_params(), prev.display_params());
+        assert_ne!(
+            refused.display_params(),
+            desired.display_params(),
+            "a refused change must still read as a change, so the next reconfigure retries it"
+        );
+
+        // And a display that took the mode but would not scale past 175 % records 175 %, so the
+        // next save at 200 % is still a change and is tried again.
+        let clamped = landed_display(
+            &desired,
+            prev.display_id,
+            prev.device_name.clone(),
+            prev.device_path.clone(),
+            ModeOutcome::Applied {
+                scale: 175,
+                refresh: 60,
+            },
+        );
+        assert_eq!(clamped.display_params(), (3840, 2160, 60, 175, false));
+        assert_ne!(clamped.display_params(), desired.display_params());
     }
 
     /// The join id is a capability, and it is honoured as one: only for a session that is still
@@ -2714,6 +3035,7 @@ mod tests {
                 session::LiveDisplay {
                     display_id: 1,
                     device_name: "1".into(),
+                    device_path: "p1".into(),
                     width: 1920,
                     height: 1080,
                     refresh: 60,
@@ -2789,6 +3111,7 @@ mod tests {
             session::LiveDisplay {
                 display_id: 1,
                 device_name: "1".into(),
+                device_path: "p1".into(),
                 width: 1920,
                 height: 1080,
                 refresh: 60,
@@ -2869,6 +3192,7 @@ mod tests {
         let upright = session::LiveDisplay {
             display_id: 1,
             device_name: "1".into(),
+            device_path: "p1".into(),
             width: 1080,
             height: 1920,
             refresh: 60,

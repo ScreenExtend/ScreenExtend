@@ -14,6 +14,9 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 
+use crate::streamer::session::DisplayTarget;
+use crate::windows_utils::virtual_display::{resolve_owned_display, ResolvedDisplay};
+
 pub fn set_dpi_awareness() {
     if let Err(e) =
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
@@ -99,6 +102,16 @@ pub fn monitor_dimensions(device_name: &str) -> Option<(u32, u32)> {
     Some((monitor.width().ok()?, monitor.height().ok()?))
 }
 
+/// The same, for a display named by its stable identity rather than by whichever `\\.\DISPLAYn`
+/// it held when the session started.
+///
+/// `None` when the display cannot be identified, which is the honest answer — the caller's
+/// alternative is to read some *other* monitor's geometry and record it as this session's.
+pub fn monitor_dimensions_owned(target: &DisplayTarget) -> Option<(u32, u32)> {
+    let resolved = resolve_owned_display(target).ok()?;
+    monitor_dimensions(&resolved.gdi_name)
+}
+
 pub fn monitor_rect(device_name: &str) -> Option<(i32, i32, u32, u32)> {
     use std::mem;
     use windows::core::BOOL;
@@ -158,10 +171,60 @@ pub fn set_display_resolution(
     height: u32,
     refresh: u32,
 ) -> Result<()> {
-    set_display_mode(device_name, width, height, refresh, false)
+    set_display_mode(device_name, width, height, refresh, false).map(|_| ())
+}
+
+/// Change one of **our** displays' mode.
+///
+/// The name is a hint. Windows hands a `\\.\DISPLAYn` straight back out when the monitor holding
+/// it detaches, so a name cached at create time can address a different monitor by the time a
+/// reconfigure runs — and `ChangeDisplaySettingsExW` will cheerfully resize whatever it finds
+/// there. The target is therefore re-derived from the display's stable identity immediately
+/// before the write, and refused outright if it does not resolve to a display this host created.
+///
+/// Returns the refresh rate the display is **actually** running at afterwards. An IDD monitor's
+/// mode list is fixed when it is created, so a rate that was never registered is refused — and
+/// the fallback below then applies the resolution at whatever rate the display is already on.
+/// That is the right thing to do, and reporting it as the requested rate is not: the session
+/// would record a cadence the display never had, and every later save would compare equal to it
+/// and decide there was nothing left to change.
+pub fn set_display_mode_owned(
+    target: &DisplayTarget,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    portrait: bool,
+) -> Result<u32> {
+    let resolved = resolve_owned_display(target)?;
+    set_display_mode_resolved(&resolved.gdi_name, width, height, refresh, portrait)?;
+    Ok(
+        crate::windows_utils::virtual_display::current_display_mode(&resolved.gdi_name)
+            .map(|(_, _, hz)| hz)
+            .filter(|hz| *hz > 0)
+            .unwrap_or(refresh),
+    )
 }
 
 pub fn set_display_mode(
+    device_name: &str,
+    width: u32,
+    height: u32,
+    refresh: u32,
+    portrait: bool,
+) -> Result<u32> {
+    set_display_mode_owned(
+        &DisplayTarget {
+            device_path: String::new(),
+            device_name: device_name.to_string(),
+        },
+        width,
+        height,
+        refresh,
+        portrait,
+    )
+}
+
+fn set_display_mode_resolved(
     device_name: &str,
     width: u32,
     height: u32,
@@ -230,6 +293,14 @@ pub fn set_display_mode(
 }
 
 pub fn set_display_orientation(device_name: &str, portrait: bool) -> Result<()> {
+    let resolved = resolve_owned_display(&DisplayTarget {
+        device_path: String::new(),
+        device_name: device_name.to_string(),
+    })?;
+    set_display_orientation_resolved(&resolved.gdi_name, portrait)
+}
+
+fn set_display_orientation_resolved(device_name: &str, portrait: bool) -> Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{
         ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY, DEVMODEW,
@@ -297,65 +368,61 @@ const DISPLAYCONFIG_DEVICE_INFO_SET_DPI: i32 = -4;
 pub const DPI_PERCENT_VALUES: [u32; 12] =
     [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
-fn source_path_for_device(device_name: &str) -> Result<(windows::Win32::Foundation::LUID, u32)> {
-    use windows::Win32::Devices::Display::{
-        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
-        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO,
-        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
-    };
-
-    let mut path_count = 0u32;
-    let mut mode_count = 0u32;
-    unsafe {
-        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-            .ok()
-            .map_err(|e| anyhow!("GetDisplayConfigBufferSizes: {e}"))?;
-    }
-
-    let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-    let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-    unsafe {
-        QueryDisplayConfig(
-            QDC_ONLY_ACTIVE_PATHS,
-            &mut path_count,
-            paths.as_mut_ptr(),
-            &mut mode_count,
-            modes.as_mut_ptr(),
-            None,
-        )
-        .ok()
-        .map_err(|e| anyhow!("QueryDisplayConfig: {e}"))?;
-    }
-
-    for path in paths.iter().take(path_count as usize) {
-        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-        source.header.adapterId = path.sourceInfo.adapterId;
-        source.header.id = path.sourceInfo.id;
-        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
-            continue;
-        }
-        let end = source
-            .viewGdiDeviceName
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(source.viewGdiDeviceName.len());
-        let gdi = String::from_utf16_lossy(&source.viewGdiDeviceName[..end]);
-        if gdi == device_name {
-            return Ok((path.sourceInfo.adapterId, path.sourceInfo.id));
-        }
-    }
-    bail!("no active path matched GDI name {device_name}")
+/// What one pass of [`ensure_dpi_at`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DpiState {
+    /// The display is where it is going to be: either at the requested step, or at the closest
+    /// step it is willing to take. `at` is the index it actually holds.
+    Settled { at: i32, requested: bool },
+    /// A write went out; read it back on the next pass.
+    Wrote,
 }
 
-fn ensure_dpi_at(device_name: &str, target_idx: i32) -> Result<bool> {
+/// Decide what to do about one display's DPI, given what `GET_DPI` reported.
+///
+/// Split out because the arithmetic is the whole of the rule and the Win32 calls around it cannot
+/// be exercised on a machine with one display. `min_rel` and `max_rel` are the offsets Windows
+/// reports from the *recommended* step to the lowest and highest it will accept, so a target
+/// outside that band is not a target — it is a request the display has already refused.
+fn plan_dpi(min_rel: i32, cur_rel: i32, max_rel: i32, target_idx: i32) -> DpiState {
+    let recommended_idx = -min_rel;
+    let current_idx = recommended_idx + cur_rel;
+    let reachable_rel = (target_idx - recommended_idx).clamp(min_rel, max_rel.max(min_rel));
+    let reachable_idx = recommended_idx + reachable_rel;
+    if current_idx == reachable_idx {
+        // Settled. Note the second field: *equal to what was asked for* is a different answer
+        // from *as close as this display goes*, and the caller has to be able to tell them
+        // apart — rewriting a step the display has already refused is a full display
+        // reconfiguration per attempt, twenty of them over the two-second window, and the
+        // desktop is reshuffled by every one.
+        return DpiState::Settled {
+            at: current_idx,
+            requested: current_idx == target_idx,
+        };
+    }
+    DpiState::Wrote
+}
+
+/// Set the per-display DPI of one resolved target.
+///
+/// `resolved` carries the `adapterId`+`sourceId` pair that came back from the *same*
+/// `QueryDisplayConfig` sweep that proved this is one of our displays, so the identity the caller
+/// verified and the identity this writes to cannot drift apart between the two calls. Resolving
+/// the pair again here, by GDI name, is what made that possible — and a GDI name is the one
+/// thing about a display that is not stable.
+fn ensure_dpi_at(resolved: &ResolvedDisplay, target_idx: i32) -> Result<DpiState> {
     use windows::Win32::Devices::Display::{
         DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_HEADER,
         DISPLAYCONFIG_DEVICE_INFO_TYPE,
     };
+    use windows::Win32::Foundation::LUID;
 
-    let (adapter_id, source_id) = source_path_for_device(device_name)?;
+    let device_name = resolved.gdi_name.as_str();
+    let adapter_id = LUID {
+        LowPart: resolved.adapter_id.0,
+        HighPart: resolved.adapter_id.1,
+    };
+    let source_id = resolved.source_id;
 
     let mut get = DisplayConfigGetDpi {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -372,14 +439,18 @@ fn ensure_dpi_at(device_name: &str, target_idx: i32) -> Result<bool> {
         bail!("DisplayConfigGetDeviceInfo(GET_DPI) failed for {device_name}");
     }
 
-    let recommended_idx = -get.min_scale_rel;
-    let current_idx = recommended_idx + get.cur_scale_rel;
-    if current_idx == target_idx {
-        return Ok(true);
+    if let settled @ DpiState::Settled { .. } = plan_dpi(
+        get.min_scale_rel,
+        get.cur_scale_rel,
+        get.max_scale_rel,
+        target_idx,
+    ) {
+        return Ok(settled);
     }
 
-    let desired_rel =
-        (target_idx - recommended_idx).clamp(get.min_scale_rel, get.max_scale_rel.max(0));
+    let recommended_idx = -get.min_scale_rel;
+    let desired_rel = (target_idx - recommended_idx)
+        .clamp(get.min_scale_rel, get.max_scale_rel.max(get.min_scale_rel));
     let set = DisplayConfigSetDpi {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(DISPLAYCONFIG_DEVICE_INFO_SET_DPI),
@@ -394,29 +465,71 @@ fn ensure_dpi_at(device_name: &str, target_idx: i32) -> Result<bool> {
     if unsafe { DisplayConfigSetDeviceInfo(header_ptr) } != 0 {
         bail!("DisplayConfigSetDeviceInfo(SET_DPI) failed for {device_name}");
     }
-    Ok(false)
+    Ok(DpiState::Wrote)
 }
 
-pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
-    let target = percent.clamp(100, 500);
+pub fn set_display_scale(device_name: &str, percent: u32) -> Result<u32> {
+    set_display_scale_owned(
+        &DisplayTarget {
+            device_path: String::new(),
+            device_name: device_name.to_string(),
+        },
+        percent,
+    )
+}
+
+/// Change one of **our** displays' DPI.
+///
+/// The target is re-resolved from the stable identity on *every* iteration of the read-back
+/// loop, not once before it: the loop runs for up to two seconds across a window in which the
+/// desktop is being reconfigured, and a target resolved before a mode change is exactly the
+/// stale pair that can name somebody else's display by the time the write goes out. A target
+/// that stops resolving ends the loop with an error rather than falling through to another
+/// display.
+/// Returns the scale the display is **actually** at afterwards, which is not always the one that
+/// was asked for: a display reports the band of steps it will take, and a step outside it is a
+/// request it has already refused. Rewriting a refused step until a deadline expires is not a
+/// retry — every `SET_DPI` is a full display reconfiguration, the read-back can never match, and
+/// twenty of them over two seconds is a desktop being rearranged twenty times while the user
+/// watches. So the loop stops at the closest step the display will take and says so once.
+pub fn set_display_scale_owned(target: &DisplayTarget, percent: u32) -> Result<u32> {
+    let want = percent.clamp(100, 500);
     let target_idx = DPI_PERCENT_VALUES
         .iter()
-        .position(|&p| p >= target)
+        .position(|&p| p >= want)
         .unwrap_or(DPI_PERCENT_VALUES.len() - 1) as i32;
+    let device_name = &target.device_name;
+    let percent_at = |idx: i32| {
+        DPI_PERCENT_VALUES
+            .get(idx.clamp(0, DPI_PERCENT_VALUES.len() as i32 - 1) as usize)
+            .copied()
+            .unwrap_or(100)
+    };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     let mut stable = 0u32;
+    let mut settled_at = target_idx;
     let mut ever_set = false;
     let mut last_err: Option<anyhow::Error> = None;
     loop {
-        match ensure_dpi_at(device_name, target_idx) {
-            Ok(true) => {
+        match resolve_owned_display(target).and_then(|r| ensure_dpi_at(&r, target_idx)) {
+            Ok(DpiState::Settled { at, requested }) => {
+                settled_at = at;
+                if !requested {
+                    teprintln!(
+                        "[display] {device_name} will not scale past {}%; {want}% was asked for \
+                         and {}% is what it is at",
+                        percent_at(at),
+                        percent_at(at)
+                    );
+                    return Ok(percent_at(at));
+                }
                 stable += 1;
                 if stable >= 5 {
-                    return Ok(());
+                    return Ok(percent_at(at));
                 }
             }
-            Ok(false) => {
+            Ok(DpiState::Wrote) => {
                 stable = 0;
                 ever_set = true;
             }
@@ -434,11 +547,11 @@ pub fn set_display_scale(device_name: &str, percent: u32) -> Result<()> {
                 _ => {
                     if ever_set {
                         teprintln!(
-                            "[display] {device_name} accepted a scale of {target}% but never \
+                            "[display] {device_name} accepted a scale of {want}% but never \
                              reported it back within 2s; the client's DPR may not match"
                         );
                     }
-                    Ok(())
+                    Ok(percent_at(settled_at))
                 }
             };
         }
@@ -533,5 +646,71 @@ pub fn probe_to_png(requested_monitor: u32, path: &str) -> Result<()> {
             Ok(())
         }
         None => bail!("capture ended without producing a frame"),
+    }
+}
+
+#[cfg(test)]
+mod dpi_tests {
+    use super::{plan_dpi, DpiState, DPI_PERCENT_VALUES};
+
+    /// The arithmetic that decides whether a DPI write goes out at all.
+    ///
+    /// The band Windows reports is relative to the display's *recommended* step, so the same
+    /// request is reachable on one display and refused on another — and a refused one used to be
+    /// rewritten every 100 ms until a two-second deadline expired. Each of those writes is a full
+    /// display reconfiguration: the desktop is rearranged, windows are moved and the shell
+    /// repaints, twenty times, for a value the display was never going to take.
+    #[test]
+    fn an_unreachable_scale_is_written_once_and_then_left_alone() {
+        // The bundled virtual display as measured at 1920x1080: recommended is 100 % and it will
+        // go no further than 175 %. 200 % was asked for.
+        let target_200 = 4;
+        assert_eq!(
+            plan_dpi(0, 0, 3, target_200),
+            DpiState::Wrote,
+            "the first pass writes the closest step it will take"
+        );
+        // Windows read back 175 %, which is `cur_rel = 3`. That is as far as it goes, so this is
+        // settled — at 175 %, not at what was asked for.
+        assert_eq!(
+            plan_dpi(0, 3, 3, target_200),
+            DpiState::Settled {
+                at: 3,
+                requested: false
+            }
+        );
+        assert_eq!(DPI_PERCENT_VALUES[3], 175);
+
+        // The same display at 3840x2160, where Windows recommends 200 % and the band is
+        // 100 %..300 %: now the request is reachable and settling means settling at it.
+        assert_eq!(
+            plan_dpi(-4, 0, 4, target_200),
+            DpiState::Settled {
+                at: 4,
+                requested: true
+            }
+        );
+        assert_eq!(plan_dpi(-4, -4, 4, target_200), DpiState::Wrote);
+        assert_eq!(DPI_PERCENT_VALUES[4], 200);
+
+        // Windows reports a minimum at or below the recommended step on every display measured
+        // here, and `DPI_PERCENT_VALUES` starts at 100 %, so "below the band" is not a case that
+        // arises in practice — the clamp covers it only so the arithmetic has no open end.
+
+        // A display that reports a single step is settled wherever it is, and is never written.
+        assert_eq!(
+            plan_dpi(0, 0, 0, 9),
+            DpiState::Settled {
+                at: 0,
+                requested: false
+            }
+        );
+        assert_eq!(
+            plan_dpi(0, 0, 0, 0),
+            DpiState::Settled {
+                at: 0,
+                requested: true
+            }
+        );
     }
 }
