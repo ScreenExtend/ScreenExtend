@@ -259,6 +259,14 @@ pub async fn setup(app_handle: tauri::AppHandle) -> bool {
     if app_handle.try_state::<AppState>().is_some() {
         return true;
     }
+    // What was on this machine before the host touched anything. One `QueryDisplayConfig`, and it
+    // is the only "before" a later report of a display that changed under the user can be checked
+    // against — the alternative is a snapshot taken afterwards and a guess at what preceded it.
+    let _ = tauri::async_runtime::spawn_blocking(|| {
+        virtual_display::log_display_inventory("at startup")
+    })
+    .await;
+
     // Extend the desktop *before* touching the driver. These are two concurrent reconfigurations
     // of the same OS state otherwise: `set_display_topology_extend` decides what to apply from a
     // snapshot of the current paths, while `new_shared_reported` removes every virtual monitor.
