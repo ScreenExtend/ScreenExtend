@@ -1541,22 +1541,27 @@ mod test {
 
         // Everything on the machine that is not ours, and what it is set to. The `ours` flag is
         // false for all of them here because nothing has been created yet.
+        /// One display as this harness recorded it: its identity, the mode it was in and the
+        /// DPI band it reported. The three things that have to be identical afterwards.
+        struct Recorded {
+            device_path: String,
+            mode: Option<(u32, u32, u32)>,
+            band: Option<(i32, i32, i32)>,
+        }
+
         // A path Windows could not name is one that is on its way in or out — a monitor the
         // driver is still departing, most often — and there is nothing to compare it against
         // later. It is skipped here for the same reason `pick_owned_display` refuses to write to
         // one: an unidentifiable display is not a display this harness can reason about.
-        let physical_before: Vec<(String, Option<(u32, u32, u32)>, Option<(i32, i32, i32)>)> =
-            active_display_paths()
-                .iter()
-                .filter(|p| !p.device_path.is_empty())
-                .map(|p| {
-                    (
-                        p.device_path.clone(),
-                        current_display_mode(&p.gdi_name),
-                        read_dpi_band(p.adapter_id, p.source_id),
-                    )
-                })
-                .collect();
+        let physical_before: Vec<Recorded> = active_display_paths()
+            .iter()
+            .filter(|p| !p.device_path.is_empty())
+            .map(|p| Recorded {
+                device_path: p.device_path.clone(),
+                mode: current_display_mode(&p.gdi_name),
+                band: read_dpi_band(p.adapter_id, p.source_id),
+            })
+            .collect();
         log_display_inventory("before the harness");
 
         const CSS: (u32, u32) = (1920, 1080);
@@ -1658,19 +1663,20 @@ mod test {
 
         log_display_inventory("after the harness");
         let now = active_display_paths();
-        for (dev_path, mode, band) in &physical_before {
-            let Some(p) = now.iter().find(|p| &p.device_path == dev_path) else {
-                panic!("{dev_path} is no longer attached; the harness disturbed the desktop");
+        for was in &physical_before {
+            let path = &was.device_path;
+            let Some(p) = now.iter().find(|p| &p.device_path == path) else {
+                panic!("{path} is no longer attached; the harness disturbed the desktop");
             };
             assert_eq!(
-                &current_display_mode(&p.gdi_name),
-                mode,
-                "{dev_path} changed mode while the harness drove a virtual display"
+                current_display_mode(&p.gdi_name),
+                was.mode,
+                "{path} changed mode while the harness drove a virtual display"
             );
             assert_eq!(
-                &read_dpi_band(p.adapter_id, p.source_id),
-                band,
-                "{dev_path} changed DPI while the harness drove a virtual display"
+                read_dpi_band(p.adapter_id, p.source_id),
+                was.band,
+                "{path} changed DPI while the harness drove a virtual display"
             );
         }
         println!("\n  every display that was not ours is exactly where it was.");
