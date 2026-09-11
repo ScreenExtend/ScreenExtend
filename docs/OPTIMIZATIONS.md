@@ -3575,6 +3575,12 @@ the client's pointer sweeping and then the host's:
 | 30 isolated host moves, frames per move | 2.07 | 14.3 | 2.0 |
 | 1 kHz burst, frames reaching `SendInput` | 934 / 1000 | **779 / 1000** | **1000 / 1000** |
 
+The host's own counters say the same thing in its own words. Before: `frames_skipped_cadence=982`,
+`frames_repeated=675`, `input_queue_drops=166`, `input_stale_drops=55` — 982 delivered frames
+thrown away by a gate, 675 re-encodes of a picture nobody changed, and 221 pointer frames that
+never reached `SendInput` at all, which is exactly the 1000 − 779 above. After: 8, 55, and the two
+input counters absent, which is how a zero reports.
+
 Both pointers regressed equally, which is the part the report could not see: the owner judges the
 native mouse on the host's own screen, where DWM draws it at no cost, and the client's through the
 stream. The asymmetry is in where they are looking, not in how the two are injected.
