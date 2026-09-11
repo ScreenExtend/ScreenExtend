@@ -602,6 +602,39 @@ pub fn claim_display_identity(gdi_name: &str, before: &[String]) -> Option<Strin
     found
 }
 
+/// Write every attached display's identity, mode and DPI to the log.
+///
+/// A host that is about to start creating displays should say what was on the machine before it
+/// did. The owner's report of this workflow — "my native display's zoom got changed" — could only
+/// be answered by taking a snapshot afterwards and guessing at the before, and one
+/// `QueryDisplayConfig` at startup is the whole cost of never needing to guess again.
+pub fn log_display_inventory(when: &str) {
+    use crate::windows_utils::streamer::capture::{dpi_percent_at, read_dpi_band};
+    let paths = active_display_paths();
+    tprintln!("[display] {when}: {} attached display(s)", paths.len());
+    for p in &paths {
+        let mode = current_display_mode(&p.gdi_name)
+            .map(|(w, h, hz)| format!("{w}x{h}@{hz}"))
+            .unwrap_or_else(|| "?".to_string());
+        let dpi = match read_dpi_band(p.adapter_id, p.source_id) {
+            Some((cur, lo, hi)) => format!(
+                "{}% (band {}%..{}%)",
+                dpi_percent_at(cur),
+                dpi_percent_at(lo),
+                dpi_percent_at(hi)
+            ),
+            None => "?".to_string(),
+        };
+        tprintln!(
+            "[display]   {} {mode} dpi={dpi} friendly={:?} ours={} path={}",
+            p.gdi_name,
+            p.friendly,
+            is_owned_path(&p.device_path),
+            p.device_path
+        );
+    }
+}
+
 /// Every attached monitor's device path. Snapshotted before a create so the identity read back
 /// afterwards can be checked against it.
 pub fn attached_display_paths() -> Vec<String> {

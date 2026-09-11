@@ -368,6 +368,53 @@ const DISPLAYCONFIG_DEVICE_INFO_SET_DPI: i32 = -4;
 pub const DPI_PERCENT_VALUES: [u32; 12] =
     [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
 
+/// The DPI band Windows reports for one display, as `(current, minimum, maximum)` step indices
+/// into [`DPI_PERCENT_VALUES`].
+///
+/// Read-only, and the one number a report of "my screen's zoom changed" can be checked against —
+/// which is what `virtual_display::log_display_inventory` prints it for. The `#[repr(C)]` pair
+/// and the two undocumented `DISPLAYCONFIG_DEVICE_INFO_TYPE` values live here, beside the writer
+/// that uses them, rather than being spelled out a second time somewhere else.
+pub fn read_dpi_band(adapter_id: (u32, i32), source_id: u32) -> Option<(i32, i32, i32)> {
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+        DISPLAYCONFIG_DEVICE_INFO_TYPE,
+    };
+    use windows::Win32::Foundation::LUID;
+
+    let mut get = DisplayConfigGetDpi {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE(DISPLAYCONFIG_DEVICE_INFO_GET_DPI),
+            size: std::mem::size_of::<DisplayConfigGetDpi>() as u32,
+            adapterId: LUID {
+                LowPart: adapter_id.0,
+                HighPart: adapter_id.1,
+            },
+            id: source_id,
+        },
+        min_scale_rel: 0,
+        cur_scale_rel: 0,
+        max_scale_rel: 0,
+    };
+    if unsafe { DisplayConfigGetDeviceInfo(&mut get.header) } != 0 {
+        return None;
+    }
+    let recommended = -get.min_scale_rel;
+    Some((
+        recommended + get.cur_scale_rel,
+        recommended + get.min_scale_rel,
+        recommended + get.max_scale_rel,
+    ))
+}
+
+/// One step index as a percentage, clamped into the table.
+pub fn dpi_percent_at(index: i32) -> u32 {
+    DPI_PERCENT_VALUES
+        .get(index.clamp(0, DPI_PERCENT_VALUES.len() as i32 - 1) as usize)
+        .copied()
+        .unwrap_or(100)
+}
+
 /// What one pass of [`ensure_dpi_at`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DpiState {
