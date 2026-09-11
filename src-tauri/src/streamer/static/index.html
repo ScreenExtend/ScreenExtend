@@ -590,8 +590,15 @@
                 armProbe();
             }
 
+            // The host's answer is a small set of fields and each one belongs to a class: the
+            // sink is audio-only, the kick epoch ends the session, and the reconfig epoch is the
+            // only thing that costs a renegotiation. Act on what moved — the poll runs about
+            // once a second and re-applying an unchanged value is work the class does not call
+            // for, which for the sink meant commanding the audio graph a speaker it was already
+            // playing on sixty times a minute.
             function applyReconfig(j) {
-                if (typeof j.audioSink === 'string') {
+                if (typeof j.audioSink === 'string' && j.audioSink !== appliedSinkId) {
+                    appliedSinkId = j.audioSink;
                     // Applied silently, on whatever ids this device has. Where the labels were
                     // never revealed — the microphone card was declined before the join — the
                     // host's picker shows opaque ids and the routing still works; that is what
@@ -613,12 +620,20 @@
                         if (window.SEAudio) {
                             Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
                                 if (ok !== false) return;
+                                // The engine refused, so the value is not applied and must be
+                                // retried on the next poll rather than latched as done.
+                                appliedSinkId = null;
                                 if (j.audioSink === lastOfferedSinkId) return;
                                 lastOfferedSinkId = j.audioSink;
                                 queueOutputPicker(j.audioSink);
                             }, noteSuppressed);
+                        } else {
+                            // There is no audio graph to command yet, so nothing was applied and
+                            // the latch must not claim otherwise — the host may never send this
+                            // value again.
+                            appliedSinkId = null;
                         }
-                    } catch (_) { noteSuppressed(); }
+                    } catch (_) { appliedSinkId = null; noteSuppressed(); }
                 }
                 if (kickEpoch !== null && j.kick !== kickEpoch) {
                     kickEpoch = j.kick;
@@ -656,7 +671,6 @@
             function reconfigure() {
                 if (reconfiguring) return;
                 reconfiguring = true;
-                teardownSession();
                 usingFallback = false;
                 clearReconfigWatchdog();
                 reconfigWatchdog = setTimeout(() => {
@@ -665,7 +679,9 @@
                     reconfiguring = false;
                     linkLost('Disconnected, reconnect to continue.');
                 }, RECONFIG_DEADLINE_MS);
-                start(true);
+                // The same session offering again: the host changes the display's mode under it
+                // and the last decoded frame stays on screen until the new one paints.
+                start(true, true);
             }
 
             let lastGeomKey = null;
@@ -1248,6 +1264,10 @@
             // is armed at a time; a newer host choice replaces the id it will open on.
             let queuedPickerId = null;
             let lastOfferedSinkId = null;
+            // The sink the audio graph is already playing on, so `/reconfig` can command it once
+            // per change rather than once per poll. Cleared whenever the graph goes, because the
+            // next one starts on the device's default and has to be told again.
+            let appliedSinkId = null;
             let pickerGestureArmed = false;
             let pickerGestureFire = null;
             // No `keydown`. `input.js` binds its own on `window` in the capture phase during
@@ -1691,17 +1711,22 @@
             // connection the previous one's answer.
             let startGen = 0;
 
-            function teardownSession() {
+            // `keepJoin` is the difference between renegotiating and leaving.
+            //
+            // Every rejoin on this page — a reconfigure, a demotion to <video>, the legacy
+            // transform, a trickle latch — goes through here and calls `start()` again. Those
+            // are the *same* session continuing: the page offers again, presents the join id it
+            // already holds, and the host keeps the session and the virtual display it created.
+            // Releasing it instead is what made a settings change look like a disconnect — the
+            // host removed the display, the dashboard raised "device left" and then "device
+            // joined", and every window the user had on that display was shuffled back onto the
+            // primary monitor before a brand-new display appeared.
+            //
+            // Without `keepJoin` this is a departure: the host takes the display down now
+            // rather than after the disconnect grace, which is what a kick and a lost link want.
+            function teardownSession(keepJoin) {
                 startGen++;
-                // Every rejoin on this page — a reconfigure, a demotion to <video>, the legacy
-                // transform, a trickle latch — goes through here and then calls `start()` again,
-                // which mints a *new* join id. The host used to replace a session addressed by
-                // this client's IP, so letting go was unnecessary and racy; now that a session
-                // is named by its own id there is nothing to replace, and a rejoin that did not
-                // release the old one would leave a second display standing for the whole
-                // disconnect grace. The two ids are distinct, so the teardown of the old cannot
-                // touch the display the new one is creating.
-                releaseJoin();
+                if (!keepJoin) releaseJoin();
                 releaseIceHold();
                 iceEverConnected = false;
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
@@ -1716,6 +1741,7 @@
                 stopFallbackFrameStats();
                 if (trickleSender) { trickleSender.stop(); trickleSender = null; }
                 try { if (window.SEAudio) SEAudio.teardown(); } catch (_) { noteSuppressed(); }
+                appliedSinkId = null;
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
             }
@@ -1734,8 +1760,7 @@
                 forceLegacyTransform = true;
                 degrade(DEG.TRANSFORM_FELL_BACK_TO_LEGACY);
                 console.warn('falling back to createEncodedStreams:', reason);
-                teardownSession();
-                start(true);
+                start(true, true);
             }
 
             // Trickle was advertised and then did not work: the resource was missing, the verb
@@ -1763,9 +1788,10 @@
                 // join is the host's own designed path, and signalling a leave would set the
                 // teardown running *concurrently* with the display the rejoin is creating. The
                 // two sibling rungs — `fallbackToVideo` and `retryWithLegacyTransform` — rejoin
-                // the same way for the same reason.
-                teardownSession();
-                start(preferWebCodecs);
+                // the same way for the same reason. All three present the join id they already
+                // hold, so the host reuses the session and its display rather than building a
+                // second one beside it.
+                start(preferWebCodecs, true);
             }
 
             function fallbackToVideo(reason) {
@@ -1773,8 +1799,7 @@
                 usingFallback = true;
                 degrade(DEG.DEMOTED_TO_VIDEO);
                 console.warn('falling back to <video>:', reason);
-                teardownSession();
-                start(false);
+                start(false, true);
             }
 
             // Presentation tier 2: decoded frames written into a track generator and played
@@ -2129,8 +2154,11 @@
             const FRAME_WATCHDOG_MS = 5000;
             const WHEP_TIMEOUT_MS = 10000;
 
-            async function start(preferWebCodecs) {
-                teardownSession();
+            // `keepJoin` says this is the same session offering again rather than a new one.
+            // `teardownSession` has already decided whether `currentJoinId` survives, so the
+            // body below can present it unconditionally: it is the empty string on a fresh join.
+            async function start(preferWebCodecs, keepJoin) {
+                teardownSession(keepJoin);
                 // After teardownSession, so this call owns the newest generation.
                 const gen = ++startGen;
                 const stale = () => gen !== startGen;
@@ -2494,6 +2522,10 @@
                             sessionId: joinData.sessionId,
                             otp: joinData.otp,
                             deviceToken: storedToken,
+                            // Empty unless this is the same tab renegotiating. The host honours
+                            // it only while the session is still live and still belongs to this
+                            // device token, so a stale one costs a fresh join and nothing else.
+                            joinId: currentJoinId,
                             deviceName: joinData.deviceName,
                             os: joinData.os,
                             refreshRate: joinData.refreshRate,

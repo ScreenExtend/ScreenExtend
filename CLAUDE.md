@@ -525,11 +525,27 @@ Cross-platform core, OS-independent:
   device token as a second factor. There is deliberately **no address fallback** on any request
   path.
 
-  Display-scale and similar changes apply live via **epoch bumps** (`bump_reconfig_epoch`,
-  `bump_kick_epoch`) without tearing down the display; a per-device change goes through
-  `bump_reconfig_epoch_for_device`, which moves every join that device holds. Note that the
-  *client's* `applyReconfig` still rebuilds its WebRTC session for most changes, so "live" means
-  the display survives, not that nothing renegotiates.
+  **What a settings edit costs the stream is a question with five answers, and
+  `DeviceOverride::reconfig_action` is where it is decided** — one comparison of the saved
+  override against the submitted one, with the field → action table beside it as a test. The
+  desktop UI writes every field on every save, so "a save happened" is never the question.
+
+  | class | fields | what happens |
+  |---|---|---|
+  | (a) cosmetic | `name`, labels, the device token, `knownDevices` | nothing reaches the host at all |
+  | (b) input-only | `remoteControl`, `pointerScope` | written into the running injector through `apply_live_input_for_device` → `input::LiveInput` (two relaxed atomics read per event). No epoch |
+  | (c) audio | `systemAudio`, the output device | `audio_enabled` is polled per packet by `audio_enabled_now`; the sink rides in *every* `/reconfig` body and the client applies it on the next poll. No epoch |
+  | (d)+(e) stream | `videoQuality`, `videoScale`, `autoFrameRate`, `orientation`, `refreshRate`, `dpr` | `bump_reconfig_epoch_for_device`, which moves every join that device holds |
+  | (e) scale | `scale` alone | `apply_scale_live_for_device`: the extended desktop's DPI changes under a stream whose geometry is already right. No epoch |
+
+  An epoch bump is a **renegotiation in place, not a rejoin.** The client answers it by offering
+  again and presenting the `joinId` it already holds; `continuing_join` honours that id for a
+  session that is still open and still belongs to the same device token, so `start_session` finds
+  an `existing` live display, changes its mode (or leaves it alone for an encoder-only edit) and
+  keeps the join. Same join id, same display id, no `DeviceRemove`, no second display, and the
+  windows the user arranged stay where they are. The outgoing session's teardown task finds its
+  `session_seq` superseded and stands down. **Never make an epoch bump a leave-and-rejoin**, and
+  never widen a class without the table above and its test.
 
   `OtpLimiter` allows `MAX_OTP_ATTEMPTS` 5 per key with a 60 s lockout, plus a global cross-key
   guard (`MAX_GLOBAL_OTP_ATTEMPTS` 20 per 60 s window → 60 s pause) that defeats the cloud

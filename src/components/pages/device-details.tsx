@@ -306,32 +306,51 @@ function DeviceDetailsBody({
         videoQuality: Number(values.videoQuality),
         dpr: Number(values.dpr),
       };
+      // What the sheet was showing when it opened. A save pushes only the commands whose
+      // values actually moved: the host classifies every edit anyway, but a command nobody
+      // needed is still a lock taken, a log line written and — for a device the host holds no
+      // settings for yet — a comparison it cannot make. Renaming a device should reach the
+      // Rust side as nothing at all.
+      const was = formValues;
+      const pointerScope = normalized.pointerScope ?? DEFAULT_POINTER_SCOPE;
+      const autoFrameRate = normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE;
+      const overrideMoved =
+        was.scale !== normalized.scale ||
+        was.orientation !== normalized.orientation ||
+        was.refreshRate !== normalized.refreshRate ||
+        was.videoScale !== normalized.videoScale ||
+        was.videoQuality !== normalized.videoQuality ||
+        was.remoteControl !== normalized.remoteControl ||
+        was.dpr !== normalized.dpr ||
+        was.systemAudio !== normalized.systemAudio;
       try {
         // Every command below takes the *device*, which is its token. The address was the key
         // until it turned out to be recycled between machines and to move under a live
         // session; it is a label on this sheet now and nothing more.
-        await commands.setDeviceOverride(
-          normalized.token,
-          normalized.scale,
-          normalized.orientation,
-          normalized.refreshRate,
-          normalized.videoScale,
-          normalized.videoQuality,
-          normalized.remoteControl,
-          normalized.dpr,
-          normalized.systemAudio
-        );
+        if (overrideMoved) {
+          await commands.setDeviceOverride(
+            normalized.token,
+            normalized.scale,
+            normalized.orientation,
+            normalized.refreshRate,
+            normalized.videoScale,
+            normalized.videoQuality,
+            normalized.remoteControl,
+            normalized.dpr,
+            normalized.systemAudio
+          );
+        }
         // Their own commands, not an eleventh and twelfth argument to `setDeviceOverride`:
         // that one is already at specta's ten-parameter ceiling.
-        await commands.setDevicePointerScope(
-          normalized.token,
-          normalized.pointerScope ?? DEFAULT_POINTER_SCOPE
-        );
-        await commands.setDeviceAutoFrameRate(
-          normalized.token,
-          normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE
-        );
-        await commands.setDeviceAudioOutput(normalized.token, normalized.audioOutputDeviceId);
+        if ((was.pointerScope ?? DEFAULT_POINTER_SCOPE) !== pointerScope) {
+          await commands.setDevicePointerScope(normalized.token, pointerScope);
+        }
+        if ((was.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE) !== autoFrameRate) {
+          await commands.setDeviceAutoFrameRate(normalized.token, autoFrameRate);
+        }
+        if ((was.audioOutputDeviceId ?? "") !== (normalized.audioOutputDeviceId ?? "")) {
+          await commands.setDeviceAudioOutput(normalized.token, normalized.audioOutputDeviceId);
+        }
         await saveDeviceSettings(normalized);
         // The event's `Device` comes from Rust, where neither field is optional; the
         // config-file `Device` makes them optional because devices saved before they existed

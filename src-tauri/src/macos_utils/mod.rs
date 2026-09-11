@@ -14,7 +14,7 @@ use crate::streamer::cloud::{
 };
 use crate::streamer::lock::LockExt;
 use crate::streamer::session::{
-    self, DeviceOverride, SessionAuth, SharedApprovedDevices, SharedBannedDevices,
+    self, DeviceOverride, ReconfigAction, SessionAuth, SharedApprovedDevices, SharedBannedDevices,
     SharedDeviceOverrides, SharedDeviceReporter, SharedOtpLimiter, SharedServerPorts,
     SharedSessions, SharedTurnConfig, SharedVirtualDisplay, UserTurnConfig,
 };
@@ -372,47 +372,70 @@ pub fn set_device_override(
         pointer_scope: carried_scope,
         auto_frame_rate: carried_auto_frame_rate,
     };
-    // Which overrides need the session rebuilt, and which only need the display touched. The
-    // client answers a reconfig epoch bump by tearing the whole session down — peer connection,
-    // encoder, capture, injector thread — and paying the full join cost. Everything below except
-    // the display scale is an encoder-session parameter, so that is unavoidable for them. The
-    // scale is not: it changes the extended desktop's DPI, not the captured geometry, so the
-    // stream the client is already decoding is exactly the stream it wants.
-    let (needs_rebuild, scale_only) = {
+    // What this edit costs the stream, decided by comparing the saved row against the one the
+    // sheet just submitted rather than by the fact that a save happened at all. The desktop UI
+    // writes every field on every save, so without the comparison renaming a device — or moving
+    // anything the pipeline never reads — bumped the epoch, and the client answers an epoch bump
+    // by rebuilding. `ReconfigAction` is the whole rule; `session.rs` holds it and the field
+    // table that tests it.
+    //
+    // A device with no saved row is the one case that cannot be compared, and the join path now
+    // seeds one, so in practice this is only ever a device that is not connected — where a bump
+    // reaches zero sessions anyway.
+    let action = {
         let mut overrides = state.device_overrides.lock_recover();
-        let verdict = match overrides.get(&token) {
-            Some(old) => {
-                let rebuild = old.orientation_portrait != next.orientation_portrait
-                    || old.refresh_rate != next.refresh_rate
-                    || old.video_scale != next.video_scale
-                    || old.video_quality != next.video_quality
-                    || (old.dpr - next.dpr).abs() > f64::EPSILON;
-                (rebuild, !rebuild && old.scale != next.scale)
-            }
-            None => (true, false),
+        let action = match overrides.get(&token) {
+            Some(old) => DeviceOverride::reconfig_action(old, &next),
+            None => ReconfigAction::Rebuild,
         };
         overrides.insert(token.clone(), next);
-        verdict
+        action
     };
-    // Every tab this device has open, because the settings are the device's.
-    if needs_rebuild {
-        session::bump_reconfig_epoch_for_device(&state.sessions, &token);
-    } else if scale_only {
-        let sessions = state.sessions.clone();
-        let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
-            MIN_DISPLAY_SCALE,
-            crate::streamer::server::MAX_EFFECTIVE_SCALE,
-        );
-        tauri::async_runtime::spawn(async move {
-            let applied =
-                crate::streamer::server::apply_scale_live_for_device(&sessions, &token, effective)
-                    .await;
-            if applied == 0 {
-                // Nothing live to touch, so there is nothing to apply it to; the next join reads
-                // it back out of the override map anyway.
-                tprintln!("display scale for device {token} saved; no live display to apply it to");
-            }
-        });
+    // Class (b), whatever else this edit did: remote control is read per event, so it lands on
+    // the pointer that is moving now rather than on the next connection.
+    session::apply_live_input_for_device(
+        &state.sessions,
+        &token,
+        next.control_enabled,
+        next.pointer_scope,
+    );
+    match action {
+        // Classes (a), (b) and (c). Nothing on the wire, nothing on the dashboard, nothing to
+        // the client: the name moved, or control did, or the audio sink, and the picture the
+        // user is looking at is already the right picture.
+        ReconfigAction::Nothing => {
+            tprintln!("device {token} settings saved; nothing the live stream reads has changed");
+        }
+        // The extended desktop's DPI changes under a stream whose geometry is already correct.
+        ReconfigAction::ScaleLive => {
+            let sessions = state.sessions.clone();
+            let effective = ((next.dpr * next.scale as f64).round() as u32).clamp(
+                MIN_DISPLAY_SCALE,
+                crate::streamer::server::MAX_EFFECTIVE_SCALE,
+            );
+            tauri::async_runtime::spawn(async move {
+                let applied = crate::streamer::server::apply_scale_live_for_device(
+                    &sessions, &token, effective,
+                )
+                .await;
+                if applied == 0 {
+                    // Nothing live to touch, so there is nothing to apply it to; the next join
+                    // reads it back out of the override map anyway.
+                    tprintln!(
+                        "display scale for device {token} saved; no live display to apply it to"
+                    );
+                }
+            });
+        }
+        // Every tab this device has open, because the settings are the device's. The client
+        // renegotiates on its own join id, so the display it is watching survives the change.
+        ReconfigAction::Rebuild => {
+            let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
+            tprintln!(
+                "device {token} changed a stream parameter; {moved} live session(s) will \
+                 renegotiate in place"
+            );
+        }
     }
 }
 
@@ -483,9 +506,17 @@ pub fn set_device_pointer_scope(state: State<'_, AppState>, device: String, scop
             );
         }
     }
+    let control_enabled = overrides
+        .get(&token)
+        .map(|o| o.control_enabled)
+        .unwrap_or(true);
     drop(overrides);
+    // Class (b): straight into every live injector this device is driving. No epoch, because
+    // nothing the encoder or the client reads has moved.
+    let reached =
+        session::apply_live_input_for_device(&state.sessions, &token, control_enabled, parsed);
     tprintln!(
-        "[input] pointer scope for device {token} is now {}",
+        "[input] pointer scope for device {token} is now {} ({reached} live session(s))",
         parsed.as_str()
     );
 }
@@ -508,8 +539,12 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, en
         return;
     };
     let mut overrides = state.device_overrides.lock_recover();
-    match overrides.get_mut(&token) {
-        Some(existing) => existing.auto_frame_rate = enabled,
+    let changed = match overrides.get_mut(&token) {
+        Some(existing) => {
+            let moved = existing.auto_frame_rate != enabled;
+            existing.auto_frame_rate = enabled;
+            moved
+        }
         None => {
             overrides.insert(
                 token.clone(),
@@ -518,13 +553,26 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, en
                     ..DeviceOverride::join_defaults()
                 },
             );
+            enabled != DeviceOverride::join_defaults().auto_frame_rate
         }
-    }
+    };
     drop(overrides);
-    tprintln!(
-        "[stream] automatic frame rate for device {token} is now {}",
-        if enabled { "on" } else { "off" }
-    );
+    // Class (d): the pipeline copies this out of the override map when the session is built and
+    // the display's compose rate is chosen from it, so it takes a rebuild — but only when it
+    // actually moved. It used to take neither, which left the setting inert until the next join.
+    if changed {
+        let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
+        tprintln!(
+            "[stream] automatic frame rate for device {token} is now {}; {moved} live \
+             session(s) will renegotiate in place",
+            if enabled { "on" } else { "off" }
+        );
+    } else {
+        tprintln!(
+            "[stream] automatic frame rate for device {token} is already {}",
+            if enabled { "on" } else { "off" }
+        );
+    }
 }
 
 #[tauri::command]
@@ -587,8 +635,12 @@ pub fn set_device_audio_output(state: State<'_, AppState>, device: String, devic
     };
     // Per device: two tabs of one browser share one set of speakers, and the choice has to
     // outlive every join so `serve` can replay it into a host with nothing connected yet.
+    //
+    // Class (c), so no epoch. `audioSink` rides in *every* `/reconfig` body and the client
+    // applies it on its next poll, about a second away; bumping as well meant that choosing an
+    // output device tore the session down — and it did so on every save of the device sheet,
+    // because the sheet pushes this command whether or not the sink moved.
     session::set_device_audio_sink(&state.audio_sinks, &token, sel);
-    session::bump_reconfig_epoch_for_device(&state.sessions, &token);
 }
 
 #[tauri::command]
