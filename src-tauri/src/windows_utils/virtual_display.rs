@@ -1509,6 +1509,173 @@ mod test {
     /// `IddCxMonitorUpdateModes` would replace the second path with an in-place update; it is
     /// IddCx 1.0 API, below the IddCx 1.2 the bundled INF declares, and upstream simply never
     /// used it. This harness is the before half of that comparison. Needs the driver installed;
+    /// Drives every DPR step of the ladder at a real display, and then proves that the writes
+    /// cannot reach anything else.
+    ///
+    /// This is the harness for the report that started this work — "when I changed the DPR, my
+    /// native display's zoom got changed" — and it answers the two halves of it directly. It
+    /// records every *physical* display's mode and DPI band before it starts and checks them
+    /// again at the end, so collateral damage is detected rather than assumed absent. And after
+    /// removing the virtual display it keeps the target it was using and writes to it again:
+    /// that stale `\\.\DISPLAYn` is exactly what Windows hands to whatever attaches next, and
+    /// both writes must be refused rather than landing on a monitor somebody is using.
+    ///
+    /// It also reports what each DPR step actually *reached*, which is the other half of the
+    /// story: a scale above the band the display advertises lands on the closest step it will
+    /// take, and a session that records the request instead of the result can never retry it.
+    #[test]
+    #[ignore = "requires the virtual display driver installed; creates a real display and changes its mode and DPI; run with --ignored --nocapture"]
+    fn report_display_change_targets() {
+        use crate::windows_utils::streamer::capture::{
+            dpi_percent_at, monitor_dimensions_owned, read_dpi_band, set_display_mode_owned,
+            set_display_scale_owned,
+        };
+
+        let Ok(display) = WindowsVirtualDisplay::new_shared_reported() else {
+            crate::test_support::skip_because(
+                "windows display-change targets",
+                "the virtual display driver is not installed",
+            );
+            return;
+        };
+
+        // Everything on the machine that is not ours, and what it is set to. The `ours` flag is
+        // false for all of them here because nothing has been created yet.
+        // A path Windows could not name is one that is on its way in or out — a monitor the
+        // driver is still departing, most often — and there is nothing to compare it against
+        // later. It is skipped here for the same reason `pick_owned_display` refuses to write to
+        // one: an unidentifiable display is not a display this harness can reason about.
+        let physical_before: Vec<(String, Option<(u32, u32, u32)>, Option<(i32, i32, i32)>)> =
+            active_display_paths()
+                .iter()
+                .filter(|p| !p.device_path.is_empty())
+                .map(|p| {
+                    (
+                        p.device_path.clone(),
+                        current_display_mode(&p.gdi_name),
+                        read_dpi_band(p.adapter_id, p.source_id),
+                    )
+                })
+                .collect();
+        log_display_inventory("before the harness");
+
+        const CSS: (u32, u32) = (1920, 1080);
+        let even = |v: f64| (v.round() as u32).clamp(2, 16384) & !1;
+        let ratios = crate::streamer::platform::display_dpr_ladder();
+        let ladder: Vec<(u32, u32)> = ratios
+            .iter()
+            .map(|r| (even(CSS.0 as f64 * r), even(CSS.1 as f64 * r)))
+            .collect();
+
+        let before_paths = attached_display_paths();
+        let id = display
+            .create_display_with_modes(
+                "ScreenExtend dpr probe".to_string(),
+                CSS.0,
+                CSS.1,
+                60,
+                &ladder,
+            )
+            .expect("create display");
+
+        // The name and the identity together, and only then recorded as ours:
+        // `claim_display_identity` is the thing that enrols a path, so it is called once, on the
+        // display this harness actually created, rather than on every candidate it looks at.
+        let mut found = None;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            let paths = active_display_paths();
+            if let Some(hit) = paths
+                .iter()
+                .find(|p| !p.device_path.is_empty() && !before_paths.contains(&p.device_path))
+            {
+                found = Some((hit.gdi_name.clone(), hit.device_path.clone()));
+                break;
+            }
+        }
+        let Some((name, path)) = found else {
+            display.remove_display(id);
+            println!("the display never attached with an identity of its own");
+            return;
+        };
+        claim_display_identity(&name, &before_paths).expect("the new display has an identity");
+        let target = DisplayTarget {
+            device_path: path.clone(),
+            device_name: name.clone(),
+        };
+        println!("created {name} ({path})");
+
+        println!("\n  DPR   requested         mode landed        scale asked  scale reached");
+        for r in &ratios {
+            let (w, h) = (even(CSS.0 as f64 * r), even(CSS.1 as f64 * r));
+            let want_scale = (r * 100.0).round() as u32;
+            let hz = set_display_mode_owned(&target, w, h, 60, false);
+            std::thread::sleep(Duration::from_millis(250));
+            let landed = monitor_dimensions_owned(&target);
+            let scale = set_display_scale_owned(&target, want_scale);
+            println!(
+                "  {r:<5} {w}x{h}@60   {:?} @{:?}Hz   {want_scale}%   {:?}",
+                landed, hz, scale
+            );
+        }
+
+        // The band this display ended on, for the record: it moves with the resolution, which is
+        // why a DPR that is reachable at one geometry is refused at another.
+        if let Ok(resolved) = resolve_owned_display(&target) {
+            if let Some((cur, lo, hi)) = read_dpi_band(resolved.adapter_id, resolved.source_id) {
+                println!(
+                    "\n  final band: {}% in {}%..{}%",
+                    dpi_percent_at(cur),
+                    dpi_percent_at(lo),
+                    dpi_percent_at(hi)
+                );
+            }
+        }
+
+        // The whole point. Take the display away and keep the target: `\\.\DISPLAYn` is now a
+        // name Windows is free to hand to anything, and both writes must refuse it.
+        display.remove_display(id);
+        forget_display_identity(&path);
+        let gone = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < gone && active_display_paths().iter().any(|p| p.device_path == path)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mode_after_removal = set_display_mode_owned(&target, 1920, 1080, 60, false);
+        let scale_after_removal = set_display_scale_owned(&target, 200);
+        println!("\n  after removal, writing to the stale target:");
+        println!("    set_display_mode_owned  -> {mode_after_removal:?}");
+        println!("    set_display_scale_owned -> {scale_after_removal:?}");
+        assert!(
+            mode_after_removal.is_err(),
+            "a mode write to a removed display must be refused, not land on whatever holds its name"
+        );
+        assert!(
+            scale_after_removal.is_err(),
+            "a DPI write to a removed display must be refused, not land on whatever holds its name"
+        );
+
+        log_display_inventory("after the harness");
+        let now = active_display_paths();
+        for (dev_path, mode, band) in &physical_before {
+            let Some(p) = now.iter().find(|p| &p.device_path == dev_path) else {
+                panic!("{dev_path} is no longer attached; the harness disturbed the desktop");
+            };
+            assert_eq!(
+                &current_display_mode(&p.gdi_name),
+                mode,
+                "{dev_path} changed mode while the harness drove a virtual display"
+            );
+            assert_eq!(
+                &read_dpi_band(p.adapter_id, p.source_id),
+                band,
+                "{dev_path} changed DPI while the harness drove a virtual display"
+            );
+        }
+        println!("\n  every display that was not ours is exactly where it was.");
+    }
+
     /// creates a real display for a few seconds. Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "requires the virtual display driver installed; creates a real display; run with --ignored --nocapture"]
