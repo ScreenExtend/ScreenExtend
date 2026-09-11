@@ -3527,3 +3527,137 @@ started for any of the store tests and the owner's live `config.json` was never 
 them: every one runs against an in-memory `serde_json::Map` or a plain object.
 
 Ledger: `docs/OPTIMIZATIONS.md` §UX-CFGSHAPE; the two rules are in `CLAUDE.md`'s config section.
+
+## 15.17 The forward leg was never slow
+
+**The report.** *"Since pre-440 commits, the input latency forwarding was not that high. Now, the
+latency when I use my native keyboard/mouse is really low thanks to very fast streaming, but the
+latency when using the client keyboard/mouse is high."* The working assumption throughout was the
+owner's: **the old code was faster, and the burden of proof is on the new code.** The baseline is
+`271aa01`, ~440 commits behind this tree.
+
+**The headline is a negative result, and it is the most useful thing here.** The forward leg —
+client `send` → the host's `SendInput` — **was never the regression.** It is a millisecond at p50
+on the baseline, on HEAD before, and after. What regressed is the **return** leg, and only for
+*small* changes: a moved cursor, a repainted caret. It regressed **equally for the client's pointer
+and the host's own**. The owner perceives an asymmetry because they judge the native mouse on the
+host's screen, where DWM draws it and no stream is involved, and the client's through the stream.
+The asymmetry is in where they are looking, not in how the two are injected.
+
+### Stage by stage
+
+| stage | verdict |
+|---|---|
+| client DOM event → bytes on the channel | **cleared.** p50 0.02 ms on both trees; the `MessageChannel` flush gate is byte-identical to the baseline's |
+| client send → host `SendInput` (the forward leg) | **cleared at p50.** p99 had regressed (18 ms) and is fixed, but p50 was always ~1 ms |
+| host injection → the OS | not a factor |
+| **host change → a frame the client can paint (the return leg)** | **this is the regression** |
+
+### Measured three-way
+
+| | baseline `271aa01` | HEAD before | HEAD after |
+|---|---|---|---|
+| forward leg, 125 Hz p99 | 1 ms | **18 ms** | 1 ms |
+| keystroke p50 / p99 | 2 / 5 ms | 3 / 14 ms | **1 / 6 ms** |
+| static desktop, client paints | 5.0 fps | **46.9 fps** | 5.4 fps |
+| client pointer sweeping | 85.3 fps | **59.1 fps** | **99.6 fps** |
+| host pointer sweeping | 85.6 fps | 60.2 fps | **116.7 fps** |
+| 1 kHz burst reaching `SendInput` | 934/1000 | **779/1000** | **1000/1000** |
+| `frames_skipped_cadence` | — | **982** | 5 |
+| `input_queue_drops` / `input_stale_drops` | — | **166 / 55** | 0 / 0 |
+
+The static-desktop row is the one to read twice: 46.9 fps of re-encoded picture *that nobody was
+changing* is not a feature, it is nine times the NVENC submissions, keyed-mutex traffic and socket
+writes contending with the capture callback on the same device.
+
+### Six causes, and four of them are reversions
+
+1. **WGC stopped compositing the pointer** (§15.9, merge `8e65d90`). With the host drawing it, a
+   cursor-only move produces no captured frame at all: it is answered by the encode thread's idle
+   tick, which polls `GetCursorInfo` and re-encodes the held slot. Event-driven became polled —
+   quantised to the frame period, skippable when the tick is lost to the keyed mutex's 8 ms
+   `AcquireSync`, and in any scene where real frames keep arriving the idle arm never fires at all.
+   **WGC composites the pointer again; the overlay is off by default behind `SE_CURSOR_OVERLAY=1`.**
+2. **The cadence gate discarded the frame carrying the cursor.** `on_frame_arrived`'s own comment
+   says the cursor must be asked about before *both* gates "because both of them would otherwise
+   throw the frame that carries the pointer's new position away" — the dirty-region gate consulted
+   `cursor_moved`, this one never did. 257 of 475 delivered frames died here in one run. A
+   cursor-moved frame is now **exempt**, and that was measured rather than assumed: 113 fps exempt,
+   74 at a two-thirds window, 70 at a half, 59 before. **A window narrower than DWM's compose
+   interval does not coalesce, it discards** — both bounded variants land *below* the baseline they
+   were meant to restore.
+3. **The keepalive collapsed from 200 ms to the frame period**, because the polled cursor was its
+   only clock. **Back to 200 ms.**
+4. **Four transport workers where the baseline had sixteen per adapter.** Tokio has no dedicated
+   I/O thread, and a session steadily occupies the RTP writer, the RTCP/TWCC reader, the bitrate
+   driver's `getStats`, the audio forwarder and the `/reconfig` poll — so at four, all of them can
+   be runnable and an arriving pointer frame waits. Measured on the *same binary* with
+   `SE_TRANSPORT_WORKERS`: 779/1000 at 4, 1000/1000 at 16. The 48-thread problem that motivated the
+   cap was real, but **the shared runtime had already solved it** — 16 total is fewer than one
+   adapter used to cost. **Back to the baseline's width.**
+5. **`SendHistory::lookup` was an O(n) reverse scan** of a 4096-entry ring, twice per reported TWCC
+   symbol, under the mutex the RTP writer takes ~2000 times a second. Its comment claimed the scan
+   "finds a recent packet immediately"; a TWCC report starts at `base_sequence_number`, the
+   *oldest* sequence it covers, so it did the opposite. Now an O(1) index, with the equality check
+   on the named slot as the verification and the scan kept as a fallback. `COMPILE-CHECKED` for
+   speed (below this harness's resolution), `VERIFIED` for correctness.
+6. **The pointer lost every acceleration curve it had** — a gain change, not a delay, and the other
+   half of what "laggy" can mean. The baseline stacked two curves; HEAD asks for
+   `unadjustedMovement: true` *and* injects from a tracked absolute position, so with the defaults
+   there is **no curve anywhere** — a strict mickey-per-pixel pointer needing two to six times the
+   hand movement. "Exactly one curve" is the right rule; what this adds is that **the side holding
+   raw counts is the side that must apply it.** Raw counts now go out as relative
+   `MOUSEEVENTF_MOVE`, so Windows' own pointer speed and "enhance pointer precision" apply — the
+   user's configured curve, on the machine being driven, byte-identical to the pre-overhaul host.
+   Already-curved counts keep the tracked-absolute path, and `PointerScope::Display` keeps it
+   either way, because confining a cursor to one monitor needs a position to clamp.
+
+**This section partially reverses §15.9.** Ledger rows 336/337 are re-statused **REVERTED / no
+longer the default**, and `docs/CAPABILITY-TIERS.md`'s pointer-compositing row now has WGC as tier 1
+with the overlay opt-in. §15.9's own justification — "WGC delivers 2–10 fps for pointer-only
+motion" — had already been withdrawn in this tree as a harness defect (the 48-byte `INPUT` struct
+whose `SendInput` never moved the pointer, ledger row 334); what §15.9 built is kept and reachable,
+because a keepalive repeat carrying the pointer where it is *now* is a real property, just not one
+worth 26 fps.
+
+### Deliberately left alone
+
+- **`MAX_IN_FLIGHT` / `BACKLOG_STALL_MS`** are looser than the baseline's — a real tolerance for
+  ~132 ms of stalled decode — but the loosening has a measurement behind it (74 IDRs in 30 s on a
+  healthy session), and tripping sooner makes the stall it avoids *more* likely.
+- **`MAX_FAST_AGE_NS` and the reorder gate.** Replaying a 50 ms-old cursor position is worse than
+  dropping it, and the counters are what make a transport stall visible at all.
+- **The pacer.** `PacingMode::Off` on this box, so the path is byte-identical to the baseline — but
+  it is a live risk on any LAN the `/24` classifier calls `Unknown`, which is a separate question.
+- **The removed 60 fps floor.**
+
+### The blind spot worth recording
+
+`route()` stamps `host_recv_ns` *after* the scheduler wait, so a stall there leaves every host-side
+stage histogram clean and surfaces only as motion the client never sees. **A host whose telemetry is
+spotless while the user reports lag is diagnostic of this shape, not evidence against it.**
+
+### Damage done during the investigation
+
+The harness's first three runs cleared the `devices` array and threw before restoring it, losing the
+owner's macOS device row (token `67b99fa5…`, `172.16.11.74`, 1280x800, 120 Hz, DPR 1.5). The agent
+restored that row by hand and the harness now restores from a trap on every exit. It states that the
+object-shaped `devices` of §15.16 was **not** its write, and the timeline supports that: that damage
+predates these runs. Two config-destroying harness defects in consecutive passes (this and §15.8's
+BOM) is the pattern, not the coincidence — a measurement script that edits the user's live settings
+must restore them from a trap, not from the happy path.
+
+### Not verified
+
+- **Under-load runs were not obtained.** Three agents were building and cycling hosts on this box
+  throughout, so a contended measurement would have measured the contention. The numbers above are
+  idle-machine numbers.
+- **macOS is untouched and needs none of this.** `CGEventPost` does not apply the system's pointer
+  acceleration to synthetic events, so there is no host curve to hand motion back to and the "one
+  curve" question does not arise; the cursor, cadence and keepalive changes are all in
+  `windows_utils/streamer/pipeline.rs` and have no macOS counterpart.
+- The **relay's own client page** is unaffected by any client-side change here, for the reason
+  §15.12 gives.
+- The **AMD, Intel and x264 paths** carry the same cadence and cursor changes but were not measured;
+  no AMD GPU exists on this project.
+- The `-Load` fix in the harness is **self-tested only**.
