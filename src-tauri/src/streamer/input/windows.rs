@@ -249,8 +249,11 @@ impl Injector {
             InputEvent::Wheel { dx, dy, mode, .. } => self.wheel(*dx, *dy, *mode),
             InputEvent::Zoom { delta } => self.zoom(*delta),
             InputEvent::MouseDelta {
-                dx, dy, buttons, ..
-            } => self.mouse_delta(*dx, *dy, *buttons),
+                dx,
+                dy,
+                buttons,
+                unadjusted,
+            } => self.mouse_delta(*dx, *dy, *buttons, *unadjusted),
             InputEvent::Key {
                 down, code, key, ..
             } => self.key(*down, code, key),
@@ -354,30 +357,63 @@ impl Injector {
         button_transitions(self.buttons, buttons, &mut self.scratch);
     }
 
-    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
+    /// Inject one relative pointer movement.
+    ///
+    /// **Exactly one pointer curve, applied by whichever side holds raw counts.** The rule the
+    /// absolute-only version got right is that two curves are wrong: the client's OS applies its
+    /// own to `movementX/Y` unless `unadjustedMovement` was granted, and Windows applies its own to
+    /// `MOUSEEVENTF_MOVE`, so a plain relative injection of already-curved deltas accelerates
+    /// twice. What it got wrong is the other end of the same rule — with `unadjustedMovement`
+    /// granted, which is what the client now asks for, the deltas are raw device counts and the
+    /// tracked-absolute path applies **no** curve at all. `settings.sensitivity` defaults to 1.0
+    /// and `settings.accel` to 0, so a flick that used to cross the display moved it by the
+    /// mickeys the mouse reported and nothing more. That is a two-to-six-times gain reduction at
+    /// ordinary speeds, and a pointer that needs several times the hand movement it used to reads
+    /// as a pointer that lags the hand.
+    ///
+    /// So: raw counts go relative, and Windows' pointer speed and "enhance pointer precision"
+    /// apply — the user's own curve, on the machine being driven, for free, and byte-identical to
+    /// what the pre-overhaul host did. Already-curved counts keep the tracked-absolute path,
+    /// because there the second curve is the one that must not happen.
+    ///
+    /// `PointerScope::Display` also keeps the tracked path whatever the flag says: confining the
+    /// cursor to one monitor needs a position to clamp, and `MOUSEEVENTF_MOVE` has none.
+    fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16, unadjusted: bool) {
         self.mouse_relative = true;
         self.scratch.clear();
+        let os_curve = self.lets_os_curve(unadjusted);
         if dx != 0 || dy != 0 {
-            // Absolute, from a position we track ourselves. A raw `MOUSEEVENTF_MOVE` goes
-            // through the Windows pointer curve, and the client has already applied its own
-            // (its OS's, unless `unadjustedMovement` was granted, plus its sensitivity
-            // setting) — so the relative path used to accelerate twice while the absolute path
-            // accelerated not at all. One curve, owned by the client, is the coherent answer,
-            // and it matches what the macOS backend has always done.
-            let pos = self.advance_rel(dx as i32, dy as i32);
-            let vx = (pos.x - self.virt.left) as f32 / self.virt.width as f32;
-            let vy = (pos.y - self.virt.top) as f32 / self.virt.height as f32;
-            self.scratch.push(mouse_input(
-                (vx.clamp(0.0, 1.0) * 65535.0).round() as i32,
-                (vy.clamp(0.0, 1.0) * 65535.0).round() as i32,
-                0,
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-            ));
+            if os_curve {
+                // The tracked position is now stale — Windows owns the cursor on this path — so it
+                // is dropped and re-read from `GetCursorPos` if a later frame needs the absolute
+                // path again.
+                self.rel_pos = None;
+                self.scratch
+                    .push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
+            } else {
+                let pos = self.advance_rel(dx as i32, dy as i32);
+                let vx = (pos.x - self.virt.left) as f32 / self.virt.width as f32;
+                let vy = (pos.y - self.virt.top) as f32 / self.virt.height as f32;
+                self.scratch.push(mouse_input(
+                    (vx.clamp(0.0, 1.0) * 65535.0).round() as i32,
+                    (vy.clamp(0.0, 1.0) * 65535.0).round() as i32,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ));
+            }
         }
         button_transitions(self.buttons, buttons, &mut self.scratch);
         send_inputs(&self.scratch);
         self.scratch.clear();
         self.buttons = buttons;
+    }
+
+    /// Whether this frame's motion should be handed to Windows' pointer curve.
+    ///
+    /// Split out from `mouse_delta` so the decision is testable without a desktop: the injection
+    /// itself is a `SendInput` and there is nothing to assert about it in a unit test.
+    fn lets_os_curve(&self, unadjusted: bool) -> bool {
+        unadjusted && matches!(self.live.pointer_scope(), PointerScope::All)
     }
 
     /// The rectangle a pointer-locked cursor may not leave.
@@ -1171,6 +1207,35 @@ mod tests {
     /// A locked client accumulates `MOUSE_DELTA` into a position we track, and the whole
     /// question item 17 asked is what that position may not leave. `Display` is the session's
     /// own monitor; `All` is the virtual desktop, which is what every build before this did.
+    #[test]
+    /// Exactly one pointer curve, and which side applies it follows the client's flag.
+    ///
+    /// Raw device counts (`unadjustedMovement` granted) go relative so Windows curves them; counts
+    /// the client's own OS has already curved keep the tracked-absolute path so they are not curved
+    /// twice. `PointerScope::Display` overrides both, because clamping to one monitor needs a
+    /// position and `MOUSEEVENTF_MOVE` does not have one.
+    #[test]
+    fn raw_counts_get_the_os_curve_and_already_curved_counts_do_not() {
+        let mut inj = Injector::new(ClientProfile::default());
+
+        inj.live.set_pointer_scope(PointerScope::All);
+        assert!(
+            inj.lets_os_curve(true),
+            "raw counts under the unrestricted scope are Windows' to accelerate"
+        );
+        assert!(
+            !inj.lets_os_curve(false),
+            "counts the client's OS already curved must not be curved again"
+        );
+
+        inj.live.set_pointer_scope(PointerScope::Display);
+        assert!(
+            !inj.lets_os_curve(true),
+            "confining the cursor to one display needs a tracked position to clamp"
+        );
+        assert!(!inj.lets_os_curve(false));
+    }
+
     #[test]
     fn a_locked_pointer_is_clamped_to_the_scope_it_was_given() {
         let target = DisplayRect {
