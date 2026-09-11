@@ -228,6 +228,33 @@ pub fn is_device_approved(approved: &SharedApprovedDevices, token: &str) -> bool
     !token.is_empty() && approved.lock_recover().contains(token)
 }
 
+/// Whether a token the client presented is one **this host already keeps settings under**.
+///
+/// The join path mints a fresh token on every successful OTP, which is right for a device the
+/// host has never seen and wrong for one it has: a per-device setting is keyed by the token, so
+/// re-minting renames the device and orphans the row that was just written for it. That is what a
+/// settings change looks like from the client — the epoch bumps, the session rebuilds, the rejoin
+/// is handed a new name, and the display comes back with the *defaults* the user had just
+/// changed. Under `serve` it happens on every single reconfigure, because nothing there ever
+/// writes the approval the desktop UI writes from its `deviceJoin` handler.
+///
+/// Continuity is granted only for a token the host itself issued and still has state for —
+/// never for an arbitrary string a client offers, because the trust maps are keyed by this value
+/// and a device that could choose its own name could choose one that is already approved.
+pub fn is_known_device(overrides: &SharedDeviceOverrides, token: &str) -> bool {
+    is_device_token(token) && overrides.lock_recover().contains_key(token)
+}
+
+/// The shape [`mint_device_token`] produces: 128 bits as lowercase hex.
+///
+/// A client presents this string, so it is parsed before it is compared: a length or alphabet
+/// this host never issues cannot be one of ours whatever a map happens to contain.
+pub fn is_device_token(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 pub type SharedDisconnectGrace = Arc<std::sync::atomic::AtomicU64>;
 
 pub const DEFAULT_DISCONNECT_GRACE_SECS: u64 = 10;
@@ -1525,5 +1552,68 @@ mod tests {
             portrait: false,
         };
         assert_eq!(d.display_params(), (1920, 1080, 120, 150, false));
+    }
+
+    // ---- device identity across a settings change ---------------------------------------
+
+    /// The reconfigure a settings change triggers must not rename the device.
+    ///
+    /// This is the shape of the reported fault: the user changes the refresh rate and the pixel
+    /// ratio, the host writes the override under the device's token and bumps the reconfig
+    /// epoch, the client tears its session down and joins again — presenting the same token and,
+    /// because the page still holds them, the same credentials. If the OTP path mints here, the
+    /// rejoin is a *different* device, the override that was just written belongs to nobody, and
+    /// the display comes back at the settings the user had just changed away from.
+    #[test]
+    fn a_device_the_host_has_settings_for_keeps_its_token() {
+        let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
+        let token = mint_device_token();
+        assert!(
+            !is_known_device(&overrides, &token),
+            "a token with no settings behind it is not continuity, it is a claim"
+        );
+
+        overrides
+            .lock_recover()
+            .insert(token.clone(), DeviceOverride::join_defaults());
+        assert!(is_known_device(&overrides, &token));
+    }
+
+    /// Continuity is granted on the host's own record, never on the client's word: every trust
+    /// map is keyed by this string, so a device that could name itself could name itself
+    /// something already approved.
+    #[test]
+    fn an_unknown_or_malformed_token_is_never_honoured() {
+        let overrides: SharedDeviceOverrides = Arc::new(Mutex::new(HashMap::new()));
+        let stranger = mint_device_token();
+        assert!(!is_known_device(&overrides, &stranger));
+        assert!(!is_known_device(&overrides, ""));
+
+        // Even present in the map, a string this host could not have minted is refused: the
+        // parse runs first, so a row planted by a corrupt config cannot become an identity.
+        for bogus in ["../../etc", "NOTHEX", &"a".repeat(64), &"g".repeat(32)] {
+            overrides
+                .lock_recover()
+                .insert(bogus.to_string(), DeviceOverride::join_defaults());
+            assert!(
+                !is_known_device(&overrides, bogus),
+                "{bogus:?} is not a shape this host mints"
+            );
+        }
+    }
+
+    #[test]
+    fn a_minted_token_is_recognised_as_one() {
+        for _ in 0..32 {
+            let t = mint_device_token();
+            assert!(is_device_token(&t), "{t}");
+        }
+        assert!(!is_device_token(""));
+        assert!(!is_device_token(&"0".repeat(31)));
+        assert!(!is_device_token(&"0".repeat(33)));
+        assert!(
+            !is_device_token(&"A".repeat(32)),
+            "minted tokens are lowercase hex; accepting uppercase would make one device two"
+        );
     }
 }

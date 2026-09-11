@@ -3273,3 +3273,132 @@ not a phone's. What the four runs isolate is the **host's response** to whatever
 which is the part this repo controls. The owner's phone on cellular remains the arbiter —
 `docs/manual-tests/client-page.md` has the procedure, and `idrs_sent` against `frames_encoded` is
 the number to read.
+
+---
+
+## UX-EXIT — a host that vanished during a settings change, and the evidence that did not exist
+
+**Status: `VERIFIED` for the instrumentation and the token-continuity fix (both measured on the
+Windows dev box). The reported disappearance itself is `NOT REPRODUCED` — see "What was not
+found".**
+
+### The report
+
+With one device connected, the owner changed that device's **frame rate and pixel ratio** in the
+dashboard's device sheet. The device "glitched, then disconnected", and the host GUI process
+(pid 22456, release build of `20b5b0e`) was afterwards gone: `ScreenExtend logs` said no running
+instance, and there was **no Application-log crash event and no WER dump** — neither in
+`%LOCALAPPDATA%\CrashDumps` nor in the WER archive or queue.
+
+The absence of crash artefacts is real evidence, not an oversight: WER on that machine logs
+faults for other processes freely (`lhm_reader.exe`, `Cloudflare WARP.exe`, and this repo's own
+test binary `screenextend_lib-*.exe` on 9 Sep, all with Event ID 1000 + a 1001 bucket). So the
+host **exited cleanly** — a `exit(0)`, a window close, or a `TerminateProcess` from outside — and
+not through a panic-abort or a fault.
+
+### What was reproduced
+
+The reported *user-visible* half reproduces, and it is a real defect:
+
+`ScreenExtend serve -v`, Chrome on the same box joining over HTTP, then a refresh-rate + DPR
+change replayed into the running host through `config set` → `RELOAD` → `set_device_override`.
+The epoch bumped, the client tore its session down and rejoined — and the log said
+
+```
+leave beacon for join 63402aff…; tearing down session
+join request: device="ChromeTest", session=ABCDEFGH2345, screen=1920x1080
+issued a new device token to 172.16.11.76 after successful OTP
+virtual display created (id=1, 1920x1080@60)
+```
+
+**1920x1080@60 — not the 120 Hz and not the 1.5x the change had just written.** Per-device
+settings are keyed by the device token, `POST /whep` minted a fresh one on every successful OTP
+join, and the rejoin that the settings change itself provoked therefore came back as a *different
+device* wearing the defaults. From the client that is exactly "it glitched and then came back
+wrong"; from the host, the override the user had just saved was orphaned the instant it was used.
+
+It is invisible in the desktop app only because `App.tsx`'s `deviceJoin` handler calls
+`setDeviceApproved(token)`, which puts the next join on the pre-approved path where the presented
+token *is* kept. `serve` writes no such approval, so under the headless host it happened on every
+single reconfigure.
+
+**Fix:** `session::is_known_device` — after a successful OTP, a presented token that is
+well-formed (`is_device_token`: 32 lowercase hex, the shape `mint_device_token` produces) **and
+already has a per-device override on this host** is kept instead of re-minted. Continuity is
+granted on the host's own record and never on the client's word, because every trust map is keyed
+by that string: a device that could name itself could name itself something already approved.
+Covered by three tests in `streamer::session::tests`, and measured end to end on the release
+build: the same device, the same page, the same saved override (120 Hz, 1.5x) — before the fix
+`issued a new device token … after successful OTP` and `virtual display created (id=1,
+1920x1080@60)`; after it, `re-presented a device token this host has settings for; keeping it`
+and `virtual display created (id=0, 2880x1620@120)`.
+
+### What was not found
+
+The disappearance did not reproduce. Both hosts survived the reported action and worse:
+
+| Host | Client | Change | Result |
+|---|---|---|---|
+| `serve -v`, debug | Chrome, same box | 120 Hz + DPR 1.5 via `RELOAD` | survived; two rebuilds, then steady |
+| GUI, debug (`pnpm dev` + the debug binary) | Chrome, same box | 120 Hz + DPR 2.25 from the device sheet, real mouse clicks | survived; display became 4320x2430@120 |
+| GUI, debug | as above | DPR 3x + 485 Hz (both sliders at maximum) | survived; 5760x3240, NVENC clamped to 4096x3240 |
+
+The suspects the brief named were read and cleared, not merely untested:
+
+- **`quit_driver_holder`** guards `pid != std::process::id()`, and `probe_display_backend`
+  short-circuits on a `CONNECTED` `OnceLock` once this process has talked to the driver, so the
+  device sheet's `checkSystemRequirements()` never re-opens the pipe a live display is holding.
+- **`ComScope`** asks `CoGetApartmentType` first and only uninitializes an apartment it created;
+  the main STA is observed, logged and left alone (`com::test` asserts it).
+- **`set_display_mode`** returns `Err` for a mode the display refuses and every caller is a
+  `spawn_blocking` whose `JoinError` is logged, not propagated. `remove_display_async`,
+  `apply_display_scale` and `wait_for_display_settle` are the same shape.
+- The **updater** is only reachable from `bootstrap.tsx`'s `runSetup`; `pendingUpdate()` races
+  `check()` against a 2 s deadline and a late result is dropped, never installed.
+- Nothing in `src/` calls `window.close()`; the only clean-exit routes in the GUI are `exit_app`
+  (from `onCloseRequested` or the profile menu), `quit_main_window`'s `app.exit(0)`, and
+  `relaunch_app`.
+
+### The fix for the part that mattered: make a silent exit impossible
+
+The instrumentation is the deliverable, because the thing that made this report un-diagnosable was
+that **a host quit from the menu and a host terminated from outside leave identical evidence**: an
+in-memory log ring that dies with the process, a lock file that is `mem::forget`ed and never
+touched again, and no OS record at all for a clean exit.
+
+`src-tauri/src/exit_reason.rs` closes that. Every deliberate route names itself before it goes —
+`exit_app`, `quit_main_window` (the control server's `QUIT`), `relaunch_app` on all three
+platforms, and `serve`'s Ctrl+C — and `lib.rs`'s run loop records the two events that previously
+passed in silence: the main window's `CloseRequested` (which is what a restart manager, a session
+logoff or an Alt+F4 looks like from inside) and `RunEvent::ExitRequested`. The first reason wins,
+since the routes chain and the one that *started* it is the informative one.
+
+The reason is written to `screenextend.exit` beside the lock, read back into the next instance's
+log at startup and then deleted — so a breadcrumb on disk always describes the running process,
+and **its absence is the finding**. `ScreenExtend logs` with nothing running now prints either
+
+```
+The last host (pid 22456) ended deliberately: exit_app: the desktop UI asked the host to quit
+```
+
+or
+
+```
+The last host left no exit record, so it did not end through any route ScreenExtend owns:
+it was terminated from outside, or it faulted.
+```
+
+Both sentences were read back off the release build: a `ScreenExtend stop` produced the first
+naming the control server's `QUIT` and the pid; `taskkill /F` produced the second; and the next
+launch logged `[exit] the previous host (pid 46840) ended deliberately: …` once and cleared the
+file.
+
+Four tests in `exit_reason::test` cover the line format, the newline flattening (a reason with a
+`\n` in it would otherwise write a line the parser never sees), the junk cases, and first-reason-
+wins.
+
+### If it happens again
+
+Run `ScreenExtend logs` immediately. The two sentences above are the whole diagnosis: the first
+names the route and closes the question; the second says the process was killed or faulted, and
+`docs/manual-tests/desktop-ui.md` §13 has the next three checks.

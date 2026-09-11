@@ -30,5 +30,6 @@ pub fn open_permission_settings(_key: String) {}
 #[tauri::command]
 #[specta::specta]
 pub fn relaunch_app(app: tauri::AppHandle) {
+    crate::exit_reason::record("relaunch_app: the desktop UI asked for a restart");
     app.restart();
 }

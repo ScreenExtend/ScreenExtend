@@ -193,3 +193,25 @@ that has to be legible.
 | Removing the device | "Remove device" on either row | Both sessions end and both rows go. |
 | Trust is by token | Settings -> known devices, with two tabs open | One row for the device, marked Connected. Banning it ends both sessions. |
 | A recycled address | Ban a device, disconnect it, then join from a different device that picks up its address | The new device joins normally and is not marked banned. Its settings are its own. |
+
+## 13. The host never ends on a settings change, and always says why it did (UX-EXIT)
+
+A host that disappears leaves no OS record when it exits cleanly, so the only usable evidence is
+the one the app writes itself. These checks are what make a repeat of the silent-exit report
+answerable in one command.
+
+| Check | How | Expected |
+|---|---|---|
+| A settings change never ends the host | With a device connected, open its sheet, move **Refresh Rate** and **Pixel Ratio** together, Save | The device rebuilds its session once and comes back. The host window is still there; `ScreenExtend status --json` answers. |
+| The change is the one that landed | `ScreenExtend logs \| findstr "virtual display created"` | The new display carries the refresh rate you chose and `css x dpr` for its size — not `1920x1080@60`. |
+| The device keeps its name | `ScreenExtend devices list --json` before and after the save | The `joins[].token` is unchanged, and the log says `re-presented a device token this host has settings for; keeping it` rather than `issued a new device token`. On a host that has never had settings for this device, minting once is correct. |
+| A deliberate quit says so | Quit from the profile menu, then `ScreenExtend logs` | `The last host (pid N) ended deliberately: exit_app: the desktop UI asked the host to quit` |
+| `stop` says so | Start the host, `ScreenExtend stop`, then `ScreenExtend logs` | `…ended deliberately: control server: another process sent QUIT…` |
+| A kill says so too — by saying nothing | Start the host, end it from Task Manager, then `ScreenExtend logs` | `The last host left no exit record, so it did not end through any route ScreenExtend owns: it was terminated from outside, or it faulted.` |
+| The record is one launch deep | Start the host again after any of the above, `ScreenExtend logs` | The startup log carries `[exit] the previous host (pid N) ended deliberately: …` once, and `screenextend.exit` in `%LOCALAPPDATA%\app.screenextend.desktop\` is gone. |
+
+**Note on the third row.** The settings the sheet writes are keyed by the device token, and the
+save bumps the reconfig epoch, which makes the client rejoin. If that rejoin is minted a *new*
+token, the settings it was just given belong to nobody and the display comes back at the
+defaults — which reads as "the change did nothing and the screen glitched". That is the bug
+UX-EXIT fixed; this row is what catches it coming back.
