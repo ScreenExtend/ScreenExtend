@@ -1032,26 +1032,37 @@ mod tests {
         }
         assert_eq!(h.ring.len(), SEND_HISTORY);
 
-        let scan = |seq: u16| h.ring.iter().rev().find(|p| p.seq == seq).copied();
-        for p in h.ring.iter() {
-            assert_eq!(h.lookup(p.seq), scan(p.seq), "seq {}", p.seq);
-            assert_eq!(h.lookup(p.seq).map(|q| q.seq), Some(p.seq));
+        // `SentPacket` is a private POD with no `PartialEq`, and adding one to production code so a
+        // test can use `assert_eq!` is the tail wagging the dog. The whole record as a tuple is the
+        // same comparison.
+        fn key(p: Option<SentPacket>) -> Option<(u16, i64, u32, u32)> {
+            p.map(|p| (p.seq, p.send_us, p.bytes, p.frame))
+        }
+        fn scan(h: &SendHistory, seq: u16) -> Option<SentPacket> {
+            h.ring.iter().rev().find(|p| p.seq == seq).copied()
+        }
+
+        let seqs: Vec<u16> = h.ring.iter().map(|p| p.seq).collect();
+        for seq in &seqs {
+            assert_eq!(key(h.lookup(*seq)), key(scan(&h, *seq)), "seq {seq}");
+            assert_eq!(h.lookup(*seq).map(|q| q.seq), Some(*seq));
         }
         // A sequence the ring no longer holds must answer nothing, not the slot its index names.
         let front = *h.ring.front().unwrap();
         let gone = front.seq.wrapping_sub(1);
-        assert_eq!(
-            h.lookup(gone),
-            None,
-            "retired sequences are not in the ring"
-        );
+        assert_eq!(key(h.lookup(gone)), None, "a retired sequence is not here");
         let unsent = h.ring.back().unwrap().seq.wrapping_add(1);
-        assert_eq!(h.lookup(unsent), None, "unsent sequences are not either");
+        assert_eq!(key(h.lookup(unsent)), None, "nor is an unsent one");
 
         // And after a retire, when the front is no longer where it was.
         h.retire_through(front.seq.wrapping_add(100));
-        for p in h.ring.iter() {
-            assert_eq!(h.lookup(p.seq), scan(p.seq), "after retire, seq {}", p.seq);
+        let seqs: Vec<u16> = h.ring.iter().map(|p| p.seq).collect();
+        for seq in &seqs {
+            assert_eq!(
+                key(h.lookup(*seq)),
+                key(scan(&h, *seq)),
+                "after retire, seq {seq}"
+            );
         }
     }
 
