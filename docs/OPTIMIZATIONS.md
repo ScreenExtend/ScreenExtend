@@ -315,8 +315,8 @@ Measurement conventions: nanosecond timestamps off the shared host clock
 | 333 | tooling | `scripts/measure-stream.ps1`: a real `serve` host, a real Chrome join over HTTPS driven through the DevTools protocol, a `SendInput` pointer sweep on the virtual display, and one row per second of what the **client** reports: painted frames, host-capture-to-paint percentiles, keyframe requests, degradation bits. It also records the client window at 60 fps and counts the gaps between frames that actually changed, and samples the host's CPU and the desktop's own animation cadence. | Every number in `docs/RESULTS.md` came from `probe`, which paints a full-frame animation into a borderless window and never involves a browser. On that content every frame is a changed frame, so it cannot see a pipeline that drops frames the compositor calls unchanged, and it cannot see a client that has demoted itself off the WebCodecs path. The owner's report and the harness disagreed because they were measuring different things. | no repeatable measurement of what a joining client sees | one command, and the six defects above are each visible in its output | **VERIFIED** (used to find and to confirm every row from 324 to 331) | yes | It clears the saved device row for the run and puts it back afterwards: a row saved from an earlier session pins the geometry and the refresh rate, and measuring against one is measuring the row rather than the build. That is not a harness quirk, it is how this box came to be running a 3840x2160 display for a 1920x1080 client. |
 | 334 | tooling | `scripts/measure-stream.ps1`'s `INPUT` struct drops the two trailing pad ints, so `Marshal.SizeOf` is the OS's 40 bytes instead of 48; the sweep is proved with a move-and-read-back before the run starts, and the run refuses rather than continues if the pointer did not move. | `SendInput` validates `cbSize` against its own `sizeof(INPUT)` and returns **0** for anything else. Nothing checked the return, so every `MoveTo` in every run of the **cursor scene** failed with `ERROR_INVALID_PARAMETER` and the pointer never moved. A cursor scene with a stationary cursor is not a failed measurement; it is a plausible-looking measurement of a *still desktop*, which is why nothing caught it. | the pointer sat at the centre of the host's own panel for the whole run; `SendInput` returned 0, 1800 times | `pointer sweep self-test passed`, then the pointer actually sweeps the virtual display | **VERIFIED** (Windows: `Marshal.SizeOf` 48 -> 40, `sent=0 err=87` -> `sent=1`, and the pointer moves) | yes | **This invalidates the pointer-motion conclusions of `docs/RESULTS.md` "User-facing stream quality" and `FINAL-REPORT` §15.6.** The "2-10 real frames a second for pointer-only motion" that both cite, and the whole "WGC does not deliver a frame for pointer-only motion" bullet under "What is not fixed", were measured with a pointer that never moved. Re-measured with a pointer that does, WGC on this box delivers ~50 fps. The corrected numbers are in the new `docs/RESULTS.md` section. |
 | 335 | tooling | The 60 fps recording's `-offset_x`/`-offset_y`/`-video_size` move **before** `-i desktop`, and a run that produced no recording says so instead of reporting no freezes. | They were output options, where ffmpeg parses and ignores them, so gdigrab recorded the entire 3840x1080 virtual desktop rather than the client's 1280x800 window. Every "changed frame" therefore counted a clock ticking, a taskbar animating or a second browser window repainting somewhere else on screen, and the freeze numbers described the desktop rather than the stream. A missing recording, separately, reads downstream as zero freezes. | `changed frames/s` counted the whole desktop; `client.mkv` was 3840x1080 | 1280x800 of the client window alone; `gap p50` reads 17 ms (the panel's frame period) rather than 50 | **VERIFIED** (Windows: the recording is now 1280x800 and a deliberate bad crop is reported as an error rather than silently skipped) | yes | Found by using it: after fixing row 334 the first crop attempt was rejected by gdigrab with its own bounds error, which is how the offsets turned out to be desktop coordinates and not virtual-screen ones. |
-| 336 | capture (Windows) | **The host composites the pointer itself.** `IsCursorCaptureEnabled(false)`; `cursor_overlay.rs` builds a sprite from `GetCursorInfo`'s `HCURSOR` and blends it onto each ring slot on the GPU; the ring encode thread redraws it on the slot it is already holding whenever the pointer has moved and no frame arrived, and re-encodes. Erasing is a saved rectangle, not a full-frame copy. `dxgi/cursor.rs` gains `shape_from_hcursor`, which converts the GDI bitmaps into DXGI's own three-shape encoding so the existing `build_sprite` serves both backends. New counters: `cursor_frames`, `cursor_composites`, `cursor_composite_us`, `cursor_shape_errors`. | WGC composites the pointer into a plane the compositor is not obliged to redeliver, and a keepalive repeat carries the pointer wherever it was last composited. Making the pointer's freshness the host's own responsibility removes the compositor from that decision entirely. | pointer sweeping an empty virtual display, median of three: painted **71.8** fps, changed frames **49.1**/s, freezes >=100 ms **2**/min, `capture_to_socket` p50 **9.44** ms, 12 % of emitted frames were stale repeats | painted **68.8** fps, changed frames **38.9**/s, freezes **4**/min, `capture_to_socket` p50 **9.44** ms, 8 % stale repeats; composite costs **29-50 us** of CPU per frame | **VERIFIED as correct, NOT as faster.** The pointer is drawn, with the right shape, hotspot and alpha (frame extracted from the client recording). The before/after numbers are **inside the run-to-run spread** on this box, and the honest reading is that they are indistinguishable. | yes, with the caveat above | Row 334 is why: the 2-10 fps this change was commissioned to fix was a stationary pointer, and WGC on Windows 11 26200 delivers ~50 fps for pointer-only motion once the pointer really moves. What the change still buys is that the pointer no longer *depends* on the compositor delivering a frame - with the pointer held still, WGC delivered 2 frames in 20 s - and that a repeat carries the current pointer rather than a stale one. Both matter most on the builds `guides/windows-legacy.md` covers, which is where it is unverified. |
-| 337 | capture (Windows) | The pointer tier is probed by building it, and `GraphicsCaptureApiHandler::cursor_capture_override` (a `windows_capture` fork addition) lets the handler overrule `Settings::cursor_capture_settings` after it exists. | The right cursor setting is not knowable when `Settings` is built: the overlay needs a render-target view on the encoder's own input textures, which only the `AsyncEncodeRing` slots are, and that is decided while the handler constructs its encoder. Deciding early means either a stale cursor or - if the overlay then fails to build - **no cursor at all**, which is far worse than the defect being fixed. | n/a (new) | `CursorOverlay::new` failing for any reason leaves the override `None` and WGC composites the pointer exactly as before; there is no state where both draw it and none where neither does | **VERIFIED** on the NVENC ring (the tier is selected and logged with the display rectangle, encode size and DPI factor). The AMF ring arm and the classic non-ring path are **COMPILE-CHECKED**: the classic path deliberately keeps WGC's pointer, because it encodes the captured texture in place and its repeater re-encodes the encoder's own held picture, so there is no slot to draw onto. | yes | `FORK.md` updated. The first live run drew no pointer at all and the log said only that compositing was on; the session line now carries the geometry and the first three absences say which test rejected the pointer and where it was, which is what turned a rebuild-and-guess loop into one run. |
+| 336 | capture (Windows) | **The host composites the pointer itself.** `IsCursorCaptureEnabled(false)`; `cursor_overlay.rs` builds a sprite from `GetCursorInfo`'s `HCURSOR` and blends it onto each ring slot on the GPU; the ring encode thread redraws it on the slot it is already holding whenever the pointer has moved and no frame arrived, and re-encodes. Erasing is a saved rectangle, not a full-frame copy. `dxgi/cursor.rs` gains `shape_from_hcursor`, which converts the GDI bitmaps into DXGI's own three-shape encoding so the existing `build_sprite` serves both backends. New counters: `cursor_frames`, `cursor_composites`, `cursor_composite_us`, `cursor_shape_errors`. | WGC composites the pointer into a plane the compositor is not obliged to redeliver, and a keepalive repeat carries the pointer wherever it was last composited. Making the pointer's freshness the host's own responsibility removes the compositor from that decision entirely. | pointer sweeping an empty virtual display, median of three: painted **71.8** fps, changed frames **49.1**/s, freezes >=100 ms **2**/min, `capture_to_socket` p50 **9.44** ms, 12 % of emitted frames were stale repeats | painted **68.8** fps, changed frames **38.9**/s, freezes **4**/min, `capture_to_socket` p50 **9.44** ms, 8 % stale repeats; composite costs **29-50 us** of CPU per frame | **REVERTED - superseded by the UX-INPUT section below.** It was `VERIFIED as correct, NOT as faster`, and re-measured against the *baseline* it is slower: a pointer sweep paints **59.1** fps with the overlay against **85.3** on `271aa01` and **99.6** with WGC drawing it again. The mechanism is in the change itself - the overlay can only redraw on the encode thread's idle tick, so it is polled and quantised to the frame period, where a WGC cursor move *is* a delivered frame at the compositor's rate. The code stays and is **off by default**, behind `SE_CURSOR_OVERLAY=1`, for a machine whose compositor behaves differently. | **no - off by default.** The justification this row was commissioned on had already been withdrawn in this file (row 334); the measurement that replaced it is against the baseline rather than against HEAD | Row 334 is why: the 2-10 fps this change was commissioned to fix was a stationary pointer, and WGC on Windows 11 26200 delivers ~50 fps for pointer-only motion once the pointer really moves. What the change still buys is that the pointer no longer *depends* on the compositor delivering a frame - with the pointer held still, WGC delivered 2 frames in 20 s - and that a repeat carries the current pointer rather than a stale one. Both matter most on the builds `guides/windows-legacy.md` covers, which is where it is unverified. |
+| 337 | capture (Windows) | The pointer tier is probed by building it, and `GraphicsCaptureApiHandler::cursor_capture_override` (a `windows_capture` fork addition) lets the handler overrule `Settings::cursor_capture_settings` after it exists. | The right cursor setting is not knowable when `Settings` is built: the overlay needs a render-target view on the encoder's own input textures, which only the `AsyncEncodeRing` slots are, and that is decided while the handler constructs its encoder. Deciding early means either a stale cursor or - if the overlay then fails to build - **no cursor at all**, which is far worse than the defect being fixed. | n/a (new) | `CursorOverlay::new` failing for any reason leaves the override `None` and WGC composites the pointer exactly as before; there is no state where both draw it and none where neither does | **VERIFIED** on the NVENC ring (the tier is selected and logged with the display rectangle, encode size and DPI factor), but **no longer the default** - see row 336 and the UX-INPUT section below. The probe and the fork's `cursor_capture_override` are what make the overlay reachable at all, so they stay; with `SE_CURSOR_OVERLAY` unset the override returns `None` and `Settings::cursor_capture_settings` - `WithCursor` - stands, which is the shipped path. The AMF ring arm and the classic non-ring path remain **COMPILE-CHECKED**. | yes | `FORK.md` updated. The first live run drew no pointer at all and the log said only that compositing was on; the session line now carries the geometry and the first three absences say which test rejected the pointer and where it was, which is what turned a rebuild-and-guess loop into one run. |
 | 338 | session identity (all platforms) | **A session is a join, not an address.** The host mints a 128-bit `join_id` at `POST /whep` and hands it back as the WHEP resource, in `X-Join-Id` and in an `se_join` cookie. `SharedSessions` is keyed by it, and so are the live display, the capture stopper, the sequence numbers, both epochs, the leave signal, the control channel, the disconnect grace and the telemetry registry. `/reconfig`, `/leave` and `/audio-outputs` carry `?join=`; the cookie is the bridge for a page cached from before the id existed and the explicit parameter always wins, because a cookie is per-origin and two tabs share it. `session::remove_session` is new, because keyed by join the map would otherwise gain an entry for every tab ever opened. | The owner's report: two tabs on one machine could never coexist. `start_session` looked the client up by IP, found the first tab's session, stopped its capture and took over its display — so the first froze and the second replaced it. | two tabs from one machine: one display; the first stream frozen | two tabs: two join ids, two displays, two independent NVENC pipelines, both encoding | **VERIFIED** on this box, two Chrome tabs on `172.16.11.76`: joins `ee9db96f…`/`cb55b3f3…`, displays `\\.\DISPLAY10` + `\\.\DISPLAY11` beside the real `DISPLAY1`, frame counters climbing on both (2782→3306 and 857→1382 over 12 s) | yes | No cap was added or removed: `session::concurrent_display_cap` is still the only refusal and still only the macOS AirPlay tier. macOS and Linux arms are written and **UNVERIFIED** (Linux does not compile). |
 | 339 | device identity (all platforms) | **A device is its token, not its address.** `SharedDeviceOverrides`, approval, bans and the new `SharedAudioSinks` are keyed by the device token; `config.json` `devices[]`/`knownDevices[]` are matched by token, with the address kept only as a display field. `is_device_banned` lost its IP arm. The `set_device_*` commands and the CLI's `devices set|reset` take a token and accept an address only as a convenience lookup that resolves while exactly one device is connected from it — and says so. A saved row with no token waits for that device to join once more rather than being replayed. | The owner's ruling: addresses rotate under a live session (a roam, a DHCP renewal, a NAT rebind) and are recycled between devices, so keyed by address a device that leaves hands its settings, and its ban, to whatever picks up the lease next. | a phone's ban and settings landed on the laptop that inherited its address | neither reaches it; `session::token_for_ip` refuses to resolve an address two devices share | **VERIFIED** by test (`a_device_that_inherits_a_disconnected_devices_address_inherits_nothing_else`, `an_address_resolves_to_a_device_only_while_it_is_unambiguous`) and live, where both tabs shared one token and therefore one settings row | yes | The behaviour change worth naming: an IP-only ban no longer holds. A device that has never completed an OTP join has no token, and there is nothing to ban it by — it has never been seen. |
 | 340 | transport | `SessionHandle::close` drops its `Arc<RTCPeerConnection>` **before** joining the injector thread, tells the injector to leave over a dedicated one-shot channel it now selects on, and bounds the join at 2 s. | The thread's only exits were its two input channels disconnecting — and every sender clone lives inside a handler the peer connection owns (the input data channel's `on_message`, the state-change handler that releases held keys). Those outlive the `SessionHandle`, so `drop(input_tx); join()` waited forever, **inside the task that removes the virtual display**. | measured live: after a leave, `live_transport_sessions` stayed at 2 and 4, the display was never removed, and `join … closed` never printed | the leave tears down inside a second: `join … closed; live transport sessions: 0`, display removed | **VERIFIED** on this box, before and after, from the host's own log and `status --json` | yes | Pre-existing and reachable on every clean `/leave`; it went unseen because the only other caller was a session being *superseded*, which kept its display on purpose. Dropping the connection first was not enough on its own — the first fix still hit the 2 s deadline every time — which is why the explicit shutdown exists. |
@@ -3644,3 +3644,191 @@ what the rest of this change removes. The classification behind it is unit teste
 is `COMPILE-CHECKED` (tsc, eslint, `pnpm build`). No host was started and the owner's live
 `config.json` was never read or written: every store test runs against an in-memory
 `serde_json::Map` or a plain object.
+
+
+## UX-INPUT — "the client keyboard and mouse feel laggy", measured against the pre-overhaul host — `VERIFIED`
+
+The report: *"since pre-440 commits, the input latency forwarding was not that high. now, the
+latency when i use my native keyboard/mouse is really low thanks to very fast streaming but the
+latency when using the client keyboard/mouse is high."* Baseline `271aa01`, ~440 commits behind
+this tree. Working assumption throughout: **the old code was faster, and the burden of proof is on
+the new code.**
+
+### What it was not
+
+`scripts/measure-input.ps1` drives a real Chrome client over CDP and times four things separately,
+because the fixes for them are different. Two of them cleared the new code immediately.
+
+**The client's send path.** The page hooks `RTCDataChannel.prototype.send` and a capture-phase
+pointer listener on `window`, which runs ahead of the page's own, so "DOM event → bytes on the
+channel" is measured inside the browser with no host involved.
+
+| | baseline | HEAD before |
+|---|---|---|
+| hold, p50 | 0.02 ms | 0.02–0.03 ms |
+| hold, p99 | 0.08–0.26 ms | 0.10–0.28 ms |
+
+Identical, and both negligible. The `MessageChannel` flush gate in `input.js` — the first move of
+each task sent inline, the rest coalesced into one macrotask — is **the same code in both trees**
+and costs nothing measurable. Keys are sent synchronously inside the DOM handler on the `reliable`
+channel in both. Nothing in `input.js` had regressed.
+
+**The forward leg.** Client `send` paired against the host's `input-trace` line, both wall clock on
+one machine:
+
+| sweep | baseline | HEAD before | HEAD after |
+|---|---|---|---|
+| 125 Hz, p50 / p95 / p99 | 0 / 1 / 1 ms | 0 / 1 / 18 ms | 1 / 1 / 1 ms |
+| keys, p50 | 2 ms | 3 ms | 2 ms |
+
+p50 is a millisecond on every build. **The forward leg was never the regression** — and that is the
+most useful negative result here, because it is where the report pointed.
+
+### What it was: the return leg stopped answering a cursor
+
+The decisive measurement is frame production on a desktop where *nothing else is changing*, with
+the client's pointer sweeping and then the host's:
+
+| | baseline | HEAD before | HEAD after |
+|---|---|---|---|
+| static desktop, client paints | 5.0 fps | **46.9 fps** | 4.7 fps |
+| client pointer sweeping | **85.3 fps** | **59.1 fps** | **113.5 fps** |
+| host pointer sweeping | 85.6 fps | 60.2 fps | 117.1 fps |
+| 30 isolated host moves, frames per move | 2.07 | 14.3 | 2.0 |
+| 1 kHz burst, frames reaching `SendInput` | 934 / 1000 | **779 / 1000** | **1000 / 1000** |
+
+The host's own counters say the same thing in its own words. Before: `frames_skipped_cadence=982`,
+`frames_repeated=675`, `input_queue_drops=166`, `input_stale_drops=55` — 982 delivered frames
+thrown away by a gate, 675 re-encodes of a picture nobody changed, and 221 pointer frames that
+never reached `SendInput` at all, which is exactly the 1000 − 779 above. After: 8, 55, and the two
+input counters absent, which is how a zero reports.
+
+Both pointers regressed equally, which is the part the report could not see: the owner judges the
+native mouse on the host's own screen, where DWM draws it at no cost, and the client's through the
+stream. The asymmetry is in where they are looking, not in how the two are injected.
+
+Four causes, all post-baseline, all on the WGC + NVENC/AMF ring path.
+
+**1. WGC stopped compositing the pointer** (`cursor_composited`, merge `8e65d90`). With the host
+drawing it instead, a cursor-only move produces no captured frame at all — it is answered by the
+encode thread's `default(tick)` idle arm, which polls `GetCursorInfo` and re-encodes the held slot.
+Event-driven became polled: quantised to the frame period, skippable when the tick is lost to the
+keyed mutex's 8 ms `AcquireSync`, and in any scene where real frames keep arriving the idle arm
+never fires at all because `select!` re-arms the timer.
+
+The justification for that change **this repo has already withdrawn**: it rests on "WGC delivers
+2–10 fps for pointer-only motion", and `docs/RESULTS.md` records that the harness which produced
+that number declared the `INPUT` struct 48 bytes where the OS wants 40, so every `SendInput`
+returned 0 and the pointer never moved. It was measuring a still desktop. Re-measured end to end
+here: 85 fps with WGC compositing, 59 with the host doing it. The overlay is now off by default and
+reachable with `SE_CURSOR_OVERLAY=1`; what it genuinely buys — a keepalive repeat carrying the
+pointer where it is *now* — is kept, not deleted.
+
+**2. The cadence gate discarded the frame carrying the cursor.** `on_frame_arrived` drops any frame
+arriving sooner than three quarters of a frame period behind the last. Its own comment says the
+cursor has to be asked about *before* both gates "because both of them would otherwise throw the
+frame that carries the pointer's new position away" — and the dirty-region gate below it does
+consult `cursor_moved`, while this one never did. 257 of 475 delivered frames were dropped here in
+the before run. A cursor-moved frame is now exempt from it.
+
+Exempt rather than given a shorter window, and that was measured rather than assumed. Painted fps
+for a pointer sweep over an otherwise static virtual display, against the baseline's 85: **113**
+exempt, 74 with a two-thirds-period window, 70 with a half-period one, 59 before any of this. A
+window narrower than DWM's compose interval is a worse gate than the one it replaces — it does not
+coalesce, it drops every frame that arrives a jitter early, and both bounded variants land *below*
+the baseline they were meant to restore. Two thirds looked like the safe choice because it is the
+number the baseline itself used; the difference is that the baseline applied it inside the
+compositor (`MinimumUpdateIntervalSettings::Custom(frame_duration * 2 / 3)`), where it throttles
+production, rather than after delivery, where it discards.
+
+The ceiling that remains is `DISPLAY_COMPOSE_HZ`: WGC cannot deliver frames the display did not
+compose, and `WGC_MIN_UPDATE_INTERVAL`'s 4 ms only permits a rate, it does not produce one. If a
+cap on how much a client is asked to decode is ever wanted, that is where it belongs.
+
+**3. The keepalive collapsed from 200 ms to the frame period.** That was the polled cursor's only
+clock, so it had to. It also meant nine times the NVENC submissions, keyed-mutex traffic and socket
+writes on a picture nobody was changing — 47 fps of re-encoded static desktop against the
+baseline's 5 — all contending with the capture callback on the same device. With WGC drawing the
+pointer again the keepalive is back to 200 ms, and only the opt-in overlay raises it.
+
+**4. Four transport workers where the baseline had sixteen per adapter.** Tokio has no dedicated
+I/O thread: a worker services the reactor when it parks or every `event_interval` (61) task polls.
+A session steadily occupies the RTP writer, the RTCP/TWCC reader, the bitrate driver's `getStats`,
+the audio forwarder at 200 packets/s and the `/reconfig` poll, so with four workers all four can be
+runnable at once and an arriving pointer frame waits. Measured with `SE_TRANSPORT_WORKERS` on the
+*same binary*: 779 of 1000 frames reached `SendInput` at 4, 1000 of 1000 at 16.
+
+The 48-thread problem that motivated the cap was real, but **one shared runtime had already solved
+it** — 16 total is fewer than a single adapter used to cost. The cap was a second, separate change
+with no measurement behind it, so it goes back to the baseline's width.
+
+The blind spot is worth recording: `route()` stamps `host_recv_ns` *after* that scheduler wait, so
+a stall there leaves every host-side stage histogram clean and surfaces only as motion the client
+never sees. A host whose telemetry is spotless while the user reports lag is diagnostic of this
+shape, not evidence against it.
+
+### Also fixed on the way
+
+**`SendHistory::lookup` was a reverse scan of a 4096-entry ring**, called twice per reported TWCC
+symbol, with `feedback.history`'s blocking mutex held — the same mutex the RTP writer takes once
+per packet, ~2000 times a second. The comment claimed the scan "finds a recent packet immediately";
+a TWCC report starts at `base_sequence_number`, the *oldest* sequence it covers, so it did the
+opposite. `record` claims sequences densely, so the position is arithmetic; the equality check on
+the slot it names is the verification, and the scan remains as the fallback if the ring is ever not
+dense. `COMPILE-CHECKED` for the latency effect — it is below this harness's resolution — and
+`VERIFIED` for correctness by `the_indexed_lookup_finds_what_a_scan_would`, which walks a wrapped,
+full, then partly retired ring against the scan it replaced.
+
+**The pointer lost every acceleration curve it had.** This one is a gain change, not a delay, and
+it is worth separating because it is the other half of what "laggy" can mean. The baseline stacked
+two: the client's OS curved `movementX/Y` (plain `requestPointerLock()`), and Windows curved the
+relative `MOUSEEVENTF_MOVE` the host injected. HEAD asks for `unadjustedMovement: true` *and*
+injects from a tracked absolute position, so with `settings.sensitivity` at its default 1.0 and
+`settings.accel` at 0 there is no curve anywhere — a strict mickey-per-pixel pointer needing two to
+six times the hand movement at ordinary speeds.
+
+"Exactly one curve" is the right rule and the fix keeps it; what it adds is that the side holding
+raw counts is the side that must apply it. Raw counts (`UNADJUSTED` set) now go out as relative
+`MOUSEEVENTF_MOVE`, so Windows' own pointer speed and "enhance pointer precision" apply — the
+user's configured curve, on the machine being driven, which is byte-identical to what the
+pre-overhaul host did. Already-curved counts keep the tracked-absolute path, because there the
+second curve is the one that must not happen. `PointerScope::Display` keeps the tracked path
+either way: confining the cursor to one monitor needs a position to clamp and relative motion has
+none. Tested by `raw_counts_get_the_os_curve_and_already_curved_counts_do_not`.
+
+**macOS is untouched and stays untouched.** `CGEventPost` does not apply the system's pointer
+acceleration to synthetic events, so there is no host curve to hand the motion back to and the
+"one curve" question does not arise; that backend tracks the position in both cases, as it always
+has. The cursor, cadence and keepalive changes are all in `windows_utils/streamer/pipeline.rs` and
+have no macOS counterpart.
+
+### What was left alone, and why
+
+- **The client's `MessageChannel` flush gate.** Measured at 0.02 ms. It is also present at the
+  baseline, byte for byte.
+- **`MAX_IN_FLIGHT` / `BACKLOG_STALL_MS` in `transform-worker.js`.** The thresholds are looser than
+  the baseline's (6 in flight plus 66 ms of no output, twice, against `decodeQueueSize > max(3,
+  fps·0.05)` twice) and that is a real tolerance for ~132 ms of stalled decode. But the loosening
+  has a measurement behind it — 74 IDRs in 30 s on a healthy session with the old test, each a
+  200 ms freeze — and tripping it sooner makes the stall it is trying to avoid more likely, not
+  less. It stays.
+- **`MAX_FAST_AGE_NS` and the reorder gate.** They drop positional frames the baseline would have
+  replayed, and replaying a 50 ms-old cursor position is worse than dropping it. The counters
+  (`input_stale_drops`, `input_reorder_drops`) are what make a transport stall visible at all.
+- **The pacer.** `locality=SameNetwork` on this box, so `PacingMode::Off` and the code path is
+  byte-identical to the baseline. It is a live risk on any LAN the `/24` classifier calls
+  `Unknown`, which is a separate question from this one.
+
+### Harness
+
+`scripts/measure-input.ps1`, and `SE_INPUT_TRACE=1` for the one host-side line it pairs against —
+one `tprintln!` per injected event, printed strictly after `dispatch` returns so it cannot delay
+the event it describes. The stage histograms answer "how long did the host take"; they cannot
+answer "did *this* keystroke reach `SendInput` before or after the frame the user was looking at",
+because a percentile has no events in it.
+
+Two harness traps are recorded in the script because both produce a plausible wrong answer rather
+than an error: PowerShell 5.1's `ConvertFrom-Json` hands back a JSON array as one `Object[]` rather
+than unrolling it, so `@(… | ConvertFrom-Json)` indexes a whole column; and pairing sends to
+injections by index means one dropped frame shifts every later pair by a full inter-event gap,
+which at a 250 ms cadence reports a quarter-second of latency that never happened.

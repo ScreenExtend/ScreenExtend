@@ -277,6 +277,24 @@ true frame time. Three of the four numbers in the sync equation are the wrong in
 **Input total: ≈ 0.1–5 ms of controllable cost on top of the network RTT**, dominated by the
 thread hop and, on batches, by the per-sample syscall.
 
+### Measured, end to end, against the pre-overhaul host
+
+The table above is an estimate from reading the code before the overhaul; the line numbers in it
+are pre-overhaul too. `scripts/measure-input.ps1` has since measured the whole leg on the Windows
+dev box, against a real Chrome client, on both `271aa01` and this tree. The estimate holds:
+
+| | baseline `271aa01` | this tree |
+|---|---|---|
+| DOM event → `RTCDataChannel.send` (stages 1–2), p50 / p99 | 0.02 / 0.26 ms | 0.03 / 0.26 ms |
+| client `send` → `SendInput` at 125 Hz (stages 3–9), p50 / p95 / p99 | 0 / 1 / 1 ms | 1 / 1 / 1 ms |
+| keystroke, p50 | 2 ms | 2 ms |
+
+**The whole forward leg is one millisecond**, and it was one millisecond before the overhaul too.
+What a user calls "input latency" is dominated by the *return* leg — the frame that shows the
+effect — and for a cursor move or a single glyph that is a different question from the bulk video
+path §1 measures. `docs/OPTIMIZATIONS.md` UX-INPUT has that half, and the two frame gates in
+`on_frame_arrived` are where it lives.
+
 ---
 
 # 4. Serialization points

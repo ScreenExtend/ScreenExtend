@@ -457,13 +457,18 @@ the capture-thread conventions below.
 Cross-platform core, OS-independent:
 
 - `mod.rs` — the `Streamer` type and **one shared tokio runtime for the whole host**
-  (`transport_runtime()`): multi-thread, at most `MAX_TRANSPORT_WORKERS` = 4 workers,
-  `on_thread_start(platform::tune_transport_thread)`, built once and kept for the process
-  lifetime. Every network adapter's server runs on it. Before this each adapter built its own
-  runtime sized to `available_parallelism()`, so three adapters on a 16-thread host meant 48
-  priority-boosted, mostly idle workers competing with the encoder; and an adapter change (a
-  Wi-Fi roam) tore a whole runtime down and rebuilt it. `prepare()` sets DPI awareness + process
-  tuning. Also exposes the `probe_*` entry points.
+  (`transport_runtime()`): multi-thread, `available_parallelism()` capped at
+  `MAX_TRANSPORT_WORKERS` = 16, `on_thread_start(platform::tune_transport_thread)`, built once and
+  kept for the process lifetime. Every network adapter's server runs on it. Before this each
+  adapter built its own runtime sized to `available_parallelism()`, so three adapters on a
+  16-thread host meant 48 priority-boosted, mostly idle workers competing with the encoder; and an
+  adapter change (a Wi-Fi roam) tore a whole runtime down and rebuilt it. **Sharing the runtime is
+  what fixed that; narrowing it was a separate change and it cost input latency** — tokio has no
+  dedicated I/O thread, so with four workers all four can be runnable and an arriving pointer frame
+  waits behind up to `event_interval` (61) task polls. Measured: at 4 workers a 1 kHz pointer burst
+  lost 221 frames of 1000 before reaching `SendInput`; at 16, none. `SE_TRANSPORT_WORKERS`
+  overrides the width for a measurement. `prepare()` sets DPI awareness + process tuning. Also
+  exposes the `probe_*` entry points.
 - `config.rs` — `Config` (the whole streaming configuration, including the `Shared*` handles
   threaded in from `AppState`), `ScalePercent` (10–100), `EncoderVendor`
   (`auto|nvidia|intel|amd|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
@@ -606,6 +611,17 @@ Cross-platform core, OS-independent:
   `PING`/`PONG` pair, `STATS`, `KEYFRAME_REQUEST` and the batched pointer frames),
   `scancode.rs`, and a per-OS backend selected with `#[path]` (`windows.rs`, `macos.rs`,
   `linux.rs`, `generic.rs`). `prime()` warms the macOS keyboard path at startup.
+  **Exactly one pointer curve, applied by whichever side holds raw counts.** The `UNADJUSTED` bit
+  on `MOUSE_DELTA` says the client holds pointer lock with `unadjustedMovement`, so its deltas are
+  raw device counts nobody has accelerated: Windows injects those as relative `MOUSEEVENTF_MOVE`
+  and the user's own pointer speed and "enhance pointer precision" apply. Without the bit the
+  client's OS has already curved them and the host injects absolutely from a position it tracks
+  itself, because there the second curve is the one that must not happen. Curving on neither side
+  is a two-to-six-times gain cut that reads as lag. `PointerScope::Display` keeps the tracked path
+  either way — clamping to one monitor needs a position and relative motion has none.
+  `SE_INPUT_TRACE=1` prints one line per injected event (after `dispatch` returns, so it cannot
+  delay it) for pairing against the client's own send stamps; `scripts/measure-input.ps1` is what
+  reads it.
 - `audio/` — cross-platform system-audio transport glue: `AudioPacket`, `AudioDiagnostics`,
   the shared host timebase (`host_now_ns` / `host_instant_to_ns` / `host_ns_to_rtp90k` — **the
   one clock both audio `capture_ns` and the video RTP timestamp ride for A/V sync**), the
@@ -633,6 +649,19 @@ Cross-platform core, OS-independent:
   first-party code that happens to use `parking_lot`.
   `windows_capture/FORK.md` records the upstream pin and checksum, every divergence and every
   deleted file — read it before changing anything in there, and update it in the same commit.
+- **WGC composites the pointer, and that is a latency decision, not a cosmetic one.** A cursor move
+  is a change the compositor tracks, so with `CursorCaptureSettings::WithCursor` the move *is* a
+  captured frame — event-driven, at the compositor's rate. `cursor_overlay.rs` draws it on the ring
+  slot instead, which can only happen on the encode thread's idle tick: polled, quantised to the
+  frame period, and never reached at all in a scene where real frames keep arriving. It measured 59
+  fps for a pointer sweep against 85 with WGC drawing it, so it is **off by default** and reachable
+  with `SE_CURSOR_OVERLAY=1`. Both frame gates in `on_frame_arrived` must consult `cursor_moved`:
+  the dirty-region one always did, the cadence one did not, and that alone threw away 982 delivered
+  frames in one run. A cursor-moved frame is **exempt** from the cadence gate: measured
+  painted fps for a pointer sweep, against the baseline's 85, is 113 exempt, 74 at a two-thirds
+  window and 70 at a half — a window narrower than DWM's compose interval does not coalesce, it
+  discards. The remaining ceiling is `DISPLAY_COMPOSE_HZ`, which is where a cap belongs. See
+  `docs/OPTIMIZATIONS.md` UX-INPUT.
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
   and is otherwise only reached by WGC failing, which is why the probe harness has
   `--capture-backend dxgi` to force it.
