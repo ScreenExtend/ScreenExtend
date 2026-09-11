@@ -627,6 +627,11 @@
                                 lastOfferedSinkId = j.audioSink;
                                 queueOutputPicker(j.audioSink);
                             }, noteSuppressed);
+                        } else {
+                            // There is no audio graph to command yet, so nothing was applied and
+                            // the latch must not claim otherwise — the host may never send this
+                            // value again.
+                            appliedSinkId = null;
                         }
                     } catch (_) { appliedSinkId = null; noteSuppressed(); }
                 }

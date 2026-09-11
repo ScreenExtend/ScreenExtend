@@ -3507,6 +3507,16 @@ neither epoch.
 the join; a kick does release it; the sink is commanded once per change rather than once per
 poll, and a sink change renegotiates nothing.
 
+### What this does not reach
+
+**A relayed client still rejoins.** The cloud relay serves its own older copy of the client page
+(UX-XNET), so nothing in `streamer/static/` reaches a cross-network join — that page does not
+know about `joinId` and will not present one. `continuing_join` then answers `None` and the join
+is new, which is the old behaviour and is safe: a display is removed and another created, exactly
+as before this change. The host half of the fix does reach it, so the *classification* is right
+for a relayed device and only class-(d)/(e) edits renegotiate at all. Closing the rest needs the
+relay's page updated, which is not in this tree.
+
 ### The rule, for anything added later
 
 Every field on `DeviceOverride` belongs to a class, and the class is in
