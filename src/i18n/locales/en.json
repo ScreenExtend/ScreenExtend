@@ -165,6 +165,10 @@
       "flushFailedTitle": "Couldn't Save Settings to Disk",
       "flushFailedDescription": "The change is active for this session but couldn't be written to disk, so it may not survive a restart."
     },
+    "savedSettings": {
+      "replayFailedTitle": "Some Saved Settings Weren't Applied",
+      "replayFailedDescription": "ScreenExtend started, but part of your saved configuration couldn't be applied. Check Settings › config.json."
+    },
     "settings": {
       "loadFailedTitle": "Couldn't Load Settings",
       "loadFailedDescription": "Some settings couldn't be read and may show default values. Reopen this page to try again.",
@@ -421,6 +425,8 @@
     "setupError": {
       "title": "Setup Error",
       "bodyBeforePrompt": "There was an error while attempting to start ScreenExtend. This often occurs due to core drivers or libraries not being installed. ",
+      "settingsBody": "ScreenExtend started, but your saved settings could not be applied. Your configuration file may be damaged — open Settings › config.json to check it. This is not a problem with your drivers. ",
+      "internalBody": "ScreenExtend started, but ran into an unexpected error before the dashboard could open. This is not a problem with your drivers. ",
       "installPrompt": "Click the button below to install the missing components.",
       "bodyAfterPrompt": " If this error is recurring, contact support at ",
       "contactSuffix": ".",

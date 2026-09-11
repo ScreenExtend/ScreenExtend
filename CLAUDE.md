@@ -958,6 +958,19 @@ address, which is all it names, until that device joins once more and is minted 
 it is not replayed onto anything. `ConnectedDevice = Device & { joinId }` is the runtime-only
 shape the dashboard's device list carries — one entry per live join, never persisted.
 
+**Two rules hold this file together, and both exist because `"devices": {"0": {…}}` — an object
+where the type says array — stopped the app from starting and was reported as a missing display
+driver.** A **writer** may never change the container type of a key the config declares: the
+dotted `config set` path (`cli.rs`'s `plan_set`) treats a numeric segment under an array key as
+an index, refuses an index past the end, and refuses any write that would turn an array into an
+object or the reverse, changing nothing and exiting 2. A **reader** treats a value of the wrong
+container type as absent: it logs one `[migrate]` line, carries on with the declared default, and
+never throws. The coercion happens once, in `config-provider.tsx`'s `readStore`
+(`src/lib/config-normalize.ts`), so every consumer downstream may go on reading
+`config.serverPorts.http` directly. The container half of the shape is mirrored in `cli.rs` as a
+`Shape` table that `pnpm test:config` parses out of the source and cross-checks against
+`config-schema.ts`. See `docs/OPTIMIZATIONS.md` UX-CFGSHAPE.
+
 Relevant values are pushed to the Rust `AppState` through commands (`setSessionCredentials`,
 `setDeviceOverride`, `setDeviceAudioOutput`, `setDisconnectGrace`, `setTurnConfig`,
 `setServerPorts`, `setDisableGpuEncode`, `setDeviceBanned`, `setDeviceApproved`,

@@ -3523,3 +3523,124 @@ Every field on `DeviceOverride` belongs to a class, and the class is in
 `DeviceOverride::reconfig_action` with a row in that test. A field not named there is cosmetic by
 construction, which is the safe default. An epoch bump is a renegotiation **in place** — never a
 leave and a rejoin, never a new join id, never a `DeviceRemove` on the dashboard.
+
+## UX-CFGSHAPE — a settings file of the wrong shape stopped the app, and blamed the drivers — `VERIFIED` (writers + readers), the dialog text `COMPILE-CHECKED`
+
+### What happened
+
+The owner's GUI would not start. The dialog said **"Setup Error — There was an error while
+attempting to start ScreenExtend. This often occurs due to core drivers or libraries not being
+installed"**, and offered to install them. The log line under it was:
+
+```
+[ui] setup failed TypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))
+```
+
+`config.json` held
+
+```json
+"devices": {"0": {"refreshRate": 30}}
+```
+
+— an object where the config type says array. `bootstrap.tsx`'s saved-settings replay does
+`for (const d of config.devices ?? [])`, which throws on an object; the throw landed in the catch
+that opens the Setup Error dialog, and that dialog had exactly one sentence for every failure.
+The machine's display driver was fine. The only thing wrong with the host was a JSON container.
+
+That shape is what a dotted CLI write produced when the intermediate array did not exist:
+`ScreenExtend config set devices.0.refreshRate 30` went through `cli.rs`'s `set_path`, which
+created an **object** for every missing path segment, numeric or not.
+
+It is also a violation of the startup gate's one rule (`src/lib/startup-gate.ts`): nothing but
+"cannot create a display, cannot capture, cannot encode" may stop the app. A malformed setting is
+none of those.
+
+### The two rules
+
+1. **A writer may never change the container type of a key the config declares.**
+2. **A reader treats a value of the wrong container type as absent** — one `[migrate]` line, the
+   declared default, and never a throw.
+
+### 1. The writers
+
+| writer | what it does now |
+|---|---|
+| `cli.rs` `set_nested` / `plan_set` (dotted `config set`) | a numeric segment under an array-typed key is an **index**, creating the array if absent; an index past `len` is refused (no holes); any path that would turn an array into an object, an object into an array, or put a scalar where a container belongs is refused; the final value is checked against the declared type. A refusal prints the reason, exits 2 and writes nothing — `store.save()` is never reached |
+| `cli.rs` `devices set` / `devices reset` | already found-or-appended an array row keyed by token; it now says on stderr when it is replacing a `devices` key that held something else |
+| `cli.rs` `stun set` / `clear`, `turn set` / `clear`, `account name` | write a whole key of the right type by construction; unchanged |
+| `config-provider.tsx` `updateConfig` / `createConfig` / `flushConfig` | typed against `Config`, so TypeScript is the guard; unchanged |
+| `apply-config.ts` (the monaco editor) | already gated on `blockingErrors(validateConfig(...))`, and a container-type mismatch is a blocking error; unchanged |
+
+The declared shape lives in Rust as a small `Shape` table in `cli.rs` — **container types only**,
+no ranges and no enums, because the host clamps every value again on its own side and a second
+copy of the ranges would be a second thing to drift. `scripts/test-config-editor.mjs` parses that
+table straight out of `cli.rs` and walks it against `configJsonSchema`, so the two cannot
+disagree about what is an array. (Checked negatively: flipping `("devices", DEVICES)` to an
+object shape and renaming one `knownDevices` field made the harness report all three faults.)
+
+### 2. The readers
+
+| reader | what it tolerates now |
+|---|---|
+| `config-provider.tsx` `readStore` | **the one place the coercion happens.** `normalizeConfig` (new, `src/lib/config-normalize.ts`) maps the raw store onto the declared shape: wrong type → the default plus a `[migrate]` line; a row of the wrong type inside a good array → dropped, named, the other rows kept; a declared field absent → filled silently, because the replay hands these straight to Tauri commands and `undefined` where a number belongs is rejected at the IPC boundary; keys the schema does not name → carried through untouched |
+| the same, writing back | only the top-level keys that were **present and malformed** are rewritten, after a successful read, so the editor and the CLI see a valid file afterwards. A key that was merely absent is not a repair and does not churn the file. A write-back that fails is logged and dropped: the in-memory config is already correct |
+| `bootstrap.tsx` saved-settings replay | split into `loadSavedSettings` (never throws; falls back to `defaultConfig`) and `replaySavedSettings` (every step individually caught). One setting the host will not take costs a log line and a toast, not the dashboard |
+| `cli.rs` `apply_saved_config` (`serve` + the `RELOAD` verb) | now reads a snapshot of the whole store as plain JSON and names every malformed value with `[migrate] …` before applying the rest. It already fell back per key; it did so in silence, so a host that had dropped the entire `devices` array looked exactly like one that had none |
+| `cli.rs` `get_nested` (`config get`) | indexes arrays by a numeric segment, so `config get devices.0.refreshRate` can name the row `config set` just wrote; a path whose container type does not match is simply not there |
+
+Every consumer downstream of `readStore` — `bootstrap.tsx`, `dashboard.tsx`, `settings.tsx`,
+`device-details.tsx`, `App.tsx`, `apply-config.ts` — reads `config.serverPorts.http` and
+`config.devices.map(…)` directly, and did so before this change too. Coercing once, at the read,
+is what makes those reads safe without each of them having to distrust the store.
+
+A whole-file JSON parse failure was already non-blocking and stays that way, for a reason worth
+writing down: `tauri-plugin-store`'s `build_inner` does `let _ = store_inner.load()`, so an
+unparseable file yields an **empty** store rather than an error. `readStore` then publishes
+`undefined`, the bootstrap calls `createConfig`, and a fresh default config is written over it.
+
+### 3. The dialog
+
+`classifySetupFailure` / `setupErrorBodyKey` / `offersDriverInstallFor` in `startup-gate.ts`, so
+the policy is testable without launching the app on a broken machine. Same dialog, same layout,
+same two buttons — only the leading sentence moves:
+
+| class | when | body | may offer "Install Drivers" |
+|---|---|---|---|
+| `setup` | `commands.setup()` returned false or threw | the existing driver text | yes, where the report carries an installable driver row |
+| `settings` | the saved configuration could not be read or replayed, and startup then failed | "…your saved settings could not be applied. Your configuration file may be damaged — open Settings › config.json to check it. This is not a problem with your drivers." | **no** |
+| `internal` | anything else in the bootstrap itself | "…ran into an unexpected error before the dashboard could open. This is not a problem with your drivers." | **no** |
+
+Refusing the install button outside the `setup` class is the part that matters: a driver install
+cannot repair a JSON document, and offering it is how a config typo turns into a UAC prompt.
+
+A settings failure on its own no longer opens the dialog at all — the replay carries on and the
+dashboard appears, with `toasts.savedSettings.replayFailed*` saying what was not applied. The
+`settings` class is what the dialog says when startup fails *after* the replay already went
+wrong, which is the only honest thing left to name.
+
+### Tests
+
+- `cli.rs`: the exact write that broke startup now lands in the array as row 0, and the
+  `{"0": {…}}` shape is asserted never to be produced; index-past-`len` refused; six
+  container-type refusals; the declared type enforced on the value (including a whole-number
+  float, which is what `serde_json` makes of `150.0`); an unknown key still writable; the replay
+  applying every other key with `devices` an object and `knownDevices` a string, with the two
+  `[migrate]` lines pinned; one bad row named while the rows around it parse; dotted reads
+  indexing arrays; no key listed twice in the table.
+- `scripts/test-config-editor.mjs` (`pnpm test:config`): the original failure reproduced first —
+  the raw value asserted to throw `is not iterable`, then the normalised one to iterate — plus
+  every top-level key malformed **at once** yielding exactly `defaultConfig` and a document the
+  editor validates; null / missing / wrong scalar; one bad member of an object; one bad row of a
+  list; an out-of-enum value; a short device row coming out complete; unknown keys kept; a valid
+  config surviving untouched; and the Rust table cross-check.
+- `scripts/test-startup-gate.mjs` (`pnpm test:gate`): the three classes, `setup` outranking
+  `settings`, the install button offered only for `setup`, and all three sentences present in
+  `en.json`.
+
+### Not verified
+
+The dialog text has not been seen on screen — it is reached only by a startup failure, which is
+what the rest of this change removes. The classification behind it is unit tested; the rendering
+is `COMPILE-CHECKED` (tsc, eslint, `pnpm build`). No host was started and the owner's live
+`config.json` was never read or written: every store test runs against an in-memory
+`serde_json::Map` or a plain object.

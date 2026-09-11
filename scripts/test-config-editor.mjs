@@ -32,6 +32,7 @@ import {
   blockingErrors,
   MASKED_CONFIG_PATHS,
 } from '../src/lib/config-schema.ts';
+import { normalizeConfig } from '../src/lib/config-normalize.ts';
 import { scanJson, maskedSpans, isMaskedPath } from '../src/lib/json-structure.ts';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -295,6 +296,243 @@ test("monaco's stylesheet ships as its own asset, not as injected CSS", () => {
     css.some(name => name.startsWith('monaco-setup-')),
     'no monaco stylesheet in dist/assets: ' + css.join(', ')
   );
+});
+
+console.log('=== a malformed config.json is survivable ===');
+
+// The defect, exactly as it reached the owner. `config.json` held
+//
+//     "devices": {"0": {"refreshRate": 30}}
+//
+// -- an object where the type says array, which is what a dotted CLI write produced when the
+// intermediate array did not exist. The bootstrap's saved-settings replay does
+// `for (const d of config.devices ?? [])`, which throws `TypeError: object is not iterable`;
+// the throw was caught as a setup failure and the user was told his drivers were missing.
+//
+// Two properties are pinned here: the raw value is genuinely un-iterable (so this is the real
+// defect and not a paraphrase of it), and the normalised value is iterable and says so in the
+// log.
+const BROKEN_DEVICES = { '0': { refreshRate: 30 } };
+
+// What `bootstrap.tsx` does with the value, reduced to the one line that threw.
+const replayDevices = config => {
+  const seen = [];
+  for (const device of config.devices ?? []) seen.push(device);
+  return seen;
+};
+
+test('the raw value really is the one that threw', () => {
+  assert.throws(
+    () => replayDevices({ devices: BROKEN_DEVICES }),
+    /is not iterable/,
+    'the fixture no longer reproduces the defect'
+  );
+});
+
+test('after normalisation the replay runs and the dashboard is reachable', () => {
+  const { config, notes, repaired } = normalizeConfig({ ...fixtureConfig, devices: BROKEN_DEVICES });
+  assert.deepEqual(replayDevices(config), []);
+  assert.deepEqual(config.devices, []);
+  assert.deepEqual(notes, ['[migrate] devices is not an array (an object with 1 key); ignoring it']);
+  assert.deepEqual(repaired, ['devices']);
+  // Nothing else was touched: one malformed key costs only itself.
+  assert.equal(config.stunUrls, fixtureConfig.stunUrls);
+  assert.deepEqual(config.serverPorts, fixtureConfig.serverPorts);
+  assert.equal(config.knownDevices.length, fixtureConfig.knownDevices.length);
+});
+
+test('every top-level key malformed at once still yields the declared shape', () => {
+  // The bootstrap has to reach the dashboard with a store in which nothing is the right type.
+  const wrecked = {};
+  for (const key of Object.keys(defaultConfig)) {
+    // Deliberately the wrong container for each: an object where an array belongs, an array
+    // where an object belongs, a string where a number belongs, and so on.
+    const declared = properties[key].type;
+    wrecked[key] =
+      declared === 'array' ? { '0': {} }
+      : declared === 'object' ? ['nope']
+      : declared === 'string' ? 42
+      : declared === 'boolean' ? 'yes'
+      : 'not a number';
+  }
+  const { config, notes, repaired } = normalizeConfig(wrecked);
+  assert.equal(notes.length, Object.keys(defaultConfig).length, notes.join('\n'));
+  assert.equal(repaired.length, Object.keys(defaultConfig).length);
+  assert.deepEqual(config, defaultConfig);
+  // And the document that comes out is one the editor accepts, which is the definition of "the
+  // declared shape" that matters to the user.
+  assert.deepEqual(validateConfig(config), []);
+});
+
+test('null, a missing key and a wrong scalar all read as absent', () => {
+  for (const stored of [null, undefined, 'nope', [], 7]) {
+    const { config } = normalizeConfig({ ...fixtureConfig, serverPorts: stored });
+    assert.deepEqual(config.serverPorts, defaultConfig.serverPorts, JSON.stringify(stored));
+  }
+  // A *missing* key is not a repair: filling it in memory must not rewrite everyone's file.
+  const absent = { ...fixtureConfig };
+  delete absent.stunUrls;
+  const { config, notes, repaired } = normalizeConfig(absent);
+  assert.equal(config.stunUrls, defaultConfig.stunUrls);
+  assert.deepEqual(notes, []);
+  assert.deepEqual(repaired, []);
+});
+
+test('one bad member of an object does not cost the others', () => {
+  const { config, notes } = normalizeConfig({
+    ...fixtureConfig,
+    serverPorts: { http: 9000, https: 'nope' },
+  });
+  assert.equal(config.serverPorts.http, 9000);
+  assert.equal(config.serverPorts.https, defaultConfig.serverPorts.https);
+  assert.deepEqual(notes, [
+    '[migrate] serverPorts.https is not a whole number (a string); ignoring it',
+  ]);
+});
+
+test('one bad row does not cost the rest of the list', () => {
+  const rows = [
+    { ...fixtureConfig.devices[0], refreshRate: 'fast' },
+    'not a device',
+    fixtureConfig.devices[1],
+  ];
+  const { config, notes } = normalizeConfig({ ...fixtureConfig, devices: rows });
+  assert.equal(config.devices.length, 2, 'the unusable row goes, the others stay');
+  assert.equal(config.devices[0].refreshRate, 60, 'the bad field falls back to its default');
+  assert.equal(config.devices[0].token, fixtureConfig.devices[0].token);
+  assert.equal(config.devices[1].token, fixtureConfig.devices[1].token);
+  assert.deepEqual(notes, [
+    '[migrate] devices[0].refreshRate is not a whole number (a string); ignoring it',
+    '[migrate] devices[1] is not an object (a string); dropping it',
+  ]);
+});
+
+test('a value outside its enum is replaced rather than passed on', () => {
+  const { config, notes } = normalizeConfig({ ...fixtureConfig, theme: 'chartreuse' });
+  assert.equal(config.theme, defaultConfig.theme);
+  assert.match(notes[0], /^\[migrate\] theme is not one of /);
+});
+
+test('a device row missing fields comes out complete, so the replay can hand it to the host', () => {
+  // `bootstrap.tsx` passes `device.scale` and friends straight to `setDeviceOverride`, where an
+  // `undefined` is rejected at the IPC boundary -- a saved row written by an older version is
+  // the same class of startup failure as the wrong container type.
+  const { config, notes, repaired } = normalizeConfig({
+    ...fixtureConfig,
+    devices: [{ ip: '10.0.0.5', token: 'a'.repeat(32) }],
+  });
+  const device = config.devices[0];
+  for (const key of Object.keys(properties.devices.items.properties)) {
+    assert.notEqual(device[key], undefined, key + ' was left undefined');
+  }
+  assert.equal(device.scale, 100);
+  assert.equal(device.refreshRate, 60);
+  assert.equal(device.pointerScope, 'all');
+  assert.equal(device.remoteControl, false);
+  // Filling a gap is not a repair, so the file is left alone.
+  assert.deepEqual(notes, []);
+  assert.deepEqual(repaired, []);
+});
+
+test('keys the schema does not name are kept, not deleted', () => {
+  // `config.json` is written by three parties; a key one of them does not know about is inert,
+  // and quietly deleting it would lose whichever of them does know.
+  const { config } = normalizeConfig({
+    ...fixtureConfig,
+    devices: [{ ...fixtureConfig.devices[0], someFutureField: 'keep me' }],
+  });
+  assert.equal(config.devices[0].someFutureField, 'keep me');
+});
+
+test("the owner's own config survives normalisation unchanged", () => {
+  // The normaliser runs on every read, so a well-formed document may not be edited by it. The
+  // one thing it adds is a value for a declared field the document does not carry at all --
+  // `pointerScope` and `autoFrameRate` post-date the rows in this fixture -- and that is what
+  // makes the replay able to hand every row to the host without an `undefined` in it.
+  const { config, notes, repaired } = normalizeConfig(fixtureConfig);
+  assert.deepEqual(notes, []);
+  assert.deepEqual(repaired, [], 'a valid document must never be rewritten');
+  assert.deepEqual(validateConfig(config), []);
+  const unchanged = (was, now, path) => {
+    if (was === null || typeof was !== 'object') {
+      assert.deepEqual(now, was, path + ' changed under normalisation');
+      return;
+    }
+    if (Array.isArray(was)) {
+      assert.equal(now.length, was.length, path + ' lost or gained a row');
+      was.forEach((item, i) => unchanged(item, now[i], path + '[' + i + ']'));
+      return;
+    }
+    for (const [key, value] of Object.entries(was)) unchanged(value, now[key], path + '.' + key);
+  };
+  for (const key of Object.keys(defaultConfig)) unchanged(fixtureConfig[key], config[key], key);
+});
+
+console.log('=== the Rust writer agrees about what is an array ===');
+
+// `cli.rs` carries the container half of this schema, because that is the half a *writer* has to
+// enforce: `config set devices.0.refreshRate 30` used to create an object for every missing
+// segment, numeric or not, which is where `{"0": {...}}` came from. Two tables mean two things
+// to drift, so the Rust one is parsed out of the source here and checked against this schema --
+// the same trick `membersOf` above plays on `config-defaults.ts`.
+const rustSource = read('src-tauri/src/cli.rs');
+
+const rustShapes = (() => {
+  const fields = new Map();
+  for (const m of rustSource.matchAll(/const ([A-Z0-9_]+): &\[\(&str, &Shape\)\] =\s*&\[([\s\S]*?)\];/g)) {
+    fields.set(m[1], [...m[2].matchAll(/\("([A-Za-z0-9_]+)",\s*([A-Z0-9_]+)\)/g)].map(e => [e[1], e[2]]));
+  }
+  const shapes = new Map();
+  for (const m of rustSource.matchAll(/const ([A-Z0-9_]+): &Shape = &Shape::(Str|Int|Num|Bool);/g)) {
+    shapes.set(m[1], { kind: { Str: 'string', Int: 'integer', Num: 'number', Bool: 'boolean' }[m[2]] });
+  }
+  for (const m of rustSource.matchAll(/const ([A-Z0-9_]+): &Shape = &Shape::Object\(([A-Z0-9_]+)\);/g)) {
+    shapes.set(m[1], { kind: 'object', fields: m[2] });
+  }
+  for (const m of rustSource.matchAll(/const ([A-Z0-9_]+): &Shape = &Shape::Array\(([A-Z0-9_]+)\);/g)) {
+    shapes.set(m[1], { kind: 'array', item: m[2] });
+  }
+  return { fields, shapes };
+})();
+
+test("cli.rs's shape table parses", () => {
+  assert.ok(rustShapes.shapes.has('CONFIG'), 'no CONFIG shape found in cli.rs');
+  assert.ok(rustShapes.fields.has('CONFIG_FIELDS'), 'no CONFIG_FIELDS table found in cli.rs');
+  assert.ok(rustShapes.fields.get('CONFIG_FIELDS').length > 10, 'CONFIG_FIELDS came out nearly empty');
+});
+
+test('the Rust table and the editor schema declare the same container for every key', () => {
+  const problems = [];
+  const walk = (shapeName, schema, path) => {
+    const shape = rustShapes.shapes.get(shapeName);
+    if (!shape) {
+      problems.push(path + ': cli.rs has no shape named ' + shapeName);
+      return;
+    }
+    const declared = schema.type === 'integer' ? 'integer' : schema.type;
+    if (shape.kind !== declared) {
+      problems.push(`${path}: cli.rs says ${shape.kind}, the schema says ${declared}`);
+      return;
+    }
+    if (shape.kind === 'array') {
+      walk(shape.item, schema.items, path + '[]');
+      return;
+    }
+    if (shape.kind !== 'object') return;
+    const rust = new Map(rustShapes.fields.get(shape.fields) ?? []);
+    const described = schema.properties ?? {};
+    for (const key of Object.keys(described)) {
+      if (!rust.has(key)) problems.push(`${path}.${key}: in the schema, missing from cli.rs`);
+    }
+    for (const key of rust.keys()) {
+      if (!(key in described)) problems.push(`${path}.${key}: in cli.rs, missing from the schema`);
+    }
+    for (const [key, child] of rust) {
+      if (described[key]) walk(child, described[key], path + '.' + key);
+    }
+  };
+  walk('CONFIG', configJsonSchema, 'config');
+  assert.deepEqual(problems, []);
 });
 
 console.log(failed === 0 ? '\nall config editor checks passed' : '\n' + failed + ' failed');
