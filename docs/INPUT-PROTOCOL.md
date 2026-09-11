@@ -232,10 +232,21 @@ version bump: an old client reads as "no flags set".
 Applies to `MOUSE_DELTA` byte 8 only. The `POINTER_MOVE_BATCH` tail has a byte in the same
 position and it is reserved: `UNADJUSTED` means the client holds pointer lock with raw
 movement, and a locked pointer sends `MOUSE_DELTA` and never a batch, so no bit defined here
-can ever be set on one. The client writes 0 and the host does not read it. Without the flag the
-client's own OS has already curved the deltas, and the host must not curve them a second time —
-which is why both backends now inject relative motion absolutely from a position they track
-themselves, rather than letting the host OS's pointer ballistics compound with the client's.
+can ever be set on one. The client writes 0 and the host does not read it.
+
+**The bit selects which side applies the one pointer curve, and there must be exactly one.**
+Without it the client's own OS has already curved the deltas and the host must not curve them
+again, so the Windows backend injects them absolutely from a position it tracks itself. With it
+the deltas are raw device counts nobody has curved — `settings.sensitivity` defaults to 1.0 and
+`settings.accel` to 0 — so the Windows backend injects them as relative `MOUSEEVENTF_MOVE` and
+Windows' own pointer speed and "enhance pointer precision" apply, which is the user's configured
+curve on the machine being driven. Curving neither way was a two-to-six-times gain reduction that
+read as a pointer lagging the hand. `PointerScope::Display` keeps the tracked-absolute path in
+both cases, because confining the cursor to one monitor needs a position to clamp and relative
+motion has none.
+
+On macOS `CGEventPost` does not apply the system's pointer acceleration to synthetic events, so
+there is no host curve to hand the motion back to; that backend tracks the position in both cases.
 
 ### `KEYFRAME_REQUEST` — `0x64`, 2 bytes
 
