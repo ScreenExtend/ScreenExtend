@@ -1151,6 +1151,19 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   slow path from one on the fast path. The `PONG` tail carries the host's capability bits the
   same way, and both frames are **prefix-stable**: a reader that sees fewer bytes than it knows
   about reads the prefix and treats the rest as absent.
+- **What the SPS declares must cover every reference the encoder keeps, long-term ones included —
+  and on NVENC nothing makes it.** `max_num_ref_frames` is what the stream promises never to
+  exceed and what a decoder sizes its DPB from, but NVENC's `maxNumRefFrames` is *also* only the
+  short-term cap, with `ltrNumFrames` kept on top; and the declaration cannot be widened to
+  compensate, because the level's DPB is the ceiling and at 1080p every level these answers carry
+  allows exactly four frames. So an enabled LTR set always under-declares: the decoder evicts a
+  picture it was told to hold, the next frame predicting from that slot is reconstructed from a
+  surface nobody wrote, and a hardware decoder paints it **flat green** and reports nothing — no
+  decode error, so no keyframe request, so it does not end. **NVENC LTR is therefore off**
+  (`SE_NVENC_LTR=1` opts in for the work that would fix it: rewriting the SPS on the way out, the
+  shape `amd/sps.rs` uses for the VUI). `nvidia::encoder::reference_budget` is the guard that
+  keeps the declaration honest if it is ever re-enabled, and any backend that gains long-term
+  references owes the same check. See `docs/OPTIMIZATIONS.md` UX-GREEN.
 - DPR is only correct when the resolution multiplier and the OS scale step are the **same
   number**: resolution x `d`, DPI `100*d`%. Snap `d` with `platform::snap_display_dpr` (Windows
   exposes its real DPI table; macOS only has 100/200, because HiDPI there is a binary 2x flag),

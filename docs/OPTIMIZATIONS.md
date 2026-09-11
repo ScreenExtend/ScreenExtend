@@ -4035,3 +4035,112 @@ reacted to either.
 `RECONFIG_DEADLINE_MS` still shows "Disconnected, reconnect to continue." — it no longer ends the
 session, so Connect lands back on the same display, but the fifteen seconds in front of it are
 ICE renegotiation and this work does not shorten them.
+
+## UX-GREEN — the picture flickered green because NVENC's SPS under-declares an enabled LTR set — `VERIFIED`
+
+**The report.** *"The picture on a LAN client flickers green randomly"*, on a desktop that is not
+moving. The baseline commit `271aa01` does not do it.
+
+Flat green in H.264 names its own cause: Y=U=V=0 decodes to about RGB(0,135,0), so it is a picture
+reconstructed from a surface nobody wrote. Either the encoder was handed a zeroed frame, or the
+*decoder* was asked to predict from a reference it no longer holds. It was the second.
+
+### `maxNumRefFrames` is the short-term cap *and* the SPS field
+
+`h264.maxNumRefFrames` is written into the SPS verbatim as `max_num_ref_frames` — the number of
+reference pictures the stream promises never to exceed, and the number a decoder sizes its DPB
+from. **NVENC counts only the short-term references against it, and keeps `ltrNumFrames` more on
+top.** The two facts together mean there is *no* value of `maxNumRefFrames` that makes the
+declaration cover an enabled LTR set: whatever is declared, the encoder may hold that many
+short-term pictures plus the long-term slots.
+
+Nor can the declaration simply be widened. `max_num_ref_frames` is bounded by the level's DPB
+size, and at 1920x1080 every level these answers carry (4.0-4.2) allows exactly four frames —
+`MaxDpbMbs / (120 x 68)` floors to 4 at each. Declaring more would mean advertising level 5.0+,
+a different promise to the client.
+
+Decoding the host's own bitstream says it out loud, and still calls the file clean:
+
+```
+[h264] number of reference frames (2+3) exceeds max (4; probably corrupt input), discarding one
+[h264] mmco: unref short failure
+...
+Input stream #0:0 (video): 4855 packets read; 4855 frames decoded; 0 decode errors;
+```
+
+`0 decode errors` is the whole defect. A software decoder conceals and carries on; a hardware
+decoder — which is what a phone or tablet on the LAN uses — evicts a picture it was told to keep,
+and the next frame predicting from the slot it freed comes back green. Neither reports anything
+the client page can see, so the page never asks for a keyframe and the artefact survives until
+something else forces an IDR. That is the "random" in the report.
+
+### The fix: long-term references are off on NVENC
+
+`ltrNumFrames = 0`, which is also what `271aa01` did. `SE_NVENC_LTR=1` re-enables them, and is an
+opt-in for the work that would make them correct — the SPS has to be rewritten on the way out so
+`max_num_ref_frames` covers both kinds, which is the shape `amd/sps.rs` already uses for the VUI.
+Until that exists it is not a supported setting.
+
+What this costs: `repair.rs` can no longer answer a loss with a P frame predicted from a
+long-term reference, so on NVENC every repair is a keyframe again — exactly what macOS already
+does, since VideoToolbox's long-term references are token-based and that pipeline declares zero
+slots. Reference-picture *invalidation* is unaffected; it does not depend on LTR.
+
+`reference_budget` stays as the guard on re-enabling: it requires the declaration to cover both
+kinds, and with `ltr_frames = 0` it pins today's `4 -> (4, 4)`. It is arithmetic and needs no GPU.
+
+### Regression, and the commits
+
+`271aa01` cannot reach this: `maxNumRefFrames = 1`, `numRefL0 = 1`, no long-term references at
+all — `streamer/repair.rs` does not exist in that tree. Two later commits combine:
+
+- `f66a5a7` widened the declaration from one short-term reference to four. Self-consistent on its
+  own: four declared, four kept.
+- `240f9f6` enabled two LTR slots on top of that four. **That is the commit that introduced the
+  defect** — and the defect is not its arithmetic but the assumption that NVENC's declaration
+  covers a long-term slot at all.
+
+### Measured
+
+`ffmpeg -v verbose -i <bitstream> -f null -`, counting `exceeds max` and `mmco: unref short
+failure`. The bitstreams are what the host emitted, captured before any network.
+
+| configuration | frames decoded | `exceeds max` | `mmco` |
+|---|---|---|---|
+| HEAD `48c3f3b`, LTR on (2 slots) | 4,855 | 1 | 1 |
+| LTR on, short-term references cut to 2 | 3,307 | 1 | 0 |
+| **LTR off — shipped** | **7,502** (this build) | **0** | **0** |
+| LTR off (earlier control at HEAD) | 18,037 | 0 | 0 |
+
+Cutting the short-term references was tried first and **did not work**, which is what established
+that the budget cannot be shared: with `numRefL0 = 2` the decoder still counted 2 long-term + 3
+short-term against a declaration of 4.
+
+Client-side, over two 60 s runs on the shipped configuration (static and a moving window), the
+in-page sampler reports `greenFrames: 0` and painted fps mean 36.1 (static) / 38.1 (motion),
+against 35.7 / 38.9 for the same scenes with LTR on — no fps cost.
+
+### The client-side pixel oracle did not discriminate, and is reported as such
+
+The harness samples the client's painted pixels and counts green-dominant ones. **At HEAD, over
+180.7 s and 6,024 samples, it reported `greenFrames: 0`** — the measurement client demotes to the
+`<video>` element and libwebrtc's *software* decoder, which conceals the eviction instead of
+painting it. The artefact the owner sees needs a hardware decoder. So the bitstream conformance
+count is what discriminates here, and the pixel counts above are a floor, not the proof.
+
+### Rejected, each with its own run
+
+- **`SE_NVENC_NO_ASYNC=1`** — the complaint is unchanged in count and timing.
+- **Intra refresh off** — unchanged; the complaint is about DPB occupancy.
+- **A ring slot encoded before it was written** — the frames around the complaint are well-formed
+  coded P frames with complete slices, not truncated access units.
+- **Packet loss with RTX off** — the dumps are of what the host emitted, before any network, and
+  the violation is already in them.
+
+### What this does not reach
+
+- **AMD.** `amd/` configures its own reference set and has never encoded a frame on this project;
+  whether AMF splits the same way is a question for `guides/windows-amd.md`.
+- **The green was never reproduced on a client in this room.** Every client this box can drive
+  decodes in software. The fix is justified by the stream being non-conformant and by that
+  non-conformance disappearing, not by a green pixel appearing and then not.
