@@ -3294,3 +3294,116 @@ rather than a gap: the log carries **no** `[exit]` line and there is no `screene
 The host it replaced was the previous release, built before `exit_reason.rs` existed, so it could
 not have left a breadcrumb. Every launch from this build onwards will either name its predecessor's
 exit route or say plainly that there was no record.
+
+## 15.15 Reconfigure only what changed, on the session that changed it
+
+**The report.** "Whenever I don't even edit anything that requires a display reconfig — like the
+device name — the client disconnects and everything goes weird. There was a whole system that
+ensured the stream/display doesn't unnecessarily do that before the 440 commits, and now not only
+does it do that, it also disconnects."
+
+Both halves are accurate, and they are two defects that compound. The "whole system" the report
+remembers is still in the file; what was removed was its ability to see that nothing had changed,
+and its ability to change something without leaving.
+
+### Why every save looked like a change to everything
+
+`set_device_override` did compare the saved override against the submitted one. The sheet never
+reached that comparison intact, for four reasons:
+
+- **`set_device_audio_output` bumped the reconfig epoch unconditionally**, and
+  `device-details.tsx` pushes that command on *every* save whether or not the output moved. So the
+  comparison two lines earlier was irrelevant — the next line of the same submit handler
+  renegotiated anyway. **This is the root cause of the disconnect-on-rename.** The bump was never
+  needed: `audioSink` rides in every `/reconfig` body and the client applies it on its next poll,
+  about a second away.
+- **A device the host held no settings for read as "rebuild".** Nothing seeded the override row,
+  so the *first* save after a join always rebuilt even when the user changed nothing.
+- **`autoFrameRate` was silently inert** — saved, replayed, and then ignored until the next join,
+  because `set_device_auto_frame_rate` never bumped anything.
+- **`orientation` was overwritten with the client's own on every join**, so the saved value was
+  stored, replayed and immediately discarded.
+
+And the comparison itself was inline, duplicated verbatim between `windows_utils/mod.rs` and
+`macos_utils/mod.rs`, and untested.
+
+### Why a renegotiation was a departure
+
+Before sessions were named, a reconfigure offered again from the same address and the host
+*replaced* the session it found there: the display was reused, its mode changed in place, nothing
+on the dashboard moved. When sessions became per-tab (§15.10), `existing` was pinned to `None`
+with a comment reading "a join is new by construction", and the client's `teardownSession` began
+beaconing `/leave` on its way out.
+
+So a settings change **removed one display and built another**. The dashboard raised
+`DeviceRemove` and then `DeviceJoin` — two rows, two OS notifications — and every window the user
+had arranged on that display was shuffled back onto the primary monitor before the replacement
+appeared. That is the "everything goes weird".
+
+### The rule now: field → action
+
+`DeviceOverride::reconfig_action` is the whole classification in one function, in
+`streamer/session.rs`, with the table below as a unit test beside it. A field not named there is
+cosmetic **by construction**, which is the safe default and the one the caller can see.
+
+| Class | Fields | Before | After |
+|---|---|---|---|
+| (a) cosmetic | name, labels, device token | full rebuild | **nothing reaches the host's stream** |
+| (b) input-only | `remoteControl`, `pointerScope` | captured when the session was built, so the only way to apply them *was* the rebuild — the most disruptive answer available to the least disruptive edit | two relaxed atomics (`input::LiveInput`) the injector reads per event, written into every live join of the device; **no epoch** |
+| (c) audio | `systemAudio`, output device | unconditional epoch bump | rides `/reconfig`; the client applies it on its next poll; **no epoch** |
+| (d) scale | `scale` | live already | unchanged — applied to the live display's DPI, the client never hears about it |
+| (e) stream / display | `videoQuality`, `videoScale`, `autoFrameRate`, `refreshRate`, `dpr`, `orientation` | `/leave` → display removed → `DeviceRemove` → new join id → new display | **renegotiate in place**: same join id, same display id, the mode changed under the stream |
+
+The client presents the `joinId` it holds whenever it is renegotiating in place — a reconfigure, a
+rotation, a step down to `<video>`, a trickle latch — and keeps it through the teardown
+(`teardownSession(keepJoin)` / `start(pref, keepJoin)`); `continuing_join` honours it for a session
+that is still open **and still belongs to the same device token**. The id is a 128-bit capability
+this host minted for that tab and is already what `PATCH`/`DELETE /whep/{id}`, `/reconfig` and
+`/leave` are addressed by, so presenting it is the same authority — and an id naming nothing, or
+naming another device's session, is simply a fresh join.
+
+Two things fell out of reusing the display: the saved **orientation** works again (honoured unless
+the device has physically rotated since its last offer), and the previous capture is stopped
+explicitly on the continuing path, because the map entry it would otherwise be reaped through is
+the one being replaced.
+
+### Measured
+
+Windows 11 26200, RTX 3080 Ti Laptop, `serve -v`, Chrome driving a real WHEP session on a real
+virtual display (`\\.\DISPLAY9`, NVENC zero-copy ring, ~40 fps). Epoch read from
+`/reconfig?join=…`, geometry from `devices list --json`, verdicts from `ScreenExtend logs`.
+
+| Edit | epoch | join id | display id |
+|---|---|---|---|
+| first save on a device with no saved row | 0 → 0 | same | same |
+| a no-op save (what a rename pushed) | 0 → 0 | same | same |
+| remote control off | 0 → 0 | same | same |
+| pointer scope → display | 0 → 0 | same | same |
+| system audio on | 0 → 0 | same | same |
+| output device → `probe-sink-42` | 2 → 2 | same | same |
+| display scale 100 → 150 | 0 → 0 | same | same |
+| video quality 15 → 24 | 0 → **1** | same | same |
+| refresh rate 60 → 120 | 1 → **2** | same | same |
+
+Both rebuilds logged `join … is renegotiating in place; keeping its session and display` followed
+by `stopping the previous capture … before renegotiating`, and **neither produced a second
+`virtual display created` or a `removing display`**. A second tab joining without a join id got its
+own session and its own display (`\\.\DISPLAY10`, id 1), so the reuse does not collapse two tabs
+into one. A join id naming no live session answered `{"epoch":0,"kick":0}` and was not honoured.
+
+### What this does not reach
+
+**A relayed client still rejoins on a class-(e) edit.** The cloud relay serves its own older copy
+of the client page (§15.12), so nothing in `streamer/static/` reaches a cross-network join — that
+page does not know about `joinId` and will not present one. `continuing_join` then answers `None`
+and the join is new, which is exactly the pre-change behaviour and is safe: a display is removed
+and another created. The *host* half of the fix does reach a relayed device, so the classification
+is right there too and only class-(d)/(e) edits renegotiate at all. Closing the rest needs the
+relay's page redeployed, which is not something this tree can do.
+
+The macOS arms of this change — `macos_utils/mod.rs` and `streamer/input/macos.rs`, a mechanical
+mirror of the Windows diff — are **`UNVERIFIED` (not compiled)**. The development Mac has been
+offline since §15.4.
+
+Ledger: `docs/OPTIMIZATIONS.md` §UX-RECONFIG; the scripts are `docs/manual-tests/desktop-ui.md`
+and `client-page.md`.
