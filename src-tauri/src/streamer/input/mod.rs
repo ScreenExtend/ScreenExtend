@@ -319,6 +319,47 @@ impl ClockOffset {
     }
 }
 
+/// Per-event injection trace, off unless `SE_INPUT_TRACE=1`.
+///
+/// The stage percentiles in [`crate::streamer::telemetry`] answer "how long did the host take",
+/// which is the question a ledger wants. They cannot answer "did *this* keystroke reach
+/// `SendInput` before or after the frame the user was looking at", because a percentile has no
+/// events in it. One line per injected event, carrying the wall clock, is what pairs against the
+/// `Date.now()` the client page recorded when it handed the frame to the channel — the only stamp
+/// the two sides can compare without trusting a clock offset estimate.
+///
+/// Read once into a `OnceLock`: an env lookup per event would be a heap allocation on the
+/// injector thread. The line is printed strictly *after* `dispatch` returns, so it can never
+/// delay the event it describes — only, by about a microsecond, the next one.
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SE_INPUT_TRACE").as_deref() == Ok("1"))
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ev_kind(ev: &InputEvent) -> &'static str {
+    match ev {
+        InputEvent::Pointer { .. } => "pointer",
+        InputEvent::PointerBatch { samples, .. } => {
+            if samples.len() > 1 {
+                "batchN"
+            } else {
+                "batch1"
+            }
+        }
+        InputEvent::MouseDelta { .. } => "delta",
+        InputEvent::Wheel { .. } => "wheel",
+        InputEvent::Key { .. } => "key",
+        _ => "other",
+    }
+}
+
 /// An event with the two stamps the telemetry needs, moved through the channel as one unit.
 pub struct Queued {
     pub ev: InputEvent,
@@ -461,6 +502,7 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
             // backend's `button_transitions` compare becomes a no-op — the motion is kept, the
             // spurious press or release is not.
             let mut last_delta_buttons: u16 = 0;
+            let tracing = trace_on();
             loop {
                 let q = select! {
                     recv(stop_rx) -> _ => break,
@@ -511,9 +553,21 @@ pub fn spawn(client: ClientProfile, telemetry: SharedTelemetry) -> (InjectorTx, 
                     last_delta_buttons = *buttons;
                 }
                 inj.dispatch(&ev);
+                let done_ns = host_now_ns();
                 t.stages
                     .input_inject
-                    .record(host_now_ns().saturating_sub(q.host_recv_ns));
+                    .record(done_ns.saturating_sub(q.host_recv_ns));
+                if tracing {
+                    tprintln!(
+                        "input-trace kind={} recv_ns={} queue_us={} inject_us={} wall_ms={} qdepth={}",
+                        ev_kind(&ev),
+                        q.host_recv_ns,
+                        age_ns / 1_000,
+                        done_ns.saturating_sub(q.host_recv_ns) / 1_000,
+                        wall_ms(),
+                        fast_rx.len()
+                    );
+                }
             }
             tprintln!("injector shutting down: releasing all held input");
             inj.release_all();
