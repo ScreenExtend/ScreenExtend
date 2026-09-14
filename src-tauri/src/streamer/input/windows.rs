@@ -135,10 +135,6 @@ pub struct Injector {
     /// The client holds pointer lock, so `MOUSE_DELTA` drives the cursor and the frozen
     /// coordinates an absolute frame still carries must be ignored.
     mouse_relative: bool,
-    /// Where relative motion has put the cursor, in desktop pixels. Windows would happily
-    /// accumulate `MOUSEEVENTF_MOVE` for us, but then it applies its own pointer ballistics on
-    /// top of the curve the client already applied, and there is no position to clamp.
-    rel_pos: Option<POINT>,
     /// The two settings the user can move under a live session: whether remote control is on
     /// at all, and what a pointer-locked cursor is clamped against. Shared with the command that
     /// writes them, so a change reaches the next event rather than the next join.
@@ -178,7 +174,6 @@ impl Injector {
             // as a bare `POINTER_DOWN` with no move before it — clicked wherever the host
             // cursor already was.
             mouse_relative: false,
-            rel_pos: None,
             live,
             scratch: Vec::with_capacity(16),
             touch_scratch: Vec::with_capacity(MAX_TOUCH_COUNT as usize),
@@ -352,7 +347,6 @@ impl Injector {
                 0,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             ));
-            self.rel_pos = None;
         }
         button_transitions(self.buttons, buttons, &mut self.scratch);
     }
@@ -378,16 +372,18 @@ impl Injector {
     ///
     /// `PointerScope::Display` also keeps the tracked path whatever the flag says: confining the
     /// cursor to one monitor needs a position to clamp, and `MOUSEEVENTF_MOVE` has none.
+    ///
+    /// **Every movement is a delta from where the cursor really is.** The tracked path used to
+    /// advance from a position it remembered from its own last injection, so a cursor the host's
+    /// own trackpad had moved in the meantime snapped back to the remembered point on the next
+    /// client delta. It reads `GetCursorPos` per frame instead: one cheap syscall, and the
+    /// cursor goes where the hand went from wherever it was.
     fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16, unadjusted: bool) {
         self.mouse_relative = true;
         self.scratch.clear();
         let os_curve = self.lets_os_curve(unadjusted);
         if dx != 0 || dy != 0 {
             if os_curve {
-                // The tracked position is now stale — Windows owns the cursor on this path — so it
-                // is dropped and re-read from `GetCursorPos` if a later frame needs the absolute
-                // path again.
-                self.rel_pos = None;
                 self.scratch
                     .push(mouse_input(dx as i32, dy as i32, 0, MOUSEEVENTF_MOVE));
             } else {
@@ -434,29 +430,26 @@ impl Injector {
         }
     }
 
-    /// Move the tracked relative position and clamp it to [`Self::pointer_bounds`].
+    /// Apply a delta to the cursor's current position and clamp it to [`Self::pointer_bounds`].
     ///
-    /// Both backends clamp the same way and to the same choice of rectangle, so a client that
-    /// crosses to the host's desktop on one OS crosses on the other.
+    /// The base is always the real cursor (`GetCursorPos`), never a remembered one, so motion
+    /// from the host's own mouse or trackpad between two client frames is simply where the next
+    /// delta starts. Both backends clamp the same way and to the same choice of rectangle, so a
+    /// client that crosses to the host's desktop on one OS crosses on the other.
     fn advance_rel(&mut self, dx: i32, dy: i32) -> POINT {
-        let base = match self.rel_pos {
-            Some(p) => p,
-            None => unsafe {
-                let mut p = POINT::default();
-                if GetCursorPos(&mut p).is_ok() {
-                    p
-                } else {
-                    self.pixel(0.5, 0.5)
-                }
-            },
+        let base = unsafe {
+            let mut p = POINT::default();
+            if GetCursorPos(&mut p).is_ok() {
+                p
+            } else {
+                self.pixel(0.5, 0.5)
+            }
         };
         let b = self.pointer_bounds();
-        let p = POINT {
+        POINT {
             x: (base.x + dx).clamp(b.left, b.left + b.width as i32 - 1),
             y: (base.y + dy).clamp(b.top, b.top + b.height as i32 - 1),
-        };
-        self.rel_pos = Some(p);
-        p
+        }
     }
 
     fn wheel(&mut self, dx: f32, dy: f32, mode: u8) {
@@ -886,9 +879,6 @@ impl Injector {
             Lifecycle::Focus(false) | Lifecycle::Visibility(false) => self.release_all(),
             Lifecycle::PointerLock(locked) => {
                 self.mouse_relative = locked;
-                if !locked {
-                    self.rel_pos = None;
-                }
             }
             _ => {}
         }
