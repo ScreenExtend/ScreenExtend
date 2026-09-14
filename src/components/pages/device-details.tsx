@@ -679,7 +679,12 @@ function DeviceDetailsBody({
                     </SelectTrigger>
                     <SelectContent className="cursor-pointer">
                       <SelectItem value="default">{t("device.audioOutput.default")}</SelectItem>
-                      {(audioOutputs?.outputs ?? []).map((o) => (
+                      {(audioOutputs?.outputs ?? [])
+                        // An output with no id (a browser that has not granted the microphone yet)
+                        // cannot be an item: Radix refuses an empty value, and it is the default
+                        // output anyway. A relayed client runs an older page that still sends them.
+                        .filter((o, i, all) => o.id !== "" && all.findIndex((p) => p.id === o.id) === i)
+                        .map((o) => (
                         <SelectItem key={o.id} value={o.id}>
                           {outputLabel(o)}
                         </SelectItem>
