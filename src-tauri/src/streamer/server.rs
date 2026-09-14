@@ -1527,7 +1527,13 @@ async fn start_session(
     };
     if let Some(o) = device_settings {
         cfg.scale = ScalePercent::new(o.video_scale);
-        cfg.quality_qp = Some(o.video_quality);
+        // The quality slider is constant QP, as it shipped. e9c521b turned it into a QP floor under
+        // CBR so congestion control could act, and at the computed ~12 Mbps for 1080p60 that CBR
+        // is what the user sees: soft text and a chroma fringe on white glyphs. Constant QP has no
+        // bitrate to adapt, and never had; `set_bitrate` reports `IgnoredConstantQp` once and the
+        // loss controller stands down, which is how every session before the overhaul ran.
+        cfg.qp = Some(o.video_quality);
+        cfg.quality_qp = None;
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
         // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise:
         // the pipeline holds the cadence and repeats an unchanged frame rather than letting the
@@ -1543,7 +1549,14 @@ async fn start_session(
     let offered_video = negotiate::read_offer(&req.sdp);
 
     let native_dpr = if req.dpr.is_finite() { req.dpr } else { 1.0 };
-    let dpr = platform::snap_display_dpr(device_settings.map(|o| o.dpr).unwrap_or(native_dpr));
+    // `native_dpr` on means the slider is ignored and the device's own ratio is followed on
+    // every join; off pins whatever the sheet shows.
+    let dpr = platform::snap_display_dpr(
+        device_settings
+            .filter(|o| !o.native_dpr)
+            .map(|o| o.dpr)
+            .unwrap_or(native_dpr),
+    );
     let backing = |css: u32| ((css as f64 * dpr).round() as u32).clamp(2, 16384) & !1;
     let width = backing(req.width);
     let height = backing(req.height);
@@ -1604,7 +1617,9 @@ async fn start_session(
     // setting.
     let prev_client_portrait = existing.as_ref().map(|p| p.height > p.width);
     let device_rotated = prev_client_portrait == Some(!client_portrait);
-    let honor_device = existing.is_none() || device_rotated;
+    // `auto_orientation` on: the device is believed on every offer, not only on a rotation.
+    let follow_device = device_settings.map(|o| o.auto_orientation).unwrap_or(false);
+    let honor_device = existing.is_none() || device_rotated || follow_device;
     let portrait = if honor_device {
         client_portrait
     } else {

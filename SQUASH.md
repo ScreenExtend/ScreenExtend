@@ -104,3 +104,12 @@ One entry per bug, newest last. Keep each under ten lines.
 - Fix:        intra refresh off (opt-in SE_INTRA_REFRESH=1); NVENC back to 1 ref, LTR opt-in SE_NVENC_LTR=1. Speedup kept: neither knob was a latency gain. Undoes abd1d2c/e9b839d, which disabled LTR only.
 - Verified:   cargo check/clippy/test on the RTX 3080 Ti box; visual check pending (user)
 - Agent:      Claude Fable 5.1, 2026-09-14
+
+### White text has a yellow fringe, picture soft            status: fixed (awaiting user's visual check)
+- Where:      src-tauri/src/streamer/server.rs (`start_session`, device override → cfg)
+- Baseline:   `cfg.qp = Some(o.video_quality)` → constant QP 23 on every overridden session (pre-overhaul:server.rs:827)
+- Broke in:   e9c521b — slider became a QP floor under CBR so congestion control could act; ledger row 17, COMPILE-CHECKED, never measured on a client
+- Cause:      CBR at the computed ~12 Mbps quantises above 23 on busy frames; 4:2:0 chroma smears glyph edges
+- Fix:        constant QP restored; `BitrateApplied` reporting kept. Speedup: none lost (CBR was not a latency change); congestion control inert on overridden sessions as at baseline
+- Verified:   compile via tauri dev; visual check pending (user)
+- Agent:      Claude Fable 5.1, 2026-09-14
