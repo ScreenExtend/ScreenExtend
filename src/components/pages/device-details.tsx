@@ -470,7 +470,7 @@ function DeviceDetailsBody({
                 onValueChange={(value) => {
                   deviceDetails.setFieldValue("orientation", value);
                 }}
-                disabled={inProgress}
+                disabled={inProgress || deviceDetails.values.autoOrientation}
               >
                 <SelectTrigger className="w-full border-2">
                   <SelectValue placeholder="Orientation" />
@@ -493,12 +493,9 @@ function DeviceDetailsBody({
             disabled={inProgress}
           />
           <Label htmlFor="autoOrientation" className="cursor-pointer">
-            {t("device.autoOrientation.label")}
+            {t("device.setAutomatically")}
           </Label>
         </div>
-        <p className="mt-2 text-sm text-muted-foreground">
-          {t("device.autoOrientation.help")}
-        </p>
           </div>
           <div className="mt-4">
             <TipLabel text="The device's network address (read-only).">
@@ -774,12 +771,9 @@ function DeviceDetailsBody({
                 disabled={inProgress}
               />
               <Label htmlFor="nativeDpr" className="cursor-pointer">
-                {t("device.nativeDpr.label")}
+                {t("device.setAutomatically")}
               </Label>
             </div>
-            <p className="mt-2 text-sm text-muted-foreground">
-              {t("device.nativeDpr.help")}
-            </p>
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
@@ -816,7 +810,7 @@ function DeviceDetailsBody({
                   }}
                   className="w-12 px-1 text-center"
                   hoverLabel={false}
-                  disabled={inProgress}
+                  disabled={inProgress || deviceDetails.values.autoFrameRate}
                 />
                 <span className="ml-1">Hz</span>
                 {/* @ts-expect-error no children for tooltip */}
@@ -833,7 +827,7 @@ function DeviceDetailsBody({
               min={15}
               max={500}
               step={5}
-              disabled={inProgress}
+              disabled={inProgress || deviceDetails.values.autoFrameRate}
             />
             <div className="mt-3 flex items-center space-x-2">
               <Checkbox
@@ -845,12 +839,9 @@ function DeviceDetailsBody({
                 disabled={inProgress}
               />
               <Label htmlFor="autoFrameRate" className="cursor-pointer">
-                {t("device.autoFrameRate.label")}
+                {t("device.setAutomatically")}
               </Label>
             </div>
-            <p className="mt-2 text-sm text-muted-foreground">
-              {t("device.autoFrameRate.help")}
-            </p>
           </div>
           <div className="mt-4">
             <TipLabel text="Resolution of the streamed video. Lower uses less bandwidth." className="my-2">
@@ -900,7 +891,7 @@ function DeviceDetailsBody({
                   }}
                   className="w-12 px-1 text-center"
                   hoverLabel={false}
-                  disabled={inProgress}
+                  disabled={inProgress || deviceDetails.values.adaptiveQuality}
                 />
               </div>
               {/* @ts-expect-error no children for tooltip */}
@@ -916,7 +907,7 @@ function DeviceDetailsBody({
               min={1}
               max={51}
               step={1}
-              disabled={inProgress}
+              disabled={inProgress || deviceDetails.values.adaptiveQuality}
             />
             <div className="mt-3 flex items-center space-x-2">
               <Checkbox
@@ -928,12 +919,9 @@ function DeviceDetailsBody({
                 disabled={inProgress}
               />
               <Label htmlFor="adaptiveQuality" className="cursor-pointer">
-                {t("device.adaptiveQuality.label")}
+                {t("device.setAutomatically")}
               </Label>
             </div>
-            <p className="mt-2 text-sm text-muted-foreground">
-              {t("device.adaptiveQuality.help")}
-            </p>
           </div>
         </div>
         </TooltipProvider>
