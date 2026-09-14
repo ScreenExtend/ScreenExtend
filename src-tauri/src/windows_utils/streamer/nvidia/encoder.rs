@@ -1114,63 +1114,42 @@ impl Encoder {
         h264.sliceMode = 0;
         h264.sliceModeData = 0;
 
-        // More than one reference frame is the prerequisite for repairing loss with a P frame
-        // that skips the damaged picture instead of a full IDR. With `maxNumRefFrames = 1`
-        // every P frame references its immediate predecessor and one loss breaks the chain
-        // permanently, so the only recovery is an IDR. The DPB cost at these resolutions is a
-        // few MB of VRAM.
+        // One reference frame, no long-term references — the DPB the app shipped with.
         //
-        // **Long-term references are off, because with them on this encoder emits a stream that
-        // lies about its own reference buffer.**
+        // f66a5a7 widened this to four and 240f9f6 added two LTR slots on top, so `repair.rs`
+        // could answer a loss with a P frame instead of an IDR. The stream that produces is not
+        // honest about itself: `maxNumRefFrames` is written into the SPS as `max_num_ref_frames`,
+        // NVENC counts only short-term references against it and keeps `ltrNumFrames` on top, and
+        // the field cannot be widened past the level's DPB (four frames at 1080p). A decoder
+        // sized from that SPS evicts a picture it was told to keep, and a hardware decoder
+        // reconstructs the next prediction from a surface nobody wrote — flat green, no decode
+        // error, no keyframe request. With one reference there is one picture to hold and the
+        // declaration is exact. The repair path sees `ltr_slots() == 0` and falls back to a
+        // keyframe, which is what macOS does on every session.
         //
-        // `maxNumRefFrames` is written into the SPS verbatim as `max_num_ref_frames` — the number
-        // of reference pictures the stream promises never to exceed, and the number a decoder
-        // sizes its DPB from — and NVENC counts only the *short-term* references against it.
-        // `ltrNumFrames` is kept on top. So **no value of `maxNumRefFrames` makes the declaration
-        // cover an enabled LTR set**: whatever is declared, the encoder may hold that many
-        // short-term plus `ltrNumFrames` more. Measured here with two slots, ffmpeg reports
-        // `number of reference frames (2+3) exceeds max (4; probably corrupt input), discarding
-        // one` and then `mmco: unref short failure`, while still reporting `0 decode errors` —
-        // a software decoder conceals. A hardware decoder, which is what a phone or tablet on the
-        // LAN uses, evicts a picture instead; the next frame predicting from the slot it freed is
-        // reconstructed from a surface nobody wrote, and what reaches the screen is flat green
-        // with no decode error for the page to report and therefore no keyframe request to end it.
-        //
-        // Nor can the declaration simply be widened: `max_num_ref_frames` is also bounded by the
-        // level's DPB size, and at 1920x1080 every level these answers carry (4.0 through 4.2)
-        // allows exactly four frames.
-        //
-        // Measured, same box, same scene: LTR on, 1 complaint in 3,307 frames; LTR off, 0 in
-        // 25,539. Re-enabling it needs the SPS rewritten on the way out so `max_num_ref_frames`
-        // covers both kinds — the shape `amd/sps.rs` already uses for the VUI — and until that
-        // exists `SE_NVENC_LTR=1` is an opt-in for that work, not a supported setting.
+        // `SE_NVENC_LTR=1` opens the wide DPB again for the work that would make it correct
+        // (rewriting `max_num_ref_frames` on the way out, the shape `amd/sps.rs` uses for the
+        // VUI). It is a measurement switch, not a supported setting.
         let ltr = caps.max_ltr_frames >= 2
             && caps.multiple_ref_frames
             && std::env::var("SE_NVENC_LTR").as_deref() == Ok("1");
-        let ltr_frames = if ltr {
-            caps.max_ltr_frames.min(MAX_LTR_SLOTS)
+        let refs = if ltr { 4 } else { 1 };
+        h264.maxNumRefFrames = refs;
+        h264.numRefL0 = if refs >= 4 {
+            NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_4
         } else {
-            0
-        };
-        let dpb_budget = if caps.multiple_ref_frames { 4 } else { 1 };
-        let (short_refs, declared_refs) = reference_budget(dpb_budget, ltr_frames);
-        h264.maxNumRefFrames = declared_refs;
-        h264.numRefL0 = match short_refs {
-            0 | 1 => NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1,
-            2 => NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_2,
-            3 => NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_3,
-            _ => NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_4,
+            NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1
         };
         // frameIntervalP = 1 means no B frames, so L1 is never consulted; left at 1.
         h264.numRefL1 = NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1;
 
-        // Long-term references, for the NACK-driven repair path: a frame marked LTR stays in
-        // the DPB until replaced, so after a loss burst the encoder can emit a P frame
-        // referencing a picture the client is known to hold. Marking and selection are
-        // per-picture (`ltrMarkFrameIdx` / `ltrUseFrameBitmap`); trust mode is deprecated.
+        // Long-term references, opt-in only (above): a frame marked LTR stays in the DPB until
+        // replaced, so after a loss burst the encoder can emit a P frame referencing a picture
+        // the client is known to hold. Marking and selection are per-picture
+        // (`ltrMarkFrameIdx` / `ltrUseFrameBitmap`); trust mode is deprecated.
         if ltr {
             h264.set_enableLTR(1);
-            h264.ltrNumFrames = ltr_frames;
+            h264.ltrNumFrames = caps.max_ltr_frames.min(MAX_LTR_SLOTS);
             h264.ltrTrustMode = 0;
         }
         self.ltr_slots = if ltr { h264.ltrNumFrames } else { 0 };
@@ -1282,14 +1261,11 @@ impl Encoder {
         }
 
         tprintln!(
-            "NVENC configured: async={}, outputs={}, dpb={} ({} short-term + {} long-term), \
-             ltr={}, intra_refresh={} (period={}, cnt={}), entropy={:?}, vbv={}B, \
-             low_delay_kf_scale={}",
+            "NVENC configured: async={}, outputs={}, max_ref_frames={}, ltr={}, \
+             intra_refresh={} (period={}, cnt={}), entropy={:?}, vbv={}B, low_delay_kf_scale={}",
             self.async_mode,
             if self.async_mode { OUTPUT_BUFFERS } else { 1 },
-            declared_refs,
-            short_refs,
-            ltr_frames,
+            refs,
             ltr,
             self.config.intra_refresh,
             intra_refresh_period,
@@ -1577,19 +1553,6 @@ impl Encoder {
 /// completion events.
 fn async_disabled_by_env() -> bool {
     std::env::var("SE_NVENC_NO_ASYNC").as_deref() == Ok("1")
-}
-
-/// Split a DPB budget between short-term and long-term references, and say what the SPS must
-/// declare.
-///
-/// Returns `(short_term_references, max_num_ref_frames)`. The second is what goes into the SPS and
-/// it always covers *both* kinds, because that is what a decoder sizes its DPB from; the first is
-/// what is left for ordinary prediction once the long-term slots are paid for. At least one
-/// short-term reference always survives — a P frame with nothing to predict from is not an option —
-/// so a budget too small for the long-term slots grows to fit rather than silently overdrawing.
-pub(crate) fn reference_budget(dpb_budget: u32, ltr_frames: u32) -> (u32, u32) {
-    let short = dpb_budget.saturating_sub(ltr_frames).max(1);
-    (short, short + ltr_frames)
 }
 
 /// Block on an NVENC completion event. A timeout here means the hardware never finished the
