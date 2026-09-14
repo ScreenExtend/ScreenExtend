@@ -409,8 +409,11 @@
                 new Promise((r) => setTimeout(() => r(null), ENUM_TIMEOUT_MS)),
             ]);
             if (!devs) { note(); return []; }
+            // A browser that has not granted the microphone yet reports every output with an
+            // empty deviceId. Those cannot be selected with setSinkId and the host cannot key a
+            // setting by them, so they are not reported.
             return devs
-                .filter((d) => d.kind === 'audiooutput')
+                .filter((d) => d.kind === 'audiooutput' && d.deviceId)
                 .map((d) => ({ id: d.deviceId, label: d.label || '' }));
         } catch (_) {
             note();
