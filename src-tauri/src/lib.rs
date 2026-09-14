@@ -412,7 +412,7 @@ impl Device {
         } else {
             info.refresh_rate.clamp(
                 crate::streamer::server::MIN_REFRESH_RATE,
-                crate::streamer::server::DEFAULT_MAX_AUTO_REFRESH,
+                crate::streamer::server::MAX_REFRESH_RATE,
             )
         };
         let native_dpr = crate::streamer::platform::snap_display_dpr(info.dpr);
@@ -439,8 +439,8 @@ impl Device {
                 .to_string(),
             auto_frame_rate: false,
             adaptive_quality: false,
-            native_dpr: false,
-            auto_orientation: false,
+            native_dpr: true,
+            auto_orientation: true,
             audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,

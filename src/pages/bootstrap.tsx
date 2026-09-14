@@ -19,7 +19,10 @@ import {
   defaultConfig,
   getConfig,
   updateConfig,
+  DEFAULT_ADAPTIVE_QUALITY,
   DEFAULT_AUTO_FRAME_RATE,
+  DEFAULT_AUTO_ORIENTATION,
+  DEFAULT_NATIVE_DPR,
   DEFAULT_POINTER_SCOPE,
   type Config,
 } from "@/components/config-provider";
@@ -255,9 +258,9 @@ export default function Bootstrap() {
       step(`devices[${device.token}].adaptiveModes`, () =>
         commands.setDeviceAdaptiveModes(
           device.token,
-          device.adaptiveQuality ?? false,
-          device.nativeDpr ?? false,
-          device.autoOrientation ?? false
+          device.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY,
+          device.nativeDpr ?? DEFAULT_NATIVE_DPR,
+          device.autoOrientation ?? DEFAULT_AUTO_ORIENTATION
         ));
     }
     for (const known of existing.knownDevices) {

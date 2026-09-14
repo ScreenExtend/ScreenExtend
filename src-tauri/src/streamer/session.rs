@@ -83,11 +83,11 @@ pub struct DeviceOverride {
     /// is what shipped; on, the slider is a QP *floor* under CBR and the loss controller owns the
     /// bitrate. Read by `server.rs` at join.
     pub adaptive_quality: bool,
-    /// Pixel ratio: off (the default) renders at `dpr`; on, at whatever ratio the device reports
+    /// Pixel ratio: off renders at `dpr`; on (the default), at whatever ratio the device reports
     /// on each join, so a browser zoom or a different screen is followed rather than pinned.
     pub native_dpr: bool,
-    /// Orientation: off (the default) honours the saved orientation for the life of a session
-    /// (a physical rotation is still believed); on, the display always follows the way the
+    /// Orientation: off honours the saved orientation for the life of a session (a physical
+    /// rotation is still believed); on (the default), the display always follows the way the
     /// device is held.
     pub auto_orientation: bool,
 }
@@ -158,8 +158,8 @@ impl DeviceOverride {
             pointer_scope: crate::streamer::input::PointerScope::default(),
             auto_frame_rate: false,
             adaptive_quality: false,
-            native_dpr: false,
-            auto_orientation: false,
+            native_dpr: true,
+            auto_orientation: true,
         }
     }
 }
