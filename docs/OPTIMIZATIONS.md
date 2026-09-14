@@ -4074,3 +4074,27 @@ locality by `KeyframeGate::for_locality` (that part of `d996635` stays).
 **Verification.** `cargo check`/`clippy`/`test` on the dev box; the visual check needs a real
 client over a real link and is the user's — see `SQUASH.md`. Status moves to `VERIFIED` when a
 session over an editor's grey area shows no colour change in the untouched region.
+
+## UX-QP — text soft with a yellow fringe: the quality slider had stopped being constant QP — `COMPILE-CHECKED`
+
+**Symptom.** After UX-GREEN, white text on the client carries a faint yellow outline and nothing
+is quite sharp. Not a DPR issue — the display is created at the client's ratio.
+
+**What the baseline did.** `start_session` copied the device's `videoQuality` (default 23) into
+`Config::qp`, so every real session ran `NV_ENC_PARAMS_RC_CONSTQP` (CQP on Intel and x264,
+pinned min/max QP on VideoToolbox): every macroblock at QP 23, text edges intact, bitrate
+whatever that costs.
+
+**What broke it.** Row 17 (`e9c521b`) remapped the slider to a QP *floor* under CBR so the loss
+controller could act. Under CBR at the computed target — 12.4 Mbps for 1080p60 on the test
+session — the encoder quantises harder than 23 whenever the picture is busy, and 4:2:0 chroma at
+that QP smears across glyph edges. Its own status said "end-to-end effect not yet measured".
+
+**The fix.** Row 17 is reverted at the join path: `cfg.qp = Some(o.video_quality)` again,
+`quality_qp` unset. The `BitrateApplied` plumbing stays, so a session in constant QP logs
+`IgnoredConstantQp` once instead of claiming an adaptation, which was the half of row 17 that was
+right. Sessions without a device override are unchanged (CBR, as before).
+
+**Cost.** Congestion control is inert on overridden sessions, as it was before the overhaul. If it
+is wanted back, it needs a mode that keeps the quality floor honest (VBR with a `maxQP`, or a
+target derived from the QP) and a measurement on a real client, not a CBR target picked blind.
