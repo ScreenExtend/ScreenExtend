@@ -1465,19 +1465,22 @@ async fn start_session(
 
     let mut cfg = state.config.as_ref().clone();
     cfg.max_fps = detected_refresh;
-    // Rolling intra refresh. It has been plumbed through the NVENC, Quick Sync and VideoToolbox
-    // backends since they were written and no shipping path ever set it, so every recoverable
-    // loss cost a full IDR — the single largest frame the encoder emits, sent unpaced, on a link
-    // that had just demonstrated it could not carry the previous burst. With a refresh wave the
-    // decoder rebuilds over a few frames instead, and a client that missed the session's opening
-    // keyframe recovers on its own rather than sitting black behind an infinite GOP.
-    // `SE_INTRA_REFRESH=0` turns it back off. There is no shipped flag for it — the probe
-    // harness's `--intra-refresh` never reaches a real join — so without this the one encode
-    // change made in this window cannot be A/B'd against a live client, which is exactly what
-    // was needed to decide whether it had anything to do with the relayed path's keyframe rate.
-    cfg.intra_refresh = !matches!(
+    // Rolling intra refresh is **off** on every live join, as it was before the overhaul.
+    //
+    // d996635 turned it on for every session so a recoverable loss would heal over a refresh
+    // wave instead of costing an IDR, and measured that it did not change the keyframe rate. It
+    // never looked at the picture. A refresh wave is a stripe of intra-coded macroblocks moving
+    // through every frame (NVENC codes it continuously, `cnt = period - 1`), and in a flat
+    // region — the grey right half of an editor — those intra blocks quantise chroma differently
+    // from the inter-predicted blocks around them, so the stripe reads as a band of another tint
+    // scanning a surface whose colour never changed. On the client that is green flicker over
+    // plain grey. The probe harness's own `--intra-refresh` help text has said so since it was
+    // written: "on = periodic refresh waves can be visible as bands repainting the image".
+    // Loss recovery is back to PLI/FIR -> IDR through `KeyframeGate`, which is what shipped.
+    // `SE_INTRA_REFRESH=1` opts a host in for a measurement.
+    cfg.intra_refresh = matches!(
         std::env::var("SE_INTRA_REFRESH").as_deref(),
-        Ok("0") | Ok("off") | Ok("false")
+        Ok("1") | Ok("on") | Ok("true")
     );
     let device_settings = state
         .config
