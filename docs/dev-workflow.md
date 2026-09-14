@@ -29,7 +29,7 @@ through `.gitignore`.
 - **Everything else over SSH**, always with the explicit OpenSSH binary:
 
   ```
-  "C:/Windows/System32/OpenSSH/ssh.exe" -o ConnectTimeout=15 -o BatchMode=yes sarvesh@172.16.11.81 \
+  "C:/Windows/System32/OpenSSH/ssh.exe" -o ConnectTimeout=15 -o BatchMode=yes sarvesh@172.16.11.74 \
     "cd /Users/sarvesh/Desktop/ScreenExtend && export PATH=\"$HOME/.cargo/bin:$HOME/.nvm/versions/node/v22.22.3/bin:$PATH\" && <cmd>"
   ```
 
@@ -42,7 +42,7 @@ through `.gitignore`.
 
 - **Windows → Mac**: `git bundle create /z/_sync/win-to-mac.bundle <branch>` on Windows, then over
   SSH `git bundle verify _sync/win-to-mac.bundle && git fetch _sync/win-to-mac.bundle <branch> && git merge FETCH_HEAD`.
-- **Mac → Windows**: `GIT_SSH_COMMAND="C:/Windows/System32/OpenSSH/ssh.exe -o BatchMode=yes" git fetch ssh://sarvesh@172.16.11.81/Users/sarvesh/Desktop/ScreenExtend <branch>` then `git merge FETCH_HEAD`.
+- **Mac → Windows**: `GIT_SSH_COMMAND="C:/Windows/System32/OpenSSH/ssh.exe -o BatchMode=yes" git fetch ssh://sarvesh@172.16.11.74/Users/sarvesh/Desktop/ScreenExtend <branch>` then `git merge FETCH_HEAD`.
   PowerShell shows git's progress output in red; that is not a failure.
 - The remote `origin` is read-only during the overhaul: nothing is pushed.
 

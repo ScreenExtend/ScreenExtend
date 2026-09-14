@@ -66,8 +66,8 @@ accessibility trusted: true
           deviceid d2:40:f4:a9:02:b3 (features 0x527FFEE6,0x0)
 [airplay] receiver up: control 50188, mirror 50189, timing 49486, advertising 1920x1080@60
 [airplay] selected "ScreenExtend Live Test" in the Displays menu
-[airplay] control connection from 172.16.11.81:50193
-[airplay] mirror stream connected from 172.16.11.81:50194
+[airplay] control connection from 172.16.11.74:50193
+[airplay] mirror stream connected from 172.16.11.74:50194
 [airplay] display 4128832 moved to the requested 1920x1080
 [airplay] display 4128832 attached as an extended desktop (1920x1080)
 created display 4128832 at (1920, 1080)
