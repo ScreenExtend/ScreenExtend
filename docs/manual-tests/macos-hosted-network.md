@@ -52,7 +52,7 @@ run twice with identical results:
 ```
 backend: HostApSpi
 channel 36 (5 GHz)
-interface Some("en3"), station address before the start Some(172.16.11.81)
+interface Some("en3"), station address before the start Some(172.16.11.74)
 securityType 1024 (unconfirmed): accepted=false in 2.13s
 securityType  512 (unconfirmed): accepted=false in 2.08s
 securityType  256 (unconfirmed): accepted=false in 2.07s
@@ -79,7 +79,7 @@ Three things, and the second is the important one.
    preferences and would therefore get `bootpd` and NAT with it) is the next thing to try — see §9.
 
 3. **The station address survives the switch.** At t+2.2 s, with the interface already in HostAP
-   mode, `getifaddrs` still reported `172.16.11.81` — the address of the network the Mac had just
+   mode, `getifaddrs` still reported `172.16.11.74` — the address of the network the Mac had just
    left. A verification that accepts it reports the AP as working on the old LAN address, so
    `wait_for_ipv4` now takes the pre-start address and refuses it.
 

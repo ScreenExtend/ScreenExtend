@@ -1084,7 +1084,7 @@ and it immediately found two things no other gate could have:
   most valuable remaining experiment in that territory.
 - **The station address survives the switch into AP mode.** At t+2.2 s, with the interface already in
   AP mode, `getifaddrs` still reported the address of the network the Mac had just left — read
-  naively, "verified, host address 172.16.11.81". `wait_for_ipv4` now refuses the pre-start address.
+  naively, "verified, host address 172.16.11.74". `wait_for_ipv4` now refuses the pre-start address.
 - **What Apple's own AirPlay encoder emits.** Type-`0x01` payloads are a plaintext
   `AVCDecoderConfigurationRecord`: profile `0x64` (**High**), level `0x29` (**4.1**), 4-byte NAL
   length prefixes. Type-`0x00` payloads are AES-CTR ciphertext (three 32-byte dumps, uniform high
@@ -2544,7 +2544,7 @@ updater signing step alone.
 
 Before relaunching, the row the measurement left behind was cleared — `ScreenExtend devices reset
 172.16.11.76`, which is the saved `refreshRate 360` / `dpr 2` that root cause 1 exists to stop
-being written in the first place. `devices list` now shows only `172.16.11.81` at 120 Hz, untouched,
+being written in the first place. `devices list` now shows only `172.16.11.74` at 120 Hz, untouched,
 and the ten `knownDevices` rows are unchanged. The app was then relaunched detached.
 
 ## 15.7 Post-report fix: a busy display driver is not a broken one
