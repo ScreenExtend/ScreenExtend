@@ -53,6 +53,17 @@ export type Device = {
    * `DEFAULT_AUTO_FRAME_RATE`.
    */
   autoFrameRate?: boolean;
+  /**
+   * The adaptive form of three more settings, each off by default so the value shown is the
+   * value used. `adaptiveQuality`: `videoQuality` is a QP floor under an adaptive bitrate
+   * instead of a constant QP. `nativeDpr`: render at the ratio the device reports on each
+   * join instead of `dpr`. `autoOrientation`: always follow the way the device is held
+   * instead of `orientation`. Optional for the same reason as `autoFrameRate`; absent reads
+   * as off.
+   */
+  adaptiveQuality?: boolean;
+  nativeDpr?: boolean;
+  autoOrientation?: boolean;
   systemAudio: boolean;
   audioOutputDeviceId: string;
   audioOutputDeviceLabel: string;

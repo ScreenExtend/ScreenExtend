@@ -201,7 +201,8 @@ qr [-t lan|cloud|all] [--session-id ID] [--no-render] [--json]
 session new [--no-render] [--json]
 devices list | set <ip> [--scale --orientation --refresh-rate --video-scale
                          --video-quality --control on|off --audio on|off
-                         --pointer-scope display|all --auto-framerate on|off] | reset <ip>
+                         --pointer-scope display|all --auto-framerate on|off
+                         --adaptive-quality on|off --native-dpr on|off --auto-orientation on|off] | reset <ip>
 network start <ssid> <password> | stop | status | wifi-on | wifi-qr
 config list | get <key> | set <key> <value> | path      # dotted keys, e.g. serverPorts.http
 stun show | set <urls> | clear
@@ -300,7 +301,7 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `turn_on_wifi`, `install_drivers`,
 `remove_drivers`, `quit_driver_holder`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
-`set_device_auto_frame_rate`, `refresh_device_stream`, `disconnect_session`,
+`set_device_auto_frame_rate`, `set_device_adaptive_modes`, `refresh_device_stream`, `disconnect_session`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,
 `set_device_banned`, `set_device_approved`, `set_disconnect_grace`, `get_disconnect_grace`,
 `get_display_capacity`, `set_turn_config`, `get_turn_config`, `set_server_ports`,
@@ -993,7 +994,7 @@ driverRepair{boot,install,reinstall,relaunch}
 ```
 
 `Device` = `{ ip, token, name, scale, orientation, refreshRate, videoScale, videoQuality,
-remoteControl, pointerScope, autoFrameRate, systemAudio, audioOutputDeviceId,
+remoteControl, pointerScope, autoFrameRate, adaptiveQuality, nativeDpr, autoOrientation, systemAudio, audioOutputDeviceId,
 audioOutputDeviceLabel, os, screenSize, dpr, maxDpr }`; `KnownDevice` = `{ token, ip, name, os, screenSize, lastSeen, banned }`.
 **Both are keyed by `token`**, not by `ip` — the address is a display field that changes under a
 live session and is recycled between devices. A row written before tokens existed matches by

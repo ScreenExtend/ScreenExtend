@@ -125,7 +125,10 @@
                 { "name": "control", "takesValue": true, "possibleValues": ["on", "off"], "description": "Remote keyboard/mouse control." },
                 { "name": "audio", "takesValue": true, "possibleValues": ["on", "off"], "description": "System audio streaming." },
                 { "name": "pointer-scope", "takesValue": true, "possibleValues": ["display", "all"], "description": "How far a pointer-locked client may drive the cursor: every screen (default), or only its own display." },
-                { "name": "auto-framerate", "takesValue": true, "possibleValues": ["on", "off"], "description": "Let the stream drop below the chosen refresh rate on its own. Off (default) holds the rate." }
+                { "name": "auto-framerate", "takesValue": true, "possibleValues": ["on", "off"], "description": "Let the stream drop below the chosen refresh rate on its own. Off (default) holds the rate." },
+                { "name": "adaptive-quality", "takesValue": true, "possibleValues": ["on", "off"], "description": "Treat the quality value as a floor under an adaptive bitrate. Off (default) codes at that constant quality." },
+                { "name": "native-dpr", "takesValue": true, "possibleValues": ["on", "off"], "description": "Render at the pixel ratio the device reports on each join. Off (default) uses the saved ratio." },
+                { "name": "auto-orientation", "takesValue": true, "possibleValues": ["on", "off"], "description": "Always follow the way the device is held. Off (default) keeps the saved orientation for a session." }
               ]
             },
             "reset": {

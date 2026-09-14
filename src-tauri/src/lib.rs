@@ -381,6 +381,15 @@ pub struct Device {
     /// is a promise: see `streamer::session::DeviceOverride::auto_frame_rate`.
     #[serde(rename = "autoFrameRate")]
     pub auto_frame_rate: bool,
+    /// The slider is a QP floor under CBR rather than a constant QP. Off is the fixed form.
+    #[serde(rename = "adaptiveQuality")]
+    pub adaptive_quality: bool,
+    /// Follow the ratio the device reports instead of `dpr`. Off is the fixed form.
+    #[serde(rename = "nativeDpr")]
+    pub native_dpr: bool,
+    /// Follow the way the device is held instead of `orientation`. Off is the fixed form.
+    #[serde(rename = "autoOrientation")]
+    pub auto_orientation: bool,
     #[serde(rename = "systemAudio")]
     pub audio_enabled: bool,
     pub os: String,
@@ -429,6 +438,9 @@ impl Device {
                 .as_str()
                 .to_string(),
             auto_frame_rate: false,
+            adaptive_quality: false,
+            native_dpr: false,
+            auto_orientation: false,
             audio_enabled: false,
             os: info.os,
             screen_size: info.screen_size,
@@ -862,6 +874,7 @@ pub fn run() {
             set_device_override,
             set_device_pointer_scope,
             set_device_auto_frame_rate,
+            set_device_adaptive_modes,
             refresh_device_stream,
             disconnect_session,
             set_device_audio_output,

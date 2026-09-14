@@ -154,6 +154,19 @@ async setDevicePointerScope(device: string, scope: string) : Promise<void> {
 async setDeviceAutoFrameRate(device: string, enabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_auto_frame_rate", { device, enabled });
 },
+/**
+ * The three adaptive switches, one per setting that has a fixed form and an adaptive one:
+ * quality (CBR with the slider as a QP floor, instead of constant QP at the slider), pixel
+ * ratio (the ratio the device reports at each join, instead of the slider) and orientation
+ * (whichever way the device is held, always, instead of the saved value). Off is the default
+ * for all three and means "fixed at what the sheet shows", the same ruling as
+ * `set_device_auto_frame_rate`. Their own command for the same reason as that one:
+ * `set_device_override` is at specta's ten-argument ceiling. Each is read when the session is
+ * built, so a change takes a rebuild — only when something actually moved.
+ */
+async setDeviceAdaptiveModes(device: string, adaptiveQuality: boolean, nativeDpr: boolean, autoOrientation: boolean) : Promise<void> {
+    await TAURI_INVOKE("set_device_adaptive_modes", { device, adaptiveQuality, nativeDpr, autoOrientation });
+},
 async refreshDeviceStream(device: string, joinId: string | null) : Promise<boolean> {
     return await TAURI_INVOKE("refresh_device_stream", { device, joinId });
 },
@@ -329,7 +342,19 @@ pointerScope: string;
  * Whether the stream may fall below `refresh_rate` on its own. Off means the chosen rate
  * is a promise: see `streamer::session::DeviceOverride::auto_frame_rate`.
  */
-autoFrameRate: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
+autoFrameRate: boolean; 
+/**
+ * The slider is a QP floor under CBR rather than a constant QP. Off is the fixed form.
+ */
+adaptiveQuality: boolean; 
+/**
+ * Follow the ratio the device reports instead of `dpr`. Off is the fixed form.
+ */
+nativeDpr: boolean; 
+/**
+ * Follow the way the device is held instead of `orientation`. Off is the fixed form.
+ */
+autoOrientation: boolean; systemAudio: boolean; os: string; screenSize: string; dpr: number; maxDpr: number }
 export type DeviceAudioOutputs = { 
 /**
  * The join that reported this list. One browser tab.

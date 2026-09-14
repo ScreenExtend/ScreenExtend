@@ -27,6 +27,9 @@ const resolveDevice = (device: Device): Device => ({
   remoteControl: device.remoteControl ?? false,
   pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
   autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
+  adaptiveQuality: device.adaptiveQuality ?? false,
+  nativeDpr: device.nativeDpr ?? false,
+  autoOrientation: device.autoOrientation ?? false,
   systemAudio: device.systemAudio ?? false,
   audioOutputDeviceId: device.audioOutputDeviceId ?? "",
   dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -88,6 +91,12 @@ export async function applyConfig(config: Config): Promise<Config> {
       await commands.setDeviceAutoFrameRate(
         device.token,
         device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE
+      );
+      await commands.setDeviceAdaptiveModes(
+        device.token,
+        device.adaptiveQuality ?? false,
+        device.nativeDpr ?? false,
+        device.autoOrientation ?? false
       );
       await commands.setDeviceAudioOutput(device.token, device.audioOutputDeviceId);
     });

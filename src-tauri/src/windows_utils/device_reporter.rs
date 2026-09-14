@@ -38,6 +38,9 @@ impl TauriDeviceReporter {
             device.control_enabled = o.control_enabled;
             device.pointer_scope = o.pointer_scope.as_str().to_string();
             device.auto_frame_rate = o.auto_frame_rate;
+            device.adaptive_quality = o.adaptive_quality;
+            device.native_dpr = o.native_dpr;
+            device.auto_orientation = o.auto_orientation;
             device.dpr = o.dpr.min(device.max_dpr);
             device.audio_enabled = o.audio_enabled;
         }

@@ -1532,8 +1532,13 @@ async fn start_session(
         // is what the user sees: soft text and a chroma fringe on white glyphs. Constant QP has no
         // bitrate to adapt, and never had; `set_bitrate` reports `IgnoredConstantQp` once and the
         // loss controller stands down, which is how every session before the overhaul ran.
-        cfg.qp = Some(o.video_quality);
-        cfg.quality_qp = None;
+        if o.adaptive_quality {
+            cfg.qp = None;
+            cfg.quality_qp = Some(o.video_quality);
+        } else {
+            cfg.qp = Some(o.video_quality);
+            cfg.quality_qp = None;
+        }
         cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
         // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise:
         // the pipeline holds the cadence and repeats an unchanged frame rather than letting the

@@ -332,6 +332,18 @@
     "autoFrameRate": {
       "label": "Automatic frame rate",
       "help": "Off by default: the stream runs at the refresh rate above and never lowers it, repeating an unchanged frame rather than skipping it. Tick this to let ScreenExtend drop the rate when the picture is still or the connection is busy."
+    },
+    "adaptiveQuality": {
+      "label": "Adaptive quality",
+      "help": "Off by default: every frame is coded at the quality above, whatever it costs the connection. Tick this to make it a floor instead, so the bitrate follows the connection and the quality may drop under load."
+    },
+    "nativeDpr": {
+      "label": "Use the device's native pixel ratio",
+      "help": "Off by default: the display is rendered at the ratio above. Tick this to follow whatever ratio the device reports each time it joins, including a browser zoom."
+    },
+    "autoOrientation": {
+      "label": "Follow device orientation",
+      "help": "Off by default: the orientation above is kept for the whole session, though a device that is physically rotated is still followed. Tick this to always match the way the device is held."
     }
   },
   "network": {

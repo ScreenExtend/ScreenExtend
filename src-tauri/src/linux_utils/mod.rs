@@ -71,6 +71,17 @@ pub fn set_device_auto_frame_rate(
 
 #[tauri::command]
 #[specta::specta]
+pub fn set_device_adaptive_modes(
+    _state: tauri::State<'_, AppState>,
+    _device: String,
+    _adaptive_quality: bool,
+    _native_dpr: bool,
+    _auto_orientation: bool,
+) {
+}
+
+#[tauri::command]
+#[specta::specta]
 pub fn refresh_device_stream(
     _state: tauri::State<'_, AppState>,
     _device: String,

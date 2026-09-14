@@ -286,6 +286,9 @@ function DeviceDetailsBody({
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
       pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
       autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
+      adaptiveQuality: device.adaptiveQuality ?? false,
+      nativeDpr: device.nativeDpr ?? false,
+      autoOrientation: device.autoOrientation ?? false,
       systemAudio: device.systemAudio ?? false,
       audioOutputDeviceId: device.audioOutputDeviceId ?? "",
       audioOutputDeviceLabel: device.audioOutputDeviceLabel ?? "",
@@ -348,6 +351,21 @@ function DeviceDetailsBody({
         if ((was.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE) !== autoFrameRate) {
           await commands.setDeviceAutoFrameRate(normalized.token, autoFrameRate);
         }
+        const adaptiveQuality = normalized.adaptiveQuality ?? false;
+        const nativeDpr = normalized.nativeDpr ?? false;
+        const autoOrientation = normalized.autoOrientation ?? false;
+        if (
+          (was.adaptiveQuality ?? false) !== adaptiveQuality ||
+          (was.nativeDpr ?? false) !== nativeDpr ||
+          (was.autoOrientation ?? false) !== autoOrientation
+        ) {
+          await commands.setDeviceAdaptiveModes(
+            normalized.token,
+            adaptiveQuality,
+            nativeDpr,
+            autoOrientation
+          );
+        }
         if ((was.audioOutputDeviceId ?? "") !== (normalized.audioOutputDeviceId ?? "")) {
           await commands.setDeviceAudioOutput(normalized.token, normalized.audioOutputDeviceId);
         }
@@ -362,6 +380,9 @@ function DeviceDetailsBody({
           joinId: device.joinId,
           pointerScope: normalized.pointerScope ?? DEFAULT_POINTER_SCOPE,
           autoFrameRate: normalized.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
+          adaptiveQuality,
+          nativeDpr,
+          autoOrientation,
         });
         toast({
           title: t("toasts.device.updatedTitle"),
@@ -460,6 +481,24 @@ function DeviceDetailsBody({
                 </SelectContent>
               </Select>
             </div>
+          </div>
+          <div className="mt-1">
+        <div className="mt-3 flex items-center space-x-2">
+          <Checkbox
+            id="autoOrientation"
+            checked={deviceDetails.values.autoOrientation}
+            onCheckedChange={(checked) => {
+              deviceDetails.setFieldValue("autoOrientation", checked === true);
+            }}
+            disabled={inProgress}
+          />
+          <Label htmlFor="autoOrientation" className="cursor-pointer">
+            {t("device.autoOrientation.label")}
+          </Label>
+        </div>
+        <p className="mt-2 text-sm text-muted-foreground">
+          {t("device.autoOrientation.help")}
+        </p>
           </div>
           <div className="mt-4">
             <TipLabel text="The device's network address (read-only).">
@@ -723,8 +762,24 @@ function DeviceDetailsBody({
               min={1}
               max={Math.max(1, deviceDetails.values.maxDpr)}
               step={0.25}
-              disabled={inProgress || deviceDetails.values.maxDpr <= 1}
+              disabled={inProgress || deviceDetails.values.maxDpr <= 1 || deviceDetails.values.nativeDpr}
             />
+            <div className="mt-3 flex items-center space-x-2">
+              <Checkbox
+                id="nativeDpr"
+                checked={deviceDetails.values.nativeDpr}
+                onCheckedChange={(checked) => {
+                  deviceDetails.setFieldValue("nativeDpr", checked === true);
+                }}
+                disabled={inProgress}
+              />
+              <Label htmlFor="nativeDpr" className="cursor-pointer">
+                {t("device.nativeDpr.label")}
+              </Label>
+            </div>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t("device.nativeDpr.help")}
+            </p>
           </div>
           <div className="mt-4">
             <Label className="my-2 flex items-center">
@@ -863,6 +918,22 @@ function DeviceDetailsBody({
               step={1}
               disabled={inProgress}
             />
+            <div className="mt-3 flex items-center space-x-2">
+              <Checkbox
+                id="adaptiveQuality"
+                checked={deviceDetails.values.adaptiveQuality}
+                onCheckedChange={(checked) => {
+                  deviceDetails.setFieldValue("adaptiveQuality", checked === true);
+                }}
+                disabled={inProgress}
+              />
+              <Label htmlFor="adaptiveQuality" className="cursor-pointer">
+                {t("device.adaptiveQuality.label")}
+              </Label>
+            </div>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t("device.adaptiveQuality.help")}
+            </p>
           </div>
         </div>
         </TooltipProvider>
@@ -879,6 +950,9 @@ function DeviceDetailsBody({
                     joinId: device.joinId,
                     pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
                     autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
+                    adaptiveQuality: device.adaptiveQuality ?? false,
+                    nativeDpr: device.nativeDpr ?? false,
+                    autoOrientation: device.autoOrientation ?? false,
                   });
                   toast({
                     title: t("toasts.device.removedTitle"),
