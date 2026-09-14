@@ -372,11 +372,15 @@ pub fn set_device_override(
     let Some(token) = resolve_device(&state, &device) else {
         return;
     };
-    let (carried_scope, carried_auto_frame_rate) = {
+    let (carried_scope, carried_auto_frame_rate, carried_modes) = {
         let overrides = state.device_overrides.lock_recover();
         match overrides.get(&token) {
-            Some(o) => (o.pointer_scope, o.auto_frame_rate),
-            None => (Default::default(), false),
+            Some(o) => (
+                o.pointer_scope,
+                o.auto_frame_rate,
+                (o.adaptive_quality, o.native_dpr, o.auto_orientation),
+            ),
+            None => (Default::default(), false, (false, false, false)),
         }
     };
     let next = DeviceOverride {
@@ -395,6 +399,9 @@ pub fn set_device_override(
         // display change.
         pointer_scope: carried_scope,
         auto_frame_rate: carried_auto_frame_rate,
+        adaptive_quality: carried_modes.0,
+        native_dpr: carried_modes.1,
+        auto_orientation: carried_modes.2,
     };
     // What this edit costs the stream, decided by comparing the saved row against the one the
     // sheet just submitted rather than by the fact that a save happened at all. The desktop UI
@@ -592,6 +599,67 @@ pub fn set_device_auto_frame_rate(state: State<'_, AppState>, device: String, en
             "[stream] automatic frame rate for device {token} is already {}",
             if enabled { "on" } else { "off" }
         );
+    }
+}
+
+/// The three adaptive switches, one per setting that has a fixed form and an adaptive one:
+/// quality (CBR with the slider as a QP floor, instead of constant QP at the slider), pixel
+/// ratio (the ratio the device reports at each join, instead of the slider) and orientation
+/// (whichever way the device is held, always, instead of the saved value). Off is the default
+/// for all three and means "fixed at what the sheet shows", the same ruling as
+/// `set_device_auto_frame_rate`. Their own command for the same reason as that one:
+/// `set_device_override` is at specta's ten-argument ceiling. Each is read when the session is
+/// built, so a change takes a rebuild — only when something actually moved.
+#[tauri::command]
+#[specta::specta]
+pub fn set_device_adaptive_modes(
+    state: State<'_, AppState>,
+    device: String,
+    adaptive_quality: bool,
+    native_dpr: bool,
+    auto_orientation: bool,
+) {
+    let Some(token) = resolve_device(&state, &device) else {
+        return;
+    };
+    let mut overrides = state.device_overrides.lock_recover();
+    let changed = match overrides.get_mut(&token) {
+        Some(existing) => {
+            let moved = existing.adaptive_quality != adaptive_quality
+                || existing.native_dpr != native_dpr
+                || existing.auto_orientation != auto_orientation;
+            existing.adaptive_quality = adaptive_quality;
+            existing.native_dpr = native_dpr;
+            existing.auto_orientation = auto_orientation;
+            moved
+        }
+        None => {
+            let defaults = DeviceOverride::join_defaults();
+            overrides.insert(
+                token.clone(),
+                DeviceOverride {
+                    adaptive_quality,
+                    native_dpr,
+                    auto_orientation,
+                    ..defaults
+                },
+            );
+            adaptive_quality != defaults.adaptive_quality
+                || native_dpr != defaults.native_dpr
+                || auto_orientation != defaults.auto_orientation
+        }
+    };
+    drop(overrides);
+    // Class (d): all three are read when the session is built.
+    if changed {
+        let moved = session::bump_reconfig_epoch_for_device(&state.sessions, &token);
+        tprintln!(
+            "[stream] adaptive modes for device {token}: quality={adaptive_quality} \
+             pixel-ratio={native_dpr} orientation={auto_orientation}; {moved} live session(s) \
+             will renegotiate in place"
+        );
+    } else {
+        tprintln!("[stream] adaptive modes for device {token} are unchanged");
     }
 }
 

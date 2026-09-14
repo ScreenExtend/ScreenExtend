@@ -872,6 +872,9 @@ mod desktop {
         ("remoteControl", BOOL),
         ("pointerScope", STR),
         ("autoFrameRate", BOOL),
+        ("adaptiveQuality", BOOL),
+        ("nativeDpr", BOOL),
+        ("autoOrientation", BOOL),
         ("systemAudio", BOOL),
         ("audioOutputDeviceId", STR),
         ("audioOutputDeviceLabel", STR),
@@ -2144,6 +2147,13 @@ mod desktop {
             );
             platform::set_device_pointer_scope(app.state(), key.clone(), d.pointer_scope.clone());
             platform::set_device_auto_frame_rate(app.state(), key.clone(), d.auto_frame_rate);
+            platform::set_device_adaptive_modes(
+                app.state(),
+                key.clone(),
+                d.adaptive_quality,
+                d.native_dpr,
+                d.auto_orientation,
+            );
             // Without this a device pinned to a specific host output in the GUI reverts to the
             // default output under `serve`, which is audible rather than theoretical.
             if let Some(output) = d.audio_output {
@@ -2169,6 +2179,9 @@ mod desktop {
         audio: bool,
         pointer_scope: String,
         auto_frame_rate: bool,
+        adaptive_quality: bool,
+        native_dpr: bool,
+        auto_orientation: bool,
         audio_output: Option<String>,
     }
 
@@ -2232,6 +2245,20 @@ mod desktop {
                         .to_string(),
                     auto_frame_rate: device
                         .get("autoFrameRate")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    // Absent is the fixed form for all three, which is what every device saved
+                    // before they existed was running.
+                    adaptive_quality: device
+                        .get("adaptiveQuality")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    native_dpr: device
+                        .get("nativeDpr")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    auto_orientation: device
+                        .get("autoOrientation")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     audio_output: device
@@ -2916,7 +2943,7 @@ mod desktop {
             }
             "set" => {
                 let Some(key) = arg_str(sm, "ip") else {
-                    eprintln!("usage: ScreenExtend devices set <device> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off]");
+                    eprintln!("usage: ScreenExtend devices set <device> [--scale N] [--orientation Portrait|Landscape] [--refresh-rate N] [--video-scale N] [--video-quality N] [--control on|off] [--audio on|off] [--pointer-scope display|all] [--auto-framerate on|off] [--adaptive-quality on|off] [--native-dpr on|off] [--auto-orientation on|off]");
                     eprintln!("  <device> is a device token (see `devices list`); an IP is accepted and resolved to whichever device is connected from it");
                     exit(2);
                 };
@@ -2939,6 +2966,8 @@ mod desktop {
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
                             "remoteControl": true, "systemAudio": false,
                             "pointerScope": "all", "autoFrameRate": false,
+                            "adaptiveQuality": false, "nativeDpr": false,
+                            "autoOrientation": false,
                             "os": "", "screenSize": ""
                         })
                     });
@@ -2970,6 +2999,15 @@ mod desktop {
                 }
                 if let Some(v) = arg_str(sm, "auto-framerate") {
                     obj.insert("autoFrameRate".into(), Value::Bool(v == "on"));
+                }
+                if let Some(v) = arg_str(sm, "adaptive-quality") {
+                    obj.insert("adaptiveQuality".into(), Value::Bool(v == "on"));
+                }
+                if let Some(v) = arg_str(sm, "native-dpr") {
+                    obj.insert("nativeDpr".into(), Value::Bool(v == "on"));
+                }
+                if let Some(v) = arg_str(sm, "auto-orientation") {
+                    obj.insert("autoOrientation".into(), Value::Bool(v == "on"));
                 }
 
                 existing
@@ -4502,6 +4540,9 @@ mod desktop {
                     audio: false,
                     pointer_scope: "all".into(),
                     auto_frame_rate: false,
+                    adaptive_quality: false,
+                    native_dpr: false,
+                    auto_orientation: false,
                     audio_output: None,
                 }
             );

@@ -252,6 +252,13 @@ export default function Bootstrap() {
         commands.setDevicePointerScope(device.token, device.pointerScope ?? DEFAULT_POINTER_SCOPE));
       step(`devices[${device.token}].autoFrameRate`, () =>
         commands.setDeviceAutoFrameRate(device.token, device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE));
+      step(`devices[${device.token}].adaptiveModes`, () =>
+        commands.setDeviceAdaptiveModes(
+          device.token,
+          device.adaptiveQuality ?? false,
+          device.nativeDpr ?? false,
+          device.autoOrientation ?? false
+        ));
     }
     for (const known of existing.knownDevices) {
       const token = known.token ?? "";

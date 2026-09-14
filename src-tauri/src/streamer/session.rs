@@ -79,6 +79,17 @@ pub struct DeviceOverride {
     /// Read by `windows_utils::streamer::pipeline` through `Config::auto_frame_rate`, which
     /// `server.rs` copies out of this at join.
     pub auto_frame_rate: bool,
+    /// Quality: off (the default) codes every picture at `video_quality` as a constant QP, which
+    /// is what shipped; on, the slider is a QP *floor* under CBR and the loss controller owns the
+    /// bitrate. Read by `server.rs` at join.
+    pub adaptive_quality: bool,
+    /// Pixel ratio: off (the default) renders at `dpr`; on, at whatever ratio the device reports
+    /// on each join, so a browser zoom or a different screen is followed rather than pinned.
+    pub native_dpr: bool,
+    /// Orientation: off (the default) honours the saved orientation for the life of a session
+    /// (a physical rotation is still believed); on, the display always follows the way the
+    /// device is held.
+    pub auto_orientation: bool,
 }
 
 /// What one settings edit costs the stream the device is already watching.
@@ -118,6 +129,9 @@ impl DeviceOverride {
             || old.video_scale != new.video_scale
             || old.video_quality != new.video_quality
             || old.auto_frame_rate != new.auto_frame_rate
+            || old.adaptive_quality != new.adaptive_quality
+            || old.native_dpr != new.native_dpr
+            || old.auto_orientation != new.auto_orientation
             || (old.dpr - new.dpr).abs() > f64::EPSILON;
         if rebuild {
             ReconfigAction::Rebuild
@@ -143,6 +157,9 @@ impl DeviceOverride {
             audio_enabled: false,
             pointer_scope: crate::streamer::input::PointerScope::default(),
             auto_frame_rate: false,
+            adaptive_quality: false,
+            native_dpr: false,
+            auto_orientation: false,
         }
     }
 }
@@ -1833,6 +1850,30 @@ mod tests {
                 "automatic frame rate",
                 DeviceOverride {
                     auto_frame_rate: !base.auto_frame_rate,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "adaptive quality",
+                DeviceOverride {
+                    adaptive_quality: !base.adaptive_quality,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "native pixel ratio",
+                DeviceOverride {
+                    native_dpr: !base.native_dpr,
+                    ..base
+                },
+                ReconfigAction::Rebuild,
+            ),
+            (
+                "automatic orientation",
+                DeviceOverride {
+                    auto_orientation: !base.auto_orientation,
                     ..base
                 },
                 ReconfigAction::Rebuild,
