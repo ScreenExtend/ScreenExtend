@@ -42,7 +42,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_AUTO_FRAME_RATE, DEFAULT_POINTER_SCOPE, type Device, type ConnectedDevice } from "@/components/config-provider";
+import { updateConfig, getConfig, useConfig, saveDeviceSettings, removeSavedDevice, DEFAULT_ADAPTIVE_QUALITY, DEFAULT_AUTO_FRAME_RATE, DEFAULT_AUTO_ORIENTATION, DEFAULT_NATIVE_DPR, DEFAULT_POINTER_SCOPE, type Device, type ConnectedDevice } from "@/components/config-provider";
 import { useAudioOutputs, useGlobalSetters } from "@/components/global-provider";
 import { toast } from "@/components/ui/use-toast";
 import { useTranslation } from "@/i18n";
@@ -286,9 +286,9 @@ function DeviceDetailsBody({
       maxDpr: device.maxDpr ?? device.dpr ?? 1,
       pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
       autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
-      adaptiveQuality: device.adaptiveQuality ?? false,
-      nativeDpr: device.nativeDpr ?? false,
-      autoOrientation: device.autoOrientation ?? false,
+      adaptiveQuality: device.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY,
+      nativeDpr: device.nativeDpr ?? DEFAULT_NATIVE_DPR,
+      autoOrientation: device.autoOrientation ?? DEFAULT_AUTO_ORIENTATION,
       systemAudio: device.systemAudio ?? false,
       audioOutputDeviceId: device.audioOutputDeviceId ?? "",
       audioOutputDeviceLabel: device.audioOutputDeviceLabel ?? "",
@@ -351,13 +351,13 @@ function DeviceDetailsBody({
         if ((was.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE) !== autoFrameRate) {
           await commands.setDeviceAutoFrameRate(normalized.token, autoFrameRate);
         }
-        const adaptiveQuality = normalized.adaptiveQuality ?? false;
-        const nativeDpr = normalized.nativeDpr ?? false;
-        const autoOrientation = normalized.autoOrientation ?? false;
+        const adaptiveQuality = normalized.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY;
+        const nativeDpr = normalized.nativeDpr ?? DEFAULT_NATIVE_DPR;
+        const autoOrientation = normalized.autoOrientation ?? DEFAULT_AUTO_ORIENTATION;
         if (
-          (was.adaptiveQuality ?? false) !== adaptiveQuality ||
-          (was.nativeDpr ?? false) !== nativeDpr ||
-          (was.autoOrientation ?? false) !== autoOrientation
+          (was.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY) !== adaptiveQuality ||
+          (was.nativeDpr ?? DEFAULT_NATIVE_DPR) !== nativeDpr ||
+          (was.autoOrientation ?? DEFAULT_AUTO_ORIENTATION) !== autoOrientation
         ) {
           await commands.setDeviceAdaptiveModes(
             normalized.token,
@@ -480,22 +480,20 @@ function DeviceDetailsBody({
                   <SelectItem value="Landscape">Landscape</SelectItem>
                 </SelectContent>
               </Select>
+              <div className="mt-3 flex items-center space-x-2">
+                <Checkbox
+                  id="autoOrientation"
+                  checked={deviceDetails.values.autoOrientation}
+                  onCheckedChange={(checked) => {
+                    deviceDetails.setFieldValue("autoOrientation", checked === true);
+                  }}
+                  disabled={inProgress}
+                />
+                <Label htmlFor="autoOrientation" className="cursor-pointer">
+                  {t("device.setAutomatically")}
+                </Label>
+              </div>
             </div>
-          </div>
-          <div className="mt-1">
-        <div className="mt-3 flex items-center space-x-2">
-          <Checkbox
-            id="autoOrientation"
-            checked={deviceDetails.values.autoOrientation}
-            onCheckedChange={(checked) => {
-              deviceDetails.setFieldValue("autoOrientation", checked === true);
-            }}
-            disabled={inProgress}
-          />
-          <Label htmlFor="autoOrientation" className="cursor-pointer">
-            {t("device.setAutomatically")}
-          </Label>
-        </div>
           </div>
           <div className="mt-4">
             <TipLabel text="The device's network address (read-only).">
@@ -552,7 +550,7 @@ function DeviceDetailsBody({
             />
           </div>
           {deviceDetails.values.remoteControl && (
-            <div className="mt-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
+            <div className="mt-3 animate-in fade-in slide-in-from-top-2 duration-200">
               <div className="flex items-center space-x-2">
                 <Checkbox
                   id="pointerScopeRestricted"
@@ -562,13 +560,12 @@ function DeviceDetailsBody({
                   }}
                   disabled={inProgress}
                 />
-                <Label htmlFor="pointerScopeRestricted" className="cursor-pointer">
-                  {t("device.pointerScope.label")}
-                </Label>
+                <TipLabel text={t("device.pointerScope.help")}>
+                  <Label htmlFor="pointerScopeRestricted" className="cursor-pointer">
+                    {t("device.pointerScope.label")}
+                  </Label>
+                </TipLabel>
               </div>
-              <p className="mt-2 text-sm text-muted-foreground">
-                {t("device.pointerScope.help")}
-              </p>
             </div>
           )}
           <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
@@ -784,8 +781,7 @@ function DeviceDetailsBody({
                 <Input
                   name="refreshRate"
                   type="number"
-                  min={15}
-                  max={500}
+                  min={1}
                   step={1}
                   value={deviceDetails.values.refreshRate}
                   onChange={(event) => {
@@ -799,7 +795,7 @@ function DeviceDetailsBody({
                   }}
                   onBlur={(event) => {
                     const value = parseInt(event.target.value.trim());
-                    if (!(value >= 15 && value <= 500)) {
+                    if (!(value >= 1)) {
                       deviceDetails.setFieldValue(
                         "refreshRate",
                         tempRate
@@ -824,9 +820,9 @@ function DeviceDetailsBody({
                 deviceDetails.setFieldValue("refreshRate", value[0]);
                 setTempRate(value[0]);
               }}
-              min={15}
-              max={500}
-              step={5}
+              min={1}
+              max={Math.max(240, Number(deviceDetails.values.refreshRate) || 0)}
+              step={1}
               disabled={inProgress || deviceDetails.values.autoFrameRate}
             />
             <div className="mt-3 flex items-center space-x-2">
@@ -938,9 +934,9 @@ function DeviceDetailsBody({
                     joinId: device.joinId,
                     pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
                     autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
-                    adaptiveQuality: device.adaptiveQuality ?? false,
-                    nativeDpr: device.nativeDpr ?? false,
-                    autoOrientation: device.autoOrientation ?? false,
+                    adaptiveQuality: device.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY,
+                    nativeDpr: device.nativeDpr ?? DEFAULT_NATIVE_DPR,
+                    autoOrientation: device.autoOrientation ?? DEFAULT_AUTO_ORIENTATION,
                   });
                   toast({
                     title: t("toasts.device.removedTitle"),

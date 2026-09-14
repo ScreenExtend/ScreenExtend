@@ -1,6 +1,9 @@
 import { commands } from "@/lib/bindings";
 import {
+  DEFAULT_ADAPTIVE_QUALITY,
   DEFAULT_AUTO_FRAME_RATE,
+  DEFAULT_AUTO_ORIENTATION,
+  DEFAULT_NATIVE_DPR,
   DEFAULT_POINTER_SCOPE,
   flushConfig,
   updateConfig,
@@ -27,9 +30,9 @@ const resolveDevice = (device: Device): Device => ({
   remoteControl: device.remoteControl ?? false,
   pointerScope: device.pointerScope ?? DEFAULT_POINTER_SCOPE,
   autoFrameRate: device.autoFrameRate ?? DEFAULT_AUTO_FRAME_RATE,
-  adaptiveQuality: device.adaptiveQuality ?? false,
-  nativeDpr: device.nativeDpr ?? false,
-  autoOrientation: device.autoOrientation ?? false,
+  adaptiveQuality: device.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY,
+  nativeDpr: device.nativeDpr ?? DEFAULT_NATIVE_DPR,
+  autoOrientation: device.autoOrientation ?? DEFAULT_AUTO_ORIENTATION,
   systemAudio: device.systemAudio ?? false,
   audioOutputDeviceId: device.audioOutputDeviceId ?? "",
   dpr: device.dpr ?? device.maxDpr ?? 1,
@@ -94,9 +97,9 @@ export async function applyConfig(config: Config): Promise<Config> {
       );
       await commands.setDeviceAdaptiveModes(
         device.token,
-        device.adaptiveQuality ?? false,
-        device.nativeDpr ?? false,
-        device.autoOrientation ?? false
+        device.adaptiveQuality ?? DEFAULT_ADAPTIVE_QUALITY,
+        device.nativeDpr ?? DEFAULT_NATIVE_DPR,
+        device.autoOrientation ?? DEFAULT_AUTO_ORIENTATION
       );
       await commands.setDeviceAudioOutput(device.token, device.audioOutputDeviceId);
     });

@@ -16,6 +16,10 @@ export type PointerScope = "display" | "all";
 // before the setting existed -- which carries no value at all -- keeps the reach it had.
 export const DEFAULT_POINTER_SCOPE: PointerScope = "all";
 export const DEFAULT_AUTO_FRAME_RATE = false;
+/** Quality is fixed at the slider unless asked otherwise; ratio and orientation follow the device. */
+export const DEFAULT_ADAPTIVE_QUALITY = false;
+export const DEFAULT_NATIVE_DPR = true;
+export const DEFAULT_AUTO_ORIENTATION = true;
 
 export type Device = {
   /**
@@ -59,7 +63,7 @@ export type Device = {
    * instead of a constant QP. `nativeDpr`: render at the ratio the device reports on each
    * join instead of `dpr`. `autoOrientation`: always follow the way the device is held
    * instead of `orientation`. Optional for the same reason as `autoFrameRate`; absent reads
-   * as off.
+   * as the `DEFAULT_*` constant above.
    */
   adaptiveQuality?: boolean;
   nativeDpr?: boolean;

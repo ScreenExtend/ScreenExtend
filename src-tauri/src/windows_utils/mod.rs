@@ -380,7 +380,14 @@ pub fn set_device_override(
                 o.auto_frame_rate,
                 (o.adaptive_quality, o.native_dpr, o.auto_orientation),
             ),
-            None => (Default::default(), false, (false, false, false)),
+            None => {
+                let d = DeviceOverride::join_defaults();
+                (
+                    Default::default(),
+                    false,
+                    (d.adaptive_quality, d.native_dpr, d.auto_orientation),
+                )
+            }
         }
     };
     let next = DeviceOverride {

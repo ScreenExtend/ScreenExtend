@@ -326,8 +326,8 @@
       "note": "macOS will show the screen-recording indicator in the menu bar while system audio is on, including when this device's video is off. This version of macOS has no audio-only capture, so ScreenExtend has to run a 2×2 screen stream to receive sound at all."
     },
     "pointerScope": {
-      "label": "Restrict cursor to this display",
-      "help": "Off by default: the mouse and keyboard reach every screen, so you can drag a window back off the extended display. Tick this to keep the cursor inside the screen this device can actually see."
+      "label": "Restrict Cursor to This Display",
+      "help": "Keep the cursor on this device's screen. Off lets it cross onto your other monitors."
     },
     "setAutomatically": "Set automatically"
   },

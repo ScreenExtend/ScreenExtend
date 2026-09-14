@@ -2247,8 +2247,8 @@ mod desktop {
                         .get("autoFrameRate")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    // Absent is the fixed form for all three, which is what every device saved
-                    // before they existed was running.
+                    // Absent is the default form: quality fixed at the slider, ratio and
+                    // orientation following the device.
                     adaptive_quality: device
                         .get("adaptiveQuality")
                         .and_then(|v| v.as_bool())
@@ -2256,11 +2256,11 @@ mod desktop {
                     native_dpr: device
                         .get("nativeDpr")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                        .unwrap_or(true),
                     auto_orientation: device
                         .get("autoOrientation")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                        .unwrap_or(true),
                     audio_output: device
                         .get("audioOutputDeviceId")
                         .and_then(|v| v.as_str())
@@ -2966,8 +2966,8 @@ mod desktop {
                             "refreshRate": 60, "videoScale": 100, "videoQuality": 15,
                             "remoteControl": true, "systemAudio": false,
                             "pointerScope": "all", "autoFrameRate": false,
-                            "adaptiveQuality": false, "nativeDpr": false,
-                            "autoOrientation": false,
+                            "adaptiveQuality": false, "nativeDpr": true,
+                            "autoOrientation": true,
                             "os": "", "screenSize": ""
                         })
                     });
@@ -4541,8 +4541,8 @@ mod desktop {
                     pointer_scope: "all".into(),
                     auto_frame_rate: false,
                     adaptive_quality: false,
-                    native_dpr: false,
-                    auto_orientation: false,
+                    native_dpr: true,
+                    auto_orientation: true,
                     audio_output: None,
                 }
             );
