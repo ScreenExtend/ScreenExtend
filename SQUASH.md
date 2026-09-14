@@ -113,3 +113,21 @@ One entry per bug, newest last. Keep each under ten lines.
 - Fix:        constant QP restored; `BitrateApplied` reporting kept. Speedup: none lost (CBR was not a latency change); congestion control inert on overridden sessions as at baseline
 - Verified:   compile via tauri dev; visual check pending (user)
 - Agent:      Claude Fable 5.1, 2026-09-14
+
+### Device sheet crashed on "Select.Item must have a value prop"       status: fixed
+- Where:      src/components/pages/device-details.tsx (audio output picker); streamer/static/audio.js listOutputs
+- Baseline:   same map, but the client only listed outputs after the mic prompt; the overhaul's page reports them before it, with deviceId ""
+- Broke in:   the overhaul's client audio-output reporting (labels-before-permission)
+- Cause:      enumerateDevices returns "" ids before the microphone permission; Radix refuses value=""
+- Fix:        client drops id-less outputs; sheet filters empty/duplicate ids (relayed clients run the old page)
+- Verified:   test:client, legacy-webkit, tsc, lint; user to confirm with a live device
+- Agent:      Claude Fable 5.1, 2026-09-14
+
+### Cursor teleports back after a native trackpad move            status: fixed
+- Where:      src-tauri/src/streamer/input/windows.rs advance_rel; input/macos.rs mouse_delta
+- Baseline:   pure relative MOUSEEVENTF_MOVE, no remembered position (pre-overhaul:windows.rs:310)
+- Broke in:   the overhaul's tracked-absolute path (rel_pos / self.pos) that avoids a second pointer curve
+- Cause:      the delta advanced from the injector's remembered point, not from where the cursor really was
+- Fix:        every delta starts from GetCursorPos / CGEventGetLocation; the cache is gone. Curve rule kept (still no double acceleration). macOS half unverified here
+- Verified:   clippy, 46 input tests; user to confirm on the client
+- Agent:      Claude Fable 5.1, 2026-09-14

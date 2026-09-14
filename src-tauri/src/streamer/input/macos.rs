@@ -527,8 +527,12 @@ impl Injector {
     fn mouse_delta(&mut self, dx: i16, dy: i16, buttons: u16) {
         self.mouse_relative = true;
         let b = self.pointer_bounds();
-        let nx = (self.pos.x + dx as f64).clamp(b.left as f64, (b.left + b.width as i32) as f64);
-        let ny = (self.pos.y + dy as f64).clamp(b.top as f64, (b.top + b.height as i32) as f64);
+        // A delta from where the cursor really is, not from where this injector last put it:
+        // the host's own trackpad moves the cursor between client frames, and advancing from
+        // the remembered point snapped it straight back. Same rule as the Windows backend.
+        let base = current_mouse_location().unwrap_or(self.pos);
+        let nx = (base.x + dx as f64).clamp(b.left as f64, (b.left + b.width as i32) as f64);
+        let ny = (base.y + dy as f64).clamp(b.top as f64, (b.top + b.height as i32) as f64);
         let pos = CGPoint { x: nx, y: ny };
         self.motion(pos, self.buttons, dx as i64, dy as i64);
         self.button_transitions(self.buttons, buttons, pos);
