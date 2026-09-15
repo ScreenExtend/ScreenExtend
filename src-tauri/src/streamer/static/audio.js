@@ -330,7 +330,12 @@
             speakers.micGranted = !!(p && p.state === 'granted');
         } catch (_) { note(); }
         if (speakers.canSink) {
-            const devs = known || await listOutputs();
+            // Order: whatever enumerates without any grant (Firefox hands out routable ids
+            // with no prompt at all; any engine with the grant hands out the full list). Only a
+            // list with nothing routable in it — Chromium before the grant reports every
+            // output with an empty id, which `listOutputs` drops — falls through to the card.
+            let devs = known || await listOutputs();
+            if (!devs.length && speakers.micGranted) devs = await listOutputs();
             if (devs.length) {
                 if (devs.some((d) => d.label)) speakers._lastEnum = devs;
                 return false;
