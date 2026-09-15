@@ -473,7 +473,7 @@ Cross-platform core, OS-independent:
 - `config.rs` — `Config` (the whole streaming configuration, including the `Shared*` handles
   threaded in from `AppState`), `ScalePercent` (10–100), `EncoderVendor`
   (`auto|nvidia|intel|amd|software`), `H264Profile`, the defaults (ports 8080/8443, monitor 1,
-  `max_fps` 500, Google STUN), and `from_args()`/`print_help()` for the probe harness.
+  `max_fps` 550, Google STUN), and `from_args()`/`print_help()` for the probe harness.
 - `server.rs` — axum HTTP(S) server per network adapter; validates session ID + OTP on join,
   creates the virtual display sized to the client, starts the pipeline. Holds the clamp
   constants: `MIN/MAX_REFRESH_RATE` 15/550, `MIN/MAX_DISPLAY_SCALE` 25/200,
