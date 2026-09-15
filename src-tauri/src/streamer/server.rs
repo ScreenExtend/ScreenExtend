@@ -128,7 +128,7 @@ const LEAVE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500)
 static DISPLAY_CORRELATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub const MIN_REFRESH_RATE: u32 = 15;
-pub const MAX_REFRESH_RATE: u32 = 500;
+pub const MAX_REFRESH_RATE: u32 = 550;
 
 /// Compose cadence to ask the virtual display for, independent of the stream's frame rate.
 /// Every created display registers this rate alongside whatever was requested

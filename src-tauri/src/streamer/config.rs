@@ -351,13 +351,13 @@ impl Config {
                 }
                 "--fps" => {
                     if let Some(v) = val(&args, i).and_then(|s| s.parse::<u32>().ok()) {
-                        c.fps = Some(v.clamp(15, 500));
+                        c.fps = Some(v.clamp(15, 550));
                     }
                     i += 2;
                 }
                 "--max-fps" => {
                     if let Some(v) = val(&args, i).and_then(|s| s.parse::<u32>().ok()) {
-                        c.max_fps = v.clamp(15, 500);
+                        c.max_fps = v.clamp(15, 550);
                     }
                     i += 2;
                 }
