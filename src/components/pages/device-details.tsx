@@ -186,13 +186,6 @@ function DeviceDetailsBody({
   const audioOutputsByToken = useAudioOutputs();
   const { setAudioOutputsByToken } = useGlobalSetters();
   const audioOutputs = audioOutputsByToken[device.token];
-  // `current` is what the client reports it is playing on; `selected` is what the host has
-  // asked for. `undefined` means the client never said, which is not the same as "the
-  // default" -- only a string (empty for the device's default output) is an answer.
-  const clientSink = typeof audioOutputs?.current === "string" ? audioOutputs.current : null;
-  // Compared against the host's *applied* choice, not the unsaved form value, so editing
-  // the picker does not flash a warning about a change that has not been sent yet.
-  const sinkMismatch = clientSink !== null && !!audioOutputs && clientSink !== audioOutputs.selected;
   // The client says whether the ids arrived carrying the operating system's own names.
   // `false` means they did not -- the page then names them by position ("Output 1"), which
   // is honest and routable but is not what the hardware is called, so the panel says so
@@ -209,14 +202,6 @@ function DeviceDetailsBody({
       : o.id === "se:loudspeaker"
         ? t("device.audioOutput.speaker")
         : o.label || unnamed(o.id);
-  const sinkLabel = (id: string): string =>
-    id === ""
-      ? t("device.audioOutput.default")
-      : id === "se:earpiece"
-        ? t("device.audioOutput.earpiece")
-        : id === "se:loudspeaker"
-          ? t("device.audioOutput.speaker")
-          : audioOutputs?.outputs.find((o) => o.id === id)?.label || unnamed(id);
   useEffect(() => {
     if (!open) return;
     (async () => {
@@ -715,27 +700,9 @@ function DeviceDetailsBody({
                     {t("device.audioOutput.generic")}
                   </p>
                 )}
-              {/* What the client says it is *actually* playing on. `setSinkId` needs
-                  transient activation in some engines, so a change made here while nobody
-                  is touching the phone does not take effect until the next tap -- and
-                  Firefox's own picker can move it without the host ever asking. Silently
-                  showing the host's stored choice as if it had applied is the failure this
-                  removes. */}
-              {clientSink !== null && (
-                <p
-                  className={cn(
-                    "mt-2 text-sm",
-                    sinkMismatch ? "text-amber-600" : "text-muted-foreground"
-                  )}
-                >
-                  {sinkMismatch
-                    ? t("device.audioOutput.mismatch", { label: sinkLabel(clientSink) })
-                    : t("device.audioOutput.playingOn", { label: sinkLabel(clientSink) })}
-                </p>
-              )}
             </div>
           )}
-          <div className="mt-4">
+          <div className="mt-4 border-t pt-4">
             <TipLabel text="Zooms the extended desktop's content up or down." className="my-2">
               <Label>Scale - ({deviceDetails.values.scale}%)</Label>
             </TipLabel>
