@@ -792,7 +792,8 @@ function DeviceDetailsBody({
                 <Input
                   name="refreshRate"
                   type="number"
-                  min={1}
+                  min={15}
+                  max={550}
                   step={1}
                   value={deviceDetails.values.refreshRate}
                   onChange={(event) => {
@@ -806,7 +807,7 @@ function DeviceDetailsBody({
                   }}
                   onBlur={(event) => {
                     const value = parseInt(event.target.value.trim());
-                    if (!(value >= 1)) {
+                    if (!(value >= 15 && value <= 550)) {
                       deviceDetails.setFieldValue(
                         "refreshRate",
                         tempRate
@@ -831,9 +832,9 @@ function DeviceDetailsBody({
                 deviceDetails.setFieldValue("refreshRate", value[0]);
                 setTempRate(value[0]);
               }}
-              min={1}
-              max={Math.max(240, Number(deviceDetails.values.refreshRate) || 0)}
-              step={1}
+              min={15}
+              max={550}
+              step={5}
               disabled={inProgress || deviceDetails.values.autoFrameRate}
             />
             <div className="mt-3 flex items-center space-x-2">

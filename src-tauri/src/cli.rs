@@ -2980,7 +2980,7 @@ mod desktop {
                     obj.insert("orientation".into(), Value::String(v));
                 }
                 if let Some(v) = arg_str(sm, "refresh-rate").and_then(|s| s.parse::<u32>().ok()) {
-                    obj.insert("refreshRate".into(), Value::from(v.clamp(15, 500)));
+                    obj.insert("refreshRate".into(), Value::from(v.clamp(15, 550)));
                 }
                 if let Some(v) = arg_str(sm, "video-scale").and_then(|s| s.parse::<u32>().ok()) {
                     obj.insert("videoScale".into(), Value::from(v.clamp(10, 100)));

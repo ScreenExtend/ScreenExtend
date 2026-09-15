@@ -45,7 +45,7 @@ const deviceSchema: JsonSchema = {
       ],
       default: "Landscape",
     },
-    refreshRate: int("Refresh rate of the virtual display, in Hz. Higher is smoother but costs more bandwidth and CPU/GPU.", 15, 500, 60),
+    refreshRate: int("Refresh rate of the virtual display, in Hz. Higher is smoother but costs more bandwidth and CPU/GPU.", 15, 550, 60),
     videoScale: int("Percentage of the display resolution actually encoded and streamed. Lower values trade sharpness for bandwidth.", 10, 100, 100),
     videoQuality: int("H.264 quantiser (QP). Lower means better quality and a larger stream; 1 is near-lossless, 51 is worst.", 1, 51, 23),
     remoteControl: bool("Let this device control the host with its keyboard, mouse and touch input.", false),

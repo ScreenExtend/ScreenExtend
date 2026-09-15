@@ -38,14 +38,14 @@ pub fn live_encoder_config(
     cfg: &Config,
 ) -> EncoderConfig {
     let fps = if let Some(f) = cfg.fps {
-        f.clamp(15, 500)
+        f.clamp(15, 550)
     } else {
         // The display's own rate, not a floor of 60. A 30 Hz display or a client that asked for
         // 30 was being captured and encoded at 60 anyway: twice the frames, none of them new,
         // and twice the encoder work competing with the ones that were. The `refresh_hz == 0`
         // line above is what covers a display that reports nothing sensible.
         let refresh = if refresh_hz == 0 { 60 } else { refresh_hz };
-        let max_fps = cfg.max_fps.clamp(15, 500);
+        let max_fps = cfg.max_fps.clamp(15, 550);
         refresh.clamp(15, max_fps)
     };
 

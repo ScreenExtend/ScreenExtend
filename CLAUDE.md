@@ -476,7 +476,7 @@ Cross-platform core, OS-independent:
   `max_fps` 500, Google STUN), and `from_args()`/`print_help()` for the probe harness.
 - `server.rs` — axum HTTP(S) server per network adapter; validates session ID + OTP on join,
   creates the virtual display sized to the client, starts the pipeline. Holds the clamp
-  constants: `MIN/MAX_REFRESH_RATE` 15/500, `MIN/MAX_DISPLAY_SCALE` 25/200,
+  constants: `MIN/MAX_REFRESH_RATE` 15/550, `MIN/MAX_DISPLAY_SCALE` 25/200,
   `MAX_EFFECTIVE_SCALE` 500, the input caps (`MAX_SDP_LEN` 64 KiB, `MAX_DEVICE_NAME_CHARS` 64, …),
   `DISPLAY_ATTACH_TIMEOUT` 5 s and `LEAVE_SETTLE` 1.5 s. Routes: `/`, `/health`, `POST /whep`,
   `PATCH /whep/{id}` (trickle ICE, `application/trickle-ice-sdpfrag`), `DELETE /whep/{id}`,
