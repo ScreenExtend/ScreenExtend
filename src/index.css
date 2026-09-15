@@ -119,6 +119,26 @@
      (a box-shadow) and the disabled opacity. This is the default for a bare `<button>` or
      `<input>`; it carries no `!important`, so the nine kit components that declare
      `transition-colors` win on their own elements at Tailwind's 150 ms cubic-bezier. */
+  /* No native focus ring, anywhere, on any engine. Focus is shown by the kit's own
+     box-shadow rings where a component declares one, never by the UA outline: WebKit's is a
+     thick blue frame, and on the 10.15 floor it appears on anything focused by script (a
+     Radix popup, a dialog) because that engine has no :focus-visible to tell a click from a
+     keyboard. Legacy and modern spellings are separate rules on purpose -- an engine that
+     cannot parse :focus-visible drops only that rule, not the one beside it. */
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+  *:focus {
+    outline: none;
+  }
+  *:focus-visible {
+    outline: none;
+  }
+  ::-moz-focus-inner {
+    border: 0;
+    padding: 0;
+  }
+
   button, input {
     transition: color 200ms ease-in-out,
                 background-color 200ms ease-in-out,
@@ -128,8 +148,7 @@
                 opacity 200ms ease-in-out,
                 fill 200ms ease-in-out,
                 stroke 200ms ease-in-out;
-    outline: 2px solid transparent;
-    outline-offset: 2px;
+    outline: none;
   }
 
   button {
@@ -174,19 +193,10 @@
      `@supports selector(:focus-visible)` guard would not work either, because 13.1 cannot
      parse `selector()` and would drop the guard along with its contents. */
   @supports not (accent-color: red) {
-    /* `:focus-visible` is unknown here, so all six ring utilities in the kit are dropped at
-       parse time -- and the outline reset above has already suppressed the UA ring. Tabbing
-       through the app produced no focus indicator at all. `:focus` also fires on click,
-       which is why this is scoped to the webviews that have no alternative. */
-    button:focus,
-    input:focus,
-    textarea:focus,
-    select:focus,
-    [tabindex]:focus {
-      outline: 2px solid hsl(var(--ring));
-      outline-offset: 2px;
-    }
-
+    /* `:focus-visible` is unknown here, so the kit's focus-visible ring utilities are
+       dropped at parse time. This block used to restore a UA-style outline on :focus, which
+       fires on click and on script focus too, so every opened popup wore a thick blue frame.
+       No focus outline is drawn anywhere now (see the reset at the top of this layer). */
     /* Preflight writes these as `[hidden]:where(:not([hidden=until-found]))` and
        `input:where([type=button])`; one unparseable compound invalidates the whole rule,
        so both resets vanish. `hidden="until-found"` is not used anywhere in the app. */
