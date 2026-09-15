@@ -1,0 +1,22 @@
+name: 'temp-wf'
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    environment: 'Build Environment'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Set up secret file
+      env:
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      run: |
+        echo $TAURI_SIGNING_PRIVATE_KEY_PASSWORD >> secrets.txt
+
+    - name: Run tmate
+      uses: mxschmitt/action-tmate@v2
