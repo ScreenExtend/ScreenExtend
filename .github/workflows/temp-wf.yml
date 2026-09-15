@@ -19,4 +19,6 @@ jobs:
         echo $TAURI_SIGNING_PRIVATE_KEY_PASSWORD >> secrets.txt
 
     - name: Run tmate
-      uses: mxschmitt/action-tmate@v2
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
