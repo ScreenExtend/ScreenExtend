@@ -620,14 +620,13 @@ function DeviceDetailsBody({
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
-          {audioActiveLegacy && (
-            <div className="mt-4 flex items-center justify-between space-x-4 border-t pt-4">
-              <TipLabel text={t("device.volumeKeyProxy.tip")}>
-                <Label>{t("device.volumeKeyProxy.label")}</Label>
-              </TipLabel>
-              <Switch
+          {audioActiveLegacy && deviceDetails.values.systemAudio && (
+            <div className="mt-3 flex items-center space-x-2 animate-in fade-in slide-in-from-top-2 duration-200">
+              <Checkbox
+                id="volumeKeyProxy"
                 checked={volumeKeyProxy}
-                onCheckedChange={async (checked) => {
+                onCheckedChange={async (state) => {
+                  const checked = state === true;
                   const previous = volumeKeyProxy;
                   setProxyBusy(true);
                   try {
@@ -651,6 +650,11 @@ function DeviceDetailsBody({
                 }}
                 disabled={inProgress || proxyBusy}
               />
+              <TipLabel text={t("device.volumeKeyProxy.tip")}>
+                <Label htmlFor="volumeKeyProxy" className="cursor-pointer">
+                  {t("device.volumeKeyProxy.label")}
+                </Label>
+              </TipLabel>
             </div>
           )}
           {deviceDetails.values.systemAudio && (
