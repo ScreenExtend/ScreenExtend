@@ -2,6 +2,24 @@
     color-scheme: dark;
 }
 
+/* No native focus ring on any engine: the page draws its own (the .inp and .otp rules
+   below); WebKit's is a thick blue frame and mobile engines add a tap flash. The legacy
+   and modern spellings are separate rules so an old engine drops only the one it cannot
+   parse. */
+* {
+    -webkit-tap-highlight-color: transparent;
+}
+*:focus {
+    outline: none;
+}
+*:focus-visible {
+    outline: none;
+}
+::-moz-focus-inner {
+    border: 0;
+    padding: 0;
+}
+
 html, body {
     margin: 0;
     height: 100%;

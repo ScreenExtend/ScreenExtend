@@ -124,7 +124,7 @@ const CSS_CHECKS = [
     re: /:focus-visible/g,
     since: "15.4",
     cover: "fallback",
-    why: "src/index.css restores a :focus ring under @supports not (accent-color: red)",
+    why: "the UA outline is suppressed in a plain :focus rule on both pages (src/index.css, static/styles.css); the :focus-visible rule beside it only re-suppresses on engines that have it, and an engine that cannot parse it drops that rule alone",
   },
   {
     label: "aspect-ratio",
