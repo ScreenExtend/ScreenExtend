@@ -654,7 +654,7 @@ function DeviceDetailsBody({
             </div>
           )}
           {deviceDetails.values.systemAudio && (
-            <div className="mt-4 border-t pt-4 animate-in fade-in slide-in-from-top-2 duration-200">
+            <div className="mt-3 animate-in fade-in slide-in-from-top-2 duration-200">
               <div className="flex items-center justify-between space-x-4">
                 <TipLabel text={t("device.audioOutput.tip")}>
                   <Label>{t("device.audioOutput.label")}</Label>
@@ -683,7 +683,9 @@ function DeviceDetailsBody({
                         // An output with no id (a browser that has not granted the microphone yet)
                         // cannot be an item: Radix refuses an empty value, and it is the default
                         // output anyway. A relayed client runs an older page that still sends them.
-                        .filter((o, i, all) => o.id !== "" && all.findIndex((p) => p.id === o.id) === i)
+                        // Chromium also lists a pseudo-device whose id is literally "default";
+                        // that is the row above, and keeping it put a check mark on both.
+                        .filter((o, i, all) => o.id !== "" && o.id !== "default" && all.findIndex((p) => p.id === o.id) === i)
                         .map((o) => (
                         <SelectItem key={o.id} value={o.id}>
                           {outputLabel(o)}
