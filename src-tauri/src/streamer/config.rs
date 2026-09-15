@@ -223,7 +223,7 @@ impl Default for Config {
             tls_key: None,
             fps: None,
             h264_profile: H264Profile::Baseline,
-            max_fps: 500,
+            max_fps: 550,
             max_bitrate_kbps: None,
             qp: None,
             quality_qp: None,
@@ -519,8 +519,8 @@ SERVER\n\
 CAPTURE / ENCODE\n\
   --monitor <n>           0-based display index (default 1, falls back to 0)\n\
   --scale <10..100>       encode resolution as percent of native (default 100)\n\
-  --fps <n>               frame-rate override, 15..500 (default = display refresh)\n\
-  --max-fps <n>           cap auto-detected fps, 15..500 (default 500)\n\
+  --fps <n>               frame-rate override, 15..550 (default = display refresh)\n\
+  --max-fps <n>           cap auto-detected fps, 15..550 (default 550)\n\
   --max-bitrate-kbps <n>  override computed CBR target (default auto)\n\
   --h264-profile <p>      baseline | main | high (default baseline)\n\
   --qp <1..51>            constant-QP rate control instead of CBR — kills flicker on\n\
