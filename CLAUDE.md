@@ -1146,6 +1146,10 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   decoder falls behind, the answer is to drop to the freshest frame and ask for a keyframe,
   never to buffer. Backpressure is measured as decodes that have not yet produced an *output*,
   never as `decodeQueueSize`, which counts acceptance and can read zero with frames in flight.
+- **Install `receiver.transform` in the same task as `addTransceiver('video')`** — nothing may
+  yield in between. Chrome short-circuits a receiver's encoded transform otherwise: `rtctransform`
+  still fires, but every frame goes to the built-in decoder. `pnpm test:client` checks it
+  (`docs/OPTIMIZATIONS.md` UX-WEBCODECS-START).
 - Every silent degradation on the client page is a bit in the `OP::STATS` frame
   (`docs/TELEMETRY.md`, `docs/INPUT-PROTOCOL.md`). A new `catch (_) {}` there should call
   `noteSuppressed()`, and a new tier should get a value, or the host cannot tell a device on the
