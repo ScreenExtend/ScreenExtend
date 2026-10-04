@@ -4098,3 +4098,20 @@ right. Sessions without a device override are unchanged (CBR, as before).
 **Cost.** Congestion control is inert on overridden sessions, as it was before the overhaul. If it
 is wanted back, it needs a mode that keeps the quality floor honest (VBR with a `maxQP`, or a
 target derived from the QP) and a measurement on a real client, not a CBR target picked blind.
+
+## UX-COEP-WORKER — audio fell back to the Opus track over HTTPS: the worker script had no COEP header — `VERIFIED`
+
+**Symptom.** Over HTTPS the page logs `[audio] decoder worker error` (a message-less `error`
+event) and audio runs on the Opus track instead of the worklet + SharedArrayBuffer ring.
+
+**Cause.** `/` is served COOP `same-origin` + COEP `require-corp`, and Chrome will not start a
+dedicated worker under such a document unless the worker script's own response carries COEP
+`require-corp`. `/audio-worker.js` went through the generic `asset()` with no such header. The
+video worker escaped only by loading from a blob URL; its `/transform-worker.js` fallback had the
+same defect.
+
+**Fix.** `worker_asset()` adds COEP `require-corp` + CORP `same-origin` to the 200 and the 304 of
+`/audio-worker.js`, `/transform-worker.js` and `/audio-worklet.js`; nothing else changes.
+`worker_scripts_carry_coep_on_200_and_304` asserts both branches. Verified in Chrome 154 by
+injecting the header (`audioPath` 1, host `audio=worklet+sab`); the shipped-binary check is
+pending a rebuild.
