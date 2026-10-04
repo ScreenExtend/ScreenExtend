@@ -22,6 +22,7 @@ const HARNESSES = [
   ['audio-worklet.js jitter buffer and the planar ring ABI', 'test-client-worklet.mjs'],
   ['transform-worker.js WebCodecs video path and A/V sync', 'test-client-transform.mjs'],
   ['index.html ICE gathering', 'test-client-ice.mjs'],
+  ['index.html encoded transform installed before Chrome short-circuits it', 'test-client-transform-start.mjs'],
   ['index.html /reconfig epochs and kick', 'test-client-reconfig.mjs'],
 ];
 

@@ -4115,3 +4115,26 @@ same defect.
 `worker_scripts_carry_coep_on_200_and_304` asserts both branches. Verified in Chrome 154 by
 injecting the header (`audioPath` 1, host `audio=worklet+sab`); the shipped-binary check is
 pending a rebuild.
+
+## UX-WEBCODECS-START — the WebCodecs path never painted a frame: Chrome had short-circuited the transform — `VERIFIED`
+
+**Symptom.** Every join on Chrome 154 (headless and windowed): `transformstart` fires, the worker's `framesIn` stays 0, `no WebCodecs frame within 5s`, demoted to `<video>`, first paint ~8.3–10.5 s.
+
+**Root cause.** `start()` created the video transceiver and then `await makeTransformWorker()` (a `fetch`) before assigning `receiver.transform`. Chrome installs a transform on every receiver and *short-circuits* it when JS has not set one within a task of creation; a script transform assigned after that still gets `rtctransform` but no frames — they go to libwebrtc's own decoder. Evidence: during the WebCodecs phase `inbound-rtp` showed `framesDecoded` 1→97 and `keyFramesDecoded` 1–2 while the worker read nothing (`findings/headless/run.mjs` EARLY lines). In a host-free loopback (`findings/headless/loopback.mjs`, same page worker) one `setTimeout(0)` between `addTransceiver` and the assignment reproduces it exactly (worker 0 frames, native 107 decoded); synchronous assignment gets every frame (135/135 decoded and painted). The legacy `createEncodedStreams` path, installed via the RTCConfiguration, was unaffected — which is why forcing it painted.
+
+**Fix.** The worker is built before the peer connection, so nothing yields between `addTransceiver('video')` and the transform assignment. `scripts/test-client-transform-start.mjs` (in `pnpm test:client`) fails on any `await`/`.then(` in that span; it fails on the old page and passes on the new one.
+
+**Measured** (Windows dev box, Chrome 154, host + client on one machine, 20 s with a 48 px window moving on the virtual display):
+
+| | before (headless) | after headless ×4 | after `HEADED=1` ×3 |
+|---|---|---|---|
+| path | demoted to `<video>` (3) | WebCodecs+canvas (1), never demoted | 1, never demoted |
+| first paint after submit | 8289 ms | 3090–3309 ms | 5107–8176 ms |
+| answer → paint | — | 53–89 ms | 81–125 ms |
+| decode p50/p99 | n/a | 0.7–0.8 / 1.3–2.3 ms | 0.8 / 1.2–2.1 ms |
+| host→paint p50/p99 | 20.3 / 28.2 ms | 11.9–14.4 / 19.4–19.8 ms | 13.8–15.0 / 23.7–23.8 ms |
+| painted fps / decodeErrors | 57 / 0 | 68.7–72.2 / 0 | 64.5–70.7 / 0 |
+
+The windowed first paint is all before the answer (the WHEP POST, i.e. display creation); the WebCodecs path itself paints within ~0.1 s of `setRemoteDescription`.
+
+**Ruled out on the way:** the keyframe gate (the host's opening IDR reached the client and was decoded natively), SPS/PPS packetization, the NVENC stream, codec/profile labelling (a Baseline-only offer failed the same way), the answer SDP (the host's own answer transplanted into the loopback works), trickle ICE, cross-origin isolation, the worker script itself. Not checked: whether `271aa01` worked only because an older Chrome did not short-circuit — it has the same `await`.

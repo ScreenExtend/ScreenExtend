@@ -2192,6 +2192,18 @@
                     // from the server list, because a LAN host hands out TURN as a backup.
                     const needRelay = relayNeeded(iceConfig);
                     if (DEBUG) console.log('[ice] locality=' + iceConfig.locality + ' needRelay=' + needRelay);
+                    // The worker has to exist before the video transceiver does. Chrome
+                    // short-circuits a receiver's encoded transform when nothing is installed
+                    // within one task of the transceiver being created: a transform assigned
+                    // after that still fires `rtctransform`, but every frame goes straight to the
+                    // built-in decoder and none reaches the worker. Awaiting the worker fetch in
+                    // between was exactly that, on every join — the decoder never saw a frame and
+                    // the 5 s watchdog demoted the session to <video>. See UX-WEBCODECS-START.
+                    let preparedWorker = null;
+                    if (webcodecs) {
+                        preparedWorker = await makeTransformWorker();
+                        if (stale()) { try { preparedWorker.terminate(); } catch (_) { noteSuppressed(); } return; }
+                    }
                     const pcConfig = { iceServers, bundlePolicy: 'max-bundle' };
                     if (webcodecs && !useScriptTransform) {
                         pcConfig.encodedInsertableStreams = true;
@@ -2241,9 +2253,8 @@
                     } catch (_) { noteSuppressed(); }
 
                     if (webcodecs) {
-                        const w = await makeTransformWorker();
-                        if (stale()) { try { w.terminate(); } catch (_) { noteSuppressed(); } return; }
-                        worker = w;
+                        // No await from here to the transform assignment below; see above.
+                        worker = preparedWorker;
                         // A worker whose script fails to load or parse is constructed
                         // successfully and then simply never posts anything, so without this
                         // the only net is a timeout — 2.5 s where there is a legacy transform
