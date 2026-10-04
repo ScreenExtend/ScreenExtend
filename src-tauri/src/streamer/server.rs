@@ -557,9 +557,9 @@ async fn health() -> &'static str {
 // Cross-origin isolation (`docs/recovered/PRD.md` §6.4): with these on the document *and* a
 // secure context (HTTPS or localhost), `crossOriginIsolated` becomes true and the client can use
 // the SharedArrayBuffer ring buffer. Over plain HTTP they're inert (isolation stays off; client
-// falls back to the postMessage ring). All our sub-resources are same-origin, so
-// COEP:require-corp does not block them — verify the existing video worker still loads if this
-// ever regresses.
+// falls back to the postMessage ring). Same-origin sub-resources pass COEP:require-corp, but a
+// dedicated worker's script is its own document: Chrome refuses to start it unless that response
+// carries COEP:require-corp too, so the worker and worklet scripts go through `worker_asset`.
 fn isolation_headers() -> [(header::HeaderName, header::HeaderValue); 2] {
     [
         (
@@ -719,6 +719,23 @@ fn asset(
         .into_response()
 }
 
+// A script loaded with `new Worker` (or `addModule`) on the isolated page. Without its own COEP
+// header Chrome fails the worker with a message-less `error` and audio drops to the Opus track.
+// The 304 carries it too: a revalidated worker script is checked again.
+fn worker_asset(etag: &str, headers: &HeaderMap, body: &'static str) -> Response {
+    let mut response = asset("text/javascript", etag, headers, body);
+    let h = response.headers_mut();
+    h.insert(
+        header::HeaderName::from_static("cross-origin-embedder-policy"),
+        header::HeaderValue::from_static("require-corp"),
+    );
+    h.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
+    response
+}
+
 // FNV-1a, `const` so every call site folds to a literal and no request pays for the hash.
 const fn asset_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -738,7 +755,7 @@ fn asset_etag(hash: u64) -> String {
 async fn transform_worker(headers: HeaderMap) -> Response {
     const BODY: &str = include_str!("static/transform-worker.js");
     const TAG: u64 = asset_hash(BODY.as_bytes());
-    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
+    worker_asset(&asset_etag(TAG), &headers, BODY)
 }
 
 async fn input_js(headers: HeaderMap) -> Response {
@@ -756,13 +773,13 @@ async fn audio_js(headers: HeaderMap) -> Response {
 async fn audio_worklet_js(headers: HeaderMap) -> Response {
     const BODY: &str = include_str!("static/audio-worklet.js");
     const TAG: u64 = asset_hash(BODY.as_bytes());
-    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
+    worker_asset(&asset_etag(TAG), &headers, BODY)
 }
 
 async fn audio_worker_js(headers: HeaderMap) -> Response {
     const BODY: &str = include_str!("static/audio-worker.js");
     const TAG: u64 = asset_hash(BODY.as_bytes());
-    asset("text/javascript", &asset_etag(TAG), &headers, BODY)
+    worker_asset(&asset_etag(TAG), &headers, BODY)
 }
 
 async fn nosleep_js(headers: HeaderMap) -> Response {
@@ -2627,6 +2644,42 @@ mod tests {
             stun_urls: vec!["stun:stun.l.google.com:19302".to_string()],
             ..Config::default()
         })
+    }
+
+    /// The scripts the isolated page loads as workers must carry their own COEP header, on the
+    /// 200 and on a revalidation 304 alike, or Chrome refuses to start the worker.
+    #[test]
+    fn worker_scripts_carry_coep_on_200_and_304() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        type Handler =
+            fn(HeaderMap) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response>>>;
+        let handlers: [(&str, Handler); 3] = [
+            ("audio-worker.js", |h| Box::pin(audio_worker_js(h))),
+            ("transform-worker.js", |h| Box::pin(transform_worker(h))),
+            ("audio-worklet.js", |h| Box::pin(audio_worklet_js(h))),
+        ];
+        for (name, handler) in handlers {
+            let plain = rt.block_on(handler(HeaderMap::new()));
+            assert_eq!(plain.status(), StatusCode::OK, "{name}");
+            assert_eq!(
+                plain.headers()["cross-origin-embedder-policy"],
+                "require-corp",
+                "{name} 200"
+            );
+            let etag = plain.headers()[header::ETAG].clone();
+
+            let mut conditional = HeaderMap::new();
+            conditional.insert(header::IF_NONE_MATCH, etag);
+            let revalidated = rt.block_on(handler(conditional));
+            assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED, "{name}");
+            assert_eq!(
+                revalidated.headers()["cross-origin-embedder-policy"],
+                "require-corp",
+                "{name} 304"
+            );
+        }
     }
 
     /// One display-affecting edit, end to end across the two halves of the mechanism: the host
