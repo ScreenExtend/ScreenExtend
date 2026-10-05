@@ -264,7 +264,12 @@ impl CursorProbe {
             self.broken = true;
             return false;
         }
-        let showing = info.flags == CURSOR_SHOWING;
+        // `flags` is a bitfield: CURSOR_SHOWING (0x1) and, from Windows 8, CURSOR_SUPPRESSED
+        // (0x2: touch or pen input, the system is not drawing the pointer). Drawn means the first
+        // bit without the second. For every documented value this is what `== SHOWING` computed;
+        // the bit form does not depend on no further bit ever being defined.
+        const CURSOR_SUPPRESSED: u32 = 0x2;
+        let showing = info.flags.0 & CURSOR_SHOWING.0 != 0 && info.flags.0 & CURSOR_SUPPRESSED == 0;
         let pt = POINT {
             x: info.ptScreenPos.x,
             y: info.ptScreenPos.y,
