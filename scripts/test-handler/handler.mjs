@@ -38,6 +38,7 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  netlog: false,           // Chrome's own network log per browser, into the run directory
 };
 const KNOWN = new Set([...Object.keys(DEFAULTS), 'label', 'notes']);
 
@@ -214,7 +215,8 @@ async function openClient(spec, { flags = [], disable = [], offset = 0 } = {}) {
   const port = 19200 + R.slot * 10 + offset;
   // A fresh directory per browser: a profile Chrome has just let go of can stay locked for a while.
   const profile = path.join(ROOT, `profile-slot${R.slot}-${offset}-${process.pid}-${++PROFILE_SEQ}`);
-  const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags], headed: REQ.headed, log, scWidth: REQ.screencast_width });
+  const netlog = REQ.netlog && RUN_DIR ? [`--log-net-log=${path.join(RUN_DIR, `netlog-${offset}-${PROFILE_SEQ}.json`)}`] : [];
+  const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags, ...netlog], headed: REQ.headed, log, scWidth: REQ.screencast_width });
   owned.clients.push(cl);
   await cl.open({ client: spec, observer: { refreshRate: spec.refresh, disable } });
   return cl;
