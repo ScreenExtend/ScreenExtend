@@ -1818,6 +1818,32 @@ mod desktop {
         };
         platform::set_session_credentials(app.state(), session_id.clone(), otp.clone());
 
+        // Before the adapter servers start. It used to come last, after the banner, so `/health`
+        // answered ~300 ms before `stop`, `logs` and `status` could reach the host: a script that
+        // waited for health and then asked for `status --json` (the test handler does) saw no
+        // control server, and stopped the host by PID — skipping the BYE and the display removal.
+        // `AppState` exists by now, which the RELOAD/STATS/SESSION verbs need. Without the
+        // control server at all, `ScreenExtend stop` reports "no running instance" or dials a
+        // stale port left by an earlier GUI run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
+        let quit_tx = std::sync::Mutex::new(tx.clone());
+        if let Err(e) = single_instance::start_control_server(
+            app.clone(),
+            ctrl_path.clone(),
+            |_| {},
+            move |_app: &tauri::AppHandle| {
+                if let Ok(tx) = quit_tx.lock() {
+                    let _ = tx.send(());
+                }
+            },
+            reload_config_into_state,
+        ) {
+            eprintln!(
+                "warning: control server unavailable, `ScreenExtend stop` will not work: {e}"
+            );
+        }
+
         platform::networking::watch_for_network_changes(app.clone());
 
         let cloud = !arg_flag(m, "no-cloud")
@@ -1840,29 +1866,6 @@ mod desktop {
             crate::streamer::telemetry::spawn_summary_printer(Arc::clone(&telemetry_stop));
         }
 
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        // Without this the host answers no control connection at all, so `ScreenExtend stop`
-        // either reports "no running instance" or dials a stale port left by an earlier GUI
-        // run — while `serve`'s own "already running" message tells you to use it.
-        let ctrl_path = lock_dir.join(single_instance::CTRL_FILE);
-        let quit_tx = std::sync::Mutex::new(tx.clone());
-        if let Err(e) = single_instance::start_control_server(
-            app.clone(),
-            ctrl_path.clone(),
-            |_| {},
-            move |_app: &tauri::AppHandle| {
-                if let Ok(tx) = quit_tx.lock() {
-                    let _ = tx.send(());
-                }
-            },
-            reload_config_into_state,
-        ) {
-            eprintln!(
-                "warning: control server unavailable, `ScreenExtend stop` will not work: {e}"
-            );
-        }
-
         println!("\nHost is running. Press Ctrl+C to stop.");
         let _ = std::io::stdout().flush();
 
@@ -1871,7 +1874,7 @@ mod desktop {
         });
         let _ = rx.recv();
 
-        println!("\nStopping…");
+        crate::logbus::echo_stdout("\nStopping…");
         crate::exit_reason::record("serve: Ctrl+C");
         telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         single_instance::clear_control_file(&ctrl_path);
@@ -2273,13 +2276,14 @@ mod desktop {
                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?");
                 let os = v.get("os").and_then(|x| x.as_str()).unwrap_or("");
                 let size = v.get("screenSize").and_then(|x| x.as_str()).unwrap_or("");
-                println!("+ device connected: {ip}  {os} {size}");
+                // On the thread that emitted the join, so it must not panic on a closed pipe.
+                crate::logbus::echo_stdout(&format!("+ device connected: {ip}  {os} {size}"));
             }
         });
         app.listen("device-remove", |event| {
             if let Ok(v) = serde_json::from_str::<Value>(event.payload()) {
                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?");
-                println!("- device disconnected: {ip}");
+                crate::logbus::echo_stdout(&format!("- device disconnected: {ip}"));
             }
         });
     }

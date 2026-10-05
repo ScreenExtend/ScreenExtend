@@ -36,7 +36,9 @@ creates/dispatches events or touches `RemoteInput`, or host commands touching `-
    exclusive mode (below). A caller that finds all four busy waits (`queueWaitMs`).
 3. **Host.** `serve --no-cloud --no-qr -v --http-port P --https-port P+1` with the slot's own data
    directory. Credentials go by environment where the build reads them (`credentialsVia`), else on
-   argv (the old app has no other way; reported). Waits for `/health` on the LAN address.
+   argv (the old app has no other way; reported). Waits for `/health` on the LAN address, polled
+   every 25 ms; `host.startup` gives `firstOutputMs`, `runningLineMs` ("Host is running") and
+   `healthMs`, all from the spawn call.
 4. **Browser.** Fresh profile, `--headless=new --ignore-certificate-errors --mute-audio
    --autoplay-policy=no-user-gesture-required --use-fake-device-for-media-stream`, background
    throttling off. Screen size, viewport and DPR are set with `Emulation.setDeviceMetricsOverride`;
@@ -171,7 +173,8 @@ the page's error text.
 | `leave_rejoin` | false | tab leaves and rejoins within 2 s (same display id?); then leaves for good and the display count is watched for 30 s (`removedAfterS` vs the configured grace) |
 | `slow_answer` | false (`{n:5}` when true) | repeats the join n times, flags answers over 5 s, a page that gave up, or a second session/display |
 | `auto_rejoin` | false | stops and restarts the host under a live page; timeline of host joins and page state |
-| `logs` | false | `logs --lines 50` and `status --json` with a live session |
+| `logs` | false | `logs --lines 50` and `status --json` with a live session; then the whole backlog (`full`: lines, bytes, U+FFFD count, `[logbus] dropped` reports, how many of the last 300 bus lines the host also echoed to serve.log). `{burst: N}` also makes the host log N lines from outside (N control connections with a wrong token, logged once each; no input, no display) and reads the backlog again (`burst`), which wraps the 2000-line ring |
+| `pipe_close` | false | after every join has left: close the host's stdout/stderr pipes as a parent that stops reading does, make it log (bad-token connections), and report whether `logs`/`status` still answer (`controlServerSurvived`). Isolated builds only |
 | `fallback_paths` | false | one fresh browser per client tier — default, no WebCodecs, no `RTCRtpScriptTransform`, neither script transform nor encoded streams, plain HTTP (no secure context / isolation), hardware decode off — each with a 10 s stamp window and the path the page ended on |
 | `loss` | false | reported as **not run**: inducing loss needs admin rights or the owner's network |
 | `screencast_width` | 480 | width of the (non-default) screencast reader |

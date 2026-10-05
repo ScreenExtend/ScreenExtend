@@ -396,11 +396,7 @@ fn handle_connection<Q, R>(
             let _ = stream.flush();
         }
         Request::Logs => {
-            let mut out = String::new();
-            for line in crate::logbus::get_log_backlog() {
-                out.push_str(&line);
-                out.push('\n');
-            }
+            let out = logs_reply();
             let _ = stream.write_all(out.as_bytes());
             let _ = stream.flush();
         }
@@ -427,6 +423,19 @@ fn handle_connection<Q, R>(
     }
 }
 
+/// The `LOGS` reply: the backlog, one line per line.
+///
+/// Read with `backlog_snapshot`, not `get_log_backlog` — that is the desktop panel's command and
+/// arms the `LogLine` stream as a side effect, which a CLI reader that never listens must not do.
+fn logs_reply() -> String {
+    let mut out = String::new();
+    for line in crate::logbus::backlog_snapshot() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Send `command` and read the running instance's reply.
 ///
 /// `None` means nothing is listening. The reply body is empty for commands that do not answer.
@@ -444,16 +453,25 @@ pub fn query_running_instance(ctrl_path: &Path, command: Command) -> Option<Stri
         .write_all(format!("{token} {}\n", command.wire()).as_bytes())
         .ok()?;
     let _ = stream.flush();
-    let mut reply = String::new();
+    Some(read_reply(&mut stream))
+}
+
+/// Read a reply to the end and decode it once.
+///
+/// Decoding each 4 KiB read on its own turned any multi-byte character that straddled a read
+/// boundary into two U+FFFD — and the `LOGS` reply is many kilobytes of lines full of `…`, `—`,
+/// `→` and `─`, so `ScreenExtend logs` mangled a few of them on every call.
+fn read_reply(stream: &mut impl std::io::Read) -> String {
+    let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
-        match std::io::Read::read(&mut stream, &mut buf) {
+        match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => reply.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
             Err(_) => break,
         }
     }
-    Some(reply)
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Where this process's control file lives, remembered once so code with no `AppHandle` in
@@ -563,6 +581,50 @@ mod test {
     }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A socket hands a reply over in whatever pieces it likes. A multi-byte character cut in
+    /// two by a read must come out whole.
+    #[test]
+    fn a_reply_split_inside_a_character_is_decoded_whole() {
+        struct Dribble<'a>(&'a [u8]);
+        impl std::io::Read for Dribble<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(2).min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let text = "[display] at startup … ─── → done — ok\n".repeat(50);
+        let reply = read_reply(&mut Dribble(text.as_bytes()));
+        assert!(
+            !reply.contains('\u{FFFD}'),
+            "a character was split: {reply:?}"
+        );
+        assert_eq!(reply, text);
+    }
+
+    /// `ScreenExtend logs` reads the backlog and goes away; it never listens to `LogLine`. It used
+    /// to read through the panel's command, which arms the event stream, so one `logs` against
+    /// the desktop app left every later log line serialised into an IPC event nobody read.
+    #[test]
+    fn the_logs_verb_does_not_arm_the_panel_stream() {
+        crate::logbus::set_log_streaming(false);
+        crate::logbus::push_line("single-instance-logs-verb-probe".to_string());
+        let mut reply = String::new();
+        for _ in 0..200 {
+            reply = logs_reply();
+            if reply.contains("single-instance-logs-verb-probe") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reply.contains("single-instance-logs-verb-probe\n"));
+        assert!(
+            !crate::logbus::streaming_armed(),
+            "the LOGS verb armed the LogLine stream"
+        );
+    }
 
     #[test]
     fn the_session_verb_is_one_word_to_read_and_three_to_write() {
