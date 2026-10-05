@@ -174,6 +174,9 @@
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
     const SE_EARPIECE = 'se:earpiece';
+    // Offered to the host in place of a list when nothing routable enumerates without a
+    // permission. Not a device: choosing it asks this page to reveal the real ones.
+    const SE_CHOOSE = 'se:choose';
 
     const speakers = {
         inited: false,
@@ -345,17 +348,16 @@
         return !speakers.micGranted;
     }
 
-    // Enumeration is for the host's device panel, never for playback. It runs *before* the
-    // join because the only thing on this page that can raise a permission prompt is here, and
-    // a prompt over a live second screen is an interruption — so if one is needed at all it is
-    // needed now, once, with the join waiting on the answer.
-    //
-    // On almost every device it needs nothing: see `needsMicPermission()`. A decline costs
-    // device *labels* in the host's picker and nothing else — the sink change itself works on
-    // bare ids — and is reported as `degraded` bit 9 for the rest of the session. It is never
-    // re-offered.
+    // Enumeration is for the host's device panel, never for playback, and the join never asks
+    // for anything to do it. The default output plays with no permission on every engine, so a
+    // join that raised a microphone card or prompt was asking the user for something they had
+    // not asked to do. What this does is whatever enumerates for free; where that is nothing
+    // routable (Chromium before a grant reports every output with an empty id, Firefox lists
+    // none before its picker), the host is offered `SE_CHOOSE` instead, and only when the host
+    // operator picks it — an explicit request for a non-default output — does
+    // `requestOutputChoice` ask the one thing that can reveal the rest.
     let enumStarted = false;
-    async function enumerateBeforeJoin(showPermModal) {
+    async function enumerateBeforeJoin() {
         if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
         enumStarted = true;
         initSpeakers();
@@ -379,18 +381,30 @@
         noteOutputLabels(enumerated);
         speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
         startDeviceWatch();
+        return speakers._cache;
+    }
 
-        // Note the order: bit 9 tracks the *labels*, not the prompt. An enumeration that
-        // worked and came back with bare ids is exactly the case that now asks nothing and
-        // still has to be reported, or the host cannot tell "Output 1" from a device name.
+    // The host operator picked `SE_CHOOSE`: they want this device on a speaker other than its
+    // default, and nothing routable has been listed. This is the one place the page may ask for
+    // anything, and it asks the least it can. An engine with `selectAudioOutput()` has a
+    // permission-free chooser, which needs a gesture, so the page queues it (`'picker'`). Only
+    // where that does not exist is the microphone card the route to the list, and its grant is
+    // released the moment the outputs have been read. A decline is answered once per page: the
+    // host is still showing `SE_CHOOSE` as selected, and every /reconfig poll carries it.
+    let choiceAsked = false;
+    async function requestOutputChoice(showPermModal) {
+        initSpeakers();
+        if (speakers.hasSelectOut) return 'picker';
+        if (choiceAsked || typeof showPermModal !== 'function') return 'done';
+        choiceAsked = true;
         let need = false;
-        try { need = await needsMicPermission(enumerated); } catch (_) { note(); }
-        if (!need || typeof showPermModal !== 'function') return speakers._cache;
-
-        const granted = await new Promise((resolve) => {
-            showPermModal(() => resolve(true), () => resolve(false));
-        });
-        if (!granted) return speakers._cache;
+        try { need = await needsMicPermission(null); } catch (_) { note(); }
+        if (need) {
+            const granted = await new Promise((resolve) => {
+                showPermModal(() => resolve(true), () => resolve(false));
+            });
+            if (!granted) return 'declined';
+        }
         try {
             await primeMicPermission();
             const withGrant = speakers.canSink ? await listOutputs() : [];
@@ -401,7 +415,8 @@
             }
         } catch (_) { note(); }
         releasePrimedStream();
-        return speakers._cache;
+        postOutputs(true);
+        return 'done';
     }
 
     // Firefox only resolves enumerateDevices() once the document has focus, so a
@@ -432,8 +447,11 @@
     // never presents them as what the operating system calls the hardware.
     function noteOutputLabels(enumerated) {
         if (!speakers.canSink) return;
-        speakers.outputsLabelled = enumerated.some((d) => d.label);
-        speakers.labelsUnavailable = !speakers.outputsLabelled;
+        const labelled = enumerated.some((d) => d.label);
+        // With nothing enumerated the host is sent `SE_CHOOSE` alone, which is not a list of
+        // positional names, so "labelled" has nothing to describe and is left unsaid.
+        speakers.outputsLabelled = enumerated.length ? labelled : null;
+        speakers.labelsUnavailable = !labelled;
     }
 
     function buildOutputs(enumerated) {
@@ -442,7 +460,10 @@
             out.push({ id: SE_LOUDSPEAKER, label: 'Speaker' });
             out.push({ id: SE_EARPIECE, label: 'Earpiece' });
         }
-        if (speakers.canSink) {
+        if (speakers.canSink && !enumerated.length) {
+            // Nothing routable without asking, so the host gets the request itself as an entry.
+            out.push({ id: SE_CHOOSE, label: 'Choose a speaker on this device…' });
+        } else if (speakers.canSink) {
             let n = 0;
             for (const d of enumerated) {
                 if (d.label) { out.push(d); continue; }
@@ -468,9 +489,12 @@
             speakers.primedStream = null;
             return true;
         }
-        if (!speakers.micGranted) return false;
+        // Reached only when the host operator chose the earpiece on an engine with no
+        // audioSession category, where holding the microphone is the routing mechanism. That
+        // choice is the request; the join no longer primes the grant ahead of it.
         try {
             speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
+            speakers.micGranted = true;
             return true;
         } catch (_) { speakers.micHold = null; return false; }
     }
@@ -662,6 +686,9 @@
         const raw = deviceId || '';
         const id = (raw === 'default') ? '' : raw;
         if (speakers.appliedSink === id) return true;
+        // A request to list the outputs, not an output: routing stays where it is and the page
+        // answers it through `requestOutputChoice`.
+        if (id === SE_CHOOSE) return true;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
             if (state.path === 'netEQ') { try { await revertSink(); } catch (_) { note(); } }
@@ -1367,6 +1394,8 @@
         teardown,
         initSpeakers,
         enumerateBeforeJoin,
+        requestOutputChoice,
+        CHOOSE_OUTPUT: SE_CHOOSE,
         needsMicPermission,
         primeMicPermission,
         canPickOutput,

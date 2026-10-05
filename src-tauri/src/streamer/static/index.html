@@ -632,10 +632,10 @@
                 if (typeof j.audioSink === 'string' && j.audioSink !== appliedSinkId) {
                     appliedSinkId = j.audioSink;
                     // Applied silently, on whatever ids this device has. Where the labels were
-                    // never revealed — the microphone card was declined before the join — the
-                    // host's picker shows opaque ids and the routing still works; that is what
-                    // `degraded` bit 9 is for. Nothing here may raise a prompt: once the picture
-                    // is up, the session is not interrupted again.
+                    // never revealed the host's picker shows positional names and the routing
+                    // still works; that is what `degraded` bit 9 is for. The only thing here that
+                    // may raise anything is the host operator choosing `CHOOSE_OUTPUT`, which is
+                    // offered only when nothing routable enumerated without a permission.
                     //
                     // `false` is the engine refusing, not "not yet": a sink commanded before the
                     // graph exists answers `null` and is applied when it does. Where the engine
@@ -649,6 +649,17 @@
                     // the ruling says. Without the latch the picker re-armed on every tick and
                     // the stage swallowed every gesture for the rest of the session.
                     try {
+                        // The host operator chose "pick a speaker on this device": the one
+                        // explicit request this page answers with a chooser or, failing that, the
+                        // microphone card. Never raised on a join, only on this choice.
+                        if (window.SEAudio && SEAudio.requestOutputChoice && j.audioSink === SEAudio.CHOOSE_OUTPUT) {
+                            Promise.resolve(SEAudio.requestOutputChoice(micCard)).then(function (r) {
+                                if (r === 'picker' && lastOfferedSinkId !== j.audioSink) {
+                                    lastOfferedSinkId = j.audioSink;
+                                    queueOutputPicker('');
+                                }
+                            }, noteSuppressed);
+                        }
                         if (window.SEAudio) {
                             Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
                                 if (ok !== false) return;
@@ -3208,13 +3219,12 @@
                 });
             }
 
-            // The card is raised in exactly one place — before the join, from the submit
-            // handler, with the page still on the join form and nothing fullscreen. There is
-            // therefore no "the modal became invisible inside a fullscreen subtree" case to
-            // handle and no deferral to remember: the user answers it, and whichever way they
-            // answer, the session that follows is never interrupted by it again. A decline is
-            // reported for the rest of the session as `degraded` bit 9 and costs nothing but
-            // the labels beside the ids in the host's picker.
+            // The card is raised in exactly one place: the host operator chose "pick a speaker
+            // on this device" for an engine that listed nothing routable without a grant and has
+            // no permission-free chooser (`SEAudio.requestOutputChoice`). Never on the join path —
+            // the default output needs no permission anywhere. It goes through `withModal`, so a
+            // live stage leaves fullscreen and drops its locks before the card shows. A decline
+            // is answered once per page and reported as `degraded` bit 9.
             function micCard(onContinue, onSkip) {
                 showPermModal(onContinue, () => {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
@@ -3232,26 +3242,11 @@
                 let audioReady = null;
                 try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
 
-                // `selectAudioOutput()` is the only permission-free output picker in any engine
-                // and the only one that hands back a *label* without a microphone grant — and it
-                // needs transient activation, which is why the tier had never once been
-                // reportable. This click is the activation. It is spent here, before the join
-                // does anything that would consume it (fullscreen and the keyboard lock come
-                // later, from `startLock`), and a no-op on every engine without the picker.
-                //
-                // Dismissing it is not an error: the join carries on with the default output.
-                let pickPromise = null;
-                try {
-                    if (window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()) {
-                        beginModal();
-                        // Bounded, and `endModal` runs from whichever of the three outcomes
-                        // arrives first. Nothing may leave the page suspended: `modalSuspend`
-                        // gates the gesture handler, so a stuck one costs fullscreen and pointer
-                        // lock for the rest of the session — and the join is itself gated on
-                        // this settling.
-                        pickPromise = pickOutputBounded(null, endModal);
-                    }
-                } catch (_) { noteSuppressed(); }
+                // No output chooser and no microphone card here. The join plays on the default
+                // output, which needs nothing from the user on any engine; a chooser (on engines
+                // with `selectAudioOutput()`) or the card is raised only when the host operator
+                // asks for a non-default output — see `applyReconfig` and
+                // `SEAudio.requestOutputChoice`.
 
                 const g0 = screenGeom();
                 joinData = {
@@ -3301,38 +3296,20 @@
                         new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
                     ])
                     : Promise.resolve(true);
-                // Audio-output enumeration is for the host's device panel, not for playback,
-                // but it is the one thing on this page that can raise a browser permission
-                // prompt — and a prompt over a live second screen is an interruption. So it
-                // happens here, before a single ICE candidate exists, and the join waits for
-                // the user's answer rather than for a timer. Browsers that need no grant
-                // (anything with `selectAudioOutput`, anything that already shows labels) are
-                // never prompted and this costs one `enumerateDevices()`.
-                //
-                // It runs alongside the three promises above rather than in front of them, so
-                // the refresh-rate measurement and the decoder probe are done by the time the
-                // card is answered — but *behind* the picker where there is one. A granted pick
-                // is what exposes the labels, and an enumeration that started before it would
-                // finish afterwards and overwrite the labelled list with the unlabelled one it
-                // read. The two never both raise UI: an engine with the picker is exactly the
-                // engine `needsMicPermission()` answers no for.
-                let enumPromise = Promise.resolve(null);
+                // Audio-output enumeration is for the host's device panel, not for playback, and
+                // asks for nothing: one `enumerateDevices()` (bounded inside audio.js), alongside
+                // the three promises above. The join does not wait on it — the list is posted
+                // once the answer lands (`_enumPromise`).
                 try {
                     if (window.SEAudio) {
                         SEAudio.initSpeakers();
-                        const runEnum = () => {
-                            try { return SEAudio.enumerateBeforeJoin(micCard); } catch (_) { noteSuppressed(); return null; }
-                        };
-                        enumPromise = pickPromise
-                            ? pickPromise.then(runEnum, runEnum)
-                            : Promise.resolve(runEnum());
-                        SEAudio._enumPromise = enumPromise;
+                        let enumPromise = null;
+                        try { enumPromise = SEAudio.enumerateBeforeJoin(); } catch (_) { noteSuppressed(); }
+                        SEAudio._enumPromise = Promise.resolve(enumPromise).catch(() => { noteSuppressed(); return null; });
                     }
                 } catch (_) { noteSuppressed(); }
 
                 const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
-                // Transitively awaits the picker where there is one.
-                try { await enumPromise; } catch (_) { noteSuppressed(); }
 
                 if (results[0]) {
                     audioCaps = results[0];
