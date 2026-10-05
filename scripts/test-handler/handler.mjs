@@ -828,7 +828,11 @@ async function main() {
       throw new Error(`host did not come up on ${H.ip || '?'}:${ports.http}${lockedOut ? ' (it reports another instance holds the lock: no isolation for this build, or a ScreenExtend is already running)' : ''}`);
     }
     if (dataDir) R.host.isolationVerified = fs.existsSync(path.join(dataDir, 'screenextend.lock'));
-    const st = await hostJoins(); R.host.statusJson = st.available ? 'telemetry' : (st.status ? 'status only (no telemetry)' : 'unavailable');
+    // A `serve` without g09's "control server before adapter servers" fix answers /health ~300 ms before its control server exists; ask
+    // again for a moment rather than deciding "no control verbs" (which means a PID stop later).
+    let st = await hostJoins();
+    for (let i = 0; i < 10 && !st.telemetry && build.controlStats; i++) { await sleep(200); st = await hostJoins(); }
+    R.host.statusJson = st.available ? 'telemetry' : (st.status ? 'status only (no telemetry)' : 'unavailable');
     R.host.controlVerbs = !!st.telemetry;
 
     const cl = await openClient(REQ.client);
