@@ -689,8 +689,13 @@ Cross-platform core, OS-independent:
   frames in one run. A cursor-moved frame is **exempt** from the cadence gate: measured
   painted fps for a pointer sweep, against the baseline's 85, is 113 exempt, 74 at a two-thirds
   window and 70 at a half — a window narrower than DWM's compose interval does not coalesce, it
-  discards. The remaining ceiling is `DISPLAY_COMPOSE_HZ`, which is where a cap belongs. See
-  `docs/OPTIMIZATIONS.md` UX-INPUT.
+  discards. The ceiling that bounds it is WGC's own `MinUpdateInterval`, **two thirds of the
+  stream's period** (`wgc_min_update_interval`, never under 4 ms): 1.5× the stream's rate, so a
+  pointer sweep is bounded near 90 fps for a 60 Hz client (113 was measured with the flat 4 ms
+  floor this replaced). Do not lower it back to a flat 4 ms: with two or more virtual displays the
+  internal panel runs at 360 Hz, DWM composes each 60 Hz virtual display ~3× too often, and a 4 ms
+  floor hands every one of those frames to WGC (~190/s for a 60 fps session). See
+  `docs/OPTIMIZATIONS.md` UX-INPUT and G01-MINUPDATE.
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
   and is otherwise only reached by WGC failing, which is why the probe harness has
   `--capture-backend dxgi` to force it.
