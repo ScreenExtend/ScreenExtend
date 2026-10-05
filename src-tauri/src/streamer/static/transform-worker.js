@@ -131,6 +131,39 @@ let suppressed = 0;
 function note() { suppressed++; }
 
 // ---------------------------------------------------------------------------
+// The receiver's own decoder, kept quiet.
+//
+// The transform consumes every frame, so libwebrtc's VideoReceiveStream never gets one, and a
+// receive stream with no decodable frame for 200 ms (its keyframe wait) asks for a keyframe:
+// an RTCP PLI about every 200-300 ms for the whole session, which the host answers with an IDR
+// almost every time (measured: ~3 PLIs and ~3 IDRs per second on every WebCodecs session, old
+// page and new alike). Handing each *keyframe* back to the receiver gives it one decodable
+// frame; it then waits for the next one with its 3 s frame timeout instead, so the request
+// rate drops about tenfold (measured: 3-4 PLIs and keyframes per 10 s instead of 28-35) at the
+// cost of one extra decode every ~3 s. Deltas are not handed back: that silences it entirely
+// but decodes every frame twice. The host's own PLI limiter (G03) is still needed for pages
+// that do not do this (the relay serves an older page).
+let receiverWriter = null;
+let keyframesForwarded = 0;
+function attachReceiverWritable(writable) {
+  receiverWriter = null;
+  if (!writable || typeof writable.getWriter !== 'function') return;
+  try { receiverWriter = writable.getWriter(); } catch (_) { note(); }
+}
+// After the frame has been handed to our own decoder: the write may take the frame's data.
+function forwardKeyframe(encodedFrame) {
+  if (!receiverWriter) return;
+  try {
+    const p = receiverWriter.write(encodedFrame);
+    keyframesForwarded++;
+    if (p && p.then) p.then(null, note);
+  } catch (_) {
+    note();
+    receiverWriter = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Per-frame stage timing.
 //
 // The host measures itself as far as the socket; this is the other half. Stages are kept as a
@@ -362,6 +395,7 @@ self.onmessage = (e) => {
     self.postMessage({ type: 'rendercount', n: framesRendered });
   } else if (e.data.type === 'encodedstream') {
     transportTier = TRANSPORT.encodedStreams;
+    attachReceiverWritable(e.data.writable);
     self.postMessage({ type: 'transformstart', transport: transportTier, hasSendKey: false });
     startPump(e.data.readable);
   }
@@ -449,6 +483,8 @@ function collectStats() {
     framesRendered: framesRendered,
     framesUnpainted: framesUnpainted,
     framesDropped: framesDroppedBacklog,
+    keyframesIn: keyframesIn,
+    keyframesForwarded: keyframesForwarded,
     decodeErrors: decodeErrors,
     keyRequests: keyRequests,
     clockValid: clockValid,
@@ -750,6 +786,7 @@ self.onrtctransform = (event) => {
   const hasSendKey = !!(transformer && typeof transformer.sendKeyFrameRequest === 'function');
   if (hasSendKey) keyTier = KEYREQ.sendKeyFrameRequest;
   self.postMessage({ type: 'transformstart', transport: transportTier, hasSendKey: hasSendKey });
+  attachReceiverWritable(transformer.writable);
   startPump(transformer.readable);
 };
 
@@ -851,6 +888,7 @@ function startPump(readable) {
             data: encodedFrame.data,
           }),
         );
+        if (type === 'key') forwardKeyframe(encodedFrame);
       } catch (err) {
         if (inFlight > 0) inFlight--;
         decodeErrors++;
