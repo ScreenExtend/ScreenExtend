@@ -184,6 +184,8 @@ the page's error text.
 | `stamp_band` | `'full'` | `'center'` reads a 2-row band through the stamp cells instead of averaging their height: immune to the stage's blit tearing, which is the ~10 % checksum failures at 1080p. Not yet the default (noise figure not re-measured) |
 | `mover_stop` | false | `true` or `{cycles, move_s, hold_s, step_ms, speed}`: a 48 px window moves in pointer-like steps and stops; per stop, where the client's picture comes to rest vs the true position (`staleStops`), and how fast it got there |
 | `cpu_burn` | null | `{threads, seconds}`: busy workers at normal priority during `slow_answer`'s joins (inside the lock), to reproduce the lost answer under load |
+| `url_params` | `''` | extra query parameters appended to every join URL (`a=1&b=2`), for a page's own debug or experiment switches; checked by the same input refusal as `custom.js` |
+| `join_probe` | null | an expression evaluated in the page after every join; its JSON result goes into that join's record as `probe` (e.g. a timeline the page keeps of its own join) |
 | `custom` | null | `{ js: "<expression evaluated in the client page after the common join>", host_commands: [["status","--json"], ...], timeout: 20 }`; results in `special.custom` |
 
 Adding a request: write an `async function` in `handler.mjs` that returns a plain object, call it
