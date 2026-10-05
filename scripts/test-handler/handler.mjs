@@ -43,7 +43,7 @@ const DEFAULTS = {
   audio_paths: false,      // true = every client audio tier; or a list of tier keys (AUDIO_TIERS)
   audio_keep_page_mute: false, // do not unmute a page that muted itself before the click train
   click_source: 'winmm',   // 'wasapi': clicks timed by the engine's play position (clicks-wasapi.ps1)
-  min_commit_gb: 6,        // wait before starting until this much system commit is free (0 = off)
+  min_commit_gb: 3,        // wait before starting until this much system commit is free (0 = off)
   netlog: false,           // Chrome's own network log per browser, into the run directory
   stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // After every join has left: close the host's stdout/stderr pipes (as a parent that stops
