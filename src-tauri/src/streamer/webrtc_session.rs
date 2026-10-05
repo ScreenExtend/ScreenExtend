@@ -37,7 +37,7 @@ use super::bitrate::{
 use super::config::H264Profile;
 use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
 use super::input;
-use super::keyframe::KeyframeGate;
+use super::keyframe::{KeyframeGate, PliBackoff, PLI_BACKOFF_CAP_HEALTHY_MS, PLI_BACKOFF_CAP_MS};
 use super::lock::LockExt;
 use super::negotiate;
 use super::pacer::{Pacer, PacingMode};
@@ -66,10 +66,24 @@ const OPUS_FALLBACK_FMTP: &str = "minptime=5;stereo=1;sprop-stereo=1";
 /// worthless. 40 ms is two Opus frames more than the client's own maximum jitter target.
 const AUDIO_BACKPRESSURE_MS: usize = 40;
 
+/// What `buffered_amount` counts on top of the queue: bytes already *sent* but not yet
+/// acknowledged.
+///
+/// webrtc-sctp 0.17.1 adds a message to `buffered_amount` when it is queued and releases it only
+/// in `handle_sack` (`stream::on_buffer_released`), so a datagram that is on the wire, or already
+/// delivered, still counts until the peer's SACK for it arrives — and an SCTP receiver may hold
+/// that SACK for up to 200 ms (RFC 9260 §6.2; webrtc-sctp's own `ACK_INTERVAL` is 200 ms). With
+/// the bare 40 ms threshold, one delayed SACK was a full queue: the forwarder dropped every packet
+/// until the SACK landed, in bursts of 41–43 packets (~205–215 ms of audio, G06's measurement),
+/// each an audible hole, on an idle loopback link. Allowing one SACK interval of in-flight data
+/// keeps the drop for a channel that is genuinely backed up.
+const AUDIO_SACK_ALLOWANCE_MS: usize = 220;
+
 /// The byte figure that `AUDIO_BACKPRESSURE_MS` works out to for the message size actually
 /// being sent, so the policy tracks the bitrate instead of assuming one.
 fn backpressure_limit_bytes(msg_len: usize) -> usize {
-    let frames = AUDIO_BACKPRESSURE_MS / crate::streamer::audio::encoder::FRAME_MS as usize;
+    let frames = (AUDIO_BACKPRESSURE_MS + AUDIO_SACK_ALLOWANCE_MS)
+        / crate::streamer::audio::encoder::FRAME_MS as usize;
     frames * msg_len.max(1)
 }
 
@@ -775,7 +789,7 @@ fn join_injector(join: std::thread::JoinHandle<()>) -> bool {
 impl SessionHandle {
     /// Close the peer connection and wait for the injector thread to release its input state.
     pub async fn close(mut self) {
-        unregister_trickle(&self.resource_id);
+        unregister_trickle(&self.resource_id, &self.pc);
         if let Err(e) = self.pc.close().await {
             teprintln!("closing peer connection: {e}");
         }
@@ -848,6 +862,9 @@ pub struct PendingWhep {
     playout_delay_max: u16,
     twcc_offered: bool,
     locality: SessionLocality,
+    /// The transport this one replaces when it is a renegotiation in place: the client has
+    /// already abandoned it, and it is closed the moment this one connects.
+    superseded: Option<std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>>,
 }
 
 impl PendingWhep {
@@ -862,7 +879,7 @@ impl PendingWhep {
     /// to leak on every join: the connection, its ICE agent, that agent's sockets, and the mux
     /// read worker.
     pub async fn abandon(mut self) {
-        unregister_trickle(&self.resource_id);
+        unregister_trickle(&self.resource_id, &self.pc);
         if let Err(e) = self.pc.close().await {
             teprintln!("closing peer connection after a failed join: {e}");
         }
@@ -1054,7 +1071,7 @@ pub async fn prepare_whep(
     // Registered only once the answer exists: the client cannot PATCH a resource whose id it has
     // not been given, and a failed negotiation must not leave an entry behind.
     let resource_id = join_id.to_string();
-    register_trickle(&resource_id, join_id, device_token, &pc);
+    let superseded = register_trickle(&resource_id, join_id, device_token, &pc);
 
     Ok(PendingWhep {
         pc,
@@ -1070,6 +1087,7 @@ pub async fn prepare_whep(
         playout_delay_max,
         twcc_offered,
         locality,
+        superseded,
     })
 }
 
@@ -1098,6 +1116,7 @@ pub async fn activate_whep(
         playout_delay_max,
         twcc_offered,
         locality,
+        superseded,
     } = pending;
     let keyframe_gate = Arc::new(KeyframeGate::for_locality(locality));
     let keyframes = KeyframeRequester {
@@ -1271,6 +1290,13 @@ pub async fn activate_whep(
             use webrtc::rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc;
             use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
             let telemetry = Arc::clone(&pipeline.telemetry);
+            // See `PliBackoff`: an encoded-transform receiver asks every 200 ms for as long as
+            // the session lives, and the gate alone answered nearly every one with an IDR.
+            let mut pli_backoff = PliBackoff::new();
+            let mut client_key_requests: u32 = 0;
+            let mut client_frames_painted: u32 = 0;
+            let mut client_stats_at: u64 = 0;
+            let mut client_painting = false;
             let mut rtcp_buf = vec![0u8; 1500];
             let mut deltas: Vec<f64> = Vec::with_capacity(256);
             while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
@@ -1288,7 +1314,34 @@ pub async fn activate_whep(
                             .degradation
                             .keyframe_requests
                             .fetch_add(1, Ordering::Relaxed);
-                        keyframes.request_keyframe_for_client_quietly();
+                        // The client counts the requests its own page makes; a moved counter is
+                        // the page saying this one is genuine.
+                        let now_ns = audio::host_now_ns();
+                        let mut cap_ms = PLI_BACKOFF_CAP_MS;
+                        if let Some(stats) = telemetry.client.get() {
+                            if stats.keyframe_requests != client_key_requests {
+                                client_key_requests = stats.keyframe_requests;
+                                pli_backoff.note_evidence();
+                            }
+                            // Painting through WebCodecs, and said so within the last 3 s: the
+                            // PLI is libwebrtc's own idle decoder, not the page.
+                            let fresh =
+                                now_ns.saturating_sub(stats.received_host_ns) < 3_000_000_000;
+                            // Judged per STATS frame (about 1 Hz), not per PLI (5 Hz).
+                            if stats.received_host_ns != client_stats_at {
+                                client_stats_at = stats.received_host_ns;
+                                client_painting = stats.frames_painted != client_frames_painted;
+                                client_frames_painted = stats.frames_painted;
+                            }
+                            if fresh && client_painting && stats.transport_tier != 0 {
+                                cap_ms = PLI_BACKOFF_CAP_HEALTHY_MS;
+                            }
+                        }
+                        if pli_backoff.allow_with_cap(now_ns, cap_ms) {
+                            keyframes.request_keyframe_for_client_quietly();
+                        } else {
+                            keyframes.gate.note_suppressed();
+                        }
                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
                         // Counted, never logged: a lossy link produces these continuously and
                         // every logbus line is a JSON IPC event to the UI.
@@ -1301,6 +1354,7 @@ pub async fn activate_whep(
                             .degradation
                             .nacks_received
                             .fetch_add(lost.max(1), Ordering::Relaxed);
+                        pli_backoff.note_evidence();
                     } else if let Some(fb) = any.downcast_ref::<TransportLayerCc>() {
                         let summary = {
                             let mut guard = feedback.history.lock_recover();
@@ -1311,6 +1365,9 @@ pub async fn activate_whep(
                         };
                         if summary.reported > 0 {
                             feedback.record_report(&summary);
+                        }
+                        if summary.lost > 0 {
+                            pli_backoff.note_evidence();
                         }
                         // The receipts, straight through to the encode thread. This is the whole
                         // point of stamping the transport-wide sequence numbers ourselves: the
@@ -1596,7 +1653,24 @@ pub async fn activate_whep(
     let grace_cancel_tx = Arc::new(grace_cancel_tx);
     let grace_cancel_rx_closure = grace_cancel_rx.clone();
     let expected_locality = locality;
+    let superseded = Mutex::new(superseded);
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        if state == RTCPeerConnectionState::Connected {
+            // A renegotiation in place leaves the transport it replaces running on the host —
+            // its ICE agent, its RTP writer, its RTCP reader and its 8 Hz stats poll — until ICE
+            // gives up on it 15-30 s later (BASELINE D-05). The client abandoned it when it
+            // offered again, and this one now carries the picture, so close it. Closing it fires
+            // its own `Closed` state, which runs the superseded session's ordinary teardown;
+            // that teardown already keeps the display, because its sequence is no longer current.
+            if let Some(old) = superseded.lock_recover().take().and_then(|w| w.upgrade()) {
+                tokio::spawn(async move {
+                    tprintln!("closing the transport this renegotiation replaced");
+                    if let Err(e) = old.close().await {
+                        teprintln!("closing the superseded peer connection: {e}");
+                    }
+                });
+            }
+        }
         tprintln!("peer connection state changed: {state:?}");
         if matches!(
             state,
@@ -2547,11 +2621,47 @@ mod tests {
             None,
             "a resource whose session is gone must not resolve, even to its own device"
         );
-        unregister_trickle(id);
+        if let Some(m) = TRICKLE_SESSIONS.lock_recover().as_mut() {
+            m.remove(id);
+        }
         assert!(TRICKLE_SESSIONS
             .lock_recover()
             .as_ref()
             .is_none_or(|m| !m.contains_key(id)));
+    }
+
+    #[tokio::test]
+    async fn a_renegotiation_hands_back_the_transport_it_replaces_and_teardown_keeps_the_new_one() {
+        // BASELINE D-05: the superseded peer connection ran on for 15-30 s after every in-place
+        // renegotiation, and its teardown then removed the *new* session's registry entry,
+        // because both are registered under the one join id.
+        let api = APIBuilder::new().build();
+        let old = Arc::new(api.new_peer_connection(Default::default()).await.unwrap());
+        let new = Arc::new(api.new_peer_connection(Default::default()).await.unwrap());
+        let id = "fedcba9876543210fedcba9876543210";
+        let token = "aaaaaaaabbbbbbbbccccccccdddddddd";
+
+        assert!(
+            register_trickle(id, id, token, &old).is_none(),
+            "a first join replaces nothing"
+        );
+        let replaced = register_trickle(id, id, token, &new).expect("the old transport");
+        assert!(std::ptr::eq(replaced.as_ptr(), Arc::as_ptr(&old)));
+        assert!(
+            register_trickle(id, id, token, &new).is_none(),
+            "re-registering the same transport is not a replacement"
+        );
+
+        unregister_trickle(id, &old);
+        assert_eq!(
+            trickle_owner(id, token).as_deref(),
+            Some(id),
+            "the superseded session's teardown must leave the live one addressable"
+        );
+        unregister_trickle(id, &new);
+        assert_eq!(trickle_owner(id, token), None);
+        let _ = old.close().await;
+        let _ = new.close().await;
     }
 
     /// The body `trickleFragment()` in `static/index.html` actually writes, byte for byte.
@@ -2874,12 +2984,17 @@ pub enum TrickleLookup {
     Exhausted,
 }
 
+/// Register `pc` as the live transport of `id`, and hand back the one it replaces, if any.
+///
+/// The resource id *is* the join id, so a renegotiation in place registers a second peer
+/// connection under the same id. The one it replaces is the transport the client has just
+/// abandoned: returned so the new session can close it once it is itself connected.
 fn register_trickle(
     id: &str,
     join_id: &str,
     device_token: &str,
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
-) {
+) -> Option<std::sync::Weak<webrtc::peer_connection::RTCPeerConnection>> {
     let mut guard = TRICKLE_SESSIONS.lock_recover();
     let map = guard.get_or_insert_with(Default::default);
     map.retain(|_, e| e.pc.strong_count() > 0);
@@ -2891,12 +3006,23 @@ fn register_trickle(
             device_token: device_token.to_string(),
             fragments: 0,
         },
-    );
+    )
+    .map(|old| old.pc)
+    .filter(|old| old.strong_count() > 0 && !std::ptr::eq(old.as_ptr(), Arc::as_ptr(pc)))
 }
 
-fn unregister_trickle(id: &str) {
+/// Forget `id`, but only while it still names `pc`.
+///
+/// A superseded session's teardown runs after its replacement registered under the same id;
+/// removing by id alone took the *live* session's trickle entry with it.
+fn unregister_trickle(id: &str, pc: &Arc<webrtc::peer_connection::RTCPeerConnection>) {
     if let Some(map) = TRICKLE_SESSIONS.lock_recover().as_mut() {
-        map.remove(id);
+        if map
+            .get(id)
+            .is_some_and(|e| std::ptr::eq(e.pc.as_ptr(), Arc::as_ptr(pc)))
+        {
+            map.remove(id);
+        }
     }
 }
 
