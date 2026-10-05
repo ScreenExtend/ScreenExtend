@@ -595,6 +595,27 @@ pub fn joins_for_relay_client(sessions: &SharedSessions, client_id: &str) -> Vec
         .collect()
 }
 
+/// The join a relay client is streaming on right now.
+///
+/// A relayed page that predates join ids names nothing, so the relay's `client_id` is all there
+/// is to go on — and one client can have two joins in the map at once: the one it is watching,
+/// and an older one still waiting out its disconnect grace after a renegotiation. Picking either
+/// at random (`.next()` over a `HashMap`) answered the page with the dead join's epoch half the
+/// time, which it reads as another reconfigure. The live one is the join whose capture is
+/// running; failing that, the one with a display; failing that, any.
+pub fn live_join_for_relay_client(sessions: &SharedSessions, client_id: &str) -> Option<String> {
+    let map = sessions.lock_recover();
+    let mine = || {
+        map.iter()
+            .filter(move |(_, s)| s.relay_client.as_deref() == Some(client_id))
+    };
+    mine()
+        .find(|(_, s)| s.active_capture.is_some())
+        .or_else(|| mine().find(|(_, s)| s.live_display.is_some()))
+        .or_else(|| mine().next())
+        .map(|(join, _)| join.clone())
+}
+
 /// Record what the UI shows beside a join: the name the client chose and the size it asked for.
 pub fn set_session_labels(sessions: &SharedSessions, join: &str, name: &str, screen_size: &str) {
     let mut map = sessions.lock_recover();

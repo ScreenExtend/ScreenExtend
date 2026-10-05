@@ -979,11 +979,11 @@ pub fn process_relay_reconfig(state: &AppState, join: &str, client_id: &str) -> 
     if !join.is_empty() {
         return process_reconfig(state, join);
     }
-    let resolved = state.config.sessions.as_ref().and_then(|s| {
-        session::joins_for_relay_client(s, client_id)
-            .into_iter()
-            .next()
-    });
+    let resolved = state
+        .config
+        .sessions
+        .as_ref()
+        .and_then(|s| session::live_join_for_relay_client(s, client_id));
     match resolved.as_deref() {
         Some(j) => process_reconfig(state, j),
         None => process_reconfig(state, join),
@@ -1387,6 +1387,35 @@ fn continuing_join(
     }
 }
 
+/// A relayed offer that names no join, from a relay client that already holds a live one.
+///
+/// The relay serves its own, older copy of the client page, which knows nothing of join ids: it
+/// answers an epoch bump by offering again with no `joinId`. Treated as a fresh join that is a
+/// second display and a second dashboard row for every settings change, with the first left to
+/// its disconnect grace — and, with two joins under one `client_id`, `/reconfig` could answer
+/// from the stale one and set off another rebuild. The relay's `client_id` is per connection, so
+/// an offer under it while one of its joins is still streaming is that same page renegotiating.
+/// UNVERIFIED (not run): no relayed session can be driven on this machine.
+fn relayed_continuation(
+    sessions: &session::SharedSessions,
+    claimed: &str,
+    origin: JoinOrigin<'_>,
+    device_token: &str,
+) -> Option<String> {
+    if !claimed.trim().is_empty() || device_token.is_empty() {
+        return None;
+    }
+    let client_id = origin.relay_client?;
+    let join = session::live_join_for_relay_client(sessions, client_id)?;
+    session::get_live_display(sessions, &join)?;
+    (session::device_token_for(sessions, &join).as_deref() == Some(device_token)).then(|| {
+        tprintln!(
+            "relayed offer from client {client_id} names no join; continuing its live join {join}"
+        );
+        join
+    })
+}
+
 async fn start_session(
     state: &AppState,
     req: &JoinRequest,
@@ -1404,11 +1433,10 @@ async fn start_session(
     // number below is what tells the outgoing session's teardown task that it has been
     // superseded rather than ended. Only a live session owned by this same device qualifies —
     // an unknown id, or one belonging to another device, is a fresh join.
-    let continuing = state
-        .config
-        .sessions
-        .as_ref()
-        .and_then(|s| continuing_join(s, &req.join_id, device_token));
+    let continuing = state.config.sessions.as_ref().and_then(|s| {
+        continuing_join(s, &req.join_id, device_token)
+            .or_else(|| relayed_continuation(s, &req.join_id, origin, device_token))
+    });
     let join_id = match &continuing {
         Some(join) => {
             tprintln!("join {join} is renegotiating in place; keeping its session and display");
@@ -3208,6 +3236,45 @@ mod tests {
         let stranger: serde_json::Value =
             serde_json::from_str(&process_relay_reconfig(&state, "", "c-99")).expect("json");
         assert_eq!(stranger["kick"], 0);
+    }
+
+    /// The relay's old page renegotiates with no join id. Its live join must be the one both
+    /// `/reconfig` and the next offer land on, never the stale one still in its grace.
+    #[test]
+    fn a_relayed_page_without_join_ids_lands_on_its_live_join() {
+        let sessions: session::SharedSessions = Default::default();
+        let display = session::LiveDisplay {
+            display_id: 3,
+            device_name: String::new(),
+            device_path: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh: 60,
+            scale: 100,
+            portrait: false,
+        };
+        let stale = session::mint_join_id();
+        let live = session::mint_join_id();
+        session::open_session_via(&sessions, &stale, "tok", "c-7", Some("c-7"));
+        session::open_session_via(&sessions, &live, "tok", "c-7", Some("c-7"));
+        session::set_live_display(&sessions, &stale, display.clone());
+        session::set_live_display(&sessions, &live, display);
+        session::set_active_capture(&sessions, &live, 1, Box::new(|| {}));
+        for _ in 0..8 {
+            assert_eq!(
+                session::live_join_for_relay_client(&sessions, "c-7").as_deref(),
+                Some(live.as_str())
+            );
+        }
+        let origin = JoinOrigin::relayed("c-7");
+        assert_eq!(
+            relayed_continuation(&sessions, "", origin, "tok").as_deref(),
+            Some(live.as_str())
+        );
+        // Another device under the same relay client, a named join, or a direct join: fresh.
+        assert!(relayed_continuation(&sessions, "", origin, "other").is_none());
+        assert!(relayed_continuation(&sessions, &live, origin, "tok").is_none());
+        assert!(relayed_continuation(&sessions, "", JoinOrigin::direct("c-7"), "tok").is_none());
     }
 
     #[test]
