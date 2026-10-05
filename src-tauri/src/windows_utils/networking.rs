@@ -72,14 +72,17 @@ const PROFILE_QUERY: &str = "SELECT InterfaceIndex, Name FROM MSFT_NetConnection
 const WIFI_DIRECT_DRIVER: &str = "Microsoft Wi-Fi Direct Virtual Adapter";
 
 fn hosted_network_name(app: &AppHandle) -> String {
-    let stored_name = app.store("config.json").ok().and_then(|config| {
-        let name = config
-            .get("hostedNetworkCredentials")?
-            .get("name")?
-            .as_str()?
-            .to_string();
-        Some(name)
-    });
+    let stored_name = app
+        .store(crate::data_dir::config_store())
+        .ok()
+        .and_then(|config| {
+            let name = config
+                .get("hostedNetworkCredentials")?
+                .get("name")?
+                .as_str()?
+                .to_string();
+            Some(name)
+        });
 
     stored_name.unwrap_or_else(|| "ScreenExtend".to_string())
 }

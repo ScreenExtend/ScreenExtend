@@ -348,6 +348,20 @@ token** are written to `screenextend.ctrl`, so another process can send `FOCUS`,
 (re-read `config.json` into the running `AppState`), `LOGS` (the backlog) or `SESSION`. The token
 is compared in constant time, the same as the join OTP.
 
+**`SCREENEXTEND_DATA_DIR` (test-only isolation switch, `src-tauri/src/data_dir.rs`).** Set to a
+path, it replaces the app-data, app-local-data and app-config directories with that one directory:
+`screenextend.lock`, `screenextend.ctrl`, `config.json`, the exit breadcrumb and the dev TLS
+certificate all move there, so several `serve` hosts can run side by side and every CLI verb run
+with the same value (`status`, `stop`, `devices set`, `logs`, `config`) addresses that one host.
+On Windows it also puts the display backend in *shared-driver mode*: the driver's monitor list is
+machine-wide, every notify replaces it, and the driver attaches a list only when its ids form one
+contiguous run starting at 0 or 1 (a gap detaches *every* display). So an isolated host never
+clears the driver, allocates the next dense id under a lock in `%TEMP%\screenextend-shared-driver\`,
+splices only its own monitors into the live list, and removes a departing monitor only while the
+run stays intact (a released id in the middle stays attached, idle, until the ones above go). Unset, every path is exactly Tauri's and nothing changes. The JS
+side of the desktop UI's store is not redirected; the switch is for `serve` and the CLI, and
+`scripts/test-handler/` is its only intended user.
+
 `SESSION` goes both ways. Bare, it answers one line of JSON — the live session id, the OTP,
 whether the host holds a relay client, and that relay's state — because a session id exists only
 in the host's memory and every reporting command runs in its own process. `SESSION <id> <otp>`

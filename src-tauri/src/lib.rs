@@ -14,6 +14,7 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 #[macro_use]
 mod logbus;
 mod cli;
+mod data_dir;
 mod exit_reason;
 mod single_instance;
 mod streamer;
@@ -498,7 +499,7 @@ pub fn boot_id() -> String {
 #[tauri::command]
 #[specta::specta]
 fn quit_driver_holder(app: tauri::AppHandle) -> bool {
-    let Ok(dir) = app.path().app_local_data_dir() else {
+    let Ok(dir) = crate::data_dir::local_data_dir(&app) else {
         return false;
     };
     let ctrl_path = dir.join(single_instance::CTRL_FILE);
@@ -545,7 +546,7 @@ fn get_username() -> String {
 }
 
 fn avatar_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = crate::data_dir::data_dir(app).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("avatar.png"))
 }
@@ -991,7 +992,7 @@ pub fn run() {
                     // This runs before the window exists, so a failure here has no UI to report
                     // itself in other than a dialog. It used to be an `.unwrap()` on the normal
                     // startup path of every user.
-                    let lock_dir = match app.path().app_local_data_dir() {
+                    let lock_dir = match crate::data_dir::local_data_dir(app) {
                         Ok(dir) => dir,
                         Err(e) => {
                             app.dialog()
