@@ -38,6 +38,7 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  settings_only: null,     // array of settings_change edit labels to run (e.g. ["video quality"]); null = all
   mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
   cpu_burn: null,          // {threads, seconds}: saturate the CPU during slow_answer's joins (inside the measurement lock)
   audio_paths: false,      // true = every client audio tier; or a list of tier keys (AUDIO_TIERS)
@@ -554,7 +555,7 @@ async function settingsChange(cl, name) {
     ['orientation portrait', ['--orientation', 'Portrait']], ['orientation landscape', ['--orientation', 'Landscape']],
     ['display scale', ['--scale', '150']], ['name', null],
   ];
-  for (const [label, args] of edits) {
+  for (const [label, args] of edits.filter(([l]) => !REQ.settings_only || REQ.settings_only.includes(l))) {
     const before = { joins: (await hostJoins()).joins, monitors: await ourMonitors(), log: serveLogCounts(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null), whep: await cl.page.ev('__se.whep.length').catch(() => null) };
     const st = await stageFor(name, { seconds: 16, stamp: true });
     const ready = await st.ready;
