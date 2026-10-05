@@ -235,7 +235,19 @@ async function joinClient(cl, spec, { name = deviceName(), grant = STD_GRANT, mi
   const j = await underLock('join', async () => {
     const known = screens();
     const factory = () => (pre.gdi ? startStage(pre.gdi, { seconds: 45, wait: 30, driverId: pre.driverId }) : startStage('', { seconds: 45, notIn: known, wait: 30 }));
-    const restage = async (old) => { stopStage(old); const r = await resolveGdi(name, { quiet: true }); if (r.error) { const n = screens().filter((x) => !known.includes(x)); return n.length ? startStage(n[n.length - 1], { seconds: 45, wait: 10 }) : null; } return startStage(r.gdi, { seconds: 45, wait: 10, driverId: r.driverId }); };
+    const restage = async (old) => {
+      stopStage(old); const r = await resolveGdi(name, { quiet: true });
+      if (r.error) {
+        const n = screens().filter((x) => !known.includes(x));
+        if (n.length) return startStage(n[n.length - 1], { seconds: 45, wait: 10 });
+        // A build that reports no joins (bef5f89) and reused the display it kept through the
+        // disconnect grace: no screen appeared with this join, so the "one new screen" the first
+        // stage waited for never comes. The one screen added since the host started is it.
+        const added = screens().filter((x) => !(HOSTCTX.screensBefore || []).includes(x));
+        return added.length === 1 ? startStage(added[0], { seconds: 45, wait: 10 }) : null;
+      }
+      return startStage(r.gdi, { seconds: 45, wait: 10, driverId: r.driverId });
+    };
     try { return await cl.join({ url, origin, grant, micChoice, stage: factory, restage }); } finally { stopStage(cl.joinStage); cl.joinStage = null; }
   });
   j.name = name;
