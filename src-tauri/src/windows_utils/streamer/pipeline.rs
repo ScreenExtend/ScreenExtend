@@ -2425,17 +2425,20 @@ fn ring_keepalive(
     if force_idr {
         encoder.request_idr();
     }
+    // Stamped around the encode, not after it: taking both stamps once the access unit was back
+    // recorded every keepalive (the majority of frames on a still desktop) as a ~0 µs encode, and
+    // a cursor frame as captured *after* it had been encoded.
+    let mut timing = if cursor_frame {
+        FrameTiming::entering_capture()
+    } else {
+        FrameTiming::repeating()
+    };
+    timing.mark_encode_submit();
     match encoder.encode_repeat_slot(slot) {
         // An encoder that consumed the picture and produced no bytes dropped a frame; only the
         // AMF backend can reach this. Sending it would packetize a payloadless access unit.
         Ok(au) if au.is_empty() => {}
         Ok(au) => {
-            let mut timing = if cursor_frame {
-                FrameTiming::entering_capture()
-            } else {
-                FrameTiming::repeating()
-            };
-            timing.mark_encode_submit();
             timing.mark_encode_done();
             let d = &telemetry.degradation;
             if cursor_frame {
