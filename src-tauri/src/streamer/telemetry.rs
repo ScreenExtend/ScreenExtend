@@ -533,6 +533,8 @@ pub fn audio_path_name(code: u8) -> &'static str {
         1 => "worklet+sab",
         2 => "worklet+postmessage",
         3 => "opus-track",
+        // The private ring fed over a `MessagePort` (`AUDIO_PATH.workletPort` in index.html).
+        4 => "worklet+port",
         _ => "unknown",
     }
 }
@@ -1055,6 +1057,24 @@ mod tests {
         );
         unregister("10.0.0.7");
         assert!(get("10.0.0.7").is_none());
+    }
+
+    /// Every value the page can report in the STATS frame has a name here, so `status --json`
+    /// never says "unknown" for a tier the page really took.
+    #[test]
+    fn every_client_audio_path_has_a_name() {
+        let page = include_str!("static/index.html");
+        let start = page.find("const AUDIO_PATH = {").expect("AUDIO_PATH in index.html");
+        let body = &page[start..];
+        let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
+        let codes: Vec<u8> = body
+            .split(',')
+            .filter_map(|kv| kv.split(':').nth(1)?.trim().parse().ok())
+            .collect();
+        assert!(codes.len() >= 5, "parsed {codes:?}");
+        for code in codes {
+            assert_ne!(audio_path_name(code), "unknown", "audio path {code}");
+        }
     }
 
     #[test]
