@@ -429,10 +429,9 @@
                 errEl.classList.toggle('show', !!msg);
                 if (msg) {
                     // The session is over, so the frozen frame the rebuild was holding on to is
-                    // no longer standing in for anything, and a picker armed for a sink that
-                    // session was going to use would open on the next click of the join form.
+                    // no longer standing in for anything.
                     dropStaleCanvas();
-                    cancelQueuedPicker();
+                    lastOfferedSinkId = null;
                     stopLock();
                     isLive = false;
                     loadingEl.classList.remove('show');
@@ -633,9 +632,9 @@
                     appliedSinkId = j.audioSink;
                     // Applied silently, on whatever ids this device has. Where the labels were
                     // never revealed the host's picker shows positional names and the routing
-                    // still works; that is what `degraded` bit 9 is for. The only thing here that
-                    // may raise anything is the host operator choosing `CHOOSE_OUTPUT`, which is
-                    // offered only when nothing routable enumerated without a permission.
+                    // still works; that is what `degraded` bit 9 is for. Nothing here raises
+                    // anything over the live stage: the host operator choosing `CHOOSE_OUTPUT` is
+                    // remembered on this device and answered at its next join, before the stream.
                     //
                     // `false` is the engine refusing, not "not yet": a sink commanded before the
                     // graph exists answers `null` and is applied when it does. A refusal is
@@ -648,17 +647,9 @@
                     // `audioSink` is in *every* `/reconfig` body, so this runs about once a
                     // second; the report is latched on the id, once per sink the host asks for.
                     try {
-                        // The host operator chose "pick a speaker on this device": the one
-                        // explicit request this page answers with a chooser or, failing that, the
-                        // microphone card. Never raised on a join, only on this choice.
-                        if (window.SEAudio && SEAudio.requestOutputChoice && j.audioSink === SEAudio.CHOOSE_OUTPUT) {
-                            Promise.resolve(SEAudio.requestOutputChoice(micCard)).then(function (r) {
-                                if (r === 'picker' && lastOfferedSinkId !== j.audioSink) {
-                                    lastOfferedSinkId = j.audioSink;
-                                    queueOutputPicker('');
-                                }
-                            }, noteSuppressed);
-                        }
+                        // "Choose a speaker on this device…" is queued for the next join; any
+                        // other value re-arms it for a later request.
+                        if (window.SEAudio && SEAudio.noteOutputChoiceRequest) SEAudio.noteOutputChoiceRequest(j.audioSink);
                         if (window.SEAudio) {
                             Promise.resolve(SEAudio.setSpeaker(j.audioSink)).then(function (ok) {
                                 if (ok !== false) return;
@@ -1023,9 +1014,8 @@
                 if (gestureHandler) return;
                 gestureHandler = () => {
                     if (!locked) return;
-                    // A dialog is up, or this tap is the one that opens the queued output
-                    // picker: either way the user is reaching for the page, not for the stage.
-                    if (modalSuspend || pickerGestureArmed) return;
+                    // A dialog is up: the user is reaching for the page, not for the stage.
+                    if (modalSuspend) return;
                     if (!fullscreenMode) {
                         if (!document.pointerLockElement) acquirePointerLock(stage);
                         return;
@@ -1301,27 +1291,17 @@
                 if (immediate) body(); else whenInputReleased(body);
             }
 
-            // The host asked this device to play somewhere and the engine refused it outright —
-            // no `setSinkId`, or it rejected. On an engine with `selectAudioOutput()` there is
-            // exactly one thing left to try, and it needs transient activation, so it waits for
-            // the user's next tap or key rather than being raised over the picture. One request
-            // is armed at a time; a newer host choice replaces the id it will open on.
-            let queuedPickerId = null;
+            // The sink id a refusal was last reported for, so a refused sink — carried by every
+            // `/reconfig` poll — is reported once rather than once a second.
             let lastOfferedSinkId = null;
             // The sink the audio graph is already playing on, so `/reconfig` can command it once
             // per change rather than once per poll. Cleared whenever the graph goes, because the
             // next one starts on the device's default and has to be told again.
             let appliedSinkId = null;
-            let pickerGestureArmed = false;
-            let pickerGestureFire = null;
-            // No `keydown`. `input.js` binds its own on `window` in the capture phase during
-            // `setup()`, i.e. before this one, so it would run first with `suspended` still
-            // false and the key that summons the dialog would land on the host's desktop —
-            // possibly a modifier, possibly something destructive. A tap is a sufficient
-            // gesture, and the stage is the thing being tapped. `pointerdown`/`touchend` are
-            // safe because input.js binds those on `#stage` in the bubble phase, so this
-            // window-capture listener wins.
-            const PICKER_GESTURES = ['pointerdown', 'touchend'];
+            // The browser's own output chooser (`selectAudioOutput()`, Firefox). It needs the
+            // transient activation of a click, and the only click it is ever opened from is Join,
+            // when the host operator has asked this device to choose a speaker — never over a
+            // live stage.
             // A browser chooser can be left open indefinitely — a backgrounded tab, an engine
             // that resolves neither way — and everything downstream of it waits on it settling.
             // Every other promise on the join path is bounded; this one is too.
@@ -1351,44 +1331,6 @@
                         () => { noteSuppressed(); resolve(finish(null)); });
                 });
             }
-            function cancelQueuedPicker() {
-                queuedPickerId = null;
-                lastOfferedSinkId = null;
-                if (!pickerGestureFire) return;
-                const fn = pickerGestureFire;
-                pickerGestureFire = null;
-                pickerGestureArmed = false;
-                PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fn, true));
-            }
-            function queueOutputPicker(preferredId) {
-                let can = false;
-                try { can = !!(window.SEAudio && SEAudio.canPickOutput && SEAudio.canPickOutput()); } catch (_) { noteSuppressed(); }
-                if (!can) {
-                    // Nothing left to offer. `sinkTier` staying 0 after a change the host asked
-                    // for is what says so, and it already does. Behind the caller's id latch,
-                    // so this is once per sink the host asks for, not once a second.
-                    console.warn('[audio] the host asked for an output this browser will not route to');
-                    return;
-                }
-                queuedPickerId = preferredId || '';
-                if (pickerGestureArmed) return;
-                pickerGestureArmed = true;
-                const fire = () => {
-                    PICKER_GESTURES.forEach((ev) => window.removeEventListener(ev, fire, true));
-                    pickerGestureArmed = false;
-                    pickerGestureFire = null;
-                    const want = queuedPickerId;
-                    queuedPickerId = null;
-                    withModal((close) => {
-                        pickOutputBounded(want, close).then((chosen) => {
-                            if (chosen) console.log('[audio] output re-selected: ' + (chosen.label || chosen.id));
-                        }, noteSuppressed);
-                    }, true);
-                };
-                pickerGestureFire = fire;
-                PICKER_GESTURES.forEach((ev) => window.addEventListener(ev, fire, true));
-            }
-
             let leaveSent = false;
             // `pagehide` is the page going away, so whatever join this tab holds is released —
             // whether or not the picture is up yet and whether or not a reconfigure is in flight.
@@ -1454,8 +1396,8 @@
             if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
 
             // Two first-use costs sat between Connect and the offer on a browser's first join:
-            // the first `enumerateDevices()` (1.3-2.4 s headless, measured; the join no longer
-            // awaits it, but the output list posted after the answer still pays it) and the
+            // the first `enumerateDevices()` (1.3-2.4 s headless, measured; the join's output
+            // detection awaits an enumeration before the offer, and this makes it a warm one) and the
             // first `new RTCPeerConnection()` (a 350-700 ms main-thread task while the WebRTC
             // stack starts). Both are paid here, while the user is still reading the form, so
             // the join finds them warm. Neither prompts: an enumeration without a grant only
@@ -3220,12 +3162,11 @@
                 });
             }
 
-            // The card is raised in exactly one place: the host operator chose "pick a speaker
-            // on this device" for an engine that listed nothing routable without a grant and has
-            // no permission-free chooser (`SEAudio.requestOutputChoice`). Never on the join path —
-            // the default output needs no permission anywhere. It goes through `withModal`, so a
-            // live stage leaves fullscreen and drops its locks before the card shows. A decline
-            // is answered once per page and reported as `degraded` bit 9.
+            // The card is raised in exactly one place: the Join handler, before the offer, when
+            // the outputs could not be detected without a permission and a microphone grant can
+            // reveal them (`SEAudio.prepareOutputsForJoin` / `outputPlan`). There is no stage and
+            // no lock yet, so it drops nothing. Skip always ends it; a decline (Skip, or a refused
+            // browser prompt) is remembered on this device and reported as `degraded` bit 9.
             function micCard(onContinue, onSkip) {
                 showPermModal(onContinue, () => {
                     degrade(DEG.AUDIO_OUTPUT_LABELS_UNAVAILABLE);
@@ -3243,11 +3184,37 @@
                 let audioReady = null;
                 try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
 
-                // No output chooser and no microphone card here. The join plays on the default
-                // output, which needs nothing from the user on any engine; a chooser (on engines
-                // with `selectAudioOutput()`) or the card is raised only when the host operator
-                // asks for a non-default output — see `applyReconfig` and
-                // `SEAudio.requestOutputChoice`.
+                // The browser's own output chooser, on an engine that has one, when the host
+                // operator asked this device to choose a speaker. Synchronous: it needs this
+                // click's transient activation, which the first `await` would spend.
+                let pickerDone = null;
+                try {
+                    if (window.SEAudio && SEAudio.pickerWantedAtJoin && SEAudio.pickerWantedAtJoin()) {
+                        pickerDone = new Promise((resolve) => {
+                            withModal((close) => {
+                                pickOutputBounded('', close).then(resolve, () => { noteSuppressed(); resolve(null); });
+                            }, true);
+                        });
+                    }
+                } catch (_) { noteSuppressed(); }
+
+                connectBtn.disabled = true;
+
+                // Everything that can ask the user anything is settled here, before the offer:
+                // the host builds no display and no session for someone still reading a card, no
+                // answer deadline or retry can fire behind it, and nothing is raised later over a
+                // live stage. Output detection asks for nothing where the platform allows it;
+                // the microphone card only when that found nothing routable and a grant can
+                // change it. The wait is bounded by the user alone — the card always has Skip,
+                // the chooser has its own deadline — and no timer on the join path is running
+                // yet: the audio-prepare and refresh-rate deadlines below start after it.
+                try {
+                    if (window.SEAudio && SEAudio.prepareOutputsForJoin) {
+                        const plan = await SEAudio.prepareOutputsForJoin(micCard, pickerDone);
+                        SEAudio._enumPromise = Promise.resolve(plan);
+                        if (plan) console.log('[audio] outputs at join: ' + plan.action + ' (' + plan.reason + ')');
+                    }
+                } catch (_) { noteSuppressed(); }
 
                 const g0 = screenGeom();
                 joinData = {
@@ -3297,19 +3264,6 @@
                         new Promise((r) => setTimeout(() => r(false), AUDIO_PREPARE_DEADLINE_MS)),
                     ])
                     : Promise.resolve(true);
-                // Audio-output enumeration is for the host's device panel, not for playback, and
-                // asks for nothing: one `enumerateDevices()` (bounded inside audio.js), alongside
-                // the three promises above. The join does not wait on it — the list is posted
-                // once the answer lands (`_enumPromise`).
-                try {
-                    if (window.SEAudio) {
-                        SEAudio.initSpeakers();
-                        let enumPromise = null;
-                        try { enumPromise = SEAudio.enumerateBeforeJoin(); } catch (_) { noteSuppressed(); }
-                        SEAudio._enumPromise = Promise.resolve(enumPromise).catch(() => { noteSuppressed(); return null; });
-                    }
-                } catch (_) { noteSuppressed(); }
-
                 const results = await Promise.all([capsPromise, readyPromise, resolveRefreshRate()]);
 
                 if (results[0]) {

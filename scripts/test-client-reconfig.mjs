@@ -119,7 +119,12 @@ function makePoller() {
   // object in a browser and has to be made so here. What it does with the answer is the whole
   // of cases 9-11: `false` is the engine refusing, and a host that repeats the same request
   // must not be answered with a second picker.
-  const seAudio = { setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; }, postOutputs: (force) => { calls.push('postOutputs:' + !!force); } };
+  const seAudio = {
+    setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; },
+    postOutputs: (force) => { calls.push('postOutputs:' + !!force); },
+    noteOutputChoiceRequest: (id) => { calls.push('noteChoice:' + id); return 'queued'; },
+    CHOOSE_OUTPUT: 'se:choose',
+  };
   const urls = [];
   const beacons = [];
   const ctx = {
@@ -484,6 +489,26 @@ sinkResult = true;
   if (p.calls.includes('start:true:true')) ok('the second bump, landed during the rebuild, rebuilds again on the next poll');
   else fail('the second bump was lost: ' + p.calls.join(', '));
   eq('and the page now holds the newer epoch', p.state().reconfigEpoch, 22);
+}
+
+// ── 14. "Choose a speaker on this device…" raises nothing over the live stage ────────────
+// The host operator's request is remembered and answered at the device's next join, before
+// its stream (audio.js `noteOutputChoiceRequest`). Every other value goes through too, since
+// it is what re-arms a later request.
+{
+  const p = makePoller();
+  const calls = p.calls;
+  sinkResult = true;
+  for (let i = 0; i < 5; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'se:choose' }); await settle(); }
+  eq('the choose request is recorded once per change, not once a poll', calls.filter((c) => c === 'noteChoice:se:choose').length, 1);
+  if (!/micCard|withModal|queueOutputPicker|showPermModal/.test(takeFunction('applyReconfig'))) ok('applyReconfig can raise no card, chooser or modal');
+  else fail('applyReconfig still reaches a modal');
+  if (!calls.some((c) => c.startsWith('queueOutputPicker') || c.startsWith('start:'))) ok('and it neither arms a picker nor renegotiates');
+  else fail('the choose request did more than record itself: ' + calls.join(', '));
+  calls.length = 0;
+  p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-E' });
+  await settle();
+  eq('another sink is passed on so a later request is fresh', calls.filter((c) => c === 'noteChoice:sink-E').length, 1);
 }
 
 if (failures) {

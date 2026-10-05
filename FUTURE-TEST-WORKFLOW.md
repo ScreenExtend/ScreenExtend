@@ -91,7 +91,7 @@ What the 81 commits add, by area. The keep status of each is in `docs/overhaul-n
   - `9aae1d3`: no demotion once painting.
   - `a00083d`: keyframes handed back to the receiver.
 - **Audio (G06):**
-  - `c020fc0`: no microphone card on the join; the `se:choose` entry.
+  - `c020fc0` then `ef9dfe6`: outputs detected before the offer; the microphone card only where nothing routable lists, at most once per device; the `se:choose` entry answered at the next join.
   - `61da27a`, `24f75e8`, `736f0f9`, `201a981`, `83facec`: audio defect fixes.
   - `dbb2863`: process loopback first.
 - **Client page (G07):**
@@ -749,22 +749,23 @@ Ledger paths are relative to the repository root.
   - Pass: no refusal once the dashboard shows credentials.
 - **Then:** reorder.
 
-#### U-7 `se:choose` end to end, and the device sheet's stale audio text
+#### U-7 The microphone card at the join, `se:choose` end to end, and the device sheet's stale audio text
 
 - **What.**
-  - New behaviour (`c020fc0`): where a client lists outputs without labels, the sheet shows "Choose a speaker on this device…" (`se:choose`). Picking it asks the client once, through the chooser on the next tap or else the microphone card.
-  - The sheet's "still playing on … needs a tap" text no longer matches the client, which now reports a refused sink instead of re-offering it (`83facec`). Raised in `G06.md`.
-- **Why untested.** GUI and a real browser needed.
-- **Suspects:** `c020fc0`, `83facec`; `static/audio.js`, `static/index.html`; `src/components/pages/device-details.tsx`.
+  - Behaviour since `ef9dfe6` (2026-10-05, owner's request; supersedes `c020fc0`'s join half): at Join, before the offer, the page detects the outputs without asking and reports any routable list. Only where nothing routable lists (desktop Chrome/Edge with no microphone grant: one entry, empty id and label — measured), with a secure context, `getUserMedia`, a permission that is not `denied`, and no earlier answer on this device, it raises the microphone card; Continue → the browser's prompt → the real list. Any answer is remembered (`localStorage se.outputs.micCardAnswer`), so at most once per device.
+  - "Choose a speaker on this device…" (`se:choose`) picked during a session is answered at the device's **next join** (the card once more, or Firefox's chooser from the Join click) — nothing is raised over a live stage.
+  - The sheet's "still playing on … needs a tap" text no longer matches the client, which reports a refused sink instead of re-offering it (`83facec`) and has no tap-to-open chooser any more. Raised in `G06.md`.
+- **Why untested.** A real headed browser with a human answering the browser's own prompt; the GUI for the sheet; Firefox and Safari are not installed here.
+- **Suspects:** `ef9dfe6`, `c020fc0`, `83facec`; `static/audio.js` (`outputPlan`, `prepareOutputsForJoin`, `noteOutputChoiceRequest`), `static/index.html` (the submit handler); `src/components/pages/device-details.tsx`, `src/i18n/locales/en.json`.
 - **Known:**
-  - `mic_prompt`, before and after: with nothing granted the card appeared on every join before and appears on none after.
-  - The `test-client-audio` harness cases pass.
+  - `mic_prompt` on the new build (`{"mic_prompt":{"audio":true,"rejoin":true}}`, 4 displays): speaker-granted and microphone-granted → no card, 3 labelled outputs; nothing granted → the card (Skipped), `se:choose` offered; rejoin → no card. One offer each, audio on the default output in all.
+  - The `test-client-audio`, `test-client-reconfig` (case 14) and `test-client-join` cases pass.
 - **How to test:**
-  - Human, headed desktop Chrome with a profile that never granted the microphone.
-  - Join, then pick the entry in the sheet and save: the card appears once on the client. Press Continue: the list fills with real names.
-  - Firefox: the chooser opens on the next tap.
-  - Alternatively, without the GUI: `config set devices.<i>.audioOutputDeviceId se:choose` with a headed browser.
-- **Then:** fix the sheet text, which is a UI-text change and needs the owner's agreement.
+  - Human, headed desktop Chrome with a profile that never granted the microphone: Join → the card before any picture; Continue → Chrome's prompt; Allow → the sheet lists real names; join again → no card. Repeat with Skip: no card at the next join, the sheet shows the choose entry.
+  - Pick the choose entry in the sheet and save; leave and join again: the card appears once more.
+  - Firefox: pick the entry, rejoin: the browser's chooser opens from the Join click; no microphone prompt.
+  - Without the GUI: `config set devices.<i>.audioOutputDeviceId se:choose` with a headed browser.
+- **Then:** fix the sheet text, which is a UI-text change and needs the owner's agreement; and the owner decides whether the card at a Chrome/Edge first join is wanted (`G06.md` addendum, question 1).
 
 #### U-8 PowerShell does not wait for the GUI-subsystem CLI
 
