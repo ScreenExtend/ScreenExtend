@@ -857,6 +857,19 @@ pub fn bump_reconfig_epoch_for_device(sessions: &SharedSessions, token: &str) ->
     joins.len()
 }
 
+/// Bump every live join on the host: a host-wide setting a session reads only when it is built.
+pub fn bump_reconfig_epoch_all(sessions: &SharedSessions) -> usize {
+    let mut map = sessions.lock_recover();
+    let mut moved = 0usize;
+    for state in map.values_mut() {
+        if state.live_display.is_some() {
+            state.reconfig_epoch += 1;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 pub fn reconfig_epoch(sessions: &SharedSessions, join: &str) -> u64 {
     sessions
         .lock_recover()
