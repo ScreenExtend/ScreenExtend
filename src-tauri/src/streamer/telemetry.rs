@@ -855,6 +855,20 @@ pub fn unregister(key: &str) {
     }
 }
 
+/// Remove `key` only while it still names `mine`.
+///
+/// A renegotiated join publishes a second session's handle under the same join id, and the
+/// superseded session's teardown runs after that (as soon as the new transport connects). A plain
+/// `unregister` there removed the live session's telemetry, so `status --json` lost the join from
+/// its first settings edit on.
+pub fn unregister_if(key: &str, mine: &SharedTelemetry) {
+    if let Ok(mut g) = registry().lock() {
+        if g.get(key).is_some_and(|t| Arc::ptr_eq(t, mine)) {
+            g.remove(key);
+        }
+    }
+}
+
 pub fn get(key: &str) -> Option<SharedTelemetry> {
     registry().lock().ok()?.get(key).cloned()
 }
@@ -1041,5 +1055,19 @@ mod tests {
         );
         unregister("10.0.0.7");
         assert!(get("10.0.0.7").is_none());
+    }
+
+    #[test]
+    fn superseded_session_does_not_unregister_its_successor() {
+        let key = "join-renegotiated-test";
+        let old = register(key);
+        let new = SessionTelemetry::new_shared();
+        publish(key, Arc::clone(&new));
+        // The superseded session's teardown leaves the live one's handle alone ...
+        unregister_if(key, &old);
+        assert!(get(key).is_some_and(|t| Arc::ptr_eq(&t, &new)));
+        // ... and the live one's own teardown removes it.
+        unregister_if(key, &new);
+        assert!(get(key).is_none());
     }
 }

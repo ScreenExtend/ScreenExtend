@@ -2346,6 +2346,7 @@ async fn start_session(
             }
         });
     }
+    let own_telemetry = Arc::clone(&session.pipeline.telemetry);
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
             session::set_active_capture(s, &join_id, session_seq, Box::new(move || session.stop()));
@@ -2380,7 +2381,9 @@ async fn start_session(
         if let Some(s) = sessions.as_ref() {
             session::clear_control_sender(s, &report_join, &control_tx);
         }
-        crate::streamer::telemetry::unregister(&report_join);
+        // Only this session's own handle: after a renegotiation the join id names the
+        // successor's telemetry, and this teardown runs once the successor has connected.
+        crate::streamer::telemetry::unregister_if(&report_join, &own_telemetry);
 
         // Give back the peer connection, its ICE agent, that agent's UDP sockets and the
         // injector thread. Nothing did this before, and because the connection held an `Arc` to
