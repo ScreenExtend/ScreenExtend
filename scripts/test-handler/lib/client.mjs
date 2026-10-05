@@ -1,7 +1,7 @@
 // One test browser: a fresh headless Chrome, one page, the observer script, the paint hook in
 // every worker (lib/paint-hook.mjs) that the primary metric reads, and the join.
 import { launchChrome, newPage, closeChrome, sleep } from './cdp.mjs';
-import { observerSource, GEOMETRY_EXPR, SECONDARY_EXPR } from './inject.mjs';
+import { observerSource, GEOMETRY_EXPR, SECONDARY_EXPR, AUDIO_DECODE_TAP_SOURCE } from './inject.mjs';
 import { decodePng, pngSize, rgb } from './png.mjs';
 import { stampLayout, decodeStamp, unwrap } from './stamp.mjs';
 import { dist } from './metrics.mjs';
@@ -57,7 +57,7 @@ export class Client {
           if (d.params.waitingForDebugger) await p.send('Runtime.runIfWaitingForDebugger', {}, sid).catch(() => {});
           if (info.type === 'worker') {
             this.workers.set(sid, { url: info.url });
-            await p.send('Runtime.evaluate', { expression: HOOK_SOURCE }, sid, 5000).catch((e) => this.log('hook install: ' + e.message));
+            await p.send('Runtime.evaluate', { expression: HOOK_SOURCE + AUDIO_DECODE_TAP_SOURCE }, sid, 5000).catch((e) => this.log('hook install: ' + e.message));
             if (this.stampCfg) await p.send('Runtime.evaluate', { expression: `self.__seStamp && (__seStamp.cfg = ${JSON.stringify(this.stampCfg)})` }, sid, 5000).catch(() => {});
           }
         })();
@@ -119,6 +119,16 @@ export class Client {
     }
     all.sort((a, b) => a.t - b.t);
     return { samples: all, counters };
+  }
+
+  /** Decoded-audio onsets every worker has seen since the last drain (AUDIO_DECODE_TAP_SOURCE). */
+  async drainAudioDecodeOnsets() {
+    const out = []; let packets = 0;
+    for (const sid of [...this.workers.keys()]) {
+      const r = await this.page.send('Runtime.evaluate', { expression: 'self.__seAudTap ? { onsets: __seAudTap.onsets.splice(0), packets: __seAudTap.packets } : null', returnByValue: true }, sid).catch(() => null);
+      const v = r && r.result ? r.result.value : null; if (v) { out.push(...v.onsets); packets += v.packets; }
+    }
+    return { onsets: out.sort((a, b) => a.decoded - b.decoded), packets };
   }
 
   async geometry() { try { this.geom = await this.page.ev(GEOMETRY_EXPR); } catch { /* navigating */ } return this.geom; }

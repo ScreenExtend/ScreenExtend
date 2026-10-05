@@ -1807,15 +1807,18 @@ fn start_audio_forwarders(
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
-    if !audio.fast {
-        if let Some(track) = track {
-            tokio::spawn(forward_track(
-                Arc::clone(pc),
-                track,
-                audio.clone(),
-                Arc::clone(&telemetry),
-            ));
-        }
+    // On the fast path the track is the client's spare, and it used to be added and never fed:
+    // a client whose decoder or worklet failed mid-session switched to it and played silence
+    // for the rest of the session. It is fed in standby — nothing until the client reports
+    // that it is playing the track (`audioPath` 3 in its stats frame).
+    if let Some(track) = track {
+        tokio::spawn(forward_track(
+            Arc::clone(pc),
+            track,
+            audio.clone(),
+            Arc::clone(&telemetry),
+            audio.fast,
+        ));
     }
 
     if let Some(dc) = dc {
@@ -1876,11 +1879,22 @@ async fn forward_datachannel(
     // the old with no resync and keeps the offset for good.
     let mut pending_discontinuity = false;
     let mut prev_payload: Option<Bytes> = None;
+    // A client that stepped down to the spare track has detached this channel's handler; the
+    // track forwarder feeds it from then on, and feeding both would be the audio twice.
+    let mut stepped_down = false;
+    let mut last_path_check = Instant::now();
     loop {
         if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
             break;
         }
-        let want = audio.audio_enabled_now();
+        if audio.fallback_track
+            && !stepped_down
+            && last_path_check.elapsed() >= Duration::from_secs(1)
+        {
+            last_path_check = Instant::now();
+            stepped_down = client_playing_track(&telemetry);
+        }
+        let want = !stepped_down && audio.audio_enabled_now();
         match (want, sub.is_some()) {
             (true, false) => {
                 sub = subscribe_blocking(&audio.hub).await;
@@ -1964,11 +1978,30 @@ async fn forward_datachannel(
     tprintln!("audio: DataChannel forwarder stopped");
 }
 
+/// `elapsed` rounded to the nearest whole number of frames, and never less than one: the RTP
+/// timestamp step for a packet that carries exactly one frame.
+fn whole_frames(elapsed: Duration, frame: Duration) -> Duration {
+    let f = frame.as_nanos().max(1);
+    let n = ((elapsed.as_nanos() + f / 2) / f).max(1);
+    frame * n.min(u32::MAX as u128) as u32
+}
+
+/// `audioPath` 3 in the client's stats frame: it is playing the standard Opus track.
+const CLIENT_AUDIO_PATH_OPUS_TRACK: u8 = 3;
+
+fn client_playing_track(telemetry: &crate::streamer::telemetry::SessionTelemetry) -> bool {
+    telemetry
+        .client
+        .get()
+        .is_some_and(|c| c.audio_path == CLIENT_AUDIO_PATH_OPUS_TRACK)
+}
+
 async fn forward_track(
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     track: Arc<TrackLocalStaticSample>,
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
+    mut standby: bool,
 ) {
     let frame_duration = Duration::from_millis(crate::streamer::audio::encoder::FRAME_MS as u64);
     // A gap longer than this is a device change or a stall, not a scheduling wobble; advancing
@@ -1982,7 +2015,13 @@ async fn forward_track(
         if !pc_alive(&pc) {
             break;
         }
-        let want = audio.audio_enabled_now();
+        // The client latches its step-down (it never returns to the fast path in a session),
+        // so once it is seen this stops being a question.
+        if standby && client_playing_track(&telemetry) {
+            standby = false;
+            tprintln!("audio: the client stepped down to the standard Opus track; feeding it");
+        }
+        let want = !standby && audio.audio_enabled_now();
         match (want, sub.is_some()) {
             (true, false) => sub = subscribe_blocking(&audio.hub).await,
             (false, true) => {
@@ -2006,9 +2045,19 @@ async fn forward_track(
                 // permanently 5 ms per lost packet behind the video, which rides the true host
                 // clock in its RTP timestamps, and nothing ever corrected it. Spacing samples
                 // by the real elapsed `capture_ns` puts both media back on one timeline.
+                //
+                // In whole frames, though. Every packet carries exactly one frame of samples,
+                // and `capture_ns` is re-anchored on each engine wake from `now − read`, so the
+                // raw spacing wobbles by the capture thread's scheduling (4.3 ms, 5.6 ms, …).
+                // Passed through as-is, each packet's RTP timestamp disagreed with the 240
+                // samples it carries, and NetEQ answered every disagreement with concealment:
+                // 627,600 concealed samples in a 22 s window (13 s of it synthesised) and a
+                // 350-600 ms buffer. Rounding to frames keeps the timestamps exact and still
+                // advances by a real gap when one happens.
                 let duration = match last_capture_ns {
                     Some(prev) if pkt.capture_ns > prev => {
-                        Duration::from_nanos(pkt.capture_ns - prev).min(MAX_CATCHUP)
+                        whole_frames(Duration::from_nanos(pkt.capture_ns - prev), frame_duration)
+                            .min(MAX_CATCHUP)
                     }
                     _ => frame_duration,
                 };
@@ -2365,6 +2414,35 @@ mod tests {
             .unwrap()
             .store(AUDIO_REDUNDANCY_LOSS_THRESHOLD, Ordering::Relaxed);
         assert!(p.redundancy_now());
+    }
+
+    /// Each packet carries one 5 ms frame, so its RTP step must be a whole number of frames:
+    /// scheduling wobble rounds away, a real gap still advances the clock.
+    #[test]
+    fn the_track_clock_steps_in_whole_frames() {
+        let f = Duration::from_millis(5);
+        assert_eq!(whole_frames(Duration::from_micros(4_300), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(5_600), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(1), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(9_800), f), f * 2);
+        assert_eq!(whole_frames(Duration::from_millis(41), f), f * 8);
+    }
+
+    /// A spare track on the fast path is fed only once the client says it is playing it.
+    #[test]
+    fn the_spare_track_waits_for_the_client_to_step_down() {
+        let t = crate::streamer::telemetry::SessionTelemetry::default();
+        assert!(!client_playing_track(&t));
+        t.set_client_stats(crate::streamer::telemetry::ClientStats {
+            audio_path: 1,
+            ..Default::default()
+        });
+        assert!(!client_playing_track(&t));
+        t.set_client_stats(crate::streamer::telemetry::ClientStats {
+            audio_path: CLIENT_AUDIO_PATH_OPUS_TRACK,
+            ..Default::default()
+        });
+        assert!(client_playing_track(&t));
     }
 
     #[test]

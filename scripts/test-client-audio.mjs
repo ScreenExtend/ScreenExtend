@@ -326,9 +326,35 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     const need = await A.needsMicPermission();
     if (need === true) ok('an enumeration that returns no outputs at all does ask');
     else fail('an empty enumeration did not ask for the microphone');
+    // ...but never on the join. The join offers the host the request itself instead.
     let raised = 0;
-    await A.enumerateBeforeJoin((_cont, skip) => { raised++; skip(); });
-    eq('and the card is raised exactly once', raised, 1);
+    const cache = await A.enumerateBeforeJoin((_cont, skip) => { raised++; skip(); });
+    eq('the join raises no card, even with nothing enumerated', raised, 0);
+    eq('the host is offered exactly one entry', cache.outputs.length, 1);
+    eq('and it is the request to choose, not a device', cache.outputs[0].id, A.CHOOSE_OUTPUT);
+    if (cache.outputs[0].label) ok('the request carries a label the host can render');
+    else fail('the choose entry has no label');
+    // The host operator picks it: now, and only now, the card.
+    const r1 = await A.requestOutputChoice((_cont, skip) => { raised++; skip(); });
+    eq('choosing it raises the card once', raised, 1);
+    eq('and a decline is reported as such', r1, 'declined');
+    await A.requestOutputChoice((_cont, skip) => { raised++; skip(); });
+    eq('the next poll carrying the same choice does not raise it again', raised, 1);
+    const kept = await A.setSpeaker(A.CHOOSE_OUTPUT);
+    if (kept === true) ok('the choose entry is never routed to as a sink');
+    else fail('setSpeaker treated the choose entry as a device: ' + kept);
+  }
+
+  // 3b. A picker engine with nothing enumerated is offered the same entry, and choosing it
+  // queues the browser's own chooser rather than the microphone card.
+  {
+    const A = speakersFor(async () => [], { hasSelectOut: true });
+    let raised = 0;
+    const cache = await A.enumerateBeforeJoin();
+    eq('a picker engine is offered the choose entry too', cache.outputs[0] && cache.outputs[0].id, A.CHOOSE_OUTPUT);
+    const r = await A.requestOutputChoice(() => { raised++; });
+    eq('choosing it asks for the picker', r, 'picker');
+    eq('and raises no card', raised, 0);
   }
 
   // 4. Enumeration unsupported — it throws — is the same answer.

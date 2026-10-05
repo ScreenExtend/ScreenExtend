@@ -174,6 +174,9 @@
 
     const SE_LOUDSPEAKER = 'se:loudspeaker';
     const SE_EARPIECE = 'se:earpiece';
+    // Offered to the host in place of a list when nothing routable enumerates without a
+    // permission. Not a device: choosing it asks this page to reveal the real ones.
+    const SE_CHOOSE = 'se:choose';
 
     const speakers = {
         inited: false,
@@ -214,6 +217,7 @@
         sessionId: '',
         deviceToken: '',
         labelsUnavailable: false,
+        refusedSink: null,
     };
 
     function detectIOS() {
@@ -345,17 +349,16 @@
         return !speakers.micGranted;
     }
 
-    // Enumeration is for the host's device panel, never for playback. It runs *before* the
-    // join because the only thing on this page that can raise a permission prompt is here, and
-    // a prompt over a live second screen is an interruption — so if one is needed at all it is
-    // needed now, once, with the join waiting on the answer.
-    //
-    // On almost every device it needs nothing: see `needsMicPermission()`. A decline costs
-    // device *labels* in the host's picker and nothing else — the sink change itself works on
-    // bare ids — and is reported as `degraded` bit 9 for the rest of the session. It is never
-    // re-offered.
+    // Enumeration is for the host's device panel, never for playback, and the join never asks
+    // for anything to do it. The default output plays with no permission on every engine, so a
+    // join that raised a microphone card or prompt was asking the user for something they had
+    // not asked to do. What this does is whatever enumerates for free; where that is nothing
+    // routable (Chromium before a grant reports every output with an empty id, Firefox lists
+    // none before its picker), the host is offered `SE_CHOOSE` instead, and only when the host
+    // operator picks it — an explicit request for a non-default output — does
+    // `requestOutputChoice` ask the one thing that can reveal the rest.
     let enumStarted = false;
-    async function enumerateBeforeJoin(showPermModal) {
+    async function enumerateBeforeJoin() {
         if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
         enumStarted = true;
         initSpeakers();
@@ -379,18 +382,30 @@
         noteOutputLabels(enumerated);
         speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
         startDeviceWatch();
+        return speakers._cache;
+    }
 
-        // Note the order: bit 9 tracks the *labels*, not the prompt. An enumeration that
-        // worked and came back with bare ids is exactly the case that now asks nothing and
-        // still has to be reported, or the host cannot tell "Output 1" from a device name.
+    // The host operator picked `SE_CHOOSE`: they want this device on a speaker other than its
+    // default, and nothing routable has been listed. This is the one place the page may ask for
+    // anything, and it asks the least it can. An engine with `selectAudioOutput()` has a
+    // permission-free chooser, which needs a gesture, so the page queues it (`'picker'`). Only
+    // where that does not exist is the microphone card the route to the list, and its grant is
+    // released the moment the outputs have been read. A decline is answered once per page: the
+    // host is still showing `SE_CHOOSE` as selected, and every /reconfig poll carries it.
+    let choiceAsked = false;
+    async function requestOutputChoice(showPermModal) {
+        initSpeakers();
+        if (speakers.hasSelectOut) return 'picker';
+        if (choiceAsked || typeof showPermModal !== 'function') return 'done';
+        choiceAsked = true;
         let need = false;
-        try { need = await needsMicPermission(enumerated); } catch (_) { note(); }
-        if (!need || typeof showPermModal !== 'function') return speakers._cache;
-
-        const granted = await new Promise((resolve) => {
-            showPermModal(() => resolve(true), () => resolve(false));
-        });
-        if (!granted) return speakers._cache;
+        try { need = await needsMicPermission(null); } catch (_) { note(); }
+        if (need) {
+            const granted = await new Promise((resolve) => {
+                showPermModal(() => resolve(true), () => resolve(false));
+            });
+            if (!granted) return 'declined';
+        }
         try {
             await primeMicPermission();
             const withGrant = speakers.canSink ? await listOutputs() : [];
@@ -401,7 +416,8 @@
             }
         } catch (_) { note(); }
         releasePrimedStream();
-        return speakers._cache;
+        postOutputs(true);
+        return 'done';
     }
 
     // Firefox only resolves enumerateDevices() once the document has focus, so a
@@ -432,8 +448,11 @@
     // never presents them as what the operating system calls the hardware.
     function noteOutputLabels(enumerated) {
         if (!speakers.canSink) return;
-        speakers.outputsLabelled = enumerated.some((d) => d.label);
-        speakers.labelsUnavailable = !speakers.outputsLabelled;
+        const labelled = enumerated.some((d) => d.label);
+        // With nothing enumerated the host is sent `SE_CHOOSE` alone, which is not a list of
+        // positional names, so "labelled" has nothing to describe and is left unsaid.
+        speakers.outputsLabelled = enumerated.length ? labelled : null;
+        speakers.labelsUnavailable = !labelled;
     }
 
     function buildOutputs(enumerated) {
@@ -442,7 +461,10 @@
             out.push({ id: SE_LOUDSPEAKER, label: 'Speaker' });
             out.push({ id: SE_EARPIECE, label: 'Earpiece' });
         }
-        if (speakers.canSink) {
+        if (speakers.canSink && !enumerated.length) {
+            // Nothing routable without asking, so the host gets the request itself as an entry.
+            out.push({ id: SE_CHOOSE, label: 'Choose a speaker on this device…' });
+        } else if (speakers.canSink) {
             let n = 0;
             for (const d of enumerated) {
                 if (d.label) { out.push(d); continue; }
@@ -468,9 +490,12 @@
             speakers.primedStream = null;
             return true;
         }
-        if (!speakers.micGranted) return false;
+        // Reached only when the host operator chose the earpiece on an engine with no
+        // audioSession category, where holding the microphone is the routing mechanism. That
+        // choice is the request; the join no longer primes the grant ahead of it.
         try {
             speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
+            speakers.micGranted = true;
             return true;
         } catch (_) { speakers.micHold = null; return false; }
     }
@@ -524,6 +549,8 @@
         const md = navigator.mediaDevices;
         const onChange = () => {
             if (speakers.firstDeviceChange) { speakers.firstDeviceChange = false; return; }
+            // A refused id may be one that has just been plugged in.
+            speakers.refusedSink = null;
             if (speakers.debounceTimer) clearTimeout(speakers.debounceTimer);
             speakers.debounceTimer = setTimeout(reEnumerateAndPost, 500);
         };
@@ -662,6 +689,14 @@
         const raw = deviceId || '';
         const id = (raw === 'default') ? '' : raw;
         if (speakers.appliedSink === id) return true;
+        // A request to list the outputs, not an output: routing stays where it is and the page
+        // answers it through `requestOutputChoice`.
+        if (id === SE_CHOOSE) return true;
+        // An id this engine has already refused, still saved on the host (the hardware it named
+        // is gone, or it belonged to another browser). Every /reconfig poll carries it, so it
+        // is refused once rather than retried — and re-routed — once a second. A device change
+        // clears the latch.
+        if (speakers.refusedSink === id) return false;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
             if (state.path === 'netEQ') { try { await revertSink(); } catch (_) { note(); } }
@@ -730,11 +765,6 @@
             }
 
             if (speakers.hasElemSink) {
-                if (!speakers.msd) {
-                    speakers.msd = state.ctx.createMediaStreamDestination();
-                    try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
-                    state.gain.connect(speakers.msd);
-                }
                 if (!speakers.sinkEl) {
                     const a = document.createElement('audio');
                     a.autoplay = true;
@@ -745,8 +775,17 @@
                     document.body.appendChild(a);
                     speakers.sinkEl = a;
                 }
-                speakers.sinkEl.srcObject = speakers.msd.stream;
+                // The sink first, the graph second. Re-routing the graph into the element before
+                // the engine had accepted the id left a refused id playing through an element
+                // on the default device — and re-assigning `srcObject` restarts the element, so
+                // a refused id retried once a second was a restart once a second.
                 await speakers.sinkEl.setSinkId(id);
+                if (!speakers.msd) {
+                    speakers.msd = state.ctx.createMediaStreamDestination();
+                    try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
+                    state.gain.connect(speakers.msd);
+                }
+                if (speakers.sinkEl.srcObject !== speakers.msd.stream) speakers.sinkEl.srcObject = speakers.msd.stream;
                 const p = speakers.sinkEl.play();
                 if (p && p.catch) p.catch(note);
                 speakers.appliedSink = id;
@@ -757,6 +796,7 @@
                 return true;
             }
         } catch (_) { note(); }
+        speakers.refusedSink = id;
         return false;
     }
 
@@ -950,6 +990,20 @@
         if (typeof ms !== 'number' || !isFinite(ms)) return;
         state.videoDelayMs = ms;
         maybeUpdateTarget();
+    }
+
+    // A page open on the host machine itself plays into the very mix the host is capturing:
+    // the host's loopback takes it back, sends it again, and the result is an echo that repeats
+    // every round trip and never decays. The host's own speakers are already playing the audio,
+    // so this page's copy adds nothing but that loop — it starts muted.
+    let sameDeviceLogged = false;
+    function playbackMutedHere() {
+        const same = window.__SAME_DEVICE__ === true;
+        if (same && !sameDeviceLogged) {
+            sameDeviceLogged = true;
+            console.warn('[audio] this page is on the host machine; its playback is muted so the host does not capture it again');
+        }
+        return same;
     }
 
     function setMuted(m) {
@@ -1247,7 +1301,7 @@
             state.worker.postMessage(buf, [buf]);
         };
         state.path = 'webcodecs';
-        setMuted(false); // default unmuted when the host has enabled audio
+        setMuted(playbackMutedHere());
         console.log('[audio] fast path active: Opus over DataChannel → worker → ' +
             (state.sab ? 'shared-memory ring' : 'postMessage ring'));
     }
@@ -1280,7 +1334,7 @@
         const p = state.audioEl.play();
         if (p && p.catch) p.catch(() => {});
         state.path = 'netEQ';
-        setMuted(false);
+        setMuted(playbackMutedHere());
         console.log('[audio] fallback path active: standard Opus track (NetEQ)');
     }
 
@@ -1367,6 +1421,8 @@
         teardown,
         initSpeakers,
         enumerateBeforeJoin,
+        requestOutputChoice,
+        CHOOSE_OUTPUT: SE_CHOOSE,
         needsMicPermission,
         primeMicPermission,
         canPickOutput,
