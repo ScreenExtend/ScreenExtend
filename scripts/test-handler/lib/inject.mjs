@@ -17,6 +17,17 @@ export function observerSource(opts = {}) {
     if (OPTS.disable && OPTS.disable.indexOf('webcodecs') >= 0) { delete window.VideoDecoder; delete window.EncodedVideoChunk; }
     if (OPTS.disable && OPTS.disable.indexOf('script_transform') >= 0) { delete window.RTCRtpScriptTransform; }
     if (OPTS.disable && OPTS.disable.indexOf('encoded_streams') >= 0 && window.RTCRtpReceiver) { delete RTCRtpReceiver.prototype.createEncodedStreams; }
+    // Audio tiers. 'sab': no SharedArrayBuffer although the page is isolated (the private ring
+    // over a MessagePort). 'audio_decoder': no WebCodecs audio (the standard Opus track from the
+    // start). 'audio_worker': the decode worker's script fails to load after the page has
+    // already claimed the fast path (the mid-session step-down).
+    if (OPTS.disable && OPTS.disable.indexOf('sab') >= 0) { delete window.SharedArrayBuffer; }
+    if (OPTS.disable && OPTS.disable.indexOf('audio_decoder') >= 0) { delete window.AudioDecoder; delete window.EncodedAudioChunk; }
+    if (OPTS.disable && OPTS.disable.indexOf('audio_worker') >= 0) {
+      const Wk = window.Worker;
+      const Wrapped = function (u, o) { const s = String(u); return new Wk(/audio-worker\\.js/.test(s) ? s.replace('audio-worker.js', 'se-handler-missing-worker.js') : u, o); };
+      Wrapped.prototype = Wk.prototype; window.Worker = Wrapped;
+    }
   } catch (e) { S.notes.push('disable failed ' + e); }
   // Microphone: was a capture permission requested, and by what.
   try {
@@ -57,6 +68,41 @@ export function observerSource(opts = {}) {
       return C.apply(this, arguments);
     };
   } catch (e) { S.notes.push('audio tap failed ' + e); }
+  // Media elements: every srcObject assignment, each element's load/play/pause history, and an
+  // analyser on any stream carrying a track a peer connection received (the standard Opus track,
+  // which never passes through the page's own audio graph). The tap lives in its own context.
+  S.mediaEls = [];
+  try {
+    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
+    const remoteIds = () => { const ids = new Set(); for (const pc of S.pcs) { try { for (const r of pc.getReceivers()) if (r.track) ids.add(r.track.id); } catch (_) {} } return ids; };
+    Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
+      configurable: true, enumerable: desc.enumerable, get: desc.get,
+      set: function (v) {
+        let rec = S.mediaEls.find((r) => r.el === this);
+        if (!rec) {
+          rec = { el: this, tag: this.tagName, assigns: [], events: {} };
+          S.mediaEls.push(rec);
+          for (const ev of ['loadstart', 'playing', 'pause', 'emptied', 'error', 'stalled', 'waiting']) this.addEventListener(ev, () => { rec.events[ev] = (rec.events[ev] || 0) + 1; });
+        }
+        const tracks = v && v.getAudioTracks ? v.getAudioTracks() : [];
+        const remote = remoteIds(); const isRemote = tracks.some((t) => remote.has(t.id));
+        rec.assigns.push({ t: now(), stream: v ? v.id : null, audioTracks: tracks.length, remote: isRemote });
+        desc.set.call(this, v);
+        if (isRemote && this.tagName === 'AUDIO' && !S.trackTaps) S.trackTaps = [];
+        if (isRemote && this.tagName === 'AUDIO' && !S.trackTaps.some((x) => x.stream === v.id)) {
+          try {
+            const ctx = new AudioContext(); const src = ctx.createMediaStreamSource(v); const an = ctx.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0; an.__seTap = true;
+            src.connect(an); S.analysers.push({ an, ctx, last: 0, quietSince: 0, armed: false, kind: 'element-track' }); S.trackTaps.push({ stream: v.id });
+            if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+          } catch (e) { S.notes.push('track tap failed ' + e); }
+        }
+      },
+    });
+  } catch (e) { S.notes.push('srcObject wrap failed ' + e); }
+  S.mediaSummary = function () {
+    return S.mediaEls.map((r) => ({ tag: r.tag, assigns: r.assigns.length, lastAssign: r.assigns[r.assigns.length - 1], events: r.events, paused: r.el.paused, currentTime: r.el.currentTime, sinkId: typeof r.el.sinkId === 'string' ? r.el.sinkId : null, muted: r.el.muted, hasSrc: !!desc0(r.el) }));
+    function desc0(el) { try { return el.srcObject; } catch (_) { return null; } }
+  };
   // Onset detection, started by the harness for the audio window.
   S.startOnsets = function (threshold, quietMs) {
     threshold = threshold || 0.02; quietMs = quietMs || 30;
@@ -92,6 +138,35 @@ export function observerSource(opts = {}) {
 })();`;
 }
 
+/**
+ * Installed in every worker: an onset detector on decoded audio. It wraps `AudioData.copyTo`
+ * (every page generation's decode worker copies plane 0 of each decoded packet out with it) and
+ * notes, per onset, when the worker had it decoded and which capture time the packet carried.
+ * That splits the audio delay at the decoder: host → decoded, and decoded → rendered. Observation
+ * only; the copy itself is untouched.
+ */
+export const AUDIO_DECODE_TAP_SOURCE = `(() => {
+  if (typeof AudioData !== 'function' || self.__seAudTap) return;
+  const T = self.__seAudTap = { onsets: [], armed: false, quietSince: null, packets: 0 };
+  const C = AudioData.prototype.copyTo;
+  AudioData.prototype.copyTo = function (dest, opts) {
+    const r = C.apply(this, arguments);
+    try {
+      if (opts && opts.planeIndex === 0 && dest && dest.length) {
+        T.packets++;
+        const now = performance.timeOrigin + performance.now(); const n = Math.min(dest.length, this.numberOfFrames || dest.length); const sr = this.sampleRate || 48000;
+        for (let i = 0; i < n; i++) {
+          const v = Math.abs(dest[i]); const tUs = this.timestamp + i * 1e6 / sr;
+          if (v < 0.01) { if (T.quietSince === null) T.quietSince = tUs; if (tUs - T.quietSince >= 30000) T.armed = true; }
+          else T.quietSince = null;
+          if (T.armed && v >= 0.02) { T.armed = false; T.quietSince = null; T.onsets.push({ decoded: now, captureUs: tUs, peak: v }); if (T.onsets.length > 500) T.onsets.shift(); }
+        }
+      }
+    } catch (_) {}
+    return r;
+  };
+})();`;
+
 /** Evaluated in the page: where the live picture is and how big its frames are. */
 export const GEOMETRY_EXPR = `(() => {
   const vis = (el) => { if (!el) return false; const s = getComputedStyle(el); const r = el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 10 && r.height > 10; };
@@ -122,7 +197,7 @@ export const SECONDARY_EXPR = `(async () => {
     r.forEach((s) => { if (s.type === 'codec') codecs[s.id] = s.mimeType + ' ' + (s.sdpFmtpLine || ''); });
     r.forEach((s) => {
       if (s.type === 'inbound-rtp' && s.kind === 'video') w.video = { codec: codecs[s.codecId], decoder: s.decoderImplementation, powerEfficientDecoder: s.powerEfficientDecoder, packets: s.packetsReceived, lost: s.packetsLost, framesReceived: s.framesReceived, framesDecoded: s.framesDecoded, framesDropped: s.framesDropped, keyFrames: s.keyFramesDecoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, jitterMs: s.jitter != null ? s.jitter * 1000 : null, frameWidth: s.frameWidth, frameHeight: s.frameHeight, fps: s.framesPerSecond, jitterBufferDelayMs: s.jitterBufferEmittedCount ? 1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount : null, bytes: s.bytesReceived };
-      if (s.type === 'inbound-rtp' && s.kind === 'audio') w.audioTrack = { codec: codecs[s.codecId], packets: s.packetsReceived, lost: s.packetsLost, concealed: s.concealedSamples, jitterMs: s.jitter != null ? s.jitter * 1000 : null };
+      if (s.type === 'inbound-rtp' && s.kind === 'audio') w.audioTrack = { codec: codecs[s.codecId], packets: s.packetsReceived, lost: s.packetsLost, concealed: s.concealedSamples, jitterMs: s.jitter != null ? s.jitter * 1000 : null, jitterBufferDelayMs: s.jitterBufferEmittedCount ? 1000 * s.jitterBufferDelay / s.jitterBufferEmittedCount : null, jitterBufferTargetMs: s.jitterBufferEmittedCount && s.jitterBufferTargetDelay != null ? 1000 * s.jitterBufferTargetDelay / s.jitterBufferEmittedCount : null, samplesReceived: s.totalSamplesReceived, audioLevel: s.audioLevel };
       if (s.type === 'data-channel') w.dataChannels.push({ label: s.label, state: s.state, messagesReceived: s.messagesReceived, bytesReceived: s.bytesReceived });
       if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') w.candidatePair = { rttMs: s.currentRoundTripTime != null ? s.currentRoundTripTime * 1000 : null, availableIncomingBitrate: s.availableIncomingBitrate, bytesReceived: s.bytesReceived };
     });

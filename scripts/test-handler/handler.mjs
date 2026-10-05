@@ -40,6 +40,10 @@ const DEFAULTS = {
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
   mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
   cpu_burn: null,          // {threads, seconds}: saturate the CPU during slow_answer's joins (inside the measurement lock)
+  audio_paths: false,      // true = every client audio tier; or a list of tier keys (AUDIO_TIERS)
+  audio_keep_page_mute: false, // do not unmute a page that muted itself before the click train
+  click_source: 'winmm',   // 'wasapi': clicks timed by the engine's play position (clicks-wasapi.ps1)
+  min_commit_gb: 6,        // wait before starting until this much system commit is free (0 = off)
   netlog: false,           // Chrome's own network log per browser, into the run directory
   stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // After every join has left: close the host's stdout/stderr pipes (as a parent that stops
@@ -455,13 +459,14 @@ function aggregate(runs) {
 }
 
 // ---------------------------------------------------------------- audio
-async function audioTest(cl, name) {
+async function audioTest(cl, name, { beforeClicks = null } = {}) {
   const res = { };
   const k = await deviceKey(name, cl);
   const set = await cli(['devices', 'set', k.key, '--audio', 'on']);
   res.enable = { by: k.by, code: set.code, out: (set.stdout + set.stderr).trim().slice(0, 300) };
   if (HOSTCTX.mode === 'exclusive') res.enable.note = 'wrote the real config.json; it is restored byte-for-byte at the end of the run';
   await sleep(4000); // the first enable renegotiates once (TEST-WORKFLOW §5.6)
+  if (beforeClicks) res.beforeClicks = await beforeClicks(k).catch((e) => ({ error: e.message }));
   if (/restart it or reconnect/i.test(res.enable.out)) {
     // Older builds apply a saved override only to a new connection — and `bef5f89`'s `serve`
     // reads device overrides from config.json only at startup, so there the host is restarted
@@ -476,11 +481,18 @@ async function audioTest(cl, name) {
     await sleep(2000);
   }
   return underLock('audio', async () => {
+    // Every handler client runs on the host machine, which a page may treat as a reason to
+    // keep its own playback muted (the same-machine echo). Chrome is muted here anyway, so the
+    // page is unmuted through its own API and the graph is measured; reported either way.
+    res.pageMutedBeforeTest = await cl.page.ev(`(window.SEAudio && SEAudio.isMuted) ? (SEAudio.isMuted() ? (${REQ.audio_keep_page_mute ? '' : 'SEAudio.setMuted(false), '}true) : false) : null`).catch(() => null);
+    res.pageUnmutedByHandler = !!res.pageMutedBeforeTest && !REQ.audio_keep_page_mute;
     await cl.page.ev('__se.startOnsets(0.02, 30)');
+    await cl.drainAudioDecodeOnsets().catch(() => null);
     await sleep(2500);
     const before = await cl.page.ev('__se.audioBuckets.slice()');
     const clicks = await new Promise((resolve) => {
-      const p = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'clicks.ps1'), '-Seconds', '12'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+      const script = REQ.click_source === 'wasapi' ? 'clicks-wasapi.ps1' : 'clicks.ps1';
+      const p = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, script), '-Seconds', '12'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       owned.stages.push(p); let o = ''; p.stdout.on('data', (d) => { o += d; }); p.stderr.on('data', (d) => { o += d; });
       p.on('exit', () => { try { resolve(JSON.parse(o.trim().split('\n').pop())); } catch { resolve({ error: o.slice(-400) }); } });
     });
@@ -497,6 +509,17 @@ async function audioTest(cl, name) {
       if (hit < 0) continue; matched.add(hit);
       const o = page.onsets[hit]; toRender.push(o.render - off - c); if (o.output) toOutput.push(o.output - off - c); peaks.push(o.peak);
     }
+    // The same clicks at the decoder (the decode worker's tap), which splits the delay into
+    // host → decoded and decoded → rendered.
+    const dec = await cl.drainAudioDecodeOnsets().catch(() => ({ onsets: [], packets: 0 }));
+    const toDecode = [], decodeToRender = []; const dUsed = new Set();
+    for (const c of clicks.clicks || []) {
+      const di = dec.onsets.findIndex((o, i) => !dUsed.has(i) && o.decoded - off >= c - 20 && o.decoded - off <= c + 650);
+      if (di < 0) continue; dUsed.add(di); toDecode.push(dec.onsets[di].decoded - off - c);
+      const ri = page.onsets.findIndex((o) => o.render >= dec.onsets[di].decoded - 5 && o.render - off <= c + 650);
+      if (ri >= 0) decodeToRender.push(page.onsets[ri].render - dec.onsets[di].decoded);
+    }
+    res.delayToDecodeMs = dist(toDecode); res.decodeToRenderMs = dist(decodeToRender); res.decodedPackets = dec.packets; res.decodedOnsets = dec.onsets.length;
     res.arrived = matched.size > 0;
     res.matched = matched.size; res.unmatchedOnsets = page.onsets.length - matched.size;
     res.delayToRenderMs = dist(toRender);
@@ -512,6 +535,9 @@ async function audioTest(cl, name) {
     res.activePath = sec.audioActivePath;
     res.dataChannels = sec.webrtc ? sec.webrtc.dataChannels : null; res.audioTrack = sec.webrtc ? sec.webrtc.audioTrack : null;
     res.fallbackHints = cl.console.filter((c) => /\[audio\]|fallback|AudioDecoder|worklet/i.test(c.text)).slice(-15);
+    res.memory = commitHeadroomGb();
+    res.mediaElements = await cl.page.ev('__se.mediaSummary ? __se.mediaSummary() : null').catch((e) => ({ error: e.message }));
+    res.analyserKinds = await cl.page.ev('__se.analysers.map((a) => a.kind || "graph")').catch(() => null);
     res.definitions = { host: 'click time = when winmm reported the click\'s first sample consumed (clicks.ps1)', render: 'onset found by an analyser spliced before the destination, timed by AudioContext.currentTime', output: 'render time mapped through getOutputTimestamp (adds the browser\'s output latency)', note: 'Chrome runs with --mute-audio so the host does not capture the client\'s playback; the graph still renders. Other sounds on the machine are captured too and show up as unmatched onsets.' };
     return res;
   });
@@ -852,6 +878,65 @@ async function fallbackPaths() {
   return out;
 }
 
+// One fresh browser per client audio tier, each running the full audio test (enable, click
+// train, onsets). The standard Opus track is tapped where it reaches an <audio> element, so the
+// track tiers are measured the same way as the worklet ones. `stale output` saves an output id
+// this client does not have (what a device row keeps after the hardware it named went away),
+// replays it into the running host, and then plays the clicks.
+const AUDIO_TIERS = {
+  default: { label: 'default (isolated page, SharedArrayBuffer ring)' },
+  no_sab: { label: 'no SharedArrayBuffer (private ring)', disable: ['sab'] },
+  no_audio_decoder: { label: 'no AudioDecoder (standard Opus track from the start)', disable: ['audio_decoder'] },
+  plain_http: { label: 'plain HTTP (no secure context)', https: false },
+  worker_fails: { label: 'decode worker fails to load after the fast path was claimed', disable: ['audio_worker'] },
+  stale_output: { label: 'saved output id that this client does not have', staleSink: 'se-handler-gone-output' },
+};
+async function audioPaths() {
+  const want = Array.isArray(REQ.audio_paths) ? REQ.audio_paths : Object.keys(AUDIO_TIERS);
+  const out = {};
+  for (const key of want) {
+    const t = AUDIO_TIERS[key];
+    if (!t) { out[key] = { error: 'unknown audio tier; known: ' + Object.keys(AUDIO_TIERS).join(', ') }; continue; }
+    const spec = { ...REQ.client, https: t.https !== false };
+    const cl = await openClient(spec, { offset: 2, disable: t.disable || [] });
+    try {
+      const j = await joinClient(cl, spec);
+      if (j.firstPictureMs == null) { out[key] = { label: t.label, error: 'no picture', join: j }; await leave(cl); continue; }
+      const beforeClicks = t.staleSink ? async (k) => {
+        const g = await cli(['config', 'get', 'devices']);
+        let rows = null; try { rows = JSON.parse(g.stdout.slice(g.stdout.indexOf('['))); } catch { /* none */ }
+        const i = rows ? rows.findIndex((r) => r.token === k.key || r.ip === k.key) : -1;
+        if (i < 0) return { error: 'no saved row for this device' };
+        const r = await cli(['config', 'set', `devices.${i}.audioOutputDeviceId`, t.staleSink]);
+        await sleep(3500); // a few /reconfig polls carry the new sink
+        const page = await cl.page.ev('(window.SEAudio && SEAudio.getSyncInfo) ? SEAudio.getSyncInfo() : null').catch((e) => ({ error: e.message }));
+        return { set: { code: r.code, out: (r.stdout + r.stderr).trim().slice(0, 200) }, syncInfoAfter: page };
+      } : null;
+      const a = await audioTest(cl, j.name, { beforeClicks });
+      out[key] = { label: t.label, join: { answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, offers: j.offers, modals: j.modals }, ...a };
+      await leave(cl);
+    } finally { await cl.close(); owned.clients.splice(owned.clients.indexOf(cl), 1); }
+  }
+  return out;
+}
+
+function commitHeadroomGb() {
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', "$c=(Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit').CounterSamples; $os=Get-CimInstance Win32_OperatingSystem; '{0} {1}' -f (($c[1].CookedValue-$c[0].CookedValue)/1GB), ($os.FreePhysicalMemory/1MB)"], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+    const [commit, phys] = out.trim().split(/\s+/).map(Number);
+    return { commitGb: Math.round(commit * 100) / 100, freePhysGb: Math.round(phys * 100) / 100 };
+  } catch (e) { return { error: e.message }; }
+}
+async function waitForCommit(minGb) {
+  if (!minGb) return null;
+  const t0 = Date.now(); let h = commitHeadroomGb();
+  while (h.commitGb != null && h.commitGb < minGb) {
+    log(`commit headroom ${h.commitGb} GB < ${minGb} GB: waiting 60 s`);
+    await sleep(60000); h = commitHeadroomGb();
+  }
+  return { ...h, waitedMs: Date.now() - t0, minGb };
+}
+
 // ---------------------------------------------------------------- main
 let REQ = null;
 let STATUS_ONLY = false;
@@ -886,6 +971,11 @@ async function main() {
   const mode = build.isolationSwitch && !REQ.force_exclusive ? 'isolated' : 'exclusive';
   R.mode = mode;
   if (mode === 'exclusive') R.warnings.push(build.isolationSwitch ? 'exclusive mode forced by the request' : 'this build has no SCREENEXTEND_DATA_DIR switch: exclusive mode (all slots held, the real data directory, config.json backed up and restored)');
+
+  // ---- commit headroom (AGENT-BRIEF "Memory emergency rules"): every virtual display leaks
+  // commit in the driver host, and running the system out of commit crashes the owner's own
+  // programs. Wait, re-checking every 60 s, until at least `min_commit_gb` is free.
+  R.commitHeadroom = await waitForCommit(REQ.min_commit_gb);
 
   // ---- slots
   const info = { exe, label: REQ.label || null };
@@ -938,6 +1028,7 @@ async function main() {
       if (REQ.slow_answer) R.special.slow_answer = await slowAnswer(cl);
       if (REQ.fallback_paths) R.special.fallback_paths = await fallbackPaths();
       if (REQ.mover_stop) R.special.mover_stop = await moverStopTest(cl);
+      if (REQ.audio_paths) R.special.audio_paths = await audioPaths();
       if (REQ.auto_rejoin) R.special.auto_rejoin = await autoRejoin(cl);
     };
     // By default the lock is held for the whole live-display part of the test, so no other
