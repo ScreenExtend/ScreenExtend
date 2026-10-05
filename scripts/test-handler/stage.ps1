@@ -162,6 +162,10 @@ if ($Mover) {
   $mf.Bounds = New-Object System.Drawing.Rectangle(($b.X + 20), ($b.Y + [int]($b.Height * 0.4)), 48, 48)
   $mf.Show(); $forms += $mf
   $mg = $mf.CreateGraphics()
+  # StageForm skips OnPaintBackground, so BackColor alone never reaches the screen: until this
+  # fill the mover showed whatever its redirection surface held (in practice not the orange the
+  # mover_stop reader looks for). Filled once here and again after every move.
+  $mg.Clear([System.Drawing.Color]::OrangeRed)
 }
 if ($Large) {
   $lf = New-Object StageForm
@@ -226,7 +230,7 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
       } else {
         $x = $b.X + 20 + [int](($now * $MoverSpeed) % ($b.Width - 100))
       }
-      if ($mf.Location.X -ne $x) { $mf.Location = New-Object System.Drawing.Point($x, ($b.Y + [int]($b.Height * 0.4))) }
+      if ($mf.Location.X -ne $x) { $mf.Location = New-Object System.Drawing.Point($x, ($b.Y + [int]($b.Height * 0.4))); $mg.Clear([System.Drawing.Color]::OrangeRed) }
     }
     if ($Large) { $off = [int](($now / 16) % 256); $lg.DrawImageUnscaled($noise, -$off, -((($now / 7) % 256) -as [int])) }
     [System.Windows.Forms.Application]::DoEvents()
