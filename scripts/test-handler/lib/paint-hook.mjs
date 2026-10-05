@@ -11,7 +11,7 @@
 
 export const HOOK_SOURCE = `(() => {
   if (self.__seStamp) return;
-  const S = self.__seStamp = { cfg: null, out: [], pending: 0, prev: null, painted: 0, sampled: 0, skipped: 0, errors: 0 };
+  const S = self.__seStamp = { cfg: null, out: [], pending: 0, prev: null, painted: 0, sampled: 0, skipped: 0, errors: 0, diag: 0 };
   const now = () => performance.timeOrigin + performance.now();
   const CELLS = 38, PX = 4, W = CELLS * PX;
   let strip = null, grid = null;
@@ -25,7 +25,7 @@ export const HOOK_SOURCE = `(() => {
     let v = 0; for (let i = 0; i < 24; i++) v = v * 2 + b[4 + i];
     let c = 0; for (let i = 0; i < 8; i++) c = c * 2 + b[28 + i];
     const sum = (((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255)) & 255;
-    if ((sum ^ 0x5a) !== c) return { e: 'checksum' };
+    if ((sum ^ 0x5a) !== c) return { e: 'checksum', l: l.map(Math.round) };
     return { v, contrast: Math.round(white - black) };
   }
   // src: a VideoFrame or an HTMLVideoElement; fw: its natural width; t: paint time.
@@ -58,7 +58,7 @@ export const HOOK_SOURCE = `(() => {
         if (!strip) strip = new OffscreenCanvas(W, 1).getContext('2d', { willReadFrequently: true });
         strip.drawImage(bm, 0, 0); const r = decode(strip.getImageData(0, 0, W, 1).data);
         if (r.e) S.errors++;
-        S.out.push(r.e ? { t, e: r.e } : { t, v: r.v });
+        S.out.push(r.e ? (r.l && S.diag++ < 40 ? { t, e: r.e, l: r.l } : { t, e: r.e }) : { t, v: r.v });
       }
       bm.close();
     }).catch((e) => { S.out.push({ t, e: 'readback: ' + e.message }); }).finally(() => { if (isFrame) img.close(); S.pending--; });
