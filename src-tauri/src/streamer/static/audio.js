@@ -217,6 +217,7 @@
         sessionId: '',
         deviceToken: '',
         labelsUnavailable: false,
+        refusedSink: null,
     };
 
     function detectIOS() {
@@ -548,6 +549,8 @@
         const md = navigator.mediaDevices;
         const onChange = () => {
             if (speakers.firstDeviceChange) { speakers.firstDeviceChange = false; return; }
+            // A refused id may be one that has just been plugged in.
+            speakers.refusedSink = null;
             if (speakers.debounceTimer) clearTimeout(speakers.debounceTimer);
             speakers.debounceTimer = setTimeout(reEnumerateAndPost, 500);
         };
@@ -689,6 +692,11 @@
         // A request to list the outputs, not an output: routing stays where it is and the page
         // answers it through `requestOutputChoice`.
         if (id === SE_CHOOSE) return true;
+        // An id this engine has already refused, still saved on the host (the hardware it named
+        // is gone, or it belonged to another browser). Every /reconfig poll carries it, so it
+        // is refused once rather than retried — and re-routed — once a second. A device change
+        // clears the latch.
+        if (speakers.refusedSink === id) return false;
 
         if (id === SE_EARPIECE || id === SE_LOUDSPEAKER) {
             if (state.path === 'netEQ') { try { await revertSink(); } catch (_) { note(); } }
@@ -757,11 +765,6 @@
             }
 
             if (speakers.hasElemSink) {
-                if (!speakers.msd) {
-                    speakers.msd = state.ctx.createMediaStreamDestination();
-                    try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
-                    state.gain.connect(speakers.msd);
-                }
                 if (!speakers.sinkEl) {
                     const a = document.createElement('audio');
                     a.autoplay = true;
@@ -772,8 +775,17 @@
                     document.body.appendChild(a);
                     speakers.sinkEl = a;
                 }
-                speakers.sinkEl.srcObject = speakers.msd.stream;
+                // The sink first, the graph second. Re-routing the graph into the element before
+                // the engine had accepted the id left a refused id playing through an element
+                // on the default device — and re-assigning `srcObject` restarts the element, so
+                // a refused id retried once a second was a restart once a second.
                 await speakers.sinkEl.setSinkId(id);
+                if (!speakers.msd) {
+                    speakers.msd = state.ctx.createMediaStreamDestination();
+                    try { state.gain.disconnect(state.ctx.destination); } catch (_) { note(); }
+                    state.gain.connect(speakers.msd);
+                }
+                if (speakers.sinkEl.srcObject !== speakers.msd.stream) speakers.sinkEl.srcObject = speakers.msd.stream;
                 const p = speakers.sinkEl.play();
                 if (p && p.catch) p.catch(note);
                 speakers.appliedSink = id;
@@ -784,6 +796,7 @@
                 return true;
             }
         } catch (_) { note(); }
+        speakers.refusedSink = id;
         return false;
     }
 
