@@ -35,9 +35,9 @@ const RTT_WINDOWS: f64 = 2.0;
 /// to overflow it, which drops more packets, which produces the next request. Latency is what a
 /// short window buys, and a cross-network path has already given that up.
 ///
-/// It is affordable to wait because rolling intra refresh is on for every shipped session
-/// (`server.rs`): the refresh wave rebuilds the picture continuously without an IDR, so a keyframe
-/// is for bootstrapping and for a loss the wave cannot cover, not for routine recovery.
+/// Note that rolling intra refresh is *off* on live joins (UX-GREEN in `docs/OPTIMIZATIONS.md`),
+/// so nothing rebuilds the picture between keyframes: a relayed client that lost one waits for
+/// this window to pass.
 const RELAY_MIN_IDR_INTERVAL_MS: u64 = 1000;
 const RELAY_MAX_IDR_INTERVAL_MS: u64 = 3000;
 
@@ -141,6 +141,12 @@ impl KeyframeGate {
         }
     }
 
+    /// Count a request something in front of the gate held back, so the telemetry total covers
+    /// every suppressed request and not only the ones this window caught.
+    pub fn note_suppressed(&self) {
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn suppressed(&self) -> u64 {
         self.suppressed.load(Ordering::Relaxed)
     }
@@ -154,11 +160,158 @@ impl KeyframeGate {
     }
 }
 
+/// The first window [`PliBackoff`] opens after an answered PLI keeps being followed by more.
+pub const PLI_BACKOFF_FLOOR_MS: u64 = 200;
+
+/// The widest it opens: one keyframe every two seconds for a receiver that never stops asking.
+pub const PLI_BACKOFF_CAP_MS: u64 = 2000;
+
+/// A PLI-free stretch this long means whatever was asking has been satisfied.
+const PLI_QUIET_RESET_MS: u64 = 2 * PLI_BACKOFF_CAP_MS;
+
+/// Rate limit for keyframe requests that arrive as RTCP PLI/FIR, on top of [`KeyframeGate`].
+///
+/// A receiver whose frames are consumed by an encoded transform — every WebCodecs client page,
+/// the relay's older copy and the pre-overhaul page included — never feeds libwebrtc's own
+/// decoder, and libwebrtc answers a decoder that has had nothing decodable for 200 ms with a
+/// keyframe request, forever. Measured on the Windows dev box: 117 PLIs in a 30 s static window,
+/// all admitted by the 200 ms same-network gate, so the host emitted an IDR every ~280 ms for the
+/// whole session. Nothing in the RTCP packet tells that receiver apart from one that really lost
+/// its picture, so this goes by behaviour: a decoder an IDR fixes stops asking, and one that keeps
+/// asking after being answered is not being fixed by IDRs. Each answered PLI that is followed by
+/// another doubles the window, up to [`PLI_BACKOFF_CAP_MS`]; a quiet stretch closes it again.
+///
+/// Evidence that a request is real opens the window at once: transport-wide feedback or a NACK
+/// reporting a lost packet, or the client's own stats showing its keyframe-request counter moved.
+/// The client's out-of-band request (opcode 0x64) never comes through here at all.
+#[derive(Debug)]
+pub struct PliBackoff {
+    window_ns: u64,
+    last_admit_ns: Option<u64>,
+    last_pli_ns: Option<u64>,
+    evidence: bool,
+    pub suppressed: u64,
+}
+
+impl Default for PliBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PliBackoff {
+    pub fn new() -> Self {
+        Self {
+            window_ns: 0,
+            last_admit_ns: None,
+            last_pli_ns: None,
+            evidence: false,
+            suppressed: 0,
+        }
+    }
+
+    /// Something says the next request is genuine: a loss report, or the client counting one.
+    pub fn note_evidence(&mut self) {
+        self.evidence = true;
+    }
+
+    /// Whether this PLI/FIR may go on to the session's [`KeyframeGate`].
+    pub fn allow(&mut self, now_ns: u64) -> bool {
+        let quiet = self
+            .last_pli_ns
+            .is_none_or(|t| now_ns.saturating_sub(t) >= PLI_QUIET_RESET_MS * 1_000_000);
+        self.last_pli_ns = Some(now_ns);
+        if quiet || std::mem::take(&mut self.evidence) {
+            self.window_ns = 0;
+        }
+        if let Some(t) = self.last_admit_ns {
+            if now_ns.saturating_sub(t) < self.window_ns {
+                self.suppressed += 1;
+                return false;
+            }
+        }
+        self.last_admit_ns = Some(now_ns);
+        // Opened for the *next* request: a receiver satisfied by this answer never meets it.
+        self.window_ns = (self.window_ns * 2).clamp(
+            PLI_BACKOFF_FLOOR_MS * 1_000_000,
+            PLI_BACKOFF_CAP_MS * 1_000_000,
+        );
+        true
+    }
+
+    pub fn window_ms(&self) -> u64 {
+        self.window_ns / 1_000_000
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MS: u64 = 1_000_000;
+
+    /// libwebrtc's starving-decoder cadence, 30 s of it.
+    fn admitted_under_starvation(b: &mut PliBackoff, every_ms: u64, seconds: u64) -> u32 {
+        let mut n = 0;
+        let mut t = 1_000 * MS;
+        let end = t + seconds * 1_000 * MS;
+        while t < end {
+            if b.allow(t) {
+                n += 1;
+            }
+            t += every_ms * MS;
+        }
+        n
+    }
+
+    #[test]
+    fn a_receiver_that_never_stops_asking_backs_off_to_the_cap() {
+        let mut b = PliBackoff::new();
+        let n = admitted_under_starvation(&mut b, 200, 30);
+        // 200, 400, 800, 1600 then 2000 ms apart: about 18 in 30 s against the 150 that a
+        // 200 ms gate admits.
+        assert!(
+            n <= 20,
+            "starvation PLIs must collapse to the cap; got {n} in 30 s"
+        );
+        assert!(n >= 14, "and must still be answered at the cap; got {n}");
+        assert_eq!(b.window_ms(), PLI_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn a_decoder_one_keyframe_fixes_is_answered_at_once_every_time() {
+        let mut b = PliBackoff::new();
+        // One request, a few seconds of health, another: each one is the first in a while.
+        for i in 0..10u64 {
+            assert!(
+                b.allow(1_000 * MS + i * 5_000 * MS),
+                "request {i} was delayed"
+            );
+        }
+        assert_eq!(b.suppressed, 0);
+    }
+
+    #[test]
+    fn evidence_of_loss_opens_the_window_immediately() {
+        let mut b = PliBackoff::new();
+        admitted_under_starvation(&mut b, 200, 10);
+        // Keep the starvation cadence going until a request is actually held back.
+        let mut t = 11_000 * MS;
+        while b.allow(t) {
+            t += 200 * MS;
+        }
+        b.note_evidence();
+        assert!(
+            b.allow(t + 200 * MS),
+            "a PLI after reported loss must not wait out the backoff"
+        );
+    }
+
+    #[test]
+    fn the_first_request_of_a_session_is_never_held() {
+        let mut b = PliBackoff::new();
+        assert!(b.allow(0));
+    }
 
     #[test]
     fn the_first_request_is_always_admitted() {
