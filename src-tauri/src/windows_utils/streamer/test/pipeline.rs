@@ -1,5 +1,20 @@
 use crate::streamer::config::{Config, ScalePercent};
-use crate::windows_utils::streamer::pipeline::{live_encoder_config, scaled_dims};
+use crate::windows_capture::capture::GraphicsCaptureApiError;
+use crate::windows_utils::streamer::pipeline::{
+    live_encoder_config, scaled_dims, wgc_start_error, StaleMonitor,
+};
+
+/// A capture item that cannot be created from the monitor handle is the one WGC start failure
+/// `start_on_monitor` retries before falling to DXGI; every other failure goes straight there.
+#[test]
+fn only_an_item_conversion_failure_is_classified_stale() {
+    let stale = wgc_start_error(GraphicsCaptureApiError::ItemConvertFailed);
+    assert!(stale.downcast_ref::<StaleMonitor>().is_some());
+    assert!(format!("{stale:#}").contains("GraphicsCaptureItem"));
+
+    let other = wgc_start_error(GraphicsCaptureApiError::FailedToInitWinRT);
+    assert!(other.downcast_ref::<StaleMonitor>().is_none());
+}
 
 #[test]
 fn scale_100_is_native_passthrough() {
