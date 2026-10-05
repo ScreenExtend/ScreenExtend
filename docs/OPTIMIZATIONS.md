@@ -4173,3 +4173,26 @@ code paths are the old ones (startup `remove_all`, whole-list commits, ids from 
 each with its own display, all removed at exit; numbers in `scripts/test-handler/README.md`). The
 macOS file changed only by the mechanical `config.json` → `config_store()` swap
 (`macos_utils/networking.rs`) and is not compiled here.
+
+## G01-MINUPDATE — WGC delivered ~190 frames a second to a 60 fps session once two virtual displays were attached — `VERIFIED` (one run per arm)
+
+`ff8bfff` replaced the pre-overhaul `MinUpdateInterval = frame_period * 2/3` with a flat 4 ms.
+With one virtual display attached that changes nothing (≈ 64 deliveries a second at 60 Hz either
+way; 1080p p50 25.3/25.8 vs 25.2/23.3 ms). With two or more the internal panel runs at 360 Hz and
+DWM composes each 60 Hz virtual display about three times too often; at 4 ms WGC handed the
+second session ~190 frames a second (full-surface copies and callbacks, two thirds of them then
+dropped by the cadence gate), at 12 ms ~70, with latency level (handler `two_clients`: B p50
+30.6/19.6 vs 29.1/21.5 ms). A fixed 12 ms capped a 120 Hz session at 64.7 painted fps against
+91.7, so the floor is back to two thirds of the stream's own period, never under 4 ms
+(`wgc_min_update_interval`). It also bounds cursor-exempt frames at 1.5× the stream's rate (≈ 90
+fps at 60 Hz, the pre-overhaul bound; `UNVERIFIED`, no pointer may be moved). Detail:
+`docs/overhaul-new/G01.md` E3, E5.
+
+## G01-STALEMON — a WGC start on a stale monitor handle fell to a DXGI path that never delivers — `VERIFIED` (forced)
+
+A join sets the display's mode just before capture; the `HMONITOR` resolved before that can be
+dead when WGC converts it (`ItemConvertFailed`). The host went straight to DXGI, which on this
+hybrid laptop never delivers a frame of an IDD display (41 re-establishes, then stop): the page
+retried its offer and the first picture took 12.9 s. Now re-resolved and retried on WGC up to 5
+times, 200 ms apart, before DXGI. Forced three times through the same path: recovered on WGC,
+first picture 5.6 s. The natural failure (about one join in 50) was not reproduced on demand.
