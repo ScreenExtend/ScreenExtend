@@ -136,7 +136,7 @@ impl EventsSubscription {
                 });
                 if let Err(e) = res {
                     if let Err(e) = result_tx.send(e) {
-                        log::error!(
+                        teprintln!(
                             "Event receiver panicked, but subscription is already dropped: {:?}",
                             e
                         );
@@ -225,8 +225,10 @@ impl Drop for EventsSubscription {
         let Some(ref mut rx) = self.result_rx else {
             return;
         };
-        if let Err(e) = rx.try_recv() {
-            log::error!(
+        // `Ok` is the panic payload the callback sent; `Err` is only "nothing was sent" (the
+        // normal case), which this used to report as a panic on every drop.
+        if let Ok(e) = rx.try_recv() {
+            teprintln!(
                 "Event receiver panicked, but subscription is dropped without canceling: {:?}",
                 e
             );
