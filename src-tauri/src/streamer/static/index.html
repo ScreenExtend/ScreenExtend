@@ -2186,6 +2186,27 @@
             const TRANSFORM_START_TIMEOUT_MS = 2500;
             const FRAME_WATCHDOG_MS = 5000;
             const WHEP_TIMEOUT_MS = 10000;
+            const ANSWER_TIMEOUT_TEXT = 'The host did not answer in time.';
+
+            // What a failed setup leads to. A host that did not answer in time says nothing about
+            // the video path, so it is not a reason to give up WebCodecs: it used to be answered
+            // with `fallbackToVideo`, and a session that lost one answer then ran on the <video>
+            // element and its jitter buffer for good. It is offered again once on the same tier,
+            // presenting whatever join id this tab holds. (A first join that lost its answer
+            // holds none, so the host still opens a second session beside the one it answered;
+            // that one is closed when its ICE fails. Recognising the retry needs the host.)
+            let answerRetried = false;
+            function setupFailureAction(err, s) {
+                const msg = (err && err.message) || '';
+                if (/Invalid session ID or OTP/.test(msg)) return s.reconfiguringLive ? 'poll' : 'error';
+                // The same holds for a POST the host refused or a connection that dropped: none
+                // of them is about this browser's decoder.
+                const hostSide = msg === ANSWER_TIMEOUT_TEXT || /^WHEP POST failed: 5\d\d|Failed to fetch|NetworkError|network error/i.test(msg);
+                if (hostSide && !s.answerRetried) return 'retry';
+                if (s.webcodecsTier) return 'video';
+                if (s.reconfiguringLive) return 'poll';
+                return 'error';
+            }
 
             // `keepJoin` says this is the same session offering again rather than a new one.
             // `teardownSession` has already decided whether `currentJoinId` survives, so the
@@ -2597,7 +2618,7 @@
                     try {
                         resp = await fetch('/whep', whepOpts);
                     } catch (err) {
-                        if (whepAbort && whepAbort.signal.aborted) throw new Error('The host did not answer in time.');
+                        if (whepAbort && whepAbort.signal.aborted) throw new Error(ANSWER_TIMEOUT_TEXT);
                         throw err;
                     } finally {
                         if (whepTimer) clearTimeout(whepTimer);
@@ -2605,6 +2626,8 @@
                     if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    // An answer arrived, so a later lost one gets its own retry.
+                    answerRetried = false;
                     // Read before anything can return: this join was accepted, and the token it
                     // issued is what a rejoin — including the one two lines below — presents
                     // instead of the OTP.
@@ -2682,10 +2705,18 @@
                     // A newer start() already owns pc and worker; this one's failure is about a
                     // connection nobody is using any more.
                     if (stale()) { noteSuppressed(); return; }
-                    const isAuthError = /Invalid session ID or OTP/.test(err && err.message);
-                    if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
+                    const action = setupFailureAction(err, {
+                        answerRetried: answerRetried,
+                        webcodecsTier: preferWebCodecs && canWebCodecs && !usingFallback,
+                        reconfiguringLive: reconfiguring && isLive,
+                    });
+                    if (action === 'retry') {
+                        answerRetried = true;
+                        console.warn('[join] ' + errorText(err) + ' — offering again on the same video path');
+                        start(preferWebCodecs, true);
+                    } else if (action === 'video') {
                         fallbackToVideo('setup error: ' + errorText(err));
-                    } else if (reconfiguring && isLive) {
+                    } else if (action === 'poll') {
                         reconfiguring = false;
                         startReconfigPoll();
                     } else {
@@ -3197,6 +3228,7 @@
                 kicked = false;
                 leaveSent = false;
                 usingFallback = false;
+                answerRetried = false;
                 reconfigEpoch = null;
                 kickEpoch = null;
                 connectBtn.disabled = true;
