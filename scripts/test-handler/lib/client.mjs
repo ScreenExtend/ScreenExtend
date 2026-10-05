@@ -86,6 +86,7 @@ export class Client {
 
   /** Turn the paint hook on (a cfg) or off (null) in the page and every worker. */
   async setStampCfg(cfg) {
+    if (cfg && cfg.mode === 'stamp' && this.stampBand) cfg = { ...cfg, band: this.stampBand };
     this.stampCfg = cfg; const expr = `self.__seStamp && (__seStamp.cfg = ${JSON.stringify(cfg)}, __seStamp.prev = null, true)`;
     await this.page.ev(expr).catch(() => {});
     for (const sid of this.workers.keys()) await this.page.send('Runtime.evaluate', { expression: expr }, sid).catch(() => {});
@@ -205,7 +206,7 @@ export class Client {
     }
     await this.setStampCfg(null); await sleep(100);
     const d = await this.drainStamps(); samples.push(...d.samples); counters = d.counters;
-    return { samples: samples.map((s) => (s.v !== undefined ? { ts: s.t, stamp: unwrap(s.v, s.t), where: s.where } : { ts: s.t, error: s.e, where: s.where })), counters, geometryChanges, method: 'paint hook' };
+    return { samples: samples.map((s) => (s.v !== undefined ? { ts: s.t, stamp: unwrap(s.v, s.t), where: s.where } : { ts: s.t, error: s.e, where: s.where, luma: s.l })), counters, geometryChanges, method: 'paint hook' };
   }
 
   async collectStampsScreencast(stage, ms, { maxWidth = this.scWidth } = {}) {
@@ -281,6 +282,9 @@ export class Client {
 export function stampMetrics(samples, { from, to, offsetMs = 0 }) {
   const inWin = samples.filter((s) => s.ts >= from && s.ts <= to);
   const errors = {}; for (const s of inWin) if (s.error) errors[s.error] = (errors[s.error] || 0) + 1;
+  // The cell luminances of the first failed reads (paint hook keeps up to 40 per context), so a
+  // failure can be told apart: two valid stamps torn together, or cells blurred towards grey.
+  const errorLuma = inWin.filter((s) => s.luma).slice(0, 12).map((s) => ({ ts: Math.round(s.ts), luma: s.luma }));
   // A misread that slips past the 8-bit check shows up as an impossible age; count it, drop it.
   const ok = inWin.filter((s) => s.stamp !== undefined && s.ts - offsetMs - s.stamp > -5 && s.ts - offsetMs - s.stamp < 5000);
   const implausible = inWin.filter((s) => s.stamp !== undefined).length - ok.length;
@@ -298,7 +302,7 @@ export function stampMetrics(samples, { from, to, offsetMs = 0 }) {
   const sortedIncr = [...incr].sort((a, b) => a - b); const medIncr = sortedIncr.length ? sortedIncr[sortedIncr.length >> 1] : null;
   return {
     latencyMs: dist(lat),
-    samples: inWin.length, decoded: ok.length, decodeErrors: errors,
+    samples: inWin.length, decoded: ok.length, decodeErrors: errors, errorLuma,
     newStamps: lat.length, paintedFps: secs > 0 ? Math.round((lat.length / secs) * 10) / 10 : null,
     duplicateFrames: dups, backwardsStamps: backwards,
     stampIncrementMs: dist(incr), skippedStamps: medIncr ? incr.filter((x) => x > 1.5 * medIncr).length : null,
