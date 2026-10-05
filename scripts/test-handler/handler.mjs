@@ -18,7 +18,7 @@ import { ROOT, acquireSlot, acquireAll, releaseSlots, measureLock, pidAlive, slo
 import { probeBuild, startHost, stopHost, runCli, cliJson, randomSessionId, randomOtp } from './lib/host.mjs';
 import { Client, stampMetrics } from './lib/client.mjs';
 import { driverState, driverRemove } from './lib/driver.mjs';
-import { startLoadSampler, snapshot, waitForQuiet } from './lib/load.mjs';
+import { startLoadSampler, snapshot, waitForQuiet, memSnapshot } from './lib/load.mjs';
 import { dist, spread } from './lib/metrics.mjs';
 import { sleep } from './lib/cdp.mjs';
 
@@ -701,7 +701,8 @@ async function moverStopTest(cl) {
   });
   const stale = stops.filter((s) => s.errorPx == null || Math.abs(s.errorPx) > 6);
   await leave(cl);
-  return { params: { cycles, moveS, holdS, stepMs, speedPxPerMs: speed, display: { width: ready.width, height: ready.height } }, stops, staleStops: stale.length, of: stops.length, note: 'settledX: where the orange window sits in the last painted frame of the hold (after 60 % of it), read from a 2-row band, 2 px resolution at 1920 wide; stale = more than 6 px from where the stage stopped it. reachedMs: stop -> first painted frame showing the true position.' };
+  const diag = { samples: res.length, found: res.filter((x) => x.mx != null).length, firstT: res.length ? Math.round(res[0].t - off) : null, lastT: res.length ? Math.round(res[res.length - 1].t - off) : null, firstStopT: stopsRaw.length ? stopsRaw[0].t : null, notFoundSamples: res.filter((x) => x.smp).slice(0, 5).map((x) => x.smp), stage: ready };
+  return { diag, params: { cycles, moveS, holdS, stepMs, speedPxPerMs: speed, display: { width: ready.width, height: ready.height } }, stops, staleStops: stale.length, of: stops.length, note: 'settledX: where the orange window sits in the last painted frame of the hold (after 60 % of it), read from a 2-row band, 2 px resolution at 1920 wide; stale = more than 6 px from where the stage stopped it. reachedMs: stop -> first painted frame showing the true position.' };
 }
 
 async function autoRejoin(cl) {
@@ -841,7 +842,18 @@ async function main() {
     // attached, streams on this build were seen to freeze, retarget or slow down (README,
     // "Concurrency"). Host start, browser start and teardown still overlap. `overlap_displays`
     // restores per-window locking, for a caller who wants that and accepts the risk.
-    if (REQ.overlap_displays) await body(); else await underLock('live-display', body);
+    // The WUDFHost leak per display: snapshots at both ends of the live-display part, under the
+    // lock, so the delta is this run's own (no other test creates a display while it is held).
+    const memBody = async () => {
+      const before = await memSnapshot();
+      try { await body(); } finally {
+        const after = await memSnapshot();
+        const joins = (R.joins || []).length + (R.special.two_clients ? 1 : 0);
+        const d = (k) => (after[k] != null && before[k] != null ? +(after[k] - before[k]).toFixed(1) : null);
+        R.memory = { before, after, joinsInWindow: joins, wudfCommitDeltaMB: d('wudfCommitMB'), wudfHandlesDelta: d('wudfHandles'), wudfThreadsDelta: d('wudfThreads'), note: 'largest WUDFHost (virtual display driver host) before and after the live-display part; joins counts joins[] (+1 for a two_clients second browser); renegotiations and fallback tiers that reuse a display are not counted separately' };
+      }
+    };
+    if (REQ.overlap_displays) await memBody(); else await underLock('live-display', memBody);
     if (REQ.loss) { R.special.loss = { notRun: true, reason: 'inducing packet loss on this machine needs admin rights (a WFP/clumsy-style driver or netsh) or touching the owner\'s network; neither is allowed. Not run.' }; R.notRun.push('loss'); }
     R.extraJoinsSeen = (await hostJoins()).joins;
     R.pageConsole = { warningsAndErrors: cl.console.filter((c) => /warn|error|exception/.test(c.level)).slice(0, 200), total: cl.console.length };

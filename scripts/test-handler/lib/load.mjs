@@ -52,6 +52,26 @@ export async function waitForQuiet({ maxCpu = 75, maxWaitMs = 180000, sampleMs =
   }
 }
 
+/**
+ * Memory state: commit headroom, free physical memory, and the largest WUDFHost (the virtual
+ * display driver's host process, which leaks with every display created). Taken at the start and
+ * end of the live-display part of a run, under the measurement lock, so no other test creates a
+ * display in between and the WUDFHost delta is this run's own.
+ */
+export function memSnapshot() {
+  const ps = "$c=(Get-Counter '\\Memory\\Committed Bytes','\\Memory\\Commit Limit').CounterSamples; " +
+    "$w = Get-Process WUDFHost -ErrorAction SilentlyContinue | Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 1; " +
+    "$os = Get-CimInstance Win32_OperatingSystem; " +
+    "[pscustomobject]@{ commitHeadroomGB=[math]::Round(($c[1].CookedValue-$c[0].CookedValue)/1GB,2); freePhysGB=[math]::Round($os.FreePhysicalMemory/1MB,2); " +
+    "wudfPid=$w.Id; wudfCommitMB=[math]::Round($w.PrivateMemorySize64/1MB,1); wudfHandles=$w.HandleCount; wudfThreads=$w.Threads.Count } | ConvertTo-Json -Compress; exit 0";
+  return new Promise((resolve) => {
+    execFile('powershell', ['-NoProfile', '-Command', ps], { timeout: 20000, windowsHide: true, encoding: 'utf8' }, (err, out) => {
+      if (err) return resolve({ error: err.message });
+      try { resolve({ t: Date.now(), ...JSON.parse(out.trim()) }); } catch (e) { resolve({ error: 'parse: ' + out.slice(0, 200) }); }
+    });
+  });
+}
+
 function summarize(s) {
   const pick = (k) => s.map((x) => x[k]).filter((v) => typeof v === 'number' && !Number.isNaN(v));
   const st = (k) => { const v = pick(k); if (!v.length) return null; return { mean: +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1), max: Math.max(...v) }; };
