@@ -68,7 +68,7 @@ epochs, meaningless on their own but valid as a *difference*, which is all A/V s
 
 | Stamp | Set where |
 |---|---|
-| `capture_available_ns` | The OS's own frame time: WGC `SystemRelativeTime`, DXGI `LastPresentTime`, CGDisplayStream `displayTime`, ScreenCaptureKit PTS. 0 when the backend supplies none. |
+| `capture_available_ns` | The OS's own frame time: DXGI `LastPresentTime`, CGDisplayStream `displayTime` (only when in the past), ScreenCaptureKit PTS. 0 when the backend supplies none — **including WGC**, whose `SystemRelativeTime` is the composition's target present time, 3–14 ms after our callback on almost every frame (measured 2026-10-05; see `windows_utils/streamer/clock.rs`). On WGC, `capture_delivery` is therefore empty and the capture-relative stages start at callback entry. |
 | `capture_cb_entry_ns` | Entry to our capture callback. |
 | `scale_done_ns` | After the GPU downscale (ring path). |
 | `encode_submit_ns` | Immediately before handing the frame to the encoder. |
@@ -155,7 +155,9 @@ pairs:
   that has lost its reference chain emits a PLI for every frame in its backlog, and on an
   infinite-GOP encoder answering each one produces the largest frame the session can send — which
   is what turns a stumble into a keyframe storm. So a large suppressed/requested ratio is healthy;
-  `idrs_sent` is what the encoder was actually told to do.
+  `idrs_sent` is what the encoder was actually told to do. (Checked against the bitstream on the
+  Windows NVENC ring path, 2026-10-05: 241 `idrs_sent`, 241 SPS-carrying access units written to
+  the socket in the same session.)
 - `frames_dropped_broadcast` is frames the encoder-to-viewer broadcast dropped on a viewer that
   fell behind. Distinct from `frames_dropped_ring`, which is the capture side.
 - `delay_overuse_events` is intervals where the delay-gradient estimator said a queue was filling.

@@ -1,11 +1,15 @@
 //! QPC → host-clock conversion for the timestamps the capture APIs hand us.
 //!
-//! Both Windows capture backends attach a timestamp to every frame and both were being
-//! discarded: WGC's `Direct3D11CaptureFrame::SystemRelativeTime` (a `TimeSpan`, 100 ns units of
-//! QPC time since boot) and DXGI duplication's `DXGI_OUTDUPL_FRAME_INFO::LastPresentTime` (raw
-//! QPC ticks). They are the only stamps that say when the pixels existed rather than when our
-//! callback got round to them, so the difference between them and callback entry is the delivery
-//! latency the host adds before doing any work at all.
+//! DXGI duplication's `DXGI_OUTDUPL_FRAME_INFO::LastPresentTime` (raw QPC ticks) says when the
+//! pixels were presented, so the difference between it and callback entry is the delivery latency
+//! the host adds before doing any work at all.
+//!
+//! WGC's `Direct3D11CaptureFrame::SystemRelativeTime` is deliberately **not** converted. It is on
+//! the same QPC timebase, but measured on the Windows dev box (2026-10-05, 120-frame blocks over a
+//! 1080p session) it sat 3-14 ms (mean 8-11 ms) *after* our own callback entry on 2,879 of 2,880
+//! frames: it is the composition's target present time, not the moment the frame existed. Used as
+//! the origin it made `capture_delivery` drop every sample but the stale ones (3 of ~9,900) and
+//! `capture_to_encode` / `capture_to_socket` drop ~89 % of frames and keep a biased remainder.
 //!
 //! The rest of the streamer measures against `streamer::audio::host_now_ns()`, whose epoch is an
 //! `Instant` taken at process start. On Windows `Instant` is itself QPC-backed, so the two clocks
@@ -69,14 +73,6 @@ pub fn boot_ns_to_host_ns(boot_ns: u64) -> u64 {
     }
 }
 
-/// WGC hands `SystemRelativeTime` as a `TimeSpan` in 100 ns units.
-pub fn wgc_timespan_to_host_ns(duration_100ns: i64) -> u64 {
-    if duration_100ns <= 0 {
-        return 0;
-    }
-    boot_ns_to_host_ns(duration_100ns as u64 * 100)
-}
-
 /// DXGI hands `LastPresentTime` as raw QPC ticks.
 pub fn dxgi_present_time_to_host_ns(ticks: i64) -> u64 {
     boot_ns_to_host_ns(qpc_ticks_to_boot_ns(ticks))
@@ -101,8 +97,6 @@ mod tests {
     #[test]
     fn a_missing_or_pre_epoch_stamp_reads_as_absent() {
         assert_eq!(boot_ns_to_host_ns(0), 0);
-        assert_eq!(wgc_timespan_to_host_ns(0), 0);
-        assert_eq!(wgc_timespan_to_host_ns(-5), 0);
         assert_eq!(dxgi_present_time_to_host_ns(0), 0);
         // A stamp from long before this process started must not wrap into a huge positive.
         assert_eq!(boot_ns_to_host_ns(1), 0);
