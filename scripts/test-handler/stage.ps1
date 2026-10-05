@@ -17,7 +17,13 @@ param(
   [string]$NewScreenNotIn = '',   # wait for a screen not in this ';'-list (a join's display) and use it
   [int]$Seconds = 20,
   [switch]$Stamp, [switch]$Mover, [switch]$Large,
-  [int]$WaitSeconds = 15
+  [int]$WaitSeconds = 15,
+  # Mover motion: one step every MoverStepMs at MoverSpeed px/ms. With MoveSeconds > 0 the mover
+  # alternates MoveSeconds of motion with HoldSeconds standing still, and prints
+  # {"stop":n,"x":..,"y":..,"t":epoch-ms} (display-relative) the moment each hold begins, so a
+  # reader can check where the client's picture comes to rest against where the window really is.
+  [int]$MoverStepMs = 16, [double]$MoverSpeed = 0.6,
+  [double]$MoveSeconds = 0, [double]$HoldSeconds = 0
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -181,6 +187,7 @@ Ready-Line
 $epoch = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
 $sw = [System.Diagnostics.Stopwatch]::StartNew(); $draws = 0; $lastSlow = -100
 $lastCheck = 0
+$holding = $false; $phaseStart = 0; $stops = 0; $moveClock = 0
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
   if ($Stamp) {
     $ms = [long]([DateTime]::UtcNow - $epoch).TotalMilliseconds
@@ -200,16 +207,31 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
       Ready-Line
     }
   }
-  if ($now - $lastSlow -ge 16) {
-    $lastSlow = $now
+  $step = if ($Mover) { $MoverStepMs } else { 16 }
+  if ($now - $lastSlow -ge $step) {
+    $dt = $now - $lastSlow; $lastSlow = $now
     if ($Mover) {
-      $x = $b.X + 20 + [int](($now * 0.6) % ($b.Width - 100))
-      $mf.Location = New-Object System.Drawing.Point($x, ($b.Y + [int]($b.Height * 0.4)))
+      if ($MoveSeconds -gt 0) {
+        $phaseLen = if ($holding) { $HoldSeconds * 1000 } else { $MoveSeconds * 1000 }
+        if ($now - $phaseStart -ge $phaseLen) {
+          $holding = -not $holding; $phaseStart = $now
+          if ($holding) {
+            $stops++
+            $ux = [long]([DateTime]::UtcNow - $epoch).TotalMilliseconds
+            "{""stop"":$stops,""x"":$($mf.Location.X - $b.X),""y"":$($mf.Location.Y - $b.Y),""w"":48,""t"":$ux}"; [Console]::Out.Flush()
+          }
+        }
+        if (-not $holding) { $moveClock += [Math]::Min($dt, 4 * $step) }
+        $x = $b.X + 20 + [int](($moveClock * $MoverSpeed) % ($b.Width - 100))
+      } else {
+        $x = $b.X + 20 + [int](($now * $MoverSpeed) % ($b.Width - 100))
+      }
+      if ($mf.Location.X -ne $x) { $mf.Location = New-Object System.Drawing.Point($x, ($b.Y + [int]($b.Height * 0.4))) }
     }
     if ($Large) { $off = [int](($now / 16) % 256); $lg.DrawImageUnscaled($noise, -$off, -((($now / 7) % 256) -as [int])) }
     [System.Windows.Forms.Application]::DoEvents()
   }
-  if (-not $Stamp) { Start-Sleep -Milliseconds 4 } else { [System.Threading.Thread]::Sleep(1) }
+  if (-not $Stamp -and -not $Mover) { Start-Sleep -Milliseconds 4 } else { [System.Threading.Thread]::Sleep(1) }
 }
 foreach ($f in $forms) { $f.Close() }
 "{""done"":true,""stampDraws"":$draws,""seconds"":$Seconds}"
