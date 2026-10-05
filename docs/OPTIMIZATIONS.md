@@ -4585,3 +4585,31 @@ not know, so `status --json` and the verbose summary said "unknown" for a device
 `every_client_audio_path_has_a_name` parses `AUDIO_PATH` out of the shipped `index.html` and
 fails on any value without a name. Found by G06. Detail: `docs/overhaul-new/G06.md` "Findings
 for other groups".
+
+## AOJ-OUTPUTS — the host's speaker list is filled at the join, before the offer; the card only where detection cannot — `VERIFIED` (`mic_prompt` with audio and rejoin, one run; unit tests)
+
+Supersedes the join half of G06-MICCARD at the owner's request ("auto-detect to the best of
+your ability. only if that doesnt work should you prompt for mic access", then "do all perms
+stuff and other stuff BEFORE stream starts. startup time doesnt matter"). Measured first, with
+no host and no display (headless Chrome 154.0.8037.93 and Edge 154.0.4258.53, fresh profiles,
+real and fake devices): with nothing granted both list **exactly one** `audiooutput`, `deviceId`
+and `label` both `""`, on a machine with two speakers; a microphone grant, or `speakerSelection`
+granted through DevTools, lists all four, labelled; `permissions.query({name:
+'speaker-selection'})` throws `TypeError`; `selectAudioOutput` is absent; ids saved under a grant
+are refused by `setSinkId` after the grant is reset (`NotFoundError` on `AudioContext`,
+`SecurityError` on an element). So on Chromium nothing permission-free yields a routable list and
+the first join of a profile that never granted the microphone reaches the card.
+
+`ef9dfe6`: `SEAudio.outputPlan` (pure) + `prepareOutputsForJoin`, awaited by the submit handler
+before the offer with Connect disabled; the audio-prepare and refresh-rate deadlines start after
+it. Report a routable list without asking; card only when nothing is routable, there is a secure
+context with `getUserMedia`, the permission is not `denied`, and this device has not answered the
+card before (`localStorage se.outputs.micCardAnswer`, any answer); `selectAudioOutput()` engines
+never get the microphone and open the browser's chooser from the Join click only when the host
+operator asked (`se:choose`, now queued for the next join instead of raised over the live stage).
+`mic_prompt` on the new build (thin LTO): speaker-granted → no card, 3 labelled outputs reported,
+submit → POST 216 ms; microphone-granted → no card, 3 labelled, 70 ms; nothing granted → the
+card, Skip, POST 128 ms (including the harness's click), one empty-id output, `se:choose` offered;
+the same browser's rejoin → no card (`asked-before`), 71 ms. Audio on in all three: path
+`webcodecs`, context `running`, sink `""` (default), 792–808 DataChannel packets in 4 s, 0
+underruns. Handler extension `e6ba676`. Detail: `docs/overhaul-new/G06.md`, addendum 2026-10-05.

@@ -167,7 +167,7 @@ The per-merge five-run re-measure that `TEST-WORKFLOW.md` §8 asks for was **not
 
 | commit | what it does | measured effect | status (ledger) |
 |---|---|---|---|
-| `c020fc0` | No microphone card or output chooser on the join. Where nothing routable enumerates, the device sheet gets one entry, "Choose a speaker on this device…" (`se:choose`), and only picking it asks the client. | `mic_prompt` with nothing granted: the card on every join, with the join waiting on it → no card, no `getUserMedia`, no permission query. | Fixed, before/after on the same request. |
+| `c020fc0` | No microphone card or output chooser on the join. Where nothing routable enumerates, the device sheet gets one entry, "Choose a speaker on this device…" (`se:choose`), and only picking it asks the client. | `mic_prompt` with nothing granted: the card on every join, with the join waiting on it → no card, no `getUserMedia`, no permission query. | Fixed, before/after on the same request. **Join half superseded by `ef9dfe6` (2026-10-05): outputs detected before the offer, the card only where nothing routable lists — it does appear at a Chrome/Edge profile's first join (measured), at most once per device.** |
 | `61da27a` | A refused or stale saved output no longer reroutes the graph every poll. | `stale_output`: 22 element restarts, 4 underruns → 0, 0. | Fixed, before/after. |
 | `24f75e8` | A page opened on the host machine itself starts muted, which ends the echo loop. | Chrome unmuted: 1/15 clicks detectable, 0.40 RMS still ringing → page muted, no loop. | Fixed, 1 + 1. |
 | `736f0f9` | The spare Opus track is fed once the client steps down to it. | `worker_fails`: 0/15 clicks → 15/15 together with `201a981`. | Fixed, before/after. |
@@ -333,7 +333,8 @@ The fixes among them that changed what earlier numbers meant are listed in `BASE
   - The old page had the same rule (`BASELINE.md` O-5, `G06.md`).
 - **Fixed.** `c020fc0`: no card and no `getUserMedia` on the join. The new "Choose a speaker on this device…" entry is the only door.
 - **Evidence.** `mic_prompt` before/after.
-- **Remains.** `se:choose` end to end with a real browser and a human answering the card.
+- **Superseded 2026-10-05 (`audio-outputs-at-join`, `ef9dfe6`), at the owner's request** ("auto-detect … only if that doesnt work should you prompt", "do all perms stuff … BEFORE stream starts"). The join now detects the outputs before the offer and reports any routable list without asking; the card is raised, before the offer, only when nothing routable came back and a grant can help, and at most once per device. **Measured: desktop Chrome/Edge 154 with no grant list exactly one output with an empty id and label, whatever is attached, so the card does appear at the first join of a profile that never granted the microphone** — contrary to the expectation that auto-detect works on most desktops. A granted microphone (or a remembered answer) means no card. Nothing is raised over a live stage any more: `se:choose` waits for the device's next join. Detail: `G06.md` addendum 2026-10-05; `OPTIMIZATIONS.md` AOJ-OUTPUTS.
+- **Remains.** The card and the browser's prompt in a real headed Chrome/Edge with a human answering; Firefox's chooser at the Join click; Safari/iOS.
 
 **6. Logs do not come through.**
 
@@ -373,7 +374,7 @@ The fixes among them that changed what earlier numbers meant are listed in `BASE
 | same-machine echo loop | `24f75e8` | E9 |
 | stale output restarted playback every second | `61da27a` | `stale_output` tier |
 | refused output re-offered over the stage | `83facec` | harness |
-| microphone card on the join | `c020fc0` | `mic_prompt` |
+| microphone card on the join | `c020fc0`, then `ef9dfe6` (before the offer, only where detection fails, once per device) | `mic_prompt` (three cases + rejoin) |
 | WGC capture stamp in the future; keepalive encode stamped after the encode | `3120abf`, `e96fe2c` | diagnostic switch; reading |
 | log bus emit race; `LOGS` arming the panel; U+FFFD; closed-pipe panic; control server late; avatar errors lost | `304cf95`, `8e4db79`, `3032603`, `8423abf`, `52c3eb3`, `18311e0` | tests and reproductions in `G09.md` |
 | `driver_ipc` errors lost; `Drop` misreported a panic | `1eca751` | reading |
@@ -532,7 +533,7 @@ Each question gives what was assumed and what changes if the answer differs. Dup
 18. **Remove `5e2dff0`'s codec-hint wait, or arm it from the answer?** (`G05.md`)
     - **Assumed:** leave it (inert).
 19. **Should the microphone card ever block the join again?** (`G07.md`)
-    - **Assumed:** no.
+    - **Answered by the owner (2026-10-05):** yes, all permission work before the stream starts; startup time does not matter. Implemented in `ef9dfe6`; see `G06.md` addendum, whose own questions (the card at a Chrome/Edge first join; `se:choose` waiting for the next join) are open.
 20. **Is a 0.4–0.8 s one-off main-thread task at page load acceptable on phones, for a faster first join?** (`G07.md`)
     - **Assumed:** yes.
     - **If not:** run the warm-up on the form's first focus.
