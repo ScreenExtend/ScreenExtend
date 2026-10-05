@@ -1064,7 +1064,9 @@ mod tests {
     #[test]
     fn every_client_audio_path_has_a_name() {
         let page = include_str!("static/index.html");
-        let start = page.find("const AUDIO_PATH = {").expect("AUDIO_PATH in index.html");
+        let start = page
+            .find("const AUDIO_PATH = {")
+            .expect("AUDIO_PATH in index.html");
         let body = &page[start..];
         let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
         let codes: Vec<u8> = body
