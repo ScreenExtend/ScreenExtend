@@ -66,10 +66,24 @@ const OPUS_FALLBACK_FMTP: &str = "minptime=5;stereo=1;sprop-stereo=1";
 /// worthless. 40 ms is two Opus frames more than the client's own maximum jitter target.
 const AUDIO_BACKPRESSURE_MS: usize = 40;
 
+/// What `buffered_amount` counts on top of the queue: bytes already *sent* but not yet
+/// acknowledged.
+///
+/// webrtc-sctp 0.17.1 adds a message to `buffered_amount` when it is queued and releases it only
+/// in `handle_sack` (`stream::on_buffer_released`), so a datagram that is on the wire, or already
+/// delivered, still counts until the peer's SACK for it arrives — and an SCTP receiver may hold
+/// that SACK for up to 200 ms (RFC 9260 §6.2; webrtc-sctp's own `ACK_INTERVAL` is 200 ms). With
+/// the bare 40 ms threshold, one delayed SACK was a full queue: the forwarder dropped every packet
+/// until the SACK landed, in bursts of 41–43 packets (~205–215 ms of audio, G06's measurement),
+/// each an audible hole, on an idle loopback link. Allowing one SACK interval of in-flight data
+/// keeps the drop for a channel that is genuinely backed up.
+const AUDIO_SACK_ALLOWANCE_MS: usize = 220;
+
 /// The byte figure that `AUDIO_BACKPRESSURE_MS` works out to for the message size actually
 /// being sent, so the policy tracks the bitrate instead of assuming one.
 fn backpressure_limit_bytes(msg_len: usize) -> usize {
-    let frames = AUDIO_BACKPRESSURE_MS / crate::streamer::audio::encoder::FRAME_MS as usize;
+    let frames = (AUDIO_BACKPRESSURE_MS + AUDIO_SACK_ALLOWANCE_MS)
+        / crate::streamer::audio::encoder::FRAME_MS as usize;
     frames * msg_len.max(1)
 }
 
