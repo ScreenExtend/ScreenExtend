@@ -76,6 +76,10 @@ struct JoinRequest {
     /// live and belongs to the same device token.
     #[serde(default, rename = "joinId")]
     join_id: String,
+    /// Minted once per page load by the client (32 lowercase hex). Absent on older pages and
+    /// on the relay's page. See `session::pending_join_for_attempt`.
+    #[serde(default, rename = "attemptId")]
+    attempt_id: String,
     #[serde(default, rename = "audioCapabilities")]
     audio_capabilities: AudioCapabilities,
     #[serde(
@@ -1312,7 +1316,26 @@ pub async fn process_whep(
         // device on every OTP join, and the per-device override map is keyed by that name — so
         // the rebuild a settings change triggers came back under a token with no settings, and
         // the change the user had just made was the one thing the reconnect did not carry.
+        // The OTP has validated. A page that lost its answer offers again with no join id and,
+        // on a first join, no token: if the join that answer opened is still waiting for it,
+        // this is that device, under the token the lost answer carried.
+        let retried = if req.join_id.trim().is_empty() {
+            state.config.sessions.as_ref().and_then(|s| {
+                session::pending_join_for_attempt(s, req.attempt_id.trim(), &presented_token)
+            })
+        } else {
+            None
+        };
         match state.config.device_overrides.as_ref() {
+            _ if retried.is_some() => {
+                let (join, token) = retried.unwrap_or_default();
+                tprintln!(
+                    "join retried attempt {} for join {join}, whose answer never arrived; \
+                     keeping its token",
+                    req.attempt_id.trim()
+                );
+                token
+            }
             Some(overrides) if session::is_known_device(overrides, &presented_token) => {
                 tprintln!(
                     "join accepted: {device_key} re-presented a device token this host has \
@@ -1387,6 +1410,39 @@ fn continuing_join(
     }
 }
 
+/// The client's `attemptId` when it has the one shape the page mints (32 lowercase hex),
+/// else empty: a malformed value is simply not an attempt id.
+fn attempt_shape(raw: &str) -> &str {
+    let raw = raw.trim();
+    if valid_join_id(raw) {
+        raw
+    } else {
+        ""
+    }
+}
+
+/// A fresh offer (no join id) from the page load whose earlier answer never arrived.
+///
+/// `process_whep` has already validated the OTP and adopted that join's token, so the token
+/// check here is what ties the two together; `session::pending_join_for_attempt` refuses any
+/// join that has connected or that already has its own different device.
+fn attempt_continuation(
+    sessions: &session::SharedSessions,
+    claimed: &str,
+    attempt: &str,
+    device_token: &str,
+) -> Option<String> {
+    if !claimed.trim().is_empty() || device_token.is_empty() {
+        return None;
+    }
+    let attempt = attempt_shape(attempt);
+    let (join, token) = session::pending_join_for_attempt(sessions, attempt, device_token)?;
+    (token == device_token).then(|| {
+        tprintln!("offer from attempt {attempt} continues join {join}, whose answer was lost");
+        join
+    })
+}
+
 /// A relayed offer that names no join, from a relay client that already holds a live one.
 ///
 /// The relay serves its own, older copy of the client page, which knows nothing of join ids: it
@@ -1435,6 +1491,7 @@ async fn start_session(
     // an unknown id, or one belonging to another device, is a fresh join.
     let continuing = state.config.sessions.as_ref().and_then(|s| {
         continuing_join(s, &req.join_id, device_token)
+            .or_else(|| attempt_continuation(s, &req.join_id, &req.attempt_id, device_token))
             .or_else(|| relayed_continuation(s, &req.join_id, origin, device_token))
     });
     let join_id = match &continuing {
@@ -1446,6 +1503,7 @@ async fn start_session(
     };
     if let Some(s) = state.config.sessions.as_ref() {
         session::open_session_via(s, &join_id, device_token, client_ip, origin.relay_client);
+        session::set_session_attempt(s, &join_id, attempt_shape(&req.attempt_id));
         session::set_session_labels(
             s,
             &join_id,
@@ -2264,6 +2322,30 @@ async fn start_session(
         session::set_control_sender(s, &join_id, control_tx.clone());
     }
 
+    // The first byte that reaches the client marks the join as connected, after which no
+    // `attemptId` may take it over. The writer only counts bytes the bound track accepted, so
+    // this is "the client has a picture", not "the answer was generated".
+    if let Some(s) = state.config.sessions.as_ref() {
+        let sessions = Arc::clone(s);
+        let telemetry = Arc::clone(&session.pipeline.telemetry);
+        let join = join_id.clone();
+        tokio::spawn(async move {
+            for _ in 0..600 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !session::is_current_session(&sessions, &join, session_seq) {
+                    return;
+                }
+                if telemetry
+                    .bytes_sent
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+                {
+                    session::mark_session_connected(&sessions, &join);
+                    return;
+                }
+            }
+        });
+    }
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
             session::set_active_capture(s, &join_id, session_seq, Box::new(move || session.stop()));
@@ -3384,6 +3466,68 @@ mod tests {
             session::get_live_display(&sessions, &join).map(|d| d.display_id),
             Some(7)
         );
+    }
+
+    /// The lost answer: the page's retry from the same page load lands on the join its first
+    /// offer opened, under that join's token, instead of opening a second session and display.
+    #[test]
+    fn a_retry_from_the_same_page_load_continues_the_join_whose_answer_was_lost() {
+        let (state, _displays, join, _seq) = failed_attempt_fixture();
+        let sessions = state.config.sessions.clone().unwrap();
+        let token = session::device_token_for(&sessions, &join).unwrap();
+        let attempt = session::mint_join_id();
+        session::set_session_attempt(&sessions, &join, &attempt);
+
+        // A first join's retry presents no token: the lost answer was what carried it.
+        assert_eq!(
+            session::pending_join_for_attempt(&sessions, &attempt, ""),
+            Some((join.clone(), token.clone()))
+        );
+        assert_eq!(
+            attempt_continuation(&sessions, "", &attempt, &token).as_deref(),
+            Some(join.as_str())
+        );
+    }
+
+    #[test]
+    fn an_attempt_id_never_reaches_a_connected_or_foreign_session() {
+        let (state, _displays, join, _seq) = failed_attempt_fixture();
+        let sessions = state.config.sessions.clone().unwrap();
+        let token = session::device_token_for(&sessions, &join).unwrap();
+        let attempt = session::mint_join_id();
+        session::set_session_attempt(&sessions, &join, &attempt);
+
+        // Another device presenting the same attempt id.
+        let other = session::mint_device_token();
+        assert!(session::pending_join_for_attempt(&sessions, &attempt, &other).is_none());
+        assert!(attempt_continuation(&sessions, "", &attempt, &other).is_none());
+        // A different page load, or a malformed id.
+        let stranger = session::mint_join_id();
+        assert!(session::pending_join_for_attempt(&sessions, &stranger, "").is_none());
+        assert!(session::pending_join_for_attempt(&sessions, "", "").is_none());
+        assert!(
+            session::pending_join_for_attempt(&sessions, &attempt.to_uppercase(), "").is_none()
+        );
+        assert_eq!(attempt_shape("not-hex"), "");
+        // An offer that names a join is a renegotiation, never an attempt continuation.
+        assert!(attempt_continuation(&sessions, &join, &attempt, &token).is_none());
+        // Once a picture has reached the client the attempt id buys nothing.
+        session::mark_session_connected(&sessions, &join);
+        assert!(session::pending_join_for_attempt(&sessions, &attempt, "").is_none());
+        assert!(attempt_continuation(&sessions, "", &attempt, &token).is_none());
+    }
+
+    #[test]
+    fn an_attempt_without_a_display_yet_is_not_taken_over() {
+        // Still being built: continuing it would make a second display beside the one its own
+        // attempt is about to record.
+        let sessions: session::SharedSessions = Default::default();
+        let token = session::mint_device_token();
+        let join = session::mint_join_id();
+        let attempt = session::mint_join_id();
+        session::open_session(&sessions, &join, &token, "192.168.1.44");
+        session::set_session_attempt(&sessions, &join, &attempt);
+        assert!(session::pending_join_for_attempt(&sessions, &attempt, "").is_none());
     }
 
     #[tokio::test]
