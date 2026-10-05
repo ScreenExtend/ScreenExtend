@@ -4138,3 +4138,38 @@ pending a rebuild.
 The windowed first paint is all before the answer (the WHEP POST, i.e. display creation); the WebCodecs path itself paints within ~0.1 s of `setRemoteDescription`.
 
 **Ruled out on the way:** the keyframe gate (the host's opening IDR reached the client and was decoded natively), SPS/PPS packetization, the NVENC stream, codec/profile labelling (a Baseline-only offer failed the same way), the answer SDP (the host's own answer transplanted into the loopback works), trickle ICE, cross-origin isolation, the worker script itself. Not checked: whether `271aa01` worked only because an older Chrome did not short-circuit — it has the same `await`.
+
+## TEST-ISOLATION — `SCREENEXTEND_DATA_DIR`: several hosts on one machine, for the test handler — `VERIFIED` (Windows; macOS/Linux `UNVERIFIED (not compiled)`)
+
+**Why.** `scripts/test-handler/` runs up to four tests at once. A host is a singleton by
+construction: one `screenextend.lock`, one `screenextend.ctrl`, one `config.json`, one TLS
+cache — and, on Windows, one virtual-display driver whose monitor list every host overwrites
+whole (`set_monitors` + `notify`) and which every host clears at startup (`remove_all`). Two
+hosts could not start side by side, and if they had, each would have removed the other's display
+on its first join.
+
+**Change.** `src-tauri/src/data_dir.rs` resolves the three directories; with the variable set they
+all become that one path, and `config_store()` hands `tauri-plugin-store` an absolute path (the
+plugin joins it onto the app-data dir, and joining an absolute path yields it). Every former
+`app.path().app_*_dir()` call and every `app.store("config.json")` goes through it, and so does
+`tls.rs`'s dev-cert directory. In `windows_utils/virtual_display.rs` an isolated host enters
+shared-driver mode (`mod shared`). Two driver facts decided its shape, both measured by notifying
+lists straight over the driver's pipe: the driver attaches a list only when its ids form one
+contiguous run starting at 0 or 1 (`[0..4]`, `[1]`, `[1,2]` attach; `[2]`, `[4]`, `[16]`, `[0,2]`,
+`[0,1,3]` attach nothing; `[0,1,2]` → `[0,2]` detaches *every* display while the driver's state
+reads `[0,2]`; removing from either end leaves the rest untouched), and it sends no `Changed`
+event to the client that made a change. A first design with per-host id blocks (16, 32, …)
+therefore attached nothing. Now every commit takes a file lock in
+`%TEMP%\screenextend-shared-driver\`, reads the live list with a fresh state request, gives a new
+monitor a released id or the next id that keeps the run valid, records owners in `owners.json`,
+marks this host's departed monitors released, removes released monitors only while the run stays
+attachable, notifies, and holds the lock until a state request shows the result. A released id in
+the middle of the run stays attached (idle) until the ones above it go; monitors of dead owners
+count as released; monitors in no registry (an unisolated host's) are never touched. Unset, the
+code paths are the old ones (startup `remove_all`, whole-list commits, ids from 0).
+`shared::tests` pins the attachability rule, the allocation and the compaction.
+
+**Status.** Built and exercised on Windows by the handler's acceptance runs (concurrent hosts,
+each with its own display, all removed at exit; numbers in `scripts/test-handler/README.md`). The
+macOS file changed only by the mechanical `config.json` → `config_store()` swap
+(`macos_utils/networking.rs`) and is not compiled here.
