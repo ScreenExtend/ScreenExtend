@@ -122,6 +122,13 @@ impl DriverClient {
         self.protocol
     }
 
+    /// Ask the driver for its monitor list now, bypassing the event-fed cache. The shipped
+    /// driver does not send `Changed` to the client that made a change, so the cache cannot
+    /// confirm a commit; shared-driver mode (`virtual_display::shared`) reads this instead.
+    pub async fn request_live_state(&self) -> Result<Vec<Monitor>, String> {
+        self.client.request_state().await.map_err(|e| e.to_string())
+    }
+
     /// Manually synchronize with the driver.
     pub fn refresh_state(&mut self) -> &[Monitor] {
         self.state = self.state_rx.borrow().clone();
