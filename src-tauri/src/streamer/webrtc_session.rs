@@ -1978,6 +1978,14 @@ async fn forward_datachannel(
     tprintln!("audio: DataChannel forwarder stopped");
 }
 
+/// `elapsed` rounded to the nearest whole number of frames, and never less than one: the RTP
+/// timestamp step for a packet that carries exactly one frame.
+fn whole_frames(elapsed: Duration, frame: Duration) -> Duration {
+    let f = frame.as_nanos().max(1);
+    let n = ((elapsed.as_nanos() + f / 2) / f).max(1);
+    frame * n.min(u32::MAX as u128) as u32
+}
+
 /// `audioPath` 3 in the client's stats frame: it is playing the standard Opus track.
 const CLIENT_AUDIO_PATH_OPUS_TRACK: u8 = 3;
 
@@ -2037,9 +2045,19 @@ async fn forward_track(
                 // permanently 5 ms per lost packet behind the video, which rides the true host
                 // clock in its RTP timestamps, and nothing ever corrected it. Spacing samples
                 // by the real elapsed `capture_ns` puts both media back on one timeline.
+                //
+                // In whole frames, though. Every packet carries exactly one frame of samples,
+                // and `capture_ns` is re-anchored on each engine wake from `now − read`, so the
+                // raw spacing wobbles by the capture thread's scheduling (4.3 ms, 5.6 ms, …).
+                // Passed through as-is, each packet's RTP timestamp disagreed with the 240
+                // samples it carries, and NetEQ answered every disagreement with concealment:
+                // 627,600 concealed samples in a 22 s window (13 s of it synthesised) and a
+                // 350-600 ms buffer. Rounding to frames keeps the timestamps exact and still
+                // advances by a real gap when one happens.
                 let duration = match last_capture_ns {
                     Some(prev) if pkt.capture_ns > prev => {
-                        Duration::from_nanos(pkt.capture_ns - prev).min(MAX_CATCHUP)
+                        whole_frames(Duration::from_nanos(pkt.capture_ns - prev), frame_duration)
+                            .min(MAX_CATCHUP)
                     }
                     _ => frame_duration,
                 };
@@ -2396,6 +2414,18 @@ mod tests {
             .unwrap()
             .store(AUDIO_REDUNDANCY_LOSS_THRESHOLD, Ordering::Relaxed);
         assert!(p.redundancy_now());
+    }
+
+    /// Each packet carries one 5 ms frame, so its RTP step must be a whole number of frames:
+    /// scheduling wobble rounds away, a real gap still advances the clock.
+    #[test]
+    fn the_track_clock_steps_in_whole_frames() {
+        let f = Duration::from_millis(5);
+        assert_eq!(whole_frames(Duration::from_micros(4_300), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(5_600), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(1), f), f);
+        assert_eq!(whole_frames(Duration::from_micros(9_800), f), f * 2);
+        assert_eq!(whole_frames(Duration::from_millis(41), f), f * 8);
     }
 
     /// A spare track on the fast path is fed only once the client says it is playing it.
