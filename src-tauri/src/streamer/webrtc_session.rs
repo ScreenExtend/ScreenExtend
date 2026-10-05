@@ -37,7 +37,7 @@ use super::bitrate::{
 use super::config::H264Profile;
 use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
 use super::input;
-use super::keyframe::KeyframeGate;
+use super::keyframe::{KeyframeGate, PliBackoff};
 use super::lock::LockExt;
 use super::negotiate;
 use super::pacer::{Pacer, PacingMode};
@@ -1271,6 +1271,10 @@ pub async fn activate_whep(
             use webrtc::rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc;
             use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
             let telemetry = Arc::clone(&pipeline.telemetry);
+            // See `PliBackoff`: an encoded-transform receiver asks every 200 ms for as long as
+            // the session lives, and the gate alone answered nearly every one with an IDR.
+            let mut pli_backoff = PliBackoff::new();
+            let mut client_key_requests: u32 = 0;
             let mut rtcp_buf = vec![0u8; 1500];
             let mut deltas: Vec<f64> = Vec::with_capacity(256);
             while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
@@ -1288,7 +1292,19 @@ pub async fn activate_whep(
                             .degradation
                             .keyframe_requests
                             .fetch_add(1, Ordering::Relaxed);
-                        keyframes.request_keyframe_for_client_quietly();
+                        // The client counts the requests its own page makes; a moved counter is
+                        // the page saying this one is genuine.
+                        if let Some(stats) = telemetry.client.get() {
+                            if stats.keyframe_requests != client_key_requests {
+                                client_key_requests = stats.keyframe_requests;
+                                pli_backoff.note_evidence();
+                            }
+                        }
+                        if pli_backoff.allow(audio::host_now_ns()) {
+                            keyframes.request_keyframe_for_client_quietly();
+                        } else {
+                            keyframes.gate.note_suppressed();
+                        }
                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
                         // Counted, never logged: a lossy link produces these continuously and
                         // every logbus line is a JSON IPC event to the UI.
@@ -1301,6 +1317,7 @@ pub async fn activate_whep(
                             .degradation
                             .nacks_received
                             .fetch_add(lost.max(1), Ordering::Relaxed);
+                        pli_backoff.note_evidence();
                     } else if let Some(fb) = any.downcast_ref::<TransportLayerCc>() {
                         let summary = {
                             let mut guard = feedback.history.lock_recover();
@@ -1311,6 +1328,9 @@ pub async fn activate_whep(
                         };
                         if summary.reported > 0 {
                             feedback.record_report(&summary);
+                        }
+                        if summary.lost > 0 {
+                            pli_backoff.note_evidence();
                         }
                         // The receipts, straight through to the encode thread. This is the whole
                         // point of stamping the transport-wide sequence numbers ourselves: the
