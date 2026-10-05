@@ -2425,17 +2425,20 @@ fn ring_keepalive(
     if force_idr {
         encoder.request_idr();
     }
+    // Stamped around the encode, not after it: taking both stamps once the access unit was back
+    // recorded every keepalive (the majority of frames on a still desktop) as a ~0 µs encode, and
+    // a cursor frame as captured *after* it had been encoded.
+    let mut timing = if cursor_frame {
+        FrameTiming::entering_capture()
+    } else {
+        FrameTiming::repeating()
+    };
+    timing.mark_encode_submit();
     match encoder.encode_repeat_slot(slot) {
         // An encoder that consumed the picture and produced no bytes dropped a frame; only the
         // AMF backend can reach this. Sending it would packetize a payloadless access unit.
         Ok(au) if au.is_empty() => {}
         Ok(au) => {
-            let mut timing = if cursor_frame {
-                FrameTiming::entering_capture()
-            } else {
-                FrameTiming::repeating()
-            };
-            timing.mark_encode_submit();
             timing.mark_encode_done();
             let d = &telemetry.degradation;
             if cursor_frame {
@@ -3384,13 +3387,11 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
         let capture = Instant::now();
+        // No OS frame time: WGC's `SystemRelativeTime` is the composition's target present time,
+        // 3-14 ms *after* this callback on almost every frame, so as an origin it threw away
+        // nearly every capture-relative sample and kept only stale ones. See `clock.rs`. The
+        // capture-relative stages therefore start at callback entry on this backend.
         let mut timing = FrameTiming::entering_capture();
-        // WGC's own frame time. Discarding it meant every "capture latency" number started at
-        // the moment the message pump reached us, hiding whatever the frame spent in the pool.
-        timing.capture_available_ns = frame
-            .timestamp()
-            .map(|ts| super::clock::wgc_timespan_to_host_ns(ts.Duration))
-            .unwrap_or(0);
 
         // The pointer is composited into the frame but is not part of what the compositor reports
         // a dirty region for, so it has to be asked about separately — and it has to be asked
