@@ -173,7 +173,7 @@ step's runs showed. **Owner** is the commit group best placed to pick the defect
 | # | defect | reproduce | rate | build | cause / suspects | owner |
 |---|---|---|---|---|---|---|
 | D-01 | **Keyframe storm**: about 3 IDRs a second for the whole session | `{"scenarios":["small_window"]}`. Read `idrs_sent` in serve.log telemetry (current), or count `RTCP PLI received, requesting IDR` (old) | every session. Old: 3.3–3.9 PLI→IDR per s. Current: 2.8–3.7 IDR per s. 56–83 PLIs per 20 s window | **both** | libwebrtc sends PLIs because the WebCodecs transform consumes every frame, and the keyframe gate admits them. G03 owns it. Not a regression | G03 |
-| D-02 | **Lost request / lost answer** | quiet: `{"scenarios":[],"calibrate":false,"slow_answer":{"n":10},"netlog":true}`. Loaded: add `"cpu_burn":{"threads":16,"seconds":150}` | quiet: 0 of 20 (10 per build). Loaded: old std1 lost 1 of 2 *requests*; current std1 lost 0 of 2. Handler author: about 1 in 5 on a loaded machine. LOADED_RESULT | **both** | own section below | G04, G07, G09 |
+| D-02 | **Lost request / lost answer** | quiet: `{"scenarios":[],"calibrate":false,"slow_answer":{"n":10},"netlog":true}`. Loaded: add `"cpu_burn":{"threads":16,"seconds":150}` | quiet: 0 of 20 (10 per build). Loaded: old std1 lost 1 of 2 *requests*; current std1 lost 0 of 2. Handler author: about 1 in 5 on a loaded machine. Induced load (current head, 16 busy threads at normal priority, spL1): 0 of 5 lost | **both** | own section below | G04, G07, G09 |
 | D-02b | **The retry after a first join's lost answer has no join id**, so a second session and a second display appear | follows from D-02, by reading `index.html` `start()` | every D-02 on a first join | current (the old page never times out) | `currentJoinId` stays empty until an answer arrives, so the retry is a new join. The host keeps the first session and its display until ICE fails. Fix direction: a client-chosen id in the first POST that a retry presents; or the host reaping a session whose peer connection never connected | G04, G07 |
 | D-03 | Streams degrade with 2 or more virtual displays | `{"scenarios":[],"calibrate":false,"two_clients":true}` | not re-run (memory). Handler author: once fine, once B got no picture. On `d4d8be9`: B's gap 635 ms, A's p50 221 ms | current, `d4d8be9`. Old not run | not diagnosed | G01, G04 |
 | D-04 | **The page demotes itself to `<video>` after WebCodecs is already painting** | `{}`. Shows as `offers: 2` and `videoPath 3` | 1 of 5 first joins (std1, loaded); 0 of 4 quiet | current | `armFrameWatchdog` is re-armed by `onconnectionstatechange` 'connected' after the worker's single `rendered` message has already cleared it. 5 s later: `fallbackToVideo('no WebCodecs frame within 5s')`. The `backlog` warning, which requires `renderedOnce`, comes first. Suspects `af69481`, `2f5d314`. G05 owns it | G05 |
@@ -224,7 +224,16 @@ browser never sees the response, the page gives up at 10 s and retries.** What w
    `answer generated` per POST. Chrome's net log (`netlog.mjs` in the scratchpad) shows whether
    `HTTP2_SESSION_RECV_HEADERS` for that stream arrived. `joins[].whepRequests[].timing` gives
    Chrome's queue, send and first-byte times. A host-side stall shows as `answer generated` with
-   no stream headers received. A browser-side stall shows as no `join request` at all. LOADED_DETAIL
+   no stream headers received. A browser-side stall shows as no `join request` at all.
+
+   **Run once on the current head (spL1), result: not reproduced.** 0 of 5 joins lost. Every
+   response reached Chrome 2–3 ms after the host's `answer generated` line. Answer times were
+   2.5–3.5 s after the POST, all host work (display 2.0–2.5 s + pipeline 0.5–1.0 s). One join's
+   answer passed 5 s from submit only because its POST left 2.6 s after submit (first join:
+   enumeration). A synthetic burn of 16 normal-priority threads was not enough: the host runs at
+   HIGH priority. The loaded runs that lost answers also had Defender (MsMpEng) and up to nine
+   other agents' Chromes and hosts competing, and memory pressure. The old-app run was not made
+   (memory budget).
 6. **`d4d8be9` and headed Chrome were not tried** (memory budget). Requests are under
    "Unverified".
 
@@ -334,4 +343,16 @@ cleaned up (no display left, config identical). I did not kill it mid-run.
 
 ## Machine state at hand-back
 
-MACHINE_STATE
+Checked at 14:15 UTC, after the last run:
+
+- The owner's `config.json` SHA-256 is `176B9DAD7C9C4985…`, the reference value after the
+  owner's own app wrote it. All 22 of my run results report `ownerConfig.identical: true`. The
+  exclusive-mode runs restored the file byte-for-byte themselves.
+- No host, test Chrome, stage window or virtual display of mine is left. Every result's
+  `cleanup` is empty (`displaysLeftByUs`, `hostProcessesLeft`). The four slots and both
+  ScreenExtend processes now running belong to other agents' handler runs. The owner's installed
+  app was not running at any old-app start and is not running now.
+- One queued handler of mine (msmoke2) was killed by PID before it held a slot or a host.
+- No product code was changed. Gates: `pnpm test:client` passes (8 harnesses). `cargo
+  fmt/clippy/test` were not run: there are no Rust changes, and the memory emergency rules out
+  a build.
