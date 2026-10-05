@@ -429,6 +429,8 @@ pub fn set_device_override(
         overrides.insert(token.clone(), next);
         action
     };
+    // A save makes the refresh rate a setting rather than the join's detection.
+    session::clear_join_seeded(&token);
     // Class (b), whatever else this edit did: remote control is read per event, so it lands on
     // the pointer that is moving now rather than on the next connection.
     session::apply_live_input_for_device(

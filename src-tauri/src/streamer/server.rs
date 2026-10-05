@@ -1542,7 +1542,13 @@ async fn start_session(
             cfg.qp = Some(o.video_quality);
             cfg.quality_qp = None;
         }
-        cfg.max_fps = o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE);
+        // A rate the join path recorded is what the device reported then, not a choice anyone
+        // made; the device's report now wins over it (see `session::mark_join_seeded`).
+        cfg.max_fps = if session::is_join_seeded(device_token) {
+            detected_refresh
+        } else {
+            o.refresh_rate.clamp(MIN_REFRESH_RATE, MAX_REFRESH_RATE)
+        };
         // Whether `max_fps` is a ceiling or a promise. Off — the default — makes it a promise:
         // the pipeline holds the cadence and repeats an unchanged frame rather than letting the
         // rate sag. Copied here, once, so nothing downstream has to reach back into the
@@ -1650,15 +1656,26 @@ async fn start_session(
     // freshly joined device rebuilt its session. The values are exactly `Device::defaults`, which
     // is what the sheet is showing the user, so an untouched save now compares equal.
     if let Some(overrides) = state.config.device_overrides.as_ref() {
-        overrides
-            .lock_recover()
-            .entry(device_token.to_string())
-            .or_insert(session::DeviceOverride {
-                orientation_portrait: client_portrait,
-                refresh_rate: detected_refresh,
-                dpr,
-                ..session::DeviceOverride::join_defaults()
-            });
+        let mut map = overrides.lock_recover();
+        match map.entry(device_token.to_string()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(session::DeviceOverride {
+                    orientation_portrait: client_portrait,
+                    refresh_rate: detected_refresh,
+                    dpr,
+                    ..session::DeviceOverride::join_defaults()
+                });
+                session::mark_join_seeded(device_token);
+            }
+            // Still only a detection: keep it current, so the sheet shows the rate this join is
+            // really running at and an untouched save still compares equal.
+            std::collections::hash_map::Entry::Occupied(mut o)
+                if session::is_join_seeded(device_token) =>
+            {
+                o.get_mut().refresh_rate = cfg.max_fps;
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
     }
 
     let base_scale = device_settings
