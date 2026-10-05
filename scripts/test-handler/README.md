@@ -176,6 +176,8 @@ the page's error text.
 | `loss` | false | reported as **not run**: inducing loss needs admin rights or the owner's network |
 | `screencast_width` | 480 | width of the (non-default) screencast reader |
 | `overlap_displays` | false | narrow the measurement lock to the timed windows (see Concurrency) |
+| `load_gate` | `{max_cpu: 75, max_wait_s: 180}` | before every timed window (and the static window) wait, bounded, for whole-machine CPU averaged over 2 s to fall below `max_cpu`. Each window then carries `loaded` (true when the gate gave up or the window's own mean CPU ended above `max_cpu`; **discard and repeat such a window**), `loadGate` (`waitedMs`, `cpuAtOpen`, `loaded`) and `windowCpuMean`; `aggregate.loadedRuns` counts them. `false` turns the gate off. Why: runs at 85–100 % CPU came out 10–25 ms slower than quiet ones |
+| `netlog` | false | each browser writes Chrome's net log to `runDir/netlog-<offset>-<n>.json` |
 | `custom` | null | `{ js: "<expression evaluated in the client page after the common join>", host_commands: [["status","--json"], ...], timeout: 20 }`; results in `special.custom` |
 
 Adding a request: write an `async function` in `handler.mjs` that returns a plain object, call it

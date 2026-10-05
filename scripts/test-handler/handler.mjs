@@ -18,7 +18,7 @@ import { ROOT, acquireSlot, acquireAll, releaseSlots, measureLock, pidAlive, slo
 import { probeBuild, startHost, stopHost, runCli, cliJson, randomSessionId, randomOtp } from './lib/host.mjs';
 import { Client, stampMetrics } from './lib/client.mjs';
 import { driverState, driverRemove } from './lib/driver.mjs';
-import { startLoadSampler, snapshot } from './lib/load.mjs';
+import { startLoadSampler, snapshot, waitForQuiet } from './lib/load.mjs';
 import { dist, spread } from './lib/metrics.mjs';
 import { sleep } from './lib/cdp.mjs';
 
@@ -38,6 +38,11 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  netlog: false,           // Chrome's own network log per browser, into the run directory
+  // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
+  // below max_cpu. A window that opened loaded, or whose own mean CPU ended above max_cpu, is
+  // marked `loaded: true` and should be discarded and repeated. `load_gate: false` turns it off.
+  load_gate: { max_cpu: 75, max_wait_s: 180 },
 };
 const KNOWN = new Set([...Object.keys(DEFAULTS), 'label', 'notes']);
 
@@ -214,7 +219,8 @@ async function openClient(spec, { flags = [], disable = [], offset = 0 } = {}) {
   const port = 19200 + R.slot * 10 + offset;
   // A fresh directory per browser: a profile Chrome has just let go of can stay locked for a while.
   const profile = path.join(ROOT, `profile-slot${R.slot}-${offset}-${process.pid}-${++PROFILE_SEQ}`);
-  const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags], headed: REQ.headed, log, scWidth: REQ.screencast_width });
+  const netlog = REQ.netlog && RUN_DIR ? [`--log-net-log=${path.join(RUN_DIR, `netlog-${offset}-${PROFILE_SEQ}.json`)}`] : [];
+  const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags, ...netlog], headed: REQ.headed, log, scWidth: REQ.screencast_width });
   owned.clients.push(cl);
   await cl.open({ client: spec, observer: { refreshRate: spec.refresh, disable } });
   return cl;
@@ -293,8 +299,26 @@ async function calibrate(cl, spec) {
   });
 }
 
+// ---------------------------------------------------------------- load gate
+async function loadGate(label) {
+  const g = REQ.load_gate;
+  if (!g) return null;
+  const r = await waitForQuiet({ maxCpu: g.max_cpu ?? 75, maxWaitMs: (g.max_wait_s ?? 180) * 1000 });
+  log(`load gate (${label}): ${r.loaded ? 'still loaded' : 'quiet'} after ${r.waitedMs} ms, cpu ${r.cpuAtOpen} %`);
+  return r;
+}
+// A window is "loaded" if the gate gave up, or if the window's own mean CPU ended above the bar.
+function loadedVerdict(gate, loadSum) {
+  const bar = REQ.load_gate ? (REQ.load_gate.max_cpu ?? 75) : null;
+  const mean = loadSum && loadSum.cpuPct ? loadSum.cpuPct.mean : null;
+  return { loaded: !!((gate && gate.loaded) || (bar != null && mean != null && mean > bar)), loadGate: gate, windowCpuMean: mean };
+}
+
 // ---------------------------------------------------------------- one timed window
 async function timedWindow(cl, name, { seconds, mover, large, label }) {
+  // The gate runs before the stage starts: the stage process lives for a fixed time, and a
+  // gate that waited inside the window would outlast it.
+  const gate = await loadGate(label);
   // The noise is painted by its own process, so a slow paint can never hold the stamp back.
   const st = await stageFor(name, { seconds: seconds + REQ.warmup + 4, stamp: true, mover, large: false });
   const ready = await st.ready;
@@ -312,7 +336,7 @@ async function timedWindow(cl, name, { seconds, mover, large, label }) {
     const loadSum = load.stop();
     await st.exited.catch(() => {}); stopStage(st); if (lg) { await lg.exited.catch(() => {}); stopStage(lg); }
     const m = stampMetrics(got.samples, { from: from + R.clock.browserMinusSystemMs, to: to + R.clock.browserMinusSystemMs, offsetMs: R.clock.browserMinusSystemMs });
-    return { ...m, stage: ready, stageDone: st.done(), layout: got.layout, load: loadSum, secondaryBefore: secBefore, secondaryAfter: secAfter, pageCounters: pageDelta(secBefore, secAfter, seconds) };
+    return { ...m, ...loadedVerdict(gate, loadSum), stage: ready, stageDone: st.done(), layout: got.layout, load: loadSum, secondaryBefore: secBefore, secondaryAfter: secAfter, pageCounters: pageDelta(secBefore, secAfter, seconds) };
   });
 }
 
@@ -341,10 +365,11 @@ async function standardScenarios(cl, spec) {
       if (want('static')) {
         await sleep(3000); // let the join's own stage window disappear and the stream settle
         out.static = await underLock('static', async () => {
+          const gate = await loadGate('static');
           const load = startLoadSampler(); const a = await cl.secondary();
           const s = await cl.collectStatic(REQ.static_duration * 1000);
-          const b = await cl.secondary();
-          return { ...s, seconds: REQ.static_duration, client: spec, load: load.stop(), pageCounters: pageDelta(a, b, REQ.static_duration), note: 'no stage window: the virtual display shows only the desktop. Every changed frame is listed; a healthy stream has none after it settles.' };
+          const b = await cl.secondary(); const loadSum = load.stop();
+          return { ...s, ...loadedVerdict(gate, loadSum), seconds: REQ.static_duration, client: spec, load: loadSum, pageCounters: pageDelta(a, b, REQ.static_duration), note: 'no stage window: the virtual display shows only the desktop. Every changed frame is listed; a healthy stream has none after it settles.' };
         });
       }
       for (const [sc, mover, large] of [['small_window', true, false], ['large_area', false, true]]) {
@@ -385,6 +410,7 @@ function aggregate(runs) {
     runs: runs.length, completed: ok.length,
     latencyP50: f((r) => r.latencyMs.p50), latencyP90: f((r) => r.latencyMs.p90), latencyP99: f((r) => r.latencyMs.p99), latencyMax: f((r) => r.latencyMs.max),
     paintedFps: f((r) => r.paintedFps), longestGapMs: f((r) => r.longestGapMs),
+    loadedRuns: ok.filter((r) => r.loaded).length,
   };
 }
 
