@@ -266,6 +266,22 @@
             var JOIN_ID_KEY = 'se.joinId';
             var currentJoinId = '';
 
+            // A per-page-load name for this tab's offers, sent with every `POST /whep`. The join id
+            // only exists once an answer has arrived, so a first join whose answer is lost has
+            // nothing to present when it offers again, and the host builds a second session and a
+            // second display beside the one it already answered. With this id the host can
+            // recognise the retry as the attempt already in flight (a session opened under the
+            // same id that has never connected). A host that does not read the field ignores it.
+            var attemptId = (function () {
+                var b = new Uint8Array(16);
+                try { window.crypto.getRandomValues(b); } catch (_) {
+                    for (var i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+                }
+                var hex = '';
+                for (var k = 0; k < 16; k++) hex += (b[k] < 16 ? '0' : '') + b[k].toString(16);
+                return hex;
+            })();
+
             function setJoinId(id) {
                 currentJoinId = id || '';
                 try {
@@ -1354,8 +1370,14 @@
             }
 
             let leaveSent = false;
+            // `pagehide` is the page going away, so whatever join this tab holds is released —
+            // whether or not the picture is up yet and whether or not a reconfigure is in flight.
+            // Gating it on `isLive && !reconfiguring` (as the old app did too) left a page closed
+            // during a rebuild, or between the answer and the first frame, holding its display
+            // until ICE failed and the grace ran out: about 45 s, during which the next join made
+            // a second one. A page that never got a join id has nothing to release.
             function sendLeave() {
-                if (leaveSent || !isLive || reconfiguring) return;
+                if (leaveSent) return;
                 leaveSent = true;
                 releaseJoin();
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
@@ -1410,6 +1432,28 @@
             // Guarded because this is module scope: a browser with no `fetch` cannot reach any
             // fast path on this page anyway, but a throw here would take the join form with it.
             if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
+
+            // Two first-use costs sat between Connect and the offer on a browser's first join:
+            // the first `enumerateDevices()` (1.3-2.4 s headless, measured; the join awaits the
+            // output enumeration because the microphone card may have to come first) and the
+            // first `new RTCPeerConnection()` (a 350-700 ms main-thread task while the WebRTC
+            // stack starts). Both are paid here, while the user is still reading the form, so
+            // the join finds them warm. Neither prompts: an enumeration without a grant only
+            // returns unlabelled devices, and a peer connection with no tracks and no offer
+            // gathers nothing.
+            function warmJoinPath() {
+                try {
+                    const md = navigator.mediaDevices;
+                    if (md && typeof md.enumerateDevices === 'function') {
+                        const p = md.enumerateDevices();
+                        if (p && p.catch) p.catch(noteSuppressed);
+                    }
+                } catch (_) { noteSuppressed(); }
+                try {
+                    if (typeof RTCPeerConnection === 'function') new RTCPeerConnection().close();
+                } catch (_) { noteSuppressed(); }
+            }
+            setTimeout(warmJoinPath, 0);
 
             // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
             // waiting for one is only right when nothing else can carry the session. The host
@@ -2164,6 +2208,27 @@
             const TRANSFORM_START_TIMEOUT_MS = 2500;
             const FRAME_WATCHDOG_MS = 5000;
             const WHEP_TIMEOUT_MS = 10000;
+            const ANSWER_TIMEOUT_TEXT = 'The host did not answer in time.';
+
+            // What a failed setup leads to. A host that did not answer in time says nothing about
+            // the video path, so it is not a reason to give up WebCodecs: it used to be answered
+            // with `fallbackToVideo`, and a session that lost one answer then ran on the <video>
+            // element and its jitter buffer for good. It is offered again once on the same tier,
+            // presenting whatever join id this tab holds. (A first join that lost its answer
+            // holds none, so the host still opens a second session beside the one it answered;
+            // that one is closed when its ICE fails. Recognising the retry needs the host.)
+            let answerRetried = false;
+            function setupFailureAction(err, s) {
+                const msg = (err && err.message) || '';
+                if (/Invalid session ID or OTP/.test(msg)) return s.reconfiguringLive ? 'poll' : 'error';
+                // The same holds for a POST the host refused or a connection that dropped: none
+                // of them is about this browser's decoder.
+                const hostSide = msg === ANSWER_TIMEOUT_TEXT || /^WHEP POST failed: 5\d\d|Failed to fetch|NetworkError|network error/i.test(msg);
+                if (hostSide && !s.answerRetried) return 'retry';
+                if (s.webcodecsTier) return 'video';
+                if (s.reconfiguringLive) return 'poll';
+                return 'error';
+            }
 
             // `keepJoin` says this is the same session offering again rather than a new one.
             // `teardownSession` has already decided whether `currentJoinId` survives, so the
@@ -2548,6 +2613,7 @@
                             // it only while the session is still live and still belongs to this
                             // device token, so a stale one costs a fresh join and nothing else.
                             joinId: currentJoinId,
+                            attemptId: attemptId,
                             deviceName: joinData.deviceName,
                             os: joinData.os,
                             refreshRate: joinData.refreshRate,
@@ -2575,7 +2641,7 @@
                     try {
                         resp = await fetch('/whep', whepOpts);
                     } catch (err) {
-                        if (whepAbort && whepAbort.signal.aborted) throw new Error('The host did not answer in time.');
+                        if (whepAbort && whepAbort.signal.aborted) throw new Error(ANSWER_TIMEOUT_TEXT);
                         throw err;
                     } finally {
                         if (whepTimer) clearTimeout(whepTimer);
@@ -2583,6 +2649,8 @@
                     if (stale()) return;
                     if (resp.status === 401) throw new Error('Invalid session ID or OTP.');
                     if (!resp.ok) throw new Error('WHEP POST failed: ' + resp.status + ' ' + (await resp.text()));
+                    // An answer arrived, so a later lost one gets its own retry.
+                    answerRetried = false;
                     // Read before anything can return: this join was accepted, and the token it
                     // issued is what a rejoin — including the one two lines below — presents
                     // instead of the OTP.
@@ -2660,10 +2728,18 @@
                     // A newer start() already owns pc and worker; this one's failure is about a
                     // connection nobody is using any more.
                     if (stale()) { noteSuppressed(); return; }
-                    const isAuthError = /Invalid session ID or OTP/.test(err && err.message);
-                    if (!isAuthError && preferWebCodecs && canWebCodecs && !usingFallback) {
+                    const action = setupFailureAction(err, {
+                        answerRetried: answerRetried,
+                        webcodecsTier: preferWebCodecs && canWebCodecs && !usingFallback,
+                        reconfiguringLive: reconfiguring && isLive,
+                    });
+                    if (action === 'retry') {
+                        answerRetried = true;
+                        console.warn('[join] ' + errorText(err) + ' — offering again on the same video path');
+                        start(preferWebCodecs, true);
+                    } else if (action === 'video') {
                         fallbackToVideo('setup error: ' + errorText(err));
-                    } else if (reconfiguring && isLive) {
+                    } else if (action === 'poll') {
                         reconfiguring = false;
                         startReconfigPoll();
                     } else {
@@ -3175,6 +3251,7 @@
                 kicked = false;
                 leaveSent = false;
                 usingFallback = false;
+                answerRetried = false;
                 reconfigEpoch = null;
                 kickEpoch = null;
                 connectBtn.disabled = true;

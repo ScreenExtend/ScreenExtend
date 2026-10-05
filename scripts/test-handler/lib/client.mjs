@@ -27,10 +27,13 @@ export class Client {
       }
     });
     // /whep requests from the browser's network log: build-independent join timing.
-    this.whep = []; const reqs = new Map();
+    // The page's other API requests ride beside them (`apiRequests` in a join): a join that never
+    // posts its offer is usually waiting on one of these.
+    this.whep = []; this.api = []; const reqs = new Map();
     p.on((d) => {
       const q = d.params || {};
       if (d.method === 'Network.requestWillBeSent' && /\/whep/.test(q.request.url)) { const r = { id: q.requestId, method: q.request.method, url: q.request.url.replace(/^https?:\/\/[^/]+/, ''), sent: q.wallTime * 1000, ts0: q.timestamp }; reqs.set(q.requestId, r); this.whep.push(r); }
+      else if (d.method === 'Network.requestWillBeSent' && /^https?:\/\/[^/]+\/(ice-config|net-config|reconfig|leave|audio-outputs|transform-worker\.js|audio-worklet\.js|audio-worker\.js)/.test(q.request.url)) { const r = { id: q.requestId, method: q.request.method, url: q.request.url.replace(/^https?:\/\/[^/]+/, '').replace(/join=[0-9a-f]+/, 'join=<id>'), sent: q.wallTime * 1000, ts0: q.timestamp }; reqs.set(q.requestId, r); this.api.push(r); if (this.api.length > 400) this.api.splice(0, 200); }
       else if (d.method === 'Network.responseReceived' && reqs.has(q.requestId)) {
         const r = reqs.get(q.requestId); r.status = q.response.status; r.answered = r.sent + (q.timestamp - r.ts0) * 1000;
         // Where the time went, on the browser's side: queued before a socket, connecting, TLS,
@@ -200,6 +203,7 @@ export class Client {
     res.answerMs = firstPost && firstPost.answered ? Math.round(firstPost.answered - submitAt) : null;
     res.answerStatus = firstPost ? firstPost.status : null;
     res.whepRequests = this.whep.filter((w) => w.sent >= submitAt - 50).map(({ ts0, id, ...w }) => ({ ...w, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null, sent: undefined, answered: undefined }));
+    res.apiRequests = this.api.filter((w) => w.sent >= submitAt - 50).slice(0, 60).map(({ ts0, id, timing, connectionId, connectionReused, ...w }) => ({ ...w, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null, sent: undefined, answered: undefined }));
     res.firstPictureMs = firstPicture ? Math.round(firstPicture - submitAt) : null;
     res.offers = res.whepRequests.filter((w) => w.method === 'POST').length;
     if (res.offers > 1) res.retried = 'the page sent ' + res.offers + ' offers (a slow or failed answer made it retry)';
