@@ -70,6 +70,9 @@ export class Client {
 
   async setClient(c) {
     this.clientSpec = c;
+    // The observer script fixed the reported refresh rate at the first spec's; a spec change (the
+    // hi-res scenario) must change it too, or a "120 Hz" client tells the host 60.
+    if (c.refresh && this.page) await this.page.send('Page.addScriptToEvaluateOnNewDocument', { source: `self.__seRefresh = ${Number(c.refresh)};` }).catch(() => {});
     await this.page.send('Emulation.setDeviceMetricsOverride', { width: c.width, height: c.height, deviceScaleFactor: c.dpr, mobile: false, screenWidth: c.width, screenHeight: c.height });
     // The observer pins `screen.refreshRate` once, at open, so a browser switched to another
     // client spec (the standard hi-res scenario reuses the 60 Hz browser) kept reporting the
@@ -165,7 +168,16 @@ export class Client {
       // The page can retry the offer (a slow answer, a fallback); the stream it ends on may be
       // on a different display from the one the stage found. Follow it.
       const lastAnswer = Math.max(0, ...this.whep.filter((w) => w.method === 'POST' && w.answered && w.sent >= submitAt - 50).map((w) => w.answered));
-      if (restage && !firstPicture && lastAnswer && Date.now() + 0 > lastAnswer + 4000 && (!res.restagedFor || res.restagedFor < lastAnswer)) {
+      // Frames that paint without a stamp ('guard') mean the stream is up but the stage is not on
+      // it, or drew at a stale geometry: the display often attaches at the first mode of the DPR
+      // ladder (e.g. 2400x1350) and is set to the client's size a moment later, and the stage
+      // kept the first geometry. That cost 4-6 s of every slow "first picture" on the current
+      // head (hookBeforeFirstPicture: 180-295 guard reads before the restage). Restage after
+      // 0.8 s of guard-only paints instead of waiting 4 s.
+      const hk = res.hookBeforeFirstPicture || {};
+      const guardOnly = (hk.guard || 0) >= 20 && (hk.stamp || 0) * 10 < hk.guard;
+      const restageAfter = guardOnly ? 800 : 4000;
+      if (restage && !firstPicture && lastAnswer && Date.now() > lastAnswer + restageAfter && (!res.restagedFor || res.restagedFor < lastAnswer)) {
         res.restagedFor = lastAnswer; stageInfo = null;
         const st2 = await restage(this.joinStage);
         if (st2) { this.joinStage = st2; st2.ready.then((r) => { stageInfo = r; res.stage2 = r; if (!r.error) this.setStampCfg({ mode: 'stamp', width: r.width, height: r.height, cell: r.cell, cellH: r.cellH }); }); }
