@@ -1807,15 +1807,18 @@ fn start_audio_forwarders(
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
 ) {
-    if !audio.fast {
-        if let Some(track) = track {
-            tokio::spawn(forward_track(
-                Arc::clone(pc),
-                track,
-                audio.clone(),
-                Arc::clone(&telemetry),
-            ));
-        }
+    // On the fast path the track is the client's spare, and it used to be added and never fed:
+    // a client whose decoder or worklet failed mid-session switched to it and played silence
+    // for the rest of the session. It is fed in standby — nothing until the client reports
+    // that it is playing the track (`audioPath` 3 in its stats frame).
+    if let Some(track) = track {
+        tokio::spawn(forward_track(
+            Arc::clone(pc),
+            track,
+            audio.clone(),
+            Arc::clone(&telemetry),
+            audio.fast,
+        ));
     }
 
     if let Some(dc) = dc {
@@ -1876,11 +1879,22 @@ async fn forward_datachannel(
     // the old with no resync and keeps the offset for good.
     let mut pending_discontinuity = false;
     let mut prev_payload: Option<Bytes> = None;
+    // A client that stepped down to the spare track has detached this channel's handler; the
+    // track forwarder feeds it from then on, and feeding both would be the audio twice.
+    let mut stepped_down = false;
+    let mut last_path_check = Instant::now();
     loop {
         if !pc_alive(&pc) || dc.ready_state() == RTCDataChannelState::Closed {
             break;
         }
-        let want = audio.audio_enabled_now();
+        if audio.fallback_track
+            && !stepped_down
+            && last_path_check.elapsed() >= Duration::from_secs(1)
+        {
+            last_path_check = Instant::now();
+            stepped_down = client_playing_track(&telemetry);
+        }
+        let want = !stepped_down && audio.audio_enabled_now();
         match (want, sub.is_some()) {
             (true, false) => {
                 sub = subscribe_blocking(&audio.hub).await;
@@ -1964,11 +1978,22 @@ async fn forward_datachannel(
     tprintln!("audio: DataChannel forwarder stopped");
 }
 
+/// `audioPath` 3 in the client's stats frame: it is playing the standard Opus track.
+const CLIENT_AUDIO_PATH_OPUS_TRACK: u8 = 3;
+
+fn client_playing_track(telemetry: &crate::streamer::telemetry::SessionTelemetry) -> bool {
+    telemetry
+        .client
+        .get()
+        .is_some_and(|c| c.audio_path == CLIENT_AUDIO_PATH_OPUS_TRACK)
+}
+
 async fn forward_track(
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     track: Arc<TrackLocalStaticSample>,
     audio: AudioParams,
     telemetry: crate::streamer::telemetry::SharedTelemetry,
+    mut standby: bool,
 ) {
     let frame_duration = Duration::from_millis(crate::streamer::audio::encoder::FRAME_MS as u64);
     // A gap longer than this is a device change or a stall, not a scheduling wobble; advancing
@@ -1982,7 +2007,13 @@ async fn forward_track(
         if !pc_alive(&pc) {
             break;
         }
-        let want = audio.audio_enabled_now();
+        // The client latches its step-down (it never returns to the fast path in a session),
+        // so once it is seen this stops being a question.
+        if standby && client_playing_track(&telemetry) {
+            standby = false;
+            tprintln!("audio: the client stepped down to the standard Opus track; feeding it");
+        }
+        let want = !standby && audio.audio_enabled_now();
         match (want, sub.is_some()) {
             (true, false) => sub = subscribe_blocking(&audio.hub).await,
             (false, true) => {
@@ -2365,6 +2396,23 @@ mod tests {
             .unwrap()
             .store(AUDIO_REDUNDANCY_LOSS_THRESHOLD, Ordering::Relaxed);
         assert!(p.redundancy_now());
+    }
+
+    /// A spare track on the fast path is fed only once the client says it is playing it.
+    #[test]
+    fn the_spare_track_waits_for_the_client_to_step_down() {
+        let t = crate::streamer::telemetry::SessionTelemetry::default();
+        assert!(!client_playing_track(&t));
+        t.set_client_stats(crate::streamer::telemetry::ClientStats {
+            audio_path: 1,
+            ..Default::default()
+        });
+        assert!(!client_playing_track(&t));
+        t.set_client_stats(crate::streamer::telemetry::ClientStats {
+            audio_path: CLIENT_AUDIO_PATH_OPUS_TRACK,
+            ..Default::default()
+        });
+        assert!(client_playing_track(&t));
     }
 
     #[test]
