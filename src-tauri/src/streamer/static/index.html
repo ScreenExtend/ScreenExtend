@@ -638,16 +638,15 @@
                     // offered only when nothing routable enumerated without a permission.
                     //
                     // `false` is the engine refusing, not "not yet": a sink commanded before the
-                    // graph exists answers `null` and is applied when it does. Where the engine
-                    // refused there is one thing left to try, and it needs a gesture, so it is
-                    // queued for the next one rather than raised over the picture.
+                    // graph exists answers `null` and is applied when it does. A refusal is
+                    // *reported*, not offered: the audio stays where it is, the host learns the
+                    // sink actually in use from `/audio-outputs` (`current`) and `sinkTier`, and
+                    // the log says why. It used to arm the browser's chooser on the next tap,
+                    // which over a live stage dropped pointer lock, keyboard lock and fullscreen
+                    // for a request the person at this device never made.
                     //
                     // `audioSink` is in *every* `/reconfig` body, so this runs about once a
-                    // second and `false` is answered about once a second too — the engine that
-                    // refused the id refuses it again on the next tick. The offer is therefore
-                    // latched on the id: one re-offer per sink the host asks for, which is what
-                    // the ruling says. Without the latch the picker re-armed on every tick and
-                    // the stage swallowed every gesture for the rest of the session.
+                    // second; the report is latched on the id, once per sink the host asks for.
                     try {
                         // The host operator chose "pick a speaker on this device": the one
                         // explicit request this page answers with a chooser or, failing that, the
@@ -668,7 +667,9 @@
                                 appliedSinkId = null;
                                 if (j.audioSink === lastOfferedSinkId) return;
                                 lastOfferedSinkId = j.audioSink;
-                                queueOutputPicker(j.audioSink);
+                                console.warn('[audio] this browser refused the output the host asked for (' +
+                                    j.audioSink + '); audio stays on the current output');
+                                try { SEAudio.postOutputs(true); } catch (_) { noteSuppressed(); }
                             }, noteSuppressed);
                         } else {
                             // There is no audio graph to command yet, so nothing was applied and
