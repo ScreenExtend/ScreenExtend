@@ -404,6 +404,11 @@ async function standardScenarios(cl, spec) {
   if (want('hires_small_window') || want('hires_large_area')) {
     const hs = { ...REQ.hires_client };
     await cl.setClient(hs);
+    // A fresh device identity for the hi-res join. The common join left a device token in the
+    // page's localStorage, and the host saved a settings row under it (refreshRate 60), which
+    // then overrides what the hi-res client reports: before this, the "120 Hz" scenario ran at
+    // 60 Hz on the current head without anyone asking for it.
+    if (H) { const o = clientUrl(hs, 'x', { https: hs.https !== false }).origin; R.hiresStorageCleared = await cl.page.send('Storage.clearDataForOrigin', { origin: o, storageTypes: 'local_storage,cookies' }).then(() => true, (e) => e.message); }
     const j = await joinClient(cl, hs);
     R.joins.push({ scenario: 'hires', ...j });
     if (j.firstPictureMs == null) out.hires = { error: 'no picture after join', join: j };
