@@ -119,11 +119,11 @@ function makePoller() {
   // object in a browser and has to be made so here. What it does with the answer is the whole
   // of cases 9-11: `false` is the engine refusing, and a host that repeats the same request
   // must not be answered with a second picker.
-  const seAudio = { setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; } };
+  const seAudio = { setSpeaker: async (id) => { calls.push('setSpeaker:' + id); return sinkResult; }, postOutputs: (force) => { calls.push('postOutputs:' + !!force); } };
   const urls = [];
   const beacons = [];
   const ctx = {
-    console,
+    console: { log: console.log, warn: (m) => calls.push('warn:' + m), error: console.error },
     calls,
     urls,
     beacons,
@@ -297,11 +297,12 @@ else fail('a kicked page still ran ' + calls.join(', '));
   else fail('a reconfiguring page armed a poll timer');
 }
 
-// ── 9. a sink the engine refuses is offered a picker once, not once a second ─────────────
+// ── 9. a sink the engine refuses is reported once, and never offered over the stage ─────
 // `process_reconfig` puts `audioSink` in *every* body, and an engine that cannot route to it
-// answers `false` on every tick. Without a latch on the requested id the picker re-armed about
-// once a second, and from then on every tap on the stage opened a browser chooser instead of
-// re-entering fullscreen.
+// answers `false` on every tick. A refusal used to arm the browser's chooser on the next tap,
+// which over a live stage dropped pointer lock, keyboard lock and fullscreen for a request the
+// person at the device never made. It is now reported (log + a forced `/audio-outputs` post
+// carrying the sink actually in use), once per requested id.
 {
   const p = makePoller();
   const calls = p.calls;
@@ -309,15 +310,16 @@ else fail('a kicked page still ran ' + calls.join(', '));
   // Ten polls a second apart, so each refusal has settled before the next one arrives — the
   // refusal clears the applied latch, so the request is retried rather than treated as done.
   for (let i = 0; i < 10; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-A' }); await settle(); }
-  const offers = calls.filter((c) => c === 'queueOutputPicker:sink-A');
-  eq('ten ticks of the same refused sink offer the picker once', offers.length, 1);
+  eq('a refused sink never arms the picker', calls.filter((c) => c.startsWith('queueOutputPicker')).length, 0);
+  eq('ten ticks of the same refused sink report it once', calls.filter((c) => c.startsWith('warn:') && c.indexOf('sink-A') >= 0).length, 1);
+  eq('and tell the host once what is actually playing', calls.filter((c) => c === 'postOutputs:true').length, 1);
   eq('and every tick still tries to apply it', calls.filter((c) => c === 'setSpeaker:sink-A').length, 10);
-  eq('the latch remembers which sink was offered', p.state().lastOfferedSinkId, 'sink-A');
+  eq('the latch remembers which sink was reported', p.state().lastOfferedSinkId, 'sink-A');
 
-  // A different sink is a different request and gets its own single offer.
+  // A different sink is a different request and gets its own single report.
   calls.length = 0;
   for (let i = 0; i < 5; i++) { p.applyReconfig({ epoch: 1, kick: 1, audioSink: 'sink-B' }); await settle(); }
-  eq('a new sink the host asks for is offered once', calls.filter((c) => c === 'queueOutputPicker:sink-B').length, 1);
+  eq('a new refused sink is reported once', calls.filter((c) => c.startsWith('warn:') && c.indexOf('sink-B') >= 0).length, 1);
 }
 
 // ── 10. a sink that applies never offers a picker ────────────────────────────────────────
