@@ -1354,8 +1354,14 @@
             }
 
             let leaveSent = false;
+            // `pagehide` is the page going away, so whatever join this tab holds is released —
+            // whether or not the picture is up yet and whether or not a reconfigure is in flight.
+            // Gating it on `isLive && !reconfiguring` (as the old app did too) left a page closed
+            // during a rebuild, or between the answer and the first frame, holding its display
+            // until ICE failed and the grace ran out: about 45 s, during which the next join made
+            // a second one. A page that never got a join id has nothing to release.
             function sendLeave() {
-                if (leaveSent || !isLive || reconfiguring) return;
+                if (leaveSent) return;
                 leaveSent = true;
                 releaseJoin();
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }

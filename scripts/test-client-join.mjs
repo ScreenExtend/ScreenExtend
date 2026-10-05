@@ -119,5 +119,38 @@ function runWarm(env) {
   else fail('the submit handler references warmJoinPath');
 }
 
+// ---- sendLeave: a page going away releases its join whatever state it is in
+function runLeave({ live, reconfiguring, joinId }) {
+  const beacons = [];
+  const calls = [];
+  const ctx = vm.createContext({
+    beacons, calls, encodeURIComponent,
+    navigator: { sendBeacon: (u) => { beacons.push(u); return true; } },
+    noteSuppressed: () => calls.push('suppressed'),
+  });
+  vm.runInContext(`
+    let currentJoinId = ${JSON.stringify(joinId)};
+    function setJoinId(id) { currentJoinId = id || ''; }
+    let isLive = ${live}; let reconfiguring = ${reconfiguring};
+    let pc = { close() { calls.push('pcclose'); } };
+    let leaveSent = false;
+    ${takeFunction('releaseJoin')}
+    ${takeFunction('sendLeave')}
+    sendLeave(); sendLeave();
+    this.after = currentJoinId;
+  `, ctx);
+  return { beacons, calls, after: ctx.after };
+}
+{
+  const id = 'a'.repeat(32);
+  for (const [what, st] of [['live', { live: true, reconfiguring: false }], ['mid-reconfigure', { live: true, reconfiguring: true }], ['answered, no frame yet', { live: false, reconfiguring: false }]]) {
+    const r = runLeave({ ...st, joinId: id });
+    eq('pagehide ' + what + ': one /leave beacon', r.beacons.length + ':' + (r.beacons[0] || ''), '1:/leave?join=' + id);
+    eq('pagehide ' + what + ': the peer connection is closed once', r.calls.filter((c) => c === 'pcclose').length, 1);
+  }
+  const none = runLeave({ live: false, reconfiguring: false, joinId: '' });
+  eq('pagehide with no join id sends nothing', none.beacons.length, 0);
+}
+
 if (failures) { console.log(failures + ' failure(s)'); process.exit(1); }
 console.log('all client join assertions passed');
