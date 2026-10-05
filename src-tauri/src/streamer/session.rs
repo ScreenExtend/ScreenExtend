@@ -318,6 +318,39 @@ pub fn is_known_device(overrides: &SharedDeviceOverrides, token: &str) -> bool {
     is_device_token(token) && overrides.lock_recover().contains_key(token)
 }
 
+/// Devices whose override row the join path wrote and nobody has saved since.
+///
+/// The join path seeds a row for a device the host holds no settings for, so the sheet's first
+/// save has something to compare against (`DeviceOverride::reconfig_action`). That row records
+/// the refresh rate the client reported *at that join*, and every later join read it back as the
+/// device's setting: a device that first joined at 60 Hz streamed at 60 for the rest of the
+/// host's life whatever it reported afterwards — a 120 Hz screen, or a first measurement the page
+/// took while throttled. Before the seed existed a device nobody had configured got the rate it
+/// reported on every join, which is what this restores: a seeded rate is a detection, not a
+/// setting, until a save makes it one.
+static JOIN_SEEDED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+pub fn mark_join_seeded(token: &str) {
+    JOIN_SEEDED
+        .lock_recover()
+        .get_or_insert_with(Default::default)
+        .insert(token.to_string());
+}
+
+/// A save makes every value in the row the user's own.
+pub fn clear_join_seeded(token: &str) {
+    if let Some(set) = JOIN_SEEDED.lock_recover().as_mut() {
+        set.remove(token);
+    }
+}
+
+pub fn is_join_seeded(token: &str) -> bool {
+    JOIN_SEEDED
+        .lock_recover()
+        .as_ref()
+        .is_some_and(|set| set.contains(token))
+}
+
 /// The shape [`mint_device_token`] produces: 128 bits as lowercase hex.
 ///
 /// A client presents this string, so it is parsed before it is compared: a length or alphabet
@@ -1292,6 +1325,17 @@ pub type SharedVirtualDisplay = Arc<dyn VirtualDisplayController>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row the join path seeded is a detection until a save makes it a setting.
+    #[test]
+    fn a_seeded_refresh_rate_is_a_detection_until_saved() {
+        let token = mint_device_token();
+        assert!(!is_join_seeded(&token));
+        mark_join_seeded(&token);
+        assert!(is_join_seeded(&token));
+        clear_join_seeded(&token);
+        assert!(!is_join_seeded(&token));
+    }
 
     #[test]
     fn per_key_lockout_still_applies() {
