@@ -2209,7 +2209,7 @@ async fn start_session(
         Ok(p) => p,
         Err(e) => {
             if let Ok((_, _, session, _, _)) = display_res {
-                session.stop();
+                discard_capture(&join_id, session).await;
             }
             abandon_failed_attempt(
                 state,
@@ -2243,7 +2243,7 @@ async fn start_session(
     // nobody watches — and its `set_active_capture` below would overwrite the newer attempt's
     // stopper, so nothing would ever stop either of them.
     if !still_current() {
-        session.stop();
+        discard_capture(&join_id, session).await;
         pending.abandon().await;
         bail!("join {join_id} was superseded by a newer offer before its answer; standing down");
     }
@@ -2267,7 +2267,7 @@ async fn start_session(
     {
         Ok(pair) => pair,
         Err(e) => {
-            session.stop();
+            discard_capture(&join_id, session).await;
             abandon_failed_attempt(
                 state,
                 &join_id,
@@ -2281,7 +2281,7 @@ async fn start_session(
     };
     // The same check once more: `activate_whep` awaits, and a newer offer can land inside it.
     if !still_current() {
-        session.stop();
+        discard_capture(&join_id, session).await;
         whep.close().await;
         bail!("join {join_id} was superseded by a newer offer while it activated; standing down");
     }
@@ -2346,6 +2346,7 @@ async fn start_session(
             }
         });
     }
+    let own_telemetry = Arc::clone(&session.pipeline.telemetry);
     let session_holder = match state.config.sessions.as_ref() {
         Some(s) => {
             session::set_active_capture(s, &join_id, session_seq, Box::new(move || session.stop()));
@@ -2380,7 +2381,9 @@ async fn start_session(
         if let Some(s) = sessions.as_ref() {
             session::clear_control_sender(s, &report_join, &control_tx);
         }
-        crate::streamer::telemetry::unregister(&report_join);
+        // Only this session's own handle: after a renegotiation the join id names the
+        // successor's telemetry, and this teardown runs once the successor has connected.
+        crate::streamer::telemetry::unregister_if(&report_join, &own_telemetry);
 
         // Give back the peer connection, its ICE agent, that agent's UDP sockets and the
         // injector thread. Nothing did this before, and because the connection held an `Arc` to
@@ -2397,7 +2400,7 @@ async fn start_session(
         if let Some(stop) = stop {
             let _ = tokio::task::spawn_blocking(stop).await;
         } else if let Some(session) = session_holder {
-            session.stop();
+            let _ = tokio::task::spawn_blocking(move || session.stop()).await;
         }
 
         if !left {
@@ -2445,6 +2448,19 @@ async fn start_session(
     });
 
     Ok((answer, resource_id))
+}
+
+/// Stop the capture an attempt built but will not use, and withdraw the telemetry it published.
+///
+/// `SessionCapture::stop` joins the capture thread: milliseconds normally, seconds when the
+/// capture is wedged (WGC on a stale monitor handle). Called inline it parked a tokio worker, and
+/// a task the worker had just woken into its LIFO slot (an h2 connection, another join's answer)
+/// cannot be stolen by the idle workers, so it waited the whole stop out. These are exactly the
+/// paths a retried or superseded join takes. Awaited, so the display is still only removed after
+/// the capture on it has stopped.
+async fn discard_capture(join_id: &str, session: pipeline::SessionCapture) {
+    crate::streamer::telemetry::unregister_if(join_id, &session.pipeline.telemetry);
+    let _ = tokio::task::spawn_blocking(move || session.stop()).await;
 }
 
 /// Forget a session whose join attempt failed — unless a newer attempt has taken it over.

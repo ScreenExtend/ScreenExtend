@@ -100,10 +100,12 @@ their first line — on exactly the machine where a green tick is most misleadin
   with `tprintln!`, and `percentiles()` prints them in the shape `scripts/perf-gate.mjs` parses.
 
 The client page has its own suite, `pnpm test:client` (`scripts/test-client.mjs`), which runs
-eight dependency-free Node harnesses over the shipped `.js` files with `vm` and minimal browser
+ten dependency-free Node harnesses over the shipped `.js` files with `vm` and minimal browser
 stubs: the input wire format and telemetry frame, golden input vectors the Rust parser reads back,
 the Opus decode worker, the jitter buffer and the planar ring ABI, the WebCodecs video path and
-the RTP→host-clock inversion, ICE gathering, and the `/reconfig` epochs. No runner and no
+the RTP→host-clock inversion, ICE gathering, the encoded transform installed before Chrome
+short-circuits it, the frame watchdog that must never demote a painting session, the
+`/reconfig` epochs, and the join path (setup failures and the load-time warm-up). No runner and no
 devDependency, and `src-tauri/src/streamer/static/` stays byte-identical.
 
 The `#[ignore]`d latency harnesses are documented in `docs/manual-tests/latency-harnesses.md` —
@@ -545,6 +547,15 @@ Cross-platform core, OS-independent:
   device token as a second factor. There is deliberately **no address fallback** on any request
   path.
 
+  **A lost answer is not a second join.** Each page load mints a 128-bit `attemptId` and sends it
+  in every `POST /whep` body. When the host answered but the page never received it, the page
+  offers again with no join id (and, on a first join, no token); `attempt_continuation` /
+  `session::pending_join_for_attempt` recognise that offer as the join already in flight — same
+  attempt id, a display already attached, **never connected** (the first byte the writer sends
+  marks a join connected), and the same device token whenever the retry presents one — so it
+  reuses that session, token and display instead of creating a second of each. An attempt id can
+  never reach a session somebody is watching or another device's.
+
   **What a settings edit costs the stream is a question with five answers, and
   `DeviceOverride::reconfig_action` is where it is decided** — one comparison of the saved
   override against the submitted one, with the field → action table beside it as a test. The
@@ -608,6 +619,13 @@ Cross-platform core, OS-independent:
   into `invalidate_reference` / `use_ltr` / `mark_ltr`. `keyframe.rs` is the gate that stops the
   four separate paths reaching for an IDR (RTCP PLI, RTCP FIR, payloader error, lagged viewer)
   from turning a transient into a keyframe storm; its window is derived from the measured RTT.
+  On top of it, RTCP PLI/FIR go through **`PliBackoff`**: every WebCodecs client page consumes
+  its frames in an encoded transform, so libwebrtc's own idle decoder asks for a keyframe every
+  ~200 ms for the life of the session (measured: 117 PLIs in 30 s, an IDR every ~280 ms, the old
+  app too). Each answered PLI that is followed by another doubles a window from 200 ms to a 2 s
+  cap (10 s while the client's STATS say it is painting through WebCodecs); a PLI-free 4 s closes
+  it; evidence of real loss (a NACK, TWCC-reported loss, the client's own keyframe counter
+  moving) opens it at once. The client's out-of-band 0x64 request bypasses it entirely.
 - `sockets.rs` — the UDP socket options webrtc-rs never sets: DSCP/`IP_TOS` so video is not in
   the AP's best-effort queue with every background download, `SO_SNDBUF`, and Windows'
   `SIO_UDP_CONNRESET`.
@@ -799,26 +817,32 @@ Cross-platform core, OS-independent:
 
 ### System audio — Windows (`windows_utils/audio/`, tiered)
 
-Per-device system-audio capture + Opus encode. Two capture tiers, selected at runtime:
+Per-device system-audio capture + Opus encode. Two capture tiers, selected at runtime by
+`loopback.rs::acquire`: **process loopback is tried first, endpoint loopback is the fallback**
+(the code's comments still number them the old way: endpoint = "tier 1", process = "tier 2").
+`SE_ENDPOINT_LOOPBACK=1` restores the old order (endpoint first, process only if endpoint
+fails), for a measurement. Either way capture runs on a **dedicated OS thread** with COM MTA +
+MMCSS "Pro Audio", event-driven.
 
-**Tier 1, endpoint loopback** (`loopback.rs::acquire_endpoint`) — WASAPI **legacy
-`IAudioClient::Initialize` loopback** on the `eRender`/`eConsole` endpoint (the IAudioClient3
-low-latency path rejects the loopback flag). Runs on a **dedicated OS thread** with COM MTA +
-MMCSS "Pro Audio", event-driven, re-acquiring on default-device change,
-`AUDCLNT_E_DEVICE_INVALIDATED`, a dead companion, or 2 s of an unsignalled event.
-
-**Tier 2, process loopback** (`process_loopback.rs`) —
+**Process loopback** (`process_loopback.rs`, tried first) —
 `ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK)` with
 `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` and
 `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` on our own pid, i.e. "the whole system
-except us". **Probed by attempting the activation, never by a build number.** It is the
-fallback rather than the default because measurement says it is not faster (both ride the same
-shared engine); what it buys is capture that survives an exclusive-mode endpoint and device
-churn, plus a format we choose instead of the endpoint's. It needs no silent companion —
-measured, not assumed. `ScreenExtend probe --audio --process-loopback` is the only way to reach
-it on a machine where tier 1 works.
+except us". **Probed by attempting the activation, never by a build number.** It is first
+because it measured faster end to end: click → encoded packet, median 59.4 ms against 80.6 ms
+for endpoint loopback (five interleaved runs each, `loopback.rs::acquire`'s comment) — the
+endpoint tier taps the mix after the endpoint's own buffering, the process tier before. It
+also survives an exclusive-mode endpoint and device churn, takes a format we choose instead of
+the endpoint's, and captures every process on every output device (endpoint loopback hears only
+the default device's mix). It needs no silent companion — measured, not assumed.
 
-- `silence.rs` — a **silent render companion** is mandatory for tier 1: it is the clock source
+**Endpoint loopback** (`loopback.rs::acquire_endpoint`, the fallback: Windows before 10 2004
+or a refused activation) — WASAPI **legacy `IAudioClient::Initialize` loopback** on the
+`eRender`/`eConsole` endpoint (the IAudioClient3 low-latency path rejects the loopback flag),
+re-acquiring on default-device change, `AUDCLNT_E_DEVICE_INVALIDATED`, a dead companion, or 2 s
+of an unsignalled event.
+
+- `silence.rs` — a **silent render companion** is mandatory for endpoint loopback: it is the clock source
   that makes the loopback event fire and keeps packets flowing while the host is idle (measured:
   0/20 event signals without it, 20/20 with it — `docs/recovered/AUDIO_NOTES.md` §3.2). It is
   also the only stream we own that may ask the engine for a smaller period (`engine.rs`,
