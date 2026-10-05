@@ -203,11 +203,21 @@ function serveLogCounts() {
   return { connected: (s.match(/\+ device connected/g) || []).length, disconnected: (s.match(/- device disconnected/g) || []).length, bytes: s.length };
 }
 
-async function deviceKey(name) {
+async function deviceKey(name, cl) {
   // Address the device by token where the build reports one (devices set refuses an address
-  // shared by two devices); the old build only knows addresses.
+  // shared by two devices); the old build only knows addresses. When a join was retried (the
+  // page gave up on an answer and offered again) two joins carry the same name, each with its own
+  // token, and the list's order says nothing about which one the page is on now — so the join id
+  // the page holds decides, and only without one does the last same-named entry stand in.
   const j = await hostJoins();
-  if (j.joins) { const mine = j.joins.filter((x) => x.name === name); if (mine.length) return { key: mine[mine.length - 1].token, by: 'token', joins: j.joins }; }
+  if (j.joins) {
+    const mine = j.joins.filter((x) => x.name === name);
+    let held = null;
+    if (cl) held = await cl.page.ev('(() => { try { return sessionStorage.getItem("se.joinId") || ""; } catch (e) { return ""; } })()').catch(() => null);
+    const live = held ? mine.find((x) => x.joinId === held) : null;
+    if (live) return { key: live.token, by: 'token (the join the page holds)', joins: j.joins };
+    if (mine.length) return { key: mine[mine.length - 1].token, by: 'token', joins: j.joins };
+  }
   return { key: H.ip, by: 'ip (this build reports no join tokens)', joins: null };
 }
 
@@ -435,7 +445,7 @@ function aggregate(runs) {
 // ---------------------------------------------------------------- audio
 async function audioTest(cl, name) {
   const res = { };
-  const k = await deviceKey(name);
+  const k = await deviceKey(name, cl);
   const set = await cli(['devices', 'set', k.key, '--audio', 'on']);
   res.enable = { by: k.by, code: set.code, out: (set.stdout + set.stderr).trim().slice(0, 300) };
   if (HOSTCTX.mode === 'exclusive') res.enable.note = 'wrote the real config.json; it is restored byte-for-byte at the end of the run';
@@ -498,7 +508,7 @@ async function audioTest(cl, name) {
 // ---------------------------------------------------------------- settings change
 async function settingsChange(cl, name) {
   const out = { edits: [] };
-  const k0 = await deviceKey(name);
+  const k0 = await deviceKey(name, cl);
   const edits = [
     ['audio on', ['--audio', 'on']], ['audio off', ['--audio', 'off']],
     ['video quality', ['--video-quality', '30']], ['video scale', ['--video-scale', '75']],
@@ -663,7 +673,7 @@ async function twoClients(clA) {
     const ready = await st.ready;
     if (ready.error) out.error = 'stage: ' + ready.error;
     else {
-      const ka = await deviceKey(ja.name);
+      const ka = await deviceKey(ja.name, clA);
       out.result = await underLock('two_clients', async () => {
         const col = clB.collectStamps(ready, 24000, { follow: st });
         await sleep(6000); const baseEnd = Date.now();
