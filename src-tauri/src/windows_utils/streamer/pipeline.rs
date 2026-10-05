@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::capture::{
+    CaptureControl, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+};
 use crate::windows_capture::d3d11::StagingTexture;
 use crate::windows_capture::frame::Frame;
 use crate::windows_capture::graphics_capture_api::{wgc_features, InternalCaptureControl};
@@ -522,7 +524,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
 
     super::capture::check_dwm_composition()?;
 
-    let (monitor, info) = select_monitor_by_device_name(device_name)?;
+    let (mut monitor, mut info) = select_monitor_by_device_name(device_name)?;
 
     if cfg.force_dxgi {
         let (pipeline, control) = start_dxgi_capture(
@@ -541,16 +543,42 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         });
     }
 
-    match start_live_capture(
-        cfg,
-        monitor,
-        &info,
-        tx.clone(),
-        Arc::clone(&idr_request),
-        Arc::clone(&repair),
-        Arc::clone(&target_bitrate),
-        Arc::clone(&telemetry),
-    ) {
+    let mut stale_retries = 0u32;
+    let started = loop {
+        let attempt = start_live_capture(
+            cfg,
+            monitor,
+            &info,
+            tx.clone(),
+            Arc::clone(&idr_request),
+            Arc::clone(&repair),
+            Arc::clone(&target_bitrate),
+            Arc::clone(&telemetry),
+        );
+        match attempt {
+            Err(e)
+                if e.downcast_ref::<StaleMonitor>().is_some()
+                    && stale_retries < WGC_STALE_MONITOR_RETRIES =>
+            {
+                stale_retries += 1;
+                teprintln!(
+                    "WGC could not open {device_name} ({e:#}); re-resolving the display \
+                     (retry {stale_retries}/{WGC_STALE_MONITOR_RETRIES})"
+                );
+                std::thread::sleep(WGC_STALE_MONITOR_BACKOFF);
+                match select_monitor_by_device_name(device_name) {
+                    Ok((m, i)) => {
+                        monitor = m;
+                        info = i;
+                    }
+                    Err(e) => teprintln!("re-resolving {device_name} failed: {e:#}"),
+                }
+            }
+            other => break other,
+        }
+    };
+
+    match started {
         Ok((pipeline, control)) => Ok(SessionCapture {
             pipeline,
             control: Some(SessionControl::Wgc(control)),
@@ -670,11 +698,45 @@ fn start_live_capture(
         },
     );
 
-    let control = LiveCapture::start_free_threaded(settings)
-        .map_err(|e| anyhow!("starting WGC capture: {e}"))?;
+    let control = LiveCapture::start_free_threaded(settings).map_err(wgc_start_error)?;
 
     Ok((pipeline, control))
 }
+
+/// A WGC start failure as an `anyhow` error, tagged [`StaleMonitor`] when the capture item could
+/// not be created from the monitor handle — the one failure worth retrying before DXGI.
+pub(crate) fn wgc_start_error(e: GraphicsCaptureApiError<anyhow::Error>) -> anyhow::Error {
+    let stale = matches!(e, GraphicsCaptureApiError::ItemConvertFailed);
+    let err = anyhow!("starting WGC capture: {e}");
+    if stale {
+        err.context(StaleMonitor)
+    } else {
+        err
+    }
+}
+
+/// `CreateForMonitor` refused the `HMONITOR` this session resolved a moment earlier.
+///
+/// A join sets the virtual display's mode just before capture starts, and the handle resolved
+/// before that can be dead by the time WGC converts it. Falling straight to DXGI on that is the
+/// worst answer available: on a hybrid laptop, duplicating an indirect display returns
+/// `ACCESS_LOST` on every acquire until the re-establish cap stops it, so the client gets no
+/// picture until its offer times out and it retries (measured: first picture 12.9 s after the
+/// submit, two offers). The display is still there under a fresh handle.
+#[derive(Debug)]
+pub(crate) struct StaleMonitor;
+
+impl std::fmt::Display for StaleMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the monitor handle went stale before WGC could open it")
+    }
+}
+
+/// Retries of a WGC start that failed on a stale monitor handle before DXGI is tried. Each one
+/// costs the backoff plus a rebuilt encoder; five cover the second or so a mode change takes to
+/// settle on a loaded machine.
+const WGC_STALE_MONITOR_RETRIES: u32 = 5;
+const WGC_STALE_MONITOR_BACKOFF: Duration = Duration::from_millis(200);
 
 #[allow(clippy::too_many_arguments)]
 fn start_dxgi_capture(
