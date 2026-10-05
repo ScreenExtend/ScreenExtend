@@ -1,8 +1,24 @@
 use crate::streamer::config::{Config, ScalePercent};
 use crate::windows_capture::capture::GraphicsCaptureApiError;
 use crate::windows_utils::streamer::pipeline::{
-    live_encoder_config, scaled_dims, wgc_start_error, StaleMonitor,
+    live_encoder_config, scaled_dims, wgc_min_update_interval, wgc_start_error, StaleMonitor,
 };
+
+/// WGC's delivery floor is two thirds of the stream's period (1.5× its rate, so the stream is
+/// never starved), and never under 4 ms. A flat 4 ms let a 60 Hz virtual display deliver ~190
+/// frames a second once a second virtual display put the panel at 360 Hz.
+#[test]
+fn wgc_floor_is_two_thirds_of_a_period_and_never_under_4ms() {
+    use std::time::Duration;
+    let period = |hz: u64| Duration::from_nanos(1_000_000_000 / hz);
+    assert_eq!(wgc_min_update_interval(period(60)), period(60) * 2 / 3);
+    assert!(wgc_min_update_interval(period(60)) > Duration::from_millis(11));
+    assert_eq!(wgc_min_update_interval(period(120)), period(120) * 2 / 3);
+    assert_eq!(
+        wgc_min_update_interval(period(500)),
+        Duration::from_millis(4)
+    );
+}
 
 /// A capture item that cannot be created from the monitor handle is the one WGC start failure
 /// `start_on_monitor` retries before falling to DXGI; every other failure goes straight there.

@@ -148,14 +148,24 @@ fn restore_pending_bitrate(target_bitrate: &AtomicU32, pending: u32) {
 
 const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
 
-/// `MinUpdateInterval` is a floor on the gap between delivered frames, not a throttle to a rate:
-/// WGC's default delivery is capped near 60 Hz whatever the panel does, and this property is what
-/// raises that ceiling. The old `frame_duration * 2/3` scaled the floor with the target rate,
-/// which is backwards — a floor near the target period caps delivery *below* it.
-/// `windows-capture` issue #190 measured a 120 Hz panel with the floor at 1/60 delivering ~52 fps,
-/// at 1/90 ~58 fps and at 1/120 ~59 fps. Sunshine sets a flat 4 ms (250 Hz); so do we, and let
-/// the pipeline's own pacing decide what to keep.
+/// The lowest `MinUpdateInterval` WGC is ever given (250 Hz, Sunshine's flat value).
 const WGC_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
+
+/// `MinUpdateInterval` for a stream at `frame_period`: two thirds of a period, never under 4 ms.
+///
+/// This is the pre-overhaul value, restored. The flat 4 ms that replaced it assumed the display
+/// composes at its nominal rate, so a floor that low only *permits* a rate. On this machine that
+/// holds with one virtual display attached (≈ 64 deliveries a second at 60 Hz either way) and
+/// fails with two or more: the internal panel then runs at 360 Hz and DWM composes every 60 Hz
+/// virtual display about three times too often. At 4 ms WGC delivered ~190 frames a second to a
+/// 60 fps session — each a full-surface copy into the frame pool and a callback, two thirds of
+/// them then thrown away by the cadence gate. At two thirds of a period it delivered ~70, with the
+/// same latency (`docs/overhaul-new/G01.md`, E5). Delivery stays above the stream's own rate
+/// (1.5× it), which is the margin `windows-capture` issue #190 says a floor needs, and the floor
+/// scales with the rate so a 120 Hz session is not capped near 60.
+pub(crate) fn wgc_min_update_interval(frame_period: Duration) -> Duration {
+    (frame_period * 2 / 3).max(WGC_MIN_UPDATE_INTERVAL)
+}
 
 /// Whether the host draws the pointer itself instead of letting WGC composite it.
 ///
@@ -659,7 +669,7 @@ fn start_live_capture(
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(WGC_MIN_UPDATE_INTERVAL),
+        MinimumUpdateIntervalSettings::Custom(wgc_min_update_interval(frame_duration)),
         DirtyRegionSettings::ReportOnly,
         ColorFormat::Bgra8,
         CaptureFlags {
@@ -3492,11 +3502,12 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // not coalesce, it drops every frame that arrives a jitter early, and both bounded variants
         // land *below* the baseline they were meant to restore.
         //
-        // The ceiling that remains is `DISPLAY_COMPOSE_HZ`: WGC cannot deliver frames the display
-        // did not compose, and `WGC_MIN_UPDATE_INTERVAL`'s 4 ms only permits a rate, it does not
-        // produce one. If a cap on how much a client is asked to decode is ever wanted, that is
-        // where it belongs — in what the display is driven at, not in a gate that by then cannot
-        // tell a moving cursor from a moving window.
+        // The ceiling that remains is WGC's own: `wgc_min_update_interval` (two thirds of a
+        // period) bounds delivery, cursor frames included, at 1.5× the stream's rate — 90 fps for a
+        // 60 Hz client, the same bound the pre-overhaul host had when it measured 85 fps for a
+        // pointer sweep. The 113 above was measured with a 4 ms floor and is no longer reachable;
+        // the bound is applied where it throttles production rather than here, where it would
+        // discard.
         if let Some(last) = self.last_delivered {
             if !cursor_moved
                 && capture.duration_since(last) < self.frame_period * CADENCE_NUM / CADENCE_DEN
