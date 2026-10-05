@@ -638,6 +638,9 @@ async function slowAnswer(cl) {
   const name = deviceName();
   for (let i = 0; i < n; i++) {
     const j = await joinClient(cl, REQ.client, { name });
+    // Every attempt's full join record (network timing per /whep request included) goes into
+    // joins[] too, so a slow or lost answer can be laid against serve.log afterwards.
+    R.joins.push({ scenario: `slow_answer#${i + 1}`, ...j });
     const s = await hostJoins(); const m = await ourMonitors();
     const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
     e.flag = (j.answerMs > 5000 ? 'answer over 5 s; ' : '') + (/did not answer|gave up|timed out/i.test(j.pageError || '') ? 'page gave up; ' : '') + ((e.liveJoins || 0) > 1 || (e.displays || 0) > 1 ? 'second session/display; ' : '');
