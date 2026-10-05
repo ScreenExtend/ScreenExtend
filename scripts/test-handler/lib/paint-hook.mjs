@@ -14,7 +14,7 @@ export const HOOK_SOURCE = `(() => {
   const S = self.__seStamp = { cfg: null, out: [], pending: 0, prev: null, painted: 0, sampled: 0, skipped: 0, errors: 0, diag: 0 };
   const now = () => performance.timeOrigin + performance.now();
   const CELLS = 38, PX = 4, W = CELLS * PX;
-  let strip = null, grid = null;
+  let strip = null, grid = null, band = null;
   function decode(d) {
     const l = [];
     for (let i = 0; i < CELLS; i++) { const o = (i * PX + (PX >> 1)) * 4; l.push(0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]); }
@@ -37,7 +37,12 @@ export const HOOK_SOURCE = `(() => {
     const img = isFrame ? src.clone() : src;
     let p;
     if (cfg.mode === 'grid') p = createImageBitmap(img, { resizeWidth: 64, resizeHeight: 36 });
-    else {
+    else if (cfg.mode === 'mover') {
+      // A 2-row band through the middle of the moving window's row, full width, 960 samples:
+      // where is the orange square in the frame the client just painted?
+      const k = fw / cfg.width; const y0 = Math.max(0, Math.min(fh - 2, Math.round((cfg.y + cfg.h / 2) * k) - 1));
+      p = createImageBitmap(img, 0, y0, fw, 2, { resizeWidth: 960, resizeHeight: 1, resizeQuality: 'low' });
+    } else {
       const k = fw / cfg.width; const sw = Math.max(1, Math.round(CELLS * cfg.cell * k));
       // 'full' averages the whole cell height. 'center' reads a 2-row band through the middle of
       // the cells: the compositor can catch the stage's blit half done (a horizontal tear, new
@@ -60,6 +65,12 @@ export const HOOK_SOURCE = `(() => {
         }
         S.prev = new Uint8ClampedArray(d);
         S.out.push({ t, changed, maxDelta, green });
+      } else if (cfg.mode === 'mover') {
+        if (!band) band = new OffscreenCanvas(960, 1).getContext("2d", { willReadFrequently: true });
+        band.drawImage(bm, 0, 0); const d = band.getImageData(0, 0, 960, 1).data;
+        let first = -1, last = -1;
+        for (let i = 0; i < 960; i++) { const o = i * 4; if (d[o] > 170 && d[o + 1] < 140 && d[o + 2] < 110 && d[o] - d[o + 2] > 100) { if (first < 0) first = i; last = i; } }
+        S.out.push({ t, mx: first < 0 ? null : (first / 960) * cfg.width, mx2: last < 0 ? null : ((last + 1) / 960) * cfg.width });
       } else {
         if (!strip) strip = new OffscreenCanvas(W, 1).getContext('2d', { willReadFrequently: true });
         strip.drawImage(bm, 0, 0); const r = decode(strip.getImageData(0, 0, W, 1).data);

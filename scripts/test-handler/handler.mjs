@@ -38,6 +38,7 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
   netlog: false,           // Chrome's own network log per browser, into the run directory
   stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
@@ -124,11 +125,12 @@ function screens() {
   } catch { return []; }
 }
 
-function startStage(gdi, { seconds, stamp = true, mover = false, large = false, notIn = null, wait = 20, driverId = null }) {
+function startStage(gdi, { seconds, stamp = true, mover = false, large = false, notIn = null, wait = 20, driverId = null, extra = [] }) {
   const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'stage.ps1'), '-Seconds', String(seconds), '-WaitSeconds', String(wait)];
   if (driverId != null) args.push('-DriverId', String(driverId));
   if (gdi) args.push('-Gdi', gdi); else args.push('-NewScreenNotIn', (notIn || []).join(';'));
   if (stamp) args.push('-Stamp'); if (mover) args.push('-Mover'); if (large) args.push('-Large');
+  args.push(...extra);
   const proc = spawn('powershell', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   owned.stages.push(proc);
   const st = { current: null };
@@ -664,6 +666,44 @@ async function slowAnswer(cl) {
   return out;
 }
 
+// The cursor stand-in at rest. A small window moves (fast steps, like a pointer) and stops; the
+// stage reports where it stopped. Does the client's picture come to rest there, or one step
+// short? A frame gate that drops the frame carrying the final position leaves the picture stale
+// until something else changes — on a still desktop, indefinitely.
+async function moverStopTest(cl) {
+  const o = typeof REQ.mover_stop === 'object' ? REQ.mover_stop : {};
+  const cycles = o.cycles || 10, moveS = o.move_s || 1.2, holdS = o.hold_s || 2, stepMs = o.step_ms || 8, speed = o.speed || 2.5;
+  const j = await joinClient(cl, REQ.client);
+  R.joins.push({ scenario: 'mover_stop', ...j });
+  if (j.firstPictureMs == null) { await leave(cl); return { error: 'no picture after join', join: { answerMs: j.answerMs, offers: j.offers } }; }
+  await sleep(1500);
+  const secs = Math.ceil(cycles * (moveS + holdS)) + 3;
+  const st = await stageFor(j.name, { seconds: secs, stamp: false, mover: true, extra: ['-MoverStepMs', String(stepMs), '-MoverSpeed', String(speed), '-MoveSeconds', String(moveS), '-HoldSeconds', String(holdS)] });
+  const ready = await st.ready;
+  if (ready.error) { stopStage(st); await leave(cl); return { error: 'stage: ' + ready.error }; }
+  const res = await underLock('mover_stop', async () => {
+    await cl.drainStamps();
+    await cl.setStampCfg({ mode: 'mover', width: ready.width, height: ready.height, y: Math.floor(ready.height * 0.4), h: 48 });
+    const samples = []; const t0 = Date.now();
+    while (st.proc.exitCode === null && Date.now() - t0 < (secs + 10) * 1000) { await sleep(250); samples.push(...(await cl.drainStamps()).samples); }
+    await cl.setStampCfg(null); await sleep(100); samples.push(...(await cl.drainStamps()).samples);
+    return samples.filter((x) => x.mx !== undefined);
+  });
+  stopStage(st);
+  const off = R.clock.browserMinusSystemMs;
+  const stopsRaw = st.output().split('\n').map((l) => { try { return JSON.parse(l.trim()); } catch { return null; } }).filter((x) => x && x.stop);
+  const stops = stopsRaw.map((s) => {
+    const inHold = res.filter((x) => x.t - off >= s.t && x.t - off <= s.t + holdS * 1000 - 50 && x.mx != null);
+    const late = inHold.filter((x) => x.t - off >= s.t + holdS * 1000 * 0.6);
+    const settled = late.length ? late[late.length - 1].mx : (inHold.length ? inHold[inHold.length - 1].mx : null);
+    const reached = inHold.find((x) => Math.abs(x.mx - s.x) <= 6);
+    return { stop: s.stop, trueX: s.x, settledX: settled == null ? null : Math.round(settled), errorPx: settled == null ? null : Math.round(settled - s.x), reachedMs: reached ? Math.round(reached.t - off - s.t) : null, paintsDuringHold: inHold.length, lastPaintMs: inHold.length ? Math.round(inHold[inHold.length - 1].t - off - s.t) : null };
+  });
+  const stale = stops.filter((s) => s.errorPx == null || Math.abs(s.errorPx) > 6);
+  await leave(cl);
+  return { params: { cycles, moveS, holdS, stepMs, speedPxPerMs: speed, display: { width: ready.width, height: ready.height } }, stops, staleStops: stale.length, of: stops.length, note: 'settledX: where the orange window sits in the last painted frame of the hold (after 60 % of it), read from a 2-row band, 2 px resolution at 1920 wide; stale = more than 6 px from where the stage stopped it. reachedMs: stop -> first painted frame showing the true position.' };
+}
+
 async function autoRejoin(cl) {
   const out = {};
   const j = await joinClient(cl, REQ.client);
@@ -793,6 +833,7 @@ async function main() {
       if (REQ.leave_rejoin) R.special.leave_rejoin = await leaveRejoin(cl);
       if (REQ.slow_answer) R.special.slow_answer = await slowAnswer(cl);
       if (REQ.fallback_paths) R.special.fallback_paths = await fallbackPaths();
+      if (REQ.mover_stop) R.special.mover_stop = await moverStopTest(cl);
       if (REQ.auto_rejoin) R.special.auto_rejoin = await autoRejoin(cl);
     };
     // By default the lock is held for the whole live-display part of the test, so no other
