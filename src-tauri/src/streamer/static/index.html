@@ -2429,14 +2429,26 @@
                             }
                             transformStarted = false;
                         } else {
-                            let readable;
+                            let readable, writable;
                             try {
-                                ({ readable } = videoTransceiver.receiver.createEncodedStreams());
+                                ({ readable, writable } = videoTransceiver.receiver.createEncodedStreams());
                             } catch (err) {
                                 fallbackToVideo('createEncodedStreams failed: ' + err.message);
                                 return;
                             }
-                            worker.postMessage({ type: 'encodedstream', readable }, [readable]);
+                            // The writable goes too: the worker hands keyframes back to the
+                            // receiver so its own decoder stops asking for them (see
+                            // transform-worker.js, "The receiver's own decoder").
+                            // A WritableStream is not transferable everywhere createEncodedStreams
+                            // exists (Chrome 86); a DataCloneError throws before anything moves.
+                            let sentWritable = false;
+                            if (writable) {
+                                try {
+                                    worker.postMessage({ type: 'encodedstream', readable, writable }, [readable, writable]);
+                                    sentWritable = true;
+                                } catch (_) { noteSuppressed(); }
+                            }
+                            if (!sentWritable) worker.postMessage({ type: 'encodedstream', readable }, [readable]);
                         }
                         // Both of these are inert on this path and deliberately kept: the
                         // transform runs in place of libwebrtc's reference finder, so the
