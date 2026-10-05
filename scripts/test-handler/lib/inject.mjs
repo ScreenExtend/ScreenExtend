@@ -11,7 +11,9 @@ export function observerSource(opts = {}) {
   const S = window.__se = { gum: [], permQueries: [], pcs: [], whep: [], errors: [], analysers: [], onsets: [], audioBuckets: [], notes: [] };
   const now = () => performance.timeOrigin + performance.now();
   try {
-    if (OPTS.refreshRate) Object.defineProperty(Screen.prototype, 'refreshRate', { get: () => OPTS.refreshRate, configurable: true });
+    // self.__seRefresh is set by a later new-document script when the client spec changes (the
+    // hi-res scenario reuses this browser), so the page reports the current spec's rate.
+    if (OPTS.refreshRate) Object.defineProperty(Screen.prototype, 'refreshRate', { get: () => self.__seRefresh || OPTS.refreshRate, configurable: true });
     if (OPTS.disable && OPTS.disable.indexOf('webcodecs') >= 0) { delete window.VideoDecoder; delete window.EncodedVideoChunk; }
     if (OPTS.disable && OPTS.disable.indexOf('script_transform') >= 0) { delete window.RTCRtpScriptTransform; }
     if (OPTS.disable && OPTS.disable.indexOf('encoded_streams') >= 0 && window.RTCRtpReceiver) { delete RTCRtpReceiver.prototype.createEncodedStreams; }

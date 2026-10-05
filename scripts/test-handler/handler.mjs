@@ -39,6 +39,7 @@ const DEFAULTS = {
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
   mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
+  cpu_burn: null,          // {threads, seconds}: saturate the CPU during slow_answer's joins (inside the measurement lock)
   netlog: false,           // Chrome's own network log per browser, into the run directory
   stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // After every join has left: close the host's stdout/stderr pipes (as a parent that stops
@@ -416,6 +417,11 @@ async function standardScenarios(cl, spec) {
   if (want('hires_small_window') || want('hires_large_area')) {
     const hs = { ...REQ.hires_client };
     await cl.setClient(hs);
+    // A fresh device identity for the hi-res join. The common join left a device token in the
+    // page's localStorage, and the host saved a settings row under it (refreshRate 60), which
+    // then overrides what the hi-res client reports: before this, the "120 Hz" scenario ran at
+    // 60 Hz on the current head without anyone asking for it.
+    if (H) { const o = clientUrl(hs, 'x', { https: hs.https !== false }).origin; R.hiresStorageCleared = await cl.page.send('Storage.clearDataForOrigin', { origin: o, storageTypes: 'local_storage,cookies' }).then(() => true, (e) => e.message); }
     const j = await joinClient(cl, hs);
     R.joins.push({ scenario: 'hires', ...j });
     if (j.firstPictureMs == null) out.hires = { error: 'no picture after join', join: j };
@@ -726,6 +732,17 @@ async function slowAnswer(cl) {
   const n = typeof REQ.slow_answer === 'object' && REQ.slow_answer.n ? REQ.slow_answer.n : 5;
   const out = { attempts: [] };
   const name = deviceName();
+  // `cpu_burn: {threads, seconds}`: saturate the CPU during the joins, to reproduce the lost
+  // request / lost answer seen only on a loaded machine. A separate process of busy workers at
+  // normal priority, killed when the joins end (or after `seconds`, whichever is first).
+  let burn = null;
+  if (REQ.cpu_burn) {
+    const n = REQ.cpu_burn.threads || os.cpus().length, secs = REQ.cpu_burn.seconds || 120;
+    const src = `const { Worker } = require('worker_threads'); for (let i = 0; i < ${n}; i++) new Worker('const e = Date.now() + ${secs * 1000}; while (Date.now() < e) {}', { eval: true }); setTimeout(() => process.exit(0), ${secs * 1000 + 500});`;
+    burn = spawn(process.execPath, ['-e', src], { stdio: 'ignore', windowsHide: true });
+    owned.stages.push(burn); out.cpuBurn = { threads: n, seconds: secs, pid: burn.pid };
+    await sleep(1500);
+  }
   for (let i = 0; i < n; i++) {
     const j = await joinClient(cl, REQ.client, { name });
     // Every attempt's full join record (network timing per /whep request included) goes into
@@ -737,6 +754,7 @@ async function slowAnswer(cl) {
     out.attempts.push(e);
     await leave(cl); await sleep(2500);
   }
+  if (burn && burn.exitCode === null) { try { burn.kill(); } catch { /* gone */ } }
   out.flagged = out.attempts.filter((a) => a.flag).length;
   return out;
 }
