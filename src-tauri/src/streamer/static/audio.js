@@ -204,10 +204,7 @@
         msd: null,
         sinkEl: null,
         micHold: null,
-        micPrime: null,
         micGranted: false,
-        primedStream: null,
-        wantPrime: null,
         // A sink to route once there is a graph to route it through, as
         // `{ id, fromPicker }`. Two things write it: `pickOutput`, whose choice the user made
         // in the browser's own chooser, and `setSpeaker` when the host commands a sink before
@@ -275,101 +272,157 @@
         }
     }
 
-    function micWanted() {
-        if (speakers.wantPrime !== null) return speakers.wantPrime;
-        return speakers.canSink || (speakers.hasEarpiece && !speakers.hasAudioSession);
+    // ── Which speakers this device has, settled before the offer goes out ────────────────
+    //
+    // The host's device sheet lists the outputs a device reports, and the owner's rule is:
+    // detect them without asking wherever the platform allows, ask for the microphone only when
+    // that yields nothing routable and a grant can actually change it, and do all of it before
+    // the stream starts, so nothing is raised over a live stage later.
+    //
+    // What the platforms allow, measured on this project (docs/overhaul-new/G06.md, 2026-10-05
+    // addendum): Chrome 154 and Edge 154 with no grant list exactly ONE `audiooutput`, with an
+    // empty id and an empty label, whatever hardware is attached — so the count says nothing
+    // and the entry cannot be routed to. A microphone grant (or `speaker-selection`, which no
+    // shipping Chromium can grant through UI) lists every output, labelled. Ids saved under an
+    // earlier grant are refused by `setSinkId` once the grant is gone (`NotFoundError` on the
+    // context, `SecurityError` on an element), so a cached list is not a routable one either.
+    // `permissions.query({name: 'speaker-selection'})` throws in both. So on Chromium the first
+    // join of a profile that never granted the microphone reaches the card, and the card is
+    // raised at most once per device: whatever the answer (a lasting grant, a one-time grant,
+    // Skip, a refused prompt) it is remembered, and only the host operator asking for a
+    // choice raises it again.
+    const OUT_KEY_ASKED = 'se.outputs.micCardAnswer';
+    const OUT_KEY_CHOOSE = 'se.outputs.chooseRequested';
+    const OUT_KEY_CHOOSE_ANSWERED = 'se.outputs.chooseAnswered';
+    function storeGet(k) {
+        try { return window.localStorage ? window.localStorage.getItem(k) : null; } catch (_) { note(); return null; }
     }
-
-    function primeMicPermission() {
-        initSpeakers();
-        if (speakers.micPrime) return speakers.micPrime;
-        if (!speakers.supported || !micWanted()) {
-            speakers.micPrime = Promise.resolve(null);
-            return speakers.micPrime;
-        }
-        let req;
+    function storeSet(k, v) {
         try {
-            req = navigator.mediaDevices.getUserMedia({ audio: true });
-        } catch (e) {
-            req = Promise.reject(e);
-        }
-        speakers.micPrime = req.then(
-            (s) => { speakers.micGranted = true; speakers.primedStream = s; return s; },
-            () => { speakers.micGranted = false; return null; }
-        );
-        return speakers.micPrime;
-    }
-
-    function releasePrimedStream() {
-        if (!speakers.primedStream) return;
-        try { speakers.primedStream.getTracks().forEach((t) => t.stop()); } catch (_) { note(); }
-        speakers.primedStream = null;
-    }
-
-
-    // The microphone is asked for only when enumerating the outputs produced *nothing*.
-    //
-    // It used to be asked whenever the ids came back unlabelled, which is most laptops and
-    // most phones — a permission prompt, on a device that needed no help, to put nicer text
-    // beside ids that already work: `setSinkId` takes the bare id, so an unlabelled list
-    // routes exactly as well as a labelled one. The host is told the names are generic
-    // (`labelled: false` on `/audio-outputs`, `degraded` bit 9) and shows them as "Output 1",
-    // which is the honest version of what a grant would have bought.
-    //
-    // So: outputs found — labelled or not — no card. Zero outputs, or an enumeration that
-    // threw or timed out, is the one case where the grant is the difference between a list
-    // and nothing at all, and only then is the card raised. `selectAudioOutput()` engines are
-    // never asked either way; they have a permission-free picker.
-    //
-    // `known` is the enumeration the caller has already paid for, so the join costs one
-    // `enumerateDevices()` rather than two.
-    async function needsMicPermission(known) {
-        initSpeakers();
-        speakers.wantPrime = false;
-        const wantsEarpieceHold = speakers.hasEarpiece && !speakers.hasAudioSession;
-        if (!speakers.canSink && !wantsEarpieceHold) return false;
-        if (speakers.hasSelectOut) return false;
-        try {
-            const p = await navigator.permissions.query({ name: 'microphone' });
-            speakers.micGranted = !!(p && p.state === 'granted');
+            if (!window.localStorage) return;
+            if (v === null) window.localStorage.removeItem(k);
+            else window.localStorage.setItem(k, v);
         } catch (_) { note(); }
+    }
+
+    // A query never prompts. `expected` is for a name some engines do not know
+    // (`speaker-selection` throws a TypeError in Chromium): that is an answer, not a failure.
+    async function queryPermission(name, expected) {
+        try {
+            if (!navigator.permissions || typeof navigator.permissions.query !== 'function') return 'unknown';
+            const p = await navigator.permissions.query({ name: name });
+            return (p && typeof p.state === 'string') ? p.state : 'unknown';
+        } catch (_) {
+            if (!expected) note();
+            return 'unsupported';
+        }
+    }
+
+    // The decision, with nothing in it that touches a browser API, so every branch is a test.
+    //   report  — a routable list was found without asking: post it, show nothing
+    //   card    — nothing routable, and a microphone grant can change that: raise the card
+    //   picker  — an engine with `selectAudioOutput()` whose host operator asked to choose:
+    //             the browser's own chooser (no microphone), opened by the Join click itself
+    //   none    — nothing routable and nothing worth asking; the host gets the choose entry
+    function outputPlan(f) {
+        if (!f.canSink) return { action: 'none', reason: 'no-sink-api' };
+        if (f.routable > 0) return { action: 'report', reason: f.labelled ? 'labelled' : 'unlabelled' };
+        if (f.hasSelectOut) return f.chooseRequested ? { action: 'picker', reason: 'operator-asked' } : { action: 'none', reason: 'picker-engine' };
+        if (!f.secure || !f.hasGUM) return { action: 'none', reason: 'cannot-prompt' };
+        if (f.mic === 'denied') return { action: 'none', reason: 'mic-denied' };
+        // Granted and still nothing routable: the enumeration itself failed, and asking again
+        // cannot help.
+        if (f.mic === 'granted') return { action: 'none', reason: 'granted-nothing-listed' };
+        if (f.askedBefore && !f.chooseRequested) return { action: 'none', reason: 'asked-before' };
+        return { action: 'card', reason: f.chooseRequested ? 'operator-asked' : 'no-routable-list' };
+    }
+
+    // True when the Join click must open the browser's chooser itself: it needs the click's
+    // transient activation, so the caller does it synchronously, before any await.
+    function pickerWantedAtJoin() {
+        initSpeakers();
+        return !!(speakers.hasSelectOut && speakers.canSink && storeGet(OUT_KEY_CHOOSE) === '1');
+    }
+
+    let lastPlan = null;
+    let joinAskedChoice = false;
+    // Run by the Join handler before the offer. `showCard(onContinue, onSkip)` raises the
+    // microphone card; it always has Skip, so this never waits on anything the user cannot end.
+    // `pickerDone` is the chooser the caller opened inside the click, if it opened one.
+    async function prepareOutputsForJoin(showCard, pickerDone) {
+        initSpeakers();
+        if (pickerDone) { try { await pickerDone; } catch (_) { note(); } }
+        const chooseRequested = storeGet(OUT_KEY_CHOOSE) === '1';
+        const mic = speakers.canSink ? await queryPermission('microphone', false) : 'unknown';
+        const speakerSel = speakers.canSink ? await queryPermission('speaker-selection', true) : 'unknown';
+        let enumerated = speakers.canSink ? await listOutputs() : [];
+        const plan = outputPlan({
+            canSink: speakers.canSink,
+            routable: enumerated.length,
+            labelled: enumerated.some((d) => d.label),
+            hasSelectOut: speakers.hasSelectOut,
+            chooseRequested: chooseRequested,
+            secure: !!window.isSecureContext,
+            hasGUM: !!(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function'),
+            mic: mic,
+            askedBefore: !!storeGet(OUT_KEY_ASKED),
+        });
+        plan.mic = mic;
+        plan.speakerSelection = speakerSel;
+        plan.routable = enumerated.length;
+        if (plan.action === 'card' && typeof showCard === 'function') {
+            plan.answer = await askWithCard(showCard);
+            if (plan.answer === 'granted') enumerated = lastAskListed;
+            storeSet(OUT_KEY_ASKED, plan.answer);
+            plan.routableAfter = enumerated.length;
+        }
+        if (chooseRequested) {
+            // Considered at this join, whichever way it went: not repeated until the host
+            // operator picks something else and then asks again.
+            storeSet(OUT_KEY_CHOOSE, null);
+            storeSet(OUT_KEY_CHOOSE_ANSWERED, '1');
+            joinAskedChoice = true;
+        }
         if (speakers.canSink) {
-            // Order: whatever enumerates without any grant (Firefox hands out routable ids
-            // with no prompt at all; any engine with the grant hands out the full list). Only a
-            // list with nothing routable in it — Chromium before the grant reports every
-            // output with an empty id, which `listOutputs` drops — falls through to the card.
-            let devs = known || await listOutputs();
-            if (!devs.length && speakers.micGranted) devs = await listOutputs();
-            if (devs.length) {
-                if (devs.some((d) => d.label)) speakers._lastEnum = devs;
-                return false;
+            const hasLabels = enumerated.some((d) => d.label);
+            if ((!enumerated.length || !hasLabels) && speakers._lastEnum && speakers._lastEnum.length) {
+                enumerated = speakers._lastEnum;
+            } else if (hasLabels) {
+                speakers._lastEnum = enumerated;
             }
         }
-        speakers.wantPrime = true;
-        return !speakers.micGranted;
+        noteOutputLabels(enumerated);
+        speakers._cache = { supported: speakers.supported, outputs: buildOutputs(enumerated) };
+        enumStarted = true;
+        startDeviceWatch();
+        lastPlan = plan;
+        return plan;
     }
 
-    // Enumeration is for the host's device panel, never for playback, and the join never asks
-    // for anything to do it. The default output plays with no permission on every engine, so a
-    // join that raised a microphone card or prompt was asking the user for something they had
-    // not asked to do. What this does is whatever enumerates for free; where that is nothing
-    // routable (Chromium before a grant reports every output with an empty id, Firefox lists
-    // none before its picker), the host is offered `SE_CHOOSE` instead, and only when the host
-    // operator picks it — an explicit request for a non-default output — does
-    // `requestOutputChoice` ask the one thing that can reveal the rest.
+    // Continue → the browser's own microphone prompt; the outputs are read while the grant is
+    // held and the track is stopped at once. Skip, or a refused prompt, resolves without one.
+    async function askWithCard(showCard) {
+        const go = await new Promise((resolve) => {
+            try { showCard(() => resolve(true), () => resolve(false)); } catch (_) { note(); resolve(false); }
+        });
+        if (!go) return 'skipped';
+        let stream = null;
+        try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (_) { note(); return 'refused'; }
+        speakers.micGranted = true;
+        try { lastAskListed = await listOutputs(); } catch (_) { note(); lastAskListed = []; }
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) { note(); }
+        return 'granted';
+    }
+    let lastAskListed = [];
+
+    // Kept for a caller that only wants the free enumeration (no card, no queries): a second
+    // join on the same page, or a harness.
     let enumStarted = false;
     async function enumerateBeforeJoin() {
         if (enumStarted) return speakers._cache || { supported: speakers.supported, outputs: [] };
         enumStarted = true;
         initSpeakers();
         if (!speakers.supported) return { supported: false, outputs: [] };
-
-        // Whatever is visible without any permission first: on Firefox and on any browser
-        // where the grant already exists that is the whole answer.
-        //
-        // Guarded the way `reEnumerateAndPost` is: on the picker path this runs *after* a
-        // granted `selectAudioOutput()` has already cached a labelled list, so an enumeration
-        // that comes back empty or unlabelled must not be allowed to downgrade it.
         let enumerated = speakers.canSink ? await listOutputs() : [];
         if (speakers.canSink) {
             const hasLabels = enumerated.some((d) => d.label);
@@ -385,40 +438,25 @@
         return speakers._cache;
     }
 
-    // The host operator picked `SE_CHOOSE`: they want this device on a speaker other than its
-    // default, and nothing routable has been listed. This is the one place the page may ask for
-    // anything, and it asks the least it can. An engine with `selectAudioOutput()` has a
-    // permission-free chooser, which needs a gesture, so the page queues it (`'picker'`). Only
-    // where that does not exist is the microphone card the route to the list, and its grant is
-    // released the moment the outputs have been read. A decline is answered once per page: the
-    // host is still showing `SE_CHOOSE` as selected, and every /reconfig poll carries it.
-    let choiceAsked = false;
-    async function requestOutputChoice(showPermModal) {
-        initSpeakers();
-        if (speakers.hasSelectOut) return 'picker';
-        if (choiceAsked || typeof showPermModal !== 'function') return 'done';
-        choiceAsked = true;
-        let need = false;
-        try { need = await needsMicPermission(null); } catch (_) { note(); }
-        if (need) {
-            const granted = await new Promise((resolve) => {
-                showPermModal(() => resolve(true), () => resolve(false));
-            });
-            if (!granted) return 'declined';
+    // The host operator picked "Choose a speaker on this device…" during a session. Nothing is
+    // raised over the live stage for it: the request is remembered on this device and answered
+    // at its next join, before the stream starts (the card, or on a `selectAudioOutput()`
+    // engine the browser's chooser opened by the Join click). Once answered it is not repeated
+    // until the operator picks something else first — every /reconfig poll carries the value.
+    function noteOutputChoiceRequest(sink) {
+        if (sink !== SE_CHOOSE) {
+            joinAskedChoice = false;
+            if (storeGet(OUT_KEY_CHOOSE_ANSWERED) === '1') storeSet(OUT_KEY_CHOOSE_ANSWERED, null);
+            return 'cleared';
         }
-        try {
-            await primeMicPermission();
-            const withGrant = speakers.canSink ? await listOutputs() : [];
-            if (withGrant.length) {
-                if (withGrant.some((d) => d.label)) speakers._lastEnum = withGrant;
-                noteOutputLabels(withGrant);
-                speakers._cache = { supported: speakers.supported, outputs: buildOutputs(withGrant) };
-            }
-        } catch (_) { note(); }
-        releasePrimedStream();
-        postOutputs(true);
-        return 'done';
+        if (joinAskedChoice || storeGet(OUT_KEY_CHOOSE_ANSWERED) === '1') return 'answered';
+        if (storeGet(OUT_KEY_CHOOSE) === '1') return 'pending';
+        storeSet(OUT_KEY_CHOOSE, '1');
+        console.log('[audio] the host asked to choose a speaker; this device will ask at its next join');
+        return 'queued';
     }
+
+    function getOutputPlan() { return lastPlan; }
 
     // Firefox only resolves enumerateDevices() once the document has focus, so a
     // backgrounded tab would wedge the 4 s poll on a promise that never settles.
@@ -485,14 +523,11 @@
 
     async function acquireMicHold() {
         if (speakers.micHold) return true;
-        if (speakers.primedStream) {
-            speakers.micHold = speakers.primedStream;
-            speakers.primedStream = null;
-            return true;
-        }
         // Reached only when the host operator chose the earpiece on an engine with no
-        // audioSession category, where holding the microphone is the routing mechanism. That
-        // choice is the request; the join no longer primes the grant ahead of it.
+        // audioSession category (iOS before 16.4), where holding the microphone *is* the routing
+        // mechanism. It is the one permission the page can still raise during a session: the
+        // operator's choice is the request, the microphone must be held for as long as the
+        // earpiece is in use, and an iPhone has no fullscreen or pointer lock for it to drop.
         try {
             speakers.micHold = await navigator.mediaDevices.getUserMedia({ audio: true });
             speakers.micGranted = true;
@@ -690,7 +725,7 @@
         const id = (raw === 'default') ? '' : raw;
         if (speakers.appliedSink === id) return true;
         // A request to list the outputs, not an output: routing stays where it is and the page
-        // answers it through `requestOutputChoice`.
+        // remembers it for the next join (`noteOutputChoiceRequest`).
         if (id === SE_CHOOSE) return true;
         // An id this engine has already refused, still saved on the host (the hardware it named
         // is gone, or it belonged to another browser). Every /reconfig poll carries it, so it
@@ -1382,6 +1417,9 @@
             labelsUnavailable: !!speakers.labelsUnavailable,
             sinkTier: sinkTier,
             currentSink: speakers.appliedSink,
+            // How the outputs were found at the join (`outputPlan`): action, reason, the
+            // microphone and speaker-selection permission states, how many were routable.
+            outputPlan: lastPlan,
         };
     }
 
@@ -1421,10 +1459,12 @@
         teardown,
         initSpeakers,
         enumerateBeforeJoin,
-        requestOutputChoice,
+        prepareOutputsForJoin,
+        pickerWantedAtJoin,
+        noteOutputChoiceRequest,
+        outputPlan,
+        getOutputPlan,
         CHOOSE_OUTPUT: SE_CHOOSE,
-        needsMicPermission,
-        primeMicPermission,
         canPickOutput,
         pickOutput,
         postOutputs,

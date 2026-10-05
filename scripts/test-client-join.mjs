@@ -119,6 +119,35 @@ function runWarm(env) {
   else fail('the submit handler references warmJoinPath');
 }
 
+// ---- the join settles every prompt before the offer
+// The owner's rule: permission work (output detection, the microphone card, the browser's output
+// chooser) completes before the stream starts, so nothing is raised over a live stage and the
+// host builds no display for someone still reading a card. The card has no timeout of its own
+// (Skip ends it), so no join-path deadline may be running while it is up.
+{
+  const submit = page.slice(page.indexOf("addEventListener('submit'"));
+  const at = (s) => submit.indexOf(s);
+  const prep = at('await SEAudio.prepareOutputsForJoin(');
+  if (prep > 0) ok('the submit handler awaits the output preparation');
+  else fail('the submit handler does not await prepareOutputsForJoin');
+  for (const [what, s] of [['the offer (beginStreaming)', 'beginStreaming();'], ['the audio-prepare deadline', 'AUDIO_PREPARE_DEADLINE_MS'], ['the refresh-rate deadline', 'resolveRefreshRate()'], ['the loading state', "loadingEl.classList.add('show')"]]) {
+    if (prep > 0 && at(s) > prep) ok('the card wait comes before ' + what);
+    else fail(what + ' starts before the card wait');
+  }
+  const firstAwait = at('await ');
+  const picker = at('pickerWantedAtJoin()');
+  if (picker > 0 && picker < firstAwait) ok("the browser's chooser is opened before the first await (inside the click's activation)");
+  else fail('the chooser is opened after an await');
+  if (at('connectBtn.disabled = true;') > 0 && at('connectBtn.disabled = true;') < prep) ok('Connect is disabled before the wait, so the join cannot be submitted twice');
+  else fail('Connect stays enabled while the card is up');
+  const reconfig = takeFunction('applyReconfig');
+  if (!/micCard|showPermModal|withModal|queueOutputPicker|pickOutput/.test(reconfig)) ok('nothing in the /reconfig handler can raise a card or a chooser');
+  else fail('applyReconfig can still raise UI over a live stage');
+  eq('the card is referenced only by its definition and the join', (page.match(/\bmicCard\b/g) || []).length, 2);
+  if (/prepareOutputsForJoin\(micCard,/.test(submit)) ok('and the join is the one that passes it');
+  else fail('the join does not hand the card to the output preparation');
+}
+
 // ---- sendLeave: a page going away releases its join whatever state it is in
 function runLeave({ live, reconfiguring, joinId }) {
   const beacons = [];
