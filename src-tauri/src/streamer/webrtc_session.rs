@@ -37,7 +37,7 @@ use super::bitrate::{
 use super::config::H264Profile;
 use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
 use super::input;
-use super::keyframe::{KeyframeGate, PliBackoff};
+use super::keyframe::{KeyframeGate, PliBackoff, PLI_BACKOFF_CAP_HEALTHY_MS, PLI_BACKOFF_CAP_MS};
 use super::lock::LockExt;
 use super::negotiate;
 use super::pacer::{Pacer, PacingMode};
@@ -1275,6 +1275,9 @@ pub async fn activate_whep(
             // the session lives, and the gate alone answered nearly every one with an IDR.
             let mut pli_backoff = PliBackoff::new();
             let mut client_key_requests: u32 = 0;
+            let mut client_frames_painted: u32 = 0;
+            let mut client_stats_at: u64 = 0;
+            let mut client_painting = false;
             let mut rtcp_buf = vec![0u8; 1500];
             let mut deltas: Vec<f64> = Vec::with_capacity(256);
             while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
@@ -1294,13 +1297,28 @@ pub async fn activate_whep(
                             .fetch_add(1, Ordering::Relaxed);
                         // The client counts the requests its own page makes; a moved counter is
                         // the page saying this one is genuine.
+                        let now_ns = audio::host_now_ns();
+                        let mut cap_ms = PLI_BACKOFF_CAP_MS;
                         if let Some(stats) = telemetry.client.get() {
                             if stats.keyframe_requests != client_key_requests {
                                 client_key_requests = stats.keyframe_requests;
                                 pli_backoff.note_evidence();
                             }
+                            // Painting through WebCodecs, and said so within the last 3 s: the
+                            // PLI is libwebrtc's own idle decoder, not the page.
+                            let fresh =
+                                now_ns.saturating_sub(stats.received_host_ns) < 3_000_000_000;
+                            // Judged per STATS frame (about 1 Hz), not per PLI (5 Hz).
+                            if stats.received_host_ns != client_stats_at {
+                                client_stats_at = stats.received_host_ns;
+                                client_painting = stats.frames_painted != client_frames_painted;
+                                client_frames_painted = stats.frames_painted;
+                            }
+                            if fresh && client_painting && stats.transport_tier != 0 {
+                                cap_ms = PLI_BACKOFF_CAP_HEALTHY_MS;
+                            }
                         }
-                        if pli_backoff.allow(audio::host_now_ns()) {
+                        if pli_backoff.allow_with_cap(now_ns, cap_ms) {
                             keyframes.request_keyframe_for_client_quietly();
                         } else {
                             keyframes.gate.note_suppressed();

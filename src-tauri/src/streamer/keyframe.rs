@@ -166,6 +166,14 @@ pub const PLI_BACKOFF_FLOOR_MS: u64 = 200;
 /// The widest it opens: one keyframe every two seconds for a receiver that never stops asking.
 pub const PLI_BACKOFF_CAP_MS: u64 = 2000;
 
+/// The cap while the client's own STATS frames say it is painting through WebCodecs.
+///
+/// That client decodes outside libwebrtc, so a PLI from it is libwebrtc's idle decoder and not
+/// the page: a page that writes keyframes back to the receiver (G05) leaves one about every 3 s,
+/// which the 2 s cap would still answer with an IDR every time. The page's own requests arrive
+/// as evidence (its keyframe counter moves) and open the window at once.
+pub const PLI_BACKOFF_CAP_HEALTHY_MS: u64 = 10_000;
+
 /// A PLI-free stretch this long means whatever was asking has been satisfied.
 const PLI_QUIET_RESET_MS: u64 = 2 * PLI_BACKOFF_CAP_MS;
 
@@ -217,6 +225,12 @@ impl PliBackoff {
 
     /// Whether this PLI/FIR may go on to the session's [`KeyframeGate`].
     pub fn allow(&mut self, now_ns: u64) -> bool {
+        self.allow_with_cap(now_ns, PLI_BACKOFF_CAP_MS)
+    }
+
+    /// [`Self::allow`] with the cap chosen by the caller: [`PLI_BACKOFF_CAP_HEALTHY_MS`] while the
+    /// client reports painting outside libwebrtc, [`PLI_BACKOFF_CAP_MS`] otherwise.
+    pub fn allow_with_cap(&mut self, now_ns: u64, cap_ms: u64) -> bool {
         let quiet = self
             .last_pli_ns
             .is_none_or(|t| now_ns.saturating_sub(t) >= PLI_QUIET_RESET_MS * 1_000_000);
@@ -234,7 +248,7 @@ impl PliBackoff {
         // Opened for the *next* request: a receiver satisfied by this answer never meets it.
         self.window_ns = (self.window_ns * 2).clamp(
             PLI_BACKOFF_FLOOR_MS * 1_000_000,
-            PLI_BACKOFF_CAP_MS * 1_000_000,
+            cap_ms.max(PLI_BACKOFF_FLOOR_MS) * 1_000_000,
         );
         true
     }
@@ -276,6 +290,35 @@ mod tests {
         );
         assert!(n >= 14, "and must still be answered at the cap; got {n}");
         assert_eq!(b.window_ms(), PLI_BACKOFF_CAP_MS);
+    }
+
+    #[test]
+    fn a_painting_webcodecs_client_is_not_sent_an_idr_for_every_residual_pli() {
+        // The page that hands keyframes back to the receiver leaves libwebrtc one PLI about every
+        // 3 s. Under the 2 s cap every one of them was an IDR; under the healthy cap they settle
+        // at one per 10 s.
+        let mut b = PliBackoff::new();
+        let mut n = 0;
+        for i in 0..40u64 {
+            if b.allow_with_cap(1_000 * MS + i * 3_000 * MS, PLI_BACKOFF_CAP_HEALTHY_MS) {
+                n += 1;
+            }
+        }
+        assert!(
+            n <= 18,
+            "120 s of residual PLIs must not be ~40 IDRs; got {n}"
+        );
+        let mut b2 = PliBackoff::new();
+        let mut n2 = 0;
+        for i in 0..40u64 {
+            if b2.allow(1_000 * MS + i * 3_000 * MS) {
+                n2 += 1;
+            }
+        }
+        assert_eq!(
+            n2, 40,
+            "the default cap answers every one — the reason for the healthy cap"
+        );
     }
 
     #[test]
