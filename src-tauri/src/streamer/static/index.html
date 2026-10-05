@@ -250,6 +250,14 @@
             // its own creation, so only the absolute form crosses the boundary meaningfully.
             let hostClockOffsetMs = null;
             let watchdog = null;
+            // Latched by the worker's one 'rendered' message and cleared only by a teardown. The
+            // frame watchdog is armed from two connection-state handlers, and either can fire
+            // again after the first frame has been painted (ICE 'connected' then 'completed',
+            // the peer connection's own 'connected' landing after the worker's message, a
+            // transient disconnect that recovers). The worker says 'rendered' once per session,
+            // so nothing would ever clear a watchdog armed after it, and five seconds later a
+            // session that was painting was demoted to <video> on a second offer.
+            let webcodecsPainted = false;
             let statsPoll = null;
             let liveWatch = null;
             let lastRendered = -1;
@@ -1781,6 +1789,7 @@
             // grace is precisely the mechanism for that.
             function teardownSession(keepJoin) {
                 startGen++;
+                webcodecsPainted = false;
                 if (!keepJoin) releaseJoin();
                 releaseIceHold();
                 iceEverConnected = false;
@@ -2332,6 +2341,7 @@
                         worker.onmessageerror = noteSuppressed;
                         worker.onmessage = (m) => {
                             if (m.data.type === 'rendered') {
+                                webcodecsPainted = true;
                                 onStreamLive();
                             } else if (m.data.type === 'decodeerror') {
                                 console.warn('[webcodecs] decode error:', m.data.message);
@@ -2474,9 +2484,10 @@
                     function armFrameWatchdog() {
                         // Only the WebCodecs path has anything to demote to; the <video> path
                         // is already the floor and its liveness is the reconfig poll's job.
-                        if (watchdog || !webcodecs) return;
+                        if (watchdog || !webcodecs || webcodecsPainted) return;
                         watchdog = setTimeout(() => {
                             watchdog = null;
+                            if (webcodecsPainted) return;
                             if (webcodecs && useScriptTransform && hasLegacyEncodedStreams && !transformStarted) {
                                 retryWithLegacyTransform('no WebCodecs frame within 5s');
                             } else {
