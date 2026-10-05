@@ -260,9 +260,7 @@ impl EncoderCaps {
     }
 
     fn supports_rc(&self, mode: NV_ENC_PARAMS_RC_MODE) -> bool {
-        // rc_modes is a bitmask of the NV_ENC_PARAMS_RC_MODE values themselves, and a driver
-        // that fails the query reports 0. Treat 0 as "unknown, do not veto".
-        self.rc_modes == 0 || (self.rc_modes & mode as u32) != 0
+        rc_mode_supported(self.rc_modes, mode)
     }
 
     /// The dimensions actually usable, clamped into the reported range. A zero max means the
@@ -280,6 +278,19 @@ impl EncoderCaps {
         };
         (w, h)
     }
+}
+
+/// Whether `NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES` admits `mode`.
+///
+/// The cap is a bitmask *of the `NV_ENC_PARAMS_RC_MODE` values themselves*, and
+/// `NV_ENC_PARAMS_RC_CONSTQP` is 0 — it has no bit, so `mask & CONSTQP` is 0 on every driver.
+/// Testing it that way silently turned every constant-QP request (the per-device quality slider)
+/// into CBR: this RTX 3080 Ti reports `0x3f` and still failed the test. Constant QP is the one
+/// mode every NVENC engine implements, so it is always admitted; a 0 mask (the query failed)
+/// vetoes nothing.
+pub(crate) fn rc_mode_supported(mask: u32, mode: NV_ENC_PARAMS_RC_MODE) -> bool {
+    let bit = mode as u32;
+    bit == 0 || mask == 0 || (mask & bit) != 0
 }
 
 /// One output bitstream buffer and, under async mode, the event NVENC signals when the picture
@@ -465,10 +476,10 @@ impl Encoder {
             config.fps,
             config.bitrate_bps,
             ring,
-            config.profile,
-            if config.qp.is_some() { "constqp" } else { "cbr" },
-            config.qp,
-            config.intra_refresh,
+            this.config.profile,
+            if this.config.qp.is_some() { "constqp" } else { "cbr" },
+            this.config.qp,
+            this.config.intra_refresh,
         );
         Ok(this)
     }
@@ -544,10 +555,10 @@ impl Encoder {
             config.fps,
             config.bitrate_bps,
             shared,
-            config.profile,
-            if config.qp.is_some() { "constqp" } else { "cbr" },
-            config.qp,
-            config.intra_refresh,
+            this.config.profile,
+            if this.config.qp.is_some() { "constqp" } else { "cbr" },
+            this.config.qp,
+            this.config.intra_refresh,
         );
         Ok(this)
     }
@@ -871,6 +882,12 @@ impl Encoder {
                 RefInvalidation::Refused
             }
         }
+    }
+
+    /// The constant QP the session was actually opened with, `None` under CBR. Read back from
+    /// what `initialize` applied, not from the request.
+    pub fn constant_qp(&self) -> Option<u8> {
+        self.config.qp
     }
 
     /// What the driver reported for this engine. Read once at session open.
@@ -1261,8 +1278,11 @@ impl Encoder {
         }
 
         tprintln!(
-            "NVENC configured: async={}, outputs={}, max_ref_frames={}, ltr={}, \
-             intra_refresh={} (period={}, cnt={}), entropy={:?}, vbv={}B, low_delay_kf_scale={}",
+            "NVENC configured: rc={:?} (qp={:?}), async={}, outputs={}, max_ref_frames={}, \
+             ltr={}, intra_refresh={} (period={}, cnt={}), entropy={:?}, vbv={}B, \
+             low_delay_kf_scale={}",
+            config.rcParams.rateControlMode,
+            self.config.qp,
             self.async_mode,
             if self.async_mode { OUTPUT_BUFFERS } else { 1 },
             refs,
