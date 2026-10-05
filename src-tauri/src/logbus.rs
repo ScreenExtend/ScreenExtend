@@ -127,17 +127,10 @@ fn writer(rx: Receiver<String>) {
             ));
         }
 
-        {
-            let mut backlog = bus.backlog.lock().unwrap();
-            for line in &batch {
-                if backlog.len() >= MAX_BACKLOG {
-                    backlog.pop_front();
-                }
-                backlog.push_back(line.clone());
-            }
-        }
-
-        if streaming {
+        // Whether to emit is decided under the backlog lock, not from `streaming` above: that
+        // was read before this batch reached the ring, so a panel that armed the stream and read
+        // the backlog in between saw these lines in neither.
+        if commit(&bus.backlog, &STREAMING, &batch) {
             if let Some(app) = bus.app.get() {
                 let payload = if batch.len() == 1 {
                     batch.pop().unwrap()
@@ -152,6 +145,30 @@ fn writer(rx: Receiver<String>) {
     }
 }
 
+/// Append one batch to the ring and say whether it must also be emitted.
+///
+/// The answer is read under the ring's lock, the same lock [`arm_and_snapshot`] arms the stream
+/// under, so every line lands on exactly one side of a panel's backlog read: either it was in the
+/// ring when the snapshot was taken, or the stream was armed when it was committed. Reading the
+/// flag outside the lock lost the lines of any batch that straddled the panel opening.
+fn commit(backlog: &Mutex<VecDeque<String>>, streaming: &AtomicBool, batch: &[String]) -> bool {
+    let mut backlog = backlog.lock().unwrap_or_else(|e| e.into_inner());
+    for line in batch {
+        if backlog.len() >= MAX_BACKLOG {
+            backlog.pop_front();
+        }
+        backlog.push_back(line.clone());
+    }
+    streaming.load(Ordering::Relaxed)
+}
+
+/// Arm the stream and copy the ring in one critical section. See [`commit`].
+fn arm_and_snapshot(backlog: &Mutex<VecDeque<String>>, streaming: &AtomicBool) -> Vec<String> {
+    let backlog = backlog.lock().unwrap_or_else(|e| e.into_inner());
+    streaming.store(true, Ordering::Relaxed);
+    backlog.iter().cloned().collect()
+}
+
 pub fn attach(app: AppHandle) {
     let _ = bus().app.set(app);
 }
@@ -159,8 +176,7 @@ pub fn attach(app: AppHandle) {
 #[tauri::command]
 #[specta::specta]
 pub fn get_log_backlog() -> Vec<String> {
-    STREAMING.store(true, Ordering::Relaxed);
-    bus().backlog.lock().unwrap().iter().cloned().collect()
+    arm_and_snapshot(&bus().backlog, &STREAMING)
 }
 
 /// Arm or disarm the `LogLine` event stream. Called by the Settings log panel on mount and,
@@ -264,6 +280,57 @@ mod tests {
         }
         drain_settled();
         assert!(bus().backlog.lock().unwrap().len() <= MAX_BACKLOG);
+    }
+
+    /// The log panel reads the backlog and then listens. Every line the writer commits while
+    /// that happens must reach the panel exactly one way: in the snapshot, or emitted. A writer
+    /// commits numbered batches on its own thread while the panel arms the stream mid-flight;
+    /// the snapshot followed by everything emitted after it must be the whole sequence, with no
+    /// gap. Before the fix the emit decision was a flag read *before* the commit, and the batch
+    /// that straddled the snapshot fell between the two.
+    #[test]
+    fn a_panel_opening_mid_stream_loses_no_line() {
+        use std::sync::Arc;
+        const BATCHES: usize = 400;
+        const PER: usize = 3;
+        for attempt in 0..20 {
+            let ring = Arc::new(Mutex::new(VecDeque::<String>::new()));
+            let streaming = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let (ring, streaming) = (Arc::clone(&ring), Arc::clone(&streaming));
+                std::thread::spawn(move || {
+                    let mut emitted = Vec::new();
+                    for b in 0..BATCHES {
+                        let batch: Vec<String> =
+                            (0..PER).map(|i| format!("{}", b * PER + i)).collect();
+                        if commit(&ring, &streaming, &batch) {
+                            emitted.extend(batch);
+                        }
+                        if b % 7 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    emitted
+                })
+            };
+            // Open the panel somewhere in the middle of the stream.
+            std::thread::sleep(Duration::from_micros(50 * attempt as u64));
+            let snapshot = arm_and_snapshot(&ring, &streaming);
+            let emitted = writer.join().unwrap();
+
+            let mut seen: Vec<usize> = snapshot.iter().map(|s| s.parse().unwrap()).collect();
+            seen.extend(emitted.iter().map(|s| s.parse::<usize>().unwrap()));
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen,
+                (0..BATCHES * PER).collect::<Vec<_>>(),
+                "attempt {attempt}: a line reached the panel neither in the backlog nor as an \
+                 event (snapshot {} lines, emitted {})",
+                snapshot.len(),
+                emitted.len()
+            );
+        }
     }
 
     /// Cost of one `tprintln!` at the call site, against the shape this module used to have.
