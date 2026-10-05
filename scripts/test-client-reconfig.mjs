@@ -451,6 +451,39 @@ sinkResult = true;
   else fail('a kick ran ' + calls.join(', '));
 }
 
+// ── 13. one save, two epoch bumps (G04's ledger, item 2) ────────────────────────────────
+// `set_device_override` and then `set_device_adaptive_modes` / `set_device_auto_frame_rate`
+// each bump the epoch. The page stops polling while it rebuilds, so a bump that lands during
+// the rebuild is only seen once the rebuilt stream is live and `onStreamLive` restarts the
+// poll. That poll must act on it — anything else leaves the second change unapplied until
+// some unrelated renegotiation.
+{
+  const p = makePoller();
+  response = json({ epoch: 20, kick: 1 });
+  await p.startReconfigPoll();
+  p.calls.length = 0;
+  // First bump seen: rebuild starts.
+  p.applyReconfig({ epoch: 21, kick: 1 });
+  if (p.calls.filter((c) => c === 'start:true:true').length === 1) ok('the first bump rebuilds');
+  else fail('the first bump ran ' + p.calls.join(', '));
+  eq('the rebuild is for epoch', p.state().reconfigEpoch, 21);
+  // While it rebuilds the host bumps again, and nothing polls.
+  response = json({ epoch: 22, kick: 1 });
+  eq('a tick during the rebuild does nothing', (await p.probeTick(), p.calls.filter((c) => c === 'start:true:true').length), 1);
+  // The rebuilt stream goes live: onStreamLive clears `reconfiguring` and restarts the poll.
+  p.setReconfiguring(false);
+  p.clearReconfigWatchdog();
+  await p.startReconfigPoll();
+  if (p.state().reconfigPoll) ok('the poll is re-armed after the rebuild');
+  else fail('no poll after the rebuild');
+  p.calls.length = 0;
+  runTimers();
+  await settle();
+  if (p.calls.includes('start:true:true')) ok('the second bump, landed during the rebuild, rebuilds again on the next poll');
+  else fail('the second bump was lost: ' + p.calls.join(', '));
+  eq('and the page now holds the newer epoch', p.state().reconfigEpoch, 22);
+}
+
 if (failures) {
   console.log('\n' + failures + ' reconfig assertion(s) failed');
   process.exitCode = 1;
