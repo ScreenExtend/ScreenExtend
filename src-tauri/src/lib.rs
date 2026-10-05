@@ -556,7 +556,7 @@ fn write_avatar(app: &tauri::AppHandle, bytes: &[u8]) -> bool {
     {
         Ok(()) => true,
         Err(e) => {
-            log::error!("failed to save avatar: {e}");
+            teprintln!("[avatar] failed to save avatar: {e}");
             false
         }
     }
@@ -568,7 +568,7 @@ fn read_avatar(app: &tauri::AppHandle) -> Option<Vec<u8>> {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            log::error!("failed to read avatar: {e}");
+            teprintln!("[avatar] failed to read avatar: {e}");
             None
         }
     }
@@ -587,7 +587,7 @@ fn set_avatar(app: tauri::AppHandle, bytes: String) -> bool {
     match base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes()) {
         Ok(decoded) => write_avatar(&app, &decoded),
         Err(e) => {
-            log::error!("failed to decode the avatar payload: {e}");
+            teprintln!("[avatar] failed to decode the avatar payload: {e}");
             false
         }
     }
@@ -606,7 +606,7 @@ fn remove_avatar(app: tauri::AppHandle) -> bool {
     let path = match avatar_path(&app) {
         Ok(path) => path,
         Err(e) => {
-            log::error!("failed to resolve avatar path: {e}");
+            teprintln!("[avatar] failed to resolve avatar path: {e}");
             return false;
         }
     };
@@ -614,7 +614,7 @@ fn remove_avatar(app: tauri::AppHandle) -> bool {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
-            log::error!("failed to remove avatar: {e}");
+            teprintln!("[avatar] failed to remove avatar: {e}");
             false
         }
     }
