@@ -396,11 +396,7 @@ fn handle_connection<Q, R>(
             let _ = stream.flush();
         }
         Request::Logs => {
-            let mut out = String::new();
-            for line in crate::logbus::get_log_backlog() {
-                out.push_str(&line);
-                out.push('\n');
-            }
+            let out = logs_reply();
             let _ = stream.write_all(out.as_bytes());
             let _ = stream.flush();
         }
@@ -425,6 +421,19 @@ fn handle_connection<Q, R>(
         }
         Request::Unknown => {}
     }
+}
+
+/// The `LOGS` reply: the backlog, one line per line.
+///
+/// Read with `backlog_snapshot`, not `get_log_backlog` — that is the desktop panel's command and
+/// arms the `LogLine` stream as a side effect, which a CLI reader that never listens must not do.
+fn logs_reply() -> String {
+    let mut out = String::new();
+    for line in crate::logbus::backlog_snapshot() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Send `command` and read the running instance's reply.
@@ -563,6 +572,28 @@ mod test {
     }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `ScreenExtend logs` reads the backlog and goes away; it never listens to `LogLine`. It used
+    /// to read through the panel's command, which arms the event stream, so one `logs` against
+    /// the desktop app left every later log line serialised into an IPC event nobody read.
+    #[test]
+    fn the_logs_verb_does_not_arm_the_panel_stream() {
+        crate::logbus::set_log_streaming(false);
+        crate::logbus::push_line("single-instance-logs-verb-probe".to_string());
+        let mut reply = String::new();
+        for _ in 0..200 {
+            reply = logs_reply();
+            if reply.contains("single-instance-logs-verb-probe") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reply.contains("single-instance-logs-verb-probe\n"));
+        assert!(
+            !crate::logbus::streaming_armed(),
+            "the LOGS verb armed the LogLine stream"
+        );
+    }
 
     #[test]
     fn the_session_verb_is_one_word_to_read_and_three_to_write() {

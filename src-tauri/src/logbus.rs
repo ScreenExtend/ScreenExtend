@@ -179,6 +179,28 @@ pub fn get_log_backlog() -> Vec<String> {
     arm_and_snapshot(&bus().backlog, &STREAMING)
 }
 
+/// The backlog for a reader that is *not* going to listen: the control server's `LOGS` verb,
+/// i.e. `ScreenExtend logs`. It used to call [`get_log_backlog`], whose arming is a side effect
+/// meant for the panel — so one `ScreenExtend logs` against the desktop app left the writer
+/// serialising every line into a `LogLine` IPC event for the rest of the process's life, which is
+/// exactly the cost `set_log_streaming(false)` exists to switch off. Under `serve` it switched
+/// the writer to 50 ms coalescing, so the newest lines reached the ring later.
+pub fn backlog_snapshot() -> Vec<String> {
+    bus()
+        .backlog
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Whether the `LogLine` stream is armed. For the control server's tests.
+#[cfg(test)]
+pub fn streaming_armed() -> bool {
+    STREAMING.load(Ordering::Relaxed)
+}
+
 /// Arm or disarm the `LogLine` event stream. Called by the Settings log panel on mount and,
 /// crucially, on unmount: without the second call the panel being opened once kept the writer
 /// thread emitting batched IPC events for the rest of the process's life.
