@@ -1725,6 +1725,12 @@ async fn start_session(
 
     let t_display = std::time::Instant::now();
     let display_and_pipeline = async {
+        // The DPI write runs beside `start_on_monitor` rather than before it. It changes the
+        // extended desktop's scaling, not the captured geometry, and `set_display_scale_owned`
+        // wants five stable read-backs 100 ms apart (p50 423 ms with the settle): time the join
+        // spent waiting before the pipeline could even begin.
+        // The target, and what to record if the write cannot be made at all.
+        let mut deferred_scale: Option<(session::DisplayTarget, u32)> = None;
         let mut mode_applied = true;
         // What the display's DPI is actually at when this is done. Not always `scale`: a display
         // reports the band of steps it will take, so a DPR above that band lands on the closest
@@ -1774,9 +1780,8 @@ async fn start_session(
                             Some(monitor_dims(width, height, swap_axes)),
                         )
                         .await;
-                        applied_scale = apply_display_scale(&target, scale)
-                            .await
-                            .unwrap_or(prev.scale);
+                        deferred_scale = Some((target.clone(), prev.scale));
+                        applied_scale = scale;
                         tprintln!(
                             "virtual display id={} settings changed in place via Windows APIs ({width}x{height}@{applied_refresh}, scale={applied_scale}%)",
                             prev.display_id
@@ -1923,8 +1928,25 @@ async fn start_session(
                 // that is guaranteed to fail whenever the requested size is off the ladder the OS
                 // published. `None` means "the backend does not know", which is every commanded
                 // backend, and keeps the old behaviour.
-                let already_at_size = client.created_geometry(display_id)
+                let mut already_at_size = client.created_geometry(display_id)
                     == Some(monitor_dims(width, height, swap_axes));
+                // A display created at exactly this mode, unrotated, needs no forced mode set.
+                // The write it skips measured p50 172 ms and up to 3.7 s, and every mode commit
+                // also costs the driver host memory it never gives back.
+                if !already_at_size && !swap_axes {
+                    let name = device_name.clone();
+                    let current = tokio::task::spawn_blocking(move || current_mode_of(&name))
+                        .await
+                        .ok()
+                        .flatten();
+                    if current == Some((width, height, refresh)) {
+                        tprintln!(
+                            "virtual display {device_name} is already at {width}x{height}@{refresh}; \
+                             no mode set needed"
+                        );
+                        already_at_size = true;
+                    }
+                }
                 if already_at_size {
                     tprintln!(
                         "virtual display {device_name} was created at {width}x{height}; skipping the forced mode set"
@@ -1964,7 +1986,8 @@ async fn start_session(
                     wait_for_display_settle(&fresh, Some(monitor_dims(width, height, swap_axes)))
                         .await;
                 }
-                applied_scale = apply_display_scale(&fresh, scale).await.unwrap_or(scale);
+                deferred_scale = Some((fresh.clone(), scale));
+                applied_scale = scale;
                 if topology_reset {
                     if let Some(sessions) = state.config.sessions.as_ref() {
                         let others = session::live_displays_except(sessions, &join_id);
@@ -2033,16 +2056,27 @@ async fn start_session(
         // capture start, with a DXGI fallback stacked behind it on failure. Running it inline parked
         // a tokio worker that also owns other clients' RTP writers, `/reconfig` and bitrate polls.
         let t_pipeline = std::time::Instant::now();
-        let session = {
+        let start = {
             let cfg = cfg.clone();
             let name = device_name.clone();
-            match tokio::task::spawn_blocking(move || pipeline::start_on_monitor(&cfg, &name))
-                .await
-                .context("start-capture task")?
-            {
-                Ok(s) => s,
-                Err(e) => return Err(e.context("starting capture for virtual display")),
+            tokio::task::spawn_blocking(move || pipeline::start_on_monitor(&cfg, &name))
+        };
+        let (started, landed_scale) = match deferred_scale.take() {
+            Some((t, fallback)) => {
+                let (s, landed) = tokio::join!(start, apply_display_scale(&t, scale));
+                (s, Some(landed.unwrap_or(fallback)))
             }
+            None => (start.await, None),
+        };
+        if let (Some(landed), Some(s)) = (landed_scale, state.config.sessions.as_ref()) {
+            if let Some(mut d) = session::get_live_display(s, &join_id) {
+                d.scale = landed.clamp(MIN_DISPLAY_SCALE, MAX_EFFECTIVE_SCALE);
+                session::set_live_display(s, &join_id, d);
+            }
+        }
+        let session = match started.context("start-capture task")? {
+            Ok(s) => s,
+            Err(e) => return Err(e.context("starting capture for virtual display")),
         };
         let pipeline_ms = t_pipeline.elapsed().as_secs_f64() * 1000.0;
 
@@ -2053,11 +2087,14 @@ async fn start_session(
 
         {
             let name = device_name.clone();
-            if let Ok(Some((left, top, width, height))) =
-                tokio::task::spawn_blocking(move || pipeline::monitor_rect(&name)).await
-            {
-                tprintln!("remote-input display {device_name}: {width}x{height} at ({left},{top})");
-            }
+            let rect = tokio::task::spawn_blocking(move || {
+                let r = pipeline::monitor_rect(&name);
+                if let Some((left, top, width, height)) = r {
+                    tprintln!("remote-input display {name}: {width}x{height} at ({left},{top})");
+                }
+            });
+            // Only a log line, so the join does not wait for it (p50 128 ms when it did).
+            drop(rect);
         }
 
         anyhow::Ok((display_id, device_name, session, display_ms, pipeline_ms))
@@ -2499,6 +2536,17 @@ fn monitor_dims(width: u32, height: u32, swap_axes: bool) -> (u32, u32) {
     } else {
         (width, height)
     }
+}
+
+/// The mode a display reports right now, as `(width, height, refresh)`.
+#[cfg(target_os = "windows")]
+fn current_mode_of(gdi_name: &str) -> Option<(u32, u32, u32)> {
+    crate::windows_utils::virtual_display::current_display_mode(gdi_name)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_mode_of(_gdi_name: &str) -> Option<(u32, u32, u32)> {
+    None
 }
 
 async fn read_back_dimensions(
