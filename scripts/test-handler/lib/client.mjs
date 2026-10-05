@@ -70,6 +70,9 @@ export class Client {
 
   async setClient(c) {
     this.clientSpec = c;
+    // The observer script fixed the reported refresh rate at the first spec's; a spec change (the
+    // hi-res scenario) must change it too, or a "120 Hz" client tells the host 60.
+    if (c.refresh && this.page) await this.page.send('Page.addScriptToEvaluateOnNewDocument', { source: `self.__seRefresh = ${Number(c.refresh)};` }).catch(() => {});
     await this.page.send('Emulation.setDeviceMetricsOverride', { width: c.width, height: c.height, deviceScaleFactor: c.dpr, mobile: false, screenWidth: c.width, screenHeight: c.height });
   }
 
