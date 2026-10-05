@@ -31,7 +31,14 @@ export class Client {
     p.on((d) => {
       const q = d.params || {};
       if (d.method === 'Network.requestWillBeSent' && /\/whep/.test(q.request.url)) { const r = { id: q.requestId, method: q.request.method, url: q.request.url.replace(/^https?:\/\/[^/]+/, ''), sent: q.wallTime * 1000, ts0: q.timestamp }; reqs.set(q.requestId, r); this.whep.push(r); }
-      else if (d.method === 'Network.responseReceived' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); r.status = q.response.status; r.answered = r.sent + (q.timestamp - r.ts0) * 1000; }
+      else if (d.method === 'Network.responseReceived' && reqs.has(q.requestId)) {
+        const r = reqs.get(q.requestId); r.status = q.response.status; r.answered = r.sent + (q.timestamp - r.ts0) * 1000;
+        // Where the time went, on the browser's side: queued before a socket, connecting, TLS,
+        // sending, then waiting for the first response byte (ms relative to requestTime).
+        const t = q.response.timing;
+        if (t) { const k = (x) => (x >= 0 ? Math.round(x) : null); r.timing = { requestTimeOffsetMs: Math.round((t.requestTime - r.ts0) * 1000), connectStart: k(t.connectStart), sslEnd: k(t.sslEnd), sendStart: k(t.sendStart), sendEnd: k(t.sendEnd), receiveHeadersStart: k(t.receiveHeadersStart), receiveHeadersEnd: k(t.receiveHeadersEnd) }; }
+        r.connectionId = q.response.connectionId; r.connectionReused = q.response.connectionReused; r.protocol = q.response.protocol;
+      }
       else if (d.method === 'Network.loadingFinished' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); if (!r.answered) { r.answered = r.sent + (q.timestamp - r.ts0) * 1000; r.answeredFrom = 'loadingFinished'; } }
       else if (d.method === 'Network.loadingFailed' && reqs.has(q.requestId)) { const r = reqs.get(q.requestId); r.failed = q.errorText; }
     });

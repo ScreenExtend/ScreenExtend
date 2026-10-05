@@ -59,9 +59,22 @@ export async function startHost(o) {
   if (o.envCredentials) { env.SCREENEXTEND_SESSION_ID = o.sessionId; env.SCREENEXTEND_OTP = o.otp; credentialsVia = 'environment'; }
   else { args.push('--session-id', o.sessionId, '--otp', o.otp); credentialsVia = 'argv (this build reads no credential environment variables)'; }
   args.push(...(o.extraArgs || []));
+  // Every line is prefixed with the system clock as it reaches us ("[epoch-ms] "), so the host's
+  // log can be laid against the browser's network log: `serve` prints no times of its own. The
+  // prefix is when the handler read the line (a pipe, read on the event loop), which trails the
+  // host's write by well under a millisecond on an idle loop and by a few ms on a busy one.
   const out = fs.openSync(o.logFile, 'a');
-  const proc = spawn(o.exe, args, { env, stdio: ['ignore', out, out], windowsHide: true });
-  fs.closeSync(out);
+  const proc = spawn(o.exe, args, { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  for (const s of [proc.stdout, proc.stderr]) {
+    let tail = '';
+    s.setEncoding('utf8');
+    s.on('data', (d) => {
+      const now = Date.now(); const parts = (tail + d).split('\n'); tail = parts.pop();
+      if (parts.length) { try { fs.writeSync(out, parts.map((l) => `[${now}] ${l.replace(/\r$/, '')}\n`).join('')); } catch { /* closed */ } }
+    });
+    s.on('end', () => { if (tail) { try { fs.writeSync(out, `[${Date.now()}] ${tail}\n`); } catch { /* closed */ } } });
+  }
+  proc.on('close', () => { try { fs.closeSync(out); } catch { /* already */ } });
   let exited = null; proc.on('exit', (code) => { exited = { code }; });
   const shownArgs = args.map((a, i) => (args[i - 1] === '--otp' ? '<otp>' : args[i - 1] === '--session-id' ? '<session>' : a));
   const t0 = Date.now(); let ip = null; let log = '';
