@@ -39,6 +39,7 @@ const DEFAULTS = {
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
   mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
+  cpu_burn: null,          // {threads, seconds}: saturate the CPU during slow_answer's joins (inside the measurement lock)
   netlog: false,           // Chrome's own network log per browser, into the run directory
   stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
@@ -651,6 +652,17 @@ async function slowAnswer(cl) {
   const n = typeof REQ.slow_answer === 'object' && REQ.slow_answer.n ? REQ.slow_answer.n : 5;
   const out = { attempts: [] };
   const name = deviceName();
+  // `cpu_burn: {threads, seconds}`: saturate the CPU during the joins, to reproduce the lost
+  // request / lost answer seen only on a loaded machine. A separate process of busy workers at
+  // normal priority, killed when the joins end (or after `seconds`, whichever is first).
+  let burn = null;
+  if (REQ.cpu_burn) {
+    const n = REQ.cpu_burn.threads || os.cpus().length, secs = REQ.cpu_burn.seconds || 120;
+    const src = `const { Worker } = require('worker_threads'); for (let i = 0; i < ${n}; i++) new Worker('const e = Date.now() + ${secs * 1000}; while (Date.now() < e) {}', { eval: true }); setTimeout(() => process.exit(0), ${secs * 1000 + 500});`;
+    burn = spawn(process.execPath, ['-e', src], { stdio: 'ignore', windowsHide: true });
+    owned.stages.push(burn); out.cpuBurn = { threads: n, seconds: secs, pid: burn.pid };
+    await sleep(1500);
+  }
   for (let i = 0; i < n; i++) {
     const j = await joinClient(cl, REQ.client, { name });
     // Every attempt's full join record (network timing per /whep request included) goes into
@@ -662,6 +674,7 @@ async function slowAnswer(cl) {
     out.attempts.push(e);
     await leave(cl); await sleep(2500);
   }
+  if (burn && burn.exitCode === null) { try { burn.kill(); } catch { /* gone */ } }
   out.flagged = out.attempts.filter((a) => a.flag).length;
   return out;
 }
