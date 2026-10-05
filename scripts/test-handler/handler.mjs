@@ -680,21 +680,57 @@ async function customHook(cl) {
   return out;
 }
 
+// `mic_prompt`: three fresh browsers — speaker access granted, microphone granted, nothing
+// granted (the card is answered with Skip) — and, with `{ rejoin: true }`, the nothing-granted
+// browser joins a second time to show the answer is remembered. `{ audio: true }` also turns
+// system audio on for each device and reads whether the page's audio graph is receiving and
+// playing (on the default output) a few seconds later. Each case costs one display creation;
+// the rejoin one more. `cases` narrows the list by label.
 async function micPrompt() {
+  const opt = typeof REQ.mic_prompt === 'object' ? REQ.mic_prompt : {};
   const out = {};
-  for (const [label, grant] of [['speaker access granted (no microphone)', ['speakerSelection', 'wakeLockScreen']], ['nothing granted', null]]) {
-    const cl = await openClient(REQ.client, { offset: 3 });
-    const j = await joinClient(cl, REQ.client, { grant, micChoice: 'skip' });
-    const page = await cl.page.ev(`(async () => ({
+  let cases = [
+    ['speaker access granted (no microphone)', ['speakerSelection', 'wakeLockScreen']],
+    ['microphone granted', ['audioCapture', 'wakeLockScreen']],
+    ['nothing granted', null],
+  ];
+  if (Array.isArray(opt.cases)) cases = cases.filter(([l]) => opt.cases.includes(l));
+  const readPage = (cl) => cl.page.ev(`(async () => ({
       gum: __se.gum, permQueries: __se.permQueries,
       micPermission: await navigator.permissions.query({ name: 'microphone' }).then((p) => p.state, (e) => 'ERR ' + e.message),
-      outputLabels: await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').map((x) => x.label)),
+      outputs: await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').map((x) => ({ idEmpty: !x.deviceId, label: x.label }))),
+      outputPlan: window.SEAudio && SEAudio.getOutputPlan ? SEAudio.getOutputPlan() : 'no getOutputPlan (older page)',
+      stored: (() => { const o = {}; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (/^se\\.outputs\\./.test(k)) o[k] = localStorage.getItem(k); } } catch (e) { o.error = e.message; } return o; })(),
       selectAudioOutput: !!(navigator.mediaDevices && navigator.mediaDevices.selectAudioOutput),
       setSinkId: 'setSinkId' in HTMLMediaElement.prototype }))()`).catch((e) => ({ error: e.message }));
-    out[label] = { join: j, micCardShown: j.modals.some((m) => /^micCard/.test(m)), microphoneRequested: (page.gum || []).some((g) => /audio/.test(g.constraints)), ...page,
-      outputsAvailableWithoutMic: (page.outputLabels || []).some((l) => l), defect: null };
+  const summarise = (j) => {
+    const posts = (j.whepRequests || []).filter((w) => w.method === 'POST');
+    const outputsPost = (j.apiRequests || []).find((w) => w.method === 'POST' && /^\/audio-outputs/.test(w.url));
+    return { modals: j.modals, submitToFirstPostMs: posts.length ? posts[0].sentMs : null, offers: posts.length, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, audioOutputsPostedMs: outputsPost ? outputsPost.sentMs : null, pageError: j.pageError || '' };
+  };
+  for (const [label, grant] of cases) {
+    const cl = await openClient(REQ.client, { offset: 3 });
+    const j = await joinClient(cl, REQ.client, { grant, micChoice: 'skip' });
+    const page = await readPage(cl);
+    out[label] = { join: summarise(j), micCardShown: j.modals.some((m) => /^micCard/.test(m)), microphoneRequested: (page.gum || []).some((g) => /audio/.test(g.constraints)), ...page,
+      outputsAvailableWithoutMic: (page.outputs || []).some((x) => x.label), defect: null };
     const o = out[label];
     if (o.outputsAvailableWithoutMic && (o.micCardShown || o.microphoneRequested)) o.defect = 'microphone prompt/card although output labels were already available';
+    if (opt.audio && j.firstPictureMs != null) {
+      const k = await deviceKey(j.name, cl);
+      const set = await cli(['devices', 'set', k.key, '--audio', 'on']);
+      const a = await cl.secondary(); await sleep(4000); const b = await cl.secondary();
+      const dc = (s) => ((s && s.webrtc && s.webrtc.dataChannels) || []).reduce((n, d) => n + (d.messagesReceived || 0), 0);
+      const sync = await cl.page.ev('window.SEAudio ? SEAudio.getSyncInfo() : null').catch((e) => ({ error: e.message }));
+      o.audio = { setCode: set.code, path: sync && sync.path, contextState: sync && sync.contextState, currentSink: sync && sync.currentSink, sinkTier: sync && sync.sinkTier,
+        depthMs: sync && sync.depthMs, underruns: sync && sync.underruns, dataChannelMessagesIn4s: dc(b) - dc(a), trackPacketsIn4s: ((b.webrtc && b.webrtc.audioTrack && b.webrtc.audioTrack.packets) || 0) - ((a.webrtc && a.webrtc.audioTrack && a.webrtc.audioTrack.packets) || 0) };
+    }
+    if (opt.rejoin && grant === null) {
+      await leave(cl);
+      const j2 = await joinClient(cl, REQ.client, { grant: null, micChoice: 'skip' });
+      const p2 = await readPage(cl);
+      o.rejoin = { join: summarise(j2), micCardShown: j2.modals.some((m) => /^micCard/.test(m)), microphoneRequested: (p2.gum || []).some((g) => /audio/.test(g.constraints)), outputPlan: p2.outputPlan, stored: p2.stored };
+    }
     await leave(cl); await cl.close(); owned.clients.splice(owned.clients.indexOf(cl), 1);
   }
   return out;
