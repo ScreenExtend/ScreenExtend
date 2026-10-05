@@ -992,6 +992,20 @@
         maybeUpdateTarget();
     }
 
+    // A page open on the host machine itself plays into the very mix the host is capturing:
+    // the host's loopback takes it back, sends it again, and the result is an echo that repeats
+    // every round trip and never decays. The host's own speakers are already playing the audio,
+    // so this page's copy adds nothing but that loop — it starts muted.
+    let sameDeviceLogged = false;
+    function playbackMutedHere() {
+        const same = window.__SAME_DEVICE__ === true;
+        if (same && !sameDeviceLogged) {
+            sameDeviceLogged = true;
+            console.warn('[audio] this page is on the host machine; its playback is muted so the host does not capture it again');
+        }
+        return same;
+    }
+
     function setMuted(m) {
         state.muted = m;
         if (state.gain) state.gain.gain.value = m ? 0 : 1;
@@ -1287,7 +1301,7 @@
             state.worker.postMessage(buf, [buf]);
         };
         state.path = 'webcodecs';
-        setMuted(false); // default unmuted when the host has enabled audio
+        setMuted(playbackMutedHere());
         console.log('[audio] fast path active: Opus over DataChannel → worker → ' +
             (state.sab ? 'shared-memory ring' : 'postMessage ring'));
     }
@@ -1320,7 +1334,7 @@
         const p = state.audioEl.play();
         if (p && p.catch) p.catch(() => {});
         state.path = 'netEQ';
-        setMuted(false);
+        setMuted(playbackMutedHere());
         console.log('[audio] fallback path active: standard Opus track (NetEQ)');
     }
 
