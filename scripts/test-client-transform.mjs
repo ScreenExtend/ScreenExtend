@@ -117,7 +117,15 @@ function makeWorker(opts) {
       ctx.onmessage({ data: { type: 'canvas', canvas } });
       return canvas;
     },
-    startPump() { ctx.onmessage({ data: { type: 'encodedstream', readable } }); },
+    startPump(writable) { ctx.onmessage({ data: { type: 'encodedstream', readable, writable } }); },
+    // The receiver's writable: everything the worker hands back to libwebrtc.
+    receiverWritable() {
+      const written = [];
+      return { written, getWriter: () => ({ write: (f) => { written.push(f.type + '@' + f.timestamp); return Promise.resolve(); } }) };
+    },
+    startScriptTransform(writable) {
+      ctx.onrtctransform({ transformer: { readable, writable, sendKeyFrameRequest: () => Promise.resolve() } });
+    },
     feed(frame) {
       if (waiting) { const w = waiting; waiting = null; w({ value: frame, done: false }); }
       else queue.push(frame);
@@ -419,6 +427,40 @@ const lastOf = (posted, type) => { for (let i = posted.length - 1; i >= 0; i--) 
   eq('its p50 is the fifth smallest of eight', p.p50, 10);
   eq('its p90 is the eighth', p.p90, 1000);
   eq('an empty window reports nothing rather than zero', new w.ctx.StatWindow().pct(), null);
+}
+
+// ── 12. keyframes, and only keyframes, go back to the receiver ───────────────────────────
+// The receiver's own decoder never sees a frame otherwise, and asks for a keyframe every
+// ~200 ms for the whole session (the keyframe storm). One keyframe gives it something decodable
+// and moves it onto its 3 s timeout; handing it every delta would decode every frame twice.
+for (const via of ['script transform', 'createEncodedStreams']) {
+  const w = makeWorker();
+  w.attachCanvas();
+  const rw = w.receiverWritable();
+  if (via === 'script transform') w.startScriptTransform(rw); else w.startPump(rw);
+  await w.settle();
+  w.feed(frame('delta', 1000));
+  w.feed(frame('key', 4000));
+  w.feed(frame('delta', 7000));
+  w.feed(frame('delta', 10000));
+  w.feed(frame('key', 13000));
+  await w.settle();
+  eq(via + ': frames handed back to the receiver', rw.written.join(' '), 'key@4000 key@13000');
+  eq(via + ': our own decoder still got every frame from the first keyframe on', w.decoded.length, 4);
+  w.send({ type: 'videostats' });
+  eq(via + ': keyframesForwarded in the stats', lastOf(w.posted, 'videostats').stats.keyframesForwarded, 2);
+}
+{
+  // A page that sends no writable (an older page, or a browser that cannot transfer one) keeps
+  // working exactly as before.
+  const w = makeWorker();
+  w.attachCanvas();
+  w.startPump();
+  await w.settle();
+  w.feed(frame('key', 4000));
+  w.feed(frame('delta', 7000));
+  await w.settle();
+  eq('no writable: both frames still decoded', w.decoded.length, 2);
 }
 
 if (failures) {

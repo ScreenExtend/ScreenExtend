@@ -845,7 +845,7 @@ async function fallbackPaths() {
       if (j.firstPictureMs == null) { out[label] = { error: 'no picture', join: j }; continue; }
       const w = await timedWindow(cl, j.name, { seconds: Math.min(REQ.duration, 10), mover: true, large: false, label: 'fallback:' + label });
       const sec = await cl.secondary();
-      out[label] = { join: { answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, secure: j.page && j.page.secure, coi: j.page && j.page.coi }, latencyMs: w.latencyMs, paintedFps: w.paintedFps, longestGapMs: w.longestGapMs, videoPath: sec.seVideo && sec.seVideo.videoPath, renderTier: sec.seVideo && sec.seVideo.renderTier, transportTier: sec.seVideo && sec.seVideo.transportTier, decoder: sec.webrtc && sec.webrtc.video ? sec.webrtc.video.decoder : null, usingFallback: sec.usingFallback, error: w.error };
+      out[label] = { join: { answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, secure: j.page && j.page.secure, coi: j.page && j.page.coi }, latencyMs: w.latencyMs, paintedFps: w.paintedFps, longestGapMs: w.longestGapMs, decodeErrors: w.decodeErrors, loaded: w.loaded, pageCounters: w.pageCounters, videoPath: sec.seVideo && sec.seVideo.videoPath, renderTier: sec.seVideo && sec.seVideo.renderTier, transportTier: sec.seVideo && sec.seVideo.transportTier, decoder: sec.webrtc && sec.webrtc.video ? sec.webrtc.video.decoder : null, usingFallback: sec.usingFallback, error: w.error };
       await leave(cl);
     } finally { await cl.close(); owned.clients.splice(owned.clients.indexOf(cl), 1); }
   }
