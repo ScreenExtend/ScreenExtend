@@ -360,14 +360,17 @@ pub fn interface_ipv4(name: &str) -> Option<Ipv4Addr> {
 }
 
 fn hosted_network_name(app: &AppHandle) -> String {
-    let stored_name = app.store("config.json").ok().and_then(|config| {
-        let name = config
-            .get("hostedNetworkCredentials")?
-            .get("name")?
-            .as_str()?
-            .to_string();
-        Some(name)
-    });
+    let stored_name = app
+        .store(crate::data_dir::config_store())
+        .ok()
+        .and_then(|config| {
+            let name = config
+                .get("hostedNetworkCredentials")?
+                .get("name")?
+                .as_str()?
+                .to_string();
+            Some(name)
+        });
 
     stored_name.unwrap_or_else(|| "ScreenExtend".to_string())
 }

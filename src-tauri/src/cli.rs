@@ -177,11 +177,10 @@ pub fn fast_path() {
 
 pub fn dispatch(app: &tauri::AppHandle) -> Outcome {
     use crate::single_instance;
-    use tauri::Manager;
     // Before the GUI early-return, because the desktop app needs it too: it is what lets the
     // display-driver probe — a plain Tauri command with no `AppHandle` of its own in reach —
     // ask the control socket which process is holding the driver's pipe.
-    if let Ok(dir) = app.path().app_local_data_dir() {
+    if let Ok(dir) = crate::data_dir::local_data_dir(app) {
         single_instance::remember_ctrl_path(dir.join(single_instance::CTRL_FILE));
     }
     let args = user_args();
@@ -810,7 +809,7 @@ mod desktop {
     type Cfg = Store<tauri::Wry>;
 
     fn open_store(app: &tauri::AppHandle) -> Arc<Cfg> {
-        match app.store(CONFIG_STORE) {
+        match app.store(crate::data_dir::config_store()) {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("error: cannot open config store: {e}");
@@ -826,7 +825,7 @@ mod desktop {
     /// is every install predating the setting and means "keep the built-in default"; `Some(vec![])`
     /// is the distinct, deliberate "no STUN at all".
     pub fn saved_stun_urls(app: &tauri::AppHandle) -> Option<Vec<String>> {
-        let store = app.store(CONFIG_STORE).ok()?;
+        let store = app.store(crate::data_dir::config_store()).ok()?;
         let raw = get_nested(&store, "stunUrls")?;
         let raw = raw.as_str()?.to_string();
         Some(crate::streamer::session::parse_stun_urls(&raw))
@@ -1267,7 +1266,7 @@ mod desktop {
     /// and make the real instance believe it is the second one. The lock is still the
     /// authority, so it is the fallback when no control file answers.
     fn host_running(app: &tauri::AppHandle) -> bool {
-        let Ok(dir) = app.path().app_local_data_dir() else {
+        let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             return false;
         };
         let ctrl_path = dir.join(single_instance::CTRL_FILE);
@@ -1368,7 +1367,7 @@ mod desktop {
     /// process. `None` when no host is up, when it is too old to know the verb (it closes the
     /// connection saying nothing), or when it is up but has not minted credentials yet.
     fn live_session(app: &tauri::AppHandle) -> Option<single_instance::SessionInfo> {
-        let dir = app.path().app_local_data_dir().ok()?;
+        let dir = crate::data_dir::local_data_dir(app).ok()?;
         let reply = single_instance::query_running_instance(
             &dir.join(single_instance::CTRL_FILE),
             single_instance::Command::Session,
@@ -1450,9 +1449,7 @@ mod desktop {
         session_id: &str,
         otp: &str,
     ) -> Result<single_instance::SessionInfo, String> {
-        let dir = app
-            .path()
-            .app_local_data_dir()
+        let dir = crate::data_dir::local_data_dir(app)
             .map_err(|e| format!("could not resolve the app data directory: {e}"))?;
         let reply = single_instance::query_running_instance(
             &dir.join(single_instance::CTRL_FILE),
@@ -1706,7 +1703,7 @@ mod desktop {
     fn run_serve(app: &tauri::AppHandle, m: &Matches) -> ! {
         crate::logbus::set_verbose(arg_flag(m, "verbose"));
 
-        let lock_dir = match app.path().app_local_data_dir() {
+        let lock_dir = match crate::data_dir::local_data_dir(app) {
             Ok(dir) => dir,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1747,7 +1744,7 @@ mod desktop {
         crate::streamer::input::prime();
         platform::permissions::prime();
 
-        let store = app.store(CONFIG_STORE).ok();
+        let store = app.store(crate::data_dir::config_store()).ok();
         let http = arg_u16(m, "http-port")
             .or_else(|| {
                 store
@@ -2086,7 +2083,7 @@ mod desktop {
     /// runs inside the host process, on behalf of a CLI process that has just written the file.
     pub fn reload_config_into_state(app: &tauri::AppHandle) -> Result<(), String> {
         let store = app
-            .store(CONFIG_STORE)
+            .store(crate::data_dir::config_store())
             .map_err(|e| format!("cannot open config store: {e}"))?;
         store
             .reload()
@@ -2098,7 +2095,7 @@ mod desktop {
 
     /// Ask a running host to re-read its configuration. `true` when it confirmed.
     fn request_reload(app: &tauri::AppHandle) -> bool {
-        let Ok(dir) = app.path().app_local_data_dir() else {
+        let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             return false;
         };
         single_instance::query_running_instance(
@@ -2334,7 +2331,7 @@ mod desktop {
     /// socket. `status` is a separate process, so this is the only path to counters that exist
     /// only in the host's memory. `None` when no host is up or it is too old to answer.
     fn live_telemetry(app: &tauri::AppHandle) -> Option<Value> {
-        let dir = app.path().app_local_data_dir().ok()?;
+        let dir = crate::data_dir::local_data_dir(app).ok()?;
         let reply = single_instance::query_running_instance(
             &dir.join(single_instance::CTRL_FILE),
             single_instance::Command::Stats,
@@ -2586,7 +2583,7 @@ mod desktop {
             generate_session_id,
         );
         let target = arg_str(m, "target").unwrap_or_else(|| "all".to_string());
-        let store = app.store(CONFIG_STORE).ok();
+        let store = app.store(crate::data_dir::config_store()).ok();
         let http = store
             .as_deref()
             .and_then(|s| cfg_u64(s, "serverPorts.http"))
@@ -2661,7 +2658,7 @@ mod desktop {
             "new" => {
                 let session_id = generate_session_id();
                 let otp = generate_otp();
-                let store = app.store(CONFIG_STORE).ok();
+                let store = app.store(crate::data_dir::config_store()).ok();
                 let http = store
                     .as_deref()
                     .and_then(|s| cfg_u64(s, "serverPorts.http"))
@@ -3203,7 +3200,7 @@ mod desktop {
         };
         match name {
             "path" => {
-                match app.path().app_config_dir() {
+                match crate::data_dir::config_dir(app) {
                     Ok(dir) => println!("{}", dir.join(CONFIG_STORE).display()),
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -3852,7 +3849,7 @@ mod desktop {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(usize::MAX);
 
-        let Ok(dir) = app.path().app_local_data_dir() else {
+        let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             eprintln!("error: could not resolve app data directory");
             exit(1);
         };
@@ -3961,7 +3958,7 @@ mod desktop {
     // stop
 
     fn run_stop(app: &tauri::AppHandle) -> ! {
-        let Ok(dir) = app.path().app_local_data_dir() else {
+        let Ok(dir) = crate::data_dir::local_data_dir(app) else {
             eprintln!("error: could not resolve app data directory");
             exit(1);
         };

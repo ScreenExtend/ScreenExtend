@@ -125,6 +125,11 @@ impl DriverClient {
         RUNTIME.block_on(self.0.notify())
     }
 
+    /// The driver's monitor list, asked for now rather than read from the cache.
+    pub fn request_live_state(&self) -> Result<Vec<Monitor>, String> {
+        RUNTIME.block_on(self.0.request_live_state())
+    }
+
     /// Find the monitor with the given ID.
     ///
     /// Note: Client state might be stale. To synchronize with the driver,

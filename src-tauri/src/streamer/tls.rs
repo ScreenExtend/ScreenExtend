@@ -7,6 +7,9 @@ const DEV_CERT_FILE: &str = "self-signed-cert.pem";
 const DEV_KEY_FILE: &str = "self-signed-key.pem";
 
 fn dev_cert_dir() -> Option<PathBuf> {
+    if let Some(dir) = crate::data_dir::override_dir() {
+        return Some(dir.to_path_buf());
+    }
     let base = if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {

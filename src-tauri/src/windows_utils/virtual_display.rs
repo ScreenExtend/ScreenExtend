@@ -303,6 +303,9 @@ pub struct WindowsVirtualDisplay {
     /// held across a `RUNTIME.block_on`. The round trip is bounded (5 s connect, 2 s write) but
     /// bounded is not short: `DISPLAY_ATTACH_TIMEOUT` is 5 s for the whole attach.
     commit: Mutex<()>,
+    /// Shared-driver mode (`SCREENEXTEND_DATA_DIR` set): merge into the driver's machine-wide
+    /// monitor list instead of replacing it. See `mod shared`.
+    shared: bool,
 }
 
 impl WindowsVirtualDisplay {
@@ -310,23 +313,38 @@ impl WindowsVirtualDisplay {
     ///
     /// The caller must already hold `commit`, which is what makes reading `owned`, computing a
     /// new list and storing it back atomic enough: no other commit can interleave.
-    fn commit_unlocked(&self, monitors: Vec<Monitor>) -> Result<(), String> {
+    fn commit_unlocked(&self, monitors: Vec<Monitor>) -> Result<Vec<Monitor>, String> {
         // An independent client over the same connection, so `set_monitors` mutates a state of
         // its own rather than the shared one — which is what lets the guard go before the wait.
         let mut client = self.inner.lock().unwrap().client.duplicate();
         let started = Instant::now();
-        let result = client
-            .set_monitors(&monitors)
-            .map_err(|e| format!("set monitors: {e}"))
-            .and_then(|()| client.notify().map_err(|e| format!("notify driver: {e}")));
+        let (result, monitors) = if self.shared {
+            let previous: Vec<u32> = self
+                .inner
+                .lock()
+                .unwrap()
+                .owned
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            match shared::commit(&mut client, &previous, monitors) {
+                Ok(final_ours) => (Ok(()), final_ours),
+                Err(e) => (Err(e), Vec::new()),
+            }
+        } else {
+            let r = client
+                .set_monitors(&monitors)
+                .map_err(|e| format!("set monitors: {e}"))
+                .and_then(|()| client.notify().map_err(|e| format!("notify driver: {e}")));
+            (r, monitors)
+        };
         let elapsed = started.elapsed();
         if elapsed >= SLOW_COMMIT {
             tprintln!("[virtual-display] driver commit took {elapsed:?}");
         }
-        if result.is_ok() {
-            self.inner.lock().unwrap().owned = monitors;
-        }
-        result
+        result?;
+        self.inner.lock().unwrap().owned = monitors.clone();
+        Ok(monitors)
     }
 }
 
@@ -363,9 +381,18 @@ impl WindowsVirtualDisplay {
             }
         })?;
         let _ = CONNECTED.set(());
-        client.remove_all();
-        if let Err(e) = client.notify() {
-            teprintln!("[virtual-display] could not clear leftover monitors at startup: {e}");
+        let shared = crate::data_dir::isolated();
+        if shared {
+            // Other hosts' monitors live in the same driver list: never clear it. Reclaim only
+            // what exited hosts left behind.
+            if let Err(e) = shared::commit(&mut client, &[], Vec::new()) {
+                teprintln!("[virtual-display] shared driver: startup reclaim failed: {e}");
+            }
+        } else {
+            client.remove_all();
+            if let Err(e) = client.notify() {
+                teprintln!("[virtual-display] could not clear leftover monitors at startup: {e}");
+            }
         }
         Ok(Arc::new(Self {
             inner: Mutex::new(Inner {
@@ -373,6 +400,7 @@ impl WindowsVirtualDisplay {
                 owned: Vec::new(),
             }),
             commit: Mutex::new(()),
+            shared,
         }))
     }
 
@@ -872,9 +900,15 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
         // the same id; `inner` itself is taken only for the moments that touch its fields.
         let _commit = self.commit.lock().unwrap();
         let mut monitors = self.inner.lock().unwrap().owned.clone();
-        let id = (0u32..)
-            .find(|candidate| !monitors.iter().any(|m| m.id == *candidate))
-            .ok_or_else(|| "no free display id".to_string())?;
+        // In shared-driver mode the id is machine-wide and is chosen under the cross-process
+        // lock inside the commit; `shared::ALLOCATE` marks the monitor that needs one.
+        let id = if self.shared {
+            shared::ALLOCATE
+        } else {
+            (0u32..)
+                .find(|candidate| !monitors.iter().any(|m| m.id == *candidate))
+                .ok_or_else(|| "no free display id".to_string())?
+        };
 
         let mut dims: Vec<(u32, u32)> = Vec::new();
         let mut candidates: Vec<(u32, u32)> = Vec::with_capacity(1 + extra_modes.len());
@@ -932,8 +966,8 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
             name: Some(name),
             modes,
         });
-        self.commit_unlocked(monitors)?;
-        Ok(id)
+        let committed = self.commit_unlocked(monitors)?;
+        Ok(committed.last().map(|m| m.id).unwrap_or(id))
     }
 
     /// Correlate one of our monitors to its `\\.\DISPLAYn` without waiting for it to appear.
@@ -970,12 +1004,305 @@ impl VirtualDisplayController for WindowsVirtualDisplay {
 
     fn remove_all_displays(&self) {
         let _commit = self.commit.lock().unwrap();
+        if self.shared {
+            // Only ours: the other hosts sharing the driver keep theirs.
+            if let Err(e) = self.commit_unlocked(Vec::new()) {
+                teprintln!("virtual_display: remove_all (shared driver) failed: {e}");
+            }
+            return;
+        }
         let mut client = self.inner.lock().unwrap().client.duplicate();
         client.remove_all();
         let result = client.notify();
         self.inner.lock().unwrap().owned.clear();
         if let Err(e) = result {
             teprintln!("virtual_display: notify after remove_all failed: {e:?}");
+        }
+    }
+}
+
+/// Shared-driver mode, entered when `SCREENEXTEND_DATA_DIR` isolates this host
+/// (`crate::data_dir`). Test-only: it is what lets `scripts/test-handler/` run several hosts at
+/// once.
+///
+/// The driver keeps one monitor list for the whole machine and every notify replaces it, and a
+/// host that owns the driver alone clears it at startup — so two of those wipe each other's
+/// displays. Two further facts about the shipped driver, measured on Windows 11 26200 by
+/// notifying lists directly over its pipe:
+///
+/// - It attaches a list only when the ids are one contiguous run starting at 0 or 1: `[0]`,
+///   `[1]`, `[1,2]`, `[0..4]` attach; `[2]`, `[4]`, `[16]`, `[0,2]`, `[0,1,3]` attach nothing, and
+///   going from `[0,1,2]` to `[0,2]` detaches *every* display while the driver's own state reads
+///   `[0,2]`. Removing from either end of a valid run leaves the rest attached untouched.
+/// - It sends no `Changed` event to the client that made a change, so the event-fed cache cannot
+///   confirm a commit; the list is read with a fresh state request instead.
+///
+/// So ids are machine-wide and dense. Every commit, under a file lock all sharing hosts take,
+/// reads the live list, puts this host's monitors in it (a new one takes a released id if there
+/// is one, else the next id that keeps the run valid), marks this host's departed monitors
+/// released in a registry beside the lock, and then removes released monitors only while the
+/// remaining run stays valid. A released monitor in the middle of the run therefore stays
+/// attached, idle, until the ones above it go; the last host out removes everything. Monitors
+/// whose owner pid has died count as released; monitors in no registry (an unisolated host's)
+/// are never touched.
+mod shared {
+    use super::{DriverClient, Monitor};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Placeholder id on a monitor that needs one allocated inside the commit.
+    pub const ALLOCATE: u32 = u32::MAX;
+
+    fn dir() -> PathBuf {
+        std::env::temp_dir().join("screenextend-shared-driver")
+    }
+
+    /// Held for a whole read-merge-notify-confirm sequence. Dropping the file releases it.
+    struct Guard(#[allow(dead_code)] std::fs::File);
+
+    fn lock() -> Guard {
+        use fs4::fs_std::FileExt;
+        let path = dir().join("commit.lock");
+        let _ = std::fs::create_dir_all(dir());
+        loop {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                Ok(file) => match FileExt::lock_exclusive(&file) {
+                    Ok(()) => return Guard(file),
+                    Err(e) => teprintln!("[virtual-display] shared lock {}: {e}", path.display()),
+                },
+                Err(e) => teprintln!("[virtual-display] shared lock {}: {e}", path.display()),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// id -> owner pid; 0 means released.
+    type Registry = BTreeMap<u32, u32>;
+
+    fn registry_path() -> PathBuf {
+        dir().join("owners.json")
+    }
+
+    fn read_registry() -> Registry {
+        std::fs::read(registry_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_registry(reg: &Registry) {
+        if let Ok(bytes) = serde_json::to_vec(reg) {
+            if let Err(e) = std::fs::write(registry_path(), bytes) {
+                teprintln!("[virtual-display] cannot write the shared registry: {e}");
+            }
+        }
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            return false;
+        };
+        let mut code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+        let _ = unsafe { CloseHandle(handle) };
+        ok && code == STILL_ACTIVE.0 as u32
+    }
+
+    /// The driver attaches a list only when its ids are one contiguous run starting at 0 or 1.
+    pub fn attachable(ids: &[u32]) -> bool {
+        if ids.is_empty() {
+            return true;
+        }
+        let mut v = ids.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v.len() == ids.len() && v[0] <= 1 && v.windows(2).all(|w| w[1] == w[0] + 1)
+    }
+
+    /// The id a new monitor takes: a released one if any (reusing an attached slot), else the
+    /// one that extends the run.
+    pub fn allocate(ids: &[u32], released: &[u32]) -> u32 {
+        if let Some(id) = released.iter().min() {
+            return *id;
+        }
+        match (ids.iter().min(), ids.iter().max()) {
+            (None, _) => 0,
+            (Some(1), _) if !ids.contains(&0) => 0,
+            (_, Some(max)) => max + 1,
+            _ => 0,
+        }
+    }
+
+    /// Remove released ids, highest first, for as long as the remaining run stays attachable.
+    pub fn compact(ids: &mut Vec<u32>, released: &mut Vec<u32>) -> Vec<u32> {
+        let mut removed = Vec::new();
+        loop {
+            let mut changed = false;
+            let mut cands = released.clone();
+            cands.sort_unstable_by(|a, b| b.cmp(a));
+            for id in cands {
+                let rest: Vec<u32> = ids.iter().copied().filter(|x| *x != id).collect();
+                if attachable(&rest) {
+                    *ids = rest;
+                    released.retain(|x| *x != id);
+                    removed.push(id);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return removed;
+            }
+        }
+    }
+
+    /// Commit `ours` (this host's whole desired list; a monitor with id [`ALLOCATE`] gets one)
+    /// into the machine-wide list. `previous` is what this host owned before. Returns `ours`
+    /// with real ids.
+    pub fn commit(
+        client: &mut DriverClient,
+        previous: &[u32],
+        mut ours: Vec<Monitor>,
+    ) -> Result<Vec<Monitor>, String> {
+        let _guard = lock();
+        let me = std::process::id();
+        let live = client
+            .request_live_state()
+            .unwrap_or_else(|_| client.refresh_state().to_vec());
+        let mut reg = read_registry();
+        reg.retain(|id, _| live.iter().any(|m| m.id == *id));
+        for pid in reg.values_mut() {
+            if *pid != 0 && *pid != me && !pid_alive(*pid) {
+                *pid = 0;
+            }
+        }
+        for id in previous {
+            if !ours.iter().any(|m| m.id == *id) {
+                reg.insert(*id, 0);
+            }
+        }
+        let mut list = live.clone();
+        let mut released: Vec<u32> = reg
+            .iter()
+            .filter(|(_, p)| **p == 0)
+            .map(|(i, _)| *i)
+            .collect();
+        for m in ours.iter_mut() {
+            if m.id == ALLOCATE {
+                let ids: Vec<u32> = list.iter().map(|m| m.id).collect();
+                m.id = allocate(&ids, &released);
+                released.retain(|x| *x != m.id);
+            }
+            reg.insert(m.id, me);
+            match list.iter_mut().find(|x| x.id == m.id) {
+                Some(slot) => *slot = m.clone(),
+                None => list.push(m.clone()),
+            }
+        }
+        let mut ids: Vec<u32> = list.iter().map(|m| m.id).collect();
+        let removed = compact(&mut ids, &mut released);
+        list.retain(|m| ids.contains(&m.id));
+        for id in &removed {
+            reg.remove(id);
+        }
+        if !attachable(&ids) {
+            teprintln!(
+                "[virtual-display] shared driver: the list {ids:?} is not one run from 0 or 1; \
+                 the driver will attach none of it"
+            );
+        }
+        let changed = list != live;
+        if changed {
+            client
+                .set_monitors(&list)
+                .map_err(|e| format!("set monitors: {e}"))?;
+            client.notify().map_err(|e| format!("notify driver: {e}"))?;
+            // Hold the lock until the driver reports the list, so the next host reads it.
+            let want: Vec<u32> = {
+                let mut v = ids.clone();
+                v.sort_unstable();
+                v
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(state) = client.request_live_state() {
+                    let mut have: Vec<u32> = state.iter().map(|m| m.id).collect();
+                    have.sort_unstable();
+                    if have == want {
+                        break;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    teprintln!(
+                        "[virtual-display] shared driver: the driver never reported {want:?}"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        write_registry(&reg);
+        tprintln!(
+            "[virtual-display] shared driver: ours {:?}, machine {:?}, released {:?}, removed {:?}",
+            ours.iter().map(|m| m.id).collect::<Vec<_>>(),
+            ids,
+            released,
+            removed
+        );
+        Ok(ours)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_one_run_from_zero_or_one_attaches() {
+            for ok in [&[][..], &[0], &[1], &[1, 2], &[0, 1, 2, 3, 4], &[2, 1, 0]] {
+                assert!(attachable(ok), "{ok:?}");
+            }
+            for bad in [&[2][..], &[4], &[16], &[0, 2], &[0, 1, 3], &[0, 0]] {
+                assert!(!attachable(bad), "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn allocation_reuses_released_then_extends_the_run() {
+            assert_eq!(allocate(&[], &[]), 0);
+            assert_eq!(allocate(&[0, 1], &[]), 2);
+            assert_eq!(allocate(&[1, 2], &[]), 0);
+            assert_eq!(allocate(&[0, 1, 2], &[1]), 1);
+        }
+
+        #[test]
+        fn a_released_middle_id_stays_until_the_top_goes() {
+            let (mut ids, mut rel) = (vec![0, 1, 2], vec![1]);
+            assert!(compact(&mut ids, &mut rel).is_empty());
+            assert_eq!(ids, vec![0, 1, 2]);
+            let (mut ids, mut rel) = (vec![0, 1, 2], vec![1, 2]);
+            compact(&mut ids, &mut rel);
+            assert_eq!(ids, vec![0]);
+            let (mut ids, mut rel) = (vec![0, 1, 2], vec![0]);
+            compact(&mut ids, &mut rel);
+            assert_eq!(
+                ids,
+                vec![1, 2],
+                "removing 0 leaves a run from 1, which attaches"
+            );
+            let (mut ids, mut rel) = (vec![0, 1, 2], vec![0, 1, 2]);
+            compact(&mut ids, &mut rel);
+            assert!(ids.is_empty());
         }
     }
 }
