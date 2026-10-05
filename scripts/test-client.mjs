@@ -24,6 +24,7 @@ const HARNESSES = [
   ['index.html ICE gathering', 'test-client-ice.mjs'],
   ['index.html encoded transform installed before Chrome short-circuits it', 'test-client-transform-start.mjs'],
   ['index.html /reconfig epochs and kick', 'test-client-reconfig.mjs'],
+  ['index.html join path: the load-time warm-up', 'test-client-join.mjs'],
 ];
 
 let failed = 0;

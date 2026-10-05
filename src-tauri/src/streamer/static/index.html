@@ -1411,6 +1411,28 @@
             // fast path on this page anyway, but a throw here would take the join form with it.
             if (typeof fetch === 'function') { try { getNetConfig(); } catch (_) { noteSuppressed(); } }
 
+            // Two first-use costs sat between Connect and the offer on a browser's first join:
+            // the first `enumerateDevices()` (1.3-2.4 s headless, measured; the join awaits the
+            // output enumeration because the microphone card may have to come first) and the
+            // first `new RTCPeerConnection()` (a 350-700 ms main-thread task while the WebRTC
+            // stack starts). Both are paid here, while the user is still reading the form, so
+            // the join finds them warm. Neither prompts: an enumeration without a grant only
+            // returns unlabelled devices, and a peer connection with no tracks and no offer
+            // gathers nothing.
+            function warmJoinPath() {
+                try {
+                    const md = navigator.mediaDevices;
+                    if (md && typeof md.enumerateDevices === 'function') {
+                        const p = md.enumerateDevices();
+                        if (p && p.catch) p.catch(noteSuppressed);
+                    }
+                } catch (_) { noteSuppressed(); }
+                try {
+                    if (typeof RTCPeerConnection === 'function') new RTCPeerConnection().close();
+                } catch (_) { noteSuppressed(); }
+            }
+            setTimeout(warmJoinPath, 0);
+
             // A relay candidate is a full TURN ALLOCATE round trip behind the host candidates, so
             // waiting for one is only right when nothing else can carry the session. The host
             // serves TURN to same-subnet clients on purpose, as a backup — so "a TURN entry is in
