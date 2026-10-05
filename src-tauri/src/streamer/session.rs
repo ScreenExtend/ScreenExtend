@@ -532,6 +532,11 @@ pub struct DeviceSessionState {
     pub audio_outputs_supported: bool,
     pub current_audio_output: Option<String>,
     pub audio_outputs_labelled: Option<bool>,
+    /// The page load this join came from (the client's `attemptId`), when it sent one.
+    pub attempt_id: String,
+    /// Whether any picture has ever reached this join's client. A join that never connected
+    /// is the one a lost answer leaves behind, and the only kind an `attemptId` may take over.
+    pub ever_connected: bool,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -614,6 +619,52 @@ pub fn live_join_for_relay_client(sessions: &SharedSessions, client_id: &str) ->
         .or_else(|| mine().find(|(_, s)| s.live_display.is_some()))
         .or_else(|| mine().next())
         .map(|(join, _)| join.clone())
+}
+
+/// Record the page load (`attemptId`) a join was opened from.
+pub fn set_session_attempt(sessions: &SharedSessions, join: &str, attempt: &str) {
+    if attempt.is_empty() {
+        return;
+    }
+    if let Some(state) = sessions.lock_recover().get_mut(join) {
+        state.attempt_id = attempt.to_string();
+    }
+}
+
+/// A picture reached this join's client; from now on no `attemptId` may take it over.
+pub fn mark_session_connected(sessions: &SharedSessions, join: &str) {
+    if let Some(state) = sessions.lock_recover().get_mut(join) {
+        state.ever_connected = true;
+    }
+}
+
+/// The join a page load opened and never received, as `(join, device_token)`.
+///
+/// The lost-answer case: the host answered, the page never saw the answer, gave up after its
+/// timeout and offered again from the same page load with no join id and (on a first join) no
+/// device token. Without this the retry was a second session and a second display beside the
+/// first. Only a join that **never connected** and already has its display qualifies, and only
+/// for the same device when the retry presents a token at all: an attempt id can never reach a
+/// session somebody is watching, or another device's.
+pub fn pending_join_for_attempt(
+    sessions: &SharedSessions,
+    attempt: &str,
+    presented_token: &str,
+) -> Option<(String, String)> {
+    if !is_device_token(attempt) {
+        return None;
+    }
+    sessions
+        .lock_recover()
+        .iter()
+        .find(|(_, s)| {
+            s.attempt_id == attempt
+                && !s.ever_connected
+                && s.live_display.is_some()
+                && !s.device_token.is_empty()
+                && (presented_token.is_empty() || presented_token == s.device_token)
+        })
+        .map(|(join, s)| (join.clone(), s.device_token.clone()))
 }
 
 /// Record what the UI shows beside a join: the name the client chose and the size it asked for.
