@@ -4256,7 +4256,7 @@ sizes; the `dc_drops` A/B was not run. Cost if wrong: up to ~260 ms of audio may
 genuinely congested link before drops start. Detail: `docs/overhaul-new/G03.md` §1
 (cross-findings), §7.
 
-## G03-SUPERSEDED — a renegotiated join's previous transport stayed alive until ICE failed (D-05) — `UNVERIFIED` (end to end; unit test)
+## G03-SUPERSEDED — a renegotiated join's previous transport stayed alive until ICE failed (D-05) — `VERIFIED` (one run on the consolidation build, docs/overhaul-new/CONSOLIDATION.md §D; unit test)
 
 After every in-place renegotiation the old peer connection (ICE agent, RTP writer, RTCP reader,
 8 Hz stats poll) ran on beside the live one: on the pre-fix build an encoder-only edit left the
@@ -4552,7 +4552,7 @@ removal. `52c3eb3` starts it right after the credentials are set and before
 at once and `stop` worked. Not a latency change (startup head vs old, E5, inconclusive). Detail:
 `docs/overhaul-new/G09.md` route table, E8.
 
-## CONSOL-TELEMETRY-OWNER — a superseded session's teardown unregistered its successor's telemetry — `COMPILE-CHECKED` (unit test)
+## CONSOL-TELEMETRY-OWNER — a superseded session's teardown unregistered its successor's telemetry — `VERIFIED` (one run, docs/overhaul-new/CONSOLIDATION.md §D; unit test)
 
 Both transports of a renegotiated join register their telemetry under one join id, and the
 superseded session's teardown called `telemetry::unregister(&join)`, which removed whatever was
