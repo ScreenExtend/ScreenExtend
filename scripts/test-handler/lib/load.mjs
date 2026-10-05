@@ -35,6 +35,23 @@ export async function snapshot() {
   return { cpuPct: +(100 * (1 - (b.idle - a.idle) / (b.total - a.total))).toFixed(1), ...(await nvidiaSmi()) };
 }
 
+/**
+ * The pre-window load gate. Runs at 85-100 % CPU came out 10-25 ms slower than quiet ones, so a
+ * timed window waits (bounded) for the whole-machine CPU, averaged over `sampleMs`, to fall
+ * below `maxCpu`. Returns what it saw; `loaded: true` means the bound ran out and the window
+ * opened anyway, so the caller can discard it.
+ */
+export async function waitForQuiet({ maxCpu = 75, maxWaitMs = 180000, sampleMs = 2000 } = {}) {
+  const t0 = Date.now(); const seen = [];
+  for (;;) {
+    const a = cpuTotals(); await new Promise((r) => setTimeout(r, sampleMs)); const b = cpuTotals();
+    const cpu = +(100 * (1 - (b.idle - a.idle) / Math.max(1, b.total - a.total))).toFixed(1);
+    seen.push(cpu);
+    if (cpu < maxCpu) return { maxCpu, waitedMs: Date.now() - t0, cpuAtOpen: cpu, loaded: false, samples: seen.length };
+    if (Date.now() - t0 >= maxWaitMs) return { maxCpu, waitedMs: Date.now() - t0, cpuAtOpen: cpu, loaded: true, samples: seen.length, minSeen: Math.min(...seen) };
+  }
+}
+
 function summarize(s) {
   const pick = (k) => s.map((x) => x[k]).filter((v) => typeof v === 'number' && !Number.isNaN(v));
   const st = (k) => { const v = pick(k); if (!v.length) return null; return { mean: +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1), max: Math.max(...v) }; };
