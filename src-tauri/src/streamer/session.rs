@@ -124,7 +124,13 @@ impl DeviceOverride {
     /// `DeviceOverride` without adding it to this match means "changing it does nothing to the
     /// stream", which is the safe default and the one the caller can see.
     pub fn reconfig_action(old: &Self, new: &Self) -> ReconfigAction {
-        let rebuild = old.orientation_portrait != new.orientation_portrait
+        // With `auto_orientation` on the join path believes the device and ignores the saved
+        // orientation, so moving it rebuilt the stream for nothing (a ~0.4 s gap), and only in
+        // one direction: the join wrote the device's own orientation back, so the edit that put
+        // it back compared equal.
+        let orientation_moved =
+            old.orientation_portrait != new.orientation_portrait && !new.auto_orientation;
+        let rebuild = orientation_moved
             || old.refresh_rate != new.refresh_rate
             || old.video_scale != new.video_scale
             || old.video_quality != new.video_quality
@@ -1935,13 +1941,14 @@ mod tests {
                 ReconfigAction::ScaleLive,
             ),
             // (d) stream parameters and the rest of (e): an encoder session is built from these.
+            // Orientation is a stream parameter only while the device is not followed.
             (
-                "orientation",
+                "orientation (auto-orientation on)",
                 DeviceOverride {
                     orientation_portrait: !base.orientation_portrait,
                     ..base
                 },
-                ReconfigAction::Rebuild,
+                ReconfigAction::Nothing,
             ),
             (
                 "refresh rate",
@@ -2013,6 +2020,26 @@ mod tests {
                 DeviceOverride::reconfig_action(&base, next),
                 *want,
                 "moving {what} should cost the stream {want:?}"
+            );
+        }
+        // With the device not followed, the saved orientation is what the display is built at.
+        let fixed = DeviceOverride {
+            auto_orientation: false,
+            ..base
+        };
+        for portrait in [true, false] {
+            let next = DeviceOverride {
+                orientation_portrait: portrait,
+                ..fixed
+            };
+            let old = DeviceOverride {
+                orientation_portrait: !portrait,
+                ..fixed
+            };
+            assert_eq!(
+                DeviceOverride::reconfig_action(&old, &next),
+                ReconfigAction::Rebuild,
+                "a fixed orientation moved to portrait={portrait}"
             );
         }
     }
