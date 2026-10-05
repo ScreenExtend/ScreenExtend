@@ -505,27 +505,33 @@ unsafe fn drain(
     }
 }
 
-/// Acquire a capture session, newest workable tier first.
+/// Acquire a capture session, fastest workable tier first.
 ///
-/// Endpoint loopback is tried first because it is what every supported Windows has and what
-/// this code has always used. Process loopback is the fallback rather than the default because
-/// it is *not* measurably faster — both ride the same shared engine — and the invariant here is
-/// that the working path is never replaced by an unmeasured one. It takes over exactly when the
-/// endpoint tier cannot work at all: the endpoint held in exclusive mode by another app (where
-/// loopback is impossible by documentation), or an endpoint that will not activate.
+/// Process loopback is tried first. It used to be the fallback on the strength of "both ride the
+/// same shared engine", which compared capture → packet inside the host and not when a sound
+/// reaches the capture at all. Measured end to end against a click whose play position the
+/// engine reports (`probe --audio` with onset logging, five interleaved runs each, 7 clicks a
+/// run): click → encoded packet, endpoint loopback 80.5 / 93.7 / 80.5 / 80.8 / 80.6 ms (median
+/// 80.6), process loopback 68.8 / 79.6 / 59.2 / 59.4 / 59.2 ms (median 59.4). The endpoint tier
+/// taps the mix after the endpoint's own buffering; the process tier taps it before. The
+/// endpoint tier still takes over whenever process loopback cannot be activated (Windows before
+/// 10 2004, a refused activation), and `SE_ENDPOINT_LOOPBACK=1` forces it for a measurement.
 unsafe fn acquire(enumerator: &IMMDeviceEnumerator) -> Result<Session> {
-    if PREFER_PROCESS_LOOPBACK.load(Ordering::Relaxed) {
+    let endpoint_forced = std::env::var("SE_ENDPOINT_LOOPBACK").as_deref() == Ok("1");
+    let try_process = PREFER_PROCESS_LOOPBACK.load(Ordering::Relaxed)
+        || (!endpoint_forced && process_loopback::available());
+    if try_process {
         match acquire_process_loopback() {
             Ok(s) => return Ok(s),
-            Err(e) => crate::teprintln!(
-                "audio: process loopback was requested but failed ({e:#}); using the endpoint"
-            ),
+            Err(e) => {
+                crate::teprintln!("audio: process loopback failed ({e:#}); using endpoint loopback")
+            }
         }
     }
     match acquire_endpoint(enumerator) {
         Ok(s) => Ok(s),
         Err(endpoint_err) => {
-            if !process_loopback::available() {
+            if try_process || !process_loopback::available() {
                 return Err(endpoint_err);
             }
             crate::teprintln!(
