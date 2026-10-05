@@ -41,8 +41,11 @@ export async function launchChrome({ port, profile, flags = [], headed = false }
     '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required',
     '--use-fake-device-for-media-stream', '--mute-audio', '--no-first-run', '--no-default-browser-check',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
-    ...flags, 'about:blank',
-  ];
+    ...flags.filter((f) => f !== '--se-unmute-audio'), 'about:blank',
+  // `--se-unmute-audio` (a handler pseudo-flag, never passed to Chrome) drops `--mute-audio`, so
+  // the client's playback reaches the machine's speakers — and therefore the host's loopback
+  // capture. Only for measuring that path (the same-machine echo); it is audible.
+  ].filter((f) => !(f === '--mute-audio' && flags.includes('--se-unmute-audio')));
   const proc = spawn(CHROME, args, { stdio: 'ignore' });
   let exited = false; proc.on('exit', () => { exited = true; });
   let ver = null;
