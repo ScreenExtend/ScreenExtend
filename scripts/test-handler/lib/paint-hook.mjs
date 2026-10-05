@@ -70,7 +70,8 @@ export const HOOK_SOURCE = `(() => {
         band.drawImage(bm, 0, 0); const d = band.getImageData(0, 0, 960, 1).data;
         let first = -1, last = -1;
         for (let i = 0; i < 960; i++) { const o = i * 4; if (d[o] > 170 && d[o + 1] < 140 && d[o + 2] < 110 && d[o] - d[o + 2] > 100) { if (first < 0) first = i; last = i; } }
-        S.out.push({ t, mx: first < 0 ? null : (first / 960) * cfg.width, mx2: last < 0 ? null : ((last + 1) / 960) * cfg.width });
+        const smp = first < 0 && S.diag++ < 5 ? [0, 240, 480, 720, 959].map((i) => [d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]) : undefined;
+        S.out.push({ t, mx: first < 0 ? null : (first / 960) * cfg.width, mx2: last < 0 ? null : ((last + 1) / 960) * cfg.width, smp });
       } else {
         if (!strip) strip = new OffscreenCanvas(W, 1).getContext('2d', { willReadFrequently: true });
         strip.drawImage(bm, 0, 0); const r = decode(strip.getImageData(0, 0, W, 1).data);
