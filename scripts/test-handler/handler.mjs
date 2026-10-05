@@ -547,7 +547,7 @@ async function logsTest() {
 async function customHook(cl) {
   const c = REQ.custom; const out = {};
   if (c.js) { try { out.js = await cl.page.ev(c.js, { timeout: (c.timeout || 20) * 1000 }); } catch (e) { out.jsError = e.message; } }
-  if (c.host_commands) { out.host = []; for (const cmd of c.host_commands) { const r = await cli([].concat(cmd)); out.host.push({ args: r.args, code: r.code, stdout: r.stdout.slice(0, 4000), stderr: r.stderr.slice(0, 1000) }); } }
+  if (c.host_commands) { out.host = []; for (const cmd of c.host_commands) { const r = await cli([].concat(cmd)); out.host.push({ args: r.args, code: r.code, stdout: r.stdout.slice(0, 200000), stderr: r.stderr.slice(0, 1000) }); } }
   return out;
 }
 
