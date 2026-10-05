@@ -34,7 +34,10 @@ fn constant_qp_is_admitted_by_any_rate_control_mask() {
     use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_PARAMS_RC_MODE::*;
     // 0x3f is what an RTX 3080 Ti Laptop reports.
     for mask in [0u32, 0x3f, 0x2] {
-        assert!(rc_mode_supported(mask, NV_ENC_PARAMS_RC_CONSTQP), "mask {mask:#x}");
+        assert!(
+            rc_mode_supported(mask, NV_ENC_PARAMS_RC_CONSTQP),
+            "mask {mask:#x}"
+        );
     }
     assert!(rc_mode_supported(0x3f, NV_ENC_PARAMS_RC_CBR));
     assert!(rc_mode_supported(0, NV_ENC_PARAMS_RC_CBR));
@@ -59,12 +62,19 @@ fn nvenc_constant_qp_request_is_applied() {
         }
     };
     assert_eq!(fine.constant_qp(), Some(18), "constant QP fell back to CBR");
-    assert_eq!(coarse.constant_qp(), Some(42), "constant QP fell back to CBR");
+    assert_eq!(
+        coarse.constant_qp(),
+        Some(42),
+        "constant QP fell back to CBR"
+    );
     let mut frame = vec![0u8; 1280 * 720 * 4];
     fill_synthetic_bgra(&mut frame, 1280, 720, 7);
     let a = fine.encode_bgra(&frame, true).expect("encode qp18").len();
     let b = coarse.encode_bgra(&frame, true).expect("encode qp42").len();
-    assert!(a > b * 2, "QP 18 IDR {a} B is not clearly larger than QP 42 IDR {b} B");
+    assert!(
+        a > b * 2,
+        "QP 18 IDR {a} B is not clearly larger than QP 42 IDR {b} B"
+    );
 }
 
 fn percentile(sorted: &[u128], pct: usize) -> u128 {
