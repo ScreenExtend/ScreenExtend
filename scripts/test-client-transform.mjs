@@ -404,6 +404,23 @@ const lastOf = (posted, type) => { for (let i = posted.length - 1; i >= 0; i--) 
   eq('and claims no render tier', lastOf(w.posted, 'videostats').stats.renderTier, 0);
 }
 
+// ── 11. the stage percentiles sort numerically ───────────────────────────────────────────
+// The windows are sorted once a second on the thread that paints. A sort that compared them as
+// strings would put 100 before 9 and report a p99 below the p50, and nothing else would notice.
+{
+  const w = makeWorker();
+  const sw = new w.ctx.StatWindow();
+  for (const v of [9, 100, 2.5, 10, 0, 33.25, 1000, 7]) sw.push(v);
+  sw.push(-1);
+  sw.push(NaN);
+  const p = sw.pct();
+  eq('a stage window keeps only finite non-negative samples', p.n, 8);
+  eq('its max is the largest sample', p.max, 1000);
+  eq('its p50 is the fifth smallest of eight', p.p50, 10);
+  eq('its p90 is the eighth', p.p90, 1000);
+  eq('an empty window reports nothing rather than zero', new w.ctx.StatWindow().pct(), null);
+}
+
 if (failures) {
   console.log('\n' + failures + ' transform-worker assertion(s) failed');
   process.exitCode = 1;
