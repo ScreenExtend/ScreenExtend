@@ -124,7 +124,13 @@ impl DeviceOverride {
     /// `DeviceOverride` without adding it to this match means "changing it does nothing to the
     /// stream", which is the safe default and the one the caller can see.
     pub fn reconfig_action(old: &Self, new: &Self) -> ReconfigAction {
-        let rebuild = old.orientation_portrait != new.orientation_portrait
+        // With `auto_orientation` on the join path believes the device and ignores the saved
+        // orientation, so moving it rebuilt the stream for nothing (a ~0.4 s gap), and only in
+        // one direction: the join wrote the device's own orientation back, so the edit that put
+        // it back compared equal.
+        let orientation_moved =
+            old.orientation_portrait != new.orientation_portrait && !new.auto_orientation;
+        let rebuild = orientation_moved
             || old.refresh_rate != new.refresh_rate
             || old.video_scale != new.video_scale
             || old.video_quality != new.video_quality
@@ -532,6 +538,11 @@ pub struct DeviceSessionState {
     pub audio_outputs_supported: bool,
     pub current_audio_output: Option<String>,
     pub audio_outputs_labelled: Option<bool>,
+    /// The page load this join came from (the client's `attemptId`), when it sent one.
+    pub attempt_id: String,
+    /// Whether any picture has ever reached this join's client. A join that never connected
+    /// is the one a lost answer leaves behind, and the only kind an `attemptId` may take over.
+    pub ever_connected: bool,
 }
 
 impl std::fmt::Debug for DeviceSessionState {
@@ -614,6 +625,52 @@ pub fn live_join_for_relay_client(sessions: &SharedSessions, client_id: &str) ->
         .or_else(|| mine().find(|(_, s)| s.live_display.is_some()))
         .or_else(|| mine().next())
         .map(|(join, _)| join.clone())
+}
+
+/// Record the page load (`attemptId`) a join was opened from.
+pub fn set_session_attempt(sessions: &SharedSessions, join: &str, attempt: &str) {
+    if attempt.is_empty() {
+        return;
+    }
+    if let Some(state) = sessions.lock_recover().get_mut(join) {
+        state.attempt_id = attempt.to_string();
+    }
+}
+
+/// A picture reached this join's client; from now on no `attemptId` may take it over.
+pub fn mark_session_connected(sessions: &SharedSessions, join: &str) {
+    if let Some(state) = sessions.lock_recover().get_mut(join) {
+        state.ever_connected = true;
+    }
+}
+
+/// The join a page load opened and never received, as `(join, device_token)`.
+///
+/// The lost-answer case: the host answered, the page never saw the answer, gave up after its
+/// timeout and offered again from the same page load with no join id and (on a first join) no
+/// device token. Without this the retry was a second session and a second display beside the
+/// first. Only a join that **never connected** and already has its display qualifies, and only
+/// for the same device when the retry presents a token at all: an attempt id can never reach a
+/// session somebody is watching, or another device's.
+pub fn pending_join_for_attempt(
+    sessions: &SharedSessions,
+    attempt: &str,
+    presented_token: &str,
+) -> Option<(String, String)> {
+    if !is_device_token(attempt) {
+        return None;
+    }
+    sessions
+        .lock_recover()
+        .iter()
+        .find(|(_, s)| {
+            s.attempt_id == attempt
+                && !s.ever_connected
+                && s.live_display.is_some()
+                && !s.device_token.is_empty()
+                && (presented_token.is_empty() || presented_token == s.device_token)
+        })
+        .map(|(join, s)| (join.clone(), s.device_token.clone()))
 }
 
 /// Record what the UI shows beside a join: the name the client chose and the size it asked for.
@@ -1884,13 +1941,14 @@ mod tests {
                 ReconfigAction::ScaleLive,
             ),
             // (d) stream parameters and the rest of (e): an encoder session is built from these.
+            // Orientation is a stream parameter only while the device is not followed.
             (
-                "orientation",
+                "orientation (auto-orientation on)",
                 DeviceOverride {
                     orientation_portrait: !base.orientation_portrait,
                     ..base
                 },
-                ReconfigAction::Rebuild,
+                ReconfigAction::Nothing,
             ),
             (
                 "refresh rate",
@@ -1962,6 +2020,26 @@ mod tests {
                 DeviceOverride::reconfig_action(&base, next),
                 *want,
                 "moving {what} should cost the stream {want:?}"
+            );
+        }
+        // With the device not followed, the saved orientation is what the display is built at.
+        let fixed = DeviceOverride {
+            auto_orientation: false,
+            ..base
+        };
+        for portrait in [true, false] {
+            let next = DeviceOverride {
+                orientation_portrait: portrait,
+                ..fixed
+            };
+            let old = DeviceOverride {
+                orientation_portrait: !portrait,
+                ..fixed
+            };
+            assert_eq!(
+                DeviceOverride::reconfig_action(&old, &next),
+                ReconfigAction::Rebuild,
+                "a fixed orientation moved to portrait={portrait}"
             );
         }
     }
