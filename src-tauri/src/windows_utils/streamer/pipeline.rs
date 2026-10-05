@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use crate::windows_capture::capture::{
+    CaptureControl, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+};
 use crate::windows_capture::d3d11::StagingTexture;
 use crate::windows_capture::frame::Frame;
 use crate::windows_capture::graphics_capture_api::{wgc_features, InternalCaptureControl};
@@ -146,14 +148,24 @@ fn restore_pending_bitrate(target_bitrate: &AtomicU32, pending: u32) {
 
 const MAX_TRANSIENT_ENCODE_DROPS: u32 = 60;
 
-/// `MinUpdateInterval` is a floor on the gap between delivered frames, not a throttle to a rate:
-/// WGC's default delivery is capped near 60 Hz whatever the panel does, and this property is what
-/// raises that ceiling. The old `frame_duration * 2/3` scaled the floor with the target rate,
-/// which is backwards — a floor near the target period caps delivery *below* it.
-/// `windows-capture` issue #190 measured a 120 Hz panel with the floor at 1/60 delivering ~52 fps,
-/// at 1/90 ~58 fps and at 1/120 ~59 fps. Sunshine sets a flat 4 ms (250 Hz); so do we, and let
-/// the pipeline's own pacing decide what to keep.
+/// The lowest `MinUpdateInterval` WGC is ever given (250 Hz, Sunshine's flat value).
 const WGC_MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(4);
+
+/// `MinUpdateInterval` for a stream at `frame_period`: two thirds of a period, never under 4 ms.
+///
+/// This is the pre-overhaul value, restored. The flat 4 ms that replaced it assumed the display
+/// composes at its nominal rate, so a floor that low only *permits* a rate. On this machine that
+/// holds with one virtual display attached (≈ 64 deliveries a second at 60 Hz either way) and
+/// fails with two or more: the internal panel then runs at 360 Hz and DWM composes every 60 Hz
+/// virtual display about three times too often. At 4 ms WGC delivered ~190 frames a second to a
+/// 60 fps session — each a full-surface copy into the frame pool and a callback, two thirds of
+/// them then thrown away by the cadence gate. At two thirds of a period it delivered ~70, with the
+/// same latency (`docs/overhaul-new/G01.md`, E5). Delivery stays above the stream's own rate
+/// (1.5× it), which is the margin `windows-capture` issue #190 says a floor needs, and the floor
+/// scales with the rate so a 120 Hz session is not capped near 60.
+pub(crate) fn wgc_min_update_interval(frame_period: Duration) -> Duration {
+    (frame_period * 2 / 3).max(WGC_MIN_UPDATE_INTERVAL)
+}
 
 /// Whether the host draws the pointer itself instead of letting WGC composite it.
 ///
@@ -262,7 +274,12 @@ impl CursorProbe {
             self.broken = true;
             return false;
         }
-        let showing = info.flags == CURSOR_SHOWING;
+        // `flags` is a bitfield: CURSOR_SHOWING (0x1) and, from Windows 8, CURSOR_SUPPRESSED
+        // (0x2: touch or pen input, the system is not drawing the pointer). Drawn means the first
+        // bit without the second. For every documented value this is what `== SHOWING` computed;
+        // the bit form does not depend on no further bit ever being defined.
+        const CURSOR_SUPPRESSED: u32 = 0x2;
+        let showing = info.flags.0 & CURSOR_SHOWING.0 != 0 && info.flags.0 & CURSOR_SUPPRESSED == 0;
         let pt = POINT {
             x: info.ptScreenPos.x,
             y: info.ptScreenPos.y,
@@ -522,7 +539,7 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
 
     super::capture::check_dwm_composition()?;
 
-    let (monitor, info) = select_monitor_by_device_name(device_name)?;
+    let (mut monitor, mut info) = select_monitor_by_device_name(device_name)?;
 
     if cfg.force_dxgi {
         let (pipeline, control) = start_dxgi_capture(
@@ -541,16 +558,42 @@ pub fn start_on_monitor(cfg: &Config, device_name: &str) -> Result<SessionCaptur
         });
     }
 
-    match start_live_capture(
-        cfg,
-        monitor,
-        &info,
-        tx.clone(),
-        Arc::clone(&idr_request),
-        Arc::clone(&repair),
-        Arc::clone(&target_bitrate),
-        Arc::clone(&telemetry),
-    ) {
+    let mut stale_retries = 0u32;
+    let started = loop {
+        let attempt = start_live_capture(
+            cfg,
+            monitor,
+            &info,
+            tx.clone(),
+            Arc::clone(&idr_request),
+            Arc::clone(&repair),
+            Arc::clone(&target_bitrate),
+            Arc::clone(&telemetry),
+        );
+        match attempt {
+            Err(e)
+                if e.downcast_ref::<StaleMonitor>().is_some()
+                    && stale_retries < WGC_STALE_MONITOR_RETRIES =>
+            {
+                stale_retries += 1;
+                teprintln!(
+                    "WGC could not open {device_name} ({e:#}); re-resolving the display \
+                     (retry {stale_retries}/{WGC_STALE_MONITOR_RETRIES})"
+                );
+                std::thread::sleep(WGC_STALE_MONITOR_BACKOFF);
+                match select_monitor_by_device_name(device_name) {
+                    Ok((m, i)) => {
+                        monitor = m;
+                        info = i;
+                    }
+                    Err(e) => teprintln!("re-resolving {device_name} failed: {e:#}"),
+                }
+            }
+            other => break other,
+        }
+    };
+
+    match started {
         Ok((pipeline, control)) => Ok(SessionCapture {
             pipeline,
             control: Some(SessionControl::Wgc(control)),
@@ -626,7 +669,7 @@ fn start_live_capture(
         CursorCaptureSettings::WithCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(WGC_MIN_UPDATE_INTERVAL),
+        MinimumUpdateIntervalSettings::Custom(wgc_min_update_interval(frame_duration)),
         DirtyRegionSettings::ReportOnly,
         ColorFormat::Bgra8,
         CaptureFlags {
@@ -670,11 +713,45 @@ fn start_live_capture(
         },
     );
 
-    let control = LiveCapture::start_free_threaded(settings)
-        .map_err(|e| anyhow!("starting WGC capture: {e}"))?;
+    let control = LiveCapture::start_free_threaded(settings).map_err(wgc_start_error)?;
 
     Ok((pipeline, control))
 }
+
+/// A WGC start failure as an `anyhow` error, tagged [`StaleMonitor`] when the capture item could
+/// not be created from the monitor handle — the one failure worth retrying before DXGI.
+pub(crate) fn wgc_start_error(e: GraphicsCaptureApiError<anyhow::Error>) -> anyhow::Error {
+    let stale = matches!(e, GraphicsCaptureApiError::ItemConvertFailed);
+    let err = anyhow!("starting WGC capture: {e}");
+    if stale {
+        err.context(StaleMonitor)
+    } else {
+        err
+    }
+}
+
+/// `CreateForMonitor` refused the `HMONITOR` this session resolved a moment earlier.
+///
+/// A join sets the virtual display's mode just before capture starts, and the handle resolved
+/// before that can be dead by the time WGC converts it. Falling straight to DXGI on that is the
+/// worst answer available: on a hybrid laptop, duplicating an indirect display returns
+/// `ACCESS_LOST` on every acquire until the re-establish cap stops it, so the client gets no
+/// picture until its offer times out and it retries (measured: first picture 12.9 s after the
+/// submit, two offers). The display is still there under a fresh handle.
+#[derive(Debug)]
+pub(crate) struct StaleMonitor;
+
+impl std::fmt::Display for StaleMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the monitor handle went stale before WGC could open it")
+    }
+}
+
+/// Retries of a WGC start that failed on a stale monitor handle before DXGI is tried. Each one
+/// costs the backoff plus a rebuilt encoder; five cover the second or so a mode change takes to
+/// settle on a loaded machine.
+const WGC_STALE_MONITOR_RETRIES: u32 = 5;
+const WGC_STALE_MONITOR_BACKOFF: Duration = Duration::from_millis(200);
 
 #[allow(clippy::too_many_arguments)]
 fn start_dxgi_capture(
@@ -3425,11 +3502,12 @@ impl GraphicsCaptureApiHandler for LiveCapture {
         // not coalesce, it drops every frame that arrives a jitter early, and both bounded variants
         // land *below* the baseline they were meant to restore.
         //
-        // The ceiling that remains is `DISPLAY_COMPOSE_HZ`: WGC cannot deliver frames the display
-        // did not compose, and `WGC_MIN_UPDATE_INTERVAL`'s 4 ms only permits a rate, it does not
-        // produce one. If a cap on how much a client is asked to decode is ever wanted, that is
-        // where it belongs — in what the display is driven at, not in a gate that by then cannot
-        // tell a moving cursor from a moving window.
+        // The ceiling that remains is WGC's own: `wgc_min_update_interval` (two thirds of a
+        // period) bounds delivery, cursor frames included, at 1.5× the stream's rate — 90 fps for a
+        // 60 Hz client, the same bound the pre-overhaul host had when it measured 85 fps for a
+        // pointer sweep. The 113 above was measured with a 4 ms floor and is no longer reachable;
+        // the bound is applied where it throttles production rather than here, where it would
+        // discard.
         if let Some(last) = self.last_delivered {
             if !cursor_moved
                 && capture.duration_since(last) < self.frame_period * CADENCE_NUM / CADENCE_DEN
