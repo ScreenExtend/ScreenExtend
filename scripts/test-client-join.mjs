@@ -152,5 +152,21 @@ function runLeave({ live, reconfiguring, joinId }) {
   eq('pagehide with no join id sends nothing', none.beacons.length, 0);
 }
 
+// ---- attemptId: one per page load, on every offer
+{
+  const m = /var attemptId = (\(function \(\) \{[\s\S]*?\}\)\(\));/.exec(page);
+  if (!m) fail('attemptId not found');
+  else {
+    const withCrypto = vm.runInContext(m[1], vm.createContext({ Uint8Array, Math, window: { crypto: { getRandomValues: (b) => { for (let i = 0; i < b.length; i++) b[i] = i * 17; return b; } } } }));
+    eq('attemptId from crypto', withCrypto, '00112233445566778899aabbccddeeff');
+    const without = vm.runInContext(m[1], vm.createContext({ Uint8Array, Math, window: {} }));
+    if (/^[0-9a-f]{32}$/.test(without)) ok('attemptId without crypto is still 32 hex digits');
+    else fail('attemptId without crypto = ' + without);
+  }
+  const body = takeFunction('start');
+  if (/attemptId: attemptId,/.test(body) && /joinId: currentJoinId,/.test(body)) ok('every offer carries the attempt id beside the join id');
+  else fail('the WHEP body does not carry attemptId');
+}
+
 if (failures) { console.log(failures + ' failure(s)'); process.exit(1); }
 console.log('all client join assertions passed');
