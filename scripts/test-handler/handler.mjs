@@ -45,6 +45,10 @@ const DEFAULTS = {
   // After every join has left: close the host's stdout/stderr pipes (as a parent that stops
   // reading does), make it log, and report whether its control server still answers.
   pipe_close: false,
+  // Extra query parameters appended to every join URL (e.g. a page's own debug switches), and
+  // an expression evaluated in the page after every join whose JSON result lands in that join's
+  // record as `probe` (e.g. a timeline the page keeps). Both are inert for a page that ignores them.
+  url_params: '', join_probe: null,
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
   // below max_cpu. A window that opened loaded, or whose own mean CPU ended above max_cpu, is
   // marked `loaded: true` and should be discarded and repeated. `load_gate: false` turns it off.
@@ -56,9 +60,9 @@ const KNOWN = new Set([...Object.keys(DEFAULTS), 'label', 'notes']);
 function inputRefusal(req) {
   const keys = Object.keys(req).filter((k) => /input|mouse|keyboard|pointer|touch|cursor|key_?press|clipboard|wheel/i.test(k));
   if (keys.length) return `request keys ${JSON.stringify(keys)} ask for input; input injection is forbidden (TEST-WORKFLOW.md §3 rule 1: the owner's cursor and keyboard are off limits)`;
-  const js = req.custom && typeof req.custom.js === 'string' ? req.custom.js : '';
+  const js = [req.custom && typeof req.custom.js === 'string' ? req.custom.js : '', typeof req.join_probe === 'string' ? req.join_probe : '', typeof req.url_params === 'string' ? req.url_params : ''].join(' ');
   const banned = /(new\s+(Mouse|Pointer|Keyboard|Wheel|Touch|Input|Focus|Drag|Clipboard)Event)|dispatchEvent|Input\.dispatch|\.focus\(|requestPointerLock|keyboard\.lock|initMouseEvent|createEvent|RemoteInput|sendInput/i;
-  if (js && banned.test(js)) return 'custom.js creates or dispatches events (or touches RemoteInput); the client page forwards such events to the host, which would move the real cursor. Refused.';
+  if (js.trim() && banned.test(js)) return 'custom.js / join_probe / url_params creates or dispatches events (or touches RemoteInput); the client page forwards such events to the host, which would move the real cursor. Refused.';
   const cmds = (req.custom && req.custom.host_commands) || [];
   for (const c of cmds) { const s = [].concat(c).join(' '); if (/measure-input|measure-stream|test-startup-gate|--control\b|pointer-scope/i.test(s)) return `custom.host_commands entry "${s}" touches input; refused.`; }
   if (req.chrome_flags && [].concat(req.chrome_flags).some((f) => /remote-debugging-port|user-data-dir/.test(f))) return 'chrome_flags may not override the slot\'s debugging port or profile';
@@ -225,7 +229,8 @@ async function deviceKey(name, cl) {
 // ---------------------------------------------------------------- client helpers
 function clientUrl(c, name, { https = true } = {}) {
   const origin = https ? `https://${H.ip}:${HOSTCTX.ports.https}` : `http://${H.ip}:${HOSTCTX.ports.http}`;
-  return { origin, url: `${origin}/?id=${HOSTCTX.sessionId}&name=${encodeURIComponent(name)}&otp=${HOSTCTX.otp}&fs=0` };
+  const extra = REQ.url_params ? '&' + String(REQ.url_params).replace(/^[?&]+/, '') : '';
+  return { origin, url: `${origin}/?id=${HOSTCTX.sessionId}&name=${encodeURIComponent(name)}&otp=${HOSTCTX.otp}&fs=0${extra}` };
 }
 
 const STD_GRANT = ['audioCapture', 'wakeLockScreen', 'speakerSelection'];
@@ -268,6 +273,7 @@ async function joinClient(cl, spec, { name = deviceName(), grant = STD_GRANT, mi
     try { return await cl.join({ url, origin, grant, micChoice, stage: factory, restage }); } finally { stopStage(cl.joinStage); cl.joinStage = null; }
   });
   j.name = name;
+  if (REQ.join_probe) j.probe = await cl.page.ev(`(() => { try { return JSON.stringify(${REQ.join_probe}); } catch (e) { return JSON.stringify({ error: String(e) }); } })()`).then((v) => { try { return JSON.parse(v); } catch { return v; } }, (e) => ({ error: e.message }));
   log(`join ${name}: answer ${j.answerMs} ms, first picture ${j.firstPictureMs} ms${j.error ? ' ERROR ' + j.error : ''}${j.pageError ? ' page: ' + j.pageError : ''}`);
   return j;
 }
