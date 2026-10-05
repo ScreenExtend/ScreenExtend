@@ -11,10 +11,10 @@
 
 export const HOOK_SOURCE = `(() => {
   if (self.__seStamp) return;
-  const S = self.__seStamp = { cfg: null, out: [], pending: 0, prev: null, painted: 0, sampled: 0, skipped: 0, errors: 0 };
+  const S = self.__seStamp = { cfg: null, out: [], pending: 0, prev: null, painted: 0, sampled: 0, skipped: 0, errors: 0, diag: 0 };
   const now = () => performance.timeOrigin + performance.now();
   const CELLS = 38, PX = 4, W = CELLS * PX;
-  let strip = null, grid = null;
+  let strip = null, grid = null, band = null;
   function decode(d) {
     const l = [];
     for (let i = 0; i < CELLS; i++) { const o = (i * PX + (PX >> 1)) * 4; l.push(0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2]); }
@@ -25,7 +25,7 @@ export const HOOK_SOURCE = `(() => {
     let v = 0; for (let i = 0; i < 24; i++) v = v * 2 + b[4 + i];
     let c = 0; for (let i = 0; i < 8; i++) c = c * 2 + b[28 + i];
     const sum = (((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255)) & 255;
-    if ((sum ^ 0x5a) !== c) return { e: 'checksum' };
+    if ((sum ^ 0x5a) !== c) return { e: 'checksum', l: l.map(Math.round) };
     return { v, contrast: Math.round(white - black) };
   }
   // src: a VideoFrame or an HTMLVideoElement; fw: its natural width; t: paint time.
@@ -37,9 +37,20 @@ export const HOOK_SOURCE = `(() => {
     const img = isFrame ? src.clone() : src;
     let p;
     if (cfg.mode === 'grid') p = createImageBitmap(img, { resizeWidth: 64, resizeHeight: 36 });
-    else {
-      const k = fw / cfg.width; const sw = Math.max(1, Math.round(CELLS * cfg.cell * k)), sh = Math.max(1, Math.round(cfg.cellH * k));
-      p = createImageBitmap(img, 0, 0, Math.min(sw, fw), Math.min(sh, fh), { resizeWidth: W, resizeHeight: 1, resizeQuality: 'medium' });
+    else if (cfg.mode === 'mover') {
+      // A 2-row band through the middle of the moving window's row, full width, 960 samples:
+      // where is the orange square in the frame the client just painted?
+      const k = fw / cfg.width; const y0 = Math.max(0, Math.min(fh - 2, Math.round((cfg.y + cfg.h / 2) * k) - 1));
+      p = createImageBitmap(img, 0, y0, fw, 2, { resizeWidth: 960, resizeHeight: 1, resizeQuality: 'low' });
+    } else {
+      const k = fw / cfg.width; const sw = Math.max(1, Math.round(CELLS * cfg.cell * k));
+      // 'full' averages the whole cell height. 'center' reads a 2-row band through the middle of
+      // the cells: the compositor can catch the stage's blit half done (a horizontal tear, new
+      // stamp above, old below), and averaging across that line turns differing bits into
+      // mid-grey, which fails the check. Any single row holds one stamp.
+      let y0 = 0, sh = Math.max(1, Math.round(cfg.cellH * k));
+      if (cfg.band === 'center') { y0 = Math.max(0, Math.round(cfg.cellH * k * 0.5) - 1); sh = Math.min(2, sh); }
+      p = createImageBitmap(img, 0, y0, Math.min(sw, fw), Math.min(sh, fh - y0), { resizeWidth: W, resizeHeight: 1, resizeQuality: 'medium' });
     }
     p.then((bm) => {
       if (cfg.mode === 'grid') {
@@ -54,11 +65,18 @@ export const HOOK_SOURCE = `(() => {
         }
         S.prev = new Uint8ClampedArray(d);
         S.out.push({ t, changed, maxDelta, green });
+      } else if (cfg.mode === 'mover') {
+        if (!band) band = new OffscreenCanvas(960, 1).getContext("2d", { willReadFrequently: true });
+        band.drawImage(bm, 0, 0); const d = band.getImageData(0, 0, 960, 1).data;
+        let first = -1, last = -1;
+        for (let i = 0; i < 960; i++) { const o = i * 4; if (d[o] > 170 && d[o + 1] < 140 && d[o + 2] < 110 && d[o] - d[o + 2] > 100) { if (first < 0) first = i; last = i; } }
+        const smp = first < 0 && S.diag++ < 5 ? [0, 240, 480, 720, 959].map((i) => [d[i * 4], d[i * 4 + 1], d[i * 4 + 2]]) : undefined;
+        S.out.push({ t, mx: first < 0 ? null : (first / 960) * cfg.width, mx2: last < 0 ? null : ((last + 1) / 960) * cfg.width, smp });
       } else {
         if (!strip) strip = new OffscreenCanvas(W, 1).getContext('2d', { willReadFrequently: true });
         strip.drawImage(bm, 0, 0); const r = decode(strip.getImageData(0, 0, W, 1).data);
         if (r.e) S.errors++;
-        S.out.push(r.e ? { t, e: r.e } : { t, v: r.v });
+        S.out.push(r.e ? (r.l && S.diag++ < 40 ? { t, e: r.e, l: r.l } : { t, e: r.e }) : { t, v: r.v });
       }
       bm.close();
     }).catch((e) => { S.out.push({ t, e: 'readback: ' + e.message }); }).finally(() => { if (isFrame) img.close(); S.pending--; });

@@ -18,7 +18,7 @@ import { ROOT, acquireSlot, acquireAll, releaseSlots, measureLock, pidAlive, slo
 import { probeBuild, startHost, stopHost, runCli, cliJson, randomSessionId, randomOtp } from './lib/host.mjs';
 import { Client, stampMetrics } from './lib/client.mjs';
 import { driverState, driverRemove } from './lib/driver.mjs';
-import { startLoadSampler, snapshot, waitForQuiet } from './lib/load.mjs';
+import { startLoadSampler, snapshot, waitForQuiet, memSnapshot } from './lib/load.mjs';
 import { dist, spread } from './lib/metrics.mjs';
 import { sleep } from './lib/cdp.mjs';
 
@@ -38,7 +38,9 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
   netlog: false,           // Chrome's own network log per browser, into the run directory
+  stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
   // below max_cpu. A window that opened loaded, or whose own mean CPU ended above max_cpu, is
   // marked `loaded: true` and should be discarded and repeated. `load_gate: false` turns it off.
@@ -123,11 +125,12 @@ function screens() {
   } catch { return []; }
 }
 
-function startStage(gdi, { seconds, stamp = true, mover = false, large = false, notIn = null, wait = 20, driverId = null }) {
+function startStage(gdi, { seconds, stamp = true, mover = false, large = false, notIn = null, wait = 20, driverId = null, extra = [] }) {
   const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(HERE, 'stage.ps1'), '-Seconds', String(seconds), '-WaitSeconds', String(wait)];
   if (driverId != null) args.push('-DriverId', String(driverId));
   if (gdi) args.push('-Gdi', gdi); else args.push('-NewScreenNotIn', (notIn || []).join(';'));
   if (stamp) args.push('-Stamp'); if (mover) args.push('-Mover'); if (large) args.push('-Large');
+  args.push(...extra);
   const proc = spawn('powershell', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   owned.stages.push(proc);
   const st = { current: null };
@@ -221,7 +224,7 @@ async function openClient(spec, { flags = [], disable = [], offset = 0 } = {}) {
   const profile = path.join(ROOT, `profile-slot${R.slot}-${offset}-${process.pid}-${++PROFILE_SEQ}`);
   const netlog = REQ.netlog && RUN_DIR ? [`--log-net-log=${path.join(RUN_DIR, `netlog-${offset}-${PROFILE_SEQ}.json`)}`] : [];
   const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags, ...netlog], headed: REQ.headed, log, scWidth: REQ.screencast_width });
-  owned.clients.push(cl);
+  cl.stampBand = REQ.stamp_band; owned.clients.push(cl);
   await cl.open({ client: spec, observer: { refreshRate: spec.refresh, disable } });
   return cl;
 }
@@ -235,7 +238,19 @@ async function joinClient(cl, spec, { name = deviceName(), grant = STD_GRANT, mi
   const j = await underLock('join', async () => {
     const known = screens();
     const factory = () => (pre.gdi ? startStage(pre.gdi, { seconds: 45, wait: 30, driverId: pre.driverId }) : startStage('', { seconds: 45, notIn: known, wait: 30 }));
-    const restage = async (old) => { stopStage(old); const r = await resolveGdi(name, { quiet: true }); if (r.error) { const n = screens().filter((x) => !known.includes(x)); return n.length ? startStage(n[n.length - 1], { seconds: 45, wait: 10 }) : null; } return startStage(r.gdi, { seconds: 45, wait: 10, driverId: r.driverId }); };
+    const restage = async (old) => {
+      stopStage(old); const r = await resolveGdi(name, { quiet: true });
+      if (r.error) {
+        const n = screens().filter((x) => !known.includes(x));
+        if (n.length) return startStage(n[n.length - 1], { seconds: 45, wait: 10 });
+        // A build that reports no joins (bef5f89) and reused the display it kept through the
+        // disconnect grace: no screen appeared with this join, so the "one new screen" the first
+        // stage waited for never comes. The one screen added since the host started is it.
+        const added = screens().filter((x) => !(HOSTCTX.screensBefore || []).includes(x));
+        return added.length === 1 ? startStage(added[0], { seconds: 45, wait: 10 }) : null;
+      }
+      return startStage(r.gdi, { seconds: 45, wait: 10, driverId: r.driverId });
+    };
     try { return await cl.join({ url, origin, grant, micChoice, stage: factory, restage }); } finally { stopStage(cl.joinStage); cl.joinStage = null; }
   });
   j.name = name;
@@ -638,6 +653,9 @@ async function slowAnswer(cl) {
   const name = deviceName();
   for (let i = 0; i < n; i++) {
     const j = await joinClient(cl, REQ.client, { name });
+    // Every attempt's full join record (network timing per /whep request included) goes into
+    // joins[] too, so a slow or lost answer can be laid against serve.log afterwards.
+    R.joins.push({ scenario: `slow_answer#${i + 1}`, ...j });
     const s = await hostJoins(); const m = await ourMonitors();
     const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
     e.flag = (j.answerMs > 5000 ? 'answer over 5 s; ' : '') + (/did not answer|gave up|timed out/i.test(j.pageError || '') ? 'page gave up; ' : '') + ((e.liveJoins || 0) > 1 || (e.displays || 0) > 1 ? 'second session/display; ' : '');
@@ -646,6 +664,45 @@ async function slowAnswer(cl) {
   }
   out.flagged = out.attempts.filter((a) => a.flag).length;
   return out;
+}
+
+// The cursor stand-in at rest. A small window moves (fast steps, like a pointer) and stops; the
+// stage reports where it stopped. Does the client's picture come to rest there, or one step
+// short? A frame gate that drops the frame carrying the final position leaves the picture stale
+// until something else changes — on a still desktop, indefinitely.
+async function moverStopTest(cl) {
+  const o = typeof REQ.mover_stop === 'object' ? REQ.mover_stop : {};
+  const cycles = o.cycles || 10, moveS = o.move_s || 1.2, holdS = o.hold_s || 2, stepMs = o.step_ms || 8, speed = o.speed || 2.5;
+  const j = await joinClient(cl, REQ.client);
+  R.joins.push({ scenario: 'mover_stop', ...j });
+  if (j.firstPictureMs == null) { await leave(cl); return { error: 'no picture after join', join: { answerMs: j.answerMs, offers: j.offers } }; }
+  await sleep(1500);
+  const secs = Math.ceil(cycles * (moveS + holdS)) + 3;
+  const st = await stageFor(j.name, { seconds: secs, stamp: false, mover: true, extra: ['-MoverStepMs', String(stepMs), '-MoverSpeed', String(speed), '-MoveSeconds', String(moveS), '-HoldSeconds', String(holdS)] });
+  const ready = await st.ready;
+  if (ready.error) { stopStage(st); await leave(cl); return { error: 'stage: ' + ready.error }; }
+  const res = await underLock('mover_stop', async () => {
+    await cl.drainStamps();
+    await cl.setStampCfg({ mode: 'mover', width: ready.width, height: ready.height, y: Math.floor(ready.height * 0.4), h: 48 });
+    const samples = []; const t0 = Date.now();
+    while (st.proc.exitCode === null && Date.now() - t0 < (secs + 10) * 1000) { await sleep(250); samples.push(...(await cl.drainStamps()).samples); }
+    await cl.setStampCfg(null); await sleep(100); samples.push(...(await cl.drainStamps()).samples);
+    return samples.filter((x) => x.mx !== undefined);
+  });
+  stopStage(st);
+  const off = R.clock.browserMinusSystemMs;
+  const stopsRaw = st.output().split('\n').map((l) => { try { return JSON.parse(l.trim()); } catch { return null; } }).filter((x) => x && x.stop);
+  const stops = stopsRaw.map((s) => {
+    const inHold = res.filter((x) => x.t - off >= s.t && x.t - off <= s.t + holdS * 1000 - 50 && x.mx != null);
+    const late = inHold.filter((x) => x.t - off >= s.t + holdS * 1000 * 0.6);
+    const settled = late.length ? late[late.length - 1].mx : (inHold.length ? inHold[inHold.length - 1].mx : null);
+    const reached = inHold.find((x) => Math.abs(x.mx - s.x) <= 6);
+    return { stop: s.stop, trueX: s.x, settledX: settled == null ? null : Math.round(settled), errorPx: settled == null ? null : Math.round(settled - s.x), reachedMs: reached ? Math.round(reached.t - off - s.t) : null, paintsDuringHold: inHold.length, lastPaintMs: inHold.length ? Math.round(inHold[inHold.length - 1].t - off - s.t) : null };
+  });
+  const stale = stops.filter((s) => s.errorPx == null || Math.abs(s.errorPx) > 6);
+  await leave(cl);
+  const diag = { samples: res.length, found: res.filter((x) => x.mx != null).length, firstT: res.length ? Math.round(res[0].t - off) : null, lastT: res.length ? Math.round(res[res.length - 1].t - off) : null, firstStopT: stopsRaw.length ? stopsRaw[0].t : null, notFoundSamples: res.filter((x) => x.smp).slice(0, 5).map((x) => x.smp), stage: ready };
+  return { diag, params: { cycles, moveS, holdS, stepMs, speedPxPerMs: speed, display: { width: ready.width, height: ready.height } }, stops, staleStops: stale.length, of: stops.length, note: 'settledX: where the orange window sits in the last painted frame of the hold (after 60 % of it), read from a 2-row band, 2 px resolution at 1920 wide; stale = more than 6 px from where the stage stopped it. reachedMs: stop -> first painted frame showing the true position.' };
 }
 
 async function autoRejoin(cl) {
@@ -777,6 +834,7 @@ async function main() {
       if (REQ.leave_rejoin) R.special.leave_rejoin = await leaveRejoin(cl);
       if (REQ.slow_answer) R.special.slow_answer = await slowAnswer(cl);
       if (REQ.fallback_paths) R.special.fallback_paths = await fallbackPaths();
+      if (REQ.mover_stop) R.special.mover_stop = await moverStopTest(cl);
       if (REQ.auto_rejoin) R.special.auto_rejoin = await autoRejoin(cl);
     };
     // By default the lock is held for the whole live-display part of the test, so no other
@@ -784,7 +842,18 @@ async function main() {
     // attached, streams on this build were seen to freeze, retarget or slow down (README,
     // "Concurrency"). Host start, browser start and teardown still overlap. `overlap_displays`
     // restores per-window locking, for a caller who wants that and accepts the risk.
-    if (REQ.overlap_displays) await body(); else await underLock('live-display', body);
+    // The WUDFHost leak per display: snapshots at both ends of the live-display part, under the
+    // lock, so the delta is this run's own (no other test creates a display while it is held).
+    const memBody = async () => {
+      const before = await memSnapshot();
+      try { await body(); } finally {
+        const after = await memSnapshot();
+        const joins = (R.joins || []).length + (R.special.two_clients ? 1 : 0);
+        const d = (k) => (after[k] != null && before[k] != null ? +(after[k] - before[k]).toFixed(1) : null);
+        R.memory = { before, after, joinsInWindow: joins, wudfCommitDeltaMB: d('wudfCommitMB'), wudfHandlesDelta: d('wudfHandles'), wudfThreadsDelta: d('wudfThreads'), note: 'largest WUDFHost (virtual display driver host) before and after the live-display part; joins counts joins[] (+1 for a two_clients second browser); renegotiations and fallback tiers that reuse a display are not counted separately' };
+      }
+    };
+    if (REQ.overlap_displays) await memBody(); else await underLock('live-display', memBody);
     if (REQ.loss) { R.special.loss = { notRun: true, reason: 'inducing packet loss on this machine needs admin rights (a WFP/clumsy-style driver or netsh) or touching the owner\'s network; neither is allowed. Not run.' }; R.notRun.push('loss'); }
     R.extraJoinsSeen = (await hostJoins()).joins;
     R.pageConsole = { warningsAndErrors: cl.console.filter((c) => /warn|error|exception/.test(c.level)).slice(0, 200), total: cl.console.length };
