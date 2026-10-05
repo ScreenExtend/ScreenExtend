@@ -2236,8 +2236,8 @@
             // with `fallbackToVideo`, and a session that lost one answer then ran on the <video>
             // element and its jitter buffer for good. It is offered again once on the same tier,
             // presenting whatever join id this tab holds. (A first join that lost its answer
-            // holds none, so the host still opens a second session beside the one it answered;
-            // that one is closed when its ICE fails. Recognising the retry needs the host.)
+            // holds none; the host recognises the retry by this page load's `attemptId` and
+            // continues the join it answered instead of opening a second one beside it.)
             let answerRetried = false;
             function setupFailureAction(err, s) {
                 const msg = (err && err.message) || '';

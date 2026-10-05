@@ -4196,3 +4196,392 @@ hybrid laptop never delivers a frame of an IDD display (41 re-establishes, then 
 retried its offer and the first picture took 12.9 s. Now re-resolved and retried on WGC up to 5
 times, 200 ms apart, before DXGI. Forced three times through the same path: recovered on WGC,
 first picture 5.6 s. The natural failure (about one join in 50) was not reproduced on demand.
+
+## G01-CURSORBITS — `CURSORINFO.flags` was compared with `==` instead of tested as a bitfield — `COMPILE-CHECKED` (no pointer may be moved)
+
+`CursorProbe` compared `flags == CURSOR_SHOWING`, but the field is a bitfield: `CURSOR_SHOWING`
+(0x1) and, from Windows 8, `CURSOR_SUPPRESSED` (0x2, the system is not drawing the pointer after
+touch or pen input). `f7c2a55` reads "drawn" as SHOWING set and SUPPRESSED clear. For every
+documented value (0, 1, 2, and 3, "not drawn" both ways) the two tests agree, so this is a
+robustness edit, not a measured fix; it only decides whether a frame is exempt from the cadence
+gate, never what WGC draws. Raised by INPUT-REPORT.md 4.5. Untested with touch or pen input on
+the host. Detail: `docs/overhaul-new/G01.md` §6 item 3, §7 item 4.
+
+## G02-CONSTQP — the per-device quality slider did nothing on NVENC: constant QP was never selected — `VERIFIED` (defect fix: live log + hardware test; not a latency change)
+
+`NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES` is a mask of the mode values themselves and
+`NV_ENC_PARAMS_RC_CONSTQP` is 0, so `supports_rc` (`rc_modes & mode`) was false for constant QP
+on every driver: since `f66a5a7` every override session logged "does not advertise CONSTQP;
+falling back to CBR" (`rc_modes=0x3f` here) while its init line printed `rc=constqp,
+qp=Some(15)`. `cf63279` admits mode 0 unconditionally (`rc_mode_supported`) and logs the
+effective rate control. After: live sessions log `NVENC configured: rc=NV_ENC_PARAMS_RC_CONSTQP
+(qp=15)`, and `nvenc_constant_qp_request_is_applied` shows a QP 18 IDR more than twice a QP 42
+IDR. CBR vs constant QP 15 is not a latency lever on loopback (1080p small window p50 median
+26.99 vs 26.95 ms; large area 30.86 vs 29.95, p99 43.2 vs 50.5); QP 15 costs IDRs of 83 KB
+(1080p) / 144 KB (1440p). Detail: `docs/overhaul-new/G02.md` E1, E5b, Defects.
+
+## G03-PLIBACKOFF — every WebCodecs session drew an IDR every ~250 ms from libwebrtc's starving decoder — `VERIFIED` (defect fix; latency gain inside noise)
+
+A page decoding through an encoded transform never feeds libwebrtc's own decoder, which then
+sends RTCP PLI every ~200 ms for the whole session (117 PLIs in 30 s on the head, 127 on the old
+app, which had no gate); the 200 ms same-network `KeyframeGate` admitted nearly every one (~3.6
+IDRs/s). `30d5719` adds `PliBackoff`: an answered PLI/FIR followed by another doubles a window
+(200 ms → cap 2 s), 4 s without one closes it, and a NACK, transport-wide loss or the client's
+STATS keyframe counter moving opens it at once; the 0x64 request and the host's own requests are
+untouched. 1080p, 3 interleaved pairs: IDRs per session 426–435 → 72–73, small-window bitrate
+~5.1 → ~2.7 Mbps, small p50 pair medians 27.4/27.8/27.7 → 25.3/25.7/24.3 ms, large 29–31 both,
+fps 52–55 both, static 0 changed/0 green both. Hi-res 60 Hz: neutral on latency (IDRs 310 → 56).
+Detail: `docs/overhaul-new/G03.md` §1, §3, §4 exp. 1–2.
+
+## G03-HEALTHYCAP — the residual libwebrtc PLI still drew an IDR every ~3 s once the page handed keyframes back — `VERIFIED` (one pair; defect reduction)
+
+With G05's page (`a00083d`) writing decoded keyframes back to the receiver, Chrome's idle decoder
+still asks about once every 3 s and the 2 s backoff cap answered each one. `396916b` caps the
+backoff at 10 s while the client's STATS say it paints through WebCodecs (transport tier set,
+painted counter advancing, report fresh within 3 s); the page's own requests, NACKs and
+transport-wide loss still open the window, and pages without STATS (the relay's, the old one)
+keep 2 s. It also corrects the `keyframe.rs` doc that said intra refresh is on. 120 Hz hi-res,
+one pair × 3 windows: IDRs 54 → 17, hi-res small p50 35.5/37.3/40.7 → 34.3/35.4/37.0 ms, fps
+72–76 → 79–84; hi-res large area noisy in both arms. Not claimed as a latency win. Detail:
+`docs/overhaul-new/G03.md` §3, §4 exp. 6.
+
+## G03-AUDIOSACK — the audio DataChannel dropped ~200 ms bursts on an idle link: a delayed SACK read as a full channel — `UNVERIFIED`
+
+webrtc-sctp counts a message in `buffered_amount` until the peer's SACK for it arrives, and a
+receiver may delay a SACK by 200 ms, so the forwarder's 40 ms drop threshold read every delayed
+SACK as a full channel: G06 saw backpressure drops in bursts of 41–43 packets (≈ 205–215 ms of
+audio) on an idle loopback link. `07ec295` allows one SACK interval (220 ms) of in-flight data on
+top of the 40 ms (the old app used a flat 16 KiB). Reasoned from the source and G06's burst
+sizes; the `dc_drops` A/B was not run. Cost if wrong: up to ~260 ms of audio may queue on a
+genuinely congested link before drops start. Detail: `docs/overhaul-new/G03.md` §1
+(cross-findings), §7.
+
+## G03-SUPERSEDED — a renegotiated join's previous transport stayed alive until ICE failed (D-05) — `VERIFIED` (one run on the consolidation build, docs/overhaul-new/CONSOLIDATION.md §D; unit test)
+
+After every in-place renegotiation the old peer connection (ICE agent, RTP writer, RTCP reader,
+8 Hz stats poll) ran on beside the live one: on the pre-fix build an encoder-only edit left the
+old transport Disconnected 4.7 s and Failed 30 s after it, with 3 live transports for one join.
+`1f85421` closes the replaced transport once the new one reaches Connected (the trickle
+registry, keyed by join id, hands it back on registration); a failed renegotiation closes
+nothing. The registry entry is now removed only by the transport that owns it, which also stops
+the superseded teardown deleting the live session's trickle entry. Unit-tested; the after-fix
+handler run was reaped for memory. Its telemetry side effect is CONSOL-TELEMETRY-OWNER. Detail:
+`docs/overhaul-new/G03.md` §3, §4 exp. 8, §5.
+
+## G04-FAILEDRENEG — a failed renegotiation left a second device row and a second virtual display — `VERIFIED` (injected failure, one run per arm)
+
+The owner's "changing a device's settings makes two new devices appear with two virtual
+screens". When a continuing join failed, `abandon_failed_attempt` removed the session that held
+the only copy of its display id, orphaning the display; the previous attempt's teardown read the
+missing entry as "superseded", kept it and sent no `DeviceRemove`, and the page's retry on the
+same join id became a fresh join with a second display and row. `f789b76` keeps a failed
+renegotiation's session and display for the retry (reaped after the grace if none comes),
+removes a failed fresh join's display with its session, and makes an attempt a newer offer
+overtook stand down after the two halves join and after `activate_whep` (it used to overwrite
+the newer stopper and leak a capture and an encoder). Injected failure, same binary: head
+displays 1 → 2, join id changed, `DeviceJoin` +1, `defectSeen: true`; fixed 1 → 1, same ids,
+picture back in 2.4 s. Detail: `docs/overhaul-new/G04.md` §1, §5 E1.
+
+## G04-SEEDEDREFRESH — a device's first-join refresh rate was pinned for the life of the host — `VERIFIED` (defect; p50 inconclusive; macOS mirror `UNVERIFIED (not compiled)`)
+
+`f569e41` seeds an override row at a device's first join; every later join read that row's
+refresh rate back as a setting, so a device that first joined at 60 Hz (or while the page's rAF
+measurement was throttled) streamed at 60 for good. `58fd8b1` treats a seeded rate as a
+detection that follows the device's report until `set_device_override` makes it the user's.
+Hi-res scenario, client reporting 120 Hz, 2 + 2: pinned 2560x1440@60, 57.5/57.4 fps, p50
+38.0/38.4 ms; fixed 2560x1440@120, 72.5/86.1 fps, p50 42.1/35.1 ms (one fixed window p99 124 ms,
+the other 46). The macOS one-line mirror (`clear_join_seeded`) is not compiled here. Detail:
+`docs/overhaul-new/G04.md` §4, §5 E3.
+
+## G04-JOINDISPLAY — ~0.55 s of a fresh join's display step was a redundant mode set, a serial DPI write and an awaited log line — `VERIFIED` (2 + 2 interleaved, thin LTO)
+
+From 79–89 timestamped joins the display step was attach 1352 ms, a forced mode set p50 172 ms
+(max 3696), settle + DPI 423 ms, `start_on_monitor` 350 ms and an awaited `monitor_rect` 128 ms
+that only fed a log line. `97e46d1` skips the mode set when a fresh unrotated display already
+reports the requested `w×h@hz`, writes the DPI concurrently with `start_on_monitor`, and stops
+awaiting the log line. Two interleaved rounds of 7 fresh joins, one binary: host request →
+answer p50 2686/2617 → 2094/2097 ms, `display=` 2078/2146 → 1404/1346, page answer 2758/2694 →
+2189/2178, first picture 3074/2870 → 2651/2688, small window p50 28.99/27.05 → 26.98/26.16 ms.
+The skipped mode set does not reduce the driver leak (first create still +37 handles, +5
+threads, +46.5 MB). Round 3 was cancelled under the join ration. Detail:
+`docs/overhaul-new/G04.md` §2, §5 E2.
+
+## G04-RELAYJOIN — a relayed page without join ids turned every settings edit into a second display — `UNVERIFIED` (unit test only)
+
+The cloud relay serves its own older page, which renegotiates with no `joinId`, so every edit
+for a relayed device was a fresh join with a second display and row while the first waited out
+its grace; with two joins under one relay `client_id`, `/reconfig` answered from `.next()` over
+a HashMap, half the time the stale join. `8e709bd` resolves a relay client to its live join
+(capture running, else display, else any) and treats a joinless relayed offer from a client
+whose join is still streaming, under the same token, as that join renegotiating. No relayed
+session can be driven on this machine. Detail: `docs/overhaul-new/G04.md` §1, §8.
+
+## G04-GPUTOGGLE — the GPU-encode toggle dropped every session and rebuilt each on a new display — `VERIFIED` (host side via `RELOAD`; the GUI button was not pressed)
+
+`set_disable_gpu_encode` ran `restart_streamers`: a `HostExit` bye to every client and the
+servers restarted, so each device came back as a fresh join on a fresh display (~47–70 MB of
+driver leak each); `5510dc9`'s claim that it no longer dropped devices was not met (G09). The
+pipeline reads the flag live (`Config::software_encode_now`), so `26630dc` renegotiates every
+live join in place, and `RELOAD` now applies `disableGpuEncode` to a running host. Measured
+through `config set disableGpuEncode true`, then `false`: "1 live session(s) will renegotiate in
+place", the same join id, x264 then back to NVENC, no display created. A port change still
+restarts the servers. Detail: `docs/overhaul-new/G04.md` §1, §5 E5, §8.
+
+## G04-DRIVERIPCLOG — two driver-IPC errors reached no log, and `Drop` reported a panic on every drop — `COMPILE-CHECKED`
+
+No `log` backend is installed, so the two `log::error!` calls in
+`windows_utils/driver_ipc/sync/client.rs` went nowhere; `1eca751` makes them `teprintln!`. The
+`Drop` one also had its test inverted: `try_recv()` returning `Err(Empty)` (nothing sent, the
+normal case) was reported as "Event receiver panicked"; it now reports only an actual panic
+payload. Found by G09 (#4). Detail: `docs/overhaul-new/G04.md` §4.
+
+## G04-ATTEMPTID — a page whose first answer was lost opened a second session and display on its retry — `VERIFIED` (simulated, one run)
+
+A first join that never received its answer held no join id, so its retry after the 10 s
+deadline was a fresh join: a second display beside the first, which lived ~42 s until ICE failed
+and the grace ran out. `7584269` is the host half of G07's `attemptId` (`e8cbe87`): an offer with
+no join id whose attempt id names a join that never connected (and already has its display, under
+the same token if one is presented) continues that join in place, `DeviceModify` not
+`DeviceJoin`; once its writer has sent a byte no attempt id reaches the join. A temporary switch
+held the first answer 12 s: displays created 2 → 1, the retry "continues join …, whose answer was
+lost" and renegotiated in 0.9 s, first picture 11.7 s, small window p50 24.55 ms / 54.4 fps. A
+retry that arrives while the first attempt is still building its display is not taken over. Three
+unit tests. Detail: `docs/overhaul-new/G04.md` §10.
+
+## G04-AUTOORIENT — an orientation edit cost a renegotiation the join path then ignored (D-08) — `COMPILE-CHECKED` (unit test)
+
+With auto-orientation on (the default) the join believes the device and ignores the saved
+orientation, but moving it still classed as a rebuild: one renegotiation, a ~0.4 s gap, and only
+toward portrait, because the join wrote the device's own landscape back so the landscape edit
+compared equal (what G07 saw). `183aea8` counts orientation in `reconfig_action` only while
+auto-orientation is off; the field → action table test gains a fixed-orientation case in both
+directions. Not re-measured live (join ration). Detail: `docs/overhaul-new/G04.md` §10.
+
+## G05-WATCHDOG — a session already painting through WebCodecs was demoted to `<video>` 5 s later — `COMPILE-CHECKED` (harness-proven; live-unverified)
+
+The 5 s "no WebCodecs frame" watchdog is armed from two handlers and cleared only by the worker's
+single `rendered` message, so an arming after it (the other handler, ICE connected → completed, a
+recovered disconnect) was never cleared: `fallbackToVideo` sent a second offer and the session
+ran on path 3 for good. Seen in 2 of 56 head runs, with 178 frames already painted. `9aae1d3`
+latches the first painted frame per session (`webcodecsPainted`, cleared by `teardownSession`);
+neither the arm nor the timer acts once it is set. `scripts/test-client-watchdog.mjs` fails 4 of
+7 assertions on the previous page. In 23 joins with the fix no demotion occurred, but at 2/56
+that does not settle it. Detail: `docs/overhaul-new/G05.md` §5 D1.
+
+## G05-KEYBACK — libwebrtc's idle decoder asked for a keyframe every ~300 ms (the storm's client half) — `VERIFIED` (defect fix; latency inside noise)
+
+The transform consumes every frame, so libwebrtc's `VideoReceiveStream` decodes nothing
+(`framesDecoded` 0) and sends a PLI each time its 200 ms keyframe wait expires. `a00083d` writes
+each keyframe the worker has decoded back to the receiver's writable (`transformer.writable`, or
+the legacy `createEncodedStreams` writable, which the page now transfers); the receiver then
+waits on its 3 s timeout. PLIs per 10 s 28–35 → 3–4; NVENC load at hi-res 40–43 % → 36 %.
+Medians base vs this: small window 26.95 vs 24.8, large area 30.7 vs 29.5, hi-res 32.9 vs 32.05
+ms, all inside the base range; fps unchanged. Handing every frame back (0 PLIs, every frame
+decoded twice) was rejected. The `createEncodedStreams` half is unit-tested only. Detail:
+`docs/overhaul-new/G05.md` §3, §4, §5 D3.
+
+## G06-MICCARD — the join raised a microphone card (or the output chooser) for audio the default output plays without one — `VERIFIED` (`mic_prompt`, one run per build)
+
+Chromium without a grant lists outputs with empty ids and Firefox lists none, so the join
+"needed" the microphone card on almost every desktop browser and waited on it, and
+`selectAudioOutput()` engines opened the browser's chooser on every Join click. `c020fc0`
+enumerates whatever is free and asks nothing; where nothing routable enumerates, the host's
+device panel gets one entry, "Choose a speaker on this device…" (`se:choose`), and only picking
+it asks. `mic_prompt`, nothing granted: `modals: sameDevice, micCard` with the join waiting →
+`modals: sameDevice`, no `getUserMedia`, no permission query; speaker-granted, neither build
+asks. `007d413` (comment only) corrects `warmJoinPath`'s note that the join awaits the
+enumeration. Detail: `docs/overhaul-new/G06.md` commits table, "Asks for mic permission…".
+
+## G06-STALESINK — a saved output the client does not have restarted playback on every `/reconfig` poll — `VERIFIED` (one run per build)
+
+The host sends the device's `audioOutputDeviceId` in every `/reconfig` body (~1 Hz). `setSpeaker`
+rerouted the graph into a hidden `<audio>` element before asking the engine, the engine refused,
+and the next poll re-assigned `srcObject`, restarting the element. `61da27a` sets the sink first,
+reroutes only once the engine accepts, assigns `srcObject` only when it changes, and latches a
+refused id until a `devicechange`. `audio_paths` tier `stale_output`, 12 s click train: 22
+element restarts (22 `loadstart`/21 `emptied`), 4 underruns, 4 concealments → no element, 0, 0;
+clicks 15/15 both. Detail: `docs/overhaul-new/G06.md` commits table.
+
+## G06-REFUSEDSINK — a refused host-chosen output raised the browser's chooser over a live stage — `COMPILE-CHECKED` (harness)
+
+When the engine refused a sink the host commanded, `applyReconfig` armed `queueOutputPicker` on
+the next tap, which over a live stage dropped pointer lock, keyboard lock and fullscreen for a
+request the person at the device never made (G07 §7). `83facec` reports the refusal instead (one
+log line per id and a forced `/audio-outputs` post whose `current` names what is playing); the
+chooser is used only for the operator's explicit `se:choose`. Reconfig harness case 9, ten polls
+of a refused sink: 1 picker offer → 0 offers, 1 report, 1 forced post. Harness only. Detail:
+`docs/overhaul-new/G06.md` commits table.
+
+## G06-ECHO — a page joined from the host machine itself played the stream into the loopback capture forever — `VERIFIED` (one run per build)
+
+Endpoint loopback captures everything the host plays, including a browser on that machine
+playing the stream back, so the sound looped every round trip and never decayed. `24f75e8` starts
+a page that knows it is on the host (`__SAME_DEVICE__`) muted (`playbackMutedHere`); the host's
+own speakers already play the audio. Chrome unmuted, 12 s click train: 1 of 15 clicks detectable
+and 0.40 RMS still ringing after the train → the page reports itself muted, nothing reaches the
+output, no loop. Detail: `docs/overhaul-new/G06.md` commits table, E9, question 2.
+
+## G06-SPARETRACK — a mid-session fast-path audio failure was silence for the rest of the session — `VERIFIED` (one run per build)
+
+On the fast path the client asks for a spare standard Opus track so a failing decoder or worklet
+has somewhere to go; the host put it in the answer but never fed it (`forward_track` ran only off
+the fast path). `736f0f9` feeds it in standby: its forwarder subscribes once the client's STATS
+report `audioPath` 3, and the DataChannel forwarder stops at the same signal so the audio is not
+sent twice. `audio_paths` tier `worker_fails`, 15 clicks: 0/15 (silence) → 8/15, and 15/15 with
+G06-TRACKCLOCK. Unit test `the_spare_track_waits_for_the_client_to_step_down`. Detail:
+`docs/overhaul-new/G06.md` commits table, "Sound doesn't work" route 3.
+
+## G06-TRACKCLOCK — the standard Opus track's RTP clock wobbled per packet and NetEQ concealed over half the audio — `VERIFIED` (one run per build)
+
+`0ed07c1` spaced the track's RTP timestamps by elapsed `capture_ns`, which is re-anchored on every
+engine wake, so each 5 ms / 240-sample packet got a step of 4.3 ms, 5.6 ms and so on, and NetEQ
+concealed each disagreement. This is the tier every client without WebCodecs audio takes,
+including every plain-HTTP join from the LAN QR code. `201a981` steps the clock by the elapsed
+time rounded to whole frames (at least one). `audio_paths` tier `no_audio_decoder`, 15 clicks:
+627,600 concealed samples, 5/15 clicks, delay to render p50 453 ms (353–604) → 240 concealed,
+15/15, p50 131 ms (126–145), NetEQ buffer 29 ms. Plain HTTP itself was not joined (the handler's
+`plain_http` tier failed in both builds). Unit test `the_track_clock_steps_in_whole_frames`.
+Detail: `docs/overhaul-new/G06.md` commits table, "Sound doesn't work" route 1.
+
+## G06-PROCLOOPBACK — endpoint loopback heard a host sound ~29 ms later than process loopback — `VERIFIED` (5 + 5 probe, 2 + 2 handler, thin LTO)
+
+Process loopback had been the fallback tier on a capture → packet measurement inside the host;
+what matters is when a sound played on the host reaches the capture, and the endpoint tier taps
+the mix after the endpoint's own buffering. `dbb2863` tries process loopback first (endpoint
+when it cannot activate; `SE_ENDPOINT_LOOPBACK=1` forces the old order). Probe click → encoded:
+endpoint median 80.6 ms (range 13.2), process 59.4 (range 20.4). Handler, one binary,
+interleaved, 15/15 clicks every run: click → client decoded 81.1/81.6 → 53.3/56.9 ms, → rendered
+95.1/93.9 → 65.9/64.9, → output 149.1/149.3 → 120.2/120.4. Idle: 0 starvations, wake p99 10.5
+ms. The second handler pair ran at ~1 GB free memory; the first, at ~3 GB, agrees. Untested on
+Windows 10 2004–22H2, Bluetooth outputs and APOs. Detail: `docs/overhaul-new/G06.md` E7.
+
+## G07-WARMJOIN — a browser's first join spent ~2 s on two first-use costs before its offer left — `VERIFIED`
+
+A timeline inside the page put almost all of a first join's pre-offer time in the first
+`enumerateDevices()` (1.36–1.67 s headless) and the first `new RTCPeerConnection()` (a 0.41–0.56
+s main-thread task); a later join in the same browser posts its offer in 60–98 ms. `cd611ce` pays
+both in `warmJoinPath()` at load (`setTimeout(0)`, never awaited, never prompting). Six first
+joins across exp2 + exp3: POST leaves {2313, 1920, 1598} ms (median 1920, range 715) → {181,
+116, 96} (median 116, range 85); first frame painted 4728–5198 → 2904–4057 ms; small-window p50
+unchanged within noise. After G06-MICCARD the join awaits no enumeration, so the peer-connection
+warm-up is what remains of it. Untested on a real phone. Detail: `docs/overhaul-new/G07.md` §1,
+§2, §3 exp. 7.
+
+## G07-SAMETIER — a lost or refused WHEP answer demoted the session to `<video>` for good — `VERIFIED` (by simulation)
+
+The page's catch answered every setup error with `fallbackToVideo`, including the 10 s WHEP
+deadline, a 5xx and a dropped connection, none of which says anything about the browser's
+decoder. `2dda493`'s `setupFailureAction` offers a host-side failure again once on the same tier,
+presenting any join id the tab holds; a second failure takes the ladder, a bad OTP never demotes,
+and the budget refills only on a 2xx answer or Connect. Simulated lost answer: before, the retry
+went out on `<video>` and the page ended on path 3; after, it retried on WebCodecs (`rendered`
+2.3 s after the retry POST) and stayed on path 1. G05's parallel fix was dropped for this one.
+Detail: `docs/overhaul-new/G07.md` §2, §3 exp. 5, 6, 8; `docs/overhaul-new/G05.md` §5 D2.
+
+## G07-PAGEHIDE — a tab closed mid-rebuild or before its first frame sent no `/leave` — `COMPILE-CHECKED` (harness)
+
+`sendLeave` returned early unless the page was live and not reconfiguring (the old app's gate),
+so such a tab left its display to ICE failure plus the grace, about 45 s, and a join in that
+window made a second display. `aec25fb` releases the held join id on `pagehide` in any state; a
+page holding none has nothing to release. Harness only (`test-client-join.mjs`), not run through
+the handler. Also `c25fa99` (test only): reconfig harness case 13 shows that two epoch bumps in
+one save are both applied, as two in-place renegotiations, not a lost setting. Detail:
+`docs/overhaul-new/G07.md` §2, §4, §8.
+
+## G07-ATTEMPTID — every offer carries a per-page-load attempt id (client half of the lost-answer fix) — `COMPILE-CHECKED` (harness)
+
+A first join whose answer is lost holds no join id, so the host cannot recognise its retry.
+`e8cbe87` mints a 128-bit `attemptId` (32 lowercase hex) at load and sends it in every `POST
+/whep` beside `joinId`. Inert on its own: the host half is G04-ATTEMPTID (`7584269`), which is
+where the measurement is. Harness: 32 hex digits with and without `crypto.getRandomValues`,
+present in the offer body. Detail: `docs/overhaul-new/G07.md` §2, §5.
+
+## G08-TELEMSTAMPS — keepalive encodes read ~0 µs and the WGC capture stages dropped 89–99.97 % of their samples — `COMPILE-CHECKED` (defects measured; fixes not re-run through the handler)
+
+`ring_keepalive` took both encode stamps after `encode_repeat_slot` returned, so every keepalive
+(the majority of frames on a still desktop) entered `encode` as ~0 µs; `e96fe2c` takes the submit
+stamp before the encode (the same two clock reads). WGC's `SystemRelativeTime` is the
+composition's target present time, not a capture time: it sat 3–14 ms after callback entry on
+2,879 of 2,880 frames, so `record_span` silently dropped almost every capture-relative sample (in
+200 s, `capture_delivery` n=3 of ~9,900 frames, `capture_to_encode` n=1,087) and the survivors
+were biased (`capture_to_encode` p50 1.05 ms against `encode` 5.77 ms; the "p99 ≈ 503 ms early
+in a session" was the same artefact). `3120abf` gives WGC frames no OS stamp; DXGI's
+`LastPresentTime` is unchanged. Detail: `docs/overhaul-new/G08.md` commits, §3.
+
+## G08-TYPEDSORT — the transform worker sorted its stage windows with a JS comparator once a second — `VERIFIED` (direct timing only; end to end inside noise)
+
+`StatWindow.pct` runs on the paint thread once a second for three 512-sample windows, and copied
+into a boxed Array sorted by a comparator. `114cc01` sorts a `Float64Array` copy natively, same
+output; a harness case asserts the sort is numeric. Direct (Node/V8 on the dev box): 320–350 µs
+→ 77 µs per poll. End to end inside the handler's noise; no phone measured. The same ledger
+measured all instrumentation off against on and found no measurable cost. Detail:
+`docs/overhaul-new/G08.md` commits, §2.
+
+## G09-LOGBUS — four ways a log line was lost or mangled on its way to the panel or `ScreenExtend logs` — `COMPILE-CHECKED` (unit tests; `18311e0` by reading)
+
+`304cf95`: the writer read `STREAMING` before pushing a batch and emitted on that stale value, so
+a batch straddling the panel's backlog read was in neither; the emit is now decided under the
+ring lock the panel arms under (`a_panel_opening_mid_stream_loses_no_line`: 20/20 failures
+against the old shape, 0/20 fixed). `8e4db79`: the `LOGS` verb read through `get_log_backlog`,
+arming the panel's `LogLine` stream for the life of the process; it now copies the ring with
+`backlog_snapshot()`. `3032603`: control replies were decoded per 4 KiB read, turning a
+multi-byte character on a boundary into U+FFFD; now decoded once (unit test; not seen in an
+11 KB live backlog). `18311e0`: five avatar errors went through `log::error!` to no backend; now
+`teprintln!`. The panel's own listen-after-backlog gap is UI-side and open. Detail:
+`docs/overhaul-new/G09.md` route table, E9, Defects.
+
+## G09-PIPECLOSE — a `-v` echo to a closed pipe panicked whichever thread logged — `VERIFIED` (one run per build)
+
+`tprintln!`/`teprintln!` echoed with `println!`/`eprintln!` under `serve -v`, which panic when
+the reader of stdout/stderr has gone; the echo runs on the logging thread (accept loop, join,
+capture, encode, audio) and came before the backlog push, so the line was lost too. `serve`'s
+device listeners and its "Stopping…" line had the same shape without `-v`. `8423abf` writes
+through `logbus::echo_stdout`/`echo_stderr`, which drop a failed write. Handler `pipe_close`:
+head — host alive but `logs` "No running ScreenExtend instance", `stop` "running but not
+answering", stopped by PID; g09 — `logs` exit 0 with the three new lines, `stop` worked, clean
+exit. Detail: `docs/overhaul-new/G09.md` E6.
+
+## G09-CTRLFIRST — `serve` answered `/health` ~300 ms before its control server existed — `VERIFIED` (one run per build)
+
+`serve` started the single-instance control server last, after the network watcher, the cloud
+client and the join banner, so `stop`, `logs`, `status --json` and `RELOAD` could not reach a
+host that already answered `/health` (head: first output 149 ms, `/health` 399 ms, control
+server 698 ms after spawn), and the handler stopped it by PID, skipping the BYE and the display
+removal. `52c3eb3` starts it right after the credentials are set and before
+`watch_for_network_changes` starts the adapter servers. g09: `status --json` returned telemetry
+at once and `stop` worked. Not a latency change (startup head vs old, E5, inconclusive). Detail:
+`docs/overhaul-new/G09.md` route table, E8.
+
+## CONSOL-TELEMETRY-OWNER — a superseded session's teardown unregistered its successor's telemetry — `VERIFIED` (one run, docs/overhaul-new/CONSOLIDATION.md §D; unit test)
+
+Both transports of a renegotiated join register their telemetry under one join id, and the
+superseded session's teardown called `telemetry::unregister(&join)`, which removed whatever was
+registered there: the live session's handle. Since G03-SUPERSEDED (`1f85421`) closes the
+superseded transport as soon as the new one connects, that happened right after every
+renegotiation, and `status --json` lost the join from its first settings edit on. `fb6d08b` adds
+`telemetry::unregister_if`, which removes the entry only while it is still this session's own
+`Arc` (`Arc::ptr_eq`), the rule `unregister_trickle` already follows. Unit test
+`superseded_session_does_not_unregister_its_successor`. Found by G03. Detail:
+`docs/overhaul-new/G03.md` §1 (cross-findings), §5.
+
+## CONSOL-STOP-OFF-WORKER — discarded captures were stopped inline on the async workers — `COMPILE-CHECKED`
+
+`server.rs` called `SessionCapture::stop()`, which joins the capture thread (milliseconds
+normally, seconds when WGC is wedged), inline on four async paths (a failed WHEP handshake, a
+failed activation, the two "superseded by a newer offer" stand-downs) and in the no-session-map
+teardown branch. A blocked tokio worker also strands the task in its LIFO slot, which is never
+stolen, e.g. an h2 connection carrying another join's answer. `9433732`'s `discard_capture` runs
+the stop on the blocking pool and awaits it, so the order is unchanged: the capture stops before
+`abandon_failed_attempt` removes the display (G04-FAILEDRENEG). It also withdraws the failed
+attempt's telemetry (`unregister_if`). This is G03's best-supported candidate mechanism for the
+lost `/whep` answer (D-02), not proven: no reproduction with a stack exists. Detail:
+`docs/overhaul-new/G03.md` §1 (D-02), §5.
+
+## CONSOL-AUDIOPATH4 — client audio path 4 (the MessagePort ring) read "unknown" in telemetry — `COMPILE-CHECKED` (unit test)
+
+The page reports `AUDIO_PATH.workletPort` = 4 (G06), which `telemetry.rs::audio_path_name` did
+not know, so `status --json` and the verbose summary said "unknown" for a device on that tier.
+`d5ea62a` names it "worklet+port", matching `docs/TELEMETRY.md`'s row 4; the test
+`every_client_audio_path_has_a_name` parses `AUDIO_PATH` out of the shipped `index.html` and
+fails on any value without a name. Found by G06. Detail: `docs/overhaul-new/G06.md` "Findings
+for other groups".

@@ -533,6 +533,8 @@ pub fn audio_path_name(code: u8) -> &'static str {
         1 => "worklet+sab",
         2 => "worklet+postmessage",
         3 => "opus-track",
+        // The private ring fed over a `MessagePort` (`AUDIO_PATH.workletPort` in index.html).
+        4 => "worklet+port",
         _ => "unknown",
     }
 }
@@ -855,6 +857,20 @@ pub fn unregister(key: &str) {
     }
 }
 
+/// Remove `key` only while it still names `mine`.
+///
+/// A renegotiated join publishes a second session's handle under the same join id, and the
+/// superseded session's teardown runs after that (as soon as the new transport connects). A plain
+/// `unregister` there removed the live session's telemetry, so `status --json` lost the join from
+/// its first settings edit on.
+pub fn unregister_if(key: &str, mine: &SharedTelemetry) {
+    if let Ok(mut g) = registry().lock() {
+        if g.get(key).is_some_and(|t| Arc::ptr_eq(t, mine)) {
+            g.remove(key);
+        }
+    }
+}
+
 pub fn get(key: &str) -> Option<SharedTelemetry> {
     registry().lock().ok()?.get(key).cloned()
 }
@@ -1041,5 +1057,39 @@ mod tests {
         );
         unregister("10.0.0.7");
         assert!(get("10.0.0.7").is_none());
+    }
+
+    /// Every value the page can report in the STATS frame has a name here, so `status --json`
+    /// never says "unknown" for a tier the page really took.
+    #[test]
+    fn every_client_audio_path_has_a_name() {
+        let page = include_str!("static/index.html");
+        let start = page
+            .find("const AUDIO_PATH = {")
+            .expect("AUDIO_PATH in index.html");
+        let body = &page[start..];
+        let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
+        let codes: Vec<u8> = body
+            .split(',')
+            .filter_map(|kv| kv.split(':').nth(1)?.trim().parse().ok())
+            .collect();
+        assert!(codes.len() >= 5, "parsed {codes:?}");
+        for code in codes {
+            assert_ne!(audio_path_name(code), "unknown", "audio path {code}");
+        }
+    }
+
+    #[test]
+    fn superseded_session_does_not_unregister_its_successor() {
+        let key = "join-renegotiated-test";
+        let old = register(key);
+        let new = SessionTelemetry::new_shared();
+        publish(key, Arc::clone(&new));
+        // The superseded session's teardown leaves the live one's handle alone ...
+        unregister_if(key, &old);
+        assert!(get(key).is_some_and(|t| Arc::ptr_eq(&t, &new)));
+        // ... and the live one's own teardown removes it.
+        unregister_if(key, &new);
+        assert!(get(key).is_none());
     }
 }
