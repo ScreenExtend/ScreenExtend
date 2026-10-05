@@ -71,6 +71,15 @@ export class Client {
   async setClient(c) {
     this.clientSpec = c;
     await this.page.send('Emulation.setDeviceMetricsOverride', { width: c.width, height: c.height, deviceScaleFactor: c.dpr, mobile: false, screenWidth: c.width, screenHeight: c.height });
+    // The observer pins `screen.refreshRate` once, at open, so a browser switched to another
+    // client spec (the standard hi-res scenario reuses the 60 Hz browser) kept reporting the
+    // first spec's rate and the "120 Hz" scenario ran at 60. Re-pin it for this page and for
+    // every document loaded after it; the later script runs after the observer's and wins.
+    if (c.refresh) {
+      const pin = `Object.defineProperty(Screen.prototype, 'refreshRate', { get: () => ${Number(c.refresh)}, configurable: true });`;
+      await this.page.send('Page.addScriptToEvaluateOnNewDocument', { source: pin }).catch(() => {});
+      await this.page.ev(pin).catch(() => {});
+    }
   }
 
   async close() {

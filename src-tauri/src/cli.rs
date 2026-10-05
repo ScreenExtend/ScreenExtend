@@ -2092,6 +2092,12 @@ mod desktop {
             .reload()
             .map_err(|e| format!("cannot re-read config store: {e}"))?;
         apply_saved_config(app, &store);
+        // Only on a reload, never at `serve` startup, where `--software-encode` has already
+        // decided it: this is what lets `config set disableGpuEncode` reach a running host the
+        // way the desktop toggle does.
+        if let Some(software) = store.get("disableGpuEncode").and_then(|v| v.as_bool()) {
+            platform::set_disable_gpu_encode(app.state(), software);
+        }
         tprintln!("[control] configuration reloaded from disk");
         Ok(())
     }

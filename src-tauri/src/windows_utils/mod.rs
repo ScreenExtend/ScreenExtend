@@ -429,6 +429,8 @@ pub fn set_device_override(
         overrides.insert(token.clone(), next);
         action
     };
+    // A save makes the refresh rate a setting rather than the join's detection.
+    session::clear_join_seeded(&token);
     // Class (b), whatever else this edit did: remote control is read per event, so it lands on
     // the pointer that is moving now rather than on the next connection.
     session::apply_live_input_for_device(
@@ -1017,15 +1019,20 @@ pub fn set_disable_gpu_encode(state: State<'_, AppState>, disabled: bool) {
     if prev == disabled {
         return;
     }
+    // The encoder is chosen when a session's pipeline is built, and the pipeline reads this flag
+    // live (`Config::software_encode_now`), so the servers do not need restarting — that dropped
+    // every session with a `HostExit` goodbye, and each device came back, if at all, as a new
+    // join on a new display. Every live join renegotiates in place instead: same join, same
+    // display, a new encoder.
+    let moved = session::bump_reconfig_epoch_all(&state.sessions);
     tprintln!(
-        "[streamer] GPU video encoding {}; restarting streamers",
+        "[streamer] GPU video encoding {}; {moved} live session(s) will renegotiate in place",
         if disabled {
             "disabled (software x264 only)"
         } else {
             "re-enabled"
         }
     );
-    restart_streamers(&state, "encoder change");
 }
 
 /// Re-invoke ourselves elevated to run one of the legacy driver subcommands.
