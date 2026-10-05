@@ -2068,16 +2068,17 @@ async fn start_session(
     let pending = match whep_res {
         Ok(p) => p,
         Err(e) => {
-            if let Ok((display_id, _, session, _, _)) = display_res {
+            if let Ok((_, _, session, _, _)) = display_res {
                 session.stop();
-                if !existed_before {
-                    if let Some(s) = state.config.sessions.as_ref() {
-                        forget_display(session::take_live_display(s, &join_id));
-                    }
-                    remove_display_async(client, display_id).await;
-                }
             }
-            abandon_failed_attempt(state, &join_id, still_current());
+            abandon_failed_attempt(
+                state,
+                &join_id,
+                session_seq,
+                still_current(),
+                existed_before,
+            )
+            .await;
             return Err(e.context("WHEP handshake"));
         }
     };
@@ -2085,10 +2086,27 @@ async fn start_session(
         Ok(v) => v,
         Err(e) => {
             pending.abandon().await;
-            abandon_failed_attempt(state, &join_id, still_current());
+            abandon_failed_attempt(
+                state,
+                &join_id,
+                session_seq,
+                still_current(),
+                existed_before,
+            )
+            .await;
             return Err(e);
         }
     };
+    // A newer offer for this join arrived while this one was building. The page that sent this
+    // one has already thrown its peer connection away (every `start()` makes the previous
+    // generation stale), so finishing it would only leave a capture and an encoder running that
+    // nobody watches — and its `set_active_capture` below would overwrite the newer attempt's
+    // stopper, so nothing would ever stop either of them.
+    if !still_current() {
+        session.stop();
+        pending.abandon().await;
+        bail!("join {join_id} was superseded by a newer offer before its answer; standing down");
+    }
 
     let (closed_tx, closed_rx) = oneshot::channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2110,16 +2128,23 @@ async fn start_session(
         Ok(pair) => pair,
         Err(e) => {
             session.stop();
-            if !existed_before {
-                if let Some(s) = state.config.sessions.as_ref() {
-                    forget_display(session::take_live_display(s, &join_id));
-                }
-                remove_display_async(client, display_id).await;
-            }
-            abandon_failed_attempt(state, &join_id, still_current());
+            abandon_failed_attempt(
+                state,
+                &join_id,
+                session_seq,
+                still_current(),
+                existed_before,
+            )
+            .await;
             return Err(e.context("WHEP activation"));
         }
     };
+    // The same check once more: `activate_whep` awaits, and a newer offer can land inside it.
+    if !still_current() {
+        session.stop();
+        whep.close().await;
+        bail!("join {join_id} was superseded by a newer offer while it activated; standing down");
+    }
 
     tprintln!(
         "join stages ({locality:?}): display={display_ms:.0}ms pipeline={pipeline_ms:.0}ms handshake={handshake_ms:.0}ms (overlapped)"
@@ -2265,7 +2290,27 @@ async fn start_session(
 /// still running makes two attempts on one join, and the loser's failure would then delete the
 /// entry the winner is about to record its display in. The session survives, the display it owns
 /// survives with it, and nothing is left holding a display with no session to reap it.
-fn abandon_failed_attempt(state: &AppState, join_id: &str, mine: bool) {
+///
+/// What it must never do is forget a session that still has a display attached. The display id
+/// lives only in the session, so removing the entry orphaned the display for the life of the
+/// host, and the previous attempt's teardown task — which finds its sequence number gone and
+/// reads that as "superseded" — kept it too. The page then retried with the join id it held,
+/// found no session, and was given a second display and a second dashboard row beside the
+/// orphaned ones: two devices and two virtual screens from one settings edit.
+///
+/// - A fresh join that failed removes the display it created (if it got that far) with the
+///   session.
+/// - A renegotiation that failed keeps both, because the page answers a failed rebuild by
+///   offering again on the same join id and the display should still be there for it. It is
+///   reaped exactly the way a closed session would be: after the disconnect grace, unless a newer
+///   attempt has taken the join over by then.
+async fn abandon_failed_attempt(
+    state: &AppState,
+    join_id: &str,
+    seq: u64,
+    mine: bool,
+    continuing: bool,
+) {
     let Some(s) = state.config.sessions.as_ref() else {
         return;
     };
@@ -2273,7 +2318,56 @@ fn abandon_failed_attempt(state: &AppState, join_id: &str, mine: bool) {
         tprintln!("join {join_id} failed but a newer offer owns it now; leaving the session alone");
         return;
     }
-    session::remove_session(s, join_id);
+    let Some(client) = state.config.virtual_display.as_ref() else {
+        session::remove_session(s, join_id);
+        return;
+    };
+    if !continuing {
+        let taken = session::take_live_display(s, join_id);
+        session::remove_session(s, join_id);
+        if let Some(d) = taken {
+            let id = d.display_id;
+            forget_display(Some(d));
+            remove_display_async(client, id).await;
+        }
+        return;
+    }
+    let grace = std::time::Duration::from_secs(
+        state
+            .config
+            .disconnect_grace
+            .as_ref()
+            .map(|g| g.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(session::DEFAULT_DISCONNECT_GRACE_SECS),
+    );
+    tprintln!(
+        "join {join_id} failed to renegotiate; keeping its display {grace:?} for the page to \
+         offer again"
+    );
+    let sessions = s.clone();
+    let client = client.clone();
+    let reporter = state.config.device_reporter.clone();
+    let join = join_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(LEAVE_SETTLE + grace).await;
+        if !session::is_current_session(&sessions, &join, seq) {
+            return;
+        }
+        let token = session::device_token_for(&sessions, &join).unwrap_or_default();
+        let taken = session::take_live_display(&sessions, &join);
+        session::remove_session(&sessions, &join);
+        if let Some(d) = taken {
+            let id = d.display_id;
+            tprintln!(
+                "join {join} never recovered from a failed renegotiation; removing display id={id}"
+            );
+            forget_display(Some(d));
+            remove_display_async(&client, id).await;
+        }
+        if let Some(reporter) = reporter {
+            reporter.report_remove(join, token);
+        }
+    });
 }
 
 /// What a mode change actually did, as opposed to what it was asked to do.
@@ -3070,6 +3164,103 @@ mod tests {
     fn portrait_geometry_is_read_back_with_its_axes_swapped() {
         assert_eq!(monitor_dims(1080, 1920, false), (1080, 1920));
         assert_eq!(monitor_dims(1080, 1920, true), (1920, 1080));
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingDisplays(std::sync::Mutex<Vec<u32>>);
+
+    impl session::VirtualDisplayController for RecordingDisplays {
+        fn create_display(&self, _: String, _: u32, _: u32, _: u32) -> Result<u32, String> {
+            Err("not used in this test".into())
+        }
+        fn remove_display(&self, id: u32) {
+            self.0.lock().unwrap().push(id);
+        }
+        fn remove_all_displays(&self) {}
+    }
+
+    /// One join holding display 7, at its first attempt, with no disconnect grace.
+    fn failed_attempt_fixture() -> (AppState, std::sync::Arc<RecordingDisplays>, String, u64) {
+        let sessions: session::SharedSessions = Default::default();
+        let token = session::mint_device_token();
+        let join = session::mint_join_id();
+        session::open_session(&sessions, &join, &token, "192.168.1.44");
+        session::set_live_display(
+            &sessions,
+            &join,
+            session::LiveDisplay {
+                display_id: 7,
+                device_name: String::new(),
+                device_path: String::new(),
+                width: 1920,
+                height: 1080,
+                refresh: 60,
+                scale: 100,
+                portrait: false,
+            },
+        );
+        let seq = session::next_session_seq(&sessions, &join);
+        let displays = std::sync::Arc::new(RecordingDisplays::default());
+        let controller: session::SharedVirtualDisplay = displays.clone();
+        let state = AppState::new(Config {
+            virtual_display: Some(controller),
+            sessions: Some(sessions),
+            disconnect_grace: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            ..Default::default()
+        });
+        (state, displays, join, seq)
+    }
+
+    /// The owner's "two devices and two virtual screens after one settings edit": a
+    /// renegotiation that failed used to forget its session outright. The display id lived only
+    /// there, so the display was orphaned, the earlier attempt's teardown read the missing entry
+    /// as "superseded" and kept it too, and the page's retry — presenting the same join id —
+    /// found no session and was given a second display and a second dashboard row.
+    #[tokio::test]
+    async fn a_failed_renegotiation_keeps_its_display_for_the_retry_and_then_reaps_it() {
+        let (state, displays, join, seq) = failed_attempt_fixture();
+        let sessions = state.config.sessions.clone().unwrap();
+        let token = session::device_token_for(&sessions, &join).unwrap();
+        abandon_failed_attempt(&state, &join, seq, true, true).await;
+        assert_eq!(
+            continuing_join(&sessions, &join, &token).as_deref(),
+            Some(join.as_str()),
+            "the page's retry must land on the same join"
+        );
+        assert_eq!(
+            session::get_live_display(&sessions, &join).map(|d| d.display_id),
+            Some(7),
+            "and find the display still there to reuse"
+        );
+        assert!(displays.0.lock().unwrap().is_empty());
+        // Nobody offered again: after the grace it goes, display and session together.
+        tokio::time::sleep(LEAVE_SETTLE + std::time::Duration::from_millis(400)).await;
+        assert_eq!(*displays.0.lock().unwrap(), vec![7]);
+        assert!(session::device_token_for(&sessions, &join).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_failed_renegotiation_owns_the_display() {
+        let (state, displays, join, seq) = failed_attempt_fixture();
+        let sessions = state.config.sessions.clone().unwrap();
+        abandon_failed_attempt(&state, &join, seq, true, true).await;
+        // The retry arrives and takes the join over.
+        session::next_session_seq(&sessions, &join);
+        tokio::time::sleep(LEAVE_SETTLE + std::time::Duration::from_millis(400)).await;
+        assert!(displays.0.lock().unwrap().is_empty());
+        assert_eq!(
+            session::get_live_display(&sessions, &join).map(|d| d.display_id),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fresh_join_takes_its_display_with_it() {
+        let (state, displays, join, seq) = failed_attempt_fixture();
+        let sessions = state.config.sessions.clone().unwrap();
+        abandon_failed_attempt(&state, &join, seq, true, false).await;
+        assert_eq!(*displays.0.lock().unwrap(), vec![7]);
+        assert!(session::device_token_for(&sessions, &join).is_none());
     }
 
     #[derive(Debug)]
