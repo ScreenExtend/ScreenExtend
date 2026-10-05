@@ -64,12 +64,21 @@ export async function startHost(o) {
   // prefix is when the handler read the line (a pipe, read on the event loop), which trails the
   // host's write by well under a millisecond on an idle loop and by a few ms on a busy one.
   const out = fs.openSync(o.logFile, 'a');
+  // Startup phases, all from the spawn call on the handler's clock: first byte of output, the
+  // banner's "Host is running" line, and the first `/health` that answered. `startupMs` below is
+  // the same span as `healthMs`, kept for older readers.
+  const phases = { firstOutputMs: null, runningLineMs: null, healthMs: null };
+  const tSpawn = Date.now();
+  try { fs.writeSync(out, `[${tSpawn}] (handler) spawned ${path.basename(o.exe)}\n`); } catch { /* best effort */ }
   const proc = spawn(o.exe, args, { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   for (const s of [proc.stdout, proc.stderr]) {
     let tail = '';
     s.setEncoding('utf8');
     s.on('data', (d) => {
-      const now = Date.now(); const parts = (tail + d).split('\n'); tail = parts.pop();
+      const now = Date.now();
+      if (phases.firstOutputMs == null) phases.firstOutputMs = now - tSpawn;
+      if (phases.runningLineMs == null && /Host is running/.test(tail + d))phases.runningLineMs = now - tSpawn;
+      const parts = (tail + d).split('\n'); tail = parts.pop();
       if (parts.length) { try { fs.writeSync(out, parts.map((l) => `[${now}] ${l.replace(/\r$/, '')}\n`).join('')); } catch { /* closed */ } }
     });
     s.on('end', () => { if (tail) { try { fs.writeSync(out, `[${Date.now()}] ${tail}\n`); } catch { /* closed */ } } });
@@ -80,16 +89,18 @@ export async function startHost(o) {
   const t0 = Date.now(); let ip = null; let log = '';
   const portRe = new RegExp(`https?://(\\d+\\.\\d+\\.\\d+\\.\\d+):(?:${o.httpsPort}|${o.httpPort})`);
   while (Date.now() - t0 < 40000) {
-    await sleep(300);
+    // 25 ms rather than 300: the poll interval was the resolution of `startupMs`, and startup is
+    // itself under a second.
+    await sleep(25);
     try { log = fs.readFileSync(o.logFile, 'utf8'); } catch { /* not yet */ }
     if (!ip) { const m = log.match(portRe); if (m) ip = m[1]; }
     if (ip) {
-      try { const r = await fetch(`http://${ip}:${o.httpPort}/health`, { signal: AbortSignal.timeout(1500) }); if (r.ok) break; } catch { /* not up */ }
+      try { const r = await fetch(`http://${ip}:${o.httpPort}/health`, { signal: AbortSignal.timeout(1500) }); if (r.ok) { phases.healthMs = Date.now() - tSpawn; break; } } catch { /* not up */ }
     }
     if (exited) break;
   }
   const up = !!ip && !exited;
-  return { proc, pid: proc.pid, args: shownArgs, credentialsVia, ip, up, startupMs: Date.now() - t0, exited: () => exited, logTail: up ? null : log.slice(-3000) };
+  return { proc, pid: proc.pid, args: shownArgs, credentialsVia, ip, up, startupMs: Date.now() - t0, startup: phases, exited: () => exited, logTail: up ? null : log.slice(-3000) };
 }
 
 /** Stop a host: the `stop` verb where the build can be reached by it, else by PID. */

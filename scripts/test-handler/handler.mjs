@@ -39,6 +39,9 @@ const DEFAULTS = {
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
   netlog: false,           // Chrome's own network log per browser, into the run directory
+  // After every join has left: close the host's stdout/stderr pipes (as a parent that stops
+  // reading does), make it log, and report whether its control server still answers.
+  pipe_close: false,
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
   // below max_cpu. A window that opened loaded, or whose own mean CPU ended above max_cpu, is
   // marked `loaded: true` and should be discarded and repeated. `load_gate: false` turns it off.
@@ -541,7 +544,69 @@ async function renameDevice(k, name) {
 async function logsTest() {
   const l = await cli(['logs', '--lines', '50']);
   const s = await hostJoins();
-  return { logs: { code: l.code, lines: l.stdout.split('\n').filter(Boolean).length, sample: l.stdout.split('\n').slice(-5) }, statusJson: { available: s.available, hasTelemetry: !!s.telemetry, joins: s.joins ? s.joins.length : null }, pass: l.code === 0 && l.stdout.trim().length > 0 && !!s.telemetry };
+  const out = { logs: { code: l.code, lines: l.stdout.split('\n').filter(Boolean).length, sample: l.stdout.split('\n').slice(-5) }, statusJson: { available: s.available, hasTelemetry: !!s.telemetry, joins: s.joins ? s.joins.length : null }, pass: l.code === 0 && l.stdout.trim().length > 0 && !!s.telemetry };
+  // The whole backlog against the host's own `-v` echo in serve.log: is every line the bus kept
+  // also one the host printed, did any multi-byte character arrive mangled (U+FFFD), and did the
+  // bus report a drop.
+  const full = await cli(['logs'], 30000);
+  const busLines = full.stdout.split(/\r?\n/).filter((x) => x.length);
+  const serveText = (() => { try { return fs.readFileSync(path.join(RUN_DIR, 'serve.log'), 'utf8'); } catch { return ''; } })();
+  const echoed = new Set(serveText.split('\n').map((x) => x.replace(/^\[\d+\] /, '').replace(/\r$/, '')));
+  const tailN = busLines.slice(-300);
+  out.full = {
+    code: full.code, lines: busLines.length, bytes: Buffer.byteLength(full.stdout),
+    replacementChars: (full.stdout.match(/�/g) || []).length,
+    replacementCharsInServeLog: (serveText.match(/�/g) || []).length,
+    droppedReports: busLines.filter((x) => /\[logbus\] dropped/.test(x)),
+    lastLinesAlsoEchoed: `${tailN.filter((x) => echoed.has(x)).length}/${tailN.length}`,
+  };
+  // `logs: {burst: N}` — N control connections with a wrong token, each of which the host logs
+  // once ("presented a bad token"). That is a log burst made from outside the host with nothing
+  // but its own loopback socket (no input, no display), enough to wrap the 2000-line ring.
+  const burst = REQ.logs && typeof REQ.logs === 'object' && REQ.logs.burst;
+  if (burst && HOSTCTX.dataDir) {
+    const ctrl = fs.readFileSync(path.join(HOSTCTX.dataDir, 'screenextend.ctrl'), 'utf8').split(/\r?\n/);
+    const port = Number(ctrl[0]);
+    const net = await import('node:net');
+    const t0 = Date.now();
+    for (let i = 0; i < burst; i++) {
+      await new Promise((resolve) => {
+        const sock = net.connect(port, '127.0.0.1', () => sock.end(`not-the-token-${i} PING\n`));
+        sock.on('close', resolve); sock.on('error', resolve); sock.resume();
+      });
+    }
+    const sentMs = Date.now() - t0;
+    await sleep(500);
+    const after = await cli(['logs'], 30000);
+    const al = after.stdout.split(/\r?\n/).filter((x) => x.length);
+    out.burst = { sent: burst, sentMs, lines: al.length, badTokenLines: al.filter((x) => /presented a bad token/.test(x)).length, droppedReports: al.filter((x) => /\[logbus\] dropped/.test(x)), replacementChars: (after.stdout.match(/�/g) || []).length, lastLine: al[al.length - 1] };
+  }
+  return out;
+}
+
+// A `serve -v` whose reader goes away: a terminal that is closed under it, a `| Select -First n`,
+// a supervising script that exits. Runs after every join has left, so no display is live.
+async function pipeClose() {
+  const out = { note: 'stdout/stderr pipes closed by the parent; the host was then made to log by bad-token control connections' };
+  if (!HOSTCTX.dataDir) return { ...out, notRun: 'needs an isolated build (the control file is in the slot data directory)' };
+  const before = await cli(['logs', '--lines', '3']);
+  out.before = { logsCode: before.code };
+  H.proc.stdout.destroy(); H.proc.stderr.destroy();
+  await sleep(300);
+  const ctrl = fs.readFileSync(path.join(HOSTCTX.dataDir, 'screenextend.ctrl'), 'utf8').split(/\r?\n/);
+  const net = await import('node:net');
+  for (let i = 0; i < 3; i++) {
+    await new Promise((resolve) => {
+      const sock = net.connect(Number(ctrl[0]), '127.0.0.1', () => sock.end(`not-the-token PING\n`));
+      sock.on('close', resolve); sock.on('error', resolve); sock.resume();
+    });
+    await sleep(200);
+  }
+  const after = await cli(['logs', '--lines', '10'], 10000);
+  const st = await cli(['status', '--json'], 10000);
+  out.after = { logsCode: after.code, logsTail: after.stdout.split(/\r?\n/).filter(Boolean).slice(-6), logsErr: after.stderr.trim().slice(0, 300), statusCode: st.code, hostAlive: pidAlive(H.pid) };
+  out.controlServerSurvived = after.code === 0;
+  return out;
 }
 
 async function customHook(cl) {
@@ -756,7 +821,7 @@ async function main() {
 
     HOSTCTX.screensBefore = screens();
     H = await bootHost('start');
-    R.host = { pid: H.pid, args: H.args, credentialsVia: H.credentialsVia, ip: H.ip, ports, dataDir, startupMs: H.startupMs, up: H.up };
+    R.host = { pid: H.pid, args: H.args, credentialsVia: H.credentialsVia, ip: H.ip, ports, dataDir, startupMs: H.startupMs, startup: H.startup, up: H.up };
     if (!H.up) {
       R.host.logTail = H.logTail;
       const lockedOut = /already running/i.test(H.logTail || '');
@@ -785,6 +850,7 @@ async function main() {
     // "Concurrency"). Host start, browser start and teardown still overlap. `overlap_displays`
     // restores per-window locking, for a caller who wants that and accepts the risk.
     if (REQ.overlap_displays) await body(); else await underLock('live-display', body);
+    if (REQ.pipe_close) R.special.pipe_close = await pipeClose();
     if (REQ.loss) { R.special.loss = { notRun: true, reason: 'inducing packet loss on this machine needs admin rights (a WFP/clumsy-style driver or netsh) or touching the owner\'s network; neither is allowed. Not run.' }; R.notRun.push('loss'); }
     R.extraJoinsSeen = (await hostJoins()).joins;
     R.pageConsole = { warningsAndErrors: cl.console.filter((c) => /warn|error|exception/.test(c.level)).slice(0, 200), total: cl.console.length };
