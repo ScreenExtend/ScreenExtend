@@ -210,18 +210,34 @@ pub fn set_log_streaming(on: bool) {
     STREAMING.store(on, Ordering::Relaxed);
 }
 
+/// The `-v` echo of one log line. `println!` panics when stdout is a pipe nobody reads any more
+/// (a closed terminal, `serve -v | Select -First 20`, a supervising script that exited), and the
+/// echo runs on whichever thread logged — the control server's accept loop, a join, the capture
+/// or audio thread — so one vanished reader took those threads down mid-line. The line never
+/// reached the backlog either, because the echo comes first. A failed echo is now dropped.
+pub fn echo_stdout(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
+}
+
+/// [`echo_stdout`] for stderr.
+pub fn echo_stderr(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
 #[macro_export]
 macro_rules! tprintln {
     () => {{
         if $crate::logbus::verbose() {
-            println!();
+            $crate::logbus::echo_stdout("");
         }
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
         if $crate::logbus::verbose() {
-            println!("{}", __line);
+            $crate::logbus::echo_stdout(&__line);
         }
         $crate::logbus::push_line(__line);
     }};
@@ -231,14 +247,14 @@ macro_rules! tprintln {
 macro_rules! teprintln {
     () => {{
         if $crate::logbus::verbose() {
-            eprintln!();
+            $crate::logbus::echo_stderr("");
         }
         $crate::logbus::push_line(String::new());
     }};
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
         if $crate::logbus::verbose() {
-            eprintln!("{}", __line);
+            $crate::logbus::echo_stderr(&__line);
         }
         $crate::logbus::push_line(__line);
     }};
