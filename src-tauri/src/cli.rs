@@ -1871,7 +1871,7 @@ mod desktop {
         });
         let _ = rx.recv();
 
-        println!("\nStopping…");
+        crate::logbus::echo_stdout("\nStopping…");
         crate::exit_reason::record("serve: Ctrl+C");
         telemetry_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         single_instance::clear_control_file(&ctrl_path);
@@ -2273,13 +2273,14 @@ mod desktop {
                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?");
                 let os = v.get("os").and_then(|x| x.as_str()).unwrap_or("");
                 let size = v.get("screenSize").and_then(|x| x.as_str()).unwrap_or("");
-                println!("+ device connected: {ip}  {os} {size}");
+                // On the thread that emitted the join, so it must not panic on a closed pipe.
+                crate::logbus::echo_stdout(&format!("+ device connected: {ip}  {os} {size}"));
             }
         });
         app.listen("device-remove", |event| {
             if let Ok(v) = serde_json::from_str::<Value>(event.payload()) {
                 let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("?");
-                println!("- device disconnected: {ip}");
+                crate::logbus::echo_stdout(&format!("- device disconnected: {ip}"));
             }
         });
     }
