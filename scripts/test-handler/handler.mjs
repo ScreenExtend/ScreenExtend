@@ -39,6 +39,7 @@ const DEFAULTS = {
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
   netlog: false,           // Chrome's own network log per browser, into the run directory
+  stamp_band: 'full',      // 'full': average each stamp cell's whole height; 'center': a 2-row band (immune to stage tearing)
   // Before every timed window: wait up to max_wait_s for whole-machine CPU (2 s average) to fall
   // below max_cpu. A window that opened loaded, or whose own mean CPU ended above max_cpu, is
   // marked `loaded: true` and should be discarded and repeated. `load_gate: false` turns it off.
@@ -221,7 +222,7 @@ async function openClient(spec, { flags = [], disable = [], offset = 0 } = {}) {
   const profile = path.join(ROOT, `profile-slot${R.slot}-${offset}-${process.pid}-${++PROFILE_SEQ}`);
   const netlog = REQ.netlog && RUN_DIR ? [`--log-net-log=${path.join(RUN_DIR, `netlog-${offset}-${PROFILE_SEQ}.json`)}`] : [];
   const cl = new Client({ port, profile, flags: [...REQ.chrome_flags, ...flags, ...netlog], headed: REQ.headed, log, scWidth: REQ.screencast_width });
-  owned.clients.push(cl);
+  cl.stampBand = REQ.stamp_band; owned.clients.push(cl);
   await cl.open({ client: spec, observer: { refreshRate: spec.refresh, disable } });
   return cl;
 }

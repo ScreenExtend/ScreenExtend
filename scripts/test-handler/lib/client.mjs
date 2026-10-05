@@ -86,6 +86,7 @@ export class Client {
 
   /** Turn the paint hook on (a cfg) or off (null) in the page and every worker. */
   async setStampCfg(cfg) {
+    if (cfg && cfg.mode === 'stamp' && this.stampBand) cfg = { ...cfg, band: this.stampBand };
     this.stampCfg = cfg; const expr = `self.__seStamp && (__seStamp.cfg = ${JSON.stringify(cfg)}, __seStamp.prev = null, true)`;
     await this.page.ev(expr).catch(() => {});
     for (const sid of this.workers.keys()) await this.page.send('Runtime.evaluate', { expression: expr }, sid).catch(() => {});

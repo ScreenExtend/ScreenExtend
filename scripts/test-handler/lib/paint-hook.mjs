@@ -38,8 +38,14 @@ export const HOOK_SOURCE = `(() => {
     let p;
     if (cfg.mode === 'grid') p = createImageBitmap(img, { resizeWidth: 64, resizeHeight: 36 });
     else {
-      const k = fw / cfg.width; const sw = Math.max(1, Math.round(CELLS * cfg.cell * k)), sh = Math.max(1, Math.round(cfg.cellH * k));
-      p = createImageBitmap(img, 0, 0, Math.min(sw, fw), Math.min(sh, fh), { resizeWidth: W, resizeHeight: 1, resizeQuality: 'medium' });
+      const k = fw / cfg.width; const sw = Math.max(1, Math.round(CELLS * cfg.cell * k));
+      // 'full' averages the whole cell height. 'center' reads a 2-row band through the middle of
+      // the cells: the compositor can catch the stage's blit half done (a horizontal tear, new
+      // stamp above, old below), and averaging across that line turns differing bits into
+      // mid-grey, which fails the check. Any single row holds one stamp.
+      let y0 = 0, sh = Math.max(1, Math.round(cfg.cellH * k));
+      if (cfg.band === 'center') { y0 = Math.max(0, Math.round(cfg.cellH * k * 0.5) - 1); sh = Math.min(2, sh); }
+      p = createImageBitmap(img, 0, y0, Math.min(sw, fw), Math.min(sh, fh - y0), { resizeWidth: W, resizeHeight: 1, resizeQuality: 'medium' });
     }
     p.then((bm) => {
       if (cfg.mode === 'grid') {
