@@ -23,6 +23,7 @@ const HARNESSES = [
   ['transform-worker.js WebCodecs video path and A/V sync', 'test-client-transform.mjs'],
   ['index.html ICE gathering', 'test-client-ice.mjs'],
   ['index.html encoded transform installed before Chrome short-circuits it', 'test-client-transform-start.mjs'],
+  ['index.html frame watchdog never demotes a painting session', 'test-client-watchdog.mjs'],
   ['index.html /reconfig epochs and kick', 'test-client-reconfig.mjs'],
   ['index.html join path: setup failures and the load-time warm-up', 'test-client-join.mjs'],
 ];
