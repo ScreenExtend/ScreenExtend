@@ -178,6 +178,9 @@ the page's error text.
 | `overlap_displays` | false | narrow the measurement lock to the timed windows (see Concurrency) |
 | `load_gate` | `{max_cpu: 75, max_wait_s: 180}` | before every timed window (and the static window) wait, bounded, for whole-machine CPU averaged over 2 s to fall below `max_cpu`. Each window then carries `loaded` (true when the gate gave up or the window's own mean CPU ended above `max_cpu`; **discard and repeat such a window**), `loadGate` (`waitedMs`, `cpuAtOpen`, `loaded`) and `windowCpuMean`; `aggregate.loadedRuns` counts them. `false` turns the gate off. Why: runs at 85–100 % CPU came out 10–25 ms slower than quiet ones |
 | `netlog` | false | each browser writes Chrome's net log to `runDir/netlog-<offset>-<n>.json` |
+| `stamp_band` | `'full'` | `'center'` reads a 2-row band through the stamp cells instead of averaging their height: immune to the stage's blit tearing, which is the ~10 % checksum failures at 1080p. Not yet the default (noise figure not re-measured) |
+| `mover_stop` | false | `true` or `{cycles, move_s, hold_s, step_ms, speed}`: a 48 px window moves in pointer-like steps and stops; per stop, where the client's picture comes to rest vs the true position (`staleStops`), and how fast it got there |
+| `cpu_burn` | null | `{threads, seconds}`: busy workers at normal priority during `slow_answer`'s joins (inside the lock), to reproduce the lost answer under load |
 | `custom` | null | `{ js: "<expression evaluated in the client page after the common join>", host_commands: [["status","--json"], ...], timeout: 20 }`; results in `special.custom` |
 
 Adding a request: write an `async function` in `handler.mjs` that returns a plain object, call it
