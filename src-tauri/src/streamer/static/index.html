@@ -266,6 +266,22 @@
             var JOIN_ID_KEY = 'se.joinId';
             var currentJoinId = '';
 
+            // A per-page-load name for this tab's offers, sent with every `POST /whep`. The join id
+            // only exists once an answer has arrived, so a first join whose answer is lost has
+            // nothing to present when it offers again, and the host builds a second session and a
+            // second display beside the one it already answered. With this id the host can
+            // recognise the retry as the attempt already in flight (a session opened under the
+            // same id that has never connected). A host that does not read the field ignores it.
+            var attemptId = (function () {
+                var b = new Uint8Array(16);
+                try { window.crypto.getRandomValues(b); } catch (_) {
+                    for (var i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+                }
+                var hex = '';
+                for (var k = 0; k < 16; k++) hex += (b[k] < 16 ? '0' : '') + b[k].toString(16);
+                return hex;
+            })();
+
             function setJoinId(id) {
                 currentJoinId = id || '';
                 try {
@@ -2597,6 +2613,7 @@
                             // it only while the session is still live and still belongs to this
                             // device token, so a stale one costs a fresh join and nothing else.
                             joinId: currentJoinId,
+                            attemptId: attemptId,
                             deviceName: joinData.deviceName,
                             os: joinData.os,
                             refreshRate: joinData.refreshRate,
