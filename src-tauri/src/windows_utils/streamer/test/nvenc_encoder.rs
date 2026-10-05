@@ -26,6 +26,57 @@ fn cfg(width: u32, height: u32, fps: u32, bitrate: u32) -> EncoderConfig {
     }
 }
 
+/// `NV_ENC_PARAMS_RC_CONSTQP` is 0 and has no bit in the rate-control capability mask, so a
+/// bitwise test rejected it on every driver and the quality slider silently became CBR.
+#[test]
+fn constant_qp_is_admitted_by_any_rate_control_mask() {
+    use crate::windows_utils::streamer::nvidia::encoder::rc_mode_supported;
+    use crate::windows_utils::streamer::nvidia::nvenc_sys::NV_ENC_PARAMS_RC_MODE::*;
+    // 0x3f is what an RTX 3080 Ti Laptop reports.
+    for mask in [0u32, 0x3f, 0x2] {
+        assert!(
+            rc_mode_supported(mask, NV_ENC_PARAMS_RC_CONSTQP),
+            "mask {mask:#x}"
+        );
+    }
+    assert!(rc_mode_supported(0x3f, NV_ENC_PARAMS_RC_CBR));
+    assert!(rc_mode_supported(0, NV_ENC_PARAMS_RC_CBR));
+    assert!(!rc_mode_supported(0x1, NV_ENC_PARAMS_RC_CBR));
+}
+
+/// A constant-QP request must reach the hardware: the session reports the QP it opened with, and
+/// a lower QP spends more bytes on the same picture than a higher one.
+#[test]
+fn nvenc_constant_qp_request_is_applied() {
+    let open = |qp: u8| {
+        Encoder::new(EncoderConfig {
+            qp: Some(qp),
+            ..cfg(1280, 720, 60, 8_000_000)
+        })
+    };
+    let (mut fine, mut coarse) = match (open(18), open(42)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            super::skip("NVENC constant-QP test (no NVIDIA GPU / driver)", e);
+            return;
+        }
+    };
+    assert_eq!(fine.constant_qp(), Some(18), "constant QP fell back to CBR");
+    assert_eq!(
+        coarse.constant_qp(),
+        Some(42),
+        "constant QP fell back to CBR"
+    );
+    let mut frame = vec![0u8; 1280 * 720 * 4];
+    fill_synthetic_bgra(&mut frame, 1280, 720, 7);
+    let a = fine.encode_bgra(&frame, true).expect("encode qp18").len();
+    let b = coarse.encode_bgra(&frame, true).expect("encode qp42").len();
+    assert!(
+        a > b * 2,
+        "QP 18 IDR {a} B is not clearly larger than QP 42 IDR {b} B"
+    );
+}
+
 fn percentile(sorted: &[u128], pct: usize) -> u128 {
     if sorted.is_empty() {
         return 0;
