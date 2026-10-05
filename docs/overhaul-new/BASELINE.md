@@ -34,11 +34,13 @@ Conditions that bound everything below:
 
 On a quiet machine the current head is **not slower than the old app at 1080p**: small-window
 p50 27.2 vs 26.5 ms, large-area p50 29.4 vs 29.6 ms, every range overlapping. That holds for p99
-and painted fps too. At the high-resolution client (2560×1440, DPR 2) it reads **slower in 3
-of 4 pairs**: p50 39.4 [32.7–40.6] vs 31.9 [30.3–32.0] ms, longest gap 59 vs 32 ms. The fourth
-new run, the quietest, read 32.7, so this is likely but **not established** (the follow-up
-request is under "Unverified"). **Joins are about twice as fast on the current head**: answer
-3.1 vs 6.2 s for a later join, first picture 3.6 s vs a slower old one. The old page waits 3 s
+and painted fps too. At the high-resolution client (2560×1440, DPR 2) **run at 60 Hz** it reads
+**slower in 3 of 4 pairs**: p50 39.4 [32.7–40.6] vs 31.9 [30.3–32.0] ms, longest gap 59 vs
+32 ms. The fourth current run, the quietest, read 32.7, so this is **not established**. At the
+**120 Hz the hi-res client really asks for**, the picture reverses: the old app **collapses**
+(p50 48 → 127 → 137 ms within a minute, gaps up to 392 ms), while the current head holds at
+35.6–37.8 ms. That is one clean pair. **Joins are about twice as fast on the current head**: answer
+3.1 vs 6.2 s for a later join, 4.6 vs 8.8 s for a host's first join. The old page waits 3 s
 for ICE gathering before it posts. Both builds share a **keyframe storm**: about 3 IDRs per
 second, all session. That inflates every number here equally. The current head's own defects
 are elsewhere: the page demotes itself to `<video>`, the quality slider never reaches the
@@ -50,7 +52,7 @@ does.
 
 Four interleaved pairs (std2–std5), 20 s windows (static 30 s), 1080p client = 1920×1080 CSS,
 DPR 1, 60 Hz; hi-res = 1280×720 CSS at DPR 2 (a 2560×1440 screen) claiming 120 Hz, **but run at
-60 Hz on both builds** (see census D-07). Median [min–max] (n). Latency in ms, host draw →
+60 Hz on both builds** (harness fault H-3; on the current head D-07 too). Median [min–max] (n). Latency in ms, host draw →
 client paint call.
 
 | scenario | metric | old `bef5f89` | current `06e6fbb` | difference |
@@ -80,13 +82,13 @@ client paint call.
 | page's own `hostToPaint` p50 | small / large / hi-res | — (old page has no counter) | 16.4–19.0 / 15.8–18.6 / 18.2–20.9 | |
 | WebRTC PLIs per 20 s window | small window | 56–61 | 64–83 | keyframe storm on both, D-01 |
 | join (first of a host) | submit → answer ms | 8787 [8483–12351] | 4615 [4293–6916] | current ~2× faster |
-| | submit → first stamped frame | 13775 [8566–15803] | 7533 [4360–12913] | old figure partly harness (H-4) |
+| | submit → first stamped frame | 13775 [8566–15803] | 7533 [4360–12913] | both inflated by the stage (H-2 current, H-4 old). Where the stage found the display at once, answer → first frame was 0.04–0.13 s old, 0.06–0.63 s current |
 | join (later, same host) | submit → answer | 6175 [5894–6348] | 3117 [3013–3334] | current ~2× faster |
 | | submit → first stamped frame | 12107 [11648–13599] | 3569 [3406–3722] | old figure inflated by H-4; old answer→picture is ≈ 0.1 s when the stage finds the display |
-| slow_answer, quiet machine, 10 joins each | answer ms | 5.5 s median [3.5–7.5] | 2.48 s median [2.42–4.66] | old page posts after ≥ 3 s of ICE gathering |
-| | first picture | 5.6 s [5.5–13.4], 2 of 10 not measured (H-4) | 2.80 s [2.56–4.73] | |
+| slow_answer, quiet machine, 10 joins each | answer ms | 5.56 s median [3.53–7.51] | 2.48 s median [2.42–4.66] | old page posts after ≥ 3 s of ICE gathering |
+| | first picture | 5.66 s [5.54–13.42], 2 of 10 not measured (H-4) | 2.80 s [2.56–4.73] | |
 | | lost answers / retried offers / 2nd display | 0 / 0 / 0 | 0 / 0 / 0 | not reproduced quiet (D-02) |
-| | WUDFHost growth (memory emergency) | per join | +93.9 MB / +53 handles / +8 threads (1 join, spM1); +94.4 MB / +54 / +8 for 2 displays (join + restart-rejoin, spA1) | +47.5 MB / +27 / +5 (1 join, msmoke3); +94.9 MB / +57 / +8 (1 join, spM1); +94.9 MB / +54 / +8 (1 join + 6 renegotiations, one a mode change, spA1) | **the same on both builds**: 47–95 MB, 27–57 handles, 5–8 threads per join. The leak is in the driver, not the host |
+| WUDFHost growth (memory emergency) | per join | +93.9 MB / +53 handles / +8 threads (1 join, spM1); +94.4 MB / +54 / +8 for 2 displays (join + restart-rejoin, spA1) | +47.5 MB / +27 / +5 (1 join, msmoke3); +94.9 MB / +57 / +8 (1 join, spM1); +94.9 MB / +54 / +8 (1 join + 6 renegotiations, one a mode change, spA1) | **the same on both builds**: 47–95 MB, 27–57 handles, 5–8 threads per join. The leak is in the driver, not the host |
 
 std1 (both builds, CPU 92–99 %) is excluded from the table. For the record, the loaded old run
 lost its first join's request entirely, and the loaded current run demoted itself to `<video>`.
@@ -101,7 +103,7 @@ Its hi-res p50 was 40.3 old vs 92.3 current.
 | `settings_change` (each class once, via CLI) | nothing applies live (overrides read at startup only), so nothing breaks either; `--native-dpr` does not exist | 1 join and 1 display before and after every edit, same join id and display id, no device removed/added. Stream edits renegotiate in place: picture back in 0.6–1.6 s, gap 0.4–1.1 s. Audio, scale and name edits cost no gap. **But** see D-05 (the old peer connection lingers) and D-08 (manual orientation silently ignored) |
 | `slow_answer` | 10 joins quiet: 0 flagged by the host side; 8 of 10 "answer > 5 s" only because the old page posts after 3 s of ICE gathering | 10 joins quiet: 0 flagged |
 | `mover_stop` (cursor stand-in at rest; `e8220e5` handler) | 0 of 11 stops stale; true position shown 12–32 ms after the stop | 0 of 11 stops stale; 11–35 ms |
-| `mic_prompt` | not re-run (memory). By code the old page shows the card when `setSinkId` exists, the mic is not granted and no output has a label, which is the same rule as the current page | not re-run. Handler author's run on this head: speaker access granted → no prompt, no card; nothing granted → card shown, outputs unlabelled. See D-09 |
+| `mic_prompt` | not re-run (memory). By code the old page shows the card when `setSinkId` exists, the mic is not granted and no output has a label, which is the same rule as the current page | not re-run. Handler author's run on this head: speaker access granted → no prompt, no card; nothing granted → card shown, outputs unlabelled. See O-5 |
 | `two_clients` | not run (memory) | not re-run. Author's runs: once B untouched, once B got no picture; on `d4d8be9` B's gap 635 ms and A's p50 221 ms after B joined (D-03) |
 | `leave_rejoin` | not run (memory) | not re-run. Author: rejoin within 2 s reused the display; gone within 1 s after a final leave |
 | `auto_rejoin` | not run | not re-run. Author: the page rejoined by itself within 12 s of a host restart |
@@ -129,7 +131,24 @@ Both of the coordinator's suspected confounds are absent from these pairs:
 G02's fixed build (constant QP really applied) measured 33.2–33.8 ms, a different rate-control
 mode from the old app's CBR. What remains between the builds here is the encoder configuration
 (profile and entropy, async) and noise. The fourth pair, the quietest, read level.
-HIRES120
+
+**The one clean pair at a real 120 Hz** (hr1). Handler ≥ `8a8bcf3`, request
+`{"scenarios":["hires_small_window"],"runs":3,"calibrate":false}`: one fresh join per build,
+three 20 s windows on it, every window gated and none loaded, CPU 39–60 %. Both builds landed at
+**2560×1440@120 with CBR 30 Mbps**. The old app ran Baseline; the current head ran High + CABAC.
+
+| window | old p50 / p99 / fps / longest gap | current p50 / p99 / fps / longest gap |
+|---|---|---|
+| 1 | 47.8 / 146.3 / 75.5 / 236 ms | 35.6 / 59.7 / 75.3 / 40 ms |
+| 2 | **127.3** / 163.5 / 62.1 / 217 ms | 36.0 / 55.5 / 78.5 / 48 ms |
+| 3 | **136.9** / 177.3 / 54.2 / 392 ms | 37.8 / 63.3 / 74.8 / 38 ms |
+
+**At 120 Hz the old app collapses within a minute and the current head holds.** Over three
+windows the old app's p50 climbed from 48 to 137 ms, its painted fps fell from 75 to 54, and its
+gaps reached 392 ms. This is the high-refresh collapse §6 asks about (`b0183dd`, `170138e`), and
+the overhaul fixed it. This is one pair only, because of the memory budget. So the 60 Hz gap
+above does not mean "the current head is worse at high resolution": at the rate a high-refresh
+client actually asks for, the current head is 1.3–3.8× better on p50.
 
 ## Bug census
 
@@ -166,7 +185,7 @@ step's runs showed. **Owner** is the commit group best placed to pick the defect
 | D-12 | Old app: an impossible RTT pushes the bitrate down | old serve.log `BWE: RTT congestion signal (rtt_ms=22705.4 > 80ms)`, 22.1 → 5.7 Mbps | std1-old (loaded) | **old** | The RTT unit bug fixed by `f5d0e27` | — (fixed) |
 | D-13 | The page reports audio ~65 ms off the picture | `audio`: page log `[audio] A/V sync: target=10.0ms residual=-62.8…-70.5ms` | 1 of 1 | current | not diagnosed | G06 |
 | §6 | green or banded frames on a static desktop | `{"scenarios":["static"]}` | current 0 of 5 runs. Old: 2 green frames in 1 of 4 runs | not reproduced on the current head | The handler author saw it in 2 of 5 loaded runs. Leads if it returns: `d996635`, `f66a5a7`, `9ffd3ad`, `abd1d2c` | G02 |
-| §6 | collapse at high refresh or high resolution | hi-res | **not tested at 120 Hz**: every hi-res run here was 60 Hz (H-3) | — | HIRES120_SHORT | G01, G04 |
+| §6 | collapse at high refresh or high resolution | hi-res | **not tested at 120 Hz**: every hi-res run here was 60 Hz (H-3) | — | **the old app collapses at 120 Hz**: p50 48 → 127 → 137 ms over three windows, gaps up to 392 ms. The current head holds 35.6–37.8 ms (one clean pair, hr1) | G01, G04 |
 | §6 | a display left behind after a leave | every run | 0: `cleanup.displaysLeftByUs` empty in every run, both builds | — | | |
 | §6 | slow join: the page waited on the mic card and on ICE gathering (`44f3f6d`, `5f6042c`) | `{}` | old: the POST leaves 3.0–5.6 s after submit (3 s of ICE gathering, plus the card and enumeration on a first join). Current: 0.05–2.6 s (trickle) | old slower | the current head's remaining join cost is the host: answer = display (1.9–2.4 s) + pipeline (0.4–0.8 s), serialised behind `DISPLAY_CORRELATION_LOCK` | G04 |
 | §6 | audio missing, late or on the plain track | O-3 | | old | | G06 |
@@ -296,7 +315,7 @@ build is named, run old and current interleaved.
 | what | why not | request |
 |---|---|---|
 | the 5th standard pair (std6) | memory emergency | `{}` on old, then current |
-| hi-res at a real 120 Hz | H-3 found after the standard runs; one pair planned at the end. HIRES120_STATUS | `{"scenarios":["hires_small_window"],"runs":3,"calibrate":false}` (handler ≥ `8a8bcf3`) |
+| hi-res at a real 120 Hz | one clean pair run (hr1, above); more pairs would confirm it | `{"scenarios":["hires_small_window"],"runs":3,"calibrate":false}` (handler ≥ `8a8bcf3`) |
 | noise figure with `stamp_band: "center"` | memory | five consecutive `{"stamp_band":"center"}` on the current head, and two `{"stamp_band":"full"}` beside them |
 | `mic_prompt`, both builds | memory | `{"scenarios":[],"calibrate":false,"mic_prompt":true}` |
 | `two_clients` and `leave_rejoin`, both builds | memory (≥ 4 displays each) | `{"scenarios":[],"calibrate":false,"two_clients":true,"leave_rejoin":true,"netlog":true}` |
