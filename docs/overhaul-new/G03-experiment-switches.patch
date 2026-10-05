@@ -1,0 +1,377 @@
+diff --git a/src-tauri/src/streamer/keyframe.rs b/src-tauri/src/streamer/keyframe.rs
+index 7937d3a..013a036 100644
+--- a/src-tauri/src/streamer/keyframe.rs
++++ b/src-tauri/src/streamer/keyframe.rs
+@@ -82,6 +82,7 @@ impl KeyframeGate {
+     pub fn for_locality(locality: super::webrtc_session::SessionLocality) -> Self {
+         use super::webrtc_session::SessionLocality::*;
+         let (floor, cap) = match locality {
++            SameNetwork if super::webrtc_session::g03("NO_GATE") => (0, 0),
+             SameNetwork => (MIN_IDR_INTERVAL_MS, MAX_IDR_INTERVAL_MS),
+             Unknown => (UNKNOWN_MIN_IDR_INTERVAL_MS, UNKNOWN_MAX_IDR_INTERVAL_MS),
+             CrossNetwork => (RELAY_MIN_IDR_INTERVAL_MS, RELAY_MAX_IDR_INTERVAL_MS),
+@@ -141,6 +142,12 @@ impl KeyframeGate {
+         }
+     }
+ 
++    /// Count a request something in front of the gate held back, so the telemetry total covers
++    /// every suppressed request and not only the ones this window caught.
++    pub fn note_suppressed(&self) {
++        self.suppressed.fetch_add(1, Ordering::Relaxed);
++    }
++
+     pub fn suppressed(&self) -> u64 {
+         self.suppressed.load(Ordering::Relaxed)
+     }
+@@ -154,12 +161,159 @@ impl KeyframeGate {
+     }
+ }
+ 
++/// The first window [`PliBackoff`] opens after an answered PLI keeps being followed by more.
++pub const PLI_BACKOFF_FLOOR_MS: u64 = 200;
++
++/// The widest it opens: one keyframe every two seconds for a receiver that never stops asking.
++pub const PLI_BACKOFF_CAP_MS: u64 = 2000;
++
++/// A PLI-free stretch this long means whatever was asking has been satisfied.
++const PLI_QUIET_RESET_MS: u64 = 2 * PLI_BACKOFF_CAP_MS;
++
++/// Rate limit for keyframe requests that arrive as RTCP PLI/FIR, on top of [`KeyframeGate`].
++///
++/// A receiver whose frames are consumed by an encoded transform — every WebCodecs client page,
++/// the relay's older copy and the pre-overhaul page included — never feeds libwebrtc's own
++/// decoder, and libwebrtc answers a decoder that has had nothing decodable for 200 ms with a
++/// keyframe request, forever. Measured on the Windows dev box: 117 PLIs in a 30 s static window,
++/// all admitted by the 200 ms same-network gate, so the host emitted an IDR every ~280 ms for the
++/// whole session. Nothing in the RTCP packet tells that receiver apart from one that really lost
++/// its picture, so this goes by behaviour: a decoder an IDR fixes stops asking, and one that keeps
++/// asking after being answered is not being fixed by IDRs. Each answered PLI that is followed by
++/// another doubles the window, up to [`PLI_BACKOFF_CAP_MS`]; a quiet stretch closes it again.
++///
++/// Evidence that a request is real opens the window at once: transport-wide feedback or a NACK
++/// reporting a lost packet, or the client's own stats showing its keyframe-request counter moved.
++/// The client's out-of-band request (opcode 0x64) never comes through here at all.
++#[derive(Debug)]
++pub struct PliBackoff {
++    window_ns: u64,
++    last_admit_ns: Option<u64>,
++    last_pli_ns: Option<u64>,
++    evidence: bool,
++    pub suppressed: u64,
++}
++
++impl Default for PliBackoff {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl PliBackoff {
++    pub fn new() -> Self {
++        Self {
++            window_ns: 0,
++            last_admit_ns: None,
++            last_pli_ns: None,
++            evidence: false,
++            suppressed: 0,
++        }
++    }
++
++    /// Something says the next request is genuine: a loss report, or the client counting one.
++    pub fn note_evidence(&mut self) {
++        self.evidence = true;
++    }
++
++    /// Whether this PLI/FIR may go on to the session's [`KeyframeGate`].
++    pub fn allow(&mut self, now_ns: u64) -> bool {
++        let quiet = self
++            .last_pli_ns
++            .is_none_or(|t| now_ns.saturating_sub(t) >= PLI_QUIET_RESET_MS * 1_000_000);
++        self.last_pli_ns = Some(now_ns);
++        if quiet || std::mem::take(&mut self.evidence) {
++            self.window_ns = 0;
++        }
++        if let Some(t) = self.last_admit_ns {
++            if now_ns.saturating_sub(t) < self.window_ns {
++                self.suppressed += 1;
++                return false;
++            }
++        }
++        self.last_admit_ns = Some(now_ns);
++        // Opened for the *next* request: a receiver satisfied by this answer never meets it.
++        self.window_ns = (self.window_ns * 2).clamp(
++            PLI_BACKOFF_FLOOR_MS * 1_000_000,
++            PLI_BACKOFF_CAP_MS * 1_000_000,
++        );
++        true
++    }
++
++    pub fn window_ms(&self) -> u64 {
++        self.window_ns / 1_000_000
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     const MS: u64 = 1_000_000;
+ 
++    /// libwebrtc's starving-decoder cadence, 30 s of it.
++    fn admitted_under_starvation(b: &mut PliBackoff, every_ms: u64, seconds: u64) -> u32 {
++        let mut n = 0;
++        let mut t = 1_000 * MS;
++        let end = t + seconds * 1_000 * MS;
++        while t < end {
++            if b.allow(t) {
++                n += 1;
++            }
++            t += every_ms * MS;
++        }
++        n
++    }
++
++    #[test]
++    fn a_receiver_that_never_stops_asking_backs_off_to_the_cap() {
++        let mut b = PliBackoff::new();
++        let n = admitted_under_starvation(&mut b, 200, 30);
++        // 200, 400, 800, 1600 then 2000 ms apart: about 18 in 30 s against the 150 that a
++        // 200 ms gate admits.
++        assert!(
++            n <= 20,
++            "starvation PLIs must collapse to the cap; got {n} in 30 s"
++        );
++        assert!(n >= 14, "and must still be answered at the cap; got {n}");
++        assert_eq!(b.window_ms(), PLI_BACKOFF_CAP_MS);
++    }
++
++    #[test]
++    fn a_decoder_one_keyframe_fixes_is_answered_at_once_every_time() {
++        let mut b = PliBackoff::new();
++        // One request, a few seconds of health, another: each one is the first in a while.
++        for i in 0..10u64 {
++            assert!(
++                b.allow(1_000 * MS + i * 5_000 * MS),
++                "request {i} was delayed"
++            );
++        }
++        assert_eq!(b.suppressed, 0);
++    }
++
++    #[test]
++    fn evidence_of_loss_opens_the_window_immediately() {
++        let mut b = PliBackoff::new();
++        admitted_under_starvation(&mut b, 200, 10);
++        // Keep the starvation cadence going until a request is actually held back.
++        let mut t = 11_000 * MS;
++        while b.allow(t) {
++            t += 200 * MS;
++        }
++        b.note_evidence();
++        assert!(
++            b.allow(t + 200 * MS),
++            "a PLI after reported loss must not wait out the backoff"
++        );
++    }
++
++    #[test]
++    fn the_first_request_of_a_session_is_never_held() {
++        let mut b = PliBackoff::new();
++        assert!(b.allow(0));
++    }
++
+     #[test]
+     fn the_first_request_is_always_admitted() {
+         let g = KeyframeGate::new();
+diff --git a/src-tauri/src/streamer/negotiate.rs b/src-tauri/src/streamer/negotiate.rs
+index b566975..8eac4a7 100644
+--- a/src-tauri/src/streamer/negotiate.rs
++++ b/src-tauri/src/streamer/negotiate.rs
+@@ -155,7 +155,12 @@ pub fn level_for(width: u32, height: u32, fps: u32) -> u8 {
+ /// recognisable — old Android and smart-TV decoders that only do constrained baseline are exactly
+ /// why the floor exists.
+ pub fn choose(offer: &OfferedVideo, width: u32, height: u32, fps: u32) -> NegotiatedVideo {
+-    let profile = if offer.h264_profiles.contains(&H264Profile::High) {
++    let profile = if super::webrtc_session::g03("BASELINE") {
++        H264Profile::Baseline
++    } else if super::webrtc_session::g03("MAIN") && offer.h264_profiles.contains(&H264Profile::Main)
++    {
++        H264Profile::Main
++    } else if offer.h264_profiles.contains(&H264Profile::High) {
+         H264Profile::High
+     } else if offer.h264_profiles.contains(&H264Profile::Main) {
+         H264Profile::Main
+diff --git a/src-tauri/src/streamer/webrtc_session.rs b/src-tauri/src/streamer/webrtc_session.rs
+index ec07e18..52a16d9 100644
+--- a/src-tauri/src/streamer/webrtc_session.rs
++++ b/src-tauri/src/streamer/webrtc_session.rs
+@@ -37,7 +37,7 @@ use super::bitrate::{
+ use super::config::H264Profile;
+ use super::congestion::{self, DelayBasedEstimate, NetworkState, SendHistory, SharedFeedback};
+ use super::input;
+-use super::keyframe::KeyframeGate;
++use super::keyframe::{KeyframeGate, PliBackoff};
+ use super::lock::LockExt;
+ use super::negotiate;
+ use super::pacer::{Pacer, PacingMode};
+@@ -103,6 +103,14 @@ pub fn live_sessions() -> i64 {
+     LIVE_SESSIONS.load(Ordering::Relaxed)
+ }
+ 
++/// G03 EXPERIMENT ONLY (never committed): `SE_G03_<name>=1`.
++pub(crate) fn g03(name: &str) -> bool {
++    matches!(
++        std::env::var(format!("SE_G03_{name}")).as_deref(),
++        Ok("1") | Ok("true")
++    )
++}
++
+ /// The one path every keyframe request in a session takes.
+ ///
+ /// There are five callers — an RTCP PLI, an RTCP FIR, this client opcode, a payloader failure
+@@ -932,6 +940,8 @@ pub async fn prepare_whep(
+         _ => RTP_PAYLOAD_MTU_LAN,
+     };
+     let pacing_mode = match locality {
++        SessionLocality::SameNetwork if g03("PACE_LIGHT") => PacingMode::Light,
++        SessionLocality::SameNetwork if g03("PACE_FULL") => PacingMode::Full,
+         SessionLocality::SameNetwork => PacingMode::Off,
+         SessionLocality::Unknown => PacingMode::Light,
+         SessionLocality::CrossNetwork => PacingMode::Full,
+@@ -948,7 +958,7 @@ pub async fn prepare_whep(
+ 
+     // Whether this client can carry a transport-wide sequence number at all. Read from the
+     // offer, because an extension the peer did not offer cannot be negotiated into the answer.
+-    let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01");
++    let twcc_offered = offer_sdp.contains("transport-wide-cc-extensions-01") && !g03("NO_TWCC");
+ 
+     // Everything from here to the answer can fail — `set_remote_description` on a malformed
+     // offer most realistically — and each failure used to return with the peer connection, its
+@@ -1271,6 +1281,10 @@ pub async fn activate_whep(
+             use webrtc::rtcp::transport_feedbacks::transport_layer_cc::TransportLayerCc;
+             use webrtc::rtcp::transport_feedbacks::transport_layer_nack::TransportLayerNack;
+             let telemetry = Arc::clone(&pipeline.telemetry);
++            // See `PliBackoff`: an encoded-transform receiver asks every 200 ms for as long as
++            // the session lives, and the gate alone answered nearly every one with an IDR.
++            let mut pli_backoff = (!g03("NO_PLI_BACKOFF")).then(PliBackoff::new);
++            let mut client_key_requests: u32 = 0;
+             let mut rtcp_buf = vec![0u8; 1500];
+             let mut deltas: Vec<f64> = Vec::with_capacity(256);
+             while let Ok((packets, _attrs)) = rtp_sender.read(&mut rtcp_buf).await {
+@@ -1288,7 +1302,25 @@ pub async fn activate_whep(
+                             .degradation
+                             .keyframe_requests
+                             .fetch_add(1, Ordering::Relaxed);
+-                        keyframes.request_keyframe_for_client_quietly();
++                        let admitted = match pli_backoff.as_mut() {
++                            Some(b) => {
++                                // The client counts the requests its own page makes; a moved
++                                // counter is the page saying this one is genuine.
++                                if let Some(stats) = telemetry.client.get() {
++                                    if stats.keyframe_requests != client_key_requests {
++                                        client_key_requests = stats.keyframe_requests;
++                                        b.note_evidence();
++                                    }
++                                }
++                                b.allow(audio::host_now_ns())
++                            }
++                            None => true,
++                        };
++                        if admitted {
++                            keyframes.request_keyframe_for_client_quietly();
++                        } else {
++                            keyframes.gate.note_suppressed();
++                        }
+                     } else if let Some(nack) = any.downcast_ref::<TransportLayerNack>() {
+                         // Counted, never logged: a lossy link produces these continuously and
+                         // every logbus line is a JSON IPC event to the UI.
+@@ -1301,6 +1333,9 @@ pub async fn activate_whep(
+                             .degradation
+                             .nacks_received
+                             .fetch_add(lost.max(1), Ordering::Relaxed);
++                        if let Some(b) = pli_backoff.as_mut() {
++                            b.note_evidence();
++                        }
+                     } else if let Some(fb) = any.downcast_ref::<TransportLayerCc>() {
+                         let summary = {
+                             let mut guard = feedback.history.lock_recover();
+@@ -1312,6 +1347,11 @@ pub async fn activate_whep(
+                         if summary.reported > 0 {
+                             feedback.record_report(&summary);
+                         }
++                        if summary.lost > 0 {
++                            if let Some(b) = pli_backoff.as_mut() {
++                                b.note_evidence();
++                            }
++                        }
+                         // The receipts, straight through to the encode thread. This is the whole
+                         // point of stamping the transport-wide sequence numbers ourselves: the
+                         // host can name the frames the client holds and the frames it does not,
+@@ -1345,14 +1385,16 @@ pub async fn activate_whep(
+     // could not get a better one, since SCTP does not report loss the way RTCP does.
+     let link_loss = Arc::new(std::sync::atomic::AtomicU32::new(0));
+ 
+-    spawn_bitrate_driver(
+-        Arc::clone(&pc),
+-        pipeline.clone(),
+-        Arc::clone(&feedback),
+-        Arc::clone(&keyframe_gate),
+-        Arc::clone(&pacing_target_bps),
+-        Arc::clone(&link_loss),
+-    );
++    if !g03("NO_BWE") {
++        spawn_bitrate_driver(
++            Arc::clone(&pc),
++            pipeline.clone(),
++            Arc::clone(&feedback),
++            Arc::clone(&keyframe_gate),
++            Arc::clone(&pacing_target_bps),
++            Arc::clone(&link_loss),
++        );
++    }
+ 
+     if let Some(mut audio) = audio {
+         audio.link_loss = Some(link_loss);
+@@ -1377,6 +1419,8 @@ pub async fn activate_whep(
+             let _pc = pc_keepalive;
+             let telemetry = Arc::clone(&pipeline.telemetry);
+             let mut packetizer = H264Packetizer::new();
++            let stock_payloader = g03("STOCK_PAYLOADER");
++            let mut stock = webrtc::rtp::codecs::h264::H264Payloader::default();
+             // A per-session access-unit ordinal, so transport-wide feedback can say which *frame*
+             // the client received whole rather than only which packets it did. See
+             // `SharedFeedback::acked_frame_capture_ns`.
+@@ -1419,7 +1463,15 @@ pub async fn activate_whep(
+                         let capture_ns = audio::host_instant_to_ns(frame.capture);
+                         let rtp_ts = audio::host_ns_to_rtp90k(capture_ns);
+                         frame_ordinal = frame_ordinal.wrapping_add(1);
+-                        packetizer.packetize(mtu, &frame.data, &mut payloads);
++                        if stock_payloader {
++                            use webrtc::rtp::packetizer::Payloader;
++                            payloads.clear();
++                            if let Ok(p) = stock.payload(mtu, &frame.data) {
++                                payloads.extend(p);
++                            }
++                        } else {
++                            packetizer.packetize(mtu, &frame.data, &mut payloads);
++                        }
+                         if payloads.is_empty() {
+                             // Nothing packetizable in this access unit at all — an encoder that
+                             // emitted only an AUD, or a degenerate buffer. Asking for another IDR
+@@ -2083,6 +2135,7 @@ fn spawn_bitrate_driver(
+     let mut last_receiver_report: Option<(u64, u64)> = None;
+     let mut stale_report_run: u32 = 0;
+     let mut stale_run_logged = false;
++    let no_delay_bwe = g03("NO_DELAY_BWE");
+ 
+     tokio::spawn(async move {
+         let mut ticker = tokio::time::interval(BWE_POLL_INTERVAL);
+@@ -2210,7 +2263,7 @@ fn spawn_bitrate_driver(
+                 None => estimate_bps,
+             };
+ 
+-            if let Some(state) = delay_state {
++            if let Some(state) = delay_state.filter(|_| !no_delay_bwe) {
+                 let delay_bps = delay_estimate.update(state, delivered_bps, now);
+                 if state == NetworkState::Overuse {
+                     pipeline
