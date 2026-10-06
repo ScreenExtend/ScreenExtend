@@ -184,6 +184,8 @@
         hasElemSink: false,
         hasCtxSink: false,
         hasSelectOut: false,
+        hasSinkApi: false,
+        insecure: false,
         hasDeviceChange: false,
         hasAudioSession: false,
         isIOS: false,
@@ -265,7 +267,17 @@
             speakers.hasEarpiece = detectHasEarpiece();
             speakers.canSink = speakers.hasEnumerate && (speakers.hasElemSink || speakers.hasCtxSink);
             speakers.canCategory = speakers.hasEarpiece;
-            speakers.supported = speakers.canSink || speakers.canCategory;
+            // `setSinkId`, `selectAudioOutput` and `navigator.mediaDevices` are all
+            // secure-context only, so on plain HTTP they are simply absent: that is the
+            // connection, not the browser, and the page offers HTTPS for it at load.
+            speakers.insecure = window.isSecureContext === false;
+            speakers.hasSinkApi = speakers.hasElemSink || speakers.hasCtxSink || speakers.hasSelectOut;
+            // `false` is what makes the host's sheet say "this device's browser can't switch
+            // speakers", so it is sent only when that is true: no sink API of any kind, no
+            // earpiece category, and not because the page is on HTTP. Whether a list could be
+            // read *yet* (no grant, card skipped, permission denied) is not this question; that
+            // device gets the "Choose a speaker on this device…" entry instead.
+            speakers.supported = speakers.hasSinkApi || speakers.canCategory || speakers.insecure;
         } catch (_) { note(); }
         if (speakers.hasAudioSession) {
             try { navigator.audioSession.type = 'playback'; } catch (_) { note(); }
@@ -325,7 +337,9 @@
     //             the browser's own chooser (no microphone), opened by the Join click itself
     //   none    — nothing routable and nothing worth asking; the host gets the choose entry
     function outputPlan(f) {
-        if (!f.canSink) return { action: 'none', reason: 'no-sink-api' };
+        if (!f.canSink) {
+            return { action: 'none', reason: f.insecure ? 'insecure-context' : (f.hasSinkApi ? 'no-enumeration' : 'no-sink-api') };
+        }
         if (f.routable > 0) return { action: 'report', reason: f.labelled ? 'labelled' : 'unlabelled' };
         if (f.hasSelectOut) return f.chooseRequested ? { action: 'picker', reason: 'operator-asked' } : { action: 'none', reason: 'picker-engine' };
         if (!f.secure || !f.hasGUM) return { action: 'none', reason: 'cannot-prompt' };
@@ -358,6 +372,8 @@
         let enumerated = speakers.canSink ? await listOutputs() : [];
         const plan = outputPlan({
             canSink: speakers.canSink,
+            insecure: speakers.insecure,
+            hasSinkApi: speakers.hasSinkApi,
             routable: enumerated.length,
             labelled: enumerated.some((d) => d.label),
             hasSelectOut: speakers.hasSelectOut,
@@ -370,6 +386,7 @@
         plan.mic = mic;
         plan.speakerSelection = speakerSel;
         plan.routable = enumerated.length;
+        plan.supported = speakers.supported;
         if (plan.action === 'card' && typeof showCard === 'function') {
             plan.answer = await askWithCard(showCard);
             if (plan.answer === 'granted') enumerated = lastAskListed;
@@ -499,10 +516,7 @@
             out.push({ id: SE_LOUDSPEAKER, label: 'Speaker' });
             out.push({ id: SE_EARPIECE, label: 'Earpiece' });
         }
-        if (speakers.canSink && !enumerated.length) {
-            // Nothing routable without asking, so the host gets the request itself as an entry.
-            out.push({ id: SE_CHOOSE, label: 'Choose a speaker on this device…' });
-        } else if (speakers.canSink) {
+        if (speakers.canSink && enumerated.length) {
             let n = 0;
             for (const d of enumerated) {
                 if (d.label) { out.push(d); continue; }
@@ -512,6 +526,11 @@
                     label: (d.id === 'default' || d.id === '') ? 'Default output' : 'Output ' + n,
                 });
             }
+        } else if (speakers.canSink || speakers.hasSinkApi || speakers.insecure) {
+            // Nothing routable without asking — no grant yet, the card skipped or refused, the
+            // permission denied, or the page on HTTP where every sink API is hidden — so the
+            // host gets the request itself as an entry, beside its own default.
+            out.push({ id: SE_CHOOSE, label: 'Choose a speaker on this device…' });
         }
         return out;
     }
@@ -671,8 +690,10 @@
         // lands and `setSpeakerIdentity` clears the change detection, so the first real post
         // is the one that goes out.
         if (!speakers.sessionId) return;
+        // `speakers.supported` is `false` until the probe runs; a post must never carry that.
+        initSpeakers();
         try {
-            const cache = speakers._cache || { supported: speakers.supported, outputs: [] };
+            const cache = speakers._cache || { supported: speakers.supported, outputs: buildOutputs([]) };
             const body = JSON.stringify({
                 sessionId: speakers.sessionId || '',
                 deviceToken: speakers.deviceToken || '',

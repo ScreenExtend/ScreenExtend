@@ -868,8 +868,10 @@ struct AudioOutputEntry {
 
 #[derive(Deserialize)]
 struct AudioOutputsRequest {
+    /// Optional: a body without it says nothing about the browser, and the host must not read
+    /// that as "cannot switch speakers" (the device sheet's only use of `false`).
     #[serde(default)]
-    supported: bool,
+    supported: Option<bool>,
     #[serde(default)]
     outputs: Vec<AudioOutputEntry>,
     /// The sink the client is playing on right now, which is not always the one the host
@@ -894,12 +896,19 @@ async fn audio_outputs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let req: AudioOutputsRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return StatusCode::NO_CONTENT.into_response(),
-    };
     let Some(join) = resolve_join(&state, &query, &headers, peer.ip()) else {
         return StatusCode::NO_CONTENT.into_response();
+    };
+    process_audio_outputs(&state, &join, &body);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// One `/audio-outputs` body for one join, from either transport. The relay names the join in
+/// the query it tunnels; a join the host does not hold is ignored rather than created.
+pub fn process_audio_outputs(state: &AppState, join: &str, body: &[u8]) {
+    let req: AudioOutputsRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return,
     };
     let outputs: Vec<session::AudioOutput> = req
         .outputs
@@ -915,15 +924,42 @@ async fn audio_outputs(
         .current
         .map(|c| truncate_chars(&c, MAX_AUDIO_OUTPUT_STR));
 
-    if let Some(s) = state.config.sessions.as_ref() {
-        session::set_audio_outputs(s, &join, req.supported, outputs, current, req.labelled);
-        if let Some(reporter) = state.config.device_reporter.as_ref() {
-            let token = session::device_token_for(s, &join).unwrap_or_default();
-            let report = state.audio_outputs_report(&join);
-            reporter.report_audio_outputs(join, token, report);
-        }
+    let Some(s) = state.config.sessions.as_ref() else {
+        return;
+    };
+    if !s.lock_recover().contains_key(join) {
+        return;
     }
-    StatusCode::NO_CONTENT.into_response()
+    let token = session::device_token_for(s, join).unwrap_or_default();
+    // One line per post: the device sheet's "can't switch speakers" is this `supported`, and
+    // without the line nothing on the host records which device said it, or whether it said
+    // anything at all.
+    tprintln!(
+        "[audio-outputs] join {join}: supported={} outputs={} ({}) labelled={} current={}",
+        req.supported
+            .map_or("unsaid".to_string(), |b| b.to_string()),
+        outputs.len(),
+        outputs
+            .iter()
+            .map(|o| if o.id.starts_with("se:") {
+                o.id.as_str()
+            } else {
+                "device"
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        req.labelled.map_or("unsaid".to_string(), |b| b.to_string()),
+        current.as_deref().map_or("unsaid", |c| if c.is_empty() {
+            "default"
+        } else {
+            "device"
+        }),
+    );
+    session::set_audio_outputs(s, join, req.supported, outputs, current, req.labelled);
+    if let Some(reporter) = state.config.device_reporter.as_ref() {
+        let report = state.audio_outputs_report(join);
+        reporter.report_audio_outputs(join.to_string(), token, report);
+    }
 }
 
 impl AppState {
