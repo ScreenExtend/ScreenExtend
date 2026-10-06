@@ -260,10 +260,14 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
   // One page load. `o.enumerate(granted)` answers enumerateDevices; `o.mic` is the microphone
   // permission state; `o.gum` is what the browser's prompt does ('grant' | 'refuse');
   // `o.localStorage` is shared between page loads of one device.
+  // `o.sinkApi === false` removes `setSinkId` from both prototypes and `o.mediaDevices === false`
+  // removes `navigator.mediaDevices` — what a real engine does on plain HTTP (all three are
+  // secure-context only) and what Safari before 18.4 does everywhere. `o.ua`/`o.platform`/
+  // `o.touch` shape the device. Every `/audio-outputs` body the page sends is in `_st.posts`.
   function page(o) {
-    const st = { granted: o.mic === 'granted', gumCalls: 0, queries: [] };
+    const st = { granted: o.mic === 'granted', gumCalls: 0, queries: [], posts: [] };
     const win = { AudioContext: function () {}, isSecureContext: o.secure !== false, localStorage: o.localStorage || null };
-    win.AudioContext.prototype = { audioWorklet: {}, setSinkId() {} };
+    win.AudioContext.prototype = o.sinkApi === false ? { audioWorklet: {} } : { audioWorklet: {}, setSinkId() {} };
     const md = {
       enumerateDevices: async () => { if (o.enumerate === 'throw') throw new Error('nope'); return o.enumerate(st.granted); },
       addEventListener() {},
@@ -279,9 +283,9 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     }
     if (o.hasSelectOut) md.selectAudioOutput = async () => null;
     const nav = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      platform: 'Win32',
-      maxTouchPoints: 0,
+      userAgent: o.ua || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      platform: o.platform || 'Win32',
+      maxTouchPoints: o.touch || 0,
       permissions: {
         query: async ({ name }) => {
           st.queries.push(name);
@@ -289,7 +293,7 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
           return { state: st.granted ? 'granted' : (o.mic || 'prompt') };
         },
       },
-      mediaDevices: md,
+      mediaDevices: o.mediaDevices === false ? undefined : md,
     };
     const c = {
       console: { log() {}, warn() {}, error() {} },
@@ -298,12 +302,13 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
       setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
       clearTimeout, clearInterval,
       Promise, Float32Array, Int32Array, Uint8Array, ArrayBuffer, DataView, JSON, Math, Date,
-      fetch: async () => ({ ok: true }),
+      fetch: async (url, init) => { if (/^\/audio-outputs/.test(url)) st.posts.push(JSON.parse(init.body)); return { ok: true }; },
       navigator: nav,
       document: { visibilityState: 'visible', createElement: () => ({ setAttribute() {}, play: () => Promise.resolve(), style: {} }), body: { appendChild() {} } },
       HTMLMediaElement: function () {},
     };
-    c.HTMLMediaElement.prototype = { setSinkId() {} };
+    c.HTMLMediaElement.prototype = o.sinkApi === false ? {} : { setSinkId() {} };
+    if (o.screen) c.screen = o.screen;
     Object.assign(c, win);
     c.window = c;
     c.self = c;
@@ -334,6 +339,10 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
       ['no setSinkId at all', {}, { canSink: false }, 'none'],
     ];
     for (const [name, , delta, want] of rows) eq('plan: ' + name, A.outputPlan(Object.assign({}, base, delta)).action, want);
+    const why = (d) => A.outputPlan(Object.assign({}, base, d)).reason;
+    eq('plan reason: no sink API anywhere', why({ canSink: false }), 'no-sink-api');
+    eq('plan reason: sink API hidden by plain HTTP', why({ canSink: false, insecure: true }), 'insecure-context');
+    eq('plan reason: a sink API but no enumeration', why({ canSink: false, hasSinkApi: true }), 'no-enumeration');
   }
 
   // 1. Outputs come back without asking — nameless, but routable. No card, no prompt.
@@ -489,6 +498,77 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     const A = page({ enumerate: chromium, gum: 'grant' });
     const plan = await A.prepareOutputsForJoin((_c, skip) => skip());
     eq('without storage a Skip still ends the join wait', plan.answer, 'skipped');
+  }
+
+  // 12. What `/audio-outputs` actually carries, per state. The host's device sheet says "This
+  //     device's browser can't switch speakers" for `supported: false` and for nothing else, so
+  //     that value is sent only by an engine with no sink API at all (no `setSinkId`, no
+  //     `selectAudioOutput`) and no earpiece category. Everything else is `true`, with either a
+  //     routable list or the choose entry.
+  {
+    const join = async (o, answer) => {
+      const A = page(Object.assign({ localStorage: store() }, o));
+      await A.prepareOutputsForJoin(answer || ((_c, skip) => skip()));
+      A.setSpeakerIdentity('SESSION', 'token', 'join-1');
+      A.postOutputs();
+      await flush();
+      const p = A._st.posts[A._st.posts.length - 1];
+      return { A, p, ids: p ? p.outputs.map((x) => x.id) : null };
+    };
+    const C = page({ enumerate: chromium }).CHOOSE_OUTPUT;
+
+    let r = await join({ enumerate: chromium, mic: 'granted' });
+    eq('routable list: supported, the list', r.p.supported + '/' + r.ids.join(','), 'true/default,abc');
+
+    r = await join({ enumerate: chromium, gum: 'grant' }, (c) => c());
+    eq('Chromium, card answered with a grant: supported, the list', r.p.supported + '/' + r.ids.join(','), 'true/default,abc');
+
+    r = await join({ enumerate: chromium, gum: 'grant' });
+    eq('Chromium, nothing granted, card skipped: supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+
+    r = await join({ enumerate: chromium, gum: 'refuse' }, (c) => c());
+    eq('Chromium, prompt refused: supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+
+    r = await join({ enumerate: chromium, mic: 'denied' });
+    eq('Chromium, microphone denied: supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+
+    {
+      const ls = store(); ls.setItem('se.outputs.micCardAnswer', 'skipped');
+      r = await join({ enumerate: chromium, localStorage: ls });
+      eq('Chromium, declined at an earlier join: supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+    }
+
+    r = await join({ enumerate: () => [], hasSelectOut: true });
+    eq('selectAudioOutput engine, nothing listed: supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+
+    r = await join({ enumerate: chromium, secure: false, sinkApi: false, mediaDevices: false });
+    eq('plain HTTP (every sink API hidden): supported, choose entry', r.p.supported + '/' + r.ids.join(','), 'true/' + C);
+    eq('and the plan says why', r.A.getOutputPlan().reason, 'insecure-context');
+
+    r = await join({ enumerate: chromium, sinkApi: false });
+    eq('no setSinkId and no selectAudioOutput (Safari before 18.4): NOT supported', r.p.supported + '/' + r.ids.length, 'false/0');
+    eq('and the plan says why', r.A.getOutputPlan().reason, 'no-sink-api');
+
+    r = await join({ enumerate: chromium, sinkApi: false, mediaDevices: false, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', platform: 'iPhone', touch: 5 });
+    eq('iPhone before 18.4: supported, Speaker and Earpiece', r.p.supported + '/' + r.ids.join(','), 'true/se:loudspeaker,se:earpiece');
+
+    r = await join({ enumerate: chromium, sinkApi: false, mediaDevices: false, ua: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)', platform: 'iPad', touch: 5 });
+    eq('iPad before 18.4 on HTTPS: NOT supported (the honest case)', r.p.supported + '/' + r.ids.length, 'false/0');
+
+    // A post sent before the join had detected anything still says `true`, and the post after
+    // detection replaces it with the list.
+    {
+      const A = page({ enumerate: chromium, mic: 'granted', localStorage: store() });
+      A.setSpeakerIdentity('SESSION', 'token', 'join-1');
+      A.postOutputs();
+      await flush();
+      eq('a post before detection is not "cannot switch"', A._st.posts[0] && A._st.posts[0].supported, true);
+      await A.prepareOutputsForJoin(() => {});
+      A.postOutputs();
+      await flush();
+      const last = A._st.posts[A._st.posts.length - 1];
+      eq('and the post after detection carries the list', last.supported + '/' + last.outputs.length, 'true/2');
+    }
   }
 }
 
