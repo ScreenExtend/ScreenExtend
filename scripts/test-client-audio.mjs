@@ -232,78 +232,106 @@ bv.setUint16(HDR, 999, true); // claims more primary bytes than the frame holds
 send(bad);
 eq('a truncated redundant frame decodes nothing', decoded.length, 0);
 
-// ── audio.js: finding the outputs at the join, and when the microphone is asked for ──────
+// ── audio.js: output discovery at Connect (owner spec, OWNER-SPEC-audio-discovery.md) ──────
 //
-// The owner's rule: detect the outputs without asking wherever the platform allows; raise the
-// microphone card only when that found nothing routable and a grant can change it; settle all
-// of it before the offer goes out. The facts it is built on (Chrome/Edge 154, measured): with
-// no grant they list exactly one output, with an empty id and label; a microphone grant lists
-// them all, labelled; `permissions.query({name: 'speaker-selection'})` throws.
+// Every discovery API runs in order with its own bounded timeout and a definite result (`ok`,
+// `unsupported`, `denied`, `empty`, `error`, `timeout`). A routable output — a non-empty
+// `deviceId` from the chooser or the enumeration, or the iPhone's two audio-session sinks — is
+// a success. Only when there is none does the microphone card appear; on Continue,
+// `getUserMedia` once, enumerate again, stop the stream. If that fails too the host gets exactly
+// one option, the default output, `labelled: false`. The report is final before the offer.
+// The facts (Chrome/Edge 154, measured): with no grant one output with an empty id and label; a
+// microphone grant lists them all, labelled; `speaker-selection` throws `TypeError`.
 //
 // audio.js is an IIFE that assigns `window.SEAudio`, so it is run whole against stubbed
-// `navigator` surfaces and asked directly.
+// `navigator` surfaces and asked directly. Timers run at 1/1000 speed, so a 30 s bound is 30 ms.
 {
   const audioSrc = fs.readFileSync(STATIC + '/audio.js', 'utf8');
 
-  const store = () => ({
-    _v: {},
-    getItem(k) { return Object.prototype.hasOwnProperty.call(this._v, k) ? this._v[k] : null; },
-    setItem(k, v) { this._v[k] = String(v); },
-    removeItem(k) { delete this._v[k]; },
-  });
   const CHROMIUM_NO_GRANT = [{ kind: 'audiooutput', deviceId: '', label: '' }, { kind: 'audioinput', deviceId: '', label: '' }];
   const LABELLED = [
     { kind: 'audiooutput', deviceId: 'default', label: 'Default - Speakers (Realtek(R) Audio)' },
     { kind: 'audiooutput', deviceId: 'abc', label: 'Speakers (Boom Audio)' },
   ];
+  const FIREFOX_UNLABELLED = [{ kind: 'audiooutput', deviceId: 'ff1', label: '' }, { kind: 'audiooutput', deviceId: 'ff2', label: '' }];
+  const never = () => new Promise(() => {});
+  const err = (name, msg) => { const e = new Error(msg || name); e.name = name; return e; };
+  const chromium = (granted) => (granted ? LABELLED : CHROMIUM_NO_GRANT);
+  const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
 
-  // One page load. `o.enumerate(granted)` answers enumerateDevices; `o.mic` is the microphone
-  // permission state; `o.gum` is what the browser's prompt does ('grant' | 'refuse');
-  // `o.localStorage` is shared between page loads of one device.
+  // One page load. Every option names how one API behaves:
+  //   picker:       'missing' | 'throw' | 'timeout' | 'dismiss' | 'empty' | { deviceId, label }
+  //   speakerPerm:  'missing' (no Permissions API) | 'throw' (TypeError, Chromium) | 'timeout' | a state
+  //   mic:          a state ('granted' | 'prompt' | 'denied') | 'throw' | 'timeout'
+  //   enumerate:    (granted) => devices | 'missing' | 'throw' | 'timeout'
+  //   gum:          'grant' | 'refuse' | 'none' | 'timeout'
+  //   sinkApi:      false removes setSinkId from both prototypes; mediaDevices: false removes it
+  //   ua/platform/touch shape the device; audioSession: true adds navigator.audioSession
+  // Every `/audio-outputs` body is in `_st.posts`.
   function page(o) {
-    const st = { granted: o.mic === 'granted', gumCalls: 0, queries: [] };
-    const win = { AudioContext: function () {}, isSecureContext: o.secure !== false, localStorage: o.localStorage || null };
-    win.AudioContext.prototype = { audioWorklet: {}, setSinkId() {} };
+    const st = { granted: o.mic === 'granted', gumCalls: 0, pickerCalls: 0, posts: [], tracksStopped: 0 };
+    const win = { AudioContext: function () {}, isSecureContext: o.secure !== false, localStorage: null };
+    win.AudioContext.prototype = o.sinkApi === false ? { audioWorklet: {} } : { audioWorklet: {}, setSinkId() {} };
     const md = {
-      enumerateDevices: async () => { if (o.enumerate === 'throw') throw new Error('nope'); return o.enumerate(st.granted); },
+      enumerateDevices: () => {
+        if (o.enumerate === 'throw') return Promise.reject(err('InvalidStateError', 'nope'));
+        if (o.enumerate === 'timeout') return never();
+        return Promise.resolve(o.enumerate(st.granted));
+      },
       addEventListener() {},
-      ondevicechange: null,
     };
+    if (o.deviceChange !== false) md.ondevicechange = null;
+    if (o.enumerate === 'missing') delete md.enumerateDevices;
     if (o.gum !== 'none') {
-      md.getUserMedia = async () => {
+      md.getUserMedia = () => {
         st.gumCalls++;
-        if (o.gum === 'refuse') { const e = new Error('Permission denied'); e.name = 'NotAllowedError'; throw e; }
+        if (o.gum === 'refuse') return Promise.reject(err('NotAllowedError', 'Permission denied'));
+        if (o.gum === 'timeout') return never();
         st.granted = true;
-        return { getTracks: () => [{ stop() {} }] };
+        return Promise.resolve({ getTracks: () => [{ stop() { st.tracksStopped++; } }] });
       };
     }
-    if (o.hasSelectOut) md.selectAudioOutput = async () => null;
-    const nav = {
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      platform: 'Win32',
-      maxTouchPoints: 0,
-      permissions: {
-        query: async ({ name }) => {
-          st.queries.push(name);
-          if (name === 'speaker-selection') throw new TypeError("Failed to execute 'query' on 'Permissions'");
-          return { state: st.granted ? 'granted' : (o.mic || 'prompt') };
-        },
+    if (o.picker && o.picker !== 'missing') {
+      md.selectAudioOutput = () => {
+        st.pickerCalls++;
+        if (o.picker === 'throw') throw err('InvalidStateError', 'no activation');
+        if (o.picker === 'timeout') return never();
+        if (o.picker === 'dismiss') return Promise.reject(err('NotAllowedError', 'dismissed'));
+        if (o.picker === 'empty') return Promise.resolve({ deviceId: '', label: '' });
+        return Promise.resolve(o.picker);
+      };
+    }
+    const perms = {
+      query: ({ name }) => {
+        const mode = name === 'speaker-selection' ? (o.speakerPerm || 'throw') : (o.mic || 'prompt');
+        if (mode === 'throw') return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions'"));
+        if (mode === 'timeout') return never();
+        if (name === 'microphone' && st.granted) return Promise.resolve({ state: 'granted' });
+        return Promise.resolve({ state: mode });
       },
-      mediaDevices: md,
     };
+    const nav = {
+      userAgent: o.ua || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      platform: o.platform || 'Win32',
+      maxTouchPoints: o.touch || 0,
+      mediaDevices: o.mediaDevices === false ? undefined : md,
+    };
+    if (o.speakerPerm !== 'missing') nav.permissions = perms;
+    if (o.audioSession) nav.audioSession = { type: 'auto' };
     const c = {
       console: { log() {}, warn() {}, error() {} },
       performance: { now: () => 0, timeOrigin: 0 },
-      setTimeout: (fn, ms) => { const t = setTimeout(fn, ms); if (t.unref) t.unref(); return t; },
+      // Not unref'd: a bounded call's deadline is what settles it, so it must keep node alive.
+      setTimeout: (fn, ms) => setTimeout(fn, Math.ceil((ms || 0) / 1000)),
       setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
       clearTimeout, clearInterval,
       Promise, Float32Array, Int32Array, Uint8Array, ArrayBuffer, DataView, JSON, Math, Date,
-      fetch: async () => ({ ok: true }),
+      fetch: async (url, init) => { if (/^\/audio-outputs/.test(url)) st.posts.push(JSON.parse(init.body)); return { ok: true }; },
       navigator: nav,
       document: { visibilityState: 'visible', createElement: () => ({ setAttribute() {}, play: () => Promise.resolve(), style: {} }), body: { appendChild() {} } },
       HTMLMediaElement: function () {},
     };
-    c.HTMLMediaElement.prototype = { setSinkId() {} };
+    c.HTMLMediaElement.prototype = o.sinkApi === false ? {} : { setSinkId() {} };
     Object.assign(c, win);
     c.window = c;
     c.self = c;
@@ -312,183 +340,172 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     c.SEAudio._st = st;
     return c.SEAudio;
   }
-  const chromium = (granted) => (granted ? LABELLED : CHROMIUM_NO_GRANT);
-  const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
 
-  // 0. The decision table, one row per branch.
-  {
-    const A = page({ enumerate: chromium });
-    const base = { canSink: true, routable: 0, labelled: false, hasSelectOut: false, chooseRequested: false, secure: true, hasGUM: true, mic: 'prompt', askedBefore: false };
-    const rows = [
-      ['routable list, no prompt', {}, { routable: 3 }, 'report'],
-      ['labelled list', {}, { routable: 2, labelled: true }, 'report'],
-      ['nothing routable, a prompt can help', {}, {}, 'card'],
-      ['selectAudioOutput engine, nobody asked', {}, { hasSelectOut: true }, 'none'],
-      ['selectAudioOutput engine, operator asked', {}, { hasSelectOut: true, chooseRequested: true }, 'picker'],
-      ['microphone denied', {}, { mic: 'denied' }, 'none'],
-      ['card answered at an earlier join', {}, { askedBefore: true }, 'none'],
-      ['answered earlier, operator asked again', {}, { askedBefore: true, chooseRequested: true }, 'card'],
-      ['plain HTTP (no secure context)', {}, { secure: false }, 'none'],
-      ['no getUserMedia', {}, { hasGUM: false }, 'none'],
-      ['granted and still nothing listed', {}, { mic: 'granted' }, 'none'],
-      ['no setSinkId at all', {}, { canSink: false }, 'none'],
-    ];
-    for (const [name, , delta, want] of rows) eq('plan: ' + name, A.outputPlan(Object.assign({}, base, delta)).action, want);
-  }
-
-  // 1. Outputs come back without asking — nameless, but routable. No card, no prompt.
-  {
-    const ls = store();
-    const A = page({ enumerate: () => [0, 1, 2, 3].map((i) => ({ kind: 'audiooutput', deviceId: i ? 'id' + i : 'default', label: '' })), localStorage: ls });
+  // A whole Connect: the chooser started synchronously (as the click does), then the awaited
+  // preparation, then — as `start()` does at the answer — the identity and the post. `card` is
+  // what the user does with the microphone card: 'continue' | 'skip'.
+  async function connect(o, card) {
+    const A = page(o);
     let raised = 0;
-    const plan = await A.prepareOutputsForJoin(() => { raised++; });
-    eq('an unlabelled routable list is reported', plan.action, 'report');
-    eq('and no card is raised', raised, 0);
-    eq('and no microphone is asked for', A._st.gumCalls, 0);
-    const out = A.getSyncInfo();
-    if (out.labelsUnavailable === true) ok('the host is told the names are generic (degraded bit 9)');
-    else fail('generic names were reported as real ones');
-    const cache = await A.enumerateBeforeJoin();
-    eq('one entry per output', cache.outputs.length, 4);
-    eq('the default device is named as what it is', cache.outputs[0].label, 'Default output');
+    const pick = A.startPicker();
+    const plan = await A.prepareOutputsForJoin((cont, skip) => { raised++; if (card === 'continue') cont(); else skip(); }, pick);
+    A.setSpeakerIdentity('SESSION', 'token', 'join-1');
+    A.postOutputs();
+    await flush();
+    const p = A._st.posts[A._st.posts.length - 1];
+    return { A, plan, raised, p, ids: p ? p.outputs.map((x) => x.id).join(',') : null, d: p ? p.discovery : null };
   }
 
-  // 2. Microphone already granted: Chromium lists every output, labelled. No card.
+  // The baseline where every source fails: Chromium with nothing granted, no chooser.
+  const NOTHING = { enumerate: chromium, picker: 'missing', gum: 'grant' };
+
+  // 1. Each API's definite result, as recorded and posted.
   {
-    const A = page({ enumerate: chromium, mic: 'granted', localStorage: store() });
-    let raised = 0;
-    const plan = await A.prepareOutputsForJoin(() => { raised++; });
-    eq('a granted microphone reports the labelled list', plan.action + '/' + plan.reason, 'report/labelled');
-    eq('without a card', raised, 0);
-    eq('or a prompt', A._st.gumCalls, 0);
-    eq('the real names are kept', A.getSyncInfo().labelsUnavailable, false);
-    eq('speaker-selection throwing is an answer, not a suppressed failure', A.suppressedCount(), 0);
-    eq('and it is recorded', plan.speakerSelection, 'unsupported');
+    const r = await connect({ enumerate: chromium, mic: 'granted', picker: 'missing', speakerPerm: 'throw' });
+    eq('chooser absent → unsupported', r.d.selectAudioOutput, 'unsupported');
+    eq('speaker-selection throwing TypeError → unsupported', r.d['permissions.speaker-selection'], 'unsupported');
+    eq('microphone query → ok', r.d['permissions.microphone'], 'ok');
+    eq('and its state is recorded', r.d['permissions.microphone.state'], 'granted');
+    eq('enumeration → ok', r.d.enumerateDevices, 'ok');
+    eq('AudioContext.setSinkId → ok', r.d['AudioContext.setSinkId'], 'ok');
+    eq('HTMLMediaElement.setSinkId → ok', r.d['HTMLMediaElement.setSinkId'], 'ok');
+    eq('audioSession absent → unsupported', r.d.audioSession, 'unsupported');
+    eq('devicechange → ok', r.d.devicechange, 'ok');
+    eq('no microphone step when the list was found', 'getUserMedia' in r.d, false);
+    eq('the full labelled list is reported', r.ids + '/' + r.p.labelled + '/' + r.p.supported, 'default,abc/true/true');
+    eq('a definite result is never counted as a suppressed failure', r.A.suppressedCount(), 0);
+  }
+  for (const [what, o, key, want] of [
+    ['chooser throwing synchronously', { picker: 'throw' }, 'selectAudioOutput', 'error'],
+    ['chooser never settling', { picker: 'timeout' }, 'selectAudioOutput', 'timeout'],
+    ['chooser dismissed', { picker: 'dismiss' }, 'selectAudioOutput', 'denied'],
+    ['chooser returning no device', { picker: 'empty' }, 'selectAudioOutput', 'empty'],
+    ['no Permissions API', { speakerPerm: 'missing' }, 'permissions.speaker-selection', 'unsupported'],
+    ['no Permissions API (microphone)', { speakerPerm: 'missing' }, 'permissions.microphone', 'unsupported'],
+    ['speaker-selection never settling', { speakerPerm: 'timeout' }, 'permissions.speaker-selection', 'timeout'],
+    ['microphone query throwing TypeError (Safari)', { mic: 'throw' }, 'permissions.microphone', 'unsupported'],
+    ['microphone query never settling', { mic: 'timeout' }, 'permissions.microphone', 'timeout'],
+    ['enumeration missing', { enumerate: 'missing' }, 'enumerateDevices', 'unsupported'],
+    ['enumeration throwing', { enumerate: 'throw' }, 'enumerateDevices', 'error'],
+    ['enumeration never settling', { enumerate: 'timeout' }, 'enumerateDevices', 'timeout'],
+    ['enumeration with only empty-id placeholders', {}, 'enumerateDevices', 'empty'],
+    ['no setSinkId anywhere', { sinkApi: false }, 'AudioContext.setSinkId', 'unsupported'],
+    ['no setSinkId anywhere (element)', { sinkApi: false }, 'HTMLMediaElement.setSinkId', 'unsupported'],
+    ['no devicechange', { deviceChange: false }, 'devicechange', 'unsupported'],
+  ]) {
+    const r = await connect(Object.assign({}, NOTHING, o), 'skip');
+    eq('result: ' + what, r.d && r.d[key], want);
   }
 
-  // 3. Chromium with nothing granted: one empty-id entry, so the card. The join waits for it —
-  //    the offer is not sent until the card is answered — and Continue reveals the list.
+  // 2. The microphone step is reached only when no source yields a routable output, whichever
+  //    way each one failed — and never when any single one succeeds.
+  for (const [what, o] of [
+    ['every source failing (chooser absent, placeholders only)', {}],
+    ['chooser throwing, enumeration empty', { picker: 'throw' }],
+    ['chooser timing out, enumeration timing out', { picker: 'timeout', enumerate: 'timeout' }],
+    ['chooser dismissed, enumeration throwing', { picker: 'dismiss', enumerate: 'throw' }],
+    ['chooser empty, enumeration missing, permissions missing', { picker: 'empty', enumerate: 'missing', speakerPerm: 'missing' }],
+    ['permissions timing out too', { speakerPerm: 'timeout', mic: 'timeout' }],
+  ]) {
+    const r = await connect(Object.assign({}, NOTHING, o), 'skip');
+    eq('card raised: ' + what, r.raised, 1);
+  }
+  for (const [what, o] of [
+    ['the chooser returns a device', { picker: { deviceId: 'pick1', label: 'Headphones' } }],
+    ['the enumeration lists a routable id (Firefox, unlabelled)', { enumerate: () => FIREFOX_UNLABELLED }],
+    ['the microphone was already granted', { mic: 'granted' }],
+    ['an iPhone with the audio session (virtual sinks)', { sinkApi: false, enumerate: () => [], audioSession: true, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', platform: 'iPhone', touch: 5 }],
+  ]) {
+    const r = await connect(Object.assign({}, NOTHING, o), 'continue');
+    eq('no card when ' + what, r.raised + '/' + r.A._st.gumCalls, '0/0');
+  }
+
+  // 3. After the card: the full list when the retry finds one, the default alone otherwise.
   {
-    const ls = store();
-    const A = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
+    const r = await connect(NOTHING, 'continue');
+    eq('Continue → getUserMedia once', r.A._st.gumCalls, 1);
+    eq('then the enumeration again, and every track stopped', r.d['enumerateDevices.afterMicrophone'] + '/' + r.A._st.tracksStopped, 'ok/1');
+    eq('the full labelled list is reported', r.ids + '/' + r.p.labelled, 'default,abc/true');
+    eq('the plan', r.plan.action + '/' + r.plan.answer, 'card/granted');
+    eq('names are available (degraded bit 9 clear)', r.A.getSyncInfo().labelsUnavailable, false);
+  }
+  {
+    const r = await connect(Object.assign({}, NOTHING, { enumerate: (g) => (g ? [] : CHROMIUM_NO_GRANT) }), 'continue');
+    eq('a retry that finds nothing → exactly one option, the default', r.ids + '/' + r.p.outputs[0].label, '/Default output');
+    eq('labelled false', r.p.labelled, false);
+    eq('and still not "cannot switch" (setSinkId exists)', r.p.supported, true);
+    eq('the retry is recorded as empty', r.d['enumerateDevices.afterMicrophone'], 'empty');
+    eq('degraded bit 9 set', r.A.getSyncInfo().labelsUnavailable, true);
+  }
+  for (const [what, o, card, gumResult] of [
+    ['Skip on the card', {}, 'skip', 'denied'],
+    ['the browser prompt refused', { gum: 'refuse' }, 'continue', 'denied'],
+    ['the browser prompt never answered', { gum: 'timeout' }, 'continue', 'timeout'],
+  ]) {
+    const r = await connect(Object.assign({}, NOTHING, o), card);
+    eq('default only after ' + what, r.ids + '/' + r.p.labelled + '/' + r.p.supported, '/false/true');
+    eq('getUserMedia recorded for ' + what, r.d.getUserMedia, gumResult);
+  }
+  {
+    const r = await connect(Object.assign({}, NOTHING, { mic: 'denied' }), 'continue');
+    eq('microphone denied: no card (a prompt cannot change it), default only', r.raised + '/' + r.ids, '0/');
+    eq('and recorded', r.d.getUserMedia, 'denied');
+  }
+
+  // 4. What the host is told per device class. `supported: false` — the sheet's "This device's
+  //    browser can't switch speakers" — only where there is no sink API of any kind.
+  {
+    let r = await connect({ enumerate: chromium, picker: 'missing', secure: false, sinkApi: false, mediaDevices: false });
+    eq('plain HTTP (every sink API hidden): default only, supported', r.ids + '/' + r.p.supported + '/' + r.raised, '/true/0');
+    eq('and recorded as unsupported, not a page error', r.d.enumerateDevices + '/' + r.d.getUserMedia, 'unsupported/unsupported');
+    r = await connect({ enumerate: () => [], picker: 'missing', sinkApi: false, gum: 'grant' }, 'continue');
+    eq('no setSinkId and no selectAudioOutput (Safari before 18.4): default only, NOT supported, no card', r.ids + '/' + r.p.supported + '/' + r.raised, '/false/0');
+    r = await connect({ enumerate: () => [], picker: 'missing', sinkApi: false, mediaDevices: false, ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)', platform: 'iPhone', touch: 5 });
+    eq('iPhone before 18.4: Speaker and Earpiece, supported', r.ids + '/' + r.p.supported + '/' + r.p.labelled, 'se:loudspeaker,se:earpiece/true/true');
+    r = await connect({ enumerate: () => FIREFOX_UNLABELLED, picker: { deviceId: 'ff2', label: 'Headphones' } });
+    eq('Firefox: the chooser\'s pick is a labelled source and is not overwritten', r.ids + '/' + r.p.labelled, 'ff2,ff1/true');
+    eq('and the pick is the preferred sink, applied when the graph exists', r.A.getSyncInfo().currentSink, null);
+    r = await connect({ enumerate: () => FIREFOX_UNLABELLED, picker: 'dismiss' });
+    eq('Firefox, chooser dismissed: the unlabelled ids, positional names, labelled false', r.ids + '/' + r.p.outputs.map((x) => x.label).join(',') + '/' + r.p.labelled, 'ff1,ff2/Output 1,Output 2/false');
+  }
+
+  // 5. The report is final before the offer: when the preparation resolves, the body the host
+  //    will get is fixed; the card wait holds it open, and nothing is posted before the join.
+  {
+    const A = page(NOTHING);
     let cont = null;
     let settled = false;
-    const p = A.prepareOutputsForJoin((onContinue) => { cont = onContinue; }).then((r) => { settled = true; return r; });
+    const p = A.prepareOutputsForJoin((c) => { cont = c; }, A.startPicker()).then((r) => { settled = true; return r; });
     await flush();
-    if (cont) ok('nothing routable without a grant raises the card');
-    else fail('the card was not raised for an empty-id enumeration');
-    eq('the join is still waiting while the card is up (no offer yet)', settled, false);
+    await new Promise((r) => setTimeout(r, 40));
+    eq('with the card up the preparation is still open (no offer can be sent)', settled, false);
     eq('and nothing has prompted yet', A._st.gumCalls, 0);
     cont();
     const plan = await p;
-    eq('Continue asks the browser for the microphone once', A._st.gumCalls, 1);
-    eq('and the plan records the grant', plan.action + '/' + plan.answer, 'card/granted');
-    eq('the outputs read under the grant are reported', plan.routableAfter, 2);
-    eq('labelled', A.getSyncInfo().labelsUnavailable, false);
-    eq('the answer is remembered', ls.getItem('se.outputs.micCardAnswer'), 'granted');
-    const B = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    let raised = 0;
-    const next = await B.prepareOutputsForJoin(() => { raised++; });
-    eq('a one-time grant that lapsed is not asked for again', raised + '/' + next.reason, '0/asked-before');
+    eq('Continue resolves it with a definite plan', plan.action, 'card');
+    eq('nothing was posted before the join existed', A._st.posts.length, 0);
+    const discovery = JSON.stringify(A.getDiscovery());
+    A.setSpeakerIdentity('SESSION', 'token', 'join-1');
+    A.postOutputs();
+    await flush();
+    eq('the post at the answer carries the discovery fixed before the offer', JSON.stringify(A._st.posts[0].discovery), discovery);
+  }
+  {
+    // A post that somehow precedes the preparation is the default alone, never "cannot switch".
+    const A = page({ enumerate: chromium, mic: 'granted', picker: 'missing' });
+    A.setSpeakerIdentity('SESSION', 'token', 'join-1');
+    A.postOutputs();
+    await flush();
+    eq('a post before discovery: default only, supported', A._st.posts[0].outputs.map((x) => x.id).join(',') + '/' + A._st.posts[0].supported, '/true');
   }
 
-  // 4. Skip: the join continues on the default output, the host gets the choose entry, and
-  //    the decline is remembered — the next join on this device does not ask again.
+  // 6. The old "Choose a speaker…" entry, still saved on some host rows, is ignored.
   {
-    const ls = store();
-    const A = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    const plan = await A.prepareOutputsForJoin((_c, skip) => skip());
-    eq('Skip ends the wait without a prompt', plan.answer + '/' + A._st.gumCalls, 'skipped/0');
-    eq('the decline is remembered on this device', ls.getItem('se.outputs.micCardAnswer'), 'skipped');
-    const cache = await A.enumerateBeforeJoin();
-    eq('the host is offered the choose entry', cache.outputs.length === 1 && cache.outputs[0].id, A.CHOOSE_OUTPUT);
-    const B = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    let raised = 0;
-    const again = await B.prepareOutputsForJoin(() => { raised++; });
-    eq('a later join after a decline raises no card', raised, 0);
-    eq('and says why', again.reason, 'asked-before');
-  }
-
-  // 5. Continue, then the browser's prompt is refused or dismissed: remembered the same way.
-  {
-    const ls = store();
-    const A = page({ enumerate: chromium, gum: 'refuse', localStorage: ls });
-    const plan = await A.prepareOutputsForJoin((c) => c());
-    eq('a refused prompt ends the wait', plan.answer, 'refused');
-    eq('and is remembered', ls.getItem('se.outputs.micCardAnswer'), 'refused');
-  }
-
-  // 6. Permission denied in the browser: a card cannot help, so none.
-  {
-    const A = page({ enumerate: chromium, mic: 'denied', gum: 'grant', localStorage: store() });
-    let raised = 0;
-    const plan = await A.prepareOutputsForJoin(() => { raised++; });
-    eq('a denied microphone raises no card', raised + '/' + plan.reason, '0/mic-denied');
-  }
-
-  // 7. Plain HTTP: no secure context, so no prompt can be made. No card.
-  {
-    const A = page({ enumerate: chromium, secure: false, gum: 'grant', localStorage: store() });
-    let raised = 0;
-    const plan = await A.prepareOutputsForJoin(() => { raised++; });
-    eq('no secure context raises no card', raised + '/' + plan.reason, '0/cannot-prompt');
-  }
-
-  // 8. A `selectAudioOutput()` engine with nothing listed: no microphone, ever. The choose
-  //    entry is offered; when the host operator picks it the request waits for the next join,
-  //    whose click opens the browser's chooser — never a tap on a live stage.
-  {
-    const ls = store();
-    const A = page({ enumerate: () => [], hasSelectOut: true, gum: 'grant', localStorage: ls });
-    let raised = 0;
-    const plan = await A.prepareOutputsForJoin(() => { raised++; });
-    eq('a picker engine raises no card', raised, 0);
-    eq('and never asks for the microphone', A._st.gumCalls, 0);
-    eq('nobody asked, so no chooser at the join', A.pickerWantedAtJoin(), false);
-    eq('the plan', plan.action + '/' + plan.reason, 'none/picker-engine');
-    const cache = await A.enumerateBeforeJoin();
-    eq('the host is offered the choose entry', cache.outputs[0] && cache.outputs[0].id, A.CHOOSE_OUTPUT);
-    eq('the operator picks it mid-session: queued, nothing raised', A.noteOutputChoiceRequest(A.CHOOSE_OUTPUT), 'queued');
-    eq('every later poll carrying it is the same request', A.noteOutputChoiceRequest(A.CHOOSE_OUTPUT), 'pending');
-    const B = page({ enumerate: () => [], hasSelectOut: true, gum: 'grant', localStorage: ls });
-    eq('the next join opens the chooser from its click', B.pickerWantedAtJoin(), true);
-    const bp = await B.prepareOutputsForJoin(() => { raised++; }, Promise.resolve(null));
-    eq('the chooser, not the card', bp.action + '/' + raised + '/' + B._st.gumCalls, 'picker/0/0');
-    eq('the request is answered and not repeated', B.noteOutputChoiceRequest(B.CHOOSE_OUTPUT), 'answered');
-    eq('picking another output re-arms it', B.noteOutputChoiceRequest('abc'), 'cleared');
-    eq('so a new request is fresh', B.noteOutputChoiceRequest(B.CHOOSE_OUTPUT), 'queued');
-  }
-
-  // 9. Chromium, declined earlier, then the operator asks: the next join asks once more.
-  {
-    const ls = store();
-    ls.setItem('se.outputs.micCardAnswer', 'skipped');
-    const A = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    eq('a Chromium page never opens a chooser', (A.noteOutputChoiceRequest(A.CHOOSE_OUTPUT), A.pickerWantedAtJoin()), false);
-    const B = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    let raised = 0;
-    const plan = await B.prepareOutputsForJoin((c) => { raised++; c(); });
-    eq('the operator asking overrides an earlier decline, once', raised + '/' + plan.reason + '/' + plan.answer, '1/operator-asked/granted');
-    const C = page({ enumerate: chromium, gum: 'grant', localStorage: ls });
-    C._st.granted = false;
-    let raised2 = 0;
-    await C.prepareOutputsForJoin(() => { raised2++; });
-    eq('and the request is not carried into the join after', raised2, 0);
-  }
-
-  // 10. The choose entry is a request, never a sink.
-  {
-    const A = page({ enumerate: chromium, localStorage: store() });
+    const A = page(NOTHING);
+    eq('the choose request is ignored', A.noteOutputChoiceRequest(A.CHOOSE_OUTPUT), 'ignored');
     const kept = await A.setSpeaker(A.CHOOSE_OUTPUT);
     if (kept === true) ok('the choose entry is never routed to as a sink');
     else fail('setSpeaker treated the choose entry as a device: ' + kept);
-  }
-
-  // 11. No localStorage at all (a private window that throws): still decides, still ends.
-  {
-    const A = page({ enumerate: chromium, gum: 'grant' });
-    const plan = await A.prepareOutputsForJoin((_c, skip) => skip());
-    eq('without storage a Skip still ends the join wait', plan.answer, 'skipped');
   }
 }
 

@@ -135,9 +135,13 @@ function runWarm(env) {
     else fail(what + ' starts before the card wait');
   }
   const firstAwait = at('await ');
-  const picker = at('pickerWantedAtJoin()');
-  if (picker > 0 && picker < firstAwait) ok("the browser's chooser is opened before the first await (inside the click's activation)");
-  else fail('the chooser is opened after an await');
+  // Output discovery API 1 (owner spec): the chooser is started on every Connect, inside the
+  // click, and its promise is handed to the preparation rather than started there.
+  const picker = at('SEAudio.startPicker()');
+  if (picker > 0 && picker < firstAwait) ok("the browser's chooser is started before the first await (inside the click's activation)");
+  else fail('the chooser is started after an await, or not at all');
+  if (/prepareOutputsForJoin\(micCard, pickerDone\)/.test(submit)) ok('and the preparation awaits that same chooser');
+  else fail('the preparation does not receive the chooser started in the click');
   if (at('connectBtn.disabled = true;') > 0 && at('connectBtn.disabled = true;') < prep) ok('Connect is disabled before the wait, so the join cannot be submitted twice');
   else fail('Connect stays enabled while the card is up');
   const reconfig = takeFunction('applyReconfig');
