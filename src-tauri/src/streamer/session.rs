@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -178,10 +178,11 @@ pub struct AudioOutput {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub struct AudioOutputsReport {
-    /// `false` only when the device's page said its browser has no way to move audio off the
-    /// default output. The desktop UI shows "can't switch speakers" for exactly that value, so
-    /// "this device has not reported" must not be `false`: it is `true` with no outputs, which
-    /// the UI shows as waiting for the device.
+    // `false` only when the device's page said its browser has no way to move audio off the
+    // default output. The desktop UI shows "can't switch speakers" for exactly that value, so
+    // "this device has not reported" must not be `false`: it is `true` with no outputs, which
+    // the UI shows as waiting for the device. (A line comment, not a doc comment: specta copies
+    // doc comments into the generated `bindings.ts`.)
     pub supported: bool,
     pub outputs: Vec<AudioOutput>,
     /// What the host last asked this device to play on.
@@ -196,6 +197,13 @@ pub struct AudioOutputsReport {
     /// ("Output 1", "Output 2") rather than spend a microphone prompt on them, so they must
     /// not be presented as device names. `None` means the client never said.
     pub labelled: Option<bool>,
+    // What each output-discovery API answered at the join, keyed by API (`selectAudioOutput`,
+    // `enumerateDevices`, `getUserMedia`, …) with `ok` / `unsupported` / `denied` / `empty` /
+    // `error` / `timeout` (docs/TELEMETRY.md). `None` from a page that predates it. Not part of
+    // the desktop UI's type (`specta(skip)`): the sheet does not read it, `status --json` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[specta(skip)]
+    pub discovery: Option<BTreeMap<String, String>>,
 }
 
 impl Default for AudioOutputsReport {
@@ -206,6 +214,7 @@ impl Default for AudioOutputsReport {
             selected: String::new(),
             current: None,
             labelled: None,
+            discovery: None,
         }
     }
 }
@@ -557,6 +566,7 @@ pub struct DeviceSessionState {
     pub audio_outputs_supported: Option<bool>,
     pub current_audio_output: Option<String>,
     pub audio_outputs_labelled: Option<bool>,
+    pub audio_discovery: Option<BTreeMap<String, String>>,
     /// The page load this join came from (the client's `attemptId`), when it sent one.
     pub attempt_id: String,
     /// Whether any picture has ever reached this join's client. A join that never connected
@@ -1034,6 +1044,7 @@ pub fn set_audio_outputs(
     outputs: Vec<AudioOutput>,
     current: Option<String>,
     labelled: Option<bool>,
+    discovery: Option<BTreeMap<String, String>>,
 ) {
     let mut map = sessions.lock_recover();
     let entry = map.entry(join.to_string()).or_default();
@@ -1049,6 +1060,9 @@ pub fn set_audio_outputs(
     }
     if labelled.is_some() {
         entry.audio_outputs_labelled = labelled;
+    }
+    if discovery.is_some() {
+        entry.audio_discovery = discovery;
     }
 }
 
@@ -1069,6 +1083,7 @@ pub fn audio_outputs_report(
         selected: String::new(),
         current: s.current_audio_output.clone(),
         labelled: s.audio_outputs_labelled,
+        discovery: s.audio_discovery.clone(),
     };
     drop(map);
     AudioOutputsReport {
@@ -1099,6 +1114,7 @@ pub fn device_audio_outputs_report(
                 selected: String::new(),
                 current: s.current_audio_output.clone(),
                 labelled: s.audio_outputs_labelled,
+                discovery: s.audio_discovery.clone(),
             })
     };
     AudioOutputsReport {
@@ -1414,6 +1430,11 @@ pub struct JoinSummary {
     pub name: String,
     pub screen_size: String,
     pub display: Option<LiveDisplay>,
+    /// What the join's page last posted to `/audio-outputs`, for `status --json`.
+    pub audio_outputs_supported: Option<bool>,
+    pub audio_outputs: usize,
+    pub audio_outputs_labelled: Option<bool>,
+    pub audio_discovery: Option<BTreeMap<String, String>>,
 }
 
 pub fn join_summaries(sessions: &SharedSessions) -> Vec<JoinSummary> {
@@ -1427,6 +1448,10 @@ pub fn join_summaries(sessions: &SharedSessions) -> Vec<JoinSummary> {
             name: s.device_name.clone(),
             screen_size: s.screen_size.clone(),
             display: s.live_display.clone(),
+            audio_outputs_supported: s.audio_outputs_supported,
+            audio_outputs: s.audio_outputs.len(),
+            audio_outputs_labelled: s.audio_outputs_labelled,
+            audio_discovery: s.audio_discovery.clone(),
         })
         .collect();
     rows.sort_by(|a, b| a.join_id.cmp(&b.join_id));
@@ -1474,31 +1499,56 @@ mod tests {
         assert!(r.supported && r.outputs.is_empty());
 
         // A body without the field leaves it unsaid.
-        set_audio_outputs(&sessions, "j1", None, vec![], None, None);
+        set_audio_outputs(&sessions, "j1", None, vec![], None, None, None);
         assert!(none("j1").supported);
 
         // A page that says its browser cannot route: the one legitimate `false`, and it outranks
         // a sibling join that never said.
-        set_audio_outputs(&sessions, "j1", Some(false), vec![], None, None);
+        set_audio_outputs(&sessions, "j1", Some(false), vec![], None, None, None);
         assert!(!none("j1").supported);
         assert!(!device_audio_outputs_report(&sessions, &sinks, token).supported);
         // ...and a later body without the field does not erase it.
-        set_audio_outputs(&sessions, "j1", None, vec![], None, None);
+        set_audio_outputs(&sessions, "j1", None, vec![], None, None, None);
         assert!(!none("j1").supported);
 
         // A join that reported a usable browser wins over one that reported none.
-        let choose = AudioOutput {
-            id: "se:choose".into(),
-            label: "Choose a speaker on this device…".into(),
+        let speakers = AudioOutput {
+            id: "abc".into(),
+            label: "Speakers (Boom Audio)".into(),
         };
-        set_audio_outputs(&sessions, "j2", Some(true), vec![choose], None, None);
+        set_audio_outputs(
+            &sessions,
+            "j2",
+            Some(true),
+            vec![speakers],
+            None,
+            None,
+            None,
+        );
         let r = device_audio_outputs_report(&sessions, &sinks, token);
         assert!(r.supported);
         assert_eq!(r.outputs.len(), 1);
 
         // A later post from the same join replaces an earlier one, in either direction.
-        set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None);
+        set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None, None);
         assert!(none("j1").supported);
+
+        // The per-API discovery results ride along, and a body without them keeps the last.
+        let mut d = BTreeMap::new();
+        d.insert("enumerateDevices".to_string(), "empty".to_string());
+        set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None, Some(d));
+        set_audio_outputs(&sessions, "j1", Some(true), vec![], None, None, None);
+        let r = none("j1");
+        assert_eq!(
+            r.discovery
+                .as_ref()
+                .and_then(|m| m.get("enumerateDevices"))
+                .map(String::as_str),
+            Some("empty")
+        );
+        // The desktop UI's type does not carry it, and an absent map is not serialised.
+        let v = serde_json::to_value(AudioOutputsReport::default()).unwrap();
+        assert!(v.get("discovery").is_none());
     }
 
     /// A row the join path seeded is a detection until a save makes it a setting.

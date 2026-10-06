@@ -688,13 +688,23 @@ async function hostAudioOutputs(cl) {
   const joinId = await cl.page.ev('(() => { try { return sessionStorage.getItem("se.joinId") || ""; } catch (e) { return ""; } })()').catch(() => '');
   if (!joinId) return { joinId: null, line: null, note: 'the page holds no join id' };
   for (let i = 0; i < 15; i++) {
+    // Authoritative: `status --json` → telemetry.joins[].audioOutputs (builds from
+    // `audio-outputs-supported` on), with `supported: null` until the page has posted.
+    const st = await cli(['status', '--json'], 10000);
+    let held = null;
+    try {
+      const j = JSON.parse(st.stdout);
+      const row = ((j.telemetry && j.telemetry.joins) || []).find((x) => x.joinId === joinId);
+      held = row && row.audioOutputs ? row.audioOutputs : null;
+    } catch { /* an older build or a non-JSON answer */ }
     const r = await cli(['logs', '--lines', '2000'], 10000);
     const lines = r.stdout.split(/\r?\n/).filter((l) => l.includes(`[audio-outputs] join ${joinId}:`));
     if (lines.length) {
       const last = lines[lines.length - 1];
       const f = (k) => { const m = last.match(new RegExp(k + '=(\\S+)')); return m ? m[1] : null; };
       const om = last.match(/outputs=(\d+) \(([^)]*)\)/);
-      return { joinId, posts: lines.length, supported: f('supported'), outputs: om ? Number(om[1]) : null, kinds: om ? om[2] : null, labelled: f('labelled'), current: f('current'), line: last.trim() };
+      if (held && held.supported === null) { await sleep(200); continue; }
+      return { joinId, posts: lines.length, supported: held ? String(held.supported) : f('supported'), outputs: om ? Number(om[1]) : null, kinds: om ? om[2] : null, labelled: f('labelled'), current: f('current'), statusJson: held, discovery: held ? held.discovery : f('discovery'), line: last.trim() };
     }
     await sleep(200);
   }

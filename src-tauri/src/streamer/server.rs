@@ -883,6 +883,32 @@ struct AudioOutputsRequest {
     /// numbering. Optional, for the same reason `current` is.
     #[serde(default)]
     labelled: Option<bool>,
+    /// Each output-discovery API's result at the join (docs/TELEMETRY.md). Values are taken as
+    /// they come and stringified, so a page that sends something unexpected still parses.
+    #[serde(default)]
+    discovery: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+const MAX_DISCOVERY_ENTRIES: usize = 24;
+const MAX_DISCOVERY_KEY: usize = 64;
+const MAX_DISCOVERY_VALUE: usize = 32;
+
+fn bounded_discovery(
+    d: serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    d.into_iter()
+        .take(MAX_DISCOVERY_ENTRIES)
+        .map(|(k, v)| {
+            let v = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (
+                truncate_chars(&k, MAX_DISCOVERY_KEY),
+                truncate_chars(&v, MAX_DISCOVERY_VALUE),
+            )
+        })
+        .collect()
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -923,6 +949,7 @@ pub fn process_audio_outputs(state: &AppState, join: &str, body: &[u8]) {
     let current = req
         .current
         .map(|c| truncate_chars(&c, MAX_AUDIO_OUTPUT_STR));
+    let discovery = req.discovery.map(bounded_discovery);
 
     let Some(s) = state.config.sessions.as_ref() else {
         return;
@@ -935,7 +962,7 @@ pub fn process_audio_outputs(state: &AppState, join: &str, body: &[u8]) {
     // without the line nothing on the host records which device said it, or whether it said
     // anything at all.
     tprintln!(
-        "[audio-outputs] join {join}: supported={} outputs={} ({}) labelled={} current={}",
+        "[audio-outputs] join {join}: supported={} outputs={} ({}) labelled={} current={} discovery={}",
         req.supported
             .map_or("unsaid".to_string(), |b| b.to_string()),
         outputs.len(),
@@ -943,6 +970,8 @@ pub fn process_audio_outputs(state: &AppState, join: &str, body: &[u8]) {
             .iter()
             .map(|o| if o.id.starts_with("se:") {
                 o.id.as_str()
+            } else if o.id.is_empty() {
+                "default"
             } else {
                 "device"
             })
@@ -954,8 +983,21 @@ pub fn process_audio_outputs(state: &AppState, join: &str, body: &[u8]) {
         } else {
             "device"
         }),
+        discovery.as_ref().map_or("unsaid".to_string(), |d| d
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",")),
     );
-    session::set_audio_outputs(s, join, req.supported, outputs, current, req.labelled);
+    session::set_audio_outputs(
+        s,
+        join,
+        req.supported,
+        outputs,
+        current,
+        req.labelled,
+        discovery,
+    );
     if let Some(reporter) = state.config.device_reporter.as_ref() {
         let report = state.audio_outputs_report(join);
         reporter.report_audio_outputs(join.to_string(), token, report);
