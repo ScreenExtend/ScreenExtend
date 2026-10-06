@@ -11,11 +11,12 @@ function cpuTotals() {
 
 function nvidiaSmi() {
   return new Promise((resolve) => {
-    execFile('nvidia-smi', ['--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,clocks.gr,temperature.gpu,power.draw', '--format=csv,noheader,nounits'],
+    execFile('nvidia-smi', ['--query-gpu=utilization.gpu,utilization.encoder,utilization.decoder,memory.used,clocks.gr,temperature.gpu,power.draw,clocks.video,pstate', '--format=csv,noheader,nounits'],
       { timeout: 4000, windowsHide: true }, (err, out) => {
         if (err) return resolve({ error: err.code === 'ENOENT' ? 'nvidia-smi not found' : err.message });
         const f = out.trim().split('\n')[0].split(',').map((x) => parseFloat(x));
-        resolve({ gpu: f[0], enc: f[1], dec: f[2], memMiB: f[3], clockMHz: f[4], tempC: f[5], powerW: f[6] });
+        const raw = out.trim().split('\n')[0].split(',').map((x) => x.trim());
+        resolve({ gpu: f[0], enc: f[1], dec: f[2], memMiB: f[3], clockMHz: f[4], tempC: f[5], powerW: f[6], videoClockMHz: f[7], pstate: raw[8] });
       });
   });
 }
@@ -76,5 +77,5 @@ function summarize(s) {
   const pick = (k) => s.map((x) => x[k]).filter((v) => typeof v === 'number' && !Number.isNaN(v));
   const st = (k) => { const v = pick(k); if (!v.length) return null; return { mean: +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1), max: Math.max(...v) }; };
   const err = s.find((x) => x.error);
-  return { samples: s.length, cpuPct: st('cpuPct'), gpuPct: st('gpu'), encoderPct: st('enc'), decoderPct: st('dec'), gpuClockMHz: st('clockMHz'), error: err ? err.error : undefined };
+  return { samples: s.length, cpuPct: st('cpuPct'), gpuPct: st('gpu'), encoderPct: st('enc'), decoderPct: st('dec'), gpuClockMHz: st('clockMHz'), videoClockMHz: st('videoClockMHz'), powerW: st('powerW'), pstates: [...new Set(s.map((x) => x.pstate).filter(Boolean))], error: err ? err.error : undefined };
 }

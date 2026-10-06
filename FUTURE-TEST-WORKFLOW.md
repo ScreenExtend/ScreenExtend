@@ -58,7 +58,7 @@ Your job is the list in section 6: everything that job did not or could not test
 
 ## 2. The state of the code
 
-- **Branch:** `latency-overhaul-new`.
+- **Branch:** `latency-overhaul-new`, plus branch `post-reboot` on top of its `90f4840` (see `docs/overhaul-new/POST-REBOOT.md`): a test-handler clock fix and new requests (`0f15e67`, `2bbce85`, `8f817f8`), the GPU clock hold (`6c0bc71`) and the post-reboot documents. Measure the head of `post-reboot` if it has been merged, else `latency-overhaul-new`.
 - **Head:** `cb0ab8d` (the consolidation merge), plus the commit that adds this file and `docs/overhaul-new/REPORT.md` on top of it. When this file was written the branch head was `5e20e52`, the merge of G03, before consolidation.
 - **Relative to the old app `bef5f89` (v0.6.3):** the 442 overhaul commits from `latency-overhaul`, plus the commits below.
 - **Relative to `latency-overhaul` (head `d4d8be9`):** 81 non-merge commits before consolidation. List them with `git log --oneline latency-overhaul..latency-overhaul-new --no-merges`.
@@ -132,7 +132,9 @@ What stayed untouched:
 - `C:\Users\sarve\.cargo\shared_target\ScreenExtend-old\release\ScreenExtend.exe`: the old app, `bef5f89`. It has no isolation switch.
 - `C:\Users\sarve\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe`: `d4d8be9`. It has no isolation switch.
 - `C:\Users\sarve\.cargo\shared_target\ScreenExtend-handler\release\ScreenExtend.exe`: `06e6fbb`, which is `d4d8be9` plus the isolation switch.
-- No fat-LTO release build of the final head exists; it was not built because commit headroom was under 10 GB. The measured binary is thin LTO (16 codegen units): `C:\Users\sarve\.cargo\shared_target\ScreenExtend-consol\final\ScreenExtend.exe` (SHA-256 starts `4F8CBA4D746DFCC2`), built from `29e75d9`. Building the real profile (`cargo build --release --offline` from `src-tauri/`, and `pnpm tauri build`) and re-measuring is the first job after the driver memory is freed.
+- Real-profile (fat LTO) builds made after the reboot: `90f4840` at `C:\Users\sarve\.cargo\shared_target\ScreenExtend-final\final\ScreenExtend.exe` (SHA-256 `89B2BEA7F38B64786E971620EA55DB69F616DB18A1FADEFC1B8502A38547ADEC`), and the `post-reboot` code with the GPU clock hold at `C:\Users\sarve\.cargo\shared_target\ScreenExtend-final\final-hold\ScreenExtend.exe` (SHA-256 starts `814A7FB52945D0A7`). The thin consolidation build `ScreenExtend-consol\final` is superseded.
+- `C:\Users\sarve\.cargo\shared_target\ScreenExtend-x\xbin\ScreenExtend.exe`: the post-reboot experiment build (thin LTO; `SE_X_*` and `SE_G03_*` switches, readable from a switch file between renegotiations with the handler's `arms` request; the patch is not committed).
+- **Absolute stamp numbers before 2026-10-06** carry an unknown per-run clock bias of up to ±16 ms whenever the machine ran at Windows' default 15.6 ms timer resolution (`0f15e67`, POST-REBOOT.md §0). Re-measure, do not reuse.
 - `C:\Users\sarve\.cargo\shared_target\ScreenExtend-g08\bin-exp1`: G08's experiment binary, with the `SE_G08_*` switches.
 
 **Building.**
@@ -365,7 +367,7 @@ Most likely to matter to a user first, cheapest to check first.
 **Cheapest:**
 
 - Items needing only the owner's eyes and five minutes: D-2 (panel 360 Hz) and the manual input check (I-2…I-7 by hand, `INPUT-REPORT.md` §7 T1–T6).
-- Items that are one handler run on an existing build: M-1…M-7.
+- Items that are one handler run on an existing or rebuilt build: M-1…M-8.
 
 **Most likely to matter:**
 
@@ -385,7 +387,7 @@ Most likely to matter to a user first, cheapest to check first.
 | 2 | I-12 (P8 diagnostics), then the owner's ten-minute manual check (`INPUT-REPORT.md` §7 T1–T6) | owner by hand; input ban lifted for the trace build only |
 | 3 | I-2, I-3, I-4, I-5 with `input_path`; apply P1, P2, P4, P3/P5 one at a time | input ban lifted, idle machine |
 | 4 | I-1 and I-6/I-7 with `cursor_capture` and `pointer_lock` | input ban lifted |
-| 5 | M-1 … M-10 (handler re-measures owed) | handler only |
+| 5 | M-1 … M-8 (handler re-measures still owed) | handler only |
 | 6 | U-1 … U-10 (GUI) | GUI rule lifted |
 | 7 | A-1 … A-6, C-1 … C-5 | a second device, real browsers |
 | 8 | N-1 … N-7 | a real AP, a loss tool, relay permission |
@@ -1170,152 +1172,99 @@ Ledger paths are relative to the repository root.
   - **Copy, by a person** (the one check the no-input rule leaves to the owner): after a failed join, select the error text and press Ctrl+C; type a digit into the OTP boxes. Both must work. On a phone, check the screen dims on its normal timeout after a failed join.
 - **Then:** keep; if a check fails, the inventory comment above `restorePreJoinPage` names what armed it.
 
-### 6.7 Measurements owed by the previous job
+### 6.7 Measurements still owed
 
-Each item here is one or more handler runs on existing or rebuilt binaries. Each needs a freed driver host (D-1).
+The post-reboot job (branch `post-reboot`, `docs/overhaul-new/POST-REBOOT.md`) ran most of what this
+section used to list. They are done and not repeated here: the fat-LTO build and the five-round
+three-way; the noise figure with `stamp_band: "center"`; the `ea821a9` A/B with one and two
+displays (the latter refuted it on painted fps; see that file); x264, async NVENC and the 1440p
+encode-stage question; G08's telemetry fixes; D-05 after the fix (twice); `07ec295`; G04b through
+the real page; G05's 40-join watchdog check, the legacy-transport keyframe hand-back and `<video>`
+vs WebCodecs; every G06 tier including plain HTTP; `mic_prompt`; the join-failure restore in four
+cases; `settings_change` in every class; `two_clients`, `leave_rejoin`, `auto_rejoin` and `logs`.
+What is left:
 
-#### M-1 `ea821a9` (WGC floor at ⅔ of a period): A/B, including hi-res 120 Hz
+#### M-1 G01's other open runs
 
-- **What.** E5 was one run per arm, and its confirmation was contaminated. On `d7a448a`, a hi-res client at 120 Hz read p50 73.5 ms, about 1 ring drop/s and 810 duplicate frames. That is unattributed, and contradicts G03's 34–37 ms and G04's 35.1–42.1 ms at 120 Hz (`G01.md` E5-confirm, `CONSOLIDATION-TODO.md`).
-- **Why untested.** The join ration.
-- **Suspects:** `ea821a9`; `windows_utils/streamer/capture.rs` / `windows_capture/`.
-- **Known:** by reading, at 120 fps the floor is 5.6 ms, under the 8.3 ms period.
-- **How to test:**
-  - Interleaved, 3 each, `d7a448a` vs `ea821a9`: `{"scenarios":["small_window"],"two_clients":true}`. Read `frames_skipped_cadence` per session and B's / A-after-B's p50.
-  - Then `{"scenarios":["hires_small_window"],"runs":3}`.
-  - Not run as an A/B. On the merged build, hi-res 120 Hz read p50 34.30 ms (range 1.17, n=6), so the 73.5 ms run did not reproduce; the A/B against the parent and the two-display confirmation are still owed.
+- **What:** P-core confinement (`d071133`) at 1080p; GPU scheduling class 2 and P-core off at
+  hi-res; the scheduled cadence grid (E2); the CPU-bridge scaler paths (`01f91c8`, `42df0f7`).
+- **Why untested.** Never reached; lower value than the GPU-clock finding.
+- **How to test:** on a binary built from branch `g01-exp`, interleaved, 3–5 each:
+  `{"scenarios":["small_window","large_area"],"runs":2,"host_env":{"SE_G01_NO_PCORE":"1"}}`,
+  `{"scenarios":["hires_small_window"],"runs":3,"host_env":{"SE_GPU_SCHED_CLASS":"2"}}`, and both
+  with `"host_env":{}`. Use the handler's `arms` request where the switch can be read per
+  renegotiation, so one join serves every arm.
 - **Then:** keep rule.
 
-#### M-2 G01's other open runs
+#### M-2 The adaptive-quality QP floor's value
 
-- **What:**
-  - P-core confinement (`d071133`) at 1080p;
-  - repeats of GPU scheduling class 2 and P-core off at hi-res;
-  - the scheduled cadence grid (E2);
-  - the x264 / CPU-bridge scaler paths (`01f91c8`, `42df0f7`).
-- **Why untested.** The join ration.
-- **Suspects:** `d071133`, `b0183dd`, `01f91c8`, `42df0f7`.
-- **Known:** E4: ±0.7 ms within 2–3 ms ranges.
-- **How to test:**
-  - On a binary built from branch `g01-exp` (it has the `SE_G01_*` switches), interleaved, 3–5 each:
-    - `{"scenarios":["small_window","large_area"],"runs":2,"host_env":{"SE_G01_NO_PCORE":"1"}}`
-    - `{"scenarios":["hires_small_window"],"runs":3,"host_env":{"SE_GPU_SCHED_CLASS":"2"}}`
-    - both of the above with `"host_env":{}`
-  - Scaler: `{"host_args":["--encoder","software"],"scenarios":["small_window"]}` vs the old app.
-- **Then:** keep rule.
+- **What.** `--adaptive-quality on` renegotiates in place and reopens NVENC as CBR (measured), but
+  no line logs the floor QP, so whether the floor is applied is unknown.
+- **How to test:** add one `tprintln!` of the min QP in the NVENC configure line (or read it from
+  `status --json` if exposed), then the `settings_change` request with `settings_only: ["adaptive quality"]`.
 
-#### M-3 G02's open runs
+#### M-3 G04's join re-check (round 3 of E2/E3)
 
-- **What.**
-  - **x264:** checks decodability and colour (`22e0f67` dropped the High 4:4:4 BGRA path; `a42c293` moved to NV12 with BT.709 VUI, matrix unverified).
-  - **Async NVENC on the handler.**
-  - **The `adaptive_quality` QP floor.**
-- **Why untested.** Budget.
-- **Suspects:** `22e0f67`, `a42c293`, `f66a5a7`, `e9c521b`.
-- **Known:** async NVENC was a wash on the bench.
-- **How to test:**
-  - `{"scenarios":["static","small_window"],"runs":2,"host_args":["--encoder","software"]}`
-  - `{"scenarios":["small_window","large_area","hires_small_window"],"runs":3,"host_env":{"SE_NVENC_NO_ASYNC":"1"}}` vs `{}`, 3 interleaved pairs on one binary.
-  - For the floor: `devices set <token> --adaptive-quality on`, then the standard run.
-- **Then:** keep rule.
+- **What.** `023014b^` vs `023014b`, three interleaved runs each of
+  `{"scenarios":["small_window","hires_small_window"],"duration":15,"slow_answer":{"n":5}}`;
+  compare `join request → WHEP answer generated` p50 and `joins[].answerMs`.
+- **Why untested.** Two builds and 42 joins for join time, which the owner said does not matter.
 
-#### M-4 G08's host telemetry fixes, and idle cadence with instruments off
+#### M-4 The previous job's baseline specials that never ran
 
-- **What.** `e96fe2c` and `3120abf` were not re-run through the handler on a build of the final tree (`G08.md`).
-- **Why untested.** Budget.
-- **Suspects:** `e96fe2c`, `3120abf`.
-- **Known:** measured with the `SE_G08_TSDIAG` switch.
-- **How to test:**
-  - `{"scenarios":["small_window"],"runs":1,"duration":20,"custom":{"js":"1","host_commands":[["status","--json"]]}}`. Pass: `capture_to_encode.count` ≈ captured frames, and `capture_delivery` absent.
-  - Idle cadence: `node scripts/test-handler/handler.mjs --exe <bin-exp1 or a rebuild of the patch> --request '{"scenarios":["static"],"static_duration":30,"host_env":{"SE_G08_TELEM_OFF":"1","SE_G08_CLIENT_TELEM_OFF":"1"}}'` against the same request without `host_env`, interleaved ×3. `bin-exp1` is at `C:\Users\sarve\.cargo\shared_target\ScreenExtend-g08\bin-exp1`.
-- **Then:** if a counter is still wrong, fix it.
+- `slow_answer` on `d4d8be9` and in headed Chrome; `slow_answer` under induced load on the old app:
+  `{"scenarios":[],"calibrate":false,"slow_answer":{"n":10},"netlog":true}` (headed: add
+  `"headed":true,"chrome_flags":["--start-minimized"]`) and
+  `{"scenarios":[],"calibrate":false,"slow_answer":{"n":5},"netlog":true,"cpu_burn":{"threads":16,"seconds":150}}`.
+- G08's static idle cadence with instruments off (`bin-exp1`, 3 interleaved pairs of
+  `{"scenarios":["static"],"static_duration":30}` with and without
+  `"host_env":{"SE_G08_TELEM_OFF":"1","SE_G08_CLIENT_TELEM_OFF":"1"}`); one of six ran (0 changed,
+  0 green), the rest were dropped for memory.
 
-#### M-5 D-05 after the fix (`1f85421`), and the G04 join re-check
+#### M-5 D-02, the lost `/whep` answer: root cause
 
-- **What.**
-  - `1f85421` was not run end to end; its after-fix run was reaped (`G03.md`).
-  - G04's round 3 of E2/E3 was cancelled (`G04.md` §8).
-- **Why untested.** Memory.
-- **Suspects:** `1f85421`, `97e46d1`, `58fd8b1`.
-- **Known:** in the pre-fix run, the old transport was still alive 30 s after each edit.
-- **How to test:**
-  - `{"scenarios":["small_window"],"duration":15,"runs":2,"settings_change":true,"settings_only":["video quality","video scale"]}`. Expect `closing the transport this renegotiation replaced` and `live transport sessions: 1` right after each edit.
-  - `{"label":"g04-join-recheck","scenarios":["small_window","hires_small_window"],"duration":15,"slow_answer":{"n":5}}`, three times each, interleaved, `latency-overhaul-new` before and after the G04 merge (`023014b^` vs `023014b`). Compare the host's `join request → WHEP answer generated` p50 and `joins[].answerMs`.
-- **Then:** keep or re-open.
+- **What.** The host logs `join accepted: WHEP answer generated`, but the browser never receives
+  the response before its 10 s deadline. Post-reboot: **0 of ~110 quiet joins** retried
+  (`offers` 1 everywhere, including 40 back-to-back `slow_answer` joins). It needs load.
+- **How to test:** `{"scenarios":[],"calibrate":false,"slow_answer":{"n":5},"netlog":true,"cpu_burn":{"threads":16,"seconds":150}}`,
+  repeated; lay each flagged join's `serve.log` against Chrome's net log `HTTP2_SESSION_RECV_HEADERS`;
+  add a worker-stall probe (`tokio::runtime::Handle::metrics`) behind a switch.
 
-#### M-6 The previous job's baseline specials that never ran
+#### M-6 Unexplained numbers
 
-- **What.** From `BASELINE.md` "Unverified / untested":
-  - the 5th standard pair;
-  - more 120 Hz hi-res pairs;
-  - `mic_prompt` on both builds;
-  - `two_clients` and `leave_rejoin`;
-  - `auto_rejoin`;
-  - `fallback_paths`;
-  - `slow_answer` on `d4d8be9` and in headed Chrome;
-  - `slow_answer` under induced load on the old app.
-- **Why untested.** Memory.
-- **Suspects:** —
-- **Known:** the hr1 pair (old collapses at 120 Hz).
-- **How to test:** verbatim requests. Run old and current interleaved.
-  - `{}` on old, then current;
-  - `{"scenarios":["hires_small_window"],"runs":3,"calibrate":false}`;
-  - `{"scenarios":[],"calibrate":false,"mic_prompt":true}`;
-  - `{"scenarios":[],"calibrate":false,"two_clients":true,"leave_rejoin":true,"netlog":true}`;
-  - `{"scenarios":[],"calibrate":false,"auto_rejoin":true}`;
-  - `{"scenarios":[],"calibrate":false,"fallback_paths":true,"netlog":true}`;
-  - `{"scenarios":[],"calibrate":false,"slow_answer":{"n":10},"netlog":true}`; for headed, add `"headed":true,"chrome_flags":["--start-minimized"]`;
-  - `{"scenarios":[],"calibrate":false,"slow_answer":{"n":5},"netlog":true,"cpu_burn":{"threads":16,"seconds":150}}`.
-- **Then:** record in the census.
+- **Host socket → client transform: 7–12 ms on loopback.** The per-stage budget (POST-REBOOT.md
+  Part 4) leaves this as the largest term after the GPU clocks and the composition wait. It spans
+  webrtc-rs's send path after `write_rtp` returns, the loopback and Chrome's receive pipeline up to
+  the encoded transform. Instrument: a host stamp at the real `send_to` (behind a switch) and a
+  per-frame receive time on the page; or a packet capture (`pktmon`, admin).
+- **~10 % stamp checksum failures at 1080p** on every build, with `center` and the precise clock;
+  none at hi-res. Vary the stage's cell size (48 px at 1080p vs 64 px at hi-res) first.
+- `hires_large_area` at 120 Hz p50 outliers of 67–520 ms (`G03.md` §5): `runs: 5`, with
+  `status --json` per window.
+- Why the old app collapses at 120 Hz; the stage's 200 ms bounds check (H-2).
 
-#### M-7 The noise figure with `stamp_band: "center"`
+#### M-7 The GPU clock hold beyond this machine
 
-- **What.** Never measured.
-- **Why untested.** Memory.
-- **How to test:** five consecutive `{"stamp_band":"center"}` on the current head, and two `{"stamp_band":"full"}` beside them.
-- **Then:** if `center` is tighter, make it the default (`scripts/test-handler/handler.mjs` `DEFAULTS`) and document it.
+- **What.** `6c0bc71` holds an NVIDIA GPU out of idle while a session streams (AC power only):
+  −5.5 ms at 1080p60, −6.1 ms at 1440p120 here, +15–18 W. Unmeasured on any other GPU, on a
+  desktop (whose idle clocks may differ), with the per-application "prefer maximum performance"
+  driver setting instead (which would make it redundant), and on battery (forced with
+  `SE_GPU_CLOCK_HOLD=1`).
+- **How to test:** the same A/B as POST-REBOOT.md §4.2 (`SE_GPU_CLOCK_HOLD=0` vs default, five
+  interleaved pairs of `{"scenarios":["small_window","hires_small_window"],"runs":2,"duration":15,"stamp_band":"center","force_exclusive":true}`),
+  reading `load.powerW`, `load.pstates` and `load.videoClockMHz` in each window.
+- **Also owed by analogy:** the AMF, Quick Sync and classic NVENC paths do not take the hold;
+  whether their GPUs idle the same way is unmeasured.
 
-#### M-8 D-02, the lost `/whep` answer: root cause
+#### M-8 The CLI pins a 120 Hz device at 60 Hz
 
-- **What.** The host logs `join accepted: WHEP answer generated`, but the browser never receives the response before its 10 s deadline. Measured rates differ:
-  - "one in five" in the handler README;
-  - 0 of 20 quiet in `BASELINE.md`;
-  - once quiet in G04;
-  - 10/66 first and 7/63 later joins in the run directories G07 mined.
-
-  The retry is now harmless (`2dda493`, `e8cbe87`, `7584269`), but the cause is unknown.
-- **Why untested.** It could not be triggered on demand.
-- **Suspects, all readings:**
-  - the h2 connection task stalls behind a blocked tokio worker, because the LIFO slot cannot be stolen (`BASELINE.md`);
-  - `server.rs` calls `session.stop()` inline on four async paths (a failed handshake and three supersede stand-downs), which joins the capture thread (`G03.md`) — fixed in `9433732` (now on the blocking pool; compile-checked only, not shown to cure the lost answer).
-  - G07 saw every request on the page's one HTTP/2 connection stall together until a session ended.
-- **Known:** in quiet runs, the browser received headers 1–3 ms after the host's line.
-- **How to test:**
-  - `{"scenarios":[],"calibrate":false,"slow_answer":{"n":5},"netlog":true,"cpu_burn":{"threads":16,"seconds":150}}`, repeated.
-  - For each flagged join, lay `serve.log`'s `join request` / `answer generated` against Chrome's net log `HTTP2_SESSION_RECV_HEADERS` and `joins[].whepRequests[].timing`.
-  - Add a tokio console or a periodic worker-stall probe (`tokio::runtime::Handle::metrics`) to the host behind a switch.
-  - A host-side stall shows as the answer generated with no stream headers received.
-- **Then:** wrap any blocking call in `spawn_blocking`; keep as a defect fix.
-
-#### M-9 Unexplained numbers
-
-- **What:**
-  - `hires_large_area` at 120 Hz p50 outliers of 67–520 ms in both arms (`G03.md` §5);
-  - G08's instruments-off arm 1.4–2.5 ms slower (`G08.md` §2);
-  - the live 1440p encode stage at 8.39 ms vs 5.0–5.7 ms of clean NVENC (`G02.md` E8; lead: the keyed-mutex wait for the capture-side copy);
-  - the hi-res 60 Hz gap against the old app (`BASELINE.md`, never reproduced by a group);
-  - why the old app collapses at 120 Hz;
-  - why the handler stage's 200 ms bounds check missed a mode change (H-2).
-- **Why untested.** Budget.
-- **How to test:**
-  - Run `hires_large_area` with `runs: 5` on a quiet machine, and add host `status --json` per window.
-  - For the encode stage, time the keyed-mutex acquire separately in the ring (a temporary stamp).
-- **Then:** write each down as explained, or as still unexplained.
-
-#### M-10 The final three-way measurement
-
-- **What.** Old `bef5f89`, previous head `d4d8be9`, and new, on the real fat-LTO profile.
-- **How to test:** The final three-way was completed in reduced form: three interleaved rounds instead of five, a thin-LTO new build against a fat-LTO previous head, under memory pressure (2.6–4.7 GB free). Binaries: old `C:\Users\sarve\.cargo\shared_target\ScreenExtend-old\release\ScreenExtend.exe`, previous head `C:\Users\sarve\.cargo\shared_target\ScreenExtend\release\ScreenExtend.exe`, new `C:\Users\sarve\.cargo\shared_target\ScreenExtend-consol\final\ScreenExtend.exe`; the request is in `docs/overhaul-new/CONSOLIDATION.md`. Result: level on per-frame latency in all three scenarios, new faster on join and audio. Repeat it after a driver restart if it was taken under memory pressure.
+- **What.** `ScreenExtend devices set <key> …` on a device with no saved row writes
+  `refreshRate: 60` (`cli.rs`, the `devices set` default row), and a save makes every field the
+  user's, so a 120 Hz client drops to 60 fps after any CLI edit. Found by the handler; the desktop
+  UI writes the row from its `DeviceJoin` payload and is not affected, by reading.
+- **How to test after a fix** (seed a new row's refresh rate from the live join's reported rate):
+  join a 120 Hz hi-res client, `devices set <token> --video-quality 20`, read `serve.log`'s
+  `ring encoder initialized … @120`.
 
 ### 6.8 Everything this machine cannot run
 
