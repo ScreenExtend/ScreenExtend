@@ -51,6 +51,27 @@ pub fn audio_driver_status() -> String {
 #[specta::specta]
 pub fn set_legacy_volume_key_proxy(_enabled: bool) {}
 
+/// UNVERIFIED (not compiled): Linux does not build today; this keeps the surface identical.
+#[tauri::command]
+#[specta::specta]
+pub fn display_driver_health() -> crate::DisplayDriverHealth {
+    crate::DisplayDriverHealth {
+        supported: false,
+        identified_by: "unsupported".to_string(),
+        ..Default::default()
+    }
+}
+
+/// UNVERIFIED (not compiled).
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_display_driver(_app: tauri::AppHandle) -> crate::DriverRestartOutcome {
+    crate::DriverRestartOutcome {
+        reason: "unsupported".to_string(),
+        ..Default::default()
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn set_device_pointer_scope(

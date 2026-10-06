@@ -467,6 +467,23 @@
       "bodyWithPid": "Another copy of ScreenExtend (process {pid}) is using the virtual display driver on this computer. Only one can use it at a time. Quit that one and try again.",
       "hint": "This can also be a ScreenExtend window you have already open, or one started from a terminal with `ScreenExtend serve`. Nothing is wrong with the driver and nothing needs reinstalling.",
       "quitOther": "Quit the Other Copy"
+    },
+    "driverRestart": {
+      "title": "Display Driver Restart Required",
+      "body": "The display driver has built up memory from earlier sessions and needs a restart before new displays can be created reliably. It takes a few seconds and needs administrator approval.",
+      "usage": "The driver is using {size}.",
+      "restarting": "Restarting the display driver…",
+      "restart": "Restart Driver",
+      "exit": "Exit App",
+      "failure": {
+        "declined": "The restart was not approved. Restarting the driver needs administrator approval.",
+        "timeout": "The driver did not come back in time. Try again, or restart the computer.",
+        "refused": "Another ScreenExtend host is using the driver. Quit it, then try again.",
+        "notElevated": "The restart did not get administrator rights. Try again and approve the prompt.",
+        "needsReboot": "Windows could not restart the driver while it was in use. Restart the computer to free its memory.",
+        "notInstalled": "The display driver is not installed, so there is nothing to restart.",
+        "failed": "The driver could not be restarted. Try again, or restart the computer."
+      }
     }
   },
   "configEditor": {

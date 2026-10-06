@@ -216,6 +216,13 @@ features = [
     "Win32_System_Performance",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    # windows_utils::driver_health: the driver host's counters (no process handle needed), the
+    # pipe's server pid, and the in-place device restart + its elevated launch.
+    "Wdk_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Pipes",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
 ]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
