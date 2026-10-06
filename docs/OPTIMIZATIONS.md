@@ -4613,3 +4613,32 @@ card, Skip, POST 128 ms (including the harness's click), one empty-id output, `s
 the same browser's rejoin → no card (`asked-before`), 71 ms. Audio on in all three: path
 `webcodecs`, context `running`, sink `""` (default), 792–808 DataChannel packets in 4 s, 0
 underruns. Handler extension `e6ba676`. Detail: `docs/overhaul-new/G06.md`, addendum 2026-10-05.
+
+## AOS-DISCOVERY — output discovery at Connect is exhaustive, bounded and final before the offer; "can't switch speakers" only where it is true — `COMPILE-CHECKED` (unit + client harness; one handler run on Chrome 154 headless: host held `supported: true` in all four cases — microphone granted, speaker-only, nothing granted → card → default only, plain HTTP → default only; no real Firefox/Safari/iOS)
+
+Owner's report: the device sheet said "This device's browser can't switch speakers; audio plays on
+its default output" — "should never be the case". Root causes at `c4ffe6d`: the host's
+`AudioOutputsReport` derived `Default` (`supported: false`), so a device that was offline, a join
+that had not posted yet, and every **relayed** join (the relay does not tunnel `/audio-outputs`)
+read as "cannot switch"; a body without the field parsed as `false`; and on plain HTTP — the LAN
+QR code's scheme — the page posted `false` because Chrome hides `navigator.mediaDevices` and
+`AudioContext.setSinkId` there and the page required enumeration (handler: element
+`setSinkId` stays exposed). Fix
+(`db377a1`, `6cce67c`): unreported is `true` with no outputs, a reported `false` outranks an
+unreported sibling, the page's `supported` is any sink API, the iPhone category or an insecure
+context; `false` now comes only from a secure page with no sink API at all (Safari < 18.4 off an
+iPhone).
+
+Then the owner's specification (`findings/overhaul-new/OWNER-SPEC-audio-discovery.md`), `6c0e363`:
+every discovery API in order under its own bound (`selectAudioOutput` 30 s, started in the click;
+the two permission queries 2 s; `enumerateDevices` 3 s; presence probes for both `setSinkId`s,
+`audioSession` and `devicechange`), each with a definite `ok`/`unsupported`/`denied`/`empty`/
+`error`/`timeout`; the microphone card only when no routable output came back; `getUserMedia`
+once (30 s), one more enumeration, every track stopped; otherwise exactly one option, the default,
+`labelled: false`. The sequence completes before `POST /whep`; the body posted at the answer
+carries `discovery`, which the host stores, logs and shows in `status --json`
+(`telemetry.joins[].audioOutputs`). The card is no longer remembered per device, and the
+"Choose a speaker on this device…" entry is gone. No latency effect intended; the join's
+submit → POST time now includes the discovery calls (all bounded). Detail and the readings of the
+spec taken: `docs/overhaul-new/G06.md`, addendum 2026-10-05 (2); field contract:
+`docs/TELEMETRY.md` (`/audio-outputs`).

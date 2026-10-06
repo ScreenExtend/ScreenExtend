@@ -584,6 +584,16 @@ async fn dispatch(
             }
             (204, "text/plain", String::new(), None, None)
         }
+        // The live relay is not known to forward this today (its page is older, and the routes
+        // above are what it was measured to tunnel). Handled anyway, so a relay or page that
+        // does send it gets the device's speakers onto the host's sheet instead of a 404; a
+        // body that names no join has nothing to attach to.
+        ("POST", "/audio-outputs") => {
+            if !relay_join.is_empty() {
+                server::process_audio_outputs(state, &relay_join, body.as_bytes());
+            }
+            (204, "text/plain", String::new(), None, None)
+        }
         _ => {
             teprintln!("[cloud] unsupported tunneled request {method} {path}");
             (404, "text/plain", "not found".to_string(), None, None)

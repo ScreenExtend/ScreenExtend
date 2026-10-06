@@ -473,7 +473,41 @@ unlabelled list routes exactly as well as a labelled one. The same fact reaches 
 as `labelled: false` on the `/audio-outputs` payload, `AudioOutputsReport` and the
 `DeviceAudioOutputs` event, so the host can render the list without presenting invented names as
 device names. The bit is still set when the microphone card *was* raised — enumeration returned
-nothing at all — and declined.
+nothing at all — and declined, and when the device is reported with the default output alone.
+
+### `/audio-outputs` — the output list and how it was found
+
+The client posts this once its join exists (right after the answer), again on a device change
+and whenever the sink in use moves. The body, every field but `outputs` optional so an older page
+still parses:
+
+| field | meaning |
+|---|---|
+| `supported` | `false` only when the browser has no way at all to move audio off the default output: no `setSinkId` on `AudioContext` or `HTMLMediaElement`, no `selectAudioOutput`, no iPhone audio-session category, and a secure context (on plain HTTP `navigator.mediaDevices` and `AudioContext.setSinkId` are hidden — Chrome 154 keeps the element's — which is the connection, not the browser). The desktop sheet's "This device's browser can't switch speakers" is exactly this value. The host treats a join that has not posted, or a body without the field, as `true` |
+| `outputs` | `[{id, label}]`: the iPhone's `se:loudspeaker` / `se:earpiece` where they apply, then every routable device; when discovery found nothing, **exactly one** entry, `{id: "", label: "Default output"}` |
+| `labelled` | whether any device entry carries the operating system's name (`false` for positional names and for the default-only report; degraded bit 9 mirrors it) |
+| `selected`, `current` | as before: the sink the host asked for, and the one actually in use |
+| `discovery` | **new.** One entry per output-discovery API run at Connect, in order, each `ok`, `unsupported`, `denied`, `empty`, `error` or `timeout` (below). Absent from a page that predates it |
+
+`discovery` keys, in the order they run (owner spec, `findings/overhaul-new/OWNER-SPEC-audio-discovery.md`):
+
+| key | API | bound |
+|---|---|---|
+| `selectAudioOutput` | the browser's chooser, started synchronously inside the Connect click; a dismissal is `denied`, a pick with no id `empty` | 30 s |
+| `permissions.speaker-selection` (+ `.state`) | `permissions.query`; a `TypeError` for an unknown name is `unsupported` | 2 s |
+| `permissions.microphone` (+ `.state`: `granted` / `prompt` / `denied`) | `permissions.query`; Safari's `TypeError` is `unsupported` | 2 s |
+| `enumerateDevices` | `audiooutput` entries with a non-empty id; none is `empty` | 3 s |
+| `AudioContext.setSinkId`, `HTMLMediaElement.setSinkId`, `audioSession`, `devicechange` | presence probes, `ok` / `unsupported` | — |
+| `getUserMedia` | only when nothing above yielded a routable output: the page's microphone card, then one request. `denied` also covers Skip on the card and a permission already `denied` (no card is raised then); `unsupported` where there is no `getUserMedia` or no sink API that could route a list | 30 s |
+| `enumerateDevices.afterMicrophone` | the one retry while the microphone is held; every track is stopped after it | 3 s |
+
+A timeout is a definite failure of that API. An `error` or a `timeout` also counts as a
+suppressed failure. The whole sequence is bounded (at most about 70 s plus however long the user
+leaves the card up; the card always has Skip), and it finishes before the offer is sent, so the
+report posted at the answer is the one fixed before the offer. The host logs one
+`[audio-outputs] join <id>: supported=… outputs=N (kinds) labelled=… current=… discovery=k:v,…`
+line per post and shows the last one per join in `ScreenExtend status --json` as
+`telemetry.joins[].audioOutputs` (`supported`, `outputs`, `labelled`, `discovery`).
 
 Bit 15 covers two different waits, both of which mean "ICE did not finish on its own". On the
 gather-then-post tier it is the wait in front of the offer (`waitForIceGathering`). On the
