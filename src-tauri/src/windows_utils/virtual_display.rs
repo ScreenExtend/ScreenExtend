@@ -215,8 +215,29 @@ pub fn driver_pipe_holder() -> Option<u32> {
     sibling_processes().into_iter().next()
 }
 
+/// The backend as the driver answers right now, ignoring this process's cached "connected".
+///
+/// For `drivers restart`, which has to see the restarted driver answer before it may report
+/// success; [`probe_display_backend`] would return the answer it got before the restart.
+pub fn probe_display_backend_fresh() -> DisplayBackend {
+    probe_pipe(DEFAULT_PIPE_NAME)
+}
+
+/// How many monitors the driver itself says are in its list, asked over a fresh connection.
+///
+/// The list is machine-wide: it holds every virtual display any ScreenExtend host on this
+/// machine has attached, which is what `drivers restart` must not take away from under one.
+pub fn driver_monitor_count() -> Result<usize, String> {
+    std::thread::spawn(|| {
+        let client = DriverClient::new().map_err(|e| e.to_string())?;
+        client.request_live_state().map(|m| m.len())
+    })
+    .join()
+    .map_err(|_| "the driver state request panicked".to_string())?
+}
+
 /// Every other process running this same executable, oldest pid first.
-fn sibling_processes() -> Vec<u32> {
+pub(crate) fn sibling_processes() -> Vec<u32> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::EnumProcesses;

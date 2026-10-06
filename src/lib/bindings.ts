@@ -104,6 +104,20 @@ async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
 /**
+ * How much the virtual display driver's host has leaked, read unelevated. The startup gate
+ * asks this before `setup` and offers [`restart_display_driver`] when it is over threshold.
+ */
+async displayDriverHealth() : Promise<DisplayDriverHealth> {
+    return await TAURI_INVOKE("display_driver_health");
+},
+/**
+ * Run `ScreenExtend drivers restart` elevated (one UAC prompt), wait for it, and say how it
+ * went. Off the main thread: the prompt and the restart take seconds.
+ */
+async restartDisplayDriver() : Promise<DriverRestartOutcome> {
+    return await TAURI_INVOKE("restart_display_driver");
+},
+/**
  * Ask the other ScreenExtend instance that is holding the display driver's pipe to quit.
  * 
  * Only ever reaches an instance answering on the single-instance control socket — a desktop
@@ -382,6 +396,60 @@ export type DeviceJoin = Device
 export type DeviceModify = Device
 export type DeviceRemove = Device
 export type DisplayCapacity = { max: number | null; in_use: number; full: boolean; backend: string }
+/**
+ * What the virtual display driver's host process has built up, read without elevation.
+ * 
+ * The bundled IddCx driver leaks ~47–124 MB of commit, ~37 handles and ~5 threads per display
+ * creation or mode change and never gives it back; at ~36 GB / ~3,200 threads it stops attaching
+ * displays at all. Only a device restart (elevated) or a reboot frees it, so the startup gate
+ * reads this before `setup` and offers the restart (`docs/OPTIMIZATIONS.md` UX-DRVRESTART).
+ */
+export type DisplayDriverHealth = { 
+/**
+ * `false` where there is no such driver (macOS, Linux). Nothing else here means anything then.
+ */
+supported: boolean; 
+/**
+ * The host is over a threshold and the driver is installed: restart it before creating
+ * displays.
+ */
+needs_restart: boolean; 
+/**
+ * The driver host's pid, when one was found.
+ */
+pid: number | null; 
+/**
+ * How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe —
+ * exact), `largestWudfHost` (a guess, used only when the pipe could not name its server),
+ * `none` (no driver host found) or `unsupported`.
+ */
+identified_by: string; 
+/**
+ * Private commit of the host process, MB (what Task Manager calls "Commit size").
+ */
+commit_mb: number; threads: number; handles: number; threshold_mb: number; 
+/**
+ * `0` when the thread criterion is switched off (see `SE_DRIVER_RESTART_THRESHOLD_MB`).
+ */
+threshold_threads: number; 
+/**
+ * One line for the log and `doctor`.
+ */
+detail: string }
+/**
+ * What an elevated `drivers restart` came back with.
+ */
+export type DriverRestartOutcome = { ok: boolean; 
+/**
+ * `restarted`, `declined` (the UAC prompt was dismissed), `timeout`, `refused` (a host is
+ * streaming or holds displays), `notElevated`, `needsReboot`, `notInstalled`, `failed` or
+ * `unsupported`. The desktop UI keys its message on this.
+ */
+reason: string; 
+/**
+ * The subcommand's own sentence, when it wrote one.
+ */
+detail: string; commit_mb_before: number | null; commit_mb_after: number | null }
 export type HostedNetworkNoPassword = null
 /**
  * Everything the UI can say about the hosted network without opening the log terminal.

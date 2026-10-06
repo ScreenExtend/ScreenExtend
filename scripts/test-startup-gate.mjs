@@ -13,7 +13,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   classifyCompat,
+  classifyDriverHealth,
   classifySetupFailure,
+  RESTART_FAILURE_REASONS,
+  restartFailureKey,
   driverRemediation,
   mayAttempt,
   offersDriverInstall,
@@ -289,6 +292,55 @@ test('every class has its own sentence, and en.json carries all three', () => {
   // And the toast the bootstrap raises when it starts anyway.
   assert.equal(typeof at('toasts.savedSettings.replayFailedTitle'), 'string');
   assert.equal(typeof at('toasts.savedSettings.replayFailedDescription'), 'string');
+});
+
+console.log('=== the display driver memory gate ===');
+
+const health = (over = {}) => ({
+  supported: true,
+  needs_restart: false,
+  pid: 1992,
+  identified_by: 'pipeServer',
+  commit_mb: 14752,
+  threads: 1270,
+  handles: 8714,
+  threshold_mb: 8192,
+  threshold_threads: 800,
+  detail: '',
+  ...over,
+});
+
+test('a driver host over its threshold stops startup for a restart', () => {
+  const gate = classifyDriverHealth(health({ needs_restart: true }));
+  assert.equal(gate.kind, 'restart');
+  assert.equal(gate.commitMb, 14752);
+  assert.equal(gate.threads, 1270);
+});
+
+test('a host under its threshold starts with no dialog', () => {
+  assert.equal(classifyDriverHealth(health({ commit_mb: 10, threads: 19 })).kind, 'ok');
+});
+
+test('a failed read or a platform with no driver never stops anyone', () => {
+  assert.equal(classifyDriverHealth(null).kind, 'ok');
+  // macOS and Linux report `supported: false`; even a stray `needs_restart` there is ignored.
+  assert.equal(classifyDriverHealth(health({ supported: false, needs_restart: true })).kind, 'ok');
+});
+
+test('every restart failure has its own sentence, and an unknown one falls back', () => {
+  const strings = JSON.parse(readFileSync(new URL('../src/i18n/locales/en.json', import.meta.url), 'utf8'));
+  const at = key => key.split('.').reduce((node, part) => (node ? node[part] : undefined), strings);
+  for (const reason of RESTART_FAILURE_REASONS) {
+    const key = restartFailureKey({ ok: false, reason, detail: '', commit_mb_before: null, commit_mb_after: null });
+    assert.equal(key, `bootstrap.driverRestart.failure.${reason}`);
+    assert.equal(typeof at(key), 'string', key + ' is missing from en.json');
+  }
+  assert.equal(restartFailureKey(null), 'bootstrap.driverRestart.failure.failed');
+  assert.equal(restartFailureKey({ reason: 'somethingNew' }), 'bootstrap.driverRestart.failure.failed');
+  // The modal's own copy: a title, the body, and exactly two actions.
+  for (const key of ['title', 'body', 'usage', 'restarting', 'restart', 'exit']) {
+    assert.equal(typeof at(`bootstrap.driverRestart.${key}`), 'string', key);
+  }
 });
 
 console.log(failed === 0 ? '\nall startup-gate assertions passed' : `\n${failed} failed`);

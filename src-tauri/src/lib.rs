@@ -344,6 +344,50 @@ impl CompatibilityReport {
     }
 }
 
+/// What the virtual display driver's host process has built up, read without elevation.
+///
+/// The bundled IddCx driver leaks ~47–124 MB of commit, ~37 handles and ~5 threads per display
+/// creation or mode change and never gives it back; at ~36 GB / ~3,200 threads it stops attaching
+/// displays at all. Only a device restart (elevated) or a reboot frees it, so the startup gate
+/// reads this before `setup` and offers the restart (`docs/OPTIMIZATIONS.md` UX-DRVRESTART).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Type)]
+pub struct DisplayDriverHealth {
+    /// `false` where there is no such driver (macOS, Linux). Nothing else here means anything then.
+    pub supported: bool,
+    /// The host is over a threshold and the driver is installed: restart it before creating
+    /// displays.
+    pub needs_restart: bool,
+    /// The driver host's pid, when one was found.
+    pub pid: Option<u32>,
+    /// How that pid was chosen: `pipeServer` (the process serving the driver's own named pipe —
+    /// exact), `largestWudfHost` (a guess, used only when the pipe could not name its server),
+    /// `none` (no driver host found) or `unsupported`.
+    pub identified_by: String,
+    /// Private commit of the host process, MB (what Task Manager calls "Commit size").
+    pub commit_mb: u32,
+    pub threads: u32,
+    pub handles: u32,
+    pub threshold_mb: u32,
+    /// `0` when the thread criterion is switched off (see `SE_DRIVER_RESTART_THRESHOLD_MB`).
+    pub threshold_threads: u32,
+    /// One line for the log and `doctor`.
+    pub detail: String,
+}
+
+/// What an elevated `drivers restart` came back with.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Type)]
+pub struct DriverRestartOutcome {
+    pub ok: bool,
+    /// `restarted`, `declined` (the UAC prompt was dismissed), `timeout`, `refused` (a host is
+    /// streaming or holds displays), `notElevated`, `needsReboot`, `notInstalled`, `failed` or
+    /// `unsupported`. The desktop UI keys its message on this.
+    pub reason: String,
+    /// The subcommand's own sentence, when it wrote one.
+    pub detail: String,
+    pub commit_mb_before: Option<u32>,
+    pub commit_mb_after: Option<u32>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, specta::Type)]
 pub struct DisplayCapacity {
     pub max: Option<u32>,
@@ -867,6 +911,8 @@ pub fn run() {
             hosted_network::turn_on_wifi,
             install_drivers,
             remove_drivers,
+            display_driver_health,
+            restart_display_driver,
             quit_driver_holder,
             install_audio_driver,
             uninstall_audio_driver,

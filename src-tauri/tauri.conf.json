@@ -260,7 +260,13 @@
           "description": "Virtual display driver management.",
           "subcommands": {
             "install": { "description": "Install the virtual display driver (elevated)." },
-            "remove": { "description": "Remove the virtual display driver (elevated)." }
+            "remove": { "description": "Remove the virtual display driver (elevated)." },
+            "restart": {
+              "description": "Restart the virtual display driver to free the memory it has leaked (run as Administrator; refuses while a host is connected). Exit 0 restarted, 1 failed, 4 not elevated, 5 refused, 6 timed out, 7 needs a reboot, 8 not installed.",
+              "args": [
+                { "name": "report", "takesValue": true, "description": "Also write the outcome as JSON to this file (used by the desktop app, which cannot read an elevated process's output)." }
+              ]
+            }
           }
         },
         "doctor": {

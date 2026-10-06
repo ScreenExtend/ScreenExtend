@@ -2,6 +2,7 @@ pub mod audio;
 pub mod com;
 pub mod compatibility;
 pub mod device_reporter;
+pub mod driver_health;
 pub mod driver_ipc;
 pub mod hosted_network;
 pub mod networking;
@@ -1104,6 +1105,35 @@ pub fn install_drivers(app: tauri::AppHandle) -> bool {
 #[specta::specta]
 pub fn remove_drivers(app: tauri::AppHandle) -> bool {
     run_elevated_driver_command(&app, "removedrivers")
+}
+
+/// How much the virtual display driver's host has leaked, read unelevated. The startup gate
+/// asks this before `setup` and offers [`restart_display_driver`] when it is over threshold.
+#[tauri::command]
+#[specta::specta]
+pub fn display_driver_health() -> crate::DisplayDriverHealth {
+    driver_health::read_health()
+}
+
+/// Run `ScreenExtend drivers restart` elevated (one UAC prompt), wait for it, and say how it
+/// went. Off the main thread: the prompt and the restart take seconds.
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_display_driver(app: tauri::AppHandle) -> crate::DriverRestartOutcome {
+    // The prompt is parented to the window so it comes up in front of it, not behind.
+    let owner = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize);
+    match tauri::async_runtime::spawn_blocking(move || driver_health::restart_elevated(owner)).await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => crate::DriverRestartOutcome {
+            reason: "failed".to_string(),
+            detail: format!("the restart task did not complete: {e}"),
+            ..Default::default()
+        },
+    }
 }
 
 #[tauri::command]
