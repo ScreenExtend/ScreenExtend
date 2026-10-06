@@ -186,6 +186,12 @@ function DeviceDetailsBody({
   const audioOutputsByToken = useAudioOutputs();
   const { setAudioOutputsByToken } = useGlobalSetters();
   const audioOutputs = audioOutputsByToken[device.token];
+  // An output with no id (a browser that has not granted the microphone yet) cannot be an
+  // item: Radix refuses an empty value, and it is the default output anyway. Chromium also
+  // lists a pseudo-device whose id is literally "default"; that is the "System default" row.
+  const selectableOutputs = (audioOutputs?.outputs ?? []).filter(
+    (o, i, all) => o.id !== "" && o.id !== "default" && all.findIndex((p) => p.id === o.id) === i,
+  );
   // The client says whether the ids arrived carrying the operating system's own names.
   // `false` means they did not -- the page then names them by position ("Output 1"), which
   // is honest and routable but is not what the hardware is called, so the panel says so
@@ -648,6 +654,9 @@ function DeviceDetailsBody({
                 <TipLabel text={t("device.audioOutput.tip")}>
                   <Label>{t("device.audioOutput.label")}</Label>
                 </TipLabel>
+                {/* The outputs a person can actually pick: no empty id, no Chromium "default"
+                    pseudo-device (the row above is that), no duplicates. A report with none of
+                    these is a device whose browser offered only its default output. */}
                 {audioOutputs?.supported === false ? (
                   <span className="text-sm text-muted-foreground text-right">
                     {t("device.audioOutput.unsupported")}
@@ -668,14 +677,7 @@ function DeviceDetailsBody({
                     </SelectTrigger>
                     <SelectContent className="cursor-pointer">
                       <SelectItem value="default">{t("device.audioOutput.default")}</SelectItem>
-                      {(audioOutputs?.outputs ?? [])
-                        // An output with no id (a browser that has not granted the microphone yet)
-                        // cannot be an item: Radix refuses an empty value, and it is the default
-                        // output anyway. A relayed client runs an older page that still sends them.
-                        // Chromium also lists a pseudo-device whose id is literally "default";
-                        // that is the row above, and keeping it put a check mark on both.
-                        .filter((o, i, all) => o.id !== "" && o.id !== "default" && all.findIndex((p) => p.id === o.id) === i)
-                        .map((o) => (
+                      {selectableOutputs.map((o) => (
                         <SelectItem key={o.id} value={o.id}>
                           {outputLabel(o)}
                         </SelectItem>
@@ -684,18 +686,19 @@ function DeviceDetailsBody({
                   </Select>
                 )}
               </div>
-              {audioOutputs?.supported !== false &&
-                (!audioOutputs || audioOutputs.outputs.length === 0) && (
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    {t("device.audioOutput.waiting")}
-                  </p>
-                )}
+              {/* "Waiting" only while the device has said nothing at all. A report that offers
+                  only the default output gets the select restricted to "System default" and no
+                  text under it (the owner's instruction). */}
+              {audioOutputs?.supported !== false && !audioOutputs && (
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {t("device.audioOutput.waiting")}
+                </p>
+              )}
               {/* Names, not routing: the ids work either way. This says so, because a list
                   reading "Output 1, Output 2" with no explanation looks like a fault. */}
               {audioOutputs?.supported !== false &&
                 namesUnavailable &&
-                !!audioOutputs &&
-                audioOutputs.outputs.length > 0 && (
+                selectableOutputs.length > 0 && (
                   <p className="mt-2 text-sm text-muted-foreground">
                     {t("device.audioOutput.generic")}
                   </p>
