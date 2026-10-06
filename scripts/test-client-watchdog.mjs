@@ -82,6 +82,9 @@ function harness() {
     let icePending = false;
     let reconfiguring = false;
     let isLive = false;
+    let joinHideTimer = 0;
+    let streamInputArmed = false;
+    function syncInputGate() {}
     const webcodecs = true;
     const useScriptTransform = true;
     const hasLegacyEncodedStreams = true;

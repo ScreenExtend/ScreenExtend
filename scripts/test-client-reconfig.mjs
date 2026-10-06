@@ -63,6 +63,9 @@ const prelude = `
   function showLinkStatus(s) { calls.push('showLinkStatus:' + s); }
   function showError(m) { calls.push('showError:' + m); }
   function linkLost(m) { calls.push('linkLost:' + m); }
+  // The real one is exercised end to end in test-client-join.mjs; here it records which way the
+  // session ended and does the three things the assertions below read.
+  function restorePreJoinPage(m, keepJoin) { calls.push('restorePreJoinPage:' + !!keepJoin); teardownSession(keepJoin); isLive = false; reconfiguring = false; showError(m); }
   function start(again, keepJoin) { calls.push('start:' + !!again + ':' + !!keepJoin); }
   function queueOutputPicker(id) { calls.push('queueOutputPicker:' + id); }
   function nowMs() { return clock; }
@@ -228,6 +231,8 @@ else fail('reconfiguring was still set after the watchdog');
 // ── 5. a bumped kick epoch removes the device and stops everything ───────────────────────
 calls.length = 0;
 api.applyReconfig({ epoch: 9, kick: 4 });
+if (calls.includes('restorePreJoinPage:false')) ok('a kick ends the session through the one full restore, releasing the join');
+else fail('a kick did not go through restorePreJoinPage: ' + calls.join(', '));
 if (calls.includes('teardownSession:false') && calls.some((c) => c.startsWith('showError'))) ok('a bumped kick epoch tears the session down and says why');
 else fail('a kick ran ' + calls.join(', '));
 eq('the device is marked kicked', api.state().kicked, true);
@@ -431,6 +436,7 @@ sinkResult = true;
       'function start(again, keepJoin) { calls.push("start:" + !!again + ":" + !!keepJoin); }',
       'function offerHttpsUpgrade() { calls.push("offerHttpsUpgrade"); }',
       'function stopLock() { calls.push("stopLock"); }',
+      'function restorePreJoinPage(m, keepJoin) { calls.push("restorePreJoinPage:" + !!keepJoin); teardownSession(keepJoin); isLive = false; showError(m); }',
       'let isLive = true; let canWebCodecs = true;',
       'const location = { protocol: "https:" };',
       takeFunction('linkLost'),
@@ -442,6 +448,8 @@ sinkResult = true;
   );
 
   ctx.api.linkLost('Disconnected, reconnect to continue.');
+  if (calls.includes('restorePreJoinPage:true')) ok('a lost link ends through the one full restore');
+  else fail('a lost link did not go through restorePreJoinPage: ' + calls.join(', '));
   if (calls.includes('teardownSession:true')) ok('a lost link keeps the join the host is holding a display for');
   else fail('a lost link ran ' + calls.join(', '));
   if (!calls.includes('teardownSession:false')) ok('and never beacons a departure the page did not mean');
