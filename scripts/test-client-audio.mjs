@@ -269,16 +269,38 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
   //   ua/platform/touch shape the device; audioSession: true adds navigator.audioSession
   // Every `/audio-outputs` body is in `_st.posts`.
   function page(o) {
-    const st = { granted: o.mic === 'granted', gumCalls: 0, pickerCalls: 0, posts: [], tracksStopped: 0 };
+    const st = { granted: o.mic === 'granted', gumCalls: 0, pickerCalls: 0, posts: [], tracksStopped: 0, intervals: new Set(), dcListeners: 0, ctx: null };
     const win = { AudioContext: function () {}, isSecureContext: o.secure !== false, localStorage: null };
     win.AudioContext.prototype = o.sinkApi === false ? { audioWorklet: {} } : { audioWorklet: {}, setSinkId() {} };
+    if (o.liveCtx) {
+      // A context whose worklet loads, so `beginFromGesture` builds the whole graph and the
+      // suspend/resume pair can be watched.
+      win.AudioContext = function () {
+        st.ctx = this;
+        this.state = 'running';
+        this.calls = [];
+        this.destination = {};
+        this.audioWorklet = { addModule: () => Promise.resolve() };
+      };
+      win.AudioContext.prototype = {
+        setSinkId() { return Promise.resolve(); },
+        resume() { this.calls.push('resume'); this.state = 'running'; return Promise.resolve(); },
+        suspend() { this.calls.push('suspend'); this.state = 'suspended'; return Promise.resolve(); },
+        close() { this.state = 'closed'; return Promise.resolve(); },
+        createGain() { return { gain: { value: 1 }, connect: (x) => x, disconnect() {} }; },
+        addEventListener() {},
+      };
+      win.AudioWorkletNode = function () { this.port = { postMessage() {}, onmessage: null }; };
+      win.AudioWorkletNode.prototype = { connect: (x) => x };
+    }
     const md = {
       enumerateDevices: () => {
         if (o.enumerate === 'throw') return Promise.reject(err('InvalidStateError', 'nope'));
         if (o.enumerate === 'timeout') return never();
         return Promise.resolve(o.enumerate(st.granted));
       },
-      addEventListener() {},
+      addEventListener(t) { if (t === 'devicechange') st.dcListeners++; },
+      removeEventListener(t) { if (t === 'devicechange') st.dcListeners--; },
     };
     if (o.deviceChange !== false) md.ondevicechange = null;
     if (o.enumerate === 'missing') delete md.enumerateDevices;
@@ -323,8 +345,9 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
       performance: { now: () => 0, timeOrigin: 0 },
       // Not unref'd: a bounded call's deadline is what settles it, so it must keep node alive.
       setTimeout: (fn, ms) => setTimeout(fn, Math.ceil((ms || 0) / 1000)),
-      setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); return t; },
-      clearTimeout, clearInterval,
+      setInterval: (fn, ms) => { const t = setInterval(fn, ms); if (t.unref) t.unref(); st.intervals.add(t); return t; },
+      clearTimeout,
+      clearInterval: (t) => { st.intervals.delete(t); clearInterval(t); },
       Promise, Float32Array, Int32Array, Uint8Array, ArrayBuffer, DataView, JSON, Math, Date,
       fetch: async (url, init) => { if (/^\/audio-outputs/.test(url)) st.posts.push(JSON.parse(init.body)); return { ok: true }; },
       navigator: nav,
@@ -497,6 +520,36 @@ eq('a truncated redundant frame decodes nothing', decoded.length, 0);
     A.postOutputs();
     await flush();
     eq('a post before discovery: default only, supported', A._st.posts[0].outputs.map((x) => x.id).join(',') + '/' + A._st.posts[0].supported, '/true');
+  }
+
+  // 7. endSession: a join that failed (or ended) gives back everything audio.js armed for it — the
+  // device watch and its POSTs, the speaker identity, the chooser's pending sink — and suspends
+  // the context, which the next Connect click resumes. `teardown` alone (a renegotiation) keeps
+  // all of it.
+  {
+    const r = await connect({ enumerate: chromium, mic: 'granted', picker: 'missing', liveCtx: true });
+    const A = r.A;
+    const st = A._st;
+    await A.beginFromGesture();
+    eq('after Connect: device poll + devicechange listener running', st.intervals.size + '/' + st.dcListeners, '1/1');
+    A.teardown();
+    eq('teardown (a renegotiation) keeps the watch', st.intervals.size + '/' + st.dcListeners, '1/1');
+    const posted = st.posts.length;
+    A.endSession();
+    eq('endSession stops the poll and removes the devicechange listener', st.intervals.size + '/' + st.dcListeners, '0/0');
+    eq('endSession suspends the context', st.ctx.state, 'suspended');
+    A.postOutputs(true);
+    await flush();
+    eq('nothing reaches the host once the session has ended', st.posts.length, posted);
+    A.endSession();
+    eq('endSession twice is harmless', st.intervals.size + '/' + st.dcListeners, '0/0');
+    // The next Connect: the click resumes the context and discovery starts the watch again.
+    const ready = await A.beginFromGesture();
+    eq('the next Connect click resumes the suspended context', ready + '/' + st.ctx.state + '/' + st.ctx.calls.join(','), 'true/running/suspend,resume');
+    const pick = A.startPicker();
+    await A.prepareOutputsForJoin(() => {}, pick);
+    eq('and its discovery starts the device watch again', st.intervals.size + '/' + st.dcListeners, '1/1');
+    A.endSession();
   }
 
   // 6. The old "Choose a speaker…" entry, still saved on some host rows, is ignored.

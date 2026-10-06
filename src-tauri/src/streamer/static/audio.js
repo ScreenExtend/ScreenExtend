@@ -217,6 +217,7 @@
         deviceToken: '',
         labelsUnavailable: false,
         refusedSink: null,
+        onDeviceChange: null,
     };
 
     function detectIOS() {
@@ -651,6 +652,7 @@
         try {
             if (md && md.addEventListener && speakers.hasDeviceChange) {
                 md.addEventListener('devicechange', onChange);
+                speakers.onDeviceChange = onChange;
             }
         } catch (_) { note(); }
         // The poll is the backstop for a browser with no `devicechange` event. Where the event
@@ -664,6 +666,20 @@
                 reEnumerateAndPost();
             }, period);
         } catch (_) { note(); }
+    }
+
+    // The watch belongs to a session: with no join there is nobody to tell about a new
+    // speaker, and the next Connect's discovery starts it again.
+    function stopDeviceWatch() {
+        speakers.watching = false;
+        speakers.firstDeviceChange = true;
+        if (speakers.poll) { clearInterval(speakers.poll); speakers.poll = null; }
+        if (speakers.debounceTimer) { clearTimeout(speakers.debounceTimer); speakers.debounceTimer = 0; }
+        const md = navigator.mediaDevices;
+        if (speakers.onDeviceChange) {
+            try { if (md && md.removeEventListener) md.removeEventListener('devicechange', speakers.onDeviceChange); } catch (_) { note(); }
+            speakers.onDeviceChange = null;
+        }
     }
 
     // Where the audio is *actually* playing, which is not always where the host last asked for
@@ -1084,7 +1100,14 @@
     // session with the failure swallowed.
     let preparePromise = null;
     function beginFromGesture() {
-        if (state.prepared) return Promise.resolve(true);
+        if (state.prepared) {
+            // `endSession` suspends the context when a join fails or ends; this click is the
+            // gesture iOS needs to start it again.
+            if (state.ctx && state.ctx.state === 'suspended') {
+                try { const p = state.ctx.resume(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
+            }
+            return Promise.resolve(true);
+        }
         if (preparePromise) return preparePromise;
         initSpeakers();
         const AC = window.AudioContext || window.webkitAudioContext;
@@ -1419,6 +1442,35 @@
         state.stats = null;
     }
 
+    // `teardown` is per peer connection: a renegotiation calls it and keeps everything else for
+    // the next one. This is the end of the session itself — the join failed, the link was lost,
+    // the host ended it, or the page is going away — so a page back on its join form holds no
+    // microphone, runs no device watch, posts nothing to the host and keeps no audio device
+    // busy. The context is suspended rather than closed: iOS builds one only inside a gesture
+    // and two would fight over the output, so `beginFromGesture` resumes this one from the next
+    // Connect click.
+    function endSession() {
+        teardown();
+        if (speakers.micHold && speakers.appliedSink === SE_EARPIECE) {
+            // Releasing the hold is what moves the audio off the earpiece, so the next session
+            // must not believe it is still there and skip re-acquiring it.
+            speakers.appliedSink = null;
+        }
+        releaseMicHold();
+        stopDeviceWatch();
+        speakers.sessionId = '';
+        speakers.deviceToken = '';
+        speakers.joinId = '';
+        // A sink chosen in the browser's chooser at this Connect, or commanded before the graph
+        // existed, belongs to the join that failed; the next Connect asks again.
+        speakers.pendingSink = null;
+        state.fallbackStream = null;
+        if (state.audioEl) { try { state.audioEl.pause(); } catch (_) { note(); } }
+        if (state.ctx && state.ctx.state === 'running' && typeof state.ctx.suspend === 'function') {
+            try { const p = state.ctx.suspend(); if (p && p.catch) p.catch(note); } catch (_) { note(); }
+        }
+    }
+
     function getSyncInfo() {
         const st = state.stats;
         return {
@@ -1487,6 +1539,7 @@
         suppressedCount: () => suppressed,
         activePath,
         teardown,
+        endSession,
         initSpeakers,
         enumerateBeforeJoin,
         prepareOutputsForJoin,
