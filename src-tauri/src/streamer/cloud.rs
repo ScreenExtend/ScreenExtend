@@ -469,10 +469,16 @@ fn handle_relay_message(
             client_id,
             method,
             path,
+            query,
             body,
             ice_servers,
             ..
         } => {
+            // The relay splits the client's URL into `path` and `query`. `dispatch` matches the
+            // route on the path and reads `?join=` from the query, so the two are put back
+            // together here; dropping the query is what made every relayed `/audio-outputs`
+            // (and a `/leave` naming its join) arrive with no join to attach to.
+            let path = request_path(&path, &query);
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -514,6 +520,16 @@ fn handle_relay_message(
         }
     }
     Ok(())
+}
+
+/// The relay sends the client's URL as separate `path` and `query` fields; `dispatch` matches
+/// the route on the path and reads `?join=` from the query, so the two are rejoined first.
+fn request_path(path: &str, query: &str) -> String {
+    if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    }
 }
 
 async fn dispatch(
@@ -629,6 +645,15 @@ mod tests {
 
     fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
         v.get(key).unwrap_or_else(|| panic!("no `{key}` in {v}"))
+    }
+
+    #[test]
+    fn the_relays_query_field_is_rejoined_to_the_path_before_dispatch() {
+        assert_eq!(
+            request_path("/audio-outputs", "join=abc"),
+            "/audio-outputs?join=abc"
+        );
+        assert_eq!(request_path("/leave", ""), "/leave");
     }
 
     #[test]
