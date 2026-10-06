@@ -680,6 +680,27 @@ async function customHook(cl) {
   return out;
 }
 
+// The host's own record of what a join posted to `/audio-outputs`: the `[audio-outputs]` line
+// `serve` logs per post (builds from `audio-outputs-supported` on). The last line for the join
+// the page holds wins; polled briefly because the post follows the answer by a few ms. A build
+// without the line reports `{ line: null }`, which says nothing either way.
+async function hostAudioOutputs(cl) {
+  const joinId = await cl.page.ev('(() => { try { return sessionStorage.getItem("se.joinId") || ""; } catch (e) { return ""; } })()').catch(() => '');
+  if (!joinId) return { joinId: null, line: null, note: 'the page holds no join id' };
+  for (let i = 0; i < 15; i++) {
+    const r = await cli(['logs', '--lines', '2000'], 10000);
+    const lines = r.stdout.split(/\r?\n/).filter((l) => l.includes(`[audio-outputs] join ${joinId}:`));
+    if (lines.length) {
+      const last = lines[lines.length - 1];
+      const f = (k) => { const m = last.match(new RegExp(k + '=(\\S+)')); return m ? m[1] : null; };
+      const om = last.match(/outputs=(\d+) \(([^)]*)\)/);
+      return { joinId, posts: lines.length, supported: f('supported'), outputs: om ? Number(om[1]) : null, kinds: om ? om[2] : null, labelled: f('labelled'), current: f('current'), line: last.trim() };
+    }
+    await sleep(200);
+  }
+  return { joinId, line: null, note: 'no [audio-outputs] line for this join (no post, or a build without the line)' };
+}
+
 // `mic_prompt`: three fresh browsers — speaker access granted, microphone granted, nothing
 // granted (the card is answered with Skip) — and, with `{ rejoin: true }`, the nothing-granted
 // browser joins a second time to show the answer is remembered. `{ audio: true }` also turns
@@ -693,12 +714,17 @@ async function micPrompt() {
     ['speaker access granted (no microphone)', ['speakerSelection', 'wakeLockScreen']],
     ['microphone granted', ['audioCapture', 'wakeLockScreen']],
     ['nothing granted', null],
+    // Plain HTTP to the LAN address: not a secure context, so `navigator.mediaDevices`,
+    // `setSinkId` and `selectAudioOutput` are all absent. Only with `http: true` (or by label).
+    ['plain HTTP, nothing granted', null, { https: false }],
   ];
   if (Array.isArray(opt.cases)) cases = cases.filter(([l]) => opt.cases.includes(l));
+  else if (!opt.http) cases = cases.filter(([, , o]) => !o);
   const readPage = (cl) => cl.page.ev(`(async () => ({
       gum: __se.gum, permQueries: __se.permQueries,
-      micPermission: await navigator.permissions.query({ name: 'microphone' }).then((p) => p.state, (e) => 'ERR ' + e.message),
-      outputs: await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').map((x) => ({ idEmpty: !x.deviceId, label: x.label }))),
+      secure: window.isSecureContext,
+      micPermission: navigator.permissions ? await navigator.permissions.query({ name: 'microphone' }).then((p) => p.state, (e) => 'ERR ' + e.message) : 'no permissions API',
+      outputs: navigator.mediaDevices ? await navigator.mediaDevices.enumerateDevices().then((d) => d.filter((x) => x.kind === 'audiooutput').map((x) => ({ idEmpty: !x.deviceId, label: x.label }))) : 'no navigator.mediaDevices',
       outputPlan: window.SEAudio && SEAudio.getOutputPlan ? SEAudio.getOutputPlan() : 'no getOutputPlan (older page)',
       stored: (() => { const o = {}; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (/^se\\.outputs\\./.test(k)) o[k] = localStorage.getItem(k); } } catch (e) { o.error = e.message; } return o; })(),
       selectAudioOutput: !!(navigator.mediaDevices && navigator.mediaDevices.selectAudioOutput),
@@ -708,14 +734,19 @@ async function micPrompt() {
     const outputsPost = (j.apiRequests || []).find((w) => w.method === 'POST' && /^\/audio-outputs/.test(w.url));
     return { modals: j.modals, submitToFirstPostMs: posts.length ? posts[0].sentMs : null, offers: posts.length, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, audioOutputsPostedMs: outputsPost ? outputsPost.sentMs : null, pageError: j.pageError || '' };
   };
-  for (const [label, grant] of cases) {
-    const cl = await openClient(REQ.client, { offset: 3 });
-    const j = await joinClient(cl, REQ.client, { grant, micChoice: 'skip' });
+  for (const [label, grant, caseOpt] of cases) {
+    const spec = { ...REQ.client, ...(caseOpt || {}) };
+    const cl = await openClient(spec, { offset: 3 });
+    const j = await joinClient(cl, spec, { grant, micChoice: 'skip' });
     const page = await readPage(cl);
     out[label] = { join: summarise(j), micCardShown: j.modals.some((m) => /^micCard/.test(m)), microphoneRequested: (page.gum || []).some((g) => /audio/.test(g.constraints)), ...page,
-      outputsAvailableWithoutMic: (page.outputs || []).some((x) => x.label), defect: null };
+      outputsAvailableWithoutMic: Array.isArray(page.outputs) && page.outputs.some((x) => x.label), defect: null };
     const o = out[label];
     if (o.outputsAvailableWithoutMic && (o.micCardShown || o.microphoneRequested)) o.defect = 'microphone prompt/card although output labels were already available';
+    // What the host holds for this join: the device sheet's "can't switch speakers" is exactly
+    // `supported=false` here.
+    o.hostAudioOutputs = await hostAudioOutputs(cl);
+    if (o.hostAudioOutputs.supported === 'false') o.defect = (o.defect ? o.defect + '; ' : '') + 'host holds supported=false (the sheet would say "can\'t switch speakers")';
     if (opt.audio && j.firstPictureMs != null) {
       const k = await deviceKey(j.name, cl);
       const set = await cli(['devices', 'set', k.key, '--audio', 'on']);
@@ -725,7 +756,7 @@ async function micPrompt() {
       o.audio = { setCode: set.code, path: sync && sync.path, contextState: sync && sync.contextState, currentSink: sync && sync.currentSink, sinkTier: sync && sync.sinkTier,
         depthMs: sync && sync.depthMs, underruns: sync && sync.underruns, dataChannelMessagesIn4s: dc(b) - dc(a), trackPacketsIn4s: ((b.webrtc && b.webrtc.audioTrack && b.webrtc.audioTrack.packets) || 0) - ((a.webrtc && a.webrtc.audioTrack && a.webrtc.audioTrack.packets) || 0) };
     }
-    if (opt.rejoin && grant === null) {
+    if (opt.rejoin && grant === null && !caseOpt) {
       await leave(cl);
       const j2 = await joinClient(cl, REQ.client, { grant: null, micChoice: 'skip' });
       const p2 = await readPage(cl);
