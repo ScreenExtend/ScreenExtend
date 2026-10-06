@@ -28,7 +28,9 @@ public static class Clicks {
 
   const int RATE = 48000, BLOCK = 480, NBUF = 6;
   static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-  static double NowMs() { return (DateTime.UtcNow - Epoch).TotalMilliseconds; }
+  // The precise system clock, not DateTime.UtcNow (coarse at the default timer resolution; see lib/clock.mjs).
+  [DllImport("kernel32.dll")] static extern void GetSystemTimePreciseAsFileTime(out long ft);
+  static double NowMs() { long ft; GetSystemTimePreciseAsFileTime(out ft); return (ft - 116444736000000000L) / 10000.0; }
 
   public static string Run(int seconds, int intervalMs, double amp, int burstMs, int freq) {
     timeBeginPeriod(1);

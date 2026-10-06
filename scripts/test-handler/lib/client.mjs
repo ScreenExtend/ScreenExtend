@@ -6,6 +6,7 @@ import { decodePng, pngSize, rgb } from './png.mjs';
 import { stampLayout, decodeStamp, unwrap } from './stamp.mjs';
 import { dist } from './metrics.mjs';
 import { HOOK_SOURCE, VIDEO_SAMPLER_SOURCE } from './paint-hook.mjs';
+import { preciseNow } from './clock.mjs';
 
 export class Client {
   constructor({ port, profile, flags = [], headed = false, log, scWidth = 480 }) { Object.assign(this, { port, profile, flags, headed, log, scWidth }); this.frameHandler = null; this.geom = null; this.console = []; this.workers = new Map(); this.stampCfg = null; }
@@ -107,26 +108,77 @@ export class Client {
     for (const sid of this.workers.keys()) await this.page.send('Runtime.evaluate', { expression: expr }, sid).catch(() => {});
   }
 
-  /** Everything the hooks have read since the last drain, oldest first. */
+  /**
+   * Each JavaScript context has its own `performance.timeOrigin`, and Chrome takes it from the
+   * wall clock at the context's creation. When Windows runs at its default 15.6 ms timer
+   * resolution that wall clock is coarse, so two contexts' `timeOrigin + now()` can disagree by
+   * up to ~16 ms: measured after a reboot, the page's offset from the system clock was 0.95 to
+   * 13.76 ms run to run, and the paint hook's samples come from the *worker*, whose own origin
+   * error is independent of the page's. Subtracting one page-measured offset from worker
+   * timestamps left a per-run bias of up to ±16 ms in the stamp metric. So every context gets
+   * its own offset (min-RTT, like `clockOffset`), measured once per worker and once per page
+   * document, and every sample is moved onto the reference clock (`Client.refOffsetMs`, the
+   * main page's offset the handler subtracts everywhere) before anyone sees it.
+   */
+  async contextOffset(sid) {
+    let best = null;
+    for (let i = 0; i < 15; i++) {
+      const t0 = preciseNow();
+      const b = sid ? await this.page.send('Runtime.evaluate', { expression: 'performance.timeOrigin + performance.now()', returnByValue: true }, sid).then((r) => r && r.result ? r.result.value : null, () => null)
+        : await this.page.ev('performance.timeOrigin + performance.now()').catch(() => null);
+      const t1 = preciseNow();
+      if (typeof b !== 'number') continue;
+      const s = { rtt: t1 - t0, off: b - (t0 + t1) / 2 };
+      if (!best || s.rtt < best.rtt) best = s;
+    }
+    return best;
+  }
+
+  /** Everything the hooks have read since the last drain, oldest first, on the reference clock. */
   async drainStamps() {
-    const expr = `self.__seStamp ? { out: __seStamp.out.splice(0), painted: __seStamp.painted, sampled: __seStamp.sampled, skipped: __seStamp.skipped } : null`;
+    const expr = `self.__seStamp ? { out: __seStamp.out.splice(0), painted: __seStamp.painted, sampled: __seStamp.sampled, skipped: __seStamp.skipped, origin: performance.timeOrigin } : null`;
     const all = []; const counters = { painted: 0, sampled: 0, skipped: 0 };
-    const add = (r, where) => { if (!r) return; for (const x of r.out) all.push({ ...x, where }); counters.painted += r.painted; counters.sampled += r.sampled; counters.skipped += r.skipped; };
-    add(await this.page.ev(expr).catch(() => null), 'page');
+    this.ctxOffsets = this.ctxOffsets || new Map();
+    const ref = Client.refOffsetMs;
+    const shiftFor = async (key, sid, origin) => {
+      if (ref == null) return 0;
+      let c = this.ctxOffsets.get(key);
+      if (!c || c.origin !== origin) { const o = await this.contextOffset(sid); c = { origin, off: o ? o.off : ref, rtt: o ? o.rtt : null }; this.ctxOffsets.set(key, c); }
+      return ref - c.off;
+    };
+    const add = async (r, where, key, sid) => {
+      if (!r) return;
+      const shift = r.out.length ? await shiftFor(key, sid, r.origin) : 0;
+      for (const x of r.out) all.push({ ...x, t: x.t + shift, where });
+      counters.painted += r.painted; counters.sampled += r.sampled; counters.skipped += r.skipped;
+    };
+    await add(await this.page.ev(expr).catch(() => null), 'page', 'page', null);
     for (const sid of [...this.workers.keys()]) {
       const r = await this.page.send('Runtime.evaluate', { expression: expr, returnByValue: true }, sid).catch(() => null);
-      add(r && r.result ? r.result.value : null, 'worker');
+      await add(r && r.result ? r.result.value : null, 'worker', sid, sid);
     }
     all.sort((a, b) => a.t - b.t);
     return { samples: all, counters };
   }
 
-  /** Decoded-audio onsets every worker has seen since the last drain (AUDIO_DECODE_TAP_SOURCE). */
+  /** The per-context offsets measured so far (ms, context clock minus system clock). */
+  clockContexts() { return [...(this.ctxOffsets || new Map()).entries()].map(([k, v]) => ({ ctx: k === 'page' ? 'page' : 'worker', offMs: Math.round(v.off * 100) / 100, rttMs: v.rtt == null ? null : Math.round(v.rtt * 100) / 100 })); }
+
+  /**
+   * Decoded-audio onsets every worker has seen since the last drain (AUDIO_DECODE_TAP_SOURCE),
+   * with `decoded` moved onto the precise system clock (each worker's own offset; see
+   * contextOffset) and the worker-clock value kept as `decodedRaw`.
+   */
   async drainAudioDecodeOnsets() {
     const out = []; let packets = 0;
+    this.ctxOffsets = this.ctxOffsets || new Map();
     for (const sid of [...this.workers.keys()]) {
-      const r = await this.page.send('Runtime.evaluate', { expression: 'self.__seAudTap ? { onsets: __seAudTap.onsets.splice(0), packets: __seAudTap.packets } : null', returnByValue: true }, sid).catch(() => null);
-      const v = r && r.result ? r.result.value : null; if (v) { out.push(...v.onsets); packets += v.packets; }
+      const r = await this.page.send('Runtime.evaluate', { expression: 'self.__seAudTap ? { onsets: __seAudTap.onsets.splice(0), packets: __seAudTap.packets, origin: performance.timeOrigin } : null', returnByValue: true }, sid).catch(() => null);
+      const v = r && r.result ? r.result.value : null; if (!v) continue;
+      let c = this.ctxOffsets.get(sid);
+      if (v.onsets.length && (!c || c.origin !== v.origin)) { const o = await this.contextOffset(sid); c = { origin: v.origin, off: o ? o.off : 0, rtt: o ? o.rtt : null }; this.ctxOffsets.set(sid, c); }
+      for (const x of v.onsets) out.push({ ...x, decodedRaw: x.decoded, decoded: x.decoded - (c ? c.off : 0) });
+      packets += v.packets;
     }
     return { onsets: out.sort((a, b) => a.decoded - b.decoded), packets };
   }
@@ -203,7 +255,7 @@ export class Client {
         res.hookBeforeFirstPicture = res.hookBeforeFirstPicture || {};
         for (const x of samples) { const k = x.v !== undefined ? 'stamp' : x.e; res.hookBeforeFirstPicture[k] = (res.hookBeforeFirstPicture[k] || 0) + 1; }
         const hit = samples.find((s) => s.v !== undefined && s.t >= submitAt);
-        if (hit) { firstPicture = hit.t; res.firstStampAgeMs = Math.round(hit.t - unwrap(hit.v, hit.t)); res.firstPaintVia = hit.where; }
+        if (hit) { firstPicture = hit.t; res.firstStampAgeMs = Math.round(hit.t - (Client.refOffsetMs || 0) - unwrap(hit.v, hit.t)); res.firstPaintVia = hit.where; }
       }
       await sleep(50);
     }

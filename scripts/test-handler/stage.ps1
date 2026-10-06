@@ -45,6 +45,10 @@ public class StageForm : Form {
 public static class Stage {
   [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr v);
   [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint p);
+  // The stamp's clock: the precise system clock. DateTime.UtcNow is the coarse one, which moves in
+  // up to 15.6 ms steps at Windows' default timer resolution (scripts/test-handler/lib/clock.mjs).
+  [DllImport("kernel32.dll")] static extern void GetSystemTimePreciseAsFileTime(out long ft);
+  public static long NowMs() { long ft; GetSystemTimePreciseAsFileTime(out ft); return (ft - 116444736000000000L + 5000L) / 10000L; }
   [DllImport("user32.dll")] static extern int GetDisplayConfigBufferSizes(uint flags, out uint nPath, out uint nMode);
   [DllImport("user32.dll")] static extern int QueryDisplayConfig(uint flags, ref uint nPath, byte[] paths, ref uint nMode, byte[] modes, IntPtr topo);
   [DllImport("user32.dll")] static extern int DisplayConfigGetDeviceInfo(byte[] packet);
@@ -194,7 +198,7 @@ $lastCheck = 0
 $holding = $false; $phaseStart = 0; $stops = 0; $moveClock = 0
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
   if ($Stamp) {
-    $ms = [long]([DateTime]::UtcNow - $epoch).TotalMilliseconds
+    $ms = [Stage]::NowMs()
     [Stage]::BlitStamp($sg, $ms, $cell, $cellH); $draws++
   }
   $now = $sw.ElapsedMilliseconds
@@ -221,7 +225,7 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
           $holding = -not $holding; $phaseStart = $now
           if ($holding) {
             $stops++
-            $ux = [long]([DateTime]::UtcNow - $epoch).TotalMilliseconds
+            $ux = [Stage]::NowMs()
             "{""stop"":$stops,""x"":$($mf.Location.X - $b.X),""y"":$($mf.Location.Y - $b.Y),""w"":48,""t"":$ux}"; [Console]::Out.Flush()
           }
         }
