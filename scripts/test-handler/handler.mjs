@@ -569,7 +569,7 @@ async function settingsChange(cl, name) {
     ['video quality', ['--video-quality', '30']], ['video scale', ['--video-scale', '75']],
     ['refresh rate', ['--refresh-rate', '120']], ['DPR (native-dpr off)', ['--native-dpr', 'off']],
     ['orientation portrait', ['--orientation', 'Portrait']], ['orientation landscape', ['--orientation', 'Landscape']],
-    ['display scale', ['--scale', '150']], ['name', null],
+    ['display scale', ['--scale', '150']], ['name', null], ['adaptive quality', ['--adaptive-quality', 'on']],
   ];
   for (const [label, args] of edits.filter(([l]) => !REQ.settings_only || REQ.settings_only.includes(l))) {
     const before = { joins: (await hostJoins()).joins, monitors: await ourMonitors(), log: serveLogCounts(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null), whep: await cl.page.ev('__se.whep.length').catch(() => null) };
@@ -644,7 +644,10 @@ async function armsTest(cl) {
     const arm = order[i]; const q = qualities[i % qualities.length];
     write(arms[arm]);
     const before = { monitors: await ourMonitors(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null) };
-    const cmd = await cli(['devices', 'set', k.key, '--video-quality', String(q)]);
+    // `set_args` ride along on every edit. A device with no saved row gets one written by the CLI
+    // with refreshRate 60 (cli.rs `devices set` default), which pins a 120 Hz client to 60 fps:
+    // pass ['--refresh-rate', '120'] for the hi-res client to keep it at its real rate.
+    const cmd = await cli(['devices', 'set', k.key, '--video-quality', String(q), ...(o.set_args || [])]);
     await sleep((o.settle_s || 5) * 1000);
     const w = await timedWindow(cl, j.name, { seconds: REQ.duration, mover: !/large/.test(sc), large: /large/.test(sc), label: `arm:${arm}#${i + 1}` });
     const after = { monitors: await ourMonitors(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null) };
@@ -921,7 +924,16 @@ async function slowAnswer(cl) {
     // joins[] too, so a slow or lost answer can be laid against serve.log afterwards.
     R.joins.push({ scenario: `slow_answer#${i + 1}`, ...j });
     const s = await hostJoins(); const m = await ourMonitors();
-    const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
+    const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, offers: j.offers, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
+    // `hold_s`: stay on the stream before leaving, long enough for the page's frame watchdog
+    // (5 s) to have fired, then read which video path the page ended on and how many peer
+    // connections it built (a demotion or a rebuild shows up here).
+    const holdS = typeof REQ.slow_answer === 'object' && REQ.slow_answer.hold_s ? REQ.slow_answer.hold_s : 0;
+    if (holdS && j.firstPictureMs != null) {
+      await sleep(holdS * 1000);
+      e.afterHold = await cl.page.ev('({ videoPath: window.SEVideo ? SEVideo.getStats().videoPath : null, pcs: window.__se ? __se.pcs.length : null, isLive: typeof isLive !== "undefined" ? isLive : null })').catch((x) => ({ error: x.message }));
+      e.demotedLines = cl.console.filter((c) => /no WebCodecs frame|fallbackToVideo|falling back to <video>|demot/i.test(c.text)).length;
+    }
     e.flag = (j.answerMs > 5000 ? 'answer over 5 s; ' : '') + (/did not answer|gave up|timed out/i.test(j.pageError || '') ? 'page gave up; ' : '') + ((e.liveJoins || 0) > 1 || (e.displays || 0) > 1 ? 'second session/display; ' : '');
     out.attempts.push(e);
     await leave(cl); await sleep(2500);
@@ -1095,7 +1107,8 @@ async function fallbackPaths() {
     ['hardware decode off', { flags: ['--disable-accelerated-video-decode'] }],
   ];
   const out = {};
-  for (const [label, o] of tiers) {
+  // `fallback_paths` as a list names the tiers to run (by label); `true` runs them all.
+  for (const [label, o] of tiers.filter(([l]) => !Array.isArray(REQ.fallback_paths) || REQ.fallback_paths.includes(l))) {
     const spec = { ...REQ.client, https: o.https !== false };
     const cl = await openClient(spec, { offset: 2, flags: o.flags || [], disable: o.disable || [] });
     try {
