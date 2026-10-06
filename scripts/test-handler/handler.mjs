@@ -1078,7 +1078,9 @@ async function joinFailures() {
         if (key === 'host_stopped') { await sleep(2000); H = await bootHost('restart-after-join-failure'); }
         const a = r.after || {};
         r.pass = {
-          formBack: a.joinFormVisible === true && a.stageVisible !== true,
+          // #stage is the page's container and is laid out before a join too, so "back" means
+          // the form is shown and the stage is as it was before Connect.
+          formBack: a.joinFormVisible === true && a.stageVisible === (r.before || {}).stageVisible,
           connectEnabled: a.connectDisabled === false,
           wakeLockReleased: a.wakeLockHeld === false && a.noSleepEnabled !== true,
           noLeavePrompt: a.beforeUnloadHandler === false,
