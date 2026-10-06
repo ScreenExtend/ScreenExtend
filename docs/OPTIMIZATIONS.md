@@ -4642,3 +4642,54 @@ carries `discovery`, which the host stores, logs and shows in `status --json`
 submit → POST time now includes the discovery calls (all bounded). Detail and the readings of the
 spec taken: `docs/overhaul-new/G06.md`, addendum 2026-10-05 (2); field contract:
 `docs/TELEMETRY.md` (`/audio-outputs`).
+
+## G07-RESTORE — a failed join left the page in its streaming state: no copy, no typing, the wake lock and the locks held — `COMPILE-CHECKED` (client harness; no live join possible on this machine)
+
+Owner's report: "WHEP POST failed: 500 join failed: virtual display 0 did not attach within
+timeout … when connection failed i couldnt copy and screen wake lock was still enabled". Causes,
+each reproduced by the new full-page harness against the page at `59bada3`:
+
+1. **Copy and typing.** `start()` calls `RemoteInput.setup(pc)` before the offer (the data
+   channels are part of it), and `setup` switches on input.js's capture-phase `keydown` on the
+   window, which `preventDefault()`s every key. The catch's final branch called `showError`, never
+   `teardownSession`, so `RemoteInput.teardown()` never ran: after a refused or unanswered join the
+   page swallowed Ctrl+C and every key typed into the form, for the life of the page, and kept the
+   peer connection open.
+2. **Wake lock, fullscreen, leave prompt.** A renegotiation that failed ended in `'poll'`:
+   `start()` had already closed the peer connection, but the page kept `isLive`, the frozen frame,
+   the wake lock, fullscreen, pointer/keyboard lock and the `beforeunload` prompt, and a
+   `/reconfig` poll the host kept answering kept it "alive" indefinitely.
+3. **Three offers on a failing host.** A host-side failure got its one same-tier retry and then
+   fell through to the decoder rule, so a second 500 (or a second lost answer) demoted to
+   `<video>` and offered a *third* time — one more display attempt on a host already failing to
+   make one, and ten more seconds of spinner.
+4. `pagehide` released the join but nothing else; a page restored from the back/forward cache
+   came back on a frozen stage with the wake lock and locks still held. A failure inside the
+   450 ms after the first frame had its error form hidden by `onStreamLive`'s timer.
+
+Fix: one function, `restorePreJoinPage(msg, keepJoin)`, with the inventory of everything the join
+arms in a comment above it — every failure path (`setupFailureAction`'s `'error'`, `linkLost`,
+`kickDevice`) and `pagehide` go through it: `teardownSession` (peer connection, input.js,
+workers, every poll and watchdog, trickle, per-connection audio), the reconfig deadline, the
+`<video>` source and the play button, `SEAudio.endSession()` (new in `audio.js`: device watch and
+its POSTs stopped, earpiece microphone hold released, the chooser's pending sink and the speaker
+identity cleared, the context suspended — and `beginFromGesture` resumes it on the next Connect),
+then `restorePageChrome` (`stopLock`: wake lock, NoSleep, fullscreen, pointer and keyboard lock,
+gesture/visibility/pageshow handlers, `beforeunload`; the form shown, Connect enabled) and the
+error text. **Arm late:** input.js's listeners are held suspended (its own modal gate, through a
+page-side `syncInputGate`) from `setup` until `onStreamLive`; everything in `startLock` was already
+armed at the first painted frame, and stays there. `setupFailureAction` has no `'poll'` and never
+demotes after a host-side retry. `input.js` untouched (its `teardown` and `setSuspended` were
+enough). The page looks the same.
+
+Verified by: `test-client-join.mjs` boots the real input.js and the page's inline script in one
+Node realm against fake DOM/WebRTC/fetch/timers — 500 twice, the 10 s deadline twice, a failed
+renegotiation, a live session then `pagehide`, and `pagehide` in the other states — and asserts
+the form, the error, Connect, Ctrl+C reaching the page, the wake lock, `beforeunload`, the three
+locks, open peer connections and workers, `endSession`, and that a minute later no interval is
+live and nothing has gone to the host. Against `59bada3` the same assertions fail in each case
+(Ctrl+C swallowed and a peer connection open after a 500; wake lock, fullscreen and the leave
+prompt held after a failed renegotiation; three offers). `test-client-audio.mjs` case 7 covers
+`endSession`/resume. Not run live: virtual display creation is failing on this machine
+(`SetDisplayConfig` error 31, driver host at ~36 GB), so no join can complete here — see
+`FUTURE-TEST-WORKFLOW.md` C-6. Detail: `docs/overhaul-new/G07.md`, addendum 2026-10-05.

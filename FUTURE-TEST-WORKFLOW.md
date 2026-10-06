@@ -1158,6 +1158,18 @@ Ledger paths are relative to the repository root.
   - **poll250:** `{"scenarios":[],"calibrate":false,"settings_change":true,"url_params":"g07=poll250"}` interleaved with `g07=none`, 3 each, on a build with that switch.
 - **Then:** keep rule for poll250 (picture recovery time).
 
+#### C-6 A failed join gives everything back (`restorePreJoinPage`, G07-RESTORE)
+
+- **What.** After a refused or unanswered `/whep`, a failed renegotiation, or `pagehide`, the page must be back on its join form with the error, Connect enabled, keys reaching the form (Ctrl+C on the error text works), no wake lock, no fullscreen/pointer/keyboard lock, no `beforeunload` prompt, no poll, and exactly two offers on a failing host (one same-tier retry, no `<video>` demotion). Harness-verified only (`test-client-join.mjs`).
+- **Why untested.** Virtual display creation was failing on the machine (`SetDisplayConfig` error 31, "did not attach within timeout", driver host ~36 GB), so no join could complete.
+- **Suspects:** `static/index.html` `restorePreJoinPage`, `restorePageChrome`, `syncInputGate`, `setupFailureAction`; `static/audio.js` `endSession`.
+- **How to test:**
+  - **The owner's case (a 500), on a host whose display creation fails** — the machine as it was, before the driver restart: `{"scenarios":[],"calibrate":false,"custom":{"js":"new Promise(r=>setTimeout(()=>r({err:document.getElementById('errorMessage').textContent, form:getComputedStyle(document.getElementById('join')).display, connect:!document.getElementById('connect').disabled, live:isLive, pc:pc===null, armed:streamInputArmed, wake:SEVideo.getStats().wakeLock, fs:!!document.fullscreenElement, offers:performance.getEntriesByType('resource').filter(e=>/\\/whep$/.test(e.name)).length}),25000))","host_commands":[["status","--json"]],"timeout":40}}` (if the handler aborts on a failed join, open the join URL in the handler's Chrome and read the same expression through `Runtime.evaluate`). Pass: `err` starts `WHEP POST failed: 500`, form not `none`, `connect` true, `live` false, `pc` true, `armed` false, `wake` false, `fs` false, `offers` 2; `serve.log` shows two `join failed` lines, not three.
+  - **On a healthy host**, the join and pagehide: `{"scenarios":[],"calibrate":false,"leave_rejoin":true,"join_probe":"({live:isLive, armed:streamInputArmed, wake:SEVideo.getStats().wakeLock})"}`. Pass: `armed` and `wake` true while live; a `leave beacon` per leave.
+  - **A failed renegotiation:** while a session is live, stop the host's display path from completing a mode change (or `ScreenExtend stop` mid-`settings_change`), and read the expression above. Pass: as for the 500, with the join kept (no `leave beacon`).
+  - **Copy, by a person** (the one check the no-input rule leaves to the owner): after a failed join, select the error text and press Ctrl+C; type a digit into the OTP boxes. Both must work. On a phone, check the screen dims on its normal timeout after a failed join.
+- **Then:** keep; if a check fails, the inventory comment above `restorePreJoinPage` names what armed it.
+
 ### 6.7 Measurements owed by the previous job
 
 Each item here is one or more handler runs on existing or rebuilt binaries. Each needs a freed driver host (D-1).
