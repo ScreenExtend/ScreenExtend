@@ -707,13 +707,13 @@ Cross-platform core, OS-independent:
   frames in one run. A cursor-moved frame is **exempt** from the cadence gate: measured
   painted fps for a pointer sweep, against the baseline's 85, is 113 exempt, 74 at a two-thirds
   window and 70 at a half — a window narrower than DWM's compose interval does not coalesce, it
-  discards. The ceiling that bounds it is WGC's own `MinUpdateInterval`, **two thirds of the
-  stream's period** (`wgc_min_update_interval`, never under 4 ms): 1.5× the stream's rate, so a
-  pointer sweep is bounded near 90 fps for a 60 Hz client (113 was measured with the flat 4 ms
-  floor this replaced). Do not lower it back to a flat 4 ms: with two or more virtual displays the
-  internal panel runs at 360 Hz, DWM composes each 60 Hz virtual display ~3× too often, and a 4 ms
-  floor hands every one of those frames to WGC (~190/s for a 60 fps session). See
-  `docs/OPTIMIZATIONS.md` UX-INPUT and G01-MINUPDATE.
+  discards. WGC's own `MinUpdateInterval` is a flat 4 ms (`WGC_MIN_UPDATE_INTERVAL`), so the
+  pointer is bounded by what DWM composes (113 fps measured for a 60 Hz client). Two thirds of
+  the stream's period was tried (`ea821a9`) to cut the ~190 deliveries a second a 60 fps session
+  gets once a second virtual display puts the panel at 360 Hz, and **reverted**: with two
+  displays it cost that session ~8 painted fps (49 vs 57) at level latency, and at a full period
+  a 120 Hz session fell to 72 fps. Do not raise the floor without a two-display A/B on painted
+  fps. See `docs/OPTIMIZATIONS.md` UX-INPUT and G01-MINUPDATE, `docs/overhaul-new/POST-REBOOT.md`.
 - `dxgi/` — custom DXGI Desktop Duplication path including cursor compositing. It is the fallback
   and is otherwise only reached by WGC failing, which is why the probe harness has
   `--capture-backend dxgi` to force it.
@@ -737,6 +737,13 @@ Cross-platform core, OS-independent:
   up to `MAX_LTR_SLOTS` = 2 long-term reference slots, cap-gated on
   `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, which is what lets `repair.rs` answer a loss with a
   P-frame predicted from a reference the client is known to hold rather than an IDR.
+- **The GPU clock hold** (`nvidia/clock_hold.rs`). A 1080p60 stream is too light for NVIDIA's
+  clock governor: the board stays in P8 (210 MHz graphics) and the composition, the ring copy and
+  NVENC (5.7 ms a frame) all run slowly. While an NVENC ring session lives, and on AC power, a
+  thread copies between two textures on its own device (8 copies a millisecond): stamp p50
+  24.2 → 18.7 ms at 1080p and 34.2 → 28.0 ms at 1440p120, for +15–18 W of GPU power.
+  `SE_GPU_CLOCK_HOLD=0` turns it off, `=1` forces it on (battery). `docs/OPTIMIZATIONS.md`
+  POSTREBOOT-GPUCLOCK.
 - **The FFI layout tests are generated from the real headers, by a C compiler.** `test/nvenc_layout.rs`
   and `test/amd_layout.rs` assert struct sizes, field offsets, vtable slot indices, GUIDs and
   struct revision words measured by `tools/nvenc_layout_gen.c` / `tools/amf_layout_gen.c` reading

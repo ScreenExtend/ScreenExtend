@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { ROOT, acquireSlot, acquireAll, releaseSlots, measureLock, pidAlive, slotStatus } from './lib/slots.mjs';
 import { probeBuild, startHost, stopHost, runCli, cliJson, randomSessionId, randomOtp } from './lib/host.mjs';
 import { Client, stampMetrics } from './lib/client.mjs';
+import { preciseNow, anchorInfo } from './lib/clock.mjs';
 import { driverState, driverRemove } from './lib/driver.mjs';
 import { startLoadSampler, snapshot, waitForQuiet, memSnapshot } from './lib/load.mjs';
 import { dist, spread } from './lib/metrics.mjs';
@@ -38,6 +39,8 @@ const DEFAULTS = {
   calibrate: true, force_exclusive: false, screencast_width: 480, overlap_displays: false,
   audio: false, mic_prompt: false, settings_change: false, two_clients: false, leave_rejoin: false,
   slow_answer: false, auto_rejoin: false, logs: false, fallback_paths: false, loss: false, custom: null,
+  arms: null,              // {arms: {name: {SE_X_*: v}}, order: [names], scenario, qualities: [q1, q2], settle_s}: A/B inside one join (see armsTest)
+  join_failures: false,    // true | [cases] | {cases, stop_after_ms, watch_ms}: wrong_otp, unknown_session, host_stopped, host_error (a host made to answer 5xx)
   settings_only: null,     // array of settings_change edit labels to run (e.g. ["video quality"]); null = all
   mover_stop: false,       // true or {cycles, move_s, hold_s, step_ms, speed}: where does the picture come to rest?
   cpu_burn: null,          // {threads, seconds}: saturate the CPU during slow_answer's joins (inside the measurement lock)
@@ -296,16 +299,18 @@ async function leave(cl) {
 
 // ---------------------------------------------------------------- clock + calibration
 async function clockOffset(cl) {
-  // browser Date.now() minus system clock (node's Date.now), from the minimum-RTT sample.
+  // browser `performance.timeOrigin + now()` minus the precise system clock (lib/clock.mjs),
+  // from the minimum-RTT sample. This is the reference offset: every sample the client returns
+  // is moved onto this clock first (Client.drainStamps measures each context's own offset).
   let best = null;
   for (let i = 0; i < 25; i++) {
-    const t0 = performance.now();
+    const t0 = preciseNow();
     const b = await cl.page.ev('performance.timeOrigin + performance.now()');
-    const t1 = performance.now();
-    const s = { rtt: t1 - t0, off: b - (performance.timeOrigin + (t0 + t1) / 2) };
+    const t1 = preciseNow();
+    const s = { rtt: t1 - t0, off: b - (t0 + t1) / 2 };
     if (!best || s.rtt < best.rtt) best = s;
   }
-  return { browserMinusSystemMs: Math.round(best.off * 100) / 100, rttMs: Math.round(best.rtt * 100) / 100, method: 'min-RTT of 25 Runtime.evaluate round trips; node performance.timeOrigin+now() is the system clock reference' };
+  return { browserMinusSystemMs: Math.round(best.off * 100) / 100, rttMs: Math.round(best.rtt * 100) / 100, anchor: anchorInfo, method: 'min-RTT of 25 Runtime.evaluate round trips against the precise system clock (QPC anchored to GetSystemTimePreciseAsFileTime, lib/clock.mjs)' };
 }
 
 async function calibrate(cl, spec) {
@@ -322,17 +327,23 @@ async function calibrate(cl, spec) {
     const out = cv.getContext('2d'); const cell = Math.max(8, Math.min(64, Math.floor(${spec.width} / 40)));
     g.fillStyle = '#336'; g.fillRect(0, 0, ${spec.width}, ${spec.height});
     setInterval(() => {
-      const ms = Date.now(); const v = ms & 0xFFFFFF; const chk = ((((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255)) & 255) ^ 0x5A;
+      const ms = Math.round(performance.timeOrigin + performance.now() - (window.__seCalOff || 0)); const v = ms & 0xFFFFFF; const chk = ((((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255)) & 255) ^ 0x5A;
       const bits = [1, 0, 1, 0]; for (let i = 23; i >= 0; i--) bits.push((v >> i) & 1); for (let i = 7; i >= 0; i--) bits.push((chk >> i) & 1); bits.push(0, 1);
       bits.forEach((b, i) => { g.fillStyle = b ? '#fff' : '#000'; g.fillRect(i * cell, 0, cell, cell); });
       const f = new VideoFrame(src, { timestamp: ms * 1000 }); out.drawImage(f, 0, 0); f.close();
     }, 16); })()`);
   await sleep(500);
+  // The page's Date.now() is the coarse wall clock (lib/clock.mjs); draw the stamp from this
+  // document's own precise clock instead, so the floor measures the method and not that.
+  const po = await cl.contextOffset(null);
+  await cl.page.ev(`window.__seCalOff = ${po ? po.off : 0}`);
   const cell = Math.max(8, Math.min(64, Math.floor(spec.width / 40)));
   const stage = { width: spec.width, height: spec.height, cell, cellH: cell };
   return underLock('calibration', async () => {
     const { samples, counters } = await cl.collectStamps(stage, 6000);
-    const m = stampMetrics(samples, { from: -Infinity, to: Infinity, offsetMs: 0 });
+    // Samples come back on the reference clock (Client.drainStamps), so the page's Date.now() stamp
+    // is compared after removing the same reference offset every stream window removes.
+    const m = stampMetrics(samples, { from: -Infinity, to: Infinity, offsetMs: Client.refOffsetMs ?? 0 });
     m.windowSeconds = 6; m.paintedFps = Math.round((m.newStamps / 6) * 10) / 10; m.hookCounters = counters;
     await cl.page.send('Page.navigate', { url: 'about:blank' }).catch(() => {});
     return { ...m, note: 'local page, no stream: a stamp from the page\'s own Date.now() painted as a VideoFrame through drawImage every 16 ms and read back by the same paint hook. This is the floor of the method (readback error + 1 ms stamp quantisation); it excludes the client compositor, exactly as every stream measurement does.' };
@@ -376,7 +387,7 @@ async function timedWindow(cl, name, { seconds, mover, large, label }) {
     const loadSum = load.stop();
     await st.exited.catch(() => {}); stopStage(st); if (lg) { await lg.exited.catch(() => {}); stopStage(lg); }
     const m = stampMetrics(got.samples, { from: from + R.clock.browserMinusSystemMs, to: to + R.clock.browserMinusSystemMs, offsetMs: R.clock.browserMinusSystemMs });
-    return { ...m, ...loadedVerdict(gate, loadSum), stage: ready, stageDone: st.done(), layout: got.layout, load: loadSum, secondaryBefore: secBefore, secondaryAfter: secAfter, pageCounters: pageDelta(secBefore, secAfter, seconds) };
+    return { ...m, ...loadedVerdict(gate, loadSum), clockContexts: cl.clockContexts(), stage: ready, stageDone: st.done(), layout: got.layout, load: loadSum, secondaryBefore: secBefore, secondaryAfter: secAfter, pageCounters: pageDelta(secBefore, secAfter, seconds) };
   });
 }
 
@@ -503,7 +514,11 @@ async function audioTest(cl, name, { beforeClicks = null } = {}) {
     const sec = await cl.secondary();
     res.clicksPlayed = clicks.clicks ? clicks.clicks.length : 0; res.player = { ...clicks, clicks: undefined };
     res.analysers = page.analysers; res.audioContexts = page.ctx;
-    const off = R.clock.browserMinusSystemMs;
+    // The page's onsets are on this document's clock; its offset from the precise system clock
+    // (the click times' clock) is measured now, not taken from the first document of the run.
+    const po = await cl.contextOffset(null);
+    const off = po ? po.off : R.clock.browserMinusSystemMs;
+    res.pageClockOffsetMs = po ? Math.round(po.off * 100) / 100 : null;
     const toRender = [], toOutput = [], peaks = []; const matched = new Set();
     for (const c of clicks.clicks || []) {
       const hit = page.onsets.findIndex((o, i) => !matched.has(i) && o.render - off >= c - 20 && o.render - off <= c + 650);
@@ -515,10 +530,11 @@ async function audioTest(cl, name, { beforeClicks = null } = {}) {
     const dec = await cl.drainAudioDecodeOnsets().catch(() => ({ onsets: [], packets: 0 }));
     const toDecode = [], decodeToRender = []; const dUsed = new Set();
     for (const c of clicks.clicks || []) {
-      const di = dec.onsets.findIndex((o, i) => !dUsed.has(i) && o.decoded - off >= c - 20 && o.decoded - off <= c + 650);
-      if (di < 0) continue; dUsed.add(di); toDecode.push(dec.onsets[di].decoded - off - c);
-      const ri = page.onsets.findIndex((o) => o.render >= dec.onsets[di].decoded - 5 && o.render - off <= c + 650);
-      if (ri >= 0) decodeToRender.push(page.onsets[ri].render - dec.onsets[di].decoded);
+      // `decoded` is already on the precise system clock (drainAudioDecodeOnsets).
+      const di = dec.onsets.findIndex((o, i) => !dUsed.has(i) && o.decoded >= c - 20 && o.decoded <= c + 650);
+      if (di < 0) continue; dUsed.add(di); toDecode.push(dec.onsets[di].decoded - c);
+      const ri = page.onsets.findIndex((o) => o.render - off >= dec.onsets[di].decoded - 5 && o.render - off <= c + 650);
+      if (ri >= 0) decodeToRender.push(page.onsets[ri].render - off - dec.onsets[di].decoded);
     }
     res.delayToDecodeMs = dist(toDecode); res.decodeToRenderMs = dist(decodeToRender); res.decodedPackets = dec.packets; res.decodedOnsets = dec.onsets.length;
     res.arrived = matched.size > 0;
@@ -553,7 +569,7 @@ async function settingsChange(cl, name) {
     ['video quality', ['--video-quality', '30']], ['video scale', ['--video-scale', '75']],
     ['refresh rate', ['--refresh-rate', '120']], ['DPR (native-dpr off)', ['--native-dpr', 'off']],
     ['orientation portrait', ['--orientation', 'Portrait']], ['orientation landscape', ['--orientation', 'Landscape']],
-    ['display scale', ['--scale', '150']], ['name', null],
+    ['display scale', ['--scale', '150']], ['name', null], ['adaptive quality', ['--adaptive-quality', 'on']],
   ];
   for (const [label, args] of edits.filter(([l]) => !REQ.settings_only || REQ.settings_only.includes(l))) {
     const before = { joins: (await hostJoins()).joins, monitors: await ourMonitors(), log: serveLogCounts(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null), whep: await cl.page.ev('__se.whep.length').catch(() => null) };
@@ -593,6 +609,55 @@ async function settingsChange(cl, name) {
   }
   out.defectSeen = out.edits.some((e) => (e.liveJoinsAfter || 0) > 1 || (e.displaysAfter || 0) > 1);
   out.note = 'Each edit runs alone with a fresh stamp window. "pictureRecoveredMs" is edit -> first new stamp after the largest gap (0 when no gap over 150 ms). The `name` edit goes through `config set devices.<i>.name` because `devices set` has no name flag.';
+  return out;
+}
+
+// A/B arms inside one join. Each step writes the arm's switches to the file the host reads
+// (`SE_X_SWITCH_FILE`, set in main; inert for a build that does not read it), renegotiates in
+// place with an encoder-only edit (no display created, no mode change unless an arm asks for
+// one), lets the stream settle and takes one timed window labelled with the arm. Video quality
+// alternates between two values step by step, so with a balanced order (A B B A ...) every arm
+// sees both values equally. Arms are interleaved in time on one display: no join-to-join
+// variance, and no display creation per arm.
+async function armsTest(cl) {
+  const o = REQ.arms;
+  const arms = o.arms || {};
+  const order = o.order || [];
+  const qualities = o.qualities || [20, 21];
+  const sc = o.scenario || 'small_window';
+  const hires = /^hires/.test(sc);
+  const spec = hires ? { ...REQ.hires_client } : REQ.client;
+  const file = HOSTCTX.hostEnv.SE_X_SWITCH_FILE;
+  const write = (sw) => fs.writeFileSync(file, Object.entries(sw || {}).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
+  write(arms[order[0]]);
+  if (hires) {
+    await cl.setClient(spec);
+    const origin = clientUrl(spec, 'x', { https: spec.https !== false }).origin;
+    await cl.page.send('Storage.clearDataForOrigin', { origin, storageTypes: 'local_storage,cookies' }).catch(() => {});
+  }
+  const j = await joinClient(cl, spec);
+  R.joins.push({ scenario: 'arms', ...j });
+  const out = { scenario: sc, order, qualities, steps: [] };
+  if (j.firstPictureMs == null) { out.error = 'no picture after join'; await leave(cl); if (hires) await cl.setClient(REQ.client); return out; }
+  const k = await deviceKey(j.name, cl);
+  for (let i = 0; i < order.length; i++) {
+    const arm = order[i]; const q = qualities[i % qualities.length];
+    write(arms[arm]);
+    const before = { monitors: await ourMonitors(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null) };
+    // `set_args` ride along on every edit. A device with no saved row gets one written by the CLI
+    // with refreshRate 60 (cli.rs `devices set` default), which pins a 120 Hz client to 60 fps:
+    // pass ['--refresh-rate', '120'] for the hi-res client to keep it at its real rate.
+    const cmd = await cli(['devices', 'set', k.key, '--video-quality', String(q), ...(o.set_args || [])]);
+    await sleep((o.settle_s || 5) * 1000);
+    const w = await timedWindow(cl, j.name, { seconds: REQ.duration, mover: !/large/.test(sc), large: /large/.test(sc), label: `arm:${arm}#${i + 1}` });
+    const after = { monitors: await ourMonitors(), pcs: await cl.page.ev('__se.pcs.length').catch(() => null) };
+    out.steps.push({ i: i + 1, arm, quality: q, cmd: cmd.code, newPeerConnections: after.pcs != null && before.pcs != null ? after.pcs - before.pcs : null, displays: after.monitors.monitors ? after.monitors.monitors.length : null, window: w });
+  }
+  const byArm = {};
+  for (const s of out.steps) (byArm[s.arm] = byArm[s.arm] || []).push(s.window);
+  out.aggregate = Object.fromEntries(Object.entries(byArm).map(([a, ws]) => [a, aggregate(ws)]));
+  await leave(cl);
+  if (hires) await cl.setClient(REQ.client);
   return out;
 }
 
@@ -859,7 +924,16 @@ async function slowAnswer(cl) {
     // joins[] too, so a slow or lost answer can be laid against serve.log afterwards.
     R.joins.push({ scenario: `slow_answer#${i + 1}`, ...j });
     const s = await hostJoins(); const m = await ourMonitors();
-    const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
+    const e = { i: i + 1, answerMs: j.answerMs, firstPictureMs: j.firstPictureMs, offers: j.offers, pageError: j.pageError, liveJoins: s.joins ? s.joins.length : null, displays: m.monitors ? m.monitors.length : null };
+    // `hold_s`: stay on the stream before leaving, long enough for the page's frame watchdog
+    // (5 s) to have fired, then read which video path the page ended on and how many peer
+    // connections it built (a demotion or a rebuild shows up here).
+    const holdS = typeof REQ.slow_answer === 'object' && REQ.slow_answer.hold_s ? REQ.slow_answer.hold_s : 0;
+    if (holdS && j.firstPictureMs != null) {
+      await sleep(holdS * 1000);
+      e.afterHold = await cl.page.ev('({ videoPath: window.SEVideo ? SEVideo.getStats().videoPath : null, pcs: window.__se ? __se.pcs.length : null, isLive: typeof isLive !== "undefined" ? isLive : null })').catch((x) => ({ error: x.message }));
+      e.demotedLines = cl.console.filter((c) => /no WebCodecs frame|fallbackToVideo|falling back to <video>|demot/i.test(c.text)).length;
+    }
     e.flag = (j.answerMs > 5000 ? 'answer over 5 s; ' : '') + (/did not answer|gave up|timed out/i.test(j.pageError || '') ? 'page gave up; ' : '') + ((e.liveJoins || 0) > 1 || (e.displays || 0) > 1 ? 'second session/display; ' : '');
     out.attempts.push(e);
     await leave(cl); await sleep(2500);
@@ -931,6 +1005,100 @@ async function autoRejoin(cl) {
   return out;
 }
 
+// A join that fails must give back everything it armed (90f4840). Each case makes a join fail
+// without breaking the driver, then reads the page's own state (no event is dispatched; nothing
+// reaches the host's injector) and watches the network for requests the page keeps sending.
+const JOIN_FAIL_PROBE = `(() => {
+  const q = (id) => document.getElementById(id);
+  const vis = (el) => { if (!el) return null; const s = getComputedStyle(el); return s.display !== 'none' && s.visibility !== 'hidden' && el.offsetWidth > 0; };
+  const st = (window.SEVideo && SEVideo.getStats) ? SEVideo.getStats() : {};
+  const v = (f) => { try { return f(); } catch (e) { return 'n/a'; } };
+  return {
+    joinFormVisible: vis(q('join')), connectDisabled: q('connect') ? q('connect').disabled : null,
+    error: (q('errorMessage') || {}).textContent || '', loadingShown: q('loading') ? q('loading').classList.contains('show') : null,
+    stageVisible: vis(q('stage')),
+    locked: v(() => locked), isLive: v(() => isLive), streamInputArmed: v(() => streamInputArmed),
+    inputSuspended: window.RemoteInput && RemoteInput.isSuspended ? RemoteInput.isSuspended() : null,
+    beforeUnloadHandler: v(() => !!beforeUnloadHandler), visibilityHandler: v(() => !!visibilityHandler), fullscreenHandler: v(() => !!fullscreenHandler),
+    wakeLockHeld: st.wakeLock, wakeLockSentinel: v(() => (wakeLockSentinel ? (wakeLockSentinel.released ? 'released' : 'held') : 'none')),
+    noSleepEnabled: v(() => !!(noSleepImpl && noSleepImpl.isEnabled)),
+    fullscreen: st.fullscreen, pointerLock: !!document.pointerLockElement,
+    activeElement: document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : null,
+    audioContext: window.SEAudio && SEAudio.getSyncInfo ? (SEAudio.getSyncInfo() || {}).contextState : null,
+  }; })()`;
+async function joinFailures() {
+  const o = typeof REQ.join_failures === 'object' && !Array.isArray(REQ.join_failures) ? REQ.join_failures : {};
+  const want = Array.isArray(REQ.join_failures) ? REQ.join_failures : (o.cases || ['wrong_otp', 'unknown_session', 'host_stopped']);
+  const out = {};
+  for (const key of want) {
+    const cl = await openClient(REQ.client, { offset: 3 });
+    const name = deviceName();
+    let { origin, url } = clientUrl(REQ.client, name);
+    if (key === 'wrong_otp') url = url.replace(/otp=\d+/, 'otp=' + String((Number(HOSTCTX.otp) + 1) % 1000000).padStart(6, '0'));
+    if (key === 'unknown_session') url = url.replace(/id=[^&]+/, 'id=' + 'ABCDEFGHJKMN'.split('').reverse().join(''));
+    const r = { case: key };
+    try {
+      await underLock('join-failure:' + key, async () => {
+        await cl.page.send('Page.navigate', { url });
+        for (let i = 0; i < 75; i++) { if (await cl.page.ev('document.readyState === "complete" && !!document.getElementById("joinForm")').catch(() => false)) break; await sleep(200); }
+        await cl.chrome.browser.send('Browser.grantPermissions', { origin, permissions: STD_GRANT }).catch(() => {});
+        r.modals = [];
+        for (let i = 0; i < 10; i++) { const m = await cl.sweepModals(); if (m) r.modals.push(m); await sleep(150); }
+        r.before = await cl.page.ev(JOIN_FAIL_PROBE).catch((e) => ({ error: e.message }));
+        const submitAt = await cl.page.ev('(() => { const t = performance.timeOrigin + performance.now(); document.getElementById("joinForm").requestSubmit(); return t; })()', { gesture: true });
+        const t0 = Date.now();
+        if (key === 'host_stopped') {
+          // Stop the host once the offer is on the wire (the host is then creating the display).
+          for (let i = 0; i < 100 && !cl.whep.some((w) => w.method === 'POST' && w.sent >= submitAt - 50); i++) await sleep(50);
+          await sleep(o.stop_after_ms || 600);
+          r.stoppedAfterMs = Date.now() - t0;
+          r.stop = await stopHost(H, { exe: HOSTCTX.exe, env: cliEnv(), useStopVerb: !!R.host.controlVerbs });
+        }
+        // Wait for the page to settle on a failure: Connect enabled again, or 45 s.
+        let settled = null;
+        for (let i = 0; i < 225; i++) {
+          const s = await cl.page.ev(JOIN_FAIL_PROBE).catch(() => null);
+          r.during = r.during || [];
+          if (s && (i % 10 === 0)) r.during.push({ ms: Date.now() - t0, connectDisabled: s.connectDisabled, error: s.error, locked: s.locked, isLive: s.isLive });
+          if (s && s.connectDisabled === false && !s.isLive) { settled = Date.now() - t0; break; }
+          await sleep(200);
+        }
+        r.settledMs = settled;
+        const failAt = performance.timeOrigin + performance.now();
+        await sleep(o.watch_ms || 8000);
+        r.after = await cl.page.ev(JOIN_FAIL_PROBE).catch((e) => ({ error: e.message }));
+        const sec = await cl.secondary();
+        r.peerConnections = sec.peerConnections; r.openPeerConnections = sec.openPeerConnections;
+        r.whep = cl.whep.filter((w) => w.sent >= submitAt - 50).map((w) => ({ method: w.method, status: w.status, failed: w.failed, sentMs: Math.round(w.sent - submitAt), answeredMs: w.answered ? Math.round(w.answered - submitAt) : null }));
+        r.offers = r.whep.filter((w) => w.method === 'POST').length;
+        // Anything the page sent to the host after it had settled on the failure.
+        const settledAbs = settled != null ? submitAt + settled : failAt;
+        r.requestsAfterFailure = [...cl.api, ...cl.whep].filter((w) => w.sent > settledAbs + 300).map((w) => ({ method: w.method, url: w.url, sentMs: Math.round(w.sent - settledAbs) }));
+        r.console = cl.console.filter((c) => c.t >= t0 - 1000).slice(0, 20);
+        if (key === 'host_stopped') { await sleep(2000); H = await bootHost('restart-after-join-failure'); }
+        const a = r.after || {};
+        r.pass = {
+          // #stage is the page's container and is laid out before a join too, so "back" means
+          // the form is shown and the stage is as it was before Connect.
+          formBack: a.joinFormVisible === true && a.stageVisible === (r.before || {}).stageVisible,
+          connectEnabled: a.connectDisabled === false,
+          wakeLockReleased: a.wakeLockHeld === false && a.noSleepEnabled !== true,
+          noLeavePrompt: a.beforeUnloadHandler === false,
+          inputNotCapturing: a.streamInputArmed === false && a.locked === false,
+          noOpenPeerConnection: (r.openPeerConnections || 0) === 0,
+          noRequestsAfterFailure: r.requestsAfterFailure.length === 0,
+          errorShown: !!(a.error && a.error.trim()),
+        };
+        r.ok = Object.values(r.pass).every(Boolean);
+      });
+      const m = await ourMonitors(); r.displaysAfter = m.monitors ? m.monitors.length : null;
+    } catch (e) { r.error = e.stack || e.message; }
+    finally { await cl.close(); owned.clients.splice(owned.clients.indexOf(cl), 1); }
+    out[key] = r;
+  }
+  return out;
+}
+
 async function fallbackPaths() {
   const tiers = [
     ['default', {}],
@@ -941,7 +1109,8 @@ async function fallbackPaths() {
     ['hardware decode off', { flags: ['--disable-accelerated-video-decode'] }],
   ];
   const out = {};
-  for (const [label, o] of tiers) {
+  // `fallback_paths` as a list names the tiers to run (by label); `true` runs them all.
+  for (const [label, o] of tiers.filter(([l]) => !Array.isArray(REQ.fallback_paths) || REQ.fallback_paths.includes(l))) {
     const spec = { ...REQ.client, https: o.https !== false };
     const cl = await openClient(spec, { offset: 2, flags: o.flags || [], disable: o.disable || [] });
     try {
@@ -1029,7 +1198,7 @@ async function main() {
     try {
       const cl = await openClient(REQ.client);
       R.chrome = { version: cl.chrome.version };
-      R.clock = await clockOffset(cl);
+      R.clock = await clockOffset(cl); Client.refOffsetMs = R.clock.browserMinusSystemMs;
       R.calibration = await calibrate(cl, REQ.client);
       R.ok = true;
     } finally { R.cleanup = { clients: [] }; for (const c of owned.clients) R.cleanup.clients.push(await c.close()); releaseSlots([s.slot]); }
@@ -1074,6 +1243,7 @@ async function main() {
     if (dataDir) { fs.rmSync(dataDir, { recursive: true, force: true }); fs.mkdirSync(dataDir, { recursive: true }); }
     const ports = { http: 18000 + R.slot * 10, https: 18001 + R.slot * 10 };
     HOSTCTX = { exe, dataDir, ports, mode, build, sessionId: randomSessionId(), otp: randomOtp(), hostArgs: REQ.host_args, hostEnv: REQ.host_env, driverBefore: [] };
+    if (REQ.arms) HOSTCTX.hostEnv = { ...REQ.host_env, SE_X_SWITCH_FILE: path.join(RUN_DIR, 'x-switches.txt') };
     const ds = await driverState(); HOSTCTX.driverBefore = Array.isArray(ds) ? ds : [];
     R.driverBefore = ds;
     R.loadBefore = await snapshot();
@@ -1097,7 +1267,7 @@ async function main() {
     const cl = await openClient(REQ.client);
     R.chrome = { version: cl.chrome.version, flags: cl.chrome.args.filter((a) => !/^--user-data-dir|^about:/.test(a)) };
     const body = async () => {
-      R.clock = await clockOffset(cl);
+      R.clock = await clockOffset(cl); Client.refOffsetMs = R.clock.browserMinusSystemMs;
       if (REQ.calibrate) R.calibration = await calibrate(cl, REQ.client);
       R.scenarios = await standardScenarios(cl, REQ.client);
       if (REQ.mic_prompt) R.special.mic_prompt = await micPrompt();
@@ -1107,6 +1277,8 @@ async function main() {
       if (REQ.fallback_paths) R.special.fallback_paths = await fallbackPaths();
       if (REQ.mover_stop) R.special.mover_stop = await moverStopTest(cl);
       if (REQ.audio_paths) R.special.audio_paths = await audioPaths();
+      if (REQ.join_failures) R.special.join_failures = await joinFailures();
+      if (REQ.arms) R.special.arms = await armsTest(cl);
       if (REQ.auto_rejoin) R.special.auto_rejoin = await autoRejoin(cl);
     };
     // By default the lock is held for the whole live-display part of the test, so no other
