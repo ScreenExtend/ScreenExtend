@@ -553,6 +553,14 @@ fn join_rows(sessions: &crate::streamer::session::SharedSessions) -> serde_json:
                     "scale": d.scale,
                     "portrait": d.portrait,
                 })),
+                // What the join's page last posted to `/audio-outputs`: `supported` is `null`
+                // until it has said, and `discovery` is each output-discovery API's result.
+                "audioOutputs": {
+                    "supported": r.audio_outputs_supported,
+                    "outputs": r.audio_outputs,
+                    "labelled": r.audio_outputs_labelled,
+                    "discovery": r.audio_discovery,
+                },
             })
         })
         .collect();
