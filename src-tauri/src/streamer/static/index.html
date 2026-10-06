@@ -398,10 +398,7 @@
             // (`pagehide`) or a session the host has ended (`kickDevice`) releases the join.
             function linkLost(msg) {
                 if (kicked) return;
-                teardownSession(true);
-                usingFallback = false;
-                showLinkStatus('');
-                showError(msg);
+                restorePreJoinPage(msg, true);
             }
 
             document.addEventListener('visibilitychange', () => {
@@ -427,19 +424,26 @@
             function showError(msg) {
                 errEl.textContent = msg || '';
                 errEl.classList.toggle('show', !!msg);
-                if (msg) {
-                    // The session is over, so the frozen frame the rebuild was holding on to is
-                    // no longer standing in for anything.
-                    dropStaleCanvas();
-                    lastOfferedSinkId = null;
-                    stopLock();
-                    isLive = false;
-                    loadingEl.classList.remove('show');
-                    joinEl.style.display = '';
-                    joinEl.classList.remove('hide');
-                    connectBtn.disabled = false;
-                    validate();
-                }
+                if (msg) restorePageChrome();
+            }
+            // The page-level half of `restorePreJoinPage` (below): what the user sees and what
+            // the browser is holding for the stage. Safe to run twice and safe before anything
+            // was armed.
+            function restorePageChrome() {
+                // The session is over, so the frozen frame the rebuild was holding on to is
+                // no longer standing in for anything.
+                dropStaleCanvas();
+                lastOfferedSinkId = null;
+                stopLock();
+                isLive = false;
+                // `onStreamLive` hides the form 450 ms after it fades it out; a session that
+                // ended inside that window would otherwise have its error form hidden for it.
+                if (joinHideTimer) { clearTimeout(joinHideTimer); joinHideTimer = 0; }
+                loadingEl.classList.remove('show');
+                joinEl.style.display = '';
+                joinEl.classList.remove('hide');
+                connectBtn.disabled = false;
+                validate();
             }
             function showCanvas() { canvas.style.display = 'block'; video.style.display = 'none'; }
             function showVideo() {
@@ -491,6 +495,22 @@
             }
 
             let isLive = false;
+            let joinHideTimer = 0;
+
+            // Input forwarding is armed late. input.js's data channels have to exist before the
+            // offer (they are part of it), and `RemoteInput.setup` switches its listeners on in
+            // the same call — including a capture-phase `keydown` on the window that calls
+            // `preventDefault()`. Armed at Connect, that swallowed every key on the join form for
+            // as long as the join took, and because a failed join never called
+            // `RemoteInput.teardown()`, for good: no Ctrl+C on the error, no typing a new OTP.
+            // So the listeners are held suspended (input.js's own modal gate) from `setup` until
+            // the stage is actually live, and a modal can only add to that, never lift it early.
+            let streamInputArmed = false;
+            function syncInputGate() {
+                try {
+                    if (window.RemoteInput && RemoteInput.setSuspended) RemoteInput.setSuspended(modalSuspend || !streamInputArmed);
+                } catch (_) { noteSuppressed(); }
+            }
 
             // Trickle ICE is kept for the speed, but its *outcome* is resolved before the
             // streaming stage appears. The three ways it can fail — the answer named no
@@ -560,11 +580,23 @@
                 reconfiguring = false;
                 loadingEl.classList.remove('show');
                 dropStaleCanvas();
+                // The stream is live: from here the stage owns the keyboard and pointer.
+                streamInputArmed = true;
+                syncInputGate();
                 if (isLive) { startReconfigPoll(); return; }
                 isLive = true;
                 showError('');
                 joinEl.classList.add('hide');
-                setTimeout(() => { joinEl.style.display = 'none'; }, 450);
+                if (joinHideTimer) clearTimeout(joinHideTimer);
+                joinHideTimer = setTimeout(() => { joinHideTimer = 0; joinEl.style.display = 'none'; }, 450);
+                // Everything that only matters to a live stage is armed here, at the first
+                // painted frame (or ICE `connected` on the <video> path), never at Connect: the
+                // wake lock, the `beforeunload` prompt, fullscreen, pointer and keyboard lock and
+                // their re-entry handlers. Fullscreen and pointer lock want a user gesture; they
+                // ride the Connect click's activation where it is still alive (Chrome keeps it
+                // ~5 s) and otherwise the next tap enters them (the gesture handler). Arming them
+                // at the click instead would hold the wake lock and the leave prompt over a join
+                // that may never produce a picture. `restorePreJoinPage` undoes all of it.
                 startLock();
                 startReconfigPoll();
                 // Keep refining in the background; it is applied by the next reconfigure
@@ -687,11 +719,7 @@
             function kickDevice(msg) {
                 if (kicked) return;
                 kicked = true;
-                teardownSession();
-                isLive = false;
-                stopLock();
-                showLinkStatus('');
-                showError(msg || 'You have been removed from this session.');
+                restorePreJoinPage(msg || 'You have been removed from this session.', false);
             }
 
             // While `reconfiguring` is set, every recovery path on the page returns early —
@@ -1242,9 +1270,9 @@
                 modalDepth--;
                 if (modalDepth > 0) return;
                 modalSuspend = false;
-                try {
-                    if (window.RemoteInput && RemoteInput.setSuspended) RemoteInput.setSuspended(false);
-                } catch (_) { noteSuppressed(); }
+                // Lifts input.js's gate only for a stream that is live; one still connecting
+                // stays suspended until `onStreamLive`.
+                syncInputGate();
             }
             // `beginModal()` only *starts* the release: a pointer-lock exit is delivered on
             // `pointerlockchange` and a fullscreen exit on `fullscreenchange`, both in a later
@@ -1305,11 +1333,15 @@
             // during a rebuild, or between the answer and the first frame, holding its display
             // until ICE failed and the grace ran out: about 45 s, during which the next join made
             // a second one. A page that never got a join id has nothing to release.
+            //
+            // It is also the user's own "leave": the page has no cancel control, so closing,
+            // reloading or navigating away is the only way to abandon a join. The whole restore
+            // runs, not just the beacon: a page kept in the back/forward cache comes back on its
+            // join form holding no wake lock, no locks and no `beforeunload` prompt.
             function sendLeave() {
                 if (leaveSent) return;
                 leaveSent = true;
-                releaseJoin();
-                try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
+                restorePreJoinPage('', false);
             }
             window.addEventListener('pagehide', sendLeave);
 
@@ -1714,6 +1746,7 @@
                 if (!keepJoin) releaseJoin();
                 releaseIceHold();
                 iceEverConnected = false;
+                streamInputArmed = false;
                 try { if (window.RemoteInput) RemoteInput.teardown(); } catch (_) { noteSuppressed(); }
                 if (transformWatchdog) { clearTimeout(transformWatchdog); transformWatchdog = null; }
                 if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -1729,6 +1762,61 @@
                 appliedSinkId = null;
                 try { if (pc) pc.close(); } catch (_) { noteSuppressed(); }
                 pc = null;
+            }
+
+            // The one way a session ends: a join that failed for good (a refused or unanswered
+            // `/whep` after its retry, a renegotiation that cannot complete), a lost link, a
+            // kick, and the page going away all come here, so whatever the join armed is given
+            // back in one place and the page is left exactly as it was before Connect, plus the
+            // error. Everything the join path arms, where, and what undoes it:
+            //
+            //   armed                                            when                 undone by
+            //   peer connection, transceivers, ICE handlers       start(), pre-offer   teardownSession
+            //   input.js: 3 data channels; window keydown/keyup   start() (channels    teardownSession
+            //     capture with preventDefault (blocked typing      are in the offer);   (RemoteInput.
+            //     and Ctrl+C), copy/cut/paste forwarding, stage    listeners held        teardown)
+            //     pointer/touch/wheel/contextmenu/drag handlers,   suspended until
+            //     blur/focus/visibility/pointerlockchange,         onStreamLive
+            //     #imeSink focus, PING/STATS 1 s interval          (channel open)
+            //   transform worker + canvas transfer, videostats    start() / ontrack    teardownSession
+            //     1 s poll, liveWatch 2 s, DEBUG statsPoll, rVFC
+            //   transform 2.5 s + frame 5 s watchdogs             ICE connected        teardownSession
+            //   trickle sender + 2 s ack timer, ICE settle 8 s    offer / answer       teardownSession
+            //   WHEP 10 s abort timer                             the POST             its finally
+            //   /reconfig probe (1 s / 300 ms)                    onStreamLive         teardownSession
+            //   reconfig 15 s deadline                            reconfigure()        here
+            //   <video> srcObject, "Tap to start playback"        ontrack / tryPlay    here
+            //   link-status pill, stale canvas                    degraded / rebuild   here / chrome
+            //   SEAudio per connection: decoder worker,           ontrack/datachannel  teardownSession
+            //     DataChannel, fallback <audio>                                         (SEAudio.teardown)
+            //   SEAudio per session: AudioContext running,        Connect click /      SEAudio.endSession
+            //     device watch (devicechange + poll + POSTs),     discovery / host
+            //     earpiece microphone hold, chooser's pending     command
+            //     sink, speaker identity
+            //   join form faded + hidden (450 ms timer), stage    onStreamLive         restorePageChrome
+            //   startLock: wake lock + NoSleep clip, fullscreen,  onStreamLive         restorePageChrome
+            //     pointer lock, keyboard lock, gesture re-entry,                       (stopLock)
+            //     visibilitychange/pageshow re-arm, beforeunload
+            //     prompt, viewport sizing, inline cursor/select
+            //   Connect disabled + "Connecting" spinner           submit               restorePageChrome
+            //
+            // Not undone here, on purpose: modals (they are raised before the offer only and end
+            // by their own buttons), the join id when `keepJoin` (the host's disconnect grace is
+            // what lets the next Connect continue on the same display), the device token, and the
+            // load-time warm-up and `/net-config` cache, which belong to the page, not a session.
+            function restorePreJoinPage(msg, keepJoin) {
+                teardownSession(keepJoin);
+                reconfiguring = false;
+                clearReconfigWatchdog();
+                usingFallback = false;
+                showLinkStatus('');
+                try { video.srcObject = null; } catch (_) { noteSuppressed(); }
+                unmuteBtn.style.display = 'none';
+                unmuteBtn.onclick = null;
+                try { if (window.SEAudio && SEAudio.endSession) SEAudio.endSession(); } catch (_) { noteSuppressed(); }
+                restorePageChrome();
+                errEl.textContent = msg || '';
+                errEl.classList.toggle('show', !!msg);
             }
 
             let transformStarted = false;
@@ -2147,16 +2235,28 @@
             // presenting whatever join id this tab holds. (A first join that lost its answer
             // holds none; the host recognises the retry by this page load's `attemptId` and
             // continues the join it answered instead of opening a second one beside it.)
+            //
+            // A host-side failure gets that one retry and no more. It used to fall through to
+            // the decoder rule below once the retry was spent, so a host that kept answering 500
+            // ("virtual display 0 did not attach within timeout") was offered a *third* time on
+            // the <video> tier — another display attempt on a host already failing to make one,
+            // ten more seconds of spinner, and a session demoted for nothing its decoder did.
+            //
+            // There is no 'poll' any more. It kept a live renegotiation that had failed "on the
+            // picture": but `start()` has already closed that peer connection, so what stayed on
+            // screen was a frozen frame with the wake lock, fullscreen and the leave prompt still
+            // held, kept alive indefinitely by a `/reconfig` poll that the host kept answering.
+            // A renegotiation that cannot complete ends the session like any other failure —
+            // with the join kept, so Connect continues on the same display.
             let answerRetried = false;
             function setupFailureAction(err, s) {
                 const msg = (err && err.message) || '';
-                if (/Invalid session ID or OTP/.test(msg)) return s.reconfiguringLive ? 'poll' : 'error';
+                if (/Invalid session ID or OTP/.test(msg)) return 'error';
                 // The same holds for a POST the host refused or a connection that dropped: none
                 // of them is about this browser's decoder.
                 const hostSide = msg === ANSWER_TIMEOUT_TEXT || /^WHEP POST failed: 5\d\d|Failed to fetch|NetworkError|network error/i.test(msg);
-                if (hostSide && !s.answerRetried) return 'retry';
+                if (hostSide) return s.answerRetried ? 'error' : 'retry';
                 if (s.webcodecsTier) return 'video';
-                if (s.reconfiguringLive) return 'poll';
                 return 'error';
             }
 
@@ -2209,10 +2309,10 @@
                     try {
                         if (window.RemoteInput) {
                             RemoteInput.setup(pc);
-                            // `teardown()` clears input.js's own flag, so a session built while
-                            // a dialog is still up would forward input with `modalSuspend` set
-                            // and the page's two notions of suspension would disagree.
-                            if (modalSuspend && RemoteInput.setSuspended) RemoteInput.setSuspended(true);
+                            // `setup` switches input.js's listeners on, and `teardown()` cleared
+                            // its suspension flag; hold them off until this stream is live (see
+                            // `streamInputArmed`), and for as long as a dialog is up.
+                            syncInputGate();
                         }
                     } catch (_) { noteSuppressed(); }
                     if (window.SEAudio) {
@@ -2675,7 +2775,6 @@
                     const action = setupFailureAction(err, {
                         answerRetried: answerRetried,
                         webcodecsTier: preferWebCodecs && canWebCodecs && !usingFallback,
-                        reconfiguringLive: reconfiguring && isLive,
                     });
                     if (action === 'retry') {
                         answerRetried = true;
@@ -2683,11 +2782,10 @@
                         start(preferWebCodecs, true);
                     } else if (action === 'video') {
                         fallbackToVideo('setup error: ' + errorText(err));
-                    } else if (action === 'poll') {
-                        reconfiguring = false;
-                        startReconfigPoll();
                     } else {
-                        showError(errorText(err));
+                        // The join is kept: a reconnect presents it, and a host still holding a
+                        // display for it continues there instead of building a second one.
+                        restorePreJoinPage(errorText(err), true);
                     }
                 }
             }

@@ -25,7 +25,7 @@ const HARNESSES = [
   ['index.html encoded transform installed before Chrome short-circuits it', 'test-client-transform-start.mjs'],
   ['index.html frame watchdog never demotes a painting session', 'test-client-watchdog.mjs'],
   ['index.html /reconfig epochs and kick', 'test-client-reconfig.mjs'],
-  ['index.html join path: setup failures and the load-time warm-up', 'test-client-join.mjs'],
+  ['index.html join path: setup failures, the full restore after a failed join, the load-time warm-up', 'test-client-join.mjs'],
 ];
 
 let failed = 0;
