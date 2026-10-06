@@ -4174,7 +4174,9 @@ each with its own display, all removed at exit; numbers in `scripts/test-handler
 macOS file changed only by the mechanical `config.json` → `config_store()` swap
 (`macos_utils/networking.rs`) and is not compiled here.
 
-## G01-MINUPDATE — WGC delivered ~190 frames a second to a 60 fps session once two virtual displays were attached — `VERIFIED` (one run per arm)
+## G01-MINUPDATE — WGC delivered ~190 frames a second to a 60 fps session once two virtual displays were attached — **REVERTED** (refuted on painted fps by the post-reboot A/B)
+
+**Post-reboot (2026-10-06):** three interleaved pairs of `two_clients` against the parent's flat 4 ms (thin switch build), and three more with the GPU clock hold in both arms: the 60 Hz session's painted fps was 46.5–49.6 with the ⅔ floor against 54.9–58.0 with 4 ms (with the hold: 49.1 vs 56.5), its p50 level (medians 20.7 vs 23.5 ms inside a 4.0 ms range). One display: level at 1080p and at 1440p120. A full-period floor dropped a 120 Hz session to 72 fps. Reverted on `post-reboot`; the text below is the original entry.
 
 `ff8bfff` replaced the pre-overhaul `MinUpdateInterval = frame_period * 2/3` with a flat 4 ms.
 With one virtual display attached that changes nothing (≈ 64 deliveries a second at 60 Hz either
