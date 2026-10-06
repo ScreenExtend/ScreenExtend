@@ -4693,3 +4693,33 @@ prompt held after a failed renegotiation; three offers). `test-client-audio.mjs`
 `endSession`/resume. Not run live: virtual display creation is failing on this machine
 (`SetDisplayConfig` error 31, driver host at ~36 GB), so no join can complete here — see
 `FUTURE-TEST-WORKFLOW.md` C-6. Detail: `docs/overhaul-new/G07.md`, addendum 2026-10-05.
+
+## POSTREBOOT-GPUCLOCK — the NVIDIA GPU sat in P8 (210 MHz graphics, 555 MHz video) for the whole of a 1080p60 session — `VERIFIED` (fat LTO, 5 interleaved pairs; power cost measured)
+
+On this machine the capture, the ring copy, DWM's composition of the virtual display and NVENC
+all run on the NVIDIA adapter, and a 1080p60 stream is too light a load for the driver's clock
+governor: the board stayed in P8 for the entire session, NVENC took 5.7 ms a frame (the hardware
+wait inside `complete_next`; acquire 0.07 ms, submit 0.12 ms, bitstream copy 0.03 ms) and the
+composition and copy before it ran at the same 210 MHz. The old app does the same. Nothing the
+host may set for its own process moves the governor (the per-application "prefer maximum
+performance" setting is a persistent write to the driver's profile database), so
+`windows_utils/streamer/nvidia/clock_hold.rs` keeps the GPU busy while a live NVENC ring session
+exists: a thread on a device of its own copies between two 2048×2048 textures, eight copies every
+millisecond, and stops with the last session. On AC power only; `SE_GPU_CLOCK_HOLD=0` turns it
+off, `=1` forces it on.
+
+Dose found first with in-join arms on a thin build (four windows per arm, 1080p small window,
+stamp p50 / GPU board power): none 26.5 ms / 18 W (P8); 4 copies/ms 21.7 / 27 W (P5); **8
+copies/ms 19.2 / 34 W (P3)**; 16 copies/2 ms 18.7 / 43 W; 16/ms 18.1 / 88 W (P0). The knee is
+eight. Confirmed on the real profile, the same binary with `SE_GPU_CLOCK_HOLD=0` vs default, five
+interleaved pairs of fresh joins (`docs/overhaul-new/POST-REBOOT.md` Part 4):
+
+| scenario | hold off p50 (range) | hold on p50 (range) | p99 off → on | fps off → on | board W off → on |
+|---|---|---|---|---|---|
+| small window 1080p60 | 24.20 (3.27) | **18.70** (1.81) | 34.9 → 30.7 | 54.7 → 54.8 | 18.2 → 33.7 |
+| hi-res 2560×1440@120 | 34.15 (0.96) | **28.03** (0.99) | 46.7 → 38.2 | 86.0 → 87.3 | 24.4 → 42.0 |
+
+The page's own `hostToPaint` fell 15.8 → 11.3 ms (1080p) and NVENC's wait 5.7 → ~2 ms: the gain
+is on the GPU on both sides of the capture callback. The cost is +15–18 W of GPU power for as
+long as a session streams, which is why it stays off on battery. Not measured on any other GPU
+or on a desktop; the classic (non-ring) NVENC path, AMF, Quick Sync and x264 do not take it.

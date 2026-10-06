@@ -737,6 +737,13 @@ Cross-platform core, OS-independent:
   up to `MAX_LTR_SLOTS` = 2 long-term reference slots, cap-gated on
   `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`, which is what lets `repair.rs` answer a loss with a
   P-frame predicted from a reference the client is known to hold rather than an IDR.
+- **The GPU clock hold** (`nvidia/clock_hold.rs`). A 1080p60 stream is too light for NVIDIA's
+  clock governor: the board stays in P8 (210 MHz graphics) and the composition, the ring copy and
+  NVENC (5.7 ms a frame) all run slowly. While an NVENC ring session lives, and on AC power, a
+  thread copies between two textures on its own device (8 copies a millisecond): stamp p50
+  24.2 → 18.7 ms at 1080p and 34.2 → 28.0 ms at 1440p120, for +15–18 W of GPU power.
+  `SE_GPU_CLOCK_HOLD=0` turns it off, `=1` forces it on (battery). `docs/OPTIMIZATIONS.md`
+  POSTREBOOT-GPUCLOCK.
 - **The FFI layout tests are generated from the real headers, by a C compiler.** `test/nvenc_layout.rs`
   and `test/amd_layout.rs` assert struct sizes, field offsets, vtable slot indices, GUIDs and
   struct revision words measured by `tools/nvenc_layout_gen.c` / `tools/amf_layout_gen.c` reading
