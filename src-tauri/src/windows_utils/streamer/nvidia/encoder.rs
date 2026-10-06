@@ -1678,7 +1678,7 @@ impl Drop for Encoder {
     }
 }
 
-fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+pub(crate) fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().context("CreateDXGIFactory1")?;
 
@@ -1727,6 +1727,16 @@ fn create_nvidia_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         let context = context.context("D3D11CreateDevice returned no context")?;
         Ok((device, context))
     }
+}
+
+/// Two plain 2048x2048 textures for [`super::clock_hold`] to copy between.
+pub(crate) fn create_hold_textures(
+    device: &ID3D11Device,
+) -> Result<(ID3D11Texture2D, ID3D11Texture2D)> {
+    Ok((
+        create_input_texture(device, 2048, 2048, false)?,
+        create_input_texture(device, 2048, 2048, false)?,
+    ))
 }
 
 fn create_input_texture(

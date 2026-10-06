@@ -2199,6 +2199,9 @@ struct AsyncEncodeRing {
     dropped_reported: u64,
     stage_timeout_ms: u32,
     telemetry: SharedTelemetry,
+    /// Holds the NVIDIA GPU out of its idle clocks while this NVENC ring lives
+    /// (`nvidia::clock_hold`). Dropped with the ring.
+    _clock_hold: Option<super::nvidia::clock_hold::Guard>,
 }
 
 impl AsyncEncodeRing {
@@ -2227,6 +2230,10 @@ impl AsyncEncodeRing {
         let mut encoder = encoder;
         encoder.attach_idr_flag(Arc::clone(&idr_request));
         let thread_name = format!("{}-encode", encoder.name());
+        let clock_hold = match &encoder {
+            RingEncoder::Nvenc(_) => super::nvidia::clock_hold::acquire(),
+            _ => None,
+        };
 
         let (free_tx, free_rx) = crossbeam_channel::bounded::<usize>(k);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded::<ReadyMsg>(k);
@@ -2288,6 +2295,7 @@ impl AsyncEncodeRing {
             dropped_reported: 0,
             stage_timeout_ms,
             telemetry,
+            _clock_hold: clock_hold,
         }
     }
 
