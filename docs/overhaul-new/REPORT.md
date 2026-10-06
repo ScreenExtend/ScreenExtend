@@ -17,7 +17,30 @@ Two conditions bound everything:
 
 ## 1. Verdict
 
-On three interleaved rounds (n=4–6 windows per build and scenario), `latency-overhaul-new` is **level with the old app and with the previous head on per-frame latency in every video scenario** (1080p small window 25.9 ms against 25.6 and 27.0; large area 28.4 against 28.9 and 29.2; hi-res 2560×1440 at a real 120 Hz 34.3 against 34.9 and 35.0), with p99 and painted fps not worse anywhere. It is **faster where the job found real defects**: submit → first picture 2.9–3.2 s against 7.2–8.0 s (previous head) and 7.4–10.6 s (old app), submit → answer 2.7–3.0 s against 4.6–4.9 s and 7.3–7.7 s, and audio click → rendered 62.8 ms against 92.3 ms on the previous head (one run each; the old app played none of the clicks). No hyper-fast version was found hiding in the 442 commits: on a same-machine headless join the old app, the previous head and the new build spend the same time per frame. The new build's numbers are from a thin-LTO build taken under memory pressure; the fat-LTO re-measure is owed.
+**Updated after the reboot (2026-10-06, `POST-REBOOT.md`).** On five interleaved rounds of the
+real release profile (fat LTO), with a harness corrected for a clock defect that had biased stamp
+numbers by up to ±16 ms per run, the final `latency-overhaul-new` build (`90f4840`) is **level with
+the old app and with the previous head on per-frame latency in every video scenario**: 1080p
+small window 25.96 ms against 26.12 and 27.15; large area 28.73 against 29.10 and 29.36; hi-res
+2560×1440 at a real 120 Hz 34.26 against 34.68 and 34.42 (p50 medians, n=10 each; ranges 1.0–5.9 ms).
+p99 is not worse anywhere. It is **clearly ahead** on:
+- joins: submit → first picture 2.8–3.1 s against 7.5–7.8 s (previous head) and 7.8–10.9 s (old);
+- keyframes: 5–7 PLIs per window against 52–70, and 1–6 IDRs against 50–70;
+- duplicate frames: 0–3 per window against 50–65;
+- audio: click → rendered 74.5–77.2 ms against 94.0–99.8 ms, and 0 `dc_drops` against 26–53. The
+  old app plays none.
+
+The one large per-frame lever was then found after the merge: the NVIDIA GPU idled in P8 at
+210 MHz for whole sessions. **Holding it out of idle while a session streams (`6c0bc71`, branch
+`post-reboot`, AC power only) cuts the stamp p50 from 24.2 to 18.7 ms at 1080p60 and from 34.2 to
+28.0 ms at 1440p120.** That is five interleaved pairs on the real profile, beyond the noise, with
+p99 and fps better, for +15–18 W of GPU power. One kept change, `ea821a9`, was refuted on painted fps
+with two displays and reverted. No hyper-fast version was hiding in the 442 commits: the old app,
+the previous head and the merged build spend the same time per frame. What makes the new build
+faster is the clock hold, which none of them had.
+
+*Original verdict (three thin-vs-fat rounds, under memory pressure):* level on per-frame latency,
+faster on join and audio.
 
 What the baseline already established (`BASELINE.md`, "Verdict" and the hr1 table):
 
@@ -41,25 +64,35 @@ None of these was a measured latency win on the stamp metric by itself on loopba
 
 ## 2. The three-way table
 
-Three interleaved rounds, all three builds in exclusive mode, `stamp_band: "center"`, two 20 s windows per scenario per round; no window marked loaded, every join one offer; free physical memory 2.6–4.7 GB throughout. Source: `CONSOLIDATION.md`. **The new build is thin LTO (16 codegen units); the previous head's binary is fat LTO.** All builds ran CBR with no constant QP (12.44 Mbps at 1920×1080@60, 30 Mbps at 2560×1440@120, a real 120 Hz with a fresh device token and no saved override). The one configuration difference: the old app always answers H.264 Baseline; previous head and new negotiate High.
+**Replaced on 2026-10-06 by the post-reboot measurement (`POST-REBOOT.md` Part 2).**
+- **Setup.** Five interleaved rounds (old, prev, new, …), all three in exclusive mode, all three
+  **fat LTO**. The request was `{"scenarios":["static","small_window","large_area","hires_small_window"],"runs":2,"duration":20,"stamp_band":"center","force_exclusive":true}`,
+  on the precise-clock harness (`0f15e67`).
+- **Run conditions.** No window loaded, every join one offer. Free memory was 4.4–9.9 GB.
+- **Like for like (from `serve.log`).** 1920×1080@60 and 2560×1440@120 (a real 120 Hz, fresh
+  token), CBR on every build. Old answers Baseline; prev and new negotiate High.
 
-| scenario | old `bef5f89` p50 ms (range), n | previous head `d4d8be9` p50 ms (range), n | new p50 ms (range), n | verdict |
+| scenario | old `bef5f89` p50 ms (min–max) | previous head `d4d8be9` | new `90f4840` | verdict |
 |---|---|---|---|---|
-| small window 1080p | 25.63 (1.39), 6 | 27.02 (1.82), 6 | 25.90 (2.52), 4 | level with both |
-| large area 1080p | 28.92 (1.26), 6 | 29.20 (1.51), 6 | 28.41 (2.17), 4 | level with both |
-| hi-res 2560×1440@120 | 34.86 (5.45), 6 | 34.98 (0.85), 6 | 34.30 (1.17), 6 | level with both |
+| small window 1080p60 | 26.12 (25.25–26.69) | 27.15 (26.52–28.01) | 25.96 (23.81–27.00) | level with both |
+| large area 1080p60 | 29.10 (28.44–29.49) | 29.36 (28.63–30.12) | 28.73 (26.87–30.23) | level with both |
+| hi-res 2560×1440@120 | 34.68 (33.80–35.50) | 34.42 (30.25–36.12) | 34.26 (31.02–34.61) | level with both |
 
 | other measure | old | previous head | new |
 |---|---|---|---|
-| hi-res p99 | 53.7 ms | 50.1 ms | 48.0 ms |
-| hi-res painted fps | 86.0 (range 74–88) | 81.2 | 82.5 |
-| duplicate frames per 20 s window, 1080p | not reported | 50–65 | 1–6 |
-| duplicate frames per 20 s window, hi-res | 627–857 | 330–427 | 294–364 |
-| join: submit → answer | 7.3–7.7 s | 4.6–4.9 s | 2.7–3.0 s |
-| join: submit → first 1080p picture | 7.4–10.6 s | 7.2–8.0 s | 2.9–3.2 s |
-| audio: click → rendered p50 (one run per build) | 0 of 15 clicks matched | 92.3 ms | 62.8 ms |
+| p99 small / large / hi-res | 35.2 / 37.6 / 46.9 | 36.0 / 39.1 / 49.0 | 35.4 / 38.0 / 47.6 |
+| painted fps small / large / hi-res | 55.0 / 54.1 / 90.9 | 54.3 / 54.3 / 83.9 | 54.3 / 53.0 / 86.6 |
+| duplicate frames / 20 s, 1080p / hi-res | 0 / 499–694 | 50–65 / 283–521 | 0–3 / 290–371 |
+| PLI per window / host IDRs per window | 52–63 / — | 55–70 / 50–70 | 5–7 / 1–6 |
+| static desktop 30 s, changed / green frames | 0 / 0 | 0 / 0 | 0 / 0 |
+| calibration floor p50 | −0.09–0.26 ms | 0.08–0.21 | 0.06–0.19 |
+| join: submit → answer / first picture (1080p) | 7.8–8.4 / 7.8–10.9 s | 5.3–5.5 / 7.5–7.8 s | 2.6–3.1 / 2.8–3.1 s |
+| audio (3 runs, WASAPI clicks): click → rendered p50 | 0 of 15 matched | 94.0–99.8 ms | 74.5–77.2 ms |
+| audio `dc_drops` per run | 0 | 26–53 | 0 |
 
-Not in this measurement (not run; memory): calibration per build, the static scenario, p90/max per scenario, PLI/IDR counts per window, rounds four and five, and the fat-LTO build of the new head. One of the three new-build rounds lost its 1080p join's four windows (see §7), which is why n=4 there.
+With the GPU clock hold (`post-reboot`, `6c0bc71`), the final build reads **18.70 ms** (1080p) and
+**28.03 ms** (1440p120). That is five interleaved pairs against the same binary with the hold off
+(24.20 and 34.15); see `POST-REBOOT.md` Part 4.
 
 ### 2.1 What the baseline measured (old vs previous head)
 
@@ -108,7 +141,13 @@ Two noise figures exist, and they disagree:
 - **Handler acceptance runs** (`scripts/test-handler/README.md`, acceptance 3): five consecutive standard runs on a loaded machine at 82–90 % CPU. Small-window p50 range was 1.48 ms, large-area 2.31 ms and hi-res 7.90 ms. p99 ranges ran into tens of ms.
 - **The baseline's quiet runs** (`BASELINE.md`, "Noise figure"): four previous-head runs spread over seven hours. Small-window p50 range was 7.6 ms (24.5–32.1), large-area 4.5 ms and hi-res at 60 Hz 7.9 ms.
 
-The noise figure with `stamp_band: "center"` was never measured.
+**Post-reboot:** with `center` and the precise clock, the final build's p50 range over five
+interleaved runs is 3.19 ms (small), 3.36 ms (large) and 3.59 ms (hi-res). The five consecutive
+runs are in `POST-REBOOT.md` §4.4. The ~10 % checksum failures at 1080p persist on every build
+(6–11 %), and there are none at hi-res; still unexplained. **Every absolute stamp number in this
+report before 2026-10-06 may carry a per-run clock bias** if the machine ran at the default 15.6 ms
+timer resolution (`POST-REBOOT.md` §0). The pre-reboot browser offsets of 0.3–1.06 ms suggest it
+did not.
 
 No separate noise figure was measured on the final build. The run-to-run ranges in the three-way table (1.2–2.5 ms on p50 for the new build, three rounds, `stamp_band: "center"`) are the best available figure. About 10 % of 1080p frames still failed the stamp checksum with `center` on all three builds, so the handler README's claim that `center` removes them is unconfirmed (`CONSOLIDATION.md`).
 
@@ -126,7 +165,7 @@ The per-merge five-run re-measure that `TEST-WORKFLOW.md` §8 asks for was **not
 |---|---|---|---|
 | `48d3807` | Retries a WGC start that fails on a stale monitor handle. It waits 200 ms, finds the display again by name, and tries up to 5 times before falling back to DXGI, which never delivers on this hybrid machine. | Unforced, the failure cost a second offer and a first picture at 12.9 s (1 of 48 logs). With the failure forced three times, it recovered on WGC: picture at 5.6 s, small-window p50 27.0 ms. | VERIFIED (forced): verified by simulation. The natural failure was never reproduced on demand. |
 | `f7c2a55` | Tests `CURSORINFO.flags` as a bitfield instead of with `==`. | Same behaviour for every documented value. | COMPILE-CHECKED: not run. Nobody may move a pointer. |
-| `ea821a9` | Sets WGC `MinUpdateInterval` back to ⅔ of the stream's period, never under 4 ms. That is the old app's value; it replaces a flat 4 ms. | One display: level (E3). Two displays attached: WGC deliveries to a 60 Hz session fell from about 190/s to about 70/s at the same latency (E5, one run per arm). As a side effect, cursor-exempt frames are now bounded at 1.5× the stream rate (about 90 fps for a 60 Hz client). | VERIFIED (one run per arm). The confirmation run was contaminated. `CONSOLIDATION-TODO.md` asks for an A/B before the change is called kept, including at hi-res 120 Hz, where one run on `d7a448a` read p50 73.5 ms with 810 duplicate frames, unattributed. Consolidation: no A/B against the parent was run. The 73.5 ms run did not reproduce — hi-res at 120 Hz on the merged build read p50 34.30 ms (range 1.17, n=6), level with the old app and the previous head. The two-display confirmation is still owed. |
+| `ea821a9` | Sets WGC `MinUpdateInterval` back to ⅔ of the stream's period, never under 4 ms. That is the old app's value; it replaces a flat 4 ms. | One display: level (E3). Two displays attached: WGC deliveries to a 60 Hz session fell from about 190/s to about 70/s at the same latency (E5, one run per arm). As a side effect, cursor-exempt frames are now bounded at 1.5× the stream rate (about 90 fps for a 60 Hz client). | **REVERTED on `post-reboot`** (post-reboot two-display A/B, 3 + 3 pairs: the 60 Hz session painted 46.5–49.6 fps with the ⅔ floor against 54.9–58.0 with the parent's 4 ms, at level latency; one display level at 1080p and 1440p120). Previously: VERIFIED (one run per arm). The confirmation run was contaminated. `CONSOLIDATION-TODO.md` asks for an A/B before the change is called kept, including at hi-res 120 Hz, where one run on `d7a448a` read p50 73.5 ms with 810 duplicate frames, unattributed. Consolidation: no A/B against the parent was run. The 73.5 ms run did not reproduce — hi-res at 120 Hz on the merged build read p50 34.30 ms (range 1.17, n=6), level with the old app and the previous head. The two-display confirmation is still owed. |
 
 ### G02 — Windows encode (`G02.md`)
 
@@ -140,8 +179,8 @@ The per-merge five-run re-measure that `TEST-WORKFLOW.md` §8 asks for was **not
 |---|---|---|---|
 | `30d5719` | `PliBackoff`: when PLI/FIR requests keep coming after they are answered, the window between answered requests doubles, up to a 2 s cap. Four quiet seconds reset it. A NACK, transport-wide loss or the client's own keyframe counter opens it at once. | 1080p, 3 interleaved pairs: IDRs per session 426–435 → 72–73. Small-window bitrate about 5.1 → 2.7 Mbps. Small p50 pair medians 27.4/27.8/27.7 → 25.3/25.7/24.3. | VERIFIED: defect fix; the latency gain is inside the noise. |
 | `396916b` | Raises the cap to 10 s while the client's STATS say it is painting through WebCodecs. | 120 Hz hi-res, 1 pair × 3 windows: IDRs 54 → 17. Hi-res small p50 35.5/37.3/40.7 → 34.3/35.4/37.0. fps 72–76 → 79–84. | VERIFIED as a defect reduction, one pair. |
-| `07ec295` | Lets the audio DataChannel carry one delayed-SACK interval (220 ms) of in-flight data on top of the 40 ms before backpressure drops audio. | Reasoned from source reading and G06's burst sizes. | UNVERIFIED. |
-| `1f85421` | D-05: closes the transport a renegotiation replaced once the new one connects. A registry entry is removed only by its owner. | Before the fix, the old transport was still alive 30 s after each edit (one run). The after-fix run was reaped for memory. Unit test. | UNVERIFIED end to end. |
+| `07ec295` | Lets the audio DataChannel carry one delayed-SACK interval (220 ms) of in-flight data on top of the 40 ms before backpressure drops audio. | Reasoned from source reading and G06's burst sizes. Post-reboot, 3 interleaved pairs (switch build): `dc_drops` 0/0/0 with the allowance, 142/272/274 without; click latency level. | VERIFIED (post-reboot). |
+| `1f85421` | D-05: closes the transport a renegotiation replaced once the new one connects. A registry entry is removed only by its owner. | Before the fix, the old transport was still alive 30 s after each edit (one run). The after-fix run was reaped for memory. Unit test. | VERIFIED end to end (consolidation once; post-reboot twice more on the fat build). |
 
 ### G04 — Session and display (`G04.md`)
 
@@ -153,15 +192,15 @@ The per-merge five-run re-measure that `TEST-WORKFLOW.md` §8 asks for was **not
 | `8e709bd` | Fix 5: a relayed page without join ids renegotiates on its live join, and a relay client resolves to its live join for `/reconfig`. | None. | Unit-tested only (`a_relayed_page_without_join_ids_lands_on_its_live_join`). Never run. |
 | `26630dc` | Fix 6: the GPU-encode toggle renegotiates live joins in place instead of restarting the servers. `RELOAD` applies `disableGpuEncode`. | One run through `RELOAD`: same join id, x264 then NVENC, no display created. | Host side measured once. The GUI button was never pressed. |
 | `1eca751` | Two `log::error!` calls in `driver_ipc/sync/client.rs` now reach the log bus. `Drop` no longer reports a panic on every normal drop. | None. | By reading. |
-| `7584269` | Host half of the per-page `attemptId`. A joinless retry whose attempt names a join that never connected continues that join. | Simulated lost answer (switch held the first answer 12 s), 1 run: displays 2 → 1. The retry "continues join…", renegotiated in place in 0.9 s. Small p50 24.55 ms. | Verified by simulation (1 run) plus 3 unit tests. |
+| `7584269` | Host half of the per-page `attemptId`. A joinless retry whose attempt names a join that never connected continues that join. | Simulated lost answer (switch held the first answer 12 s), 1 run: displays 2 → 1. The retry "continues join…", renegotiated in place in 0.9 s. Small p50 24.55 ms. | Verified by simulation (1 run) plus 3 unit tests. Post-reboot: confirmed through the real page (the host held its first answer 12 s): one display, the retry continued the join, picture at 10.4 s. |
 | `183aea8` | D-08: an orientation edit counts only when auto-orientation is off. | None live. | Unit-tested only. |
 
 ### G05 — Client video path (`G05.md`)
 
 | commit | what it does | measured effect | status (ledger) |
 |---|---|---|---|
-| `9aae1d3` | D1: the frame watchdog never demotes a session to `<video>` once WebCodecs has painted. | Previous head: 2 of 56 runs demoted after painting. Fixed: 0 demotions in 23 joins. The regression test fails 4 of 7 assertions on the old page. | Harness-proven; live-unverified. A confirmation needs tens of joins. |
-| `a00083d` | D3, the client half of the storm: keyframes go back to the receiver, so libwebrtc's own decoder stops asking for them. | PLIs 28–35 → 3–4 per 10 s. Medians base vs fixed: small 26.95 vs 24.8, large 30.7 vs 29.5, hi-res 32.9 vs 32.05, all inside the base range. Encoder load at hi-res 40–43 % → 36 %. | Kept as a defect fix (measured); not a latency win by the keep rule. |
+| `9aae1d3` | D1: the frame watchdog never demotes a session to `<video>` once WebCodecs has painted. | Previous head: 2 of 56 runs demoted after painting. Fixed: 0 demotions in 23 joins. The regression test fails 4 of 7 assertions on the old page. | Harness-proven; post-reboot live: 0 demotions in 40 joins held 8 s each (0/63 with G05's 23). |
+| `a00083d` | D3, the client half of the storm: keyframes go back to the receiver, so libwebrtc's own decoder stops asking for them. | PLIs 28–35 → 3–4 per 10 s. Medians base vs fixed: small 26.95 vs 24.8, large 30.7 vs 29.5, hi-res 32.9 vs 32.05, all inside the base range. Encoder load at hi-res 40–43 % → 36 %. | Kept as a defect fix (measured); not a latency win by the keep rule. Post-reboot: the legacy `createEncodedStreams` half confirmed live (3 PLIs per 10 s). |
 
 ### G06 — Audio (`G06.md`)
 
@@ -171,11 +210,11 @@ The per-merge five-run re-measure that `TEST-WORKFLOW.md` §8 asks for was **not
 | `61da27a` | A refused or stale saved output no longer reroutes the graph every poll. | `stale_output`: 22 element restarts, 4 underruns → 0, 0. | Fixed, before/after. |
 | `24f75e8` | A page opened on the host machine itself starts muted, which ends the echo loop. | Chrome unmuted: 1/15 clicks detectable, 0.40 RMS still ringing → page muted, no loop. | Fixed, 1 + 1. |
 | `736f0f9` | The spare Opus track is fed once the client steps down to it. | `worker_fails`: 0/15 clicks → 15/15 together with `201a981`. | Fixed, before/after. |
-| `201a981` | The standard track's RTP clock steps in whole frames. This is the HTTP / no-`AudioDecoder` tier. | `no_audio_decoder`: 627,600 concealed samples, 5/15 clicks, p50 453 ms → 240 concealed, 15/15, p50 131 ms. | Fixed, before/after. Proven through the same track path with `AudioDecoder` removed, **not on plain HTTP itself**. |
+| `201a981` | The standard track's RTP clock steps in whole frames. This is the HTTP / no-`AudioDecoder` tier. | `no_audio_decoder`: 627,600 concealed samples, 5/15 clicks, p50 453 ms → 240 concealed, 15/15, p50 131 ms. | Fixed, before/after. Proven through the same track path with `AudioDecoder` removed; **post-reboot also on plain HTTP itself** (15/15 clicks, 116 ms to render, NetEQ/postMessage). |
 | `83facec` | A refused host-chosen output is reported, not offered as a chooser over the live stage. | Harness: 10 polls → 0 picker offers, 1 report. | Harness only. |
 | `dbb2863` | Process loopback is tried first; endpoint loopback when it cannot activate. `SE_ENDPOINT_LOOPBACK=1` forces the old order. | Probe 5 + 5: median 80.6 → 59.4 ms. Handler 2 + 2 interleaved: click → rendered 95.1/93.9 → 65.9/64.9 ms; → output 149.1/149.3 → 120.2/120.4. 15/15 every run. | Kept (verified by A/B). The second handler pair ran at about 1 GB free physical memory. |
 
-All of G06 ran on thin builds. A fat-profile re-run is owed.
+All of G06 ran on thin builds. **Post-reboot:** every audio tier re-run on the fat final build, all 15/15 (`POST-REBOOT.md` Part 3 item 5), and `mic_prompt` in its three cases as designed.
 
 ### G07 — Client page (`G07.md`)
 
@@ -191,7 +230,7 @@ All of G06 ran on thin builds. A fat-profile re-run is owed.
 | commit | what it does | measured effect | status (ledger) |
 |---|---|---|---|
 | `e96fe2c` | The ring keepalive's encode stamps go around the encode, not after it. | — | Defect by reading. |
-| `3120abf` | WGC's `SystemRelativeTime` is no longer used as a capture time. It is a target present time, 3–14 ms in the future on 2,879 of 2,880 frames. | Capture-relative stages had been dropping 89–99.97 % of their samples. | Measured with a diagnostic switch. Not re-run through the handler on the final tree. |
+| `3120abf` | WGC's `SystemRelativeTime` is no longer used as a capture time. It is a target present time, 3–14 ms in the future on 2,879 of 2,880 frames. | Capture-relative stages had been dropping 89–99.97 % of their samples. | Measured with a diagnostic switch. Post-reboot: confirmed through the handler on the fat build (`capture_to_encode.count` 607–620 for ~10 s, `capture_delivery` absent). |
 | `114cc01` | The worker's stage windows are sorted as typed arrays. | 320–350 → 77 µs per 1 Hz poll; end to end inside noise. | Direct timing. |
 
 Instrumentation all off vs on showed no measurable cost (3 v 3 joins, `G08.md` §2).
@@ -218,6 +257,22 @@ These are tooling, not product changes:
 The fixes among them that changed what earlier numbers meant are listed in `BASELINE.md` "Harness faults" (H-1 to H-7).
 
 ---
+
+### Changes that landed after this report was first written
+
+| commit | what it does | status |
+|---|---|---|
+| `efef3a1` | The cloud relay's query is rejoined to the path, so a relayed `/audio-outputs` keeps its `?join=`. | Unit-tested. **Cannot be tested here**: it needs the live relay, which would publish a session for the owner. |
+| `0ad9b7d` (merge of `audio-discovery`; supersedes `c020fc0`'s "Choose a speaker on this device…" entry) | Deterministic audio-output discovery before the offer. The device sheet lists the full set or "System default"; "can't switch speakers" only where no sink API exists. | VERIFIED post-reboot through real joins (`mic_prompt` with audio): speaker granted → 3 labelled outputs, host `supported: true`; microphone granted → the same; nothing granted → the card, then default only, host `supported: true`; the discovery map reaches `status --json`. |
+| `59bada3` | Desktop UI: a device offering only its default output shows just "System default". | Desktop UI; not run (out of scope). |
+| `90f4840` (merge of `join-failure-restore`) | A failed join gives back everything it armed: input gate, wake lock, locks, leave prompt, audio, form. | **VERIFIED post-reboot** in four live cases (wrong OTP, unknown session, host stopped mid-join, host 500 via a switch build). Each time: form back, Connect enabled, no wake lock, no `beforeunload`, input gate closed, 0 open peer connections, 0 requests to the host afterwards (`POST-REBOOT.md` Part 3 item 6). |
+
+**On branch `post-reboot`:**
+- `0f15e67`, `2bbce85`, `8f817f8`: the test handler. A precise reference clock; `join_failures`;
+  `arms`; GPU clocks in the load sample; `slow_answer.hold_s`; a fallback tier filter.
+- `6c0bc71`: **the GPU clock hold.** 1080p60 p50 24.20 → 18.70 ms; 1440p120 34.15 → 28.03 ms; +15–18 W;
+  AC only. VERIFIED, five interleaved pairs on the real profile.
+- The revert of `ea821a9`.
 
 ## 4. Every change tried and not kept
 
@@ -420,7 +475,7 @@ Fixed during consolidation (`CONSOLIDATION.md`): `fb6d08b` telemetry removed by 
 - **macOS (G12, 67 commits).** Unchanged except two mirrors: `58fd8b1` added `session::clear_join_seeded` to `macos_utils::set_device_override`, marked UNVERIFIED (not compiled), and `655e828` routed `networking.rs`'s store name through `data_dir::config_store()`. Nothing macOS was compiled or run.
 - **AMD and Intel (G13, 15 commits).** Untouched. G02 notes that Intel picks `MFX_RATECONTROL_CQP` without a capability mask, so it does not share the constant-QP bug. The AMF backend remains UNVERIFIED as `CLAUDE.md` says.
 - **Desktop UI (G10, 29 commits).** `src/` is byte-identical to `latency-overhaul`. The GUI was never started: it steals focus on launch (`G09.md`). Every GUI finding is from reading.
-- **Not compiled or not run on this machine for other reasons:** DXGI duplication (it never delivers on this hybrid machine), the x264 path through the handler, Windows below 24H2, the hosted network, the relay.
+- **Not compiled or not run on this machine for other reasons:** DXGI duplication (it never delivers on this hybrid machine), Windows below 24H2, the hosted network, the relay. (The x264 path ran post-reboot: decodable, 0 changed / 0 green on a static desktop, p50 26.0–27.9 ms.)
 
 ---
 
@@ -435,8 +490,13 @@ Fixed during consolidation (`CONSOLIDATION.md`): `fb6d08b` telemetry removed by 
 7. **What makes an in-place renegotiation fail on the owner's machine** (`G04.md`).
 8. **Why the panel goes to 60 Hz with exactly one virtual display.** The suspected cause is Windows' persisted per-topology configuration. Unproven (`G04.md` §4).
 9. **The `dc_drops` bursts** of 41–43 packets, about 205–215 ms of audio. A delayed SACK is suspected, not established (`G06.md`; `G03.md` attributes them to `buffered_amount` counting until the peer's SACK).
-10. **The live 1440p encode stage** reads 8.39 ms p50 against 5.0–5.7 ms of clean NVENC time (`G02.md` E8). The open lead is the keyed-mutex wait for the capture-side copy.
-11. **`<video>` vs WebCodecs at 1080p:** 23.4 and 34.3 ms on two `<video>` joins, against 25–26 on WebCodecs, one window each (`G05.md` §2).
+10. **The live 1440p encode stage** reads 8.39 ms p50 against 5.0–5.7 ms of clean NVENC time (`G02.md` E8). **Explained post-reboot:**
+    - It is not the keyed mutex. Acquire is 0.07 ms.
+    - It is NVENC's hardware time at idle GPU clocks: P5/P8, video clock 555–627 MHz. The
+      completion wait is 7.3–9.3 ms.
+    - The GPU clock hold takes it to ~3.5 ms.
+11. **`<video>` vs WebCodecs at 1080p:** 23.4 and 34.3 ms on two `<video>` joins, against 25–26 on WebCodecs, one window each (`G05.md` §2). **Settled post-reboot** (3 runs each): WebCodecs 18.2–19.1 ms, `<video>` 35.8–36.4 ms.
+15. **Post-reboot: 7–12 ms between the host's socket write and the client's encoded transform** on a loopback link. This is the largest remaining term in the per-frame budget (`POST-REBOOT.md` Part 4). Unexplained.
 12. **Green samples on a static desktop.** 2 of 5 handler acceptance runs (loaded) showed them; 0 since on the previous head. The old app showed 2 green frames in 1 of 4 baseline runs.
 13. **Why the old app collapses at 120 Hz.** Observed, not diagnosed (`BASELINE.md`).
 14. **`serve`'s unpumped main thread** and display-topology broadcasts (`G09.md` item 7). A hypothesis, never measured.
@@ -575,6 +635,16 @@ Each question gives what was assumed and what changes if the answer differs. Dup
     - does pointer speed change after a mid-session settings edit?
 
     Each assumption is in `INPUT-REPORT.md` §10.
+32. **Post-reboot: the GPU clock hold** (`6c0bc71`) buys 5.5–6 ms per frame for +15–18 W of GPU
+    power while streaming. It is on by default on AC power only (`SE_GPU_CLOCK_HOLD=0|1`).
+    - **Assumed:** latency first.
+    - **Alternative:** the persistent driver setting "Prefer maximum performance" for
+      `ScreenExtend.exe` (`POST-REBOOT.md` §7).
+33. **Post-reboot: should a page rejoin by itself after the host was stopped and restarted?**
+    Today the host's bye takes the kick path (`ab37665`) and the page waits for Connect.
+34. **Post-reboot: the CLI's `devices set` pins a 120 Hz device at 60 Hz** when no row was saved
+    before. Seed the row's refresh rate from the live join?
+    - **Assumed:** yes. Not done; CLI-only.
 31. **May isolated tests run alongside your installed ScreenExtend?** (`QUESTIONS.md`)
     - **Background:** asked twice on 10/4, not answered.
     - **Assumed:** no; agents stood down from display tests while the app was open.
@@ -636,3 +706,23 @@ Each question gives what was assumed and what changes if the answer differs. Dup
 Consolidation: no rule breach reported. One unexplained event: in one new-build round the 1080p join's four timed windows decoded only implausible stamps (older than 5 s or in the future) while the host encoded 59 fps and the page's own counters showed path 1, 70 painted fps and hostToPaint 15.7 ms; those windows were discarded (see §7). `SE_REQUIRE_HW=1 cargo test` has one failure by configuration (`nvenc_ltr_repair_is_cheaper_than_an_idr` skips because LTR is off by default; it passes with `SE_NVENC_LTR=1`). The fat-LTO build and `pnpm tauri build` were not done (commit headroom 9.63 GB, under the 10 GB floor set for a fat link). From the orchestrator's own record, not in a ledger: at the first owner-requested pause (22:16 on 10/4) stopping G02's runner killed a handler before teardown and left one virtual display attached, which G02 removed through the driver; and the orchestrator stopped three agents' release builds by PID to honour the second pause. Machine state at hand-back: no host, no test browser, no stage window and no virtual display left; all handler slots free; owner's `config.json` SHA-256 still `176B9DAD7C9C4985…`; the driver host at 36.7 GB commit and 3,131 threads; commit headroom 7.9 GB.
 
 One contradiction in the brief itself, recorded as an incident: `TEST-WORKFLOW.md` §3 rule 1 says never to run `scripts/test-startup-gate.mjs`, while §8 lists `pnpm test:gate` (which runs it) in the final gate. The consolidation agent read the script in full first — it is a pure decision-table test that imports `startup-gate.ts` and reads `en.json`, starts no process, opens no window and injects nothing — and then ran it; it passed. No input was injected at any point in the job, and `git diff latency-overhaul latency-overhaul-new -- src-tauri/src/streamer/input src-tauri/src/streamer/static/input.js` is empty.
+
+### Post-reboot (2026-10-06, branch `post-reboot`)
+
+- **The harness measured on four unaligned clocks.** At the default 15.6 ms timer resolution, the
+  first seven post-reboot runs carried a per-run stamp bias of up to ±16 ms. They were discarded
+  (`p2biased-*`), and the handler was fixed in `0f15e67`. Earlier absolute numbers may carry it too;
+  see `POST-REBOOT.md` §0.
+- **The test handler was edited while a batch was running.**
+  - The edits were additive: new request keys, extra `nvidia-smi` fields and the arms set-args.
+  - The batch spawns a fresh handler per run, so a later run of the same batch used the newer
+    file.
+  - No measured quantity of the standard request changed. The clock fix itself was applied
+    between batches: Part 2 was restarted from scratch after it.
+- **Two runs were stopped by the runner's STOP file** between runs, never mid-run. One batch
+  stopped itself before its first run because the STOP file was still present, and was restarted.
+- **Five of G08's six static runs were dropped**: free physical memory fell under 2 GB as the
+  driver host passed 12 GB. The stop line the coordinator set (20 GB driver host, or 10 GB commit
+  headroom) was not reached.
+- The owner's `config.json` was byte-identical (`309851D4DECF7BC2…`) after every run. No host,
+  browser, stage or display was left (`cleanup` empty in every result). No input was injected.
