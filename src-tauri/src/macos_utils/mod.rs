@@ -974,6 +974,30 @@ pub fn remove_drivers(_app: tauri::AppHandle) -> bool {
     true
 }
 
+/// No virtual display driver process to leak on macOS: `CGVirtualDisplay` lives in WindowServer.
+/// UNVERIFIED (not compiled): written on Windows, mirrors the Windows command's surface.
+#[tauri::command]
+#[specta::specta]
+pub fn display_driver_health() -> crate::DisplayDriverHealth {
+    crate::DisplayDriverHealth {
+        supported: false,
+        identified_by: "unsupported".to_string(),
+        detail: "macOS has no display driver host to measure".to_string(),
+        ..Default::default()
+    }
+}
+
+/// UNVERIFIED (not compiled).
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_display_driver(_app: tauri::AppHandle) -> crate::DriverRestartOutcome {
+    crate::DriverRestartOutcome {
+        reason: "unsupported".to_string(),
+        detail: "macOS has no display driver to restart".to_string(),
+        ..Default::default()
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 pub fn install_audio_driver(app: tauri::AppHandle) -> String {

@@ -4725,3 +4725,60 @@ The page's own `hostToPaint` fell 15.8 → 11.3 ms (1080p) and NVENC's wait 5.7 
 is on the GPU on both sides of the capture callback. The cost is +15–18 W of GPU power for as
 long as a session streams, which is why it stays off on battery. Not measured on any other GPU
 or on a desktop; the classic (non-ring) NVENC path, AMF, Quick Sync and x264 do not take it.
+
+## UX-DRVRESTART — the display driver's leak is checked at startup and freed by an elevated in-place restart — `VERIFIED` (unelevated half: the health read, both refusals) / `UNVERIFIED` (the elevated restart and the modal, live)
+
+The bundled IddCx driver leaks ~47–124 MB of commit, ~37 handles and ~5 threads into its own
+`WUDFHost.exe` per display creation or mode change and never gives them back (D-1 in
+`FUTURE-TEST-WORKFLOW.md`, `docs/overhaul-new/G04.md` §3). At ~36 GB / ~3,200 threads
+`SetDisplayConfig` fails with error 31 and every join times out waiting for its display. Only a
+device restart (Administrator) or a reboot frees it. The owner asked for the driver-install
+pattern — modal, UAC, subcommand — for a restart, checked at startup.
+
+- **Detection** (`windows_utils/driver_health.rs`, unelevated). `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+  on the LocalService host is refused (measured: error 5), so its command line and modules are out
+  of reach. The driver's own pipe is not: a client handle on `\\.\pipe\virtualdisplaydriver`
+  answers `GetNamedPipeServerProcessId` with the host's pid (measured: 1992, the 14.7 GB one, among
+  five `WUDFHost.exe`). Counters come from `NtQuerySystemInformation(SystemProcessInformation)`,
+  which needs no handle: `PrivatePageCount` (= .NET `PrivateMemorySize64`, what the test handler
+  logs), threads, handles. The largest `WUDFHost.exe` is used only when the pipe exists but will
+  not name its server, and the result and the log say so; an absent pipe never asks for a restart.
+- **Threshold**: ≥ 8192 MB commit or ≥ 800 threads — a quarter of the failure point on each axis,
+  ~170 ordinary joins/mode changes from a fresh boot (~10 MB / 19 threads), never one session's
+  worth. `SE_DRIVER_RESTART_THRESHOLD_MB` overrides the commit figure and switches the thread
+  criterion off unless `SE_DRIVER_RESTART_THRESHOLD_THREADS` is set too, so the override really
+  forces or suppresses the prompt.
+- **Restart** (`ScreenExtend drivers restart [--report PATH]`). In-process SetupAPI: the present
+  Display-class devnodes whose hardware ids include `Root\VirtualDisplayDriver` (the id the
+  installer creates it with), then `DIF_PROPERTYCHANGE` / `DICS_PROPCHANGE` — Device Manager's and
+  devcon's restart — and `DI_NEEDREBOOT` read back as a failure. No `pnputil`/PowerShell/devcon;
+  the bundled `nefconc` was checked and has no restart verb (only remove/create/install, i.e. a
+  reinstall). Order: device present (exit 8 if not) → refusal (exit 5: the running instance's
+  `STATS` carries `joins`, i.e. it has set up and holds a driver client; or the driver lists
+  displays while another ScreenExtend process is alive) → elevation (exit 4) → restart (exit 7
+  needs reboot, 1 failed) → wait ≤ 30 s for the pipe to answer the protocol from a **new** host pid
+  (exit 6 otherwise) → before/after line, exit 0.
+- **Launch** (`restart_display_driver`). `elevated-command`'s Windows half is a bare
+  `ShellExecuteW("runas")`: it does not wait, gives no exit code, and its `status` is the
+  ShellExecute instance value — so `output.status.success()` is false for every launch that
+  *worked* (a latent defect in `run_elevated_driver_command`, which `install_drivers` survives only
+  because the bootstrap re-probes regardless; not changed here). The restart must be waited for,
+  so it uses `ShellExecuteExW("runas", SEE_MASK_NOCLOSEPROCESS)` parented to the main window, waits
+  ≤ 120 s, reads the exit code, and reads the reason from the `--report` JSON the child writes
+  (an elevated process's stdout cannot be captured). `ERROR_CANCELLED` is `declined`.
+- **Gate** (`classifyDriverHealth` in `startup-gate.ts`, `driverHealthBlocks` in `bootstrap.tsx`):
+  at the top of `runSetup`, i.e. after the compatibility gate (a missing driver is installed first)
+  and before `setup()`. Over threshold: "Display Driver Restart Required", Restart Driver / Exit
+  App, nothing else; a failed restart shows its reason and the same two actions; a verified one
+  resumes `runSetup` with the arguments it was stopped with. A failed health read lets startup
+  through.
+
+Verified on this machine, unelevated, debug build: `doctor --json` reports
+`drivers.displayDriverHealth` = pid 1992, `pipeServer`, 14,752 MB, 1,270 threads, 8,715 handles,
+`needs_restart: true`; `drivers restart` with no host → exit 4 (`notElevated`, report written);
+with an isolated `serve` up (no display) → exit 5 (`refused`, names its pid); unit tests for the
+selection, the thresholds, the env override, the refusal table and the exit-code map;
+`pnpm test:gate` for the gate and the strings. **Not verified:** the elevated restart itself (needs a
+UAC click; agents may not elevate, and the owner's app was running), whether `DIF_PROPERTYCHANGE`
+actually ends the 14.7 GB host on this driver (the INF's `ProcessSharingDisabled` says it should),
+the modal on screen, and macOS/Linux stubs (`UNVERIFIED (not compiled)`). Steps: `FUTURE-TEST-WORKFLOW.md` D-6.

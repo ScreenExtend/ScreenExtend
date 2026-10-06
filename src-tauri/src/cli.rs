@@ -97,6 +97,8 @@ SUBCOMMANDS:
     account avatar set <path> | remove | show
     autostart enable | disable | status
     drivers install | remove          Install/remove the virtual display driver
+    drivers restart       Restart the virtual display driver to free the memory it has leaked
+                          (Windows, Administrator; refuses while a host is connected)
     doctor                Check system requirements and permissions
     logs                  Print the running host's log backlog
     update check | install
@@ -1547,14 +1549,26 @@ mod desktop {
                 }
                 None => "could not query (certutil unavailable)".to_string(),
             };
+            // The leak gate: unelevated, so `doctor` can always say it.
+            let health = platform::driver_health::read_health();
+            let health_text = if health.needs_restart {
+                format!(
+                    "{} — run `ScreenExtend drivers restart` as Administrator with no host running",
+                    health.detail
+                )
+            } else {
+                health.detail.clone()
+            };
             DriverState {
                 rows: vec![
                     ("Virtual display driver", display),
                     ("Signing certificate", cert_text),
+                    ("Driver host memory", health_text),
                 ],
                 json: serde_json::json!({
                     "virtualDisplay": backend.as_str(),
                     "virtualDisplayHolderPid": backend.holder(),
+                    "displayDriverHealth": health,
                     "signingCertificate": match cert {
                         Some(true) => "trusted",
                         Some(false) => "absent",
@@ -3570,11 +3584,12 @@ mod desktop {
     // drivers
 
     fn run_drivers(app: &tauri::AppHandle, m: &Matches) -> ! {
-        let Some((name, _)) = sub(m) else {
-            eprintln!("usage: ScreenExtend drivers <install|remove>");
+        let Some((name, sm)) = sub(m) else {
+            eprintln!("usage: ScreenExtend drivers <install|remove|restart>");
             exit(2);
         };
         match name {
+            "restart" => run_drivers_restart(app, sm),
             "install" => {
                 println!("Requesting elevation to install the virtual display driver…");
                 platform::install_drivers(app.clone());
@@ -3592,6 +3607,173 @@ mod desktop {
                 exit(2);
             }
         }
+    }
+
+    /// `drivers restart`: restart the virtual display driver in place to free what it has leaked.
+    ///
+    /// The order is deliberate. Nothing that could be refused for a reason the user can fix
+    /// (a host in the way) waits behind the elevation check, so the unelevated run tells the
+    /// whole story; and the elevated run checks the same things again, because it is the one
+    /// that acts. Every exit writes `--report` when given, which is the only channel back to a
+    /// desktop app that started this through UAC.
+    #[cfg(windows)]
+    fn run_drivers_restart(app: &tauri::AppHandle, m: &Matches) -> ! {
+        use crate::windows_utils::driver_health as dh;
+        use crate::DriverRestartOutcome;
+
+        fn finish_with(
+            report: Option<&std::path::Path>,
+            code: i32,
+            outcome: DriverRestartOutcome,
+        ) -> ! {
+            if let Some(path) = report {
+                dh::write_report(path, &outcome);
+            }
+            if code == dh::EXIT_RESTARTED {
+                println!("{}", outcome.detail);
+            } else {
+                eprintln!("error: {}", outcome.detail);
+            }
+            exit(code);
+        }
+        fn outcome(reason: &str, detail: String) -> DriverRestartOutcome {
+            DriverRestartOutcome {
+                ok: false,
+                reason: reason.to_string(),
+                detail,
+                ..Default::default()
+            }
+        }
+        let report = arg_str(m, "report").map(std::path::PathBuf::from);
+        let rep = report.as_deref();
+
+        // 1. Is there a driver to restart at all?
+        let devices = match dh::find_driver_devices() {
+            Ok(d) => d,
+            Err(e) => finish_with(
+                rep,
+                dh::EXIT_FAILED,
+                outcome(
+                    "failed",
+                    format!("could not enumerate display devices: {e}"),
+                ),
+            ),
+        };
+        if devices.is_empty() {
+            finish_with(
+                rep,
+                dh::EXIT_NOT_INSTALLED,
+                outcome(
+                    "notInstalled",
+                    "the ScreenExtend display driver is not installed; nothing to restart \
+                     (`ScreenExtend drivers install`)"
+                        .to_string(),
+                ),
+            );
+        }
+        let ids: Vec<&str> = devices.iter().map(|d| d.instance_id.as_str()).collect();
+        println!("Display driver device: {}", ids.join(", "));
+
+        let before = dh::read_health();
+        println!("Before: {}", before.detail);
+
+        // 2. Would it take displays away from a host? Ask the instance this data directory
+        //    belongs to, then the driver's own (machine-wide) display list.
+        let ctrl = crate::data_dir::local_data_dir(app)
+            .ok()
+            .map(|d| d.join(single_instance::CTRL_FILE));
+        let (stats, running_pid) = match &ctrl {
+            Some(path) => (
+                single_instance::query_running_instance(path, single_instance::Command::Stats)
+                    .and_then(|r| serde_json::from_str::<Value>(r.trim()).ok()),
+                single_instance::running_instance_pid_at(path),
+            ),
+            None => (None, None),
+        };
+        let others = platform::virtual_display::sibling_processes();
+        let monitors = platform::virtual_display::driver_monitor_count();
+        if let Some(refusal) = dh::restart_refusal(stats.as_ref(), running_pid, monitors, &others) {
+            finish_with(
+                rep,
+                dh::EXIT_REFUSED,
+                outcome("refused", refusal.sentence()),
+            );
+        }
+
+        // 3. Only now, elevation.
+        if !elevated_command::Command::is_elevated() {
+            finish_with(
+                rep,
+                dh::EXIT_NOT_ELEVATED,
+                outcome(
+                    "notElevated",
+                    "restarting a device needs Administrator: run this from an elevated \
+                     terminal, or let the desktop app ask for it"
+                        .to_string(),
+                ),
+            );
+        }
+
+        // 4. Restart, then wait for the driver to answer from a new host process.
+        println!("Restarting…");
+        match dh::restart_driver_devices() {
+            Ok(n) => tprintln!(
+                "[driver-restart] restarted {n} device(s): {}",
+                ids.join(", ")
+            ),
+            Err(dh::RestartError::NeedsReboot(why)) => {
+                finish_with(rep, dh::EXIT_NEEDS_REBOOT, outcome("needsReboot", why))
+            }
+            Err(dh::RestartError::Api(why)) => {
+                finish_with(rep, dh::EXIT_FAILED, outcome("failed", why))
+            }
+        }
+        let Some(new_pid) = dh::wait_until_ready(before.pid, dh::READY_TIMEOUT) else {
+            finish_with(
+                rep,
+                dh::EXIT_TIMEOUT,
+                outcome(
+                    "timeout",
+                    format!(
+                        "the driver did not come back answering from a new host process within \
+                         {} s",
+                        dh::READY_TIMEOUT.as_secs()
+                    ),
+                ),
+            );
+        };
+        let after = dh::read_health();
+        println!("After:  {}", after.detail);
+        finish_with(
+            rep,
+            dh::EXIT_RESTARTED,
+            DriverRestartOutcome {
+                ok: true,
+                reason: "restarted".to_string(),
+                detail: format!(
+                    "Display driver restarted: host pid {} → {new_pid}, commit {} MB → {} MB, \
+                     threads {} → {}.",
+                    before
+                        .pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    before.commit_mb,
+                    after.commit_mb,
+                    before.threads,
+                    after.threads
+                ),
+                commit_mb_before: Some(before.commit_mb),
+                commit_mb_after: Some(after.commit_mb),
+            },
+        );
+    }
+
+    #[cfg(not(windows))]
+    fn run_drivers_restart(_app: &tauri::AppHandle, _m: &Matches) -> ! {
+        eprintln!(
+            "error: `drivers restart` is Windows-only; there is no display driver to restart here"
+        );
+        exit(2);
     }
 
     // doctor

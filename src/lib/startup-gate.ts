@@ -11,7 +11,12 @@
 // host that cannot do the bare minimum is stopped, and only after the app has tried to fix
 // whatever it can fix itself.
 
-import type { CompatibilityReport, UnsupportedApi } from "./bindings";
+import type {
+  CompatibilityReport,
+  DisplayDriverHealth,
+  DriverRestartOutcome,
+  UnsupportedApi,
+} from "./bindings";
 
 // The severities the host classifies each missing capability with. `blocking` is the only one
 // that means "this machine cannot stream at all"; `installable` is a row the app can fix itself.
@@ -81,6 +86,41 @@ export function driverRemediation(rows: UnsupportedApi[]): "reinstall" | "instal
   if (rows.some(a => a.key === DRIVER_UNRESPONSIVE_KEY)) return "reinstall";
   if (rows.some(a => a.key === DRIVER_KEY)) return "install";
   return null;
+}
+
+/// The driver-memory gate, asked after the compatibility gate (so a missing driver has already
+/// been installed) and before `setup()` (so no display of ours exists yet to be taken away).
+///
+/// The bundled display driver leaks memory into its host process with every display it creates
+/// and only a device restart gives it back; past a threshold the host offers that restart with
+/// exactly two ways out — restart, or exit. There is deliberately no "continue anyway": the
+/// failure it heads off is every join timing out, which is worse than not starting. A health
+/// read that failed, or a platform with no such driver, is not a reason to stop anyone.
+export type DriverHealthGate =
+  | { kind: "ok" }
+  | { kind: "restart"; commitMb: number; threads: number };
+
+export function classifyDriverHealth(health: DisplayDriverHealth | null): DriverHealthGate {
+  if (!health || !health.supported || !health.needs_restart) return { kind: "ok" };
+  return { kind: "restart", commitMb: health.commit_mb, threads: health.threads };
+}
+
+/// The i18n key for why a restart did not happen, keyed on `DriverRestartOutcome.reason`.
+/// Anything unrecognised reads as the generic failure rather than as nothing.
+export const RESTART_FAILURE_REASONS = [
+  "declined",
+  "timeout",
+  "refused",
+  "notElevated",
+  "needsReboot",
+  "notInstalled",
+  "failed",
+] as const;
+
+export function restartFailureKey(outcome: DriverRestartOutcome | null): string {
+  const reason = outcome?.reason ?? "failed";
+  const known = (RESTART_FAILURE_REASONS as readonly string[]).includes(reason);
+  return `bootstrap.driverRestart.failure.${known ? reason : "failed"}`;
 }
 
 /// What this machine has already tried to do about the display driver since it last booted.

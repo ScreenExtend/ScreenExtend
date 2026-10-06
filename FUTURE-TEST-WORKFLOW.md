@@ -830,6 +830,34 @@ Ledger paths are relative to the repository root.
   - With a fixed driver, re-run every M-item.
   - Without one, keep reducing creates. Candidate, not done: adopt a display still in its disconnect grace for a fresh join from the same device token.
 
+#### D-6 The driver-restart gate: the elevated restart and the startup modal, live (UX-DRVRESTART)
+
+- **What.** `ScreenExtend drivers restart` restarts the virtual display driver's devnode in place
+  (`DIF_PROPERTYCHANGE` / `DICS_PROPCHANGE`, `windows_utils/driver_health.rs`) to free what D-1
+  leaks; the desktop app checks the driver host's commit/threads before `setup()` and, at ≥ 8 GB or
+  ≥ 800 threads, shows "Display Driver Restart Required" with **Restart Driver** (UAC →
+  elevated `drivers restart --report <file>` → continue setup) and **Exit App**.
+- **Why untested.** It needs a UAC click and removes every virtual display; agents may not elevate,
+  and the owner's app was running. Verified unelevated only: the health read (`doctor --json`),
+  the not-elevated refusal (exit 4) and the host-connected refusal (exit 5).
+- **How to test (owner, at the keyboard):**
+  1. Note the host: `ScreenExtend doctor --json` → `drivers.displayDriverHealth` (`pid`,
+     `commit_mb`, `threads`, `identified_by` should be `pipeServer`).
+  2. Quit every ScreenExtend. Start the app. The modal must appear before the dashboard (the
+     host is over threshold). Press **Restart Driver**, approve UAC.
+  3. Pass: the spinner reads "Restarting the display driver…", the modal closes by itself within
+     ~10 s, the dashboard appears, the log (Settings → logs) has `[driver-restart] restarted: N MB →
+     M MB`, and `doctor --json` now shows a **different** `pid` at ~10 MB / ~19 threads.
+  4. Then join one device and check it streams (the driver came back usable).
+  5. Negative paths: start again with `SE_DRIVER_RESTART_THRESHOLD_MB=1` set (forces the modal on a
+     fresh driver) and press **Restart Driver** then **No** at UAC → the modal stays, says the
+     restart was not approved, and offers the same two buttons; **Exit App** quits.
+  6. CLI: from an elevated terminal with no host running, `ScreenExtend drivers restart` →
+     exit 0 and a before/after line; with `ScreenExtend serve` running → exit 5, nothing restarted.
+- **If the restart reports `needsReboot` (exit 7):** something held the adapter open; record what
+  (Device Manager's events tab on `ROOT\DISPLAY\0000`) and try `CM_Query_And_Remove_SubTree` +
+  `CM_Setup_DevNode` as the alternative restart.
+
 #### D-2 The owner's 360 Hz panel drops to 60 Hz while exactly one device is connected
 
 - **What.** Read-only `QueryDisplayConfig` sampling (`G04.md` §4) shows the internal panel (target 8388688) at 360.006 Hz with no virtual display, **60.003 Hz with exactly one**, and 360 Hz again with two or more. With one VD, DWM runs at 60 Hz; with two, DWM runs at 360 Hz and composes each 60 Hz VD about 3× too often, flooding capture (D-3). Raised in `G04.md`.
