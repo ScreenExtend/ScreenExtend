@@ -1298,39 +1298,6 @@
             // per change rather than once per poll. Cleared whenever the graph goes, because the
             // next one starts on the device's default and has to be told again.
             let appliedSinkId = null;
-            // The browser's own output chooser (`selectAudioOutput()`, Firefox). It needs the
-            // transient activation of a click, and the only click it is ever opened from is Join,
-            // when the host operator has asked this device to choose a speaker — never over a
-            // live stage.
-            // A browser chooser can be left open indefinitely — a backgrounded tab, an engine
-            // that resolves neither way — and everything downstream of it waits on it settling.
-            // Every other promise on the join path is bounded; this one is too.
-            const PICKER_DEADLINE_MS = 15000;
-            function pickOutputBounded(preferredId, onSettled) {
-                let settled = false;
-                let timer = 0;
-                const finish = (chosen) => {
-                    if (settled) return null;
-                    settled = true;
-                    if (timer) { clearTimeout(timer); timer = 0; }
-                    try { if (onSettled) onSettled(); } catch (_) { noteSuppressed(); }
-                    return chosen || null;
-                };
-                // Synchronous, inside the gesture: the activation this depends on is spent by
-                // the first await, not by anything above it.
-                let p = null;
-                try { p = SEAudio.pickOutput(preferredId); } catch (_) { noteSuppressed(); }
-                return new Promise((resolve) => {
-                    timer = setTimeout(function () {
-                        timer = 0;
-                        noteSuppressed();
-                        resolve(finish(null));
-                    }, PICKER_DEADLINE_MS);
-                    Promise.resolve(p).then(
-                        (chosen) => resolve(finish(chosen)),
-                        () => { noteSuppressed(); resolve(finish(null)); });
-                });
-            }
             let leaveSent = false;
             // `pagehide` is the page going away, so whatever join this tab holds is released —
             // whether or not the picture is up yet and whether or not a reconfigure is in flight.
@@ -3184,18 +3151,13 @@
                 let audioReady = null;
                 try { if (window.SEAudio) audioReady = SEAudio.beginFromGesture(); } catch (_) { noteSuppressed(); }
 
-                // The browser's own output chooser, on an engine that has one, when the host
-                // operator asked this device to choose a speaker. Synchronous: it needs this
-                // click's transient activation, which the first `await` would spend.
+                // Output discovery, API 1: the browser's own output chooser
+                // (`selectAudioOutput()`), on every engine that has one. Synchronous: it needs
+                // this click's transient activation, which the first `await` would spend. It is
+                // bounded inside SEAudio and resolves `unsupported` where absent.
                 let pickerDone = null;
                 try {
-                    if (window.SEAudio && SEAudio.pickerWantedAtJoin && SEAudio.pickerWantedAtJoin()) {
-                        pickerDone = new Promise((resolve) => {
-                            withModal((close) => {
-                                pickOutputBounded('', close).then(resolve, () => { noteSuppressed(); resolve(null); });
-                            }, true);
-                        });
-                    }
+                    if (window.SEAudio && SEAudio.startPicker) pickerDone = SEAudio.startPicker();
                 } catch (_) { noteSuppressed(); }
 
                 connectBtn.disabled = true;
@@ -3203,11 +3165,12 @@
                 // Everything that can ask the user anything is settled here, before the offer:
                 // the host builds no display and no session for someone still reading a card, no
                 // answer deadline or retry can fire behind it, and nothing is raised later over a
-                // live stage. Output detection asks for nothing where the platform allows it;
-                // the microphone card only when that found nothing routable and a grant can
-                // change it. The wait is bounded by the user alone — the card always has Skip,
-                // the chooser has its own deadline — and no timer on the join path is running
-                // yet: the audio-prepare and refresh-rate deadlines below start after it.
+                // live stage. Every discovery API runs in order with its own bounded timeout
+                // (SEAudio.prepareOutputsForJoin); the microphone card only when none of them
+                // found a routable output. The report the host gets at the answer is final when
+                // this returns, so the offer below never goes out with the question open. The
+                // card always has Skip, and no timer on the join path is running yet: the
+                // audio-prepare and refresh-rate deadlines below start after it.
                 try {
                     if (window.SEAudio && SEAudio.prepareOutputsForJoin) {
                         const plan = await SEAudio.prepareOutputsForJoin(micCard, pickerDone);
