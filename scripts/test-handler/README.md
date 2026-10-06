@@ -113,6 +113,7 @@ stamp in the frame; `checksum`: a frame caught between two stamps or blurred by 
 `implausible`: decoded but older than 5 s or in the future, dropped), and `stage.via` (how the
 display was found).
 
+- **One reference clock (2026-10-06, `lib/clock.mjs`).** Every time is compared on the precise system clock (`GetSystemTimePreciseAsFileTime`): node's QPC is anchored to it once, the stage and click scripts draw and time with it, and every Chrome context (each page document, each worker) gets its own min-RTT offset; samples are moved onto the reference clock in `Client.drainStamps`. At Windows' default 15.6 ms timer resolution the coarse clocks this replaced (.NET `UtcNow`, node's and Chrome's `timeOrigin`) disagreed by up to ~16 ms per process and biased the metric per run (`docs/overhaul-new/POST-REBOOT.md` §0).
 - **Clock offset** (`clock.browserMinusSystemMs`): browser `performance.timeOrigin + now()` minus
   the system clock, from the minimum-RTT of 25 `Runtime.evaluate` round trips; subtracted from
   every latency. 0.3–0.5 ms on this machine.
@@ -187,6 +188,8 @@ the page's error text.
 | `cpu_burn` | null | `{threads, seconds}`: busy workers at normal priority during `slow_answer`'s joins (inside the lock), to reproduce the lost answer under load |
 | `url_params` | `''` | extra query parameters appended to every join URL (`a=1&b=2`), for a page's own debug or experiment switches; checked by the same input refusal as `custom.js` |
 | `join_probe` | null | an expression evaluated in the page after every join; its JSON result goes into that join's record as `probe` (e.g. a timeline the page keeps of its own join) |
+| `join_failures` | false | `true`, a list of cases, or `{cases, stop_after_ms, watch_ms}`: `wrong_otp`, `unknown_session`, `host_stopped` (the host is stopped once the offer is on the wire, then restarted), or any other name (a normal join, e.g. against a host built to fail it). After each failure, reads the page's own state (form, Connect, wake lock sentinel, NoSleep, `beforeunload` handler, input gate, open peer connections) and every request the page sends for `watch_ms`. Dispatches nothing |
+| `arms` | null | `{arms: {name: {SWITCH: value}}, order: [names], scenario, qualities: [q1, q2], settle_s, set_args}`: A/B arms inside one join. Before each window the arm's switches are written to the file the host reads as `SE_X_SWITCH_FILE` (inert for a build that does not read it) and the device renegotiates in place with `devices set --video-quality` alternating between `qualities` (use a balanced order, e.g. forward then reversed). `set_args` ride on every edit (`["--refresh-rate","120"]` for the hi-res client: `devices set` on a device with no saved row writes refreshRate 60) |
 | `custom` | null | `{ js: "<expression evaluated in the client page after the common join>", host_commands: [["status","--json"], ...], timeout: 20 }`; results in `special.custom` |
 
 Adding a request: write an `async function` in `handler.mjs` that returns a plain object, call it
