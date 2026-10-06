@@ -335,6 +335,7 @@ The fixes among them that changed what earlier numbers meant are listed in `BASE
 - **Evidence.** `mic_prompt` before/after.
 - **Superseded 2026-10-05 (`audio-outputs-at-join`, `ef9dfe6`), at the owner's request** ("auto-detect … only if that doesnt work should you prompt", "do all perms stuff … BEFORE stream starts"). The join now detects the outputs before the offer and reports any routable list without asking; the card is raised, before the offer, only when nothing routable came back and a grant can help, and at most once per device. **Measured: desktop Chrome/Edge 154 with no grant list exactly one output with an empty id and label, whatever is attached, so the card does appear at the first join of a profile that never granted the microphone** — contrary to the expectation that auto-detect works on most desktops. A granted microphone (or a remembered answer) means no card. Nothing is raised over a live stage any more: `se:choose` waits for the device's next join. Detail: `G06.md` addendum 2026-10-05; `OPTIMIZATIONS.md` AOJ-OUTPUTS.
 - **Remains.** The card and the browser's prompt in a real headed Chrome/Edge with a human answering; Firefox's chooser at the Join click; Safari/iOS.
+- **Superseded again 2026-10-05 (`audio-discovery`, `6c0e363`/`6cce67c`), by the owner's discovery spec** (`findings/overhaul-new/OWNER-SPEC-audio-discovery.md`): every discovery API runs at Connect in order, each bounded with a definite result; the card only when none yields a routable output (now at every such join, not once per device); `getUserMedia` once, one more enumeration; otherwise the host gets the default output alone, `labelled: false`. The `discovery` map rides `/audio-outputs` and shows in `status --json`. `se:choose` is gone. `G06.md` addendum (2).
 
 **6. Logs do not come through.**
 
@@ -375,6 +376,7 @@ The fixes among them that changed what earlier numbers meant are listed in `BASE
 | stale output restarted playback every second | `61da27a` | `stale_output` tier |
 | refused output re-offered over the stage | `83facec` | harness |
 | microphone card on the join | `c020fc0`, then `ef9dfe6` (before the offer, only where detection fails, once per device) | `mic_prompt` (three cases + rejoin) |
+| device sheet said "can't switch speakers" for devices that can (offline, not yet posted, relayed, plain HTTP) | `db377a1`, `6cce67c` (unreported is not `false`; page `supported` = any sink API); then the owner's discovery spec `6c0e363` | unit test; `test-client-audio.mjs`; `mic_prompt` + `custom`: host held `supported: true` in 4 of 4 cases |
 | WGC capture stamp in the future; keepalive encode stamped after the encode | `3120abf`, `e96fe2c` | diagnostic switch; reading |
 | log bus emit race; `LOGS` arming the panel; U+FFFD; closed-pipe panic; control server late; avatar errors lost | `304cf95`, `8e4db79`, `3032603`, `8423abf`, `52c3eb3`, `18311e0` | tests and reproductions in `G09.md` |
 | `driver_ipc` errors lost; `Drop` misreported a panic | `1eca751` | reading |

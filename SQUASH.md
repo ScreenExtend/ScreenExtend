@@ -131,3 +131,13 @@ One entry per bug, newest last. Keep each under ten lines.
 - Fix:        every delta starts from GetCursorPos / CGEventGetLocation; the cache is gone. Curve rule kept (still no double acceleration). macOS half unverified here
 - Verified:   clippy, 46 input tests; user to confirm on the client
 - Agent:      Claude Fable 5.1, 2026-09-14
+
+### Device sheet said "This device's browser can't switch speakers"; output discovery rebuilt to the owner's spec      status: fixed (headless Chrome verified; other browsers open)
+- Where:      src-tauri/src/streamer/session.rs (AudioOutputsReport default, supported_rank), server.rs (/audio-outputs), cloud.rs (relay dispatch), single_instance.rs (status --json), static/audio.js (discovery), static/index.html (Connect handler)
+- Baseline:   bef5f89 had no per-device output list at all; the sheet's "unsupported" text came with the overhaul's list
+- Broke in:   the overhaul's output reporting: `AudioOutputsReport` derived Default (supported=false), so offline / not-yet-posted / relayed joins (the relay does not tunnel /audio-outputs) read "can't switch"; a body without the field parsed as false; on plain HTTP (the LAN QR scheme) the page required enumerateDevices, which Chrome hides there
+- Cause:      "not reported" and "cannot" shared one value
+- Fix:        db377a1 + 6cce67c (unreported is supported:true with no outputs; page supported = any sink API, iPhone category or insecure context; false only on a secure page with no sink API at all), then the owner's spec (findings/overhaul-new/OWNER-SPEC-audio-discovery.md) in 6c0e363: every discovery API in order, bounded, with a definite result; card only when nothing routable; getUserMedia once + one more enumeration; else default output alone, labelled:false; `discovery` map on /audio-outputs, in status --json and docs/TELEMETRY.md. Branch audio-discovery off latency-overhaul-new (not latency-overhaul, per the orchestrator); handler change cf17b7b
+- Verified:   pnpm test:client (10/10), check-legacy-webkit, cargo fmt/clippy -D warnings/test (490 pass); handler mic_prompt + custom on Chrome 154 headless: host held supported:true in 4/4 cases (mic granted, speaker-only, nothing granted → card → default only, plain HTTP → default only). Mac sync (SSH-GIT.md) skipped: the Mac is shut down
+- Open:       Firefox (chooser on every Connect), Safari 18.4+ macOS/iPadOS/iOS, Safari < 18.4 (the one supported:false case), iOS 16.4+ audio session and earpiece hold, Android Chrome, Samsung Internet, real headed Chrome/Edge prompt, the relay forwarding /audio-outputs. Questions in docs/overhaul-new/G06.md addendum (2)
+- Agent:      Claude Opus 5.5, 2026-10-05
