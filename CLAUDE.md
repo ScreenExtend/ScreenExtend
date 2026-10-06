@@ -211,7 +211,7 @@ stun show | set <urls> | clear
 turn show | set <urls> [--username U] [--credential C] | clear
 account name [value] | whoami | avatar set <path>|remove|show
 autostart enable | disable | status
-drivers install | remove
+drivers install | remove | restart [--report PATH]
 doctor [--json]
 logs [--lines N]
 update check | install
@@ -252,6 +252,22 @@ Notes:
 - On Windows the binary is GUI-subsystem in release (`windows_subsystem = "windows"` in
   `main.rs`), so `attach_console()` (`AttachConsole(ATTACH_PARENT_PROCESS)`) is what makes CLI
   output visible in the parent shell.
+- **The driver-memory gate.** The bundled display driver leaks ~47–124 MB of commit and ~5
+  threads per display creation or mode change into its own `WUDFHost.exe`, and only a device
+  restart frees it (at ~36 GB every join fails). `windows_utils/driver_health.rs` reads that host
+  **unelevated** — identified as the server of the driver's own named pipe
+  (`GetNamedPipeServerProcessId`), counters from `NtQuerySystemInformation`, since `OpenProcess`
+  on it is refused — and `display_driver_health` reports `needs_restart` at ≥ 8 GB or ≥ 800
+  threads (`SE_DRIVER_RESTART_THRESHOLD_MB` / `_THREADS` override). The bootstrap asks it after
+  the compatibility gate and before `setup()`, and over threshold shows "Display Driver Restart
+  Required" with exactly two actions, Restart Driver and Exit App (`classifyDriverHealth` in
+  `startup-gate.ts`). `restart_display_driver` runs `drivers restart --report <tmp>` through
+  `ShellExecuteExW("runas")` and **waits** for it — `elevated-command` cannot, it neither waits
+  nor returns an exit code — and the subcommand restarts the devnode in-process
+  (`DIF_PROPERTYCHANGE`/`DICS_PROPCHANGE`, found by hardware id `Root\VirtualDisplayDriver`; no
+  `pnputil`, and `nefconc` has no restart verb), refuses while a set-up host or another host's
+  displays are in the way (exit 5) or unelevated (exit 4), and exits 0 only once the pipe
+  answers from a new host pid. `doctor` prints it as `drivers.displayDriverHealth`.
 - `installdrivers`, `removedrivers` and `hostednetwork <ssid> <password>` are **legacy**
   subcommands still handled inline in `lib.rs::run`'s `setup` (they shell out to
   `certutil`/`nefconc`/`netsh` and exit). `route` deliberately returns `LaunchGui` for them so
@@ -301,7 +317,7 @@ Registered commands (the per-OS ones exist in all three `*_utils` modules):
 `get_network_adapters`, `watch_for_network_changes`, `start_hosted_network`,
 `stop_hosted_network`, `is_hosted_network`, `get_hosted_network_status`, `is_wifi_on`,
 `turn_on_wifi`, `install_drivers`,
-`remove_drivers`, `quit_driver_holder`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
+`remove_drivers`, `display_driver_health`, `restart_display_driver`, `quit_driver_holder`, `install_audio_driver`, `uninstall_audio_driver`, `audio_driver_status`,
 `set_legacy_volume_key_proxy`, `set_device_override`, `set_device_pointer_scope`,
 `set_device_auto_frame_rate`, `set_device_adaptive_modes`, `refresh_device_stream`, `disconnect_session`,
 `set_device_audio_output`, `get_device_audio_outputs`, `remove_device_override`,

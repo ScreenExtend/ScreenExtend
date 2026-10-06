@@ -27,10 +27,19 @@ import {
   type Config,
 } from "@/components/config-provider";
 import { useGlobalSetters, useLoaded } from "@/components/global-provider";
-import { commands, type CompatibilityReport, type PermissionStatus, type UnsupportedApi } from "@/lib/bindings";
+import {
+  commands,
+  type CompatibilityReport,
+  type DisplayDriverHealth,
+  type DriverRestartOutcome,
+  type PermissionStatus,
+  type UnsupportedApi,
+} from "@/lib/bindings";
 import { generateOtp, readQrValues } from "@/lib/utils";
 import {
   classifyCompat,
+  classifyDriverHealth,
+  restartFailureKey,
   classifySetupFailure,
   driverRemediation,
   mayAttempt,
@@ -169,6 +178,17 @@ export default function Bootstrap() {
   const [downloaded, setDownloaded] = useState(0);
   const [total, setTotal] = useState(0);
   const running = useRef(false);
+  // The driver-memory gate (`classifyDriverHealth`). Null while it has nothing to say; otherwise
+  // the modal is open, in one of its three phases. `outcome` is the last failed attempt's answer.
+  const [driverRestart, setDriverRestart] = useState<{
+    phase: "prompt" | "restarting" | "failed";
+    commitMb: number;
+    outcome: DriverRestartOutcome | null;
+  } | null>(null);
+  // Set once the gate has passed (or a restart has been verified), so a retry of `setup()` does
+  // not ask again. And what `runSetup` was called with when the gate stopped it, to resume with.
+  const driverHealthCleared = useRef(false);
+  const pendingTryInstall = useRef(true);
   // Set by anything in the saved-settings phase that did not work. It does not open a dialog on
   // its own -- a setting the host would not take is not a reason to refuse to start -- but it is
   // what lets the dialog name the right cause if startup then fails for another reason.
@@ -286,7 +306,59 @@ export default function Bootstrap() {
   const failStartup = () =>
     setFailure(classifySetupFailure({ setupFailed: false, settingsFailed: settingsFailed.current }));
 
+  // Read the driver host's memory. A read that fails says nothing about the machine, so it lets
+  // startup through -- `setup()` is still the real test.
+  const readDriverHealth = async (): Promise<DisplayDriverHealth | null> => {
+    try {
+      return await commands.displayDriverHealth();
+    } catch (e) {
+      console.error("[bootstrap] the display driver health read failed; starting without it", e);
+      return null;
+    }
+  };
+
+  // The one place the driver-memory gate sits: after the compatibility gate has installed a
+  // missing driver, before `setup()` creates anything a restart would take away.
+  const driverHealthBlocks = async (tryInstall: boolean): Promise<boolean> => {
+    if (loaded || driverHealthCleared.current) return false;
+    const gate = classifyDriverHealth(await readDriverHealth());
+    if (gate.kind === "restart") {
+      pendingTryInstall.current = tryInstall;
+      setDriverRestart({ phase: "prompt", commitMb: gate.commitMb, outcome: null });
+      return true;
+    }
+    driverHealthCleared.current = true;
+    return false;
+  };
+
+  // "Restart Driver": one UAC prompt, the elevated `drivers restart`, and on a verified restart
+  // straight on with the setup the gate interrupted. A failure keeps the modal and its two
+  // actions, with the reason.
+  const restartDriver = async () => {
+    setDriverRestart(prev => prev && { ...prev, phase: "restarting", outcome: null });
+    let outcome: DriverRestartOutcome | null = null;
+    try {
+      outcome = await commands.restartDisplayDriver();
+    } catch (e) {
+      console.error("[bootstrap] restarting the display driver failed", e);
+    }
+    if (outcome?.ok) {
+      console.log(`[bootstrap] ${outcome.detail}`);
+      driverHealthCleared.current = true;
+      setDriverRestart(null);
+      try {
+        await runSetup(pendingTryInstall.current);
+      } catch {
+        failStartup();
+      }
+      return;
+    }
+    console.error(`[bootstrap] the display driver was not restarted: ${outcome?.reason ?? "no answer"} ${outcome?.detail ?? ""}`);
+    setDriverRestart(prev => prev && { ...prev, phase: "failed", outcome });
+  };
+
   const runSetup = async (tryInstall: boolean) => {
+    if (await driverHealthBlocks(tryInstall)) return;
     // Whether `setup()` got as far as answering. Everything after it is the app's own work, and
     // a failure there is not a verdict on the machine's drivers.
     let setupAnswered = false;
@@ -781,8 +853,71 @@ export default function Bootstrap() {
       </AlertDialog>
       <Loader2 className="animate-spin mb-4" size={48} />
       <p className="text-xl font-semibold">
-        {remediating ? t("bootstrap.installingDriver") : t("bootstrap.starting")}
+        {remediating
+          ? t("bootstrap.installingDriver")
+          : driverRestart?.phase === "restarting"
+            ? t("bootstrap.driverRestart.restarting")
+            : t("bootstrap.starting")}
       </p>
+      {/* The driver has leaked past its threshold. Same dialog as the busy-driver one, and only
+          the two actions the owner asked for: no "continue anyway", because what it heads off
+          is every join timing out. */}
+      <AlertDialog open={driverRestart !== null}>
+        <AlertDialogContent className="max-w-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("bootstrap.driverRestart.title")}</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-3 text-left">
+                <div>{t("bootstrap.driverRestart.body")}</div>
+                {driverRestart && driverRestart.commitMb > 0 && (
+                  <div>
+                    {withBold(
+                      t("bootstrap.driverRestart.usage"),
+                      formatBytes(driverRestart.commitMb * 1024 * 1024)
+                    )}
+                  </div>
+                )}
+                {driverRestart?.phase === "failed" && (
+                  <div className="flex items-start space-x-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                    <Info className="mt-0.5 shrink-0 text-amber-600" size={16} />
+                    <div>
+                      {t(restartFailureKey(driverRestart.outcome))}
+                      {driverRestart.outcome?.detail && (
+                        <div className="mt-1 text-muted-foreground">{driverRestart.outcome.detail}</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction
+              className="bg-secondary hover:bg-secondary/80 text-secondary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={driverRestart?.phase === "restarting"}
+              onClick={() => {
+                commands.exitApp().catch(() => {
+                  toast({
+                    variant: "destructive",
+                    title: t("toasts.exitApp.failureTitle"),
+                    description: t("toasts.exitApp.failureDescription"),
+                  });
+                });
+              }}
+            >
+              {t("bootstrap.driverRestart.exit")}
+            </AlertDialogAction>
+            <AlertDialogAction
+              className="bg-blue-600 hover:bg-blue-700 text-white disabled:cursor-not-allowed disabled:select-none disabled:opacity-50"
+              disabled={driverRestart?.phase === "restarting"}
+              onClick={() => { void restartDriver(); }}
+            >
+              {driverRestart?.phase === "restarting" && <Loader2 className="animate-spin mr-2" size={16} />}
+              {t("bootstrap.driverRestart.restart")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <AlertDialog open={failure !== null}>
         <AlertDialogContent>
           <AlertDialogHeader>
