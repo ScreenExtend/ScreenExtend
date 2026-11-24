@@ -29,6 +29,9 @@ pub enum Workload {
     Scroll,
     Motion,
     Drag,
+    /// Every pixel random, new every frame: incompressible, the worst case for a per-frame-QP
+    /// encoder with no rate control (the QP governor's test content).
+    Noise,
 }
 
 impl Workload {
@@ -39,6 +42,7 @@ impl Workload {
             "scroll" => Some(Workload::Scroll),
             "motion" => Some(Workload::Motion),
             "drag" => Some(Workload::Drag),
+            "noise" => Some(Workload::Noise),
             _ => None,
         }
     }
@@ -50,6 +54,7 @@ impl Workload {
             Workload::Scroll => "scroll",
             Workload::Motion => "motion",
             Workload::Drag => "drag",
+            Workload::Noise => "noise",
         }
     }
 }
@@ -156,6 +161,22 @@ pub fn fill(buf: &mut [u8], width: u32, height: u32, frame: u32, workload: Workl
                         put(buf, o, shade, shade, shade + 8);
                     }
                 }
+            }
+        }
+
+        Workload::Noise => {
+            // xorshift64*, seeded per frame: deterministic, different every frame.
+            let mut x: u64 =
+                0x9E37_79B9_7F4A_7C15 ^ ((f as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D));
+            for px in buf[..w * h * 4].as_chunks_mut::<4>().0.iter_mut() {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                px[0] = v as u8;
+                px[1] = (v >> 8) as u8;
+                px[2] = (v >> 16) as u8;
+                px[3] = 255;
             }
         }
 
@@ -361,11 +382,12 @@ mod tests {
             Workload::Scroll,
             Workload::Motion,
             Workload::Drag,
+            Workload::Noise,
         ] {
             let mut buf = frame(w, h);
             fill(&mut buf, w, h, 7, wl);
             assert!(
-                buf.chunks_exact(4).all(|px| px[3] == 255),
+                buf.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
                 "{} left transparent pixels",
                 wl.name()
             );

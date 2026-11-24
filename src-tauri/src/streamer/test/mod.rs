@@ -7,3 +7,7 @@ pub mod whep_selftest;
 
 #[cfg(test)]
 mod bitrate;
+
+// Counts UDP descriptors through `/dev/fd` and `getsockname`, which Windows has neither of.
+#[cfg(all(test, target_os = "macos"))]
+mod session_leak;

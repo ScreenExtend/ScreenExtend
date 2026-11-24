@@ -91,27 +91,87 @@ was, was to run `strings` on it. That is recorded here so the next person does n
 
 - **Upstream:** [xiph/opus](https://github.com/xiph/opus). BSD-3-Clause. Same codec as the
   Windows `libopus.dll`; feeds the shared encoder wrapper (`streamer/audio/opus_sys.rs`).
-- **Used for:** low-delay Opus encode of captured macOS system audio (Process Tap / SCK) before
-  WebRTC transport. Loaded at runtime via `libloading`, same pattern as the Windows DLL.
-- **Version:** built from source at the **same** commit as the Windows DLL,
-  `03647f524a40b05a1898522e92033810b58103c7`. Unlike the Windows DLL, this one *does* carry a
-  version string: `opus_get_version_string()` returns `libopus 1.5.x-screenextend-src`, because
-  the hand-rolled `clang` build defines `PACKAGE_VERSION` itself rather than relying on the
-  generated `package_version` a shallow checkout does not produce. The commit hash above stays
-  the authoritative pin — the two platforms report different strings for the same source, which
-  is exactly why the host logs whatever the library says rather than assuming.
-- **Build:** `clang -O2 -fPIC -shared -DOPUS_BUILD -DVAR_ARRAYS -DHAVE_LRINTF -DFLOAT_APPROX`
-  over the `celt_sources.mk` + float `silk_sources.mk` + `opus_sources.mk` C sources (x86/arm/mips
-  intrinsics and the fixed-point SILK path excluded — generic-C float build). `otool -L` shows it
-  links only `/usr/lib/libSystem.B.dylib`.
-- **⚠️ Architecture:** this artifact is **x86_64 only** — it was built on the macOS 10.15 (Intel)
-  dev box, whose SDK cannot target arm64 macOS. The **shipped** binary should be a **universal**
-  (x86_64 + arm64) `libopus.dylib` built on a newer Mac / CI runner from the same opus commit; the
-  runtime loader finds `libopus.dylib` regardless of slice, so swapping in a fat binary needs no
-  code change. Re-pin the SHA-256 below when that universal artifact is produced.
+- **Used for:** low-delay Opus encode (`OPUS_APPLICATION_RESTRICTED_LOWDELAY`, 5 ms frames) of
+  captured macOS system audio (Process Tap / SCK / the legacy virtual device) before WebRTC
+  transport. `dlopen`ed by path through `libloading`: `opus_sys.rs::open_library` tries
+  `<exe dir>/resources/`, then `Contents/Resources/resources/` and `Contents/Resources/` inside
+  the bundle, then the exe dir, then the bare name. Nothing links against it, so the install
+  name is cosmetic; it is set to `@rpath/libopus.dylib` as before.
+- **Version:** the official **libopus 1.6.1** release tarball. `opus_get_version_string()`
+  returns `libopus 1.6.1`.
+  - **Source:** `https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz` (linked from
+    `https://opus-codec.org/downloads/`).
+  - **Tarball SHA-256:** `6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1`,
+    identical to the value published in `https://downloads.xiph.org/releases/opus/SHA256SUMS.txt`
+    and on `https://opus-codec.org/downloads/`, and to the one computed locally.
+  - **Why not the previous pin.** The artifact this replaces was a hand-rolled `clang` build of
+    git commit `03647f524a40b05a1898522e92033810b58103c7` (master, 2026-08-14, after 1.6.1),
+    labelled `1.5.x-screenextend-src`. It was x86_64-only and unsigned, so the arm64 slice of
+    the universal app could not map it and system audio could not be encoded on Apple silicon
+    at all. A git snapshot has no published checksum; the nearest *release* to that commit is
+    1.6.1, so the version moved to the release rather than back to 1.5.2. Every error code and
+    CTL number in `opus_sys.rs` (40 constants) was compared against 1.6.1's
+    `include/opus_defines.h` and all match; those numbers have not changed since 1.0. The
+    Windows DLL still carries the git-commit pin above and was not rebuilt.
+- **Configuration:** float API (not fixed point), shared only, no docs, no extra programs,
+  `--enable-float-approx` (kept from the previous build, which defined `FLOAT_APPROX`). Custom
+  modes, DRED, deep PLC, OSCE and QEXT are off (upstream defaults); the encoder-only path needs
+  none of them. Unlike the previous generic-C build, this one has upstream's SIMD: x86_64 gets
+  SSE/SSE2/SSE4.1 plus AVX2 behind run-time CPU detection; arm64 gets NEON (and DOTPROD, used
+  only by the DNN code, which is compiled out here; every Apple-silicon CPU has it anyway).
+- **Build** (each architecture configured and compiled **separately**, because Opus selects
+  per-arch intrinsics at configure time, then joined with `lipo`). Toolchain: Apple clang 21.0.0
+  (clang-2100.1.1.101), Command Line Tools SDK 26.5, GNU Make 3.81, on macOS 26.7.1 arm64:
+
+  ```sh
+  curl -sSfLO https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+  shasum -a 256 opus-1.6.1.tar.gz   # must equal the value above
+  tar xzf opus-1.6.1.tar.gz
+  SRC=$PWD/opus-1.6.1; SDK=$(xcrun --sdk macosx --show-sdk-path)
+  build() {  # arch host min
+    mkdir -p build-$1 && cd build-$1
+    "$SRC/configure" --host=$2 --prefix=$PWD/../prefix-$1 \
+      --enable-shared --disable-static --disable-doc --disable-extra-programs \
+      --enable-float-approx --disable-dependency-tracking \
+      CC="clang -arch $1 -isysroot $SDK" \
+      CFLAGS="-O2 -mmacosx-version-min=$3" \
+      LDFLAGS="-arch $1 -mmacosx-version-min=$3"
+    make -j4 && make install && cd ..
+    cp prefix-$1/lib/libopus.0.dylib libopus-$1.dylib
+    install_name_tool -id @rpath/libopus.dylib libopus-$1.dylib
+  }
+  build x86_64 x86_64-apple-darwin 10.15
+  build arm64  aarch64-apple-darwin 11.0
+  lipo -create libopus-x86_64.dylib libopus-arm64.dylib -output libopus.dylib
+  codesign --force --sign - libopus.dylib
+  ```
+
+  A rebuild with a different toolchain will not be byte-identical (the linker embeds the SDK
+  version and the ad-hoc signature hashes the result), so the check on a reproduction is: same
+  tarball checksum, same `lipo -archs`, same per-slice `minos`, same exported API, and
+  `opus_get_version_string()` == `libopus 1.6.1`.
+- **Floor check** (measured on the committed file): `lipo -archs` → `x86_64 arm64`; `otool -l`
+  `LC_BUILD_VERSION` `minos 10.15` (x86_64) and `minos 11.0` (arm64), SDK 26.5 on both;
+  `otool -L` → only `/usr/lib/libSystem.B.dylib`; `nm -u` (x86_64) → `___chkstk_darwin ___bzero
+  ___memcpy_chk ___memset_chk ___stack_chk_fail ___stack_chk_guard ___stderrp _abort _acos _cos
+  _exp _exp2 _fprintf _free _log _log10 _malloc _memcpy _memmove _memset _memset_pattern16
+  dyld_stub_binder`, all present in 10.15's libSystem (`___chkstk_darwin` is the newest, and is
+  10.15 itself; the previous 10.15-SDK build imported it too). Exports are now only the public
+  `opus_*` API (87 symbols, versus 425 in the old build, which exported every internal); all
+  nine entry points `opus_sys.rs` resolves are present in both slices.
+- **Signing:** **ad-hoc** (`codesign --force --sign -`, `flags=0x2(adhoc)`, both slices). Arm64
+  macOS refuses to map unsigned code, and the Tauri bundler does not sign files under
+  `Contents/Resources`, so the blob has to arrive signed. An ad-hoc dylib loads into the app
+  only while the app runs **without** hardened runtime (the current `tauri.macos.conf.json`):
+  library validation would reject it for having no Team ID. **When a Developer ID is
+  configured, this file must be re-signed with the team identity** (`codesign --force
+  --options runtime --timestamp --sign "Developer ID Application: …"`) before or during
+  bundling, or the hardened-runtime app will refuse to load it and the notarization service
+  will reject the submission for an unsigned/ad-hoc nested binary. Re-signing changes the
+  file's bytes, so its SHA-256 here and in `SHA256SUMS` changes with it.
 - **License:** BSD-3-Clause. Compatible with AGPL-3.0.
-- **SHA-256 (current x86_64 build):**
-  `8285c2a9faf6360c6eb0803639a0d6011fcc600827c4ae5356bfdfe7a694ff0e`
+- **SHA-256 (universal, ad-hoc signed):**
+  `7eafaa8c818e311a59194ef037fc706236a6dbcdddb1e6a7244c29a1b4969a3d`
 
 ## libx264 (`libx264-164.dll`)
 

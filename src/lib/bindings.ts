@@ -9,9 +9,18 @@ export const commands = {
 async checkSystemRequirements() : Promise<CompatibilityReport> {
     return await TAURI_INVOKE("check_system_requirements");
 },
+/**
+ * A plain `fn` command runs on the main thread. Nothing here needs to: the window-list
+ * read is CoreGraphics IPC and `AXIsProcessTrusted` is a syscall, so both belong on a
+ * blocking thread even at well under a millisecond apiece.
+ */
 async checkPermissions() : Promise<PermissionStatus[]> {
     return await TAURI_INVOKE("check_permissions");
 },
+/**
+ * `CGRequestScreenCaptureAccess` blocks until the user dismisses the OS prompt, which is
+ * seconds of a frozen window if it runs on the main thread.
+ */
 async requestPermission(key: string) : Promise<boolean> {
     return await TAURI_INVOKE("request_permission", { key });
 },
@@ -19,9 +28,14 @@ async openPermissionSettings(key: string) : Promise<void> {
     await TAURI_INVOKE("open_permission_settings", { key });
 },
 /**
- * Restart the app so it comes back as a fresh process. On macOS this is how a
- * newly granted permission is picked up; here there is no per-process permission
- * cache to escape, so the plain restart is enough.
+ * Relaunch through LaunchServices rather than by spawning the executable.
+ * 
+ * TCC attributes a request to the *responsible* process, and a binary started by
+ * another process inherits that process's attribution instead of establishing its
+ * own — the documented reason an app launched from a terminal never appears in the
+ * Screen Recording list. `open -n -a` hands the launch to LaunchServices, so the
+ * new instance is its own responsible process and the grant the user just made
+ * applies to it.
  */
 async relaunchApp() : Promise<void> {
     await TAURI_INVOKE("relaunch_app");
@@ -76,17 +90,15 @@ async startHostedNetwork(name: string, password: string) : Promise<boolean> {
 async stopHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("stop_hosted_network");
 },
-/**
- * Whether the hosted network is up. Reads the platform object we already hold — it must not
- * spawn a process, because the UI and the adapter list ask often.
- */
 async isHostedNetwork() : Promise<boolean> {
     return await TAURI_INVOKE("is_hosted_network");
 },
 /**
- * Everything the network card can show: the tri-state, the backend, the band and the
- * authentication. It re-reads liveness through `is_hosted_network` first so a hotspot the
- * OS took down on its own is not still reported as advertised.
+ * Everything the network card can show without opening the log terminal: the tri-state,
+ * the backend, the channel and band the ladder settled on, the `securityType` that was
+ * accepted, and — the one that matters for consent — whether the AP carries encryption at
+ * all. All of it was already logged on every start and reachable through
+ * `hosted_network_status()`; none of it had a way to reach the UI.
  */
 async getHostedNetworkStatus() : Promise<HostedNetworkReport> {
     return await TAURI_INVOKE("get_hosted_network_status");
@@ -104,15 +116,14 @@ async removeDrivers() : Promise<boolean> {
     return await TAURI_INVOKE("remove_drivers");
 },
 /**
- * How much the virtual display driver's host has leaked, read unelevated. The startup gate
- * asks this before `setup` and offers [`restart_display_driver`] when it is over threshold.
+ * No virtual display driver process to leak on macOS: `CGVirtualDisplay` lives in WindowServer.
+ * UNVERIFIED (not compiled): written on Windows, mirrors the Windows command's surface.
  */
 async displayDriverHealth() : Promise<DisplayDriverHealth> {
     return await TAURI_INVOKE("display_driver_health");
 },
 /**
- * Run `ScreenExtend drivers restart` elevated (one UAC prompt), wait for it, and say how it
- * went. Off the main thread: the prompt and the restart take seconds.
+ * UNVERIFIED (not compiled).
  */
 async restartDisplayDriver() : Promise<DriverRestartOutcome> {
     return await TAURI_INVOKE("restart_display_driver");
@@ -164,6 +175,10 @@ async setDevicePointerScope(device: string, scope: string) : Promise<void> {
  * A separate command for the same reason as `set_device_pointer_scope` — `set_device_override`
  * is at specta's ten-argument ceiling — and read by the pipeline when the session is built, so
  * a change applies to the next connection.
+ * 
+ * **UNVERIFIED on macOS**: written to keep the command surface identical across the three
+ * `*_utils` modules and never compiled on a Mac in this workstream. The macOS pipeline's half
+ * of the ruling is not implemented at all.
  */
 async setDeviceAutoFrameRate(device: string, enabled: boolean) : Promise<void> {
     await TAURI_INVOKE("set_device_auto_frame_rate", { device, enabled });

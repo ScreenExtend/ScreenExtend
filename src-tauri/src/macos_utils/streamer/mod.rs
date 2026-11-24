@@ -8,11 +8,15 @@ pub mod encoder;
 pub mod frame;
 pub mod gpu;
 pub mod mach;
+pub mod perf_hold;
 pub mod pipeline;
 pub mod power;
 pub mod qos;
+pub mod raw_capture;
 pub mod sck;
+pub mod tune;
 pub mod tuning;
+pub mod vt_recipe;
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -108,29 +112,34 @@ const SCK_FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
 /// stream refresh — so it is where a consent that lapsed *mid-session* is noticed.
 /// macOS 15 re-asks for screen recording roughly monthly, and a host left running
 /// as a permanent second monitor will hit that with a session live.
+///
+/// Silent only. This used to call `CGRequestScreenCaptureAccess` whenever the live read
+/// was not a definite yes, which raised the system dialog on every join of an
+/// unauthorized host; an automatic path may not prompt (`permissions::prompt_gate` is
+/// the only door). Returns `false` only on `Silent::DefinitelyDenied`: never on the
+/// per-process cached preflight negative, never on a read with nothing on screen to judge,
+/// and never once this process has confirmed a grant. `Unknown` never blocks.
 pub fn ensure_screen_recording_access() -> bool {
-    match crate::macos_utils::permissions::screen_recording_live() {
-        Some(true) => return true,
-        Some(false) => teprintln!(
-            "[tcc] Screen Recording is not authorized for this process. macOS 15 and later \
-             re-ask about every 30 days, so a session that has been working can stop here. \
-             Re-approve ScreenExtend under System Settings → Privacy & Security → Screen \
-             Recording; if the toggle is already on, quit and reopen ScreenExtend."
-        ),
-        None => tprintln!(
-            "[tcc] Screen Recording state could not be read; starting capture anyway and \
-             letting it report its own failure."
-        ),
-    }
-    type AccessFn = unsafe extern "C" fn() -> bool;
-    unsafe {
-        // A `c"..."` literal rather than `CString::new(...).unwrap()`: the name is a compile-time
-        // constant, so there is nothing to allocate and nothing to fail.
-        let p = libc::dlsym(libc::RTLD_DEFAULT, c"CGRequestScreenCaptureAccess".as_ptr());
-        if p.is_null() {
+    use crate::macos_utils::permissions::{screen_recording_silent, Silent};
+    let read = screen_recording_silent();
+    match read.state {
+        Silent::Granted => true,
+        Silent::DefinitelyDenied => {
+            teprintln!(
+                "[tcc] Screen Recording is not authorized for this process ({}). Approve \
+                 ScreenExtend under System Settings → Privacy & Security → Screen Recording; if \
+                 the toggle is already on, quit and reopen ScreenExtend.",
+                read.source
+            );
+            false
+        }
+        Silent::Unknown => {
+            tprintln!(
+                "[tcc] Screen Recording state could not be confirmed ({}); starting capture \
+                 anyway and letting it report its own failure.",
+                read.source
+            );
             true
-        } else {
-            std::mem::transmute::<*mut std::ffi::c_void, AccessFn>(p)()
         }
     }
 }
@@ -138,9 +147,12 @@ pub fn ensure_screen_recording_access() -> bool {
 /// Liveness, not authorization. An *unauthorized* process still gets a stream and
 /// still gets `FrameComplete` frames — they just contain wallpaper — so this must
 /// never gate a permission decision. Use `permissions::screen_recording_live()`.
-pub fn probe_screen_recording() -> bool {
+///
+/// Both probes are prompting calls while unauthorized (`SCShareableContent` on macOS 15+,
+/// and starting a `CGDisplayStream`), hence the permit.
+pub fn probe_screen_recording(permit: crate::macos_utils::permissions::PromptPermit) -> bool {
     if screencapturekit_available() {
-        if let Some(granted) = sck::probe_screen_recording() {
+        if let Some(granted) = sck::probe_screen_recording(permit) {
             return granted;
         }
         // Only reached when SCK is present and its probe could not answer at all. CGDisplayStream
@@ -186,6 +198,12 @@ pub fn start_capture(
     cfg: CaptureConfig,
     telemetry: SharedTelemetry,
 ) -> Result<Box<dyn CaptureBackend>, CaptureError> {
+    // TEST HOOK, bench builds only (compile time) and `SE_TEST_HOOKS=1` + `SE_TEST_SOURCE`
+    // (run time): a synthetic frame source in place of screen capture (`bench/synth_source.rs`).
+    #[cfg(feature = "bench")]
+    if let Some(b) = crate::bench::synth_source::from_env(cfg, sink.clone()) {
+        return Ok(b);
+    }
     let sck_err =
         if capture_ladder(screencapturekit_available()).contains(&CaptureRung::ScreenCaptureKit) {
             match start_sck(display, gpu.clone(), sink.clone(), cfg, telemetry.clone()) {

@@ -4,7 +4,7 @@
 db896ceccd9cba9e5f5cbebdb1d61d27e8e984f076233f97bcc75840faf0492c *ScreenExtend.cer
 87bf8a8331691b32cf6c8e9b282c9c2a825ed0b83eba0f24e539f667c042684e *libx264-164.dll
 73924f6a4124a52c9a3e1b5cedb68339f4d21627826b2b5fce5c453dde2857b5 *libopus.dll
-8285c2a9faf6360c6eb0803639a0d6011fcc600827c4ae5356bfdfe7a694ff0e *libopus.dylib
+7eafaa8c818e311a59194ef037fc706236a6dbcdddb1e6a7244c29a1b4969a3d *libopus.dylib
 
 # AMD AMF headers (source only, not bundled) — see PROVENANCE.md
 4ef6392bb4b9c6b05d00b5cd1486b99866e40e61449206a3a515063e4ffd289b *amf-headers/components/ColorSpace.h

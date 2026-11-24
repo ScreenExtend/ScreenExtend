@@ -422,11 +422,13 @@ impl CaptureBackend for SckBackend {
 
         tprintln!(
             "[sck] capture started: display={} {}x{} @ {}fps \
-             (queueDepth={QUEUE_DEPTH}, minimumFrameInterval=0.9/fps)",
+             (queueDepth={}, minimumFrameInterval={}/fps)",
             self.display_id,
             self.cfg.width,
             self.cfg.height,
-            self.cfg.fps
+            self.cfg.fps,
+            sck_knobs().queue_depth.unwrap_or(QUEUE_DEPTH),
+            sck_knobs().min_interval_factor.unwrap_or(0.9),
         );
 
         self.ctx = ctx;
@@ -601,6 +603,70 @@ unsafe fn find_display(content: &AnyObject, display_id: DisplayId) -> Option<Ret
 /// the latest-wins slot plus the encode loop's keepalive frame.
 const QUEUE_DEPTH: isize = 8;
 
+/// Capture A/B switches, read once from the environment (the bench `live` stage sets them; a
+/// shipped host never does). Unset means today's value, byte for byte:
+///
+/// - `SE_SCK_QUEUE_DEPTH=<n>` — `queueDepth` (default [`QUEUE_DEPTH`]).
+/// - `SE_SCK_MIN_INTERVAL=<factor>` — `minimumFrameInterval` as a multiple of the frame period
+///   (default 0.9; `0` sets `kCMTimeZero`, i.e. no throttle; `1.0` is exactly 1/fps).
+/// - `SE_SCK_PIXEL_FORMAT=420f|420v` — the delivered pixel format (default: the pipeline's).
+/// - `SE_SCK_SHOWS_CURSOR=0|1` — `showsCursor` (default 1).
+#[derive(Clone, Debug, Default)]
+struct SckKnobs {
+    queue_depth: Option<isize>,
+    min_interval_factor: Option<f64>,
+    pixel_format: Option<u32>,
+    shows_cursor: Option<bool>,
+    rejected: Vec<String>,
+}
+
+fn sck_knobs() -> &'static SckKnobs {
+    static KNOBS: std::sync::OnceLock<SckKnobs> = std::sync::OnceLock::new();
+    KNOBS.get_or_init(|| {
+        let mut k = SckKnobs::default();
+        let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
+        if let Some(v) = var("SE_SCK_QUEUE_DEPTH") {
+            match v.trim().parse::<isize>() {
+                Ok(n) if (1..=64).contains(&n) => k.queue_depth = Some(n),
+                _ => k.rejected.push(format!("SE_SCK_QUEUE_DEPTH={v}")),
+            }
+        }
+        if let Some(v) = var("SE_SCK_MIN_INTERVAL") {
+            match v.trim().parse::<f64>() {
+                Ok(f) if (0.0..=4.0).contains(&f) => k.min_interval_factor = Some(f),
+                _ => k.rejected.push(format!("SE_SCK_MIN_INTERVAL={v}")),
+            }
+        }
+        if let Some(v) = var("SE_SCK_PIXEL_FORMAT") {
+            match v.trim() {
+                "420f" => k.pixel_format = Some(0x3432_3066),
+                "420v" => k.pixel_format = Some(0x3432_3076),
+                _ => k.rejected.push(format!("SE_SCK_PIXEL_FORMAT={v}")),
+            }
+        }
+        if let Some(v) = var("SE_SCK_SHOWS_CURSOR") {
+            match v.trim() {
+                "1" | "true" | "on" => k.shows_cursor = Some(true),
+                "0" | "false" | "off" => k.shows_cursor = Some(false),
+                _ => k.rejected.push(format!("SE_SCK_SHOWS_CURSOR={v}")),
+            }
+        }
+        for r in &k.rejected {
+            teprintln!("[sck] ignoring {r} (out of range or unrecognised)");
+        }
+        k
+    })
+}
+
+/// What the last `configure_stream` actually set, for a measurement to record.
+static APPLIED: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+/// The values the most recent ScreenCaptureKit stream was configured with, and which of them
+/// came from an `SE_SCK_*` switch. `None` until a stream has been configured in this process.
+pub fn applied_knobs() -> Option<serde_json::Value> {
+    APPLIED.lock().ok().and_then(|g| g.clone())
+}
+
 /// step 3 — apply the low-latency SCStreamConfiguration knobs via objc2 setters.
 fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
     let fps = cfg.fps.max(1);
@@ -611,12 +677,31 @@ fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
     // of our frame rate seems to provide a capture that drops many frames" and ships a 10 %
     // shortening. The property is a floor on delivery spacing, so asking for slightly less than a
     // frame period costs nothing and stops the beat.
-    let interval = objc2_core_media::CMTime {
-        value: 9,
-        timescale: fps.saturating_mul(10),
-        flags: objc2_core_media::CMTimeFlags::Valid,
-        epoch: 0,
+    let knobs = sck_knobs();
+    let interval = match knobs.min_interval_factor {
+        None => objc2_core_media::CMTime {
+            value: 9,
+            timescale: fps.saturating_mul(10),
+            flags: objc2_core_media::CMTimeFlags::Valid,
+            epoch: 0,
+        },
+        // kCMTimeZero: deliver as fast as the compositor produces.
+        Some(f) if f <= 0.0 => objc2_core_media::CMTime {
+            value: 0,
+            timescale: 1,
+            flags: objc2_core_media::CMTimeFlags::Valid,
+            epoch: 0,
+        },
+        Some(f) => objc2_core_media::CMTime {
+            value: (f * 1000.0).round() as i64,
+            timescale: fps.saturating_mul(1000),
+            flags: objc2_core_media::CMTimeFlags::Valid,
+            epoch: 0,
+        },
     };
+    let queue_depth = knobs.queue_depth.unwrap_or(QUEUE_DEPTH);
+    let pixel_format = knobs.pixel_format.unwrap_or(cfg.pixel_format);
+    let shows_cursor = knobs.shows_cursor.unwrap_or(true);
     // SAFETY: each selector is a public `SCStreamConfiguration` property setter
     // with the documented argument type. `width`/`height`/`queueDepth` take
     // NSInteger (isize); `pixelFormat` takes an OSType (u32); the bools take BOOL.
@@ -624,10 +709,27 @@ fn configure_stream(config: &AnyObject, cfg: &CaptureConfig) {
         let _: () = msg_send![config, setWidth: cfg.width as isize];
         let _: () = msg_send![config, setHeight: cfg.height as isize];
         let _: () = msg_send![config, setMinimumFrameInterval: interval];
-        let _: () = msg_send![config, setPixelFormat: cfg.pixel_format];
-        let _: () = msg_send![config, setQueueDepth: QUEUE_DEPTH];
-        let _: () = msg_send![config, setShowsCursor: true];
+        let _: () = msg_send![config, setPixelFormat: pixel_format];
+        let _: () = msg_send![config, setQueueDepth: queue_depth];
+        let _: () = msg_send![config, setShowsCursor: shows_cursor];
         let _: () = msg_send![config, setCapturesAudio: false];
+    }
+    if let Ok(mut g) = APPLIED.lock() {
+        *g = Some(serde_json::json!({
+            "queue_depth": queue_depth,
+            "queue_depth_from_env": knobs.queue_depth.is_some(),
+            "minimum_frame_interval_s": if interval.value == 0 { 0.0 } else {
+                interval.value as f64 / interval.timescale.max(1) as f64
+            },
+            "minimum_frame_interval_factor": knobs.min_interval_factor.unwrap_or(0.9),
+            "minimum_frame_interval_from_env": knobs.min_interval_factor.is_some(),
+            "pixel_format": String::from_utf8_lossy(&pixel_format.to_be_bytes()),
+            "pixel_format_from_env": knobs.pixel_format.is_some(),
+            "shows_cursor": shows_cursor,
+            "shows_cursor_from_env": knobs.shows_cursor.is_some(),
+            "rejected": knobs.rejected,
+            "fps": fps,
+        }));
     }
     // Match the CGDisplayStream backend's colour handling instead of leaving SCK on its defaults.
     // Both tiers feed the same encoder, and a stream whose primaries depend on which capture tier
@@ -866,7 +968,12 @@ unsafe extern "C-unwind" {
     fn CFNumberGetValue(number: *const CFNumber, the_type: isize, value_ptr: *mut c_void) -> u8;
 }
 
-pub fn probe_screen_recording() -> Option<bool> {
+/// PROMPTING while unauthorized: on macOS 15+ `getShareableContent…` raises the system
+/// screen-recording alert on every call. Callers need a `PromptPermit`, which only the
+/// permission gate or a silent "already granted" read hands out.
+pub fn probe_screen_recording(
+    _permit: crate::macos_utils::permissions::PromptPermit,
+) -> Option<bool> {
     let cls_content = AnyClass::get(c"SCShareableContent")?;
 
     let (tx, rx) = mpsc::channel::<bool>();

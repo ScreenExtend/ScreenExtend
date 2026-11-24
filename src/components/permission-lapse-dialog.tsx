@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Info } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Info, Loader2 } from "lucide-react";
 
 import {
   AlertDialog,
@@ -21,10 +21,10 @@ const stopListening = (unlisten: () => void) => {
 };
 
 // The other half of the macOS TCC watchdog. It re-reads `screen_recording_live()` every
-// 30 s while a session holds a live display and ends the sessions on a definite
-// granted -> denied edge -- macOS 15 re-asks for consent roughly every 30 days, and a
-// dismissed dialog does *not* stop `CGDisplayStream`, which keeps delivering frames of the
-// wallpaper. Until now that edge was named in the log and nowhere else, so the person at
+// 30 s while a session holds a live display and ends the sessions on a *definite* denial
+// (other apps' windows on screen with their titles stripped -- never the per-process cached
+// answer, never "nothing on screen to read"). Without the permission `CGDisplayStream`
+// keeps delivering frames of the wallpaper. Until now that edge was named in the log and nowhere else, so the person at
 // the host saw a device drop with no reason given. This raises the permission gate over
 // whatever route is mounted, with the copy that says a relaunch is part of the fix.
 //
@@ -32,6 +32,10 @@ const stopListening = (unlisten: () => void) => {
 export function PermissionLapseDialog() {
   const { t } = useTranslation();
   const [lapse, setLapse] = useState<{ key: string; sessionsEnded: number } | null>(null);
+  // One Retry at a time: each one is an explicit request that may raise the macOS dialog (and,
+  // on a definite denial, clear the TCC entry first), so a double click must not send two.
+  const [retrying, setRetrying] = useState(false);
+  const retryInFlight = useRef(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -54,7 +58,8 @@ export function PermissionLapseDialog() {
 
   // Poll while the dialog is up so ticking the box in System Settings closes it, the same
   // way the bootstrap gate behaves. A grant bound to the old process still reads as denied
-  // here, which is what the relaunch button is for.
+  // here, which is what the relaunch button is for. The poll is `checkPermissions` only --
+  // a silent read. Nothing here re-raises the macOS prompt except the Retry button.
   useEffect(() => {
     if (!lapse) return;
     let cancelled = false;
@@ -108,7 +113,34 @@ export function PermissionLapseDialog() {
           </AlertDialogAction>
           <AlertDialogAction
             className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+            title={t("bootstrap.permissions.retryHint")}
+            disabled={retrying}
             onClick={event => {
+              // The one explicit re-request. "retry:" is the host's marker for a user-pressed
+              // Retry (`RETRY_PREFIX` in macos_utils/permissions.rs); without it the request
+              // would be a silent read, because this permission was requested before.
+              event.preventDefault();
+              // The ref closes the gap before React re-renders the button as disabled.
+              if (retryInFlight.current) return;
+              retryInFlight.current = true;
+              setRetrying(true);
+              commands
+                .requestPermission(`retry:${lapse.key}`)
+                .catch((e: unknown) => {
+                  console.error("retrying the permission failed", e);
+                })
+                .finally(() => {
+                  retryInFlight.current = false;
+                  setRetrying(false);
+                });
+            }}
+          >
+            {retrying ? <Loader2 className="animate-spin" size={14} /> : t("bootstrap.permissions.retry")}
+          </AlertDialogAction>
+          <AlertDialogAction
+            className="bg-secondary hover:bg-secondary/80 text-secondary-foreground"
+            onClick={event => {
+              // Opens the pane only; it never requests.
               event.preventDefault();
               commands.openPermissionSettings(lapse.key).catch((e: unknown) => {
                 console.error("openPermissionSettings failed", e);

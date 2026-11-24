@@ -108,6 +108,20 @@ short-circuits it, the frame watchdog that must never demote a painting session,
 `/reconfig` epochs, and the join path (setup failures and the load-time warm-up). No runner and no
 devDependency, and `src-tauri/src/streamer/static/` stays byte-identical.
 
+**`ScreenExtend bench`** (cargo feature `bench`, off by default; `scripts/build-bench-macos.sh`
+builds it universal) is the macOS encoder and whole-workflow benchmark, `src-tauri/src/bench/`. A
+plan is JSON (workloads, encoder recipes as data, groups); every run is its own child process
+under a watchdog, so a configuration that crashes or hangs is a result. Stages: `lab` (one
+encoder session), `pipe` (the production encode loop fed by replay), `live` (real virtual
+display, capture, WHEP transport and a decoding client), `churn`. `--list` prints the runs and an
+estimate. Encoder test hooks (`SE_VT_RECIPE`, `SE_VT_DENY`, `SE_VT_SIM_HOLD`, `SE_TEST_SOURCE`, …)
+need `SE_TEST_HOOKS=1`, and the raw frame recorder and the synthetic capture source exist only in
+a `bench` build. **`scripts/e2e-headless/run-mac.mjs`** is the real-browser session test for
+macOS hosts: `serve` in an isolated data dir, locally or over SSH, joined by headless Chrome
+through the shipped page; `--synthetic <workload>` puts motion into a real session on a machine
+whose screen is locked, `--relay-stall` imitates a Wi-Fi hiccup, `--client-override` proves a
+page change against a host that embeds the old page. `docs/OPTIMIZATIONS.md` E2E-MAC.
+
 The `#[ignore]`d latency harnesses are documented in `docs/manual-tests/latency-harnesses.md` —
 `cargo test` never runs them, so without that note the numbers are never produced. The perf gate
 (`ci/perf-baseline.json` + `scripts/perf-gate.mjs`) keys baselines by machine class, takes the
@@ -639,7 +653,8 @@ Cross-platform core, OS-independent:
   its frames in an encoded transform, so libwebrtc's own idle decoder asks for a keyframe every
   ~200 ms for the life of the session (measured: 117 PLIs in 30 s, an IDR every ~280 ms, the old
   app too). Each answered PLI that is followed by another doubles a window from 200 ms to a 2 s
-  cap (10 s while the client's STATS say it is painting through WebCodecs); a PLI-free 4 s closes
+  cap (60 s while the client's STATS say it is painting through WebCodecs — was 10 s, one
+  ~2 MB IDR every 10 s for nothing; `SE_PLI_HEALTHY_CAP_MS` overrides); a PLI-free 4 s closes
   it; evidence of real loss (a NACK, TWCC-reported loss, the client's own keyframe counter
   moving) opens it at once. The client's out-of-band 0x64 request bypasses it entirely.
 - `sockets.rs` — the UDP socket options webrtc-rs never sets: DSCP/`IP_TOS` so video is not in
@@ -760,6 +775,13 @@ Cross-platform core, OS-independent:
   24.2 → 18.7 ms at 1080p and 34.2 → 28.0 ms at 1440p120, for +15–18 W of GPU power.
   `SE_GPU_CLOCK_HOLD=0` turns it off, `=1` forces it on (battery). `docs/OPTIMIZATIONS.md`
   POSTREBOOT-GPUCLOCK.
+  Its macOS counterpart is **the performance hold** (`macos_utils/streamer/perf_hold.rs`): one
+  `USER_INTERACTIVE` thread spins from each captured frame until 200 ms after the newest one, so
+  the encode runs on a woken performance cluster — on by default only with >= 2 perf levels
+  (`hw.nperflevels`), AC power and Low Power Mode off, re-decided about once a second. M1 1080p60
+  offer→packetized p50 8.1 → 6.5 ms, 10 fps 9.4 → ~6.6; no effect on Intel, so it never starts
+  there. `SE_PERF_HOLD=0` off, `=1` forces it on, `=spin` spins for the whole session.
+  `docs/OPTIMIZATIONS.md` PERF-HOLD.
 - **The FFI layout tests are generated from the real headers, by a C compiler.** `test/nvenc_layout.rs`
   and `test/amd_layout.rs` assert struct sizes, field offsets, vtable slot indices, GUIDs and
   struct revision words measured by `tools/nvenc_layout_gen.c` / `tools/amf_layout_gen.c` reading
@@ -811,6 +833,31 @@ Cross-platform core, OS-independent:
   name, so `RepairAction`'s `mark_ltr`/`use_ltr_bitmap` have nothing to map onto and the macOS
   pipeline declares zero slots — every repair is still a keyframe. `Encoder::supports_ltr()`
   reports per session whether this Mac advertises the property. See `docs/OPTIMIZATIONS.md`.
+- **Rate control is a tier chosen per session from what the session reports**
+  (`encoder.rs::select_rate_tier`, pure and unit-tested per branch): `BaseFrameQp` (pinned quality
+  on a low-latency session that reads `SupportsBaseFrameQP` true: per-frame QP, rate control off,
+  nothing dropped for budget — the M1's tier), `ClampCeiling`, `LowLatencyBitrate`,
+  `StandardBitrate` (no low-latency encoder: a bitrate stands in for quality,
+  `constant_quality_bitrate` — the Intel tier), and `AdaptiveLowLatency` / `AdaptiveStandard`. The
+  low-latency path is attempted only when its specification key resolves by `dlsym` and believed
+  only when the read-back confirms it (`low_latency_confirmed`): on 10.15 the key is silently
+  ignored, and treating that session as low-latency once put a 300 Mbps ceiling on Quick Sync.
+  **Never pin quality with `MinAllowedFrameQP == MaxAllowedFrameQP`**: that is a control that drops
+  frames (1,163 of 1,359 on a recorded window drag, each reported as success with a null sample
+  and `kVTEncodeInfo_FrameDropped`). A `DropGuard` rebuilds the session once on the standard
+  encoder if more than 5 % of frames are dropped in 2 s. `docs/OPTIMIZATIONS.md` MAC-RATE-TIERS.
+- **Hold push** (`pipeline.rs::HoldPush`). Intel's `h264.gva` emits frame N only when N+1 is
+  submitted, so its latency is one frame interval plus its real work and the last frame of a
+  burst waits for the keepalive. The loop learns that behaviourally (a resubmitted picture
+  releases the previous frame early) and then resubmits every real frame at once: 23 → 11 ms at
+  1080p60, for +44 % bitrate and twice the frames on the wire. An encoder that emits freely never
+  enters the mode (0 pushes on the M1). `SE_TUNE_OFF=hold_push` disables it. HOLD-PUSH.
+- **A re-submitted picture (keepalive repeat, forced-IDR repeat, hold push) is stamped when it
+  leaves the encoder**, at `max(own submit, emit − E)` and below the newest real capture, never
+  with the capture time of the picture it repeats: the client turns that stamp into its video-delay
+  estimate, which sets the audio buffer target, and a stale one walked the audio delay to its
+  400 ms cap on a still screen. Repeats also have their own `encode_repeat` stage histogram;
+  `stages.encode` is captured frames only.
 - `virtual_display.rs` — the private CoreGraphics `CGVirtualDisplay*` classes via
   `extern_class!` / `extern_methods!` (objc2 resolves these at runtime, so a Mac without them
   still loads the binary — but instantiating a missing class panics, hence the probe below).
@@ -1212,6 +1259,14 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   decoder falls behind, the answer is to drop to the freshest frame and ask for a keyframe,
   never to buffer. Backpressure is measured as decodes that have not yet produced an *output*,
   never as `decodeQueueSize`, which counts acceptance and can read zero with frames in flight.
+- **The client's decoder-stall clock must not run while nothing is arriving.** "No output for
+  66 ms with more than six decodes outstanding" is evidence of a stalled decoder only if the
+  decoder had work for those 66 ms. Measured from the last output alone, a network gap followed by
+  a clump of frames — which is what every large keyframe produces — tripped it, and the response
+  (drop the deltas, request a keyframe) made the next gap: 49 IDRs in a 20 s session with no packet
+  lost. `stallFloor()` in `transform-worker.js` is the clock's floor (last output, last keyframe
+  submit, the arrival that ended an input gap, the submit that found the decoder idle), and a
+  keyframe in decode is never a stall. `docs/OPTIMIZATIONS.md` CLIENT-RESYNC.
 - **Install `receiver.transform` in the same task as `addTransceiver('video')`** — nothing may
   yield in between. Chrome short-circuits a receiver's encoded transform otherwise: `rtctransform`
   still fires, but every frame goes to the built-in decoder. `pnpm test:client` checks it
@@ -1245,6 +1300,14 @@ touches: the TS config type + default, the Rust command, and the `serve`/`config
   return what is in effect and `landed_display` is what puts it on the session. A session that
   records the request instead makes the next edit compare equal, and the change can then never be
   retried.
+- **Never write a permanent display configuration on macOS** (`kCGConfigurePermanently`), outside
+  the pre-10.14.4 AirPlay tier. It saves the WHOLE set of connected displays, the modes of the
+  user's own screens included, and macOS re-applies it every time that set comes back: a build that
+  did it left a developer's built-in display flipping 1680x1050 <-> 1440x900 for hours. Every
+  create/resize/remove of a virtual display also snapshots the screens that are not ours and puts
+  back any whose mode moved, for this session only (`virtual_display.rs` SCREENS-GUARD,
+  `SE_SCREENS_GUARD=0` to disable). And never run a test that creates virtual displays on a Mac
+  someone is working on.
 - **A display write names a monitor, never a `\\.\DISPLAYn`.** That name is a *slot*: Windows
   hands it straight back out when the monitor holding it detaches, so a name cached when a
   display was created can address a different monitor — the machine's own screen included — by

@@ -1,0 +1,47 @@
+ScreenExtend on Windows: make it as low-latency as possible and prove it is stable. Any amount of effort
+is worth it for tiny latency cuts. Run to completion. Ask before anything that changes my screen, resolution,
+drivers or power settings, and never run display tests while I am working.
+
+This continues from finished macOS work. Read CLAUDE.md, docs/OPTIMIZATIONS.md and
+docs/research/macos-latency-final-report.md first, including "Not verified". Shared code was written and
+tested on Macs; on Windows it has only been type-checked. It is on the branch
+new-agent-work: start from it. The Mac recording and raw results are private and are not in the repo. Known now:
+clippy on current stable fails on Windows on `chunks_exact` in windows_utils (audio/format.rs, driver_health.rs,
+streamer/dxgi/cursor.rs, streamer/test/x264_encoder.rs), so CI's Windows job may fail until you fix it.
+
+Who does what
+- SHARED code (session and leak fix, first-join quality, frame times, keyframe interval, client page,
+  telemetry): build it here, run all tests and real sessions, fix only what breaks on Windows, and tell me
+  before changing how it behaves. Do not redesign it.
+- WINDOWS code is yours: NVIDIA NVENC, Intel Quick Sync, AMD AMF, x264, WGC and DXGI capture, the
+  virtual display driver, WASAPI audio, hosted network, installer, CLI, and process/thread/power/GPU-clock
+  tuning. The Mac benchmark stages do not run on Windows, so build your own.
+
+What to do
+1. Deep research (web and git repos): every NVENC and Quick Sync setting and its minimum version, the newest
+   low-latency options, how Sunshine, Parsec, OBS, Chromium and AirPlay-class streaming do it, and where we
+   fall short (including fixed quality on slow networks). Research AMD and the driver too.
+2. Audit every Windows component and driver interface by reading the code, AMD included, and the code
+   quality overall. Fix everything. Only NVIDIA and Intel can be tested here; the rest stays UNVERIFIED.
+   Test any general Windows component you change. Qualcomm stays unimplemented.
+3. Record my screen raw at the encoder input, no preprocessing, any size on disk, so the whole workflow
+   replays offline without me. Keep it local. Tell me when to move fast.
+4. Measure every stage end to end: capture, encode, packetize, network, decode, paint, audio sync, input.
+5. Build one executable that runs the full suite exhaustively: recording replay and synthetic content,
+   30/60/120 fps, 720p to 4K, several sessions, real browsers, a second client machine, slow clients, network
+   stalls, hour-long soaks, join/leave churn, leaks (sockets, handles, memory, GPU objects), power.
+6. Goals: no dropped frames, no frame-rate sag, lowest latency, high bandwidth is fine but it must also scale
+   down on slow networks. Passing tests is not enough: prove it stable over time on real recorded input.
+7. Probe capabilities at run time, never by OS version or GPU name, with fallbacks. One build everywhere.
+
+How: you analyse the raw data; Opus subagents write code and run tests; use workflows. One measurement at a
+time, never compile during one. Get independent reviews of big changes. Watch for side effects and check
+what you leave behind (on the Mac our tests flipped my display's resolution for hours). Say what is proven
+and what is not, correct yourself plainly, and don't commit, push or upload anything.
+
+Finish with real sessions on the final build and a report: what was tested, what worked and what didn't,
+before/after latency per stage and per GPU, what is unverified. Give progress and ETAs when I ask.
+
+Open shared items to weigh: loss repair without a keyframe, dropping quality instead of frames on slow
+links, a client that aborts its join leaving a display up, and an old Chrome 128 client that stops
+receiving frames.

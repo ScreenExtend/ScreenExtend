@@ -13,6 +13,8 @@ use tauri_specta::{collect_commands, collect_events, Builder, Event};
 
 #[macro_use]
 mod logbus;
+#[cfg(feature = "bench")]
+mod bench;
 mod cli;
 mod data_dir;
 mod exit_reason;

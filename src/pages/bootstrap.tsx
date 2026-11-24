@@ -74,6 +74,13 @@ const PERMISSION_POLL_STEPS = [
 ];
 const UPDATE_CHECK_DEADLINE_MS = 2000;
 
+// `request_permission` takes a key; this prefix marks an explicit, user-pressed Retry. It is a
+// key prefix rather than a new argument so the generated bindings stay as they are. The host
+// enforces the rule this pairs with: the first request for a permission may raise the macOS
+// prompt, every later automatic one is a silent read, and only a Retry asks macOS again.
+// Keep in step with `RETRY_PREFIX` in `src-tauri/src/macos_utils/permissions.rs`.
+const PERMISSION_RETRY_PREFIX = "retry:";
+
 function samePermissions(a: PermissionStatus[] | null, b: PermissionStatus[]): boolean {
   return a !== null
     && a.length === b.length
@@ -525,6 +532,9 @@ export default function Bootstrap() {
     }
     const missing = perms.filter(blocks);
     if (missing.length === 0) return "ok";
+    // The automatic request. The host lets it reach the macOS prompt only the very first time
+    // this permission is ever requested (persisted across relaunches); after that it is a
+    // silent read and nothing appears on screen. Only the Retry button asks macOS again.
     for (const p of missing) {
       try {
         await commands.requestPermission(p.key);
@@ -532,6 +542,8 @@ export default function Bootstrap() {
         console.error(`requesting the ${p.key} permission failed`, e);
       }
     }
+    // The gate is (re)opening: the next way out of it may start `proceed()` once more.
+    gateLeft.current = false;
     try {
       setPermReport(await commands.checkPermissions());
     } catch {
@@ -540,7 +552,44 @@ export default function Bootstrap() {
     return "blocked";
   };
 
+  // Three things can close the permission gate -- the poll, Re-check, and a Retry that ends in
+  // a grant -- and each used to call `proceed()` itself, so two of them landing together ran
+  // setup twice. Leaving the gate is now one function that starts `proceed()` once per opening.
+  const gateLeft = useRef(false);
+  const leavePermissionGate = () => {
+    if (gateLeft.current) return;
+    gateLeft.current = true;
+    setPermReport(null);
+    proceed().catch(() => failStartup());
+  };
+
+  // The only path that may re-raise a macOS permission prompt after the first. When the host's
+  // silent read is a *definite* denial (never just "could not confirm"), it also clears the TCC
+  // entry first -- macOS will not ask over an existing one -- and says so in the row's detail.
+  const [retrying, setRetrying] = useState<string | null>(null);
+  // State disables the button on the next render; the ref closes the gap before it.
+  const retryInFlight = useRef(false);
+  const retryPermission = async (key: string) => {
+    if (retryInFlight.current) return;
+    retryInFlight.current = true;
+    setRetrying(key);
+    try {
+      await commands.requestPermission(PERMISSION_RETRY_PREFIX + key);
+    } catch (e) {
+      console.error(`retrying the ${key} permission failed`, e);
+    } finally {
+      retryInFlight.current = false;
+      setRetrying(null);
+    }
+    await recheckPermissions();
+  };
+
+  const [rechecking, setRechecking] = useState(false);
+  const recheckInFlight = useRef(false);
   const recheckPermissions = async () => {
+    if (recheckInFlight.current) return;
+    recheckInFlight.current = true;
+    setRechecking(true);
     let perms: PermissionStatus[];
     try {
       perms = await commands.checkPermissions();
@@ -551,12 +600,12 @@ export default function Bootstrap() {
         description: t("toasts.permissions.checkFailedDescription"),
       });
       return;
+    } finally {
+      recheckInFlight.current = false;
+      setRechecking(false);
     }
     setPermReport(perms);
-    if (!perms.some(blocks)) {
-      setPermReport(null);
-      proceed().catch(() => failStartup());
-    }
+    if (!perms.some(blocks)) leavePermissionGate();
   };
 
   // The boot the repair budget is scoped to, from the last report. Empty until one arrives, and
@@ -735,8 +784,7 @@ export default function Bootstrap() {
           setPermReport(prev => samePermissions(prev, perms) ? prev : perms);
           if (!perms.some(blocks)) {
             stopped = true;
-            setPermReport(null);
-            proceed().catch(() => failStartup());
+            leavePermissionGate();
           }
         })
         .catch(() => { /* transient; the next tick tries again */ })
@@ -1203,15 +1251,29 @@ export default function Bootstrap() {
                         <div className="text-sm text-muted-foreground">{p.detail || p.description}</div>
                       </div>
                       {p.state !== "granted" && (
-                        <button
-                          className="shrink-0 rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
-                          onClick={() => {
-                            commands.openPermissionSettings(p.key)
-                              .catch((e: unknown) => { console.error("openPermissionSettings failed", e); });
-                          }}
-                        >
-                          Open Settings
-                        </button>
+                        <div className="flex shrink-0 items-center space-x-2">
+                          <button
+                            className="rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80 disabled:opacity-50"
+                            disabled={retrying !== null}
+                            title={t("bootstrap.permissions.retryHint")}
+                            onClick={() => void retryPermission(p.key)}
+                          >
+                            {retrying === p.key
+                              ? <Loader2 className="animate-spin" size={14} />
+                              : t("bootstrap.permissions.retry")}
+                          </button>
+                          {/* Opens the pane only. It never requests: a request from here would
+                              raise the macOS dialog over the very pane it just opened. */}
+                          <button
+                            className="rounded-md bg-secondary px-3 py-1.5 text-sm hover:bg-secondary/80"
+                            onClick={() => {
+                              commands.openPermissionSettings(p.key)
+                                .catch((e: unknown) => { console.error("openPermissionSettings failed", e); });
+                            }}
+                          >
+                            {t("bootstrap.permissions.openSettings")}
+                          </button>
+                        </div>
                       )}
                     </li>
                   ))}
@@ -1239,7 +1301,8 @@ export default function Bootstrap() {
               {t("common.quit")}
             </AlertDialogAction>
             <button
-              className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+              className="inline-flex h-10 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
+              disabled={rechecking}
               onClick={() => void recheckPermissions()}
             >
               {t("bootstrap.permissions.recheck")}

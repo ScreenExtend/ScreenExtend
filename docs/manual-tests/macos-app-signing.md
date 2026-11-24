@@ -1,8 +1,8 @@
 # Manual test: the macOS app's code identity (and why TCC depends on it)
 
-Nothing in this repository could sign anything, and nothing here signs anything now: the
-release is signed by `tauri-action` with whatever identity the workflow's environment
-carries. What was missing is any statement of **what that identity has to be**, and any
+Until 0.7.x the release was not signed at all: `tauri-action` ran with no identity, so the
+bundle carried no signature and only the arm64 slice of the executable had the linker's
+ad-hoc one. TCC could never match a grant against that (see "Ad-hoc, but whole" below). What was missing is any statement of **what that identity has to be**, and any
 check that it stayed the same between releases. Both are written down here, and
 `.github/workflows/build-release.yml` now enforces the second.
 
@@ -47,6 +47,28 @@ Three ways to land there:
   A locally signed experiment must use a different identifier, or it poisons the release
   build's TCC rows on that machine.
 - The designated requirement string must be **identical across consecutive releases**.
+
+## Ad-hoc, but whole (what ships while there is no Developer ID)
+
+`tauri.macos.conf.json` sets `bundle.macOS.signingIdentity` to `"-"` and `hardenedRuntime` to
+`false`. With an identity set, the Tauri 2.6 bundler (`tauri-bundler` `macos/app.rs`) runs
+`codesign --force -s - [--options runtime] --entitlements Entitlements.plist` on the main
+executable (every slice of the universal binary) and then on the `.app`, inside
+`app::bundle_project` — before the DMG and the updater `.app.tar.gz` are built from that
+`.app`, so neither needs regenerating. It does not sign the DMG when the identity is `"-"`.
+
+Hardened runtime is off because, with an ad-hoc signature, it turns on library validation
+with no Team ID to match: `dlopen` of `resources/libopus.dylib` then fails with "mapping
+process and mapped file (non-platform) have different Team IDs" (reproduced with a test
+loader on macOS 26). Notarization needs it on, so a Developer ID build must turn it back on
+and sign `libopus.dylib` with the same team (or add
+`com.apple.security.cs.disable-library-validation`), and set `APPLE_SIGNING_IDENTITY` — the
+bundler refuses an `APPLE_CERTIFICATE` whose name does not contain the configured identity,
+and `"-"` is not in a Developer ID name.
+
+An ad-hoc designated requirement is the set of slice cdhashes, so a grant still does not
+survive an update; it does now apply to the build it was made for.
+`scripts/check-macos-signature.sh` gates the release on the signature being whole.
 
 ## Seeding the checked-in expectation (once)
 

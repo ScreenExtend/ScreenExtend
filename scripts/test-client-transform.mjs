@@ -38,6 +38,11 @@ function makeWorker(opts) {
   const queue = [];
   let waiting = null;
   let closed = false;
+  // `holdOutputs`: the decoder accepts chunks but returns nothing until `releaseOutputs()`,
+  // which emits them in decode order — a decoder busy on a large keyframe.
+  let holding = false;
+  const held = [];
+  let decoderInit = null;
 
   class FakeVideoFrame {
     constructor(ts) { this.timestamp = ts; this.displayWidth = 1280; this.displayHeight = 720; this.codedWidth = 1280; this.codedHeight = 720; }
@@ -57,6 +62,7 @@ function makeWorker(opts) {
     VideoDecoder: class {
       constructor(init) {
         this.init = init;
+        decoderInit = init;
         this.decodeQueueSize = 0;
         Object.defineProperty(this, 'state', { get: () => decoderState });
       }
@@ -66,6 +72,7 @@ function makeWorker(opts) {
         // A decoder that accepts a chunk and never produces an output is the real failure
         // mode this path guards against: `decodeQueueSize` reads zero the whole time.
         if (o.swallowDeltas && chunk.type !== 'key') return;
+        if (holding) { held.push(chunk.timestamp); return; }
         this.init.output(new FakeVideoFrame(chunk.timestamp));
       }
       reset() {}
@@ -105,6 +112,12 @@ function makeWorker(opts) {
     probed,
     get configuredWith() { return configuredWith; },
     setClock(ms) { clock = ms; },
+    holdOutputs(on) { holding = on; },
+    releaseOutputs(only) {
+      const n = only === undefined ? held.length : Math.min(only, held.length);
+      for (const ts of held.splice(0, n)) decoderInit.output(new FakeVideoFrame(ts));
+    },
+    get heldCount() { return held.length; },
     advance(ms) { clock += ms; },
     send(msg) { ctx.onmessage({ data: msg }); },
     // The canvas the page hands over. `getContext` has to succeed or the worker reports
@@ -251,10 +264,11 @@ const lastOf = (posted, type) => { for (let i = posted.length - 1; i >= 0; i--) 
   if (!lastOf(w.posted, 'backlog')) ok('a pipelined decoder that is still producing outputs is not called a backlog');
   else fail('the in-flight count alone tripped the backlog path, which is what a healthy hardware decoder looks like');
 
-  // Now the decoder has genuinely stopped: nothing has come back out for longer than the stall
-  // window. This is the state the path exists for.
-  w.advance(200);
-  for (let i = 9; i <= 12; i++) {
+  // Now the decoder has genuinely stopped: frames keep arriving at 60 fps and nothing comes
+  // back out for longer than the stall window. This is the state the path exists for. (Time
+  // with no input at all is not evidence of a stall — see case 16.)
+  for (let i = 9; i <= 16; i++) {
+    w.advance(16);
     w.feed(frame('delta', 1000 + i * 1500));
     await w.settle();
   }
@@ -461,6 +475,244 @@ for (const via of ['script transform', 'createEncodedStreams']) {
   w.feed(frame('delta', 7000));
   await w.settle();
   eq('no writable: both frames still decoded', w.decoded.length, 2);
+}
+
+// ── 13. a keyframe still in the decoder is not a stalled decoder ─────────────────────────
+// A 1-2 MB IDR takes longer than BACKLOG_STALL_MS to decode, and the deltas that depend on it
+// keep arriving meanwhile. Calling that a backlog dropped those deltas and asked for another
+// keyframe just as large: on the Intel Mac host, 20-49 IDRs in 20 s with no packet lost.
+const stats = (w) => { w.send({ type: 'videostats' }); return lastOf(w.posted, 'videostats').stats; };
+{
+  const w = makeWorker();
+  w.attachCanvas();
+  w.startScriptTransform(w.receiverWritable());
+  await w.settle();
+  w.advance(1000); // clear of the opening request's KEY_REQUEST_MIN_INTERVAL_MS
+  w.feed(frame('key', 1000));
+  w.feed(frame('delta', 2500));
+  await w.settle();
+  if (!lastOf(w.posted, 'rendered')) fail('setup: nothing painted before the big keyframe');
+  const before = stats(w);
+  const decodedBefore = w.decoded.length;
+
+  // The big keyframe follows straight on from a healthy output, as on the wire.
+  w.holdOutputs(true);
+  w.feed(frame('key', 100000));
+  await w.settle();
+  // 12 deltas over 150 ms while the keyframe has produced nothing.
+  for (let i = 1; i <= 12; i++) {
+    w.advance(12.5);
+    w.feed(frame('delta', 100000 + i * 1500));
+    await w.settle();
+  }
+  const during = stats(w);
+  eq('keyframe in decode: keyframe requests made', during.keyRequests - before.keyRequests, 0);
+  eq('keyframe in decode: deltas dropped', during.framesDropped - before.framesDropped, 0);
+  eq('keyframe in decode: no backlog reported', w.posted.filter((m) => m.type === 'backlog').length, 0);
+  eq('keyframe in decode: the keyframe and all 12 deltas were submitted', w.decoded.length - decodedBefore, 13);
+  if (during.keyDecodeGraceHits > 0) ok('the grace is counted (keyDecodeGraceHits = ' + during.keyDecodeGraceHits + ')');
+  else fail('keyDecodeGraceHits stayed 0 while the backlog test was held off');
+  if (!during.waitingForKey) ok('the stream is not resynchronising to another keyframe');
+  else fail('a keyframe in decode put the stream back into waiting for a keyframe');
+
+  // The keyframe comes out 150 ms late and everything behind it follows.
+  w.holdOutputs(false);
+  const paintedBefore = w.painted.length;
+  w.releaseOutputs();
+  await w.settle();
+  eq('after the keyframe: frames painted (key + 12 deltas)', w.painted.length - paintedBefore, 13);
+  w.advance(16);
+  w.feed(frame('delta', 100000 + 13 * 1500));
+  await w.settle();
+  const after = stats(w);
+  eq('after the keyframe: still no keyframe request', after.keyRequests - before.keyRequests, 0);
+  eq('after the keyframe: in-flight count back to zero', after.inFlight, 0);
+}
+
+// ── 14. a real stall with no keyframe pending still trips, once ──────────────────────────
+{
+  const w = makeWorker({ swallowDeltas: true });
+  w.attachCanvas();
+  w.startScriptTransform(w.receiverWritable());
+  await w.settle();
+  w.advance(1000); // clear of the opening request's KEY_REQUEST_MIN_INTERVAL_MS
+  w.feed(frame('key', 1000));
+  await w.settle();
+  const before = stats(w);
+  for (let i = 1; i <= 8; i++) { w.feed(frame('delta', 1000 + i * 1500)); await w.settle(); }
+  // Frames keep arriving at 60 fps with nothing out for > BACKLOG_STALL_MS.
+  for (let i = 9; i <= 16; i++) { w.advance(16); w.feed(frame('delta', 1000 + i * 1500)); await w.settle(); }
+  const after = stats(w);
+  eq('real stall: keyframe requests', after.keyRequests - before.keyRequests, 1);
+  eq('real stall: backlog reported', w.posted.filter((m) => m.type === 'backlog').length, 1);
+  eq('real stall: grace not applied', after.keyDecodeGraceHits, 0);
+}
+
+// ── 15. the grace is bounded: a decoder that dies on a keyframe is still caught ─────────
+// Frames keep arriving at 60 fps. Inside KEY_DECODE_GRACE_MS nothing is dropped or requested;
+// past it the stale count is resynchronised, the stall clock starts again from that resync, and
+// the backlog test trips.
+{
+  const w = makeWorker();
+  w.attachCanvas();
+  w.startScriptTransform(w.receiverWritable());
+  await w.settle();
+  w.advance(1000);
+  w.feed(frame('key', 1000));
+  w.feed(frame('delta', 2500));
+  await w.settle();
+  const before = stats(w);
+  w.holdOutputs(true);
+  w.feed(frame('key', 100000));
+  await w.settle();
+  for (let i = 1; i <= 8; i++) { w.advance(12.5); w.feed(frame('delta', 100000 + i * 1500)); await w.settle(); }
+  const mid = stats(w);
+  eq('dead keyframe, inside the grace: no request yet', mid.keyRequests - before.keyRequests, 0);
+  if (mid.inFlight > 6) ok('dead keyframe, inside the grace: the in-flight count is left alone (' + mid.inFlight + ')');
+  else fail('the in-flight count was reset while a keyframe was decoding');
+  // Steady 60 fps until the grace has run out, then until the backlog test fires.
+  let i = 9;
+  // The big keyframe went in at 11000 ms; KEY_DECODE_GRACE_MS ends at 12000.
+  while (w.ctx.performance.now() + 16 <= 11000 + 1000) { w.advance(16); w.feed(frame('delta', 100000 + i++ * 1500)); await w.settle(); }
+  const atExpiry = stats(w);
+  eq('dead keyframe, still inside/at the grace edge: no request yet', atExpiry.keyRequests - before.keyRequests, 0);
+  let n = 0;
+  while (n < 20 && stats(w).keyRequests === atExpiry.keyRequests) { w.advance(16); w.feed(frame('delta', 100000 + i++ * 1500)); await w.settle(); n++; }
+  const after = stats(w);
+  eq('dead keyframe, past the grace: one keyframe request', after.keyRequests - before.keyRequests, 1);
+  if (n <= 12) ok('dead keyframe, past the grace: caught ' + n + ' frames (' + n * 16 + ' ms) after the grace ran out');
+  else fail('a decoder dead on a keyframe took ' + n + ' frames past the grace to catch');
+  if (after.waitingForKey) ok('dead keyframe, past the grace: resynchronising to the next keyframe');
+  else fail('not resynchronising after the backlog trip');
+}
+
+// ── 16. an arrival gap followed by a clump is not a stalled decoder ──────────────────────
+// The defect behind the keyframe storm, with no keyframe involved: the stall clock used to run
+// from the last output whether or not anything had arrived since. 150 ms with no input (a Wi-Fi
+// hiccup; idle ping between the dev Macs reaches 75 ms), then 12 deltas inside 10 ms, put
+// `now - lastOutput` past 66 ms before the decoder had been given anything.
+async function gapThenClump(w) {
+  w.attachCanvas();
+  w.startScriptTransform(w.receiverWritable());
+  await w.settle();
+  w.advance(1000);
+  w.holdOutputs(true);
+  // A healthy pipelined decoder: every output lands one frame period after its input.
+  w.feed(frame('key', 1000)); await w.settle();
+  let ts = 1000;
+  for (let k = 0; k < 30; k++) { w.advance(16); w.releaseOutputs(); ts += 1500; w.feed(frame('delta', ts)); await w.settle(); }
+  w.advance(16); w.releaseOutputs(); await w.settle();
+  const before = stats(w);
+  const paintedBefore = w.painted.length;
+  w.advance(150); // nothing arrives
+  for (let k = 0; k < 12; k++) { w.advance(0.8); ts += 1500; w.feed(frame('delta', ts)); await w.settle(); }
+  w.advance(20); w.releaseOutputs(); await w.settle();
+  return { before, after: stats(w), painted: w.painted.length - paintedBefore };
+}
+{
+  const w = makeWorker();
+  const r = await gapThenClump(w);
+  eq('gap then clump: keyframe requests', r.after.keyRequests - r.before.keyRequests, 0);
+  eq('gap then clump: deltas dropped', r.after.framesDropped - r.before.framesDropped, 0);
+  eq('gap then clump: all 12 deltas painted', r.painted, 12);
+  if (r.after.stallFloorSavesGap > 0) ok('the arrival-gap floor is what held it off (stallFloorSavesGap = ' + r.after.stallFloorSavesGap + ')');
+  else fail('stallFloorSavesGap stayed 0: ' + JSON.stringify({ saves: r.after.stallFloorSaves, key: r.after.stallFloorSavesKey, idle: r.after.stallFloorSavesIdle }));
+  eq('gap then clump: no keyframe grace involved', r.after.keyDecodeGraceHits, 0);
+}
+
+// ── 17. a decoder that dies on a steady 60 fps stream is still caught ────────────────────
+// The floor only moves after an arrival gap or from idle, never on a steady stream, so the
+// stall window starts with the decoder's last real work. Also with an arrival gap just before.
+for (const withGap of [false, true]) {
+  const label = withGap ? 'dead after a gap' : 'dead on a steady stream';
+  const w = makeWorker();
+  w.attachCanvas();
+  w.startScriptTransform(w.receiverWritable());
+  await w.settle();
+  w.advance(1000);
+  w.holdOutputs(true);
+  w.feed(frame('key', 1000)); await w.settle();
+  let ts = 1000;
+  for (let k = 0; k < 30; k++) { w.advance(16); w.releaseOutputs(); ts += 1500; w.feed(frame('delta', ts)); await w.settle(); }
+  w.advance(16); w.releaseOutputs(); await w.settle();
+  if (withGap) w.advance(150);
+  const before = stats(w);
+  // From here the decoder accepts and never outputs.
+  let n = 0;
+  while (n < 30 && stats(w).keyRequests === before.keyRequests) { if (n) w.advance(16); ts += 1500; w.feed(frame('delta', ts)); await w.settle(); n++; }
+  const after = stats(w);
+  eq(label + ': one keyframe request', after.keyRequests - before.keyRequests, 1);
+  if (n <= 9) ok(label + ': caught on frame ' + n + ' (' + (n - 1) * 16 + ' ms after the decoder\'s last work)');
+  else fail(label + ': took ' + n + ' frames to catch');
+}
+
+// ── 18. a dead decoder is caught whatever the arrival rate, and a healthy one never is ───
+// The gap floor used to be judged against a rate learned from rendered frames, which freezes
+// when output stops: with arrivals further apart than that, every one moved the floor.
+async function atRate(w, st, ms, frames) {
+  for (let k = 0; k < frames; k++) { w.advance(ms); st.ts += Math.round(ms * 90); w.feed(frame('delta', st.ts)); await w.settle(); }
+}
+async function startHealthy(preMs, preFrames, opts) {
+  const w = makeWorker(opts); w.attachCanvas(); w.startScriptTransform(w.receiverWritable()); await w.settle();
+  w.advance(1000); w.feed(frame('key', 1000)); await w.settle();
+  const st = { ts: 1000 };
+  await atRate(w, st, preMs, preFrames);
+  return { w, st };
+}
+for (const [label, preMs, pre, ms, limitMs] of [
+  ['dead on a 5 fps keepalive', 200, 20, 200, 1000],
+  ['dead at 5 fps straight after 60 fps', 16.7, 60, 200, 1000],
+  ['dead after a drop from 60 to 25 fps', 16.7, 60, 40, 500],
+  ['dead at 10 fps', 100, 20, 100, 1000],
+  ['dead at 60 fps', 16.7, 60, 16.7, 500],
+]) {
+  const { w, st } = await startHealthy(preMs, pre);
+  const before = stats(w).keyRequests;
+  w.holdOutputs(true);
+  let n = 0;
+  while (n < 80 && stats(w).keyRequests === before) { await atRate(w, st, ms, 1); n++; }
+  eq(label + ': requests', stats(w).keyRequests - before, 1);
+  const took = (n - 1) * ms;
+  if (took <= limitMs) ok(label + ': caught ' + took.toFixed(0) + ' ms after the first unanswered frame');
+  else fail(label + ': took ' + took.toFixed(0) + ' ms, limit ' + limitMs);
+}
+for (const [label, preMs, pre, ms, n] of [
+  ['healthy 5 fps for 30 s', 200, 5, 200, 150],
+  ['healthy 5 fps for 30 s after 60 fps', 16.7, 60, 200, 150],
+  ['healthy 25 fps for 30 s after 60 fps', 16.7, 60, 40, 750],
+  ['healthy 1 fps for 30 s after 60 fps', 16.7, 60, 1000, 30],
+]) {
+  const { w, st } = await startHealthy(preMs, pre);
+  const b = stats(w);
+  await atRate(w, st, ms, n);
+  const a = stats(w);
+  eq(label + ': requests', a.keyRequests - b.keyRequests, 0);
+  eq(label + ': dropped', a.framesDropped - b.framesDropped, 0);
+}
+{
+  // A pipelined decoder that always holds eight pictures and answers every input with one: over
+  // the in-flight cap for good, at any rate, and perfectly healthy.
+  const { w, st } = await startHealthy(16.7, 60);
+  w.holdOutputs(true);
+  await atRate(w, st, 2, 8);       // the pipeline fills, then answers one for one
+  w.releaseOutputs(1); await w.settle();
+  const b = stats(w);
+  for (const ms of [200, 40, 16.7]) for (let k = 0; k < 60; k++) { await atRate(w, st, ms, 1); w.releaseOutputs(1); await w.settle(); }
+  const a = stats(w);
+  eq('healthy, eight pictures held at 5/25/60 fps: requests', a.keyRequests - b.keyRequests, 0);
+  eq('healthy, eight pictures held at 5/25/60 fps: dropped', a.framesDropped - b.framesDropped, 0);
+}
+{
+  // A machine that slept with two submits outstanding: the first frames after it wakes reach the
+  // pump before the decoder's outputs do.
+  const { w, st } = await startHealthy(16.7, 60);
+  const b = stats(w);
+  w.holdOutputs(true);
+  await atRate(w, st, 16.7, 2);
+  w.advance(60000);
+  await atRate(w, st, 1, 4);
+  w.releaseOutputs(); await w.settle();
+  eq('wake from sleep: requests', stats(w).keyRequests - b.keyRequests, 0);
 }
 
 if (failures) {

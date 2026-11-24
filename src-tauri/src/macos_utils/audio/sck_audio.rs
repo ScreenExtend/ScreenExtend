@@ -90,7 +90,20 @@ impl SckAudioCapture {
         let cls_config = runtime_class(c"SCStreamConfiguration")?;
         let cls_stream = runtime_class(c"SCStream")?;
 
-        let display = resolve_any_display(cls_content)?;
+        // `getShareableContent` raises the Screen Recording alert on macOS 15+ while the app is
+        // unauthorized, and this runs automatically at system-audio start. It is refused only
+        // on a *definite* denial — the same rule the video pipeline applies before it starts
+        // its own SCStream at this same join. An unknown read (a host granted while running,
+        // with no other window on screen to confirm it) must not silence the session.
+        let Some(permit) = crate::macos_utils::permissions::capture_start_permit() else {
+            return Err(AudioCaptureError::Setup(
+                "Screen Recording is definitely denied for this process (the live window list \
+                 shows other apps' windows with their titles stripped), so ScreenCaptureKit \
+                 audio is not started"
+                    .into(),
+            ));
+        };
+        let display = resolve_any_display(cls_content, permit)?;
 
         let arr_cls = runtime_class(c"NSArray")?;
         // SAFETY: standard runtime construction, mirroring the video sck.rs
@@ -569,7 +582,11 @@ unsafe fn get_ctx_ivar(delegate: &AnyObject) -> *mut OutputCtx {
     unsafe { (*slot).cast::<OutputCtx>() }
 }
 
-fn resolve_any_display(cls_content: &AnyClass) -> Result<Retained<AnyObject>, AudioCaptureError> {
+/// `SCShareableContent` is a prompting API while unauthorized, hence the permit.
+fn resolve_any_display(
+    cls_content: &AnyClass,
+    _permit: crate::macos_utils::permissions::PromptPermit,
+) -> Result<Retained<AnyObject>, AudioCaptureError> {
     let (tx, rx) = mpsc::channel::<Option<usize>>();
     let handler = RcBlock::new(move |content: *mut AnyObject, error: *mut AnyObject| {
         if !error.is_null() || content.is_null() {

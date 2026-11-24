@@ -13,5 +13,15 @@
 
     <key>com.apple.security.device.audio-input</key>
     <true/>
+
+    <!-- Hardened runtime stays on, so DYLD_INSERT_LIBRARIES / DYLD_LIBRARY_PATH cannot inject
+         code into a process holding Screen Recording and Accessibility. Library validation
+         is what is relaxed instead: with an ad-hoc signature there is no Team ID, and the
+         runtime refuses to map resources/libopus.dylib ("mapping process and mapped file
+         (non-platform) have different Team IDs") without this key. Measured on a test loader
+         signed both ways; see MAC-TCC-SIGN in docs/OPTIMIZATIONS.md. Drop it once the app and
+         the dylib are signed with one Developer ID. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
 </dict>
 </plist>

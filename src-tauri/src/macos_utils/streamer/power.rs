@@ -49,6 +49,11 @@ impl KeepAwake {
                 ids.push(id);
             }
         }
+        super::tune::record(
+            "keep_awake",
+            !ids.is_empty(),
+            serde_json::json!({ "assertions": ids.len() }),
+        );
         if ids.is_empty() {
             teprintln!("[power] keep-awake assertions failed; system/display may sleep mid-stream");
         } else {

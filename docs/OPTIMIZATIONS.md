@@ -4782,3 +4782,1407 @@ selection, the thresholds, the env override, the refusal table and the exit-code
 UAC click; agents may not elevate, and the owner's app was running), whether `DIF_PROPERTYCHANGE`
 actually ends the 14.7 GB host on this driver (the INF's `ProcessSharingDisabled` says it should),
 the modal on screen, and macOS/Linux stubs (`UNVERIFIED (not compiled)`). Steps: `FUTURE-TEST-WORKFLOW.md` D-6.
+
+## MAC-CQP-CEILING — constant QP on VideoToolbox gets a bitrate ceiling
+
+**Status: replay-measured on one Mac (macOS 26.7.1, Apple silicon, 1080p60, QP 15); live client and
+every other Mac UNVERIFIED.** **Superseded on capable Macs by `MAC-RATE-TIERS`**: a session whose
+encoder supports per-frame `BaseFrameQP` no longer uses the ceiling; it survives as the
+`ClampCeiling` tier for low-latency sessions without per-frame QP.
+
+The low-latency encoder rejects `Quality` and only clamps QP, so its rate controller keeps running.
+With no `AverageBitRate` it dropped 1163 of 1359 frames (85.6 %) of a recorded window drag at 2.1
+Mbps. The drops were invisible: the output callback ignored `kVTEncodeInfo_FrameDropped`. They are
+now counted as `encoder_rate_drops`.
+
+| `AverageBitRate` | dropped | sent | SPS level |
+|---|---|---|---|
+| unset (before) | 1163 | 2.1 Mbps | 4.2 |
+| 12.4 Mbps | 430 | 6.7 Mbps | 4.2 |
+| 100 / 120 / 200 Mbps | 2 | 10.9 Mbps | not read |
+| 150 Mbps | fails, -12904, 6 of 6 | | |
+| **300 Mbps (shipped)** | **0** | 10.9 Mbps | 5.1 |
+| 1 Gbps | 0 | 10.9 Mbps | 6.2 |
+
+Open: the -12904 cause; the SPS level (5.1) exceeding what `negotiate.rs` answers at 1080p60; burst
+behaviour on a weak link, since constant QP ignores congestion control. `SE_VT_QP_BPS` overrides the
+ceiling (0 = none). Frames are recorded with `SE_RAW_RECORD` and replayed with `SE_RAW_REPLAY`
+(`macos_utils/streamer/raw_capture.rs`).
+
+## BENCH-M1 — encoder recipes as data, and a self-contained VideoToolbox benchmark
+
+**Status: VERIFIED on one Mac (MacBookAir10,1, M1, macOS 26.7.1) for arm64 and for the x86_64
+slice under Rosetta; the 10.15 Intel run is UNVERIFIED until the results file comes back.**
+
+- `macos_utils/streamer/vt_recipe.rs`: a `Recipe` (codec, spec, props in order, frame options,
+  `flush_each_frame`) in JSON, every key a short name resolved with `dlsym`; a symbol that does not
+  resolve is the outcome `missing_symbol`. Each key records resolved / advertised by the session's
+  own `VTSessionCopySupportedPropertyDictionary` / set status / read-back.
+- `EncoderConfig.recipe` (and `SE_VT_RECIPE=<file>` for a running host) builds the session from the
+  recipe alone: one create, no ladder, exactly its props. `None` is the shipped path unchanged
+  (replayed: 0 drops, level 5.1, identical bytes p50/p95/max to the recipe that spells it out).
+  `CompressedSample` now carries the callback status, info flags and an `Instant` stamped at callback
+  entry; `Encoder::submit_ex`, `set_property`, `read_property`, `recipe_report`.
+- `ScreenExtend bench` (`--features bench`, `src/bench/`): env, probe and lab stages, one child
+  process per unit with a watchdog, `runs.jsonl` + one `results-<host>.json`. Replaces the
+  `replay_recorded_take` test in `raw_capture.rs` (the recorder stays). Universal build and 10.15
+  floor checks: `scripts/build-bench-macos.sh`.
+
+Measured while reproducing MAC-CQP-CEILING through the new engine (drag.raw, 1359 frames):
+
+- 150 Mbps does not fail at one frame: **every** callback, from frame 0, is status 0 with
+  `kVTEncodeInfo_FrameDropped` and no sample (1359 of 1359, no picture ever), and the -12904 is the
+  final `VTCompressionSessionCompleteFrames`. No encode call fails.
+- The non-low-latency hardware encoder (`…ave.avc`) **blocks inside `EncodeFrame`** at 1080p60
+  QP 15 with `RealTime`: call p50 11.5 ms, max 74 ms, so submits fell up to 2.9 s behind and
+  submit→callback p50 was 170 ms. The low-latency encoder's call is ~30–40 µs. The bench reports
+  lateness caused by a still-running encode call separately from lateness caused by the harness.
+- The synthetic `window_drag_stress` clip reproduces the failure without the recording: 589 of 600
+  dropped with no `AverageBitRate`, 1 of 600 under the 300 Mbps ceiling.
+
+## MAC-TCC-SIGN — the release app was never whole-signed, so no TCC grant could match it — `VERIFIED` (local arm64 build) / `UNVERIFIED` (universal CI build)
+
+**Defect.** 0.7.0 on an M1 (macOS 26.7.1): no `Contents/_CodeSignature`, `Info.plist=not
+bound`, `Sealed Resources=none`, identifier `ScreenExtend-5227d5090939e562`,
+`flags=0x20002(adhoc,linker-signed)`; only the arm64 slice carried the linker's signature, the
+x86_64 slice none, and `SecCodeCopyDesignatedRequirement` on the bundle returned -67062. TCC
+stored the user's grants with a csreq of two cdhashes, neither the running one, so every check
+stayed false and the bootstrap gate could not be passed.
+
+**Change.** `tauri.macos.conf.json`: `bundle.macOS.signingIdentity: "-"` (and, since
+MAC-TCC-SILENT3, `hardenedRuntime: true` with `com.apple.security.cs.disable-library-validation`
+in `Entitlements.plist` — the paragraph below describes the first version of this change). The Tauri 2.6.2 bundler (`tauri-bundler/src/bundle/macos/app.rs`) then runs `codesign
+--force -s - --entitlements Entitlements.plist` on `Contents/MacOS/ScreenExtend` (all slices)
+and then on the `.app`, inside `app::bundle_project`, before the DMG and the updater tarball
+are built from it; the DMG itself is not signed for `"-"` (`dmg/mod.rs`, tauri#12288).
+Hardened runtime was first turned off because ad-hoc + runtime turns on library validation with
+no Team ID: a test loader on macOS 26 got `dlopen … not valid for use in process: mapping
+process and mapped file (non-platform) have different Team IDs` for an ad-hoc dylib, i.e.
+libopus would not load. That threw away DYLD-injection protection on a process holding Screen
+Recording and Accessibility; MAC-TCC-SILENT3 turns the runtime back on and relaxes library
+validation alone. New `scripts/check-macos-signature.sh` (verify --deep --strict, identifier ==
+bundle id, Info.plist bound, resources sealed, every slice's CDHash in the DR or a non-cdhash
+DR satisfied) gates `build-release.yml` on the `.app` and on the `.app` inside the updater
+tarball. The script was exercised on a synthetic linker-signed universal bundle (fails, -67062,
+x86_64 unsigned: the 0.7.0 state), the same bundle ad-hoc signed (passes, DR = both cdhashes),
+an identifier DR (passes) and a mismatched identifier DR (fails).
+
+**Measured.** Local `pnpm tauri build --config src-tauri/tauri.macos.conf.json --bundles app`
+(arm64): `flags=0x2(adhoc)`, `Identifier=app.screenextend.desktop`, `Info.plist entries=19`,
+`Sealed Resources version=2 rules=13 files=2`, DR `cdhash H"ebca6f40…"` == slice CDHash,
+`open -n -W -a … --args --version` → `ScreenExtend 0.7.0`. Not verified: the universal CI
+build (both slices) and a human granting the permission on it. (When this entry was written the
+committed `resources/libopus.dylib` was x86_64-only and unsigned; it has since been replaced by
+an ad-hoc-signed universal x86_64 + arm64 build, libopus 1.6.1 — see `resources/PROVENANCE.md`
+— and `check-macos-signature.sh` now checks every Mach-O under `Contents/Resources` for a valid
+signature and every architecture the main executable has.)
+
+An ad-hoc DR is a cdhash set, so a grant still does not survive an update. An explicit
+identifier DR would, at the cost of letting any local binary claiming the identifier inherit
+the grant; that is left to the owner (not implemented).
+
+## MAC-TCC-PROMPT — the permission poll re-raised the system dialog every 2 s — `COMPILE-CHECKED` (policy and call sites unit-tested; one-prompt behaviour unverified on screen)
+
+**Defect.** `screen_recording_status()` kicked a background `SCShareableContent` probe on every
+`check_permissions` (2 s refresh). On macOS 15+ that call raises the screen-recording alert
+whenever the app is unauthorized, so while the bootstrap gate polled, the alert reappeared over
+System Settings. `ensure_screen_recording_access()` also called `CGRequestScreenCaptureAccess`
+at every pipeline start that was not a definite yes.
+
+**Change** (`macos_utils/permissions.rs`, `streamer/mod.rs`, `streamer/sck.rs`, bootstrap gate,
+lapse dialog). APIs are split into silent (`CGPreflightScreenCaptureAccess`, the window-name
+probe, `AXIsProcessTrusted`) and prompting (`CGRequestScreenCaptureAccess`, the AX prompt
+option, `SCShareableContent` / starting a stream while unauthorized). Every periodic or
+automatic path is silent: `check_permissions`, `screen_recording_live`,
+`ensure_screen_recording_access` (now returns `false` on a definite denial and never requests),
+`prime`, and the session watchdog. Prompting calls take a `PromptPermit`, minted only by
+`prompt_gate` (first-ever request for that permission, persisted in
+`<app-local-data>/permission-requests.json`, honouring `SCREENEXTEND_DATA_DIR`; or an explicit
+Retry) and by `silently_granted_permit` (a silent read already said granted — `doctor`'s SCK
+confirmation). The decision is the pure `prompt_policy`. On an explicit Retry when a request
+was recorded before this process started and the silent reads still say denied, the host runs
+`tccutil reset ScreenCapture|Accessibility <bundle id>` first (only from an `.app` with a
+bundle id), logs one line, and says so in `PermissionStatus.detail`. (Superseded in part by
+MAC-TCC-SILENT3: "denied" is now three-way, the reset needs a *definite* denial, the marker is
+per TCC identity, and there is a third permit for capture start.) Retry is signalled as the
+key prefix `retry:` so `bindings.ts` is unchanged. The UI polls `checkPermissions` only, calls
+`requestPermission` automatically once per bootstrap (a no-op after the first ever), and has
+a visible Retry per row and in the lapse dialog; Open Settings only opens the pane.
+
+**Tests.** Six policy cases (first prompts; poll never; automatic after relaunch never; retry
+prompts; retry after relaunch while denied resets; granted never), marker round-trip, process
+start time, and two source-level tests: the permit is minted only in the two functions, every
+prompting call site is in a function taking a permit, no periodic entry point mints one, and no
+other file in `src/` names `CGRequestScreenCaptureAccess` / the AX prompt.
+
+**Not verified.** (This paragraph used to list `audio/sck_audio.rs` and `pipeline.rs` as not
+changed. Both are gated now: `pipeline.rs`'s `require_screen_recording` refuses a capture start
+on `ensure_screen_recording_access() == false`, and `sck_audio.rs` takes a `PromptPermit` before
+`getShareableContent` — see MAC-TCC-SILENT3 for which answer each acts on.) The one-prompt
+behaviour needs a person at the screen: `docs/manual-tests/macos-permissions.md`, "One prompt,
+then silence".
+
+## MAC-TCC-SILENT3 — a stale cached negative was read as a definite denial; three-way silent state, `serve`'s first request, hardened runtime back on — `COMPILE-CHECKED` (policy unit-tested) / `VERIFIED` (hardened runtime + library loading, local arm64 build) / `UNVERIFIED` (on-screen behaviour)
+
+**Defects** (independent review of MAC-TCC-PROMPT). (1) `screen_recording_live()` fell back to
+`CGPreflightScreenCaptureAccess`'s negative when the window probe had nothing to read, and the
+silent read mapped that to `Denied`. Preflight is cached per process, so a host granted while
+running, with no other titled window on screen, refused every join (`require_screen_recording`),
+had its live sessions kicked by the watchdog with "Screen Recording Was Turned Off", could
+`tccutil reset` the grant just made on a Retry, and SCK audio refused to start. (2) `serve` never
+requested Screen Recording, so a headless host never appeared in the list. (3) A Retry in the same
+process never reset a stale row. (4) The Accessibility reset trusted `AXIsProcessTrusted` alone.
+(5) The lapse dialog's Retry could double-fire; two gate exits could run `proceed()` twice.
+(6) Hardened runtime was off. (7) The signature check ignored `Contents/Resources`. (8) A bare
+dev binary wrote the same request marker as the `.app` and suppressed its one automatic prompt.
+
+**Change.**
+- `permissions.rs`: `Silent` is `Granted | DefinitelyDenied | Unknown`, with a source
+  (`SilentRead`), decided by the pure `classify_screen_recording(confirmed, preflight, on_screen,
+  titled_anywhere)`. `DefinitelyDenied` needs ≥ 2 foreign normal windows on screen from ≥ 2
+  processes, none titled (`DENY_MIN_WINDOWS` / `DENY_MIN_OWNERS`; one untitled window, or several
+  from one app, is ordinary even with the grant — measured 1 of 4 untitled on an authorized
+  session), in a process that has never latched `CONFIRMED`. The cached preflight negative never
+  contributes. A titled foreign window **off** screen counts as a grant (positive evidence only:
+  22 of 25 off-screen layer-0 windows were untitled on an authorized session), which is what
+  makes Show Desktop readable. Any `Granted` read latches `CONFIRMED`; after it no negative is
+  definite. `screen_recording_live()` keeps its `Option<bool>` signature (the bench reads it) but
+  `Some(false)` now means `DefinitelyDenied` only.
+- Accessibility: `DefinitelyDenied` only when `AXIsProcessTrusted` is false *and* a synchronous
+  AX messaging probe returns `kAXErrorAPIDisabled`, with `AXIsProcessTrusted` re-read after the
+  probe. The module comment claiming `AXIsProcessTrusted` is cached per process was unsupported
+  and is corrected (not verified either way here; nothing depends on it now).
+- `prompt_policy(first, retry, silent, owns_identity)`: reset iff explicit Retry **and**
+  `DefinitelyDenied` **and** the process owns its TCC identity — regardless of when the first
+  request happened. `owns_tcc_identity()` = bundle id **and** parent is launchd: an `.app`
+  executable started from a shell is attributed by TCC to the terminal, the same as a bare binary.
+  Only such a process reads or writes `permission-requests.json`; anything else keeps the record
+  in memory (may prompt once per process, persists nothing).
+- Third permit, `capture_start_permit()` (Some unless `DefinitelyDenied`), used by `sck_audio.rs`:
+  the video pipeline already starts its own `SCStream` on the same `Unknown`.
+- `serve` calls `prompt_gate(KEY_SCREEN_RECORDING, false)` on a thread at startup (a source test
+  pins `cli.rs::run_serve` as the only outside caller).
+- Watchdog (`macos_utils/mod.rs`): acts on `screen_recording_live() == Some(false)` alone. The old
+  "prior `Some(true)`" requirement is gone because any positive now latches `CONFIRMED`, which
+  would make the edge unreachable. Consequence, stated plainly: it catches a session that started
+  on `Unknown` and is streaming wallpaper; it cannot see a grant *withdrawn* from a process that
+  confirmed one. It mostly could not before either — a process that starts authorized has
+  preflight `true` cached for life.
+- `ensure_screen_recording_access()` reads `screen_recording_silent()` and refuses only on
+  `DefinitelyDenied`; `pipeline.rs` is unchanged and becomes correct through that.
+- The startup gate's `screen_recording_status()` still shows "not granted yet" for a cached
+  preflight negative with nothing on screen (so a first run with an empty screen still opens the
+  gate and makes the one request), with detail text saying it is unconfirmed. It is display only.
+- UI: lapse-dialog Retry disabled while in flight (state + ref); bootstrap's poll, Re-check and
+  Retry leave the gate through one `leavePermissionGate()` that starts `proceed()` once per gate
+  opening; Re-check has its own in-flight guard. Copy no longer says a reset entry was one "macOS
+  was not honouring" (it may simply have been switched off); the lapse dialog says "Screen
+  Recording Is Off" (never granted, or turned off).
+- Packaging: `hardenedRuntime: true` + `com.apple.security.cs.disable-library-validation`.
+  `check-macos-signature.sh` step 6 checks every Mach-O under `Contents/Resources`.
+
+**Measured** (MacBookAir10,1, macOS 26.7.1). A universal test loader that `dlopen`s
+`src-tauri/resources/libopus.dylib` (ad-hoc, universal, libopus 1.6.1): signed ad-hoc with
+`--options runtime` + `disable-library-validation` → `dlopen OK: libopus 1.6.1` (arm64, and x86_64
+under Rosetta); the same without the entitlement → `dlopen FAILED … mapping process and mapped
+file (non-platform) have different Team IDs` on both slices; signed with the app's own
+`Entitlements.plist` + runtime, loading the copy inside the built bundle → OK. With
+`DYLD_INSERT_LIBRARIES` set to an ad-hoc dylib whose constructor prints, the hardened loader and
+the built app's executable (`--version`) print nothing injected; an unhardened re-signed copy of
+the same executable prints `INJECTED`. Local `pnpm tauri build --config
+src-tauri/tauri.macos.conf.json --bundles app` (arm64): `flags=0x10002(adhoc,runtime)`, the
+entitlement present in `codesign -d --entitlements -`, `check-macos-signature.sh` ok (including
+`libopus.dylib is signed (x86_64 arm64)`), `open -n -W -a … --args --version` → `ScreenExtend
+0.7.0`. The script fails on a copy whose dylib signature was stripped (path with spaces) and on
+a re-sealed copy carrying an x86_64-only dylib, which steps 1–5 alone pass. Not run: the GUI
+(WKWebView under the hardened runtime — WebKit's JIT lives in its own Apple-signed WebContent
+process, so no `allow-jit` is expected to be needed, but that is not observed here) and an
+actual Opus encode inside the app.
+
+**Tests.** `classify_screen_recording` (granted-while-running + nothing to read ⇒ `Unknown` ⇒ no
+refusal / kick / reset; definite denial ⇒ all three; `CONFIRMED` ⇒ never definite; preflight
+negative alone never definite), `classify_accessibility`, the policy table, identity ownership,
+the bare-binary marker, and the source pins (three mint sites, permit-taking call sites, periodic
+entry points, `run_serve` as the only outside `prompt_gate` caller).
+
+**Not verified.** Everything on screen: the stale-cache case, the `serve`-only first run, Retry
+with and without other windows (`docs/manual-tests/macos-permissions.md`). Whether the 2-window
+threshold ever reads a genuinely authorized screen as denied (it needs every window of ≥ 2 apps
+untitled). On `Unknown` with a genuinely unauthorized host on macOS 15+, a join's capture start
+(video, and SCK audio on 13.0–14.1) may raise the system alert — accepted by design: the
+alternative refuses every join of a host granted while running.
+
+## BENCH-M2 — production-path replay, deny hook, tuning switches, churn, sessions, LTR harness
+
+**Status: VERIFIED on one Mac (MacBookAir10,1, M1, macOS 26.7.1, low-power mode on) for the bench
+machinery; every tuning candidate is COMPILE-CHECKED + "applied" recorded, latency effect
+UNVERIFIED (to be measured from plans). Default production behaviour unchanged (re-replayed:
+drag.raw through `production {qp:15}` in the lab → 0 of 1359 dropped, level_idc 51, 10.854 Mbps).**
+
+- `bench` lab engine: event `set_frame_opt` (`Encoder::set_frame_opt`, layered over the recipe's
+  `frame_opts`, `null` removes); `sessions: N` (N encoders in one child fed the same buffers;
+  top-level = session 0, plus `per_session` and `aggregate`); a background sampler (RSS, thermal,
+  low-power every 5 s → `series`) and `buckets_10s` / `buckets_60s` (frames, emitted, dropped,
+  errored, Mbps, latency summary); the watchdog is estimate × 1.1 + slack; a `churn` child kind
+  (create → K frames → destroy, M times; create/destroy ms, statuses, RSS / fds / mach ports /
+  threads at start, every 10 cycles and at the end).
+- `"stage": "pipe"` (`src/bench/pipe.rs`): the clip is published into the production latest-frame
+  slot and runs through `pipeline::spawn_pipeline` (now `pub(crate)`) — in-flight cap, stall
+  bypass, keepalive, IDR requests, drain — then through `H264Packetizer` at the LAN MTU and
+  `SessionTelemetry::record_frame`. Reports offered / submitted / repeated / coalesced / encoded /
+  rate drops / output-queue drops / broadcast lag, the per-stage FrameTiming spans and the
+  telemetry JSON verbatim. The telemetry gained `frames_submitted` (macOS encode loop) and
+  `host_power` (only with the `power_report` candidate); both are omitted from the JSON while empty.
+- `SE_VT_DENY` (+ mandatory `SE_TEST_HOOKS=1`; `vt_recipe::Deny`): `prop:` / `frame:` / `spec:` /
+  `read:` / `create:lowlatency`. Plans: `"deny": [...]`. Measured: `create:lowlatency` → the
+  production default lands on `…h264.ave.avc` (hardware, not low-latency) and encodes 600/600;
+  a low-latency recipe fails create with -12902.
+- `SE_TUNE_OFF` / `SE_TUNE_ON` (`macos_utils/streamer/tune.rs`), audit in
+  `docs/research/macos-tuning-audit.md`. Every call site records what it got; results carry
+  `"tuning"`. Nothing new is on by default.
+- The pipe stage's offer thread is a deadline thread: at USER_INTERACTIVE QoS alone (low-power
+  mode) 413 of 600 offers were > 2 ms late (p50 3.4 ms) — harness error, now removed.
+- Churn, 50 × (create, 30 frames, destroy) at 1080p60 on the low-latency encoder: create p50
+  14.4 ms (first 411 ms), destroy p50 26.8 ms, no failures; mach ports +192 and threads +7 after
+  the first cycle and flat afterwards (framework initialisation, not a per-session leak), fds +0.
+- Pipe stage, 1080p60, one run each (M1, low-power mode on): offer→packetized p50 / p99 —
+  synthetic stress, `production {qp:15}` 7.76 / 9.44 ms (1 rate drop of 598, the same frame the lab
+  drops), BaseFrameQP-15 recipe 7.90 / 9.34 ms (0 drops); drag.raw 8.14 / 15.31 ms and 8.04 /
+  15.27 ms (0 drops, 9 replayed client IDRs, 24–25 keepalive repeats). Of that, submit→encoded
+  (callback + drain hand-off) is ~7.7–8.0 ms, offer→submit ~0.02 ms, encoded→packetized ~0.05 ms.
+- **`max_num_ref_frames` is now read from the SPS, and the shipped constant-QP path declares 15.**
+  The low-latency encoder under the 300 Mbps ceiling (level 5.1) writes `max_num_ref_frames = 15`;
+  the BaseFrameQP recipe (level 4.2) writes 4; the standard `ave.avc` encoder writes 1. Relevant to
+  UX-GREEN (a hardware decoder sizing its DPB from this field). UNVERIFIED on any client.
+- LTR harness (`"ltr": {"ack": ...}` + event `force_ltr_refresh`), BaseFrameQP-15 recipe, stress
+  clip, refreshes at 3 s and 6 s: `EnableLTR` sets and reads back true on the low-latency encoder.
+  ack `all`: a token on 596 of 600 frames, `ForceLTRRefresh` frames are 2.1 / 2.3 KB P frames
+  carrying `ReferenceWasRefreshed = true`, no PSNR dip. ack `none`: only 9 tokens, and each refresh
+  becomes an IDR (1.58 MB, PSNR 47.68 → 47.11 recovering over 5 frames). ack after 30 frames: a
+  token every 30 frames, refreshes are P frames of 82 KB and 1.03 MB (PSNR dip to 45.9 at the
+  second). VTDecompressionSession decoded all 600 frames with no failure in all three. One run each.
+
+## MAC-OPUS-UNIVERSAL — the bundled `libopus.dylib` was x86_64-only and unsigned, so Apple silicon had no system-audio encoder — `VERIFIED` (load + encode on both slices, crate ABI tests on arm64) / `UNVERIFIED` (live capture end to end on Apple silicon)
+
+**Defect.** `src-tauri/resources/libopus.dylib` (also inside the released 0.7.0 app) was a
+hand-rolled generic-C `clang` build of git commit `03647f5`, made on the 10.15 dev box:
+`lipo -archs` → `x86_64`, `codesign -dv` → `not signed at all`. The app ships universal, so its
+arm64 process could not map it — `dlopen` fails with `incompatible architecture (have 'x86_64',
+need … 'arm64')` — and every macOS audio tier on Apple silicon ended at "could not load libopus".
+
+**Change.** Replaced it with the official **libopus 1.6.1** release tarball (SHA-256
+`6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1`, matching xiph's `SHA256SUMS.txt` and opus-codec.org), configured and
+built once per architecture with upstream's autotools (x86_64 `-mmacosx-version-min=10.15`,
+arm64 `-mmacosx-version-min=11.0`, `-O2`, float API, shared only, `--enable-float-approx`
+kept from the previous build), joined with `lipo`, install name `@rpath/libopus.dylib`, then
+ad-hoc signed. The version moved from the git snapshot to the nearest release, because a
+snapshot has no published checksum; all 40 error/CTL constants in `opus_sys.rs` match 1.6.1's
+`opus_defines.h`. The build also gains upstream's SIMD (SSE4.1/AVX2 with RTCD on x86_64, NEON
+on arm64) that the generic-C build lacked; not measured as a latency change (5 ms CELT frames
+are microseconds to encode either way). Exact commands, toolchain and the Developer-ID re-sign
+requirement are in `resources/PROVENANCE.md`; `SHA256SUMS` re-pinned
+(`7eafaa8c818e311a59194ef037fc706236a6dbcdddb1e6a7244c29a1b4969a3d`). The `opus_sys.rs` doc comment's version string was updated; no code
+changed.
+
+**Measured.** `lipo -archs` → `x86_64 arm64`, 1,045,216 bytes (was 491,688), `flags=0x2(adhoc)`,
+`codesign --verify --strict` valid. `minos` 10.15 / 11.0, `otool -L` only libSystem, x86_64
+`nm -u` all 10.15-present (newest `___chkstk_darwin`, which the old 10.15-SDK build imported
+too). A standalone `dlopen` loader encoding ten 5 ms 48 kHz stereo float frames in
+`RESTRICTED_LOWDELAY` printed `libopus 1.6.1`, `application=2051 bitrate=128000`, TOC `0xec`
+(config 29 = CELT FB 5 ms, stereo), packets 120/83/87/84/84/85/81/104/81/81 bytes — identical
+natively on arm64 and under Rosetta (`arch -x86_64`); the old file failed the arm64 `dlopen`.
+`SE_REQUIRE_HW=1 cargo test --release --lib streamer::audio` on arm64 with the library on
+`DYLD_LIBRARY_PATH`: 23 passed, including all six `opus_abi` tests (CTL round trips, error
+strings, TOC). `shasum -a 256 -c SHA256SUMS`: 34 OK.
+
+**Not verified.** Real system-audio capture → Opus → client on Apple silicon (needs a live
+session); the crate tests on the x86_64 slice (only the C loader exercised it); the 10.15-SDK
+`check-macos-dyld.sh` run (needs the dev Mac's SDK); loading inside a bundled universal `.app`
+(the bundle-path lookup in `open_library` is unchanged, and an ad-hoc dylib loads only while the
+app has no hardened runtime — true of the current `tauri.macos.conf.json`). Under a future
+Developer ID build the dylib must be re-signed with the team identity, or library validation
+refuses it.
+
+## MAC-RATE-TIERS — VideoToolbox rate control chosen per session by capability; drop guard; verified low-latency detection — `VERIFIED` (M1, macOS 26.7.1, replay + pipe stage) / `UNVERIFIED` (Intel 10.15, macOS 11–15, live client)
+
+**Defects.** (1) The ladder put the *literal* string `EnableLowLatencyRateControl` in the encoder
+specification. 10.15 has no such key, ignores it without an error and creates the standard
+encoder (`h264.gva`), so the low-latency rung "succeeded", `low_latency` read true and the
+300 Mbps constant-QP ceiling went to Quick Sync: level 5.1, a 2 MB first keyframe, worse tails.
+(2) Constant QP on the low-latency encoder (`h264.rtvc`) was a QP clamp over a rate controller
+that keeps running, which needed the ceiling (MAC-CQP-CEILING) and still declared level 5.1 and
+`max_num_ref_frames = 15` and dropped 1 frame of the stress clip. (3) On a non-low-latency
+session the constant-QP path set `Quality` and QP clamps — rejected there, or (QP clamps on
+`ave.avc`) a stall inside `EncodeFrame`. (4) A forced keyframe dropped by rate control was never
+re-requested. (5) After an error-driven encoder reset the loop subtracted the new encoder's
+zeroed counters from the old ones (u64 underflow). (6) `pipeline::start*` ignored a definite
+Screen Recording denial, and `sck_audio` called `getShareableContent` unguarded.
+
+**Change** (`macos_utils/streamer/encoder.rs`, `pipeline.rs`, `streamer/telemetry.rs`,
+`macos_utils/compatibility.rs`, `macos_utils/audio/sck_audio.rs`, one line pair in
+`bench/replay.rs`):
+
+- The low-latency rung exists only when `kVTVideoEncoderSpecification_EnableLowLatencyRateControl`
+  resolves by `dlsym` (`SE_VT_DENY spec:` hides it), and the spec carries the resolved constant.
+  `low_latency` now means "created with the resolved key" (recipe sessions too: only when the key
+  was `Included`). `EncoderID` and `SupportsBaseFrameQP` are read back after creation.
+- Constant quality picks a tier with the pure `select_rate_tier(&Capabilities, constant_quality)`:
+  `BaseFrameQp` (low-latency ∧ `SupportsBaseFrameQP` = true ∧ frame-option symbol resolves:
+  `kVTEncodeFrameOptionKey_BaseFrameQP = q` in every frame's options, alongside `ForceKeyFrame`;
+  no `AverageBitRate`, no QP limits, no `Quality`) → `ClampCeiling` (low-latency, Min/Max QP set
+  and read back equal to q; today's clamp + ceiling list + `SE_VT_QP_BPS`) → `LowLatencyBitrate`
+  (QP keys missing/refused; a half clamp is cleared) → `StandardBitrate` (any non-low-latency
+  session; `RealTime`, no reordering, no `Quality`, no QP limits). The bitrate tiers use
+  `constant_quality_bitrate`: `clamp(w·h·fps/10, 6, 30 Mbps) · 1.6 · 2^((15−q)/6)`, clamped to
+  2–62.5 Mbps — a first fit (Intel `gva`: 20 Mbps ≈ 47.6 dB on the stress clip, the M1's QP-15
+  quality), to be refined. `set_bitrate` stays `IgnoredConstantQp` on every constant-quality tier.
+  Adaptive mode is unchanged on a low-latency session (`AdaptiveLowLatency`) and sets
+  `AverageBitRate` only on a standard one (`AdaptiveStandard`).
+  `Quality` is no longer tried on any tier (it is rejected by `rtvc`, which is where it used to be
+  tried before the clamp, so the measured `ClampCeiling` output is unchanged).
+- Drop guard (encode loop): on `BaseFrameQp` / `ClampCeiling` / `LowLatencyBitrate`, more than 5 %
+  of ≥ 30 submits rate-dropped in any 2 s window (sliding, 250 ms steps) rebuilds the session once
+  through `reset_encoder(…, standard_only = true)` → `Encoder::new_standard`, forces an IDR,
+  counts `encoder_tier_fallbacks`, and every later reset of that session keeps the floor.
+  `BaseFrameQp` tripping is logged as UNEXPECTED.
+- A rate-control drop of a frame submitted with `ForceKeyFrame` (`forced_keyframe_lost`, carried
+  through `sourceFrameRefCon`) re-arms the IDR request; an ordinary drop does not.
+- Visibility: one `[vt] rate control: <tier> … (<encoder id>, <why>)` line per session;
+  telemetry JSON gains `encoder_id` and `rate_tier` (omitted while empty, so Windows output is
+  unchanged) and the summary line `vt=[id tier]`; `CompatibilityReport.encoder_backend` is
+  `videotoolbox-hardware (low-latency rate control key: …; BaseFrameQP frame key: …[; last
+  session: h264.rtvc BaseFrameQp])` — same specta type, `bindings.ts` untouched.
+- `FAMILY_EXTRAS` (keyed `rtvc` / `ave` / `gva` / software) applies extra properties and
+  `flush_each_frame` after the tier, outcomes logged. **Ships empty.**
+- `start` / `start_on_monitor` fail the join with a clear error when
+  `ensure_screen_recording_access()` returns false (a definite denial; still silent, unknown does
+  not block). SCK audio start requires `silently_granted_permit()` before `getShareableContent`.
+
+**Measured** (MacBookAir10,1 M1, macOS 26.7.1, 1080p60, QP 15, one run each, the production path
+through `ScreenExtend bench`; `drag.raw` = 1359-frame recorded window drag, stress = synthetic
+`window_drag_stress`, 600 frames):
+
+| run | tier | encoder | dropped | Mbps | level_idc | max_num_ref | PSNR | lat p50/p99 ms |
+|---|---|---|---|---|---|---|---|---|
+| lab, drag.raw | BaseFrameQp | h264.rtvc | 0 / 1359 | 10.854 | 42 | 4 | 51.26 | 7.74 / 10.05 |
+| lab, stress | BaseFrameQp | h264.rtvc | 0 / 600 | 8.90 | 42 | 4 | 47.60 | 7.49 / 21.64 |
+| pipe, drag.raw | BaseFrameQp | h264.rtvc | 0 (1380 submitted, 9 IDRs) | 10.87 | 42 | 4 | | |
+| pipe, stress | BaseFrameQp | h264.rtvc | 0 / 598 | 8.87 | 42 | 4 | | |
+| deny `read:SupportsBaseFrameQP` | ClampCeiling | h264.rtvc | 1 / 600 | 8.90 | 51 | 15 | | 6.73 / 23.31 |
+| deny `frame:BaseFrameQP` | ClampCeiling | h264.rtvc | 1 / 600 | 8.90 | 51 | 15 | | 6.57 / 7.18 |
+| deny read + `prop:Max/MinAllowedFrameQP` | LowLatencyBitrate (19.9 Mbps) | h264.rtvc | 0 / 600 | 7.99 | 42 | 4 | | 6.61 / 7.11 |
+| deny `spec:EnableLowLatencyRateControl` | StandardBitrate (19.9 Mbps) | ave.avc | 0 / 600 | 13.49 | 42 | 1 | | 6.50 / 7.21 |
+| pipe, deny read, `SE_VT_QP_BPS=0` | ClampCeiling → StandardBitrate | rtvc → ave.avc | 111 in the first 2 s window (111 of 118), then 0 of 480 | 14.06 | | | | |
+| adaptive `{min_qp:15, 12.44 Mbps}`, before (M2 binary) | — | h264.rtvc | 0 / 600 | 8.2658 | 42 | 4 | | 7.57 / 8.83 |
+| adaptive, after | AdaptiveLowLatency | h264.rtvc | 0 / 600 | 8.2658 | 42 | 4 | | 6.60 / 7.30 |
+
+The drop-guard run: one `encoder_tier_fallbacks`, one IDR, `encoder_resets` 0. `ClampCeiling`
+reproduces the shipped ceiling exactly (level 51, refs 15, the same 1 drop); `BaseFrameQp` gives
+the same bitrate and PSNR on the recording at level 4.2 and 4 references.
+
+**Not verified.** Intel 10.15 (`gva`): the no-symbol path → `StandardBitrate` is COMPILE-CHECKED
+and unit-tested, not run; the q→bitrate fit there is from the lead's stress-clip measurement only.
+macOS 11–15 and other Apple-silicon generations: which tier each lands on is UNVERIFIED.
+The `ave.avc` StandardBitrate run hit 13.5 Mbps against a 19.9 Mbps target (the rate controller
+spends less on this content); its quality was not measured. A live client (level 4.2 / 4 refs vs
+5.1 / 15 decoder behaviour, UX-GREEN) is UNVERIFIED. The capture-refusal and SCK-audio gates are
+COMPILE-CHECKED (no denied-permission run on this machine).
+
+**Amendments (review fixes; M1 / macOS 26.7.1, one run each unless noted).**
+
+- **Low-latency is verified by what VideoToolbox returned.** After `read_identity()` the session
+  counts as low-latency only if its `EncoderID` is the `rtvc` family or `SupportsBaseFrameQP`
+  reads true (`low_latency_confirmed`, also inside `select_rate_tier`); otherwise one log line and
+  a standard session for the profile, the tier and the adaptive configuration. Unit-tested via
+  `Capabilities` (a `gva` / `ave.avc` id with the key resolved → `StandardBitrate`).
+  COMPILE-CHECKED against a real silent downgrade (none available here).
+- **Forced-keyframe re-arm is bounded:** at most 3 re-arms per keyframe request, then the client's
+  next PLI; the log line is rate-limited to one per 5 s with a suppressed count.
+- **`ClampCeiling` with no accepted ceiling** (every candidate refused, or `SE_VT_QP_BPS=0`) takes
+  the clamp off again and runs `LowLatencyBitrate`. Taking it off was itself broken: `h264.rtvc`
+  refuses a NULL `MaxAllowedFrameQP` (-50) and `MinAllowedFrameQP` (-12902), so the old "half a
+  clamp is cleared" path never cleared anything. `clear_optional` now falls back to the widest
+  value (51 / 1, read back). Measured, pipe stage, stress clip, `deny read:SupportsBaseFrameQP` +
+  `SE_VT_QP_BPS=0`: with the NULL clear 10 of 598 dropped (clamp still 15/15 under 19.9 Mbps);
+  with the widening 0 of 599, 10.08 Mbps, level 4.2, 4 refs. The measured-bad configuration is now
+  reachable only as `SE_VT_QP_BPS=uncapped` (+ `SE_TEST_HOOKS=1`): drop guard trips at 111 of 118
+  in the first 2 s window and the session lands on `ave.avc` `StandardBitrate`, as before.
+- **The drop-guard fallback is sticky per process,** keyed by (encoder id, tier, width, height):
+  `spawn_pipeline` releases the low-latency session and starts the next one on
+  `Encoder::new_standard`, with a log line. COMPILE-CHECKED (the bench runs one pipeline per
+  process, so the second session was not exercised).
+- **Developer switches are gated:** `SE_VT_RECIPE`, `SE_VT_QP_BPS` (and the new `SE_VT_SIM_HOLD`)
+  are honoured only with `SE_TEST_HOOKS=1`, like `SE_VT_DENY`; a lone one is ignored with one log
+  line (verified: all four set without the gate → BaseFrameQp, three "IGNORED" lines;
+  `SE_VT_QP_BPS` is read only on the `ClampCeiling` tier). The bench runner's live stage now sets
+  `SE_TEST_HOOKS=1` beside the `SE_VT_RECIPE` it passes (one line in `bench/runner.rs`).
+- **The raw frame recorder is bench-only:** `raw_capture.rs` is `#![cfg(feature = "bench")]` and
+  so is its call in `submit_one`. Its take is opened `O_CREAT|O_EXCL|O_NOFOLLOW` 0600 (an existing
+  file or symlink is refused, never truncated), and only while `<path>.arm` is a regular file owned
+  by the effective uid. COMPILE-CHECKED (no take recorded).
+- **`CompatibilityReport.encoder_backend` is a bare backend name again** (`videotoolbox-hardware`),
+  as CLAUDE.md documents for `doctor --json`; the rate-control detail is a `[vt] encoder backend:`
+  log line, and per session `encoder_id` / `rate_tier` in the telemetry.
+- The "encoder ready" line names the rate control that applies (`constant QP 15 (per-frame QP)`,
+  `constant quality q=15 as 19906 kbps`, or `N kbps start (adaptive)`), not the adaptive default.
+
+Regression after all of the above: lab drag.raw `production {qp:15}` → BaseFrameQp, 0 of 1359
+dropped, level_idc 42, 4 refs, 10.854 Mbps, p50 8.05 ms; pipe drag.raw → 0 dropped, 10.868 Mbps,
+offer→packetized 8.20 / 15.24 ms. The four deny cases land on the table's tiers with the table's
+numbers (`read:` ClampCeiling 1/600 8.90 Mbps level 51 refs 15; `frame:` the same; read + QP props
+LowLatencyBitrate 0/600 7.99 Mbps level 42; `spec:` StandardBitrate `ave.avc` 0/600 13.49 Mbps
+refs 1).
+
+## BENCH-M3 — `"stage": "live"`: real virtual display, real capture, real WHEP transport, decoding client — `VERIFIED` (M1, macOS 26.7.1, arm64) / `UNVERIFIED` (x86_64 under Rosetta: join never connected; Intel 10.15 untested)
+
+- One run is one child, `bench --child live <spec>`, which `cli::fast_path` lets through and
+  `cli::dispatch` hands to `bench::live` inside Tauri's `setup` (it needs `platform::setup`).
+  The runner gives it a fresh `SCREENEXTEND_DATA_DIR` (`work/<id>.data`), loopback ports
+  28780/28743, and `SE_VT_RECIPE=<work/<id>.recipe.json>` for a recipe run. A production run seeds a
+  device override with `videoQuality = qp` and the plan's refresh rate, the state a real device has
+  after its first save.
+- Preconditions, each a recorded skip: Screen Recording granted, read **silently**
+  (preflight / window-name probe / `screen_recording_live`, nothing that prompts; test hook
+  `SE_BENCH_DENY_SCREEN_RECORDING=1` + `SE_TEST_HOOKS=1`); display backend `CGVirtualDisplay`;
+  free ports; an isolated data dir. A skip happens before `platform::setup`, so no display exists.
+- Workload (`bench/live_window.rs`): a borderless `NSWindow` at screen-saver level, placed from
+  AppKit's own frame for the display, its layer's `contents` swapped to one of six BGRA IOSurfaces
+  per frame in an explicit `CATransaction` committed and flushed on a deadline thread. AppKit and
+  CA are reached only by `AnyClass::get` / `msg_send!`. Each frame carries `draw_counter` and a
+  26-cell barcode of its index, which the client reads out of the decoded luma.
+  **Measured defect fixed on the way:** with the main run loop parked (the child sits in `setup`)
+  AppKit never learns of the new display, and the first window was clamped onto the user's main
+  screen. The window now waits, pumping the run loop, until `NSScreen` lists the display, stays at
+  alpha 0 until `CGWindowListCopyWindowInfo` says it covers the display, and is refused otherwise.
+  The same staleness hid the display's removal from `CGGetActiveDisplayList`, so the teardown poll
+  pumps too. If the window's frames do not reach capture during warm-up (< 20 %), the run switches
+  to a cursor sweep (`workload_mode: "cursor-fallback"`). That moves the user's real pointer.
+- Receiver (`bench/live_rx.rs`): RTP from the webrtc-rs track (offering High + Constrained Baseline,
+  as Chrome does), STAP-A / FU-A reassembly, capture time from the RTP timestamp (inverse of
+  `host_ns_to_rtp90k`), `VTDecompressionSession` (async, 1x real-time), and a PLI plus a wait for a
+  keyframe on an incomplete frame or a decode error.
+- Capture A/B switches, read once and default to today's values: `SE_SCK_QUEUE_DEPTH`,
+  `SE_SCK_MIN_INTERVAL` (multiple of the frame period; 0 = `kCMTimeZero`), `SE_SCK_PIXEL_FORMAT`
+  (420f/420v), `SE_SCK_SHOWS_CURSOR`, `SE_CGDS_QUEUE_DEPTH` and `SE_CGDS_MIN_FRAME_TIME`.
+  `sck::applied_knobs()` / `cgds::applied_knobs()` report what each stream was actually given.
+
+Measured (M1, macOS 26.7.1, 1920x1080@60, 12 s measured after a 1.5 s warm-up, one run each, AC
+power, low-power mode off, ScreenCaptureKit, encoder `h264.rtvc` / BaseFrameQp q=15, High profile
+negotiated `640c2a`): window_drag_stress `production {qp:15}`: 720 presented, 719 captured, 719
+received, 719 decoded, 719 distinct stamps; capture→arrival p50/p99 8.46/10.75 ms, decode 2.03/2.58,
+capture→decoded 10.50/13.13, present→capture 15.34/20.19, present→decoded 26.23/31.61, 9.7 Mbps.
+`ll-bfqp15` recipe: the same within noise (the shipped path now lands on the same BaseFrameQp tier).
+scroll: capture→decoded 8.89/9.43 ms, 1.1 Mbps. static: 683 frames received, **all repeats by
+stamp**, yet the encode loop counted 678 of them as captured (only 5 idle repeats). With the window
+static, ScreenCaptureKit kept delivering about 57 fps. Under Rosetta (x86_64 slice) the host
+created the display, started SCK capture and the encoder, but the peer connection never reached
+Connected in 10 s. Unexplained; the result now records the client's ICE and PC state transitions
+and the candidates.
+
+## HOLD-PUSH — a one-frame-hold encoder sat on the newest frame until the next one arrived — `VERIFIED` (real `h264.gva`, 10.15.8, r2; M1 no-op) / r3 fixes `VERIFIED` against the simulation only
+
+**Defect** (lead's measurement: 2012 Intel MacBook Pro, macOS 10.15.8, `…h264.gva`, 1080p,
+real-time replay, 0 drops in every run). Submit→output latency tracks the frame *interval*:
+120 fps 13.2 ms p50, 60 fps 23.3, 30 fps 42.6, 20 fps 59.4, 10 fps 110.8. This encoder emits frame
+N only when N+1 is submitted, then needs ~5–10 ms. `MaxFrameDelayCount` 0/1/2/3 is accepted and
+changes nothing; `CompleteFrames` after every frame emits at once (14 ms) but makes every frame an
+IDR (850 KB) — unusable. In the encode loop: during motion every frame is one interval late, and
+when the screen stops the last frame waits for the 200 ms keepalive. The M1 (`h264.rtvc`, and
+`ave.avc`) does not hold: ~6.7 ms after submit regardless of cadence.
+
+**Change** (`macos_utils/streamer/pipeline.rs`, `encoder.rs`, `tune.rs`, `streamer/telemetry.rs`,
+`bench/pipe.rs`). A pure state machine, `HoldPush` (submits / emissions / clock in, `Due` out),
+drives a **push**: a resubmit of the newest real frame's pixel buffer as a repeat
+(`FrameTiming::repeating()` — the keepalive's stamps, so it stays out of the capture-relative
+histograms), counted in `frames_repeated` and `frames_hold_pushed`. Emission `n` is submit `n`
+(one callback per accepted frame, in decode order = submit order with reordering off); the encoder
+now records each emission's host-clock time in a lock-free 64-slot ring (`Encoder::emit_time_ns`).
+
+- **Probing** (start): push a real frame still unemitted `PUSH_AFTER = max(50 ms, 3 × EWMA)` after
+  its submit with nothing newer submitted. The EWMA (α = 1/8) is of submit→emit on *free* real
+  emissions only. Nothing is pushed before the encoder's first emission: the first frame of a
+  session is warm-up (50.9 ms measured on the M1, which made the first M1 run push once).
+- **Immediate**: entered after 3 real frames that each sat alone for the whole `PUSH_AFTER`, were
+  pushed, and came out ≤ 20 ms after the push, with no free emission in between (a frame simply
+  released by the next real frame is no evidence either way and leaves the streak alone; a pushed
+  frame that does not come out promptly resets it). Then every real frame is followed by one push
+  in the same loop iteration. At most 2 pushes per real frame (the second 20 ms after the first in
+  immediate, one `PUSH_AFTER` in probing); still held after that → logged once, left to the
+  keepalive and the stall bypass. A push is only ever for the newest real frame while nothing but
+  its own pushes followed it — never a push of a push, never after a keepalive.
+- **Back to probing** on: any free emission (any frame out with nothing submitted after it —
+  definitive proof of no hold); 3 captured frames in a row that had to wait for the in-flight cap
+  (an encoder that is merely slow at continuous motion never shows a free emission, so this is
+  where its overload shows); an encoder reset or rebuild. The mode is remembered per process by
+  (encoder id, width, height); later sessions start there. One log line per change with the
+  evidence; `hold_push_mode` in the session telemetry JSON; `SE_TUNE_OFF=hold_push` disables it
+  (recorded in `tune::report()` with initial/final mode, pushes, transitions, `push_after_ms`).
+- **In-flight cap.** In immediate mode the held push gets a slot of its own:
+  `MAX_FRAMES_IN_FLIGHT + 1`. Steady state on a one-frame holder is the previous push (released
+  by this frame's submit, encoding), this frame (released by its push, encoding) and its push
+  (held) — three, two of them work. With the plain cap of 2 the push for frame k+1 would wait for
+  push k to come out, adding a whole encode time to every frame. Probing keeps the cap of 2 (a
+  probing push holds a slot only until the next frame arrives). `STALL_BYPASS` is unchanged and
+  remains the backstop for encoders that hold more than one frame.
+- **Slow ≠ holding.** A slow encoder that does not hold produces free emissions at every pause,
+  which reset the streak, leave immediate mode and raise `PUSH_AFTER` past its own latency; under
+  continuous motion it is never alone long enough to be pushed, and if it ever starts in immediate
+  mode the cap-wait rule takes it out within 3 frames. Unit-tested: 25–60 ms per frame at 16 ms
+  intervals (continuous, bursts with pauses, isolated frames) never enters immediate and gets at
+  most one push per four frames.
+- **Test-only simulation** `SE_VT_SIM_HOLD=1` (+ `SE_TEST_HOOKS=1`): the encoder's output callback
+  withholds frame k until submit k+1 has been made (released on flush / teardown too), so the
+  holding path runs on a Mac that does not hold.
+
+**Measured** (MacBookAir10,1 M1, macOS 26.7.1, 1080p, `production {qp:15}`, pipe stage, one run
+each; latency = offer→packetized of **real** frames, p50 / p99 ms):
+
+| run | hold_push | mode at end | real frames | pushes | repeats > 2 after a frame | latency | Mbps |
+|---|---|---|---|---|---|---|---|
+| drag.raw 60 fps, real M1 | on | probing | 1359 | 0 | 0 | 8.20 / 15.24 | 10.868 |
+| drag.raw 60 fps, real M1 | off | — | 1359 | 0 | 0 | 8.27 / 15.29 | 10.867 |
+| stress 60 fps, real M1 | on | probing | 598 | 0 | 0 | 8.01 / 9.14 | 8.87 |
+| stress 60 fps, real M1 | off | — | 598 | 0 | 0 | 7.99 / 9.22 | 8.87 |
+| stress 30 / 10 fps, real M1 | on | probing | 300 / 100 | 0 / 0 | 0 | 8.80 / 13.52, 9.50 / 70.83 | |
+| drag.raw 60 fps, **simulated hold** | off | — | 1359 | 0 | 0 | 16.01 / 202.17 | 10.873 |
+| drag.raw 60 fps, simulated hold | on | immediate | 1359 | 1356 | 0 | **7.92** / 20.03 | 12.663 |
+| drag.raw ×0.5 (30 fps), simulated | off | — | 1359 | 0 | 0 | 31.78 / 202.44 | 5.458 |
+| drag.raw ×0.5 (30 fps), simulated | on | immediate | 1359 | 1358 | 0 | **8.76** / 13.99 | 6.352 |
+| drag.raw ×1/6 (10 fps, 420 frames), simulated | off | — | 420 | 0 | 0 | 95.74 / 206.62 | 1.333 |
+| drag.raw ×1/6 (10 fps, 420 frames), simulated | on | immediate | 420 | 419 | 0 | **9.14** / 18.17 | 1.552 |
+| stress 10 fps, simulated | off / on | — / immediate | 100 | 0 / 99 | 0 | 100.74 / 200.65 → **9.42** / 102.09 | 11.25 / 11.55 |
+| stress 60 / 30 fps, simulated | on | probing | 598 / 300 | 1 / 1 | 0 | 16.87 / 18.22, 33.62 / 41.52 (unchanged) | |
+
+Each simulated run entered immediate mode within its first 20 frames on the recording's own early
+pauses ("3 consecutive frames sat unemitted for >= 50 ms … came out 0.2/0.2/0.2 ms after one
+push"); the simulation releases on the push's submit, a real `gva` would add its ~5–10 ms, inside
+the 20 ms window. The p99 of the "off" rows is the last frame before a pause waiting for the
+200 ms keepalive. **Cost:** a push is a near-empty P frame of the unchanged picture, but on the
+recording it was +16 % bytes at 60 fps (≈ 3.7 KB per push). **Limitation:** probing learns only
+from pauses, so continuous motion from the very first frame (the synthetic 60 / 30 fps clips) stays
+in probing until the first three pauses — then the learned mode carries over to later sessions in
+the process. The 10 fps pipe runs are flagged invalid by the harness (20–92 offers > 2 ms late);
+the offer stamp is the real offer time, so the latency is unaffected (pipe.rs now sleeps in ≤ 10 ms
+slices, which cut the 10 fps lateness from 85 to ~20 of 100 offers but did not remove it).
+
+**Follow-up: learning at a steady cadence, and a start-immediate hook.**
+
+- **Steady-cadence probe** (probing mode, beside the pause probe). Suspicion: 8 consecutive real
+  frames each released only by the next real submit (no push, no repeat between), never freely.
+  Then **one** deliberate probe: the next real frame gets a push at once (with the reserved slot,
+  so the push is not held up by the cap). It passes only if the frame came out ≤ 20 ms after the
+  push **and** its submit→emit is at least `max(5 ms, 30 %)` below the median of the 8 suspicious
+  frames — a causal test: a holding encoder emits the probed frame an encode time after the push,
+  a whole interval early; an encoder that is merely slow emits it at its own time whatever follows.
+  3 passes, each ≥ 1 s after the last, enter immediate mode; a failed probe resets the count and
+  backs off 2 s, doubling to 60 s; any free emission voids all of it. Unit-tested: a one-frame
+  holder at 8 / 16 / 33 ms intervals enters immediate at 2.0–3.0 s with exactly 3 probe pushes
+  before it (latency interval + 7 → ≤ 8 ms); encoders at 18 ms, bimodal 12/21 ms and 30 ms per
+  frame at a 16 ms interval, and a three-frame holder, never enter it and push ≤ 6 times in 60 s
+  (20 s for the holder). VERIFIED against the simulated hold (pipe stage, continuous stress clip,
+  which never pauses, so the pause probe alone never engaged): 60 fps — 3 probes at frames 10 / 73
+  / 136, probe vs median submit→emit 7.0 vs 16.8, 8.5 vs 16.9, 7.6 vs 16.7 ms, then immediate;
+  whole-run real-frame offer→packetized 8.00 / 18.39 ms (16.87 / 18.22 before), 467 pushes for 598
+  frames. 30 fps — probes 8.4 vs 33.5, 8.7 vs 33.8, 8.9 vs 33.4 ms; 8.91 / 34.10 ms (33.62 / 41.52
+  before), 229 pushes for 300 frames. On the real M1 no frame is ever suspicious (it emits each
+  frame before the next arrives), so no probe fires. UNVERIFIED on a real `gva`.
+- **`SE_HOLD_PUSH_START=immediate`** or the tuning candidate **`hold_push_start_immediate`**
+  (plan: `"tune_on": ["hold_push_start_immediate"]`; the runner adds `SE_TEST_HOOKS=1` with it),
+  honoured only with `SE_TEST_HOOKS=1`: every session starts in immediate mode, normal exit rules
+  apply, recorded in the tuning report as `hold_push_start_immediate`. Unit-tested: an M1-like
+  encoder started in immediate leaves on the first push's free emission (one push, ≤ 16 ms).
+  Through the runner on the real M1 (`tune_on`, pipe stage, stress clip): started immediate, left
+  at frame 9 ("a push came out 16.2 ms after its submit with nothing submitted after it"), 4 pushes
+  in all, tuning record `hold_push_start_immediate: applied, test_hooks: true`.
+  `SE_VT_SIM_HOLD` and `SE_HOLD_PUSH_START` are in the runner's cleared variables.
+
+**Real hardware (lead's runs, 2012 MacBook Pro, `h264.gva`, macOS 10.15.8, r2 build, pipe stage,
+offer→packetized p50/p95 ms, hold push off → on).** 1080p stress 60 fps: 23.27/23.88 (max 206) →
+11.25/23.3 in a 10 s run; a 10-minute run started immediate 11.02/12.06, p99 12.48, 36000/36000
+pushed, 85 forced IDRs, 0 drops, flat. 720p60: 19.60/20.07 → 7.88/9.03. 30 fps: 42.5 → 16.3 only
+when started immediate. 10 fps: 110 → 22.7. **Cost on `gva`: ~21 KB per push** — it refines the
+repeated picture and has no QP control — so 1080p60 went from 17.9 to 25.7–28.4 Mbps; now visible as
+`hold_push_bytes` in the session telemetry (omitted while zero) and in the pipe result. On the M1 a
+push is a near-empty P frame (simulation: ~3.7 KB).
+
+**Three defects on `gva`, fixed in r3:**
+
+1. *Absolute 20 ms bounds.* `gva` encodes in ~11 ms at 60 fps, ~16 ms at 30 fps, ~22 ms at 10 fps.
+   At 30 fps the steady learner never engaged (4 pushes in 300 frames); at 10 fps 44 % of frames
+   got a wasted second push. Now every bound comes from the encoder: an EWMA of pushed frames'
+   push→emit; the pause probe accepts a release within `min(max(20 ms, 2.5 × EWMA), PUSH_AFTER)`;
+   the second push waits `max(20 ms, 2.5 × EWMA)` (so never before one full EWMA); the steady probe
+   passes on the causal test alone — probed submit→emit ≥ `max(5 ms, 30 %)` below the suspicious
+   median **and** below the frame interval (median submit gap of the suspicious frames).
+2. *Immediate mode fell out after the session-start IDR* (~580 KB, ~50 ms on `gva`): the frames
+   behind it waited for the cap and the 3-cap-waits rule exited; ~133 of 600 frames went unpushed
+   while it re-learned (~2.2 s). Cap waits no longer count in the encoder's first second or while a
+   forced keyframe is in flight, and the 3 waits must span ≥ 150 ms. And an encoder **confirmed
+   holding** in this process (process-wide set keyed like the learned mode; a free emission
+   withdraws it) re-enters immediate mode on **one** passing probe of either kind.
+3. Cost visibility: `hold_push_bytes` (above). No behaviour change.
+
+The hold simulation gained `SE_VT_SIM_HOLD_DELAY_MS` (test hook): frame k comes out
+`max(real output, submit of k+1 + delay)`, in order, completed by a simulation thread.
+
+**r3, simulated hold on the M1** (pipe stage, synthetic stress, continuous — no pauses — one run
+each; real-frame offer→packetized ms):
+
+| clip | sim encode | start | pushes / frames | max repeats after a frame | transitions | p50 / p95 / p99 |
+|---|---|---|---|---|---|---|
+| 30 fps | 16 ms | probing | 230 / 300 | 1 | probing → immediate (3 steady probes) | 19.93 / 57.78 / 58.03 |
+| 30 fps | 22 ms | probing | 230 / 300 | 1 | probing → immediate (3 steady probes) | 28.30 / 65.61 / 66.23 |
+| 10 fps | 16 ms | probing | 99 / 100 | 1 | probing → immediate (pause probes, 20.2 ms after the push) | 19.98 / 25.20 / 126.38 |
+| 10 fps | 22 ms | probing | 99 / 100 | 1 | probing → immediate (29.1 ms after the push) | 26.68 / 29.81 / 134.31 |
+| 10 fps | 16 ms | immediate | 101 / 100 | 2 (the first frame only) | none | 19.71 / 22.71 / 73.63 |
+| 10 fps | 22 ms | immediate | 101 / 100 | 2 (the first frame only) | none | 28.21 / 29.62 / 72.33 |
+| 30 fps | 16 ms | immediate | 299 / 300 | 1 | none | 19.74 / 20.59 / 29.73 |
+| 30 fps | 22 ms | immediate | 300 / 300 | 2 | none | 26.88 / 29.59 / 57.63 |
+| 60 fps | 11 ms | immediate | 597 / 598 | 1 | none (the `gva` IDR case) | 12.94 / 13.54 / 16.26 |
+| 60 fps | 11 ms | probing | 468 / 595 | 1 | probing → immediate (3 steady probes) | 13.04 / 37.43 / 49.66 |
+
+Before r3 the 30 fps steady learner failed every probe on a > 20 ms push→emit, a 22 ms encode got
+a second push on every frame, and every immediate start left on the session-start keyframe. The
+remaining first-frame second push is the warm-up frame, which has no push→emit history yet.
+
+**Real `gva` with r3** (lead): all three fixes confirmed — a 10-minute self-learning run with an
+IDR every 7 s 10.82 / 11.98 / 14.91 ms (p50/p95/p99), 35,869 of 36,000 pushed, one transition, no
+exit after any IDR; 30 fps now learns (42.4 → 16.3 ms); 10 fps 299 of 300 pushed, no wasted second
+push (109.9 → 24.5 ms).
+
+**RTP timestamps of re-submitted pictures (r4).** A headless-Chrome session against `serve` read
+the client's host-capture→paint statistic as 4.6–10 s on a still screen: `webrtc_session.rs`
+derives the RTP timestamp from `EncodedFrame.capture`, and the encode loop passed the *original*
+frame's `captured_at` for every keepalive repeat, forced-IDR repeat and hold push. So a still
+screen's repeats carried a seconds-old timestamp (feeding the client's video-delay estimate used
+for A/V sync and the STATS frame), and with hold push a frame and its push shared one timestamp
+(on `gva` half of all frames would read one interval late). Now every re-submitted picture carries
+`Instant::now()` at its own submit (its `FrameTiming` is still `repeating()`), and the RTP writer
+keeps the per-session video timestamp strictly increasing (wrapping comparison, `last + 1` when not
+ahead), counted in `rtp_ts_clamped`. Platform-neutral in `webrtc_session.rs`. Status: unit-tested
+(`the_video_rtp_timestamp_never_goes_backwards`: increase untouched, equal → +1, behind → +1,
+across the 32-bit wrap); `pnpm test:client` passes (10 harnesses, including the RTP→host-clock
+inversion); live-browser verification to follow (lead).
+
+**Follow-up (r4): the stamp is set at emission, and `encode` holds real frames only.** On a holding
+encoder a keepalive repeat comes out ~200 ms after its submit, so a submit stamp still read ~200
+ms on the client and the audio target (`audio.js::maybeUpdateTarget`, fed by
+`transform-worker.js::reportAvSync`'s asymmetric EMA, capped at 400 ms) would still creep up on a
+still screen. The drain thread now sets a re-submitted picture's capture instant to
+`max(own submit, emit − E)` (`pipeline.rs::repeat_capture`), `E` = the minimum submit→emit of the
+last 8 captured frames (`RealEncodeTime`; a 2 MB first IDR is gone at the next frame). Unit-tested:
+free-emitting encoder → its own submit; keepalive out at +200 ms with E 11 ms → emit − 11; a push
+released by the next real frame lands between the real frame it follows and the next one; no E
+yet → its own submit. Separately `stages.encode` (and `encode_queue`) now hold captured frames
+only, re-submitted pictures going to a new `encode_repeat` stage — a still screen on `gva` showed
+`encode` p50 201 ms over 177 keepalives. The strictly-increasing RTP clamp stays as the last line
+of defence; the pipe result now reports `rtp_capture_to_packetized_real` / `_repeat` (the host side
+of the client's host-capture→paint, per kind) and `rtp_ts_would_clamp`.
+
+r4 runs (pipe stage, synthetic stress 60 fps): on the M1 (no hold) repeats on a still screen read
+7.5 ms capture→packetized (p50; max 8.3), `rtp_ts_would_clamp` 0 in all ten runs, and `encode_repeat`
+appears only where repeats exist. Simulated holder (`SE_VT_SIM_HOLD=1`, 11 ms encode): real frames
+13.3 ms p50, re-submitted pictures 14.1 ms p50 (p99 17.0) — the client now reads a repeat like a
+real frame instead of a 200 ms or multi-second one; `encode` (real) p50 12.6 ms against
+`encode_repeat` 29.4 ms, kept apart. **The clamp is not ~0 on a holding encoder in immediate mode:**
+171 of ~1200 outputs (18–24 in a probing run). A push is released by the next real frame's submit,
+so `emit − E` lands at that submit, a few µs *after* the next real frame's capture — which is
+emitted right after the push — and the writer moves that real frame one tick (11 µs) forward.
+Harmless at that size, but real frames' stamps are the ones that matter (latency statistics, A/V
+sync), so **(r5) the repeat yields instead**: the encode loop keeps the capture instant of the
+newest captured frame submitted (an atomic of host ns), and a re-submitted picture is stamped at
+`min(max(own submit, emit − E), newest real capture − 12 µs)` whenever that real frame was
+submitted after it (`repeat_capture_ns`; 12 µs > one 90 kHz tick); a keepalive released by another
+keepalive is unchanged. Simulated holder (`SE_VT_SIM_HOLD=1`, 11 ms, stress 60 fps, local arm64
+build): `rtp_ts_would_clamp` 171 → 0 and 0 (started immediate, two runs), 18 → 0 (probing start);
+real frames 13.26 → 13.31 / 13.29 ms p50, repeats 14.1–14.2 ms p50 as before. A real-browser run
+on r4 had shown `rtp_ts_clamped` 4–11 per 20 s on the Intel host and 2–3 on the M1. Unit test
+extended: a push released by the next real frame is stamped > 1 tick before that frame's capture
+and after the frame it follows; the RTP timestamps then increase without the writer's clamp.
+
+**Test hook for real sessions under motion (r4, bench builds only):** `SE_TEST_HOOKS=1
+SE_TEST_SOURCE=<stress|static|scroll|motion|drag|mixed>[:<fps>]` makes `start_capture` return a
+synthetic `CaptureBackend` (`bench/synth_source.rs`) at the session's encode size, looped, frames
+stamped at offer, through the production `FrameSink`; `capture_backend` reads
+`synthetic:<workload>`; one loud `[test-hook]` line. Not compiled without `--features bench`;
+ignored (one log line) without `SE_TEST_HOOKS=1`. `static` delivers one frame then nothing, like
+real capture of a still screen. Verified by an ignored test: 1280×720, stress 60 frames in 1 s,
+static 0 after the first. No live session was run with it here (both screens locked; the live
+stage now skips a locked screen). The `ave.avc` multi-frame hold (4–16 frames, forum 748918) is handled by the 2-push limit
+and the stall bypass, not measured.
+
+## TUNE-ROLE — the foreground task role while streaming (default on); `perf_hold` candidates; power source — `VERIFIED` (M1 under load, lead's A/B) / candidates `COMPILE-CHECKED` + one idle sanity round
+
+**Measured** (lead, MacBookAir10,1 M1, macOS 26.7.1, pipe stage, 1080p60 stress, `production
+{qp:15}`, r2; offer→packetized p50 / p90 / p95 / p99 ms):
+
+| under 8 busy threads | p50 | p90 | p95 | p99 |
+|---|---|---|---|---|
+| default tuning | 8.37 | 11.55 | 12.09 | 16.06 |
+| `task_role_foreground` alone | 6.18 | 6.36 | 6.43 | 6.92 |
+| all candidates | 6.18 | 6.35 | 6.41 | 6.63 |
+| `SE_TUNE_OFF=encode_time_constraint` | 9.69 | | | 18.07 |
+| `SE_TUNE_OFF=drain_precedence` | 9.35 | | | 14.81 |
+
+`task_qos_tier0`, `encode_tc_short`, `drain_time_constraint`: no help. Idle machine: no switch
+changes anything. Intel (`gva`): no switch changes anything.
+
+**Change.** `task_role_foreground` is now an existing item, **on by default while a session is
+live** (`SE_TUNE_OFF=task_role_foreground` turns it off): `task_policy_set(TASK_CATEGORY_POLICY,
+TASK_FOREGROUND_APPLICATION)` at the start of every encode loop and about once a second from its
+slow path (macOS resets an app's role on activation changes), one log line when first applied, a
+failure logged once and otherwise counted; nothing is restored at session end. The tuning report
+carries `rc`, `asserts`, `failures`, `last_rc`. It is no longer applied process-wide at
+`Streamer::prepare`.
+
+New candidates (`SE_TUNE_ON`, off by default; `perf_hold.rs`), for the M1's ~6.3 ms on fast
+cores vs ~8.1 ms idle (`ave.avc` 6.5 vs 12.2; an external low-priority spinner did not help):
+`perf_hold_spin` — one `QOS_CLASS_USER_INTERACTIVE` thread in the streaming process busy-spins
+(`spin_loop` hint, 256 per slice) while any session is live; `perf_hold_inflight` — it spins only
+while a frame is in flight anywhere in the process (a process-wide count kept beside each encoder's
+own, from submit to the output callback) and parks otherwise with `std::thread::park_timeout`,
+woken by `Thread::unpark` from the submit path; the wake latency is measured. The thread is
+created once per process and parks indefinitely when the last session ends. Tuning record per
+session: `live_s`, `spin_s`, `spin_fraction`, `wakes`, `wake_us_mean`, `wake_us_max`.
+`power_report` now also says `power_source=ac|battery|ups|unknown` (IOKit
+`IOPSCopyPowerSourcesInfo` + `IOPSGetProvidingPowerSourceType`, 10.2+, `dlsym`'d — no new link-time
+symbol), so a later default can be "AC only".
+
+**r3 sanity** (same Mac, idle, plugged state not controlled, pipe stage, stress, 3 repeats
+interleaved; offer→packetized p50 / p95 / p99 ms):
+
+| variant | r0 | r1 | r2 | record |
+|---|---|---|---|---|
+| default (role on) | 8.04 / 8.81 / 9.47 | 8.13 / 8.89 / 9.50 | 8.18 / 8.88 / 9.38 | role rc 0, 11 asserts in 10 s |
+| `tune_off: task_role_foreground` | 8.00 / 8.81 / 9.45 | 8.11 / 8.76 / 9.34 | 8.05 / 8.79 / 9.37 | skipped |
+| `tune_on: perf_hold_spin` | 6.42 / 6.82 / 7.04 | 6.40 / 6.77 / 6.92 | 6.41 / 6.80 / 6.97 | spin fraction 0.989 |
+| `tune_on: perf_hold_inflight` | 6.50 / 6.85 / 7.14 | 6.53 / 6.88 / 7.08 | 6.53 / 6.87 / 7.14 | spin fraction 0.384, 596 wakes, mean 10.6 µs, max 25.0 µs |
+
+The role is a no-op on an idle machine, as measured before; both `perf_hold` variants reproduce
+the fast-core number with the inflight variant spinning 38 % of the time. Power cost not measured.
+
+## PERF-HOLD — the performance hold: a spinning thread keeps the encode on a woken performance cluster; default on with efficiency cores + AC + no Low Power Mode — `VERIFIED` (one M1, macOS 26.7.1) / `UNVERIFIED` (other Apple silicon) / power cost NOT measured
+
+**Measured** (lead, MacBookAir10,1 M1, r3, pipe stage, `production {qp:15}`, 4 repeats each,
+offer→packetized p50/p95/p99 ms; `inflight` = the r3 variant without a linger):
+
+| idle machine | default | `perf_hold_inflight` | `perf_hold_spin` |
+|---|---|---|---|
+| 60 fps stress | 8.12 / 8.86 / 9.29 | 6.51 / 6.84 / 7.10 | 6.45 / 6.82 / 7.04 |
+| recording (drag.raw) | 8.19 / 9.29 / 15.30 | 6.61 / 7.78 / 14.00 | 6.50 / 7.00 / 10.88 |
+| 10 fps stress (sparse) | 9.38 (p50) | 8.82 (parked between frames: each starts cold) | 6.64 |
+| fallback `ave.avc` (StandardBitrate) | 10.46 / 13.28 (p50/p95) | | 7.38 / 8.25 |
+
+| 8 busy threads | p50 / p95 / p99 |
+|---|---|
+| default (foreground role on) | 6.22 / 6.49 / 6.75 |
+| role off | 9.76 / 16.72 / 20.52 |
+| inflight | 6.25 / 6.53 |
+| spin | 6.23 / 6.53 |
+
+Intel (2012 MacBook Pro, `gva`): busy threads change nothing (10.4–10.8 ms with 0/1/2), so a hold
+would be pure cost there.
+
+**Change** (`macos_utils/streamer/perf_hold.rs`). The in-flight variant became a **linger**: one
+`QOS_CLASS_USER_INTERACTIVE` thread spins (`spin_loop` hint) from each *captured* frame's submit
+until 200 ms after the newest one (`SE_PERF_HOLD_LINGER_MS`, test hook), parked on
+`park_timeout` otherwise and woken by `unpark` from the encode loop's real-frame submit. Keepalive
+repeats and hold pushes never start or extend it, so a still screen costs nothing and sparse
+content (typing, a cursor at ~10 fps) stays warm. **Default policy** (`perf_hold::decide`, pure):
+on only when `sysctlbyname("hw.nperflevels") >= 2` (absent ⇒ not eligible), the power source is
+AC (`IOPSGetProvidingPowerSourceType`) and Low Power Mode is off (unreadable ⇒ off); decided at the
+first session's start and re-decided about once a second on the hold's own thread (never the
+encode thread), so it follows a power change mid-session; a log line names why on every change.
+`SE_PERF_HOLD=0` off, `=1` linger forced on, `=spin` the always-spin variant; in a plan
+`tune_off: ["perf_hold"]` disables the default and `tune_on: ["perf_hold_spin"]` /
+`["perf_hold_inflight"]` force a variant. Tuning record `perf_hold`: variant, why, decision inputs
+(perf levels, power source, Low Power Mode, overrides), decision changes, linger, spin fraction,
+wake-ups. Unit-tested: one test per policy row and override, and the linger (a real frame starts
+and extends it, a repeat or push does not, it parks 200 ms after the last real frame). The hold
+also no longer counts frames in flight, so the encoder's process-wide in-flight counter is gone.
+The pipe stage gained `"skip_unchanged": true` on a workload: a frame identical to the previous one
+is not offered, as a capture backend delivers nothing for an unchanged screen.
+
+**r4 sanity** (same M1, on AC, idle, pipe stage, `production {qp:15}`, default settings unless
+noted; offer→packetized p50 / p95 / p99 ms; spin fraction from the `perf_hold` tuning record):
+
+| run | r0 | r1 | r2 | perf hold | spin fraction |
+|---|---|---|---|---|---|
+| stress 60 fps | 6.42 / 6.73 / 6.92 | 6.41 / 6.69 / 6.80 | 6.42 / 6.70 / 6.89 | linger, "2 perf levels, AC power" | 0.967 |
+| stress 10 fps | 6.61 / 19.14 / 67.85 | 6.57 / 18.89 / 65.80 | 6.54 / 18.93 / 67.43 | linger | 0.967 |
+| static (`skip_unchanged`: 1 real frame, 49 keepalives) | 44.51 (the one warm-up frame) | | | linger | 0.019 |
+| control `tune_off: perf_hold`, stress 60 fps | 7.66 / 8.19 / 8.46 | 7.65 / 8.27 / 8.61 | 7.65 / 8.23 / 8.72 | off ("SE_TUNE_OFF perf_hold") | 0 |
+
+The 10 fps p50 (6.6 ms against the lead's 9.38 default and 8.82 without a linger) shows the linger
+keeping sparse content warm; at 10 fps it spins almost the whole time (a 200 ms linger covers a
+100 ms interval). A still screen costs ~2 % (the one real frame's linger). 0 hold pushes on the M1.
+
+## JOIN-QUALITY — a device's first join ran the adaptive tier while its seeded row said constant QP 15 — `VERIFIED` (macOS: unit test + real browser on M1 and Intel hosts) / `COMPILE-CHECKED` for Windows (shared file, not compiled there)
+
+**Defect** (found by the real-browser test, `streamer/server.rs`). The join path applied quality
+settings only inside `if let Some(o) = device_settings`. For a device the host holds no row for —
+every device's first join — `cfg.qp` stayed at the base config's `None`, so the session ran the
+adaptive tier (`AdaptiveLowLatency` on the M1, `AdaptiveStandard` on Intel), while the same join
+seeded the override map with `DeviceOverride::join_defaults()` (`video_quality: 15,
+adaptive_quality: false`) under a comment saying the row records what the join runs. A later save
+(or `devices set … --video-quality 15 --adaptive-quality off`) compared equal to the seeded row,
+so nothing corrected it until a second join. Measured: `serve` + a new device →
+`rate_tier: AdaptiveLowLatency`; `devices set` q15 / adaptive off logged "unchanged"; q16 then q15
+renegotiated and the tier became `BaseFrameQp`.
+
+**Change.** One function, `apply_override_quality`, applies a row's stream-quality fields (video
+scale, `video_quality` + `adaptive_quality` → `cfg.qp` / `cfg.quality_qp`, the frame-rate cap,
+`auto_frame_rate`); `apply_join_quality` uses it for a saved row (as before) and, when there is an
+override map but no row and the base config has no explicit `qp`, for `join_defaults()` with
+`max_fps` = the detected refresh. No override map or an explicit base `qp`: unchanged. (**Corrected r8:** this said
+the probe was unchanged, but `live_config` passed the override map, so `probe --whep-selftest`
+without `--qp` ran constant QP 15 and `--scale` was forced to 100, on Windows too. `live_config` now
+passes none, and the test covers `--scale`.) The misleading comment now says what is true. **Same behaviour change
+on Windows** (`server.rs` is shared): a first join is constant QP 15 there too, which is what every
+later join already ran and what the settings sheet shows. Unit test
+`a_first_join_runs_what_the_row_it_seeds_says`: a first join and the second join of an untouched
+device produce the same quality configuration (qp 15, no QP ceiling, the detected rate); the probe
+cases are untouched; a saved adaptive row still runs adaptive. Verified with the browser harness (r4 and r5): `rate_tier` right after a first join is
+`BaseFrameQp` on the M1 and `StandardBitrate` on Intel, without any `devices set`.
+
+## CLIENT-RESYNC — the client's decoder-stall test counted time with no input, so a network gap or a large keyframe became a keyframe storm — `VERIFIED` (headless Chrome on macOS against M1 and Intel hosts; ten client harnesses) / `UNVERIFIED` on other browsers
+
+**Defect** (`streamer/static/transform-worker.js`, found with a real browser against the Intel
+host under synthetic 1080p60 motion). The resync test was "more than `MAX_IN_FLIGHT` (6) decodes
+outstanding and no decoder output for `BACKLOG_STALL_MS` (66 ms), twice ⇒ drop every delta, wait
+for a keyframe, `sendKeyFrameRequest()`". The 66 ms were measured from the last output, whether or
+not the decoder had been given anything since. So:
+
+- A 1–2 MB keyframe takes ~150 ms to cross a 108 Mbps Wi-Fi link. Nothing reaches the decoder
+  meanwhile; when the keyframe and the clump of deltas queued behind it arrive, the clock already
+  reads > 66 ms and the 7th delta of the clump trips the test. The client throws away the deltas
+  that depend on the keyframe it just received and asks for another one, which is just as large.
+  The host's PLI backoff sees the client's keyframe counter move and answers at once.
+- The same happens with no keyframe involved: any arrival gap longer than ~66 ms (a Wi-Fi hiccup)
+  followed by ≥ 7 frames at once.
+
+Measured, 20 s sessions, Intel host at 1920×1080, synthetic stress, no packet lost on the path:
+49 IDRs, 41.5 Mbps on the wire for a 27 Mbps stream, 78 frames dropped by the client, painted
+50.9 fps, host-capture→paint p90 181 ms. With a 150 ms stall induced every 3 s the shipped page
+made 149 keyframe requests and froze for 4.8 s on that host, and dropped 14 frames against an
+M1 host at 800×600.
+
+**Change.** "No output for 66 ms" is evidence of a stalled decoder only if the decoder had work
+for those 66 ms. The stall clock now has a floor, `stallFloor()` = the latest of: the last output;
+the last keyframe submit; the arrival that ended an input gap (`arrivalGapMs()` =
+max(33 ms, 1.5 × the worker's frame-period estimate), so a steady stream at any rate never moves
+it); and the submit that found the decoder idle. Separately, a keyframe in decode is not a stall:
+while one is pending, for at most `KEY_DECODE_GRACE_MS` (1 s), the test neither drops nor requests,
+and `ondequeue` / the stale-count reset leave `inFlight` alone. A decoder that is really dead on a
+steady stream is still caught in 9 frames (128 ms at 60 fps). Local counters through
+`collectStats()` say which guard acted (`keyDecodeGraceHits`, `stallFloorSaves{,Key,Gap,Idle}`);
+nothing new is on the wire.
+
+**Tests.** `scripts/test-client-transform.mjs`: a keyframe held 150 ms while 12 deltas arrive
+(0 requests, 0 dropped); a 150 ms gap then 12 deltas in 10 ms with no keyframe (0 requests, all
+painted); a dead decoder on a steady 60 fps stream, with and without a gap before it (one request
+on frame 9); a decoder that dies on a keyframe (caught 9 frames after the grace). The two older
+cases that modelled a stall as a clock jump with no arrivals were re-modelled as a dead decoder
+with steady arrivals, which is the only thing the test can honestly detect. The original page
+fails the new cases. `pnpm test:client` 10/10, `check-legacy-webkit.mjs` passes.
+
+**Browser** (`scripts/e2e-headless/run-mac.mjs`, r4 hosts, the fixed page served by CDP override;
+then r5 with the page built in). Intel 1920×1080 stress, 20 s:
+
+| page | IDRs | client keyframe requests | painted fps | dropped | host-capture→paint p50 / p90 / p99 |
+|---|---|---|---|---|---|
+| shipped | 48 | 53 | 50.8 | 78 | 31.9 / 180.8 / 220.2 ms |
+| fixed | 7 | 0 | 117.0 | 0 | 28.7 / 34.7 / 38.7 |
+| fixed, hold push off | 7 | 0 | 59.1 | 0 | 42.4 / 50.7 / 254.5 |
+
+With a 150 ms stall every 3 s: Intel shipped 33 IDRs / 149 requests / 44 dropped / 4.8 s longest
+gap → fixed 7 / 0 / 0 / 267 ms; M1 shipped 9 / 8 / 14 dropped → fixed 7 / 0 / 0. The 7 IDRs that
+remain are the PLI backoff's own ramp.
+
+**Final build (r5, the page built in, 14 sessions on two hosts):** 0 frames dropped by the page, 0
+decode errors and 0 keyframe requests in every measured window, including a 5-minute run on each
+host (M1 800×600: 18,030 frames at 60.1 fps, longest gap 43 ms; Intel 1920×1080: 35,412 frames at
+117.9 fps with one 2.0 s network outage it recovered from). In the Intel 5-minute run the page's
+counters show the old test would have fired 456 times (`stallFloorSaves`: 440 key, 16 idle).
+
+**Not changed, and worth knowing.** The relay serves its own older copy of the page, so a relayed
+client keeps the old test. The host still answers Chrome's idle-decoder PLIs at least every 60 s (PLI-HEALTHY-CAP; 10 s when this was written)
+(`PliBackoff`); on worst-case content each of those keyframes is 1.5–2 MB (next entry).
+
+## KEYFRAME-SIZE — two ways to shrink a keyframe, measured and not adopted — `VERIFIED` (lab stage, both Macs)
+
+A keyframe at pinned quality is large on dense content: ~1.58 MB on the M1 (`h264.rtvc`, QP 15)
+and 1.7–2.1 MB on the Intel Mac (`h264.gva`, 19.9 Mbps) for the synthetic stress clip; the real
+recording's keyframes are ≤ 441 KB and a scrolling page's are 27–41 KB. On a 108 Mbps Wi-Fi link
+a 2 MB keyframe is ~150 ms of airtime.
+
+**M1, per-frame QP ramp** (forced IDR every 2 s; the IDR coded at a higher QP, stepping back to
+15). IDR size by its QP: 21 → 1,034 KB, 24 → 868, 27 → 729, 30 → 592, 33 → 463, 36 → 334. The
+bytes move rather than disappear: after a QP 27 IDR the next QP 15 frame is ~626 KB. A five-step
+ramp (36-30-24-20-17) gives six frames of ~330 KB instead of one of 1.58 MB and cuts encode p99
+from 33 to 13–16 ms, at a luma PSNR of 26.7 dB on the IDR and 30.9 dB at the first percentile: a
+soft pulse of ~80 ms at every keyframe.
+
+**Intel, `DataRateLimits`.** Any limit (seven window shapes, [1.5×, 1 s] to [2×, 100 ms]) behaves
+the same, so the property switches a mode rather than applying the numbers: forced IDRs fall from
+1,726 KB mean / 2,064 KB max to ~245 KB / 271 KB, peak rate per 100 ms from 184 to 60–91 Mbps.
+But PSNR falls to 23.5 dB on the keyframe and recovers slowly (mean 45.6 → 40.6 dB with an IDR
+every 2 s), and the keyframe's own encode time rises from 37 to 61–63 ms. No effect on light
+content.
+
+**Decision.** Neither ships. Once the client stopped multiplying keyframes (CLIENT-RESYNC) the
+cost of a large keyframe is one stall per keyframe on worst-case content, and both mitigations
+trade it for visibly lower quality on a setting the user pinned. Plans and results:
+`bench-results/gen_kf.py`, `kfm1/`, `intel-mbp2012/r4/out-kf/`.
+
+## E2E-MAC — a real-browser session test for macOS hosts — `VERIFIED` (headless Chrome 800×600 / 1080p against both Macs)
+
+`scripts/e2e-headless/run-mac.mjs` (+ `mac-host.sh`, `cursor-mover.c`) starts `serve` locally or
+over SSH in an isolated `SCREENEXTEND_DATA_DIR`, joins it with headless Chrome through the
+shipped page, and writes one JSON document: join time, the client's video path, paints (timed
+inside the worker), drops, decode and capture-to-paint percentiles, Chrome's own RTP counters per
+second, and the host's `status --json` before and after. `--synthetic <workload>` feeds synthetic
+motion into the real session (bench builds, `SE_TEST_HOOKS=1 SE_TEST_SOURCE=…`), which is what
+makes motion measurable on a machine whose screen is locked; `--quality` / `--adaptive` pin the
+tier through the shipped CLI; `--relay-stall MS@EVERY_S` holds all host→client packets to imitate
+a Wi-Fi hiccup; `--client-override` serves a local copy of a page file so a client change can be
+proven against a host that embeds the old one. It found four defects in one night: stale capture
+stamps on repeated frames, the first-join quality mismatch, the resync storm, and a 201 ms
+"encode" that was a keepalive waiting in a holding encoder.
+
+Its limits: Chrome on the development Mac has no Local Network permission, so a remote host is
+reached through a loopback relay in node (8 MB socket buffers, its own thread, no pacing; with the
+default 786 KB buffers the relay itself lost 7 % of a 27 Mbps stream, which is recorded here so
+nobody repeats it). Headless Chrome on the same machine shows ~9.5 ms between the host's socket
+write and a frame's arrival in the page's worker, where the bench's in-process receiver shows
+0.6 ms for the same hop; that time is inside the browser and was not broken down.
+
+## PLI-HEALTHY-CAP — a painting WebCodecs client was sent an IDR every 10 s for nothing — `COMPILE-CHECKED` (unit tests) / real-browser verification by the lead
+
+`streamer/keyframe.rs`. `PLI_BACKOFF_CAP_HEALTHY_MS` is the PLI back-off's cap while the client's
+fresh STATS say it is painting through WebCodecs, i.e. while a PLI is known to be libwebrtc's idle
+decoder rather than the page (the page's own requests are evidence and open the window once the
+STATS frame carrying their counter arrives, up to ~2 s later; a NACK or transport-wide loss does at
+once). At 10 s a real browser got one IDR every 10 s for
+the life of the session — 31 in a 5-minute run on the M1, 39 on the Intel Mac — and on worst-case
+content on the Intel Mac each was a ~2 MB frame and a ~250 ms pause in painting, answering nothing.
+**Now 60 s**, overridable for a measurement with `SE_PLI_HEALTHY_CAP_MS` (plain env, read once).
+Nothing else in the back-off changes: the evidence path, the 2 s non-healthy cap and the 4 s quiet
+reset are as they were. **Shared code: the same change applies on Windows.** Unit test
+`the_healthy_cap_is_a_minute_and_overridable`: the override parses; five minutes of residual PLIs
+every 3 s admit at most 12 (one a minute once the window has opened), and the non-healthy cap and
+evidence behave as before.
+**r8:** the window is compared as `min(window, cap in force)`, so one grown to 60 s under the healthy
+cap waits at most 2 s once the client stops being healthy (it used to finish its 60 s). Test
+`a_window_grown_under_the_healthy_cap_narrows_when_the_cap_does`.
+
+## MAC-DISPLAY-MODE — a re-created virtual display came up at the size macOS remembered, not the one requested — `VERIFIED` (M1, macOS 26.7.1, size sequence in one process) / Intel 10.15 to be re-checked by the lead
+
+**Defect** (real sessions, screen unlocked): a client whose size differed from what macOS last saw
+for that display got the old size — 2560x1440 after 1080p stayed 1920x1080; every 1920x1080
+session after an 800x600 one stayed 800x600 — with
+`activate_mode(N, WxH) failed: CGDisplayCopyAllDisplayModes(N) returned nil`.
+
+**Cause, measured** (`virtual_display.rs` tests, one process, create → read → remove, sizes
+1280x720 → 2560x1440 → 1920x1080 → 800x600 → 1920x1080):
+
+| regime | what each display came up at | mode list |
+|---|---|---|
+| same device name (one display identity), 0.5 s apart | 1280x720, then **1280x720, 1280x720**, 800x600, **1280x720** | non-nil only for the first display; nil for 8 s for every later one |
+| same name, 4 s apart | the same | the same |
+| a new name (new serial) each time | 1280x720, 2560x1440, 1920x1080, 800x600, 1920x1080 — all right | nil for every display after the first |
+| same name + `applySettings:` again after create | right, 2 ms after the re-apply, every size | nil |
+
+So two separate things. (1) WindowServer restores the geometry it remembers for a display
+identity (vendor, product, serial — and the serial is a hash of the device name, so every join of
+one device shares it) whenever that geometry fits inside the new display; 800x600 "worked" only
+because 1280x720 does not fit in it. (2) `CGDisplayCopyAllDisplayModes` answers nil for every
+display after the first one a process creates, for at least 8 s, so the old fix-up
+(`CGDisplaySetDisplayMode` from the mode list) could never run — retrying it does not help. The
+first display of a session that also happened to have the right remembered size (720p in the
+lead's `g8`) looked fine, which is why the defect read as content- or lock-related.
+
+**Fix.** `create_display_with_modes` checks the geometry after creation and, if it is not the
+requested one, applies the display's own settings a second time (requested mode first) and waits
+for the settle (bounded by the settle timeout); the mode-list path stays as a fallback, its nil
+now retried within its own bound instead of failing at once. The display keeps its stable
+identity (so macOS's per-device memory still works). Measured after the fix, same sequence:
+1280x720, 2560x1440, 1920x1080, 800x600, 1920x1080 — every one at its requested size, 94–219 ms
+from create to ready. 2560x1440 is reachable on this M1. The bench `live` stage now marks a run
+INVALID when the display's actual size differs from the request (DPR 1; HiDPI recorded only).
+
+## HOLD-PUSH-GUARD (amends HOLD-PUSH, r6) — pushing suspended when it makes real frames slower, on the encoder side or the client side — `VERIFIED` against the simulation (M1) / real Intel host and slow-client browser runs by the lead
+
+**Evidence** (lead). Intel host, live stage, real capture with the bench's in-process decoder on the
+same HD4000, 1080p60: without pushes encode p50 23.1 ms, capture→decoded 27.2 / 29.7 / 31.4 ms;
+with them encode 25.2 ms, 31.1 / 42.1 / 44.9 ms, only ~58 % of frames pushed, +35 % bitrate, 39
+mode changes in 5 minutes. (With the decoder on another machine pushes win clearly: encode 11.5 vs
+21.0 ms, browser capture→paint 31.4 vs 43.6 ms — the encoder-side guard is what protects a host
+whose GPU is busy.) A client 8 ms slower per frame: arrival→paint 11.7 → 32.7 ms with pushes.
+
+**Change** (`pipeline.rs::HoldPush`). A third mode, **`suspended`**: only the end-of-burst push
+(one push for a real frame nothing followed within 1.25 frame intervals), for a back-off of 10 s
+doubling to 120 s (reset after 5 healthy minutes in immediate mode), then probing again, where a
+probe must pass before immediate mode. Entered from immediate mode on: (1) **the efficacy guard** —
+over the last 60 real frames, median submit→emit ≥ 90 % of the median frame interval; (2) 3+
+captured frames in a row waiting for the in-flight cap (the old exit to probing, which flapped);
+(3) **the client guard** — the page's STATS `arrival_to_paint` p50 (a sliding window of its last
+512 painted frames, sent about once a second; read once a second on the encode loop's slow path) above
+`max(2 × baseline, baseline + half an interval)` in 3 fresh STATS in a row, the baseline being a
+window painted entirely without pushes, and with no baseline (a session that started in immediate
+mode) above 1.5 intervals; a judgement waits until half the window was painted while pushing.
+No fresh client STATS within 3 s (an older page, the relay): immediate mode is not entered, and is
+left after a 3 s grace from the encoder's first submit. Telemetry: mode `suspended`, degradation
+`hold_push_suspensions`, `hold_push_guard` (the reason with its statistic); a suspension is
+session-local (the learned mode is not changed by it — true only from r8: until then the
+suspension's expiry to probing overwrote it). Test hooks: `SE_VT_SIM_HOLD_COST_MS` (a
+SERIALISED simulated holder, so a push delays the next real frame) and, in the pipe stage, a
+modelled client (`SE_BENCH_CLIENT_FRAME_MS`, FIFO at that per-frame cost, STATS once a second).
+Also r6: the repeat-stamp encode estimate is bounded by one frame interval (`min(E, interval)`;
+a still-screen session on a holding encoder read keepalives at 71 ms instead of ~25).
+
+**Measured** (M1, r6, pipe stage, synthetic stress 60 fps, simulated holder; offer→packetized of
+real frames p50 / p95 / p99 ms):
+
+| run | pushes / real frames | end mode, suspensions, transitions | latency |
+|---|---|---|---|
+| fast holder (5 ms serial), started immediate | 597 / 599 | immediate, 0, 0 | 7.37 / 7.98 / 10.01 |
+| fast holder, probing start, 30 s | 1668 / 1799 | immediate, 0, 1 | 7.49 / 16.85 / 17.13 |
+| saturated holder (12 ms serial), started immediate | 27 / 598 | probing, 1 (at the first full window), 2 | 16.84 / 41.76 / 46.48 |
+| saturated holder, 5 minutes | 38 / 17996 | probing, 1, 2 — no flapping | 16.83 / 16.95 / 17.07 (= the no-push value, one interval) |
+| fast holder + slow modelled client (12 ms a frame), 30 s | 709 / 1799 | suspended, 2 (10 s then 20 s back-off), 4 | 16.80 / 16.94 / 17.07 |
+
+Unit tests: fast serial holder stays immediate; saturated one suspends within 2 s, recovers to the
+no-push latency, ≤ 6 transitions in 5 minutes; end-of-burst pushes while suspended; back-off
+doubling and reset; healthy client stays; slow client suspends within ~5 s and does not flap; no
+STATS → not entered / left after 3 s; slow client caught with no baseline; the start grace.
+
+## QP-GOVERNOR — the per-frame-QP tier had no bound at all on incompressible content — `VERIFIED` (M1, pipe stage, synthetic noise) / browser verification by the lead
+
+**Evidence** (lead): M1 host, a window whose every pixel changes every frame, QP 15, 800x600: 371
+Mbps on the wire, capture→socket p50 84 ms, 103 IDRs and 15 decode errors in 30 s in the browser;
+Chrome 128 on the Intel Mac fell back to `<video>` and painted nothing. `BaseFrameQp` has no rate
+control by design; the bitrate tiers are bounded and `ClampCeiling` has its ceiling.
+
+**Change** (`pipeline.rs::QpGovernor`, `BaseFrameQp` only). A ceiling
+`C = clamp(4 × clamp(w·h·fps/10, 6, 30 Mbps), 24, 80 Mbps)` (1080p60 49.8 Mbps; 800x600 24 Mbps; r8
+raised the upper bounds to 40 / 160 Mbps, see QP-GOVERNOR r8) on
+the encoded rate over a sliding 500 ms window; over `C` → QP += `ceil(6·log2(rate/C))` (one move to
+the target) and then one window's wait; under `0.6·C` for a full second → QP −= 1; never below the
+user's q, never above 51. Keyframes count through the windowed rate only. `SE_QP_CEILING_MBPS`
+overrides (0 = off). Every QP change is logged; session JSON `qp_governor`
+{`qp_effective`, `qp_user`, `ceiling_mbps`, `ms_above_user_qp`, `steps`}. New synthetic workload
+`noise`. Unit tests: ordinary content (10 Mbps, a 27 Mbps second, a 2 MB keyframe) never moves it;
+noise settles under the ceiling within a second without oscillating and returns to q one step a
+second when the content calms; ceiling formula and override.
+
+**Measured** (M1, r6, pipe stage, QP 15, one run each; offer→packetized p50 / p95 / p99 ms):
+
+| content | governor | Mbps (run average) | QP reached | latency | drops |
+|---|---|---|---|---|---|
+| noise 800x600 60 fps, 10 s | off (`SE_QP_CEILING_MBPS=0`) | 382.6 | 15 | 16.61 / 17.38 / 31.32 | 0 |
+| noise 800x600 | on | 31.7 (365 for the first 0.5 s, then ~9–12) | 15 → 39 → 50 → 47 (down one a second, then steady) | 3.83 / 6.02 / 30.84 | 0 |
+| noise 1080p60, 5 s | off | 507.4 | 15 | 122.11 / 129.88 / 172.25 | 0 |
+| noise 1080p60 | on | 116.6 | 15 → 34 → **51** (pinned) | 7.83 / 43.66 / 130.54 | 0 |
+| stress 60 fps, recording | on | 8.9, 10.9 | 15 (never engaged, 0 steps) | unchanged | 0 |
+
+At 800x600 it settles within ~1 s (two raises) and then descends to the top of its hysteresis band
+without oscillating. **At 1080p60 pure noise exceeds the ceiling even at QP 51** (~80 Mbps steady,
+VideoToolbox's QP limit), so the governor pins at 51: the stream is cut ~4–5× and latency goes
+from 122 to 7.8 ms p50, but the ceiling itself is not met for that content.
+
+## MAC-DISPLAY-ORIGIN (amends MAC-DISPLAY-MODE, r7) — a resized display kept its old origin and overlapped the built-in panel; the re-apply also ran on a display still attaching — `VERIFIED` (M1, see the r7 runs) / Intel 10.15 re-check by the lead
+
+**Defect.** (1) After the MAC-DISPLAY-MODE re-apply, a display identity remembered at 800x600 on
+the LEFT (x = -800) grew to 1920x1080 in place: still at (-800, 0), overlapping the main display
+by 1120 points, captured at 1–19 fps, input mapped into the wrong rectangle. (2) On 10.15 the
+re-apply ran while the new display still read 1x1 (attaching); it then never attached, and the
+join failed with "did not attach within timeout" (HTTP 500).
+
+**Measured** (`investigate_arrangement_and_large_modes`, `SE_EXP=left`, M1 macOS 26.7.1): after
+the re-apply, `CGDisplayBounds` showed (-800, 0, 1920, 1080) overlapping display 1 at +0, +50,
++500 and +2000 ms — it never moves on its own; not in a mirror set. `NSScreen.screens` in a
+process without an AppKit run loop never updated at all (still the taught 800x600 screen), so it
+is not a usable reader here; `CGDisplayBounds` is what capture and the input mapper read.
+
+**Moving it back does not work** (same test, origin read by a separate process as well, so not a
+stale in-process cache): `CGConfigureDisplayOrigin` to x = -1920 returns success under both
+`ForSession` and `Permanently` and is ignored — -1920, -1000, -3920 all read back as -800, while
+y = -100 and moves to the right (1680, 0) or below (0, 1050) take effect at once. WindowServer keeps
+snapping the left neighbour to the width it remembers. And on every display after a process's first,
+`CGConfigureDisplayOrigin` fails outright (`kCGErrorFailure`), as the mode list is nil there.
+
+**Fix.** At the source: the display identity (serial) is now the device name **and the size** it
+is created at (`display_identity`). What WindowServer remembers for an identity is then always a
+geometry of exactly this size — the user's arrangement for it comes back (a 1280x720 identity
+remembered on the left came back at (-1280, 0)) and can never be a smaller one grown into a
+neighbour. `ensure_geometry` (create and `reconfigure_display`) also waits for the display to be
+online (active, both axes >= 64, bounded 3 s; nothing judged or re-applied before), re-applies
+only a valid wrong size, and as a last resort moves an overlapping display (`fix_arrangement`, one
+`Permanently` transaction, waits for `CGDisplayBounds`; logs "NOT settled" when WindowServer
+refuses). `create_display_with_modes` returns only after that, so the server's attach wait (it
+starts after the create), `landed_display`, capture and the input mapper read the settled geometry.
+
+**Measured after the fix** (M1, r7, bench `live`, one process per run): 10/10 valid — 800x600 at
+(-800,0) ×3, 1280x720 at (-1280,0), 1920x1080 ×3, 2560x1440 ×2, 3840x2160 at (1680,0) — every one
+at its requested size, 0 overlaps, input-mapper rect = display bounds, fresh capture 59.3–60.0 fps
+(4K 52.8). Before (same plan, identity per device): 7/10 overlapped the built-in display at
+(-800, 0); the bench marked them INVALID.
+
+**Not covered:** a live `/reconfig` to a size larger than the display was created for is refused by
+`applySettings:` (the descriptor's maximum is fixed at create), so the session records the size it
+stayed at (pre-existing behaviour; measured in `SE_EXP=live`). The bench `live` stage reports
+`overlaps`, `mirrored`, `input_mapper_rect` and marks a run INVALID on an overlap; `teach_origin_left`
+reproduces a left-hand memory; the `churn` mode runs N real joins back to back.
+
+## MAC-DISPLAY-4K — 3840x2160 came up at 1920x1080 — `VERIFIED` (M1, investigation test + live run)
+
+**Cause, measured.** Ours, not a platform limit. A panel with both axes >= 3840x2160 declared at
+96 PPI (a 40-inch screen) gets a scaled "looks like" default from macOS whatever mode list it
+registered: 3840x2160 -> 1920x1080, 4096x2160 -> 1920x1012; 3800x2150, 3840x2048, 3840x2100,
+3000x2800 (8.4 Mpx) and 2160x3840 portrait all came up at size. 60 PPI behaves as 96. The native
+mode is in the list, and on a process's first display `CGDisplaySetDisplayMode` reaches it; on
+every later display the mode list is nil (MAC-DISPLAY-MODE), so nothing could. **Declared at 200
+PPI the same panel comes up at 3840x2160 natively, first display and later ones.** `panel_ppi`
+declares 200 PPI for 4K-class panels only (everything smaller unchanged at 96). When a size still
+cannot be reached, the error says what the client gets (the stream is the size the display runs
+at, scaled by the client); the session records the size it landed at (`ModeOutcome::Refused`).
+Not covered: a live `/reconfig` from a smaller size to 4K — the physical size is fixed at create,
+so that path still lands on the scaled default.
+
+## QP-GOVERNOR fast path (amends QP-GOVERNOR, r7) — `VERIFIED` (unit test + M1 pipe stage)
+
+Three consecutive frames each over 4x the per-frame budget (`C / fps`) step at once, from those
+frames' rate, then wait a window. One large keyframe (441 KB recording, 1.58 MB stress, against a
+4 x 104 KB threshold at 1080p60) followed by ordinary frames never meets it (unit test with those
+sizes). The drain thread writes each frame's size into a 16-slot ring in telemetry; the loop reads
+the frames since its last look. Each step's log line now carries the MB encoded so far.
+
+Measured (M1, AC, pipe stage, QP 15, one run each; offer→packetized p50 / p95 / p99 ms):
+
+| content | first step at | r6 (window only) | r7 (fast path) | steps |
+|---|---|---|---|---|
+| noise 800x600 60 fps | 2.4 MB encoded (15 → 39 at once) | ~23 MB (first 0.5 s at 365 Mbps); 3.83 / 6.02 / 30.84 | 2.36 / 3.71 / 12.26, 18.8 Mbps, settles at 47 | 6 |
+| noise 1080p60 | 10.3 MB (15 → 46 at once) | ~32 MB (507 Mbps); 7.83 / 43.66 / 130.54 | 6.47 / 6.88 / 132.25 (start-up), 64.8 Mbps, pinned at 51 | 2 |
+| stress 1080p60 | never | 0 steps | 6.39 / 6.74 / 7.04, 8.9 Mbps | 0 |
+| recording | never | 0 steps | 6.44 / 6.86 / 10.89, 10.9 Mbps | 0 |
+
+## LIVE-CLIENT (bench, r7) — the in-process live client was weaker than any real receiver — `VERIFIED` (M1)
+
+- **STATS.** It sends the page's v3 `OP::STATS` frame once a second on a `reliable` DataChannel
+  (the page's label), so the host's real parser and the hold-push client guard run: arrival ->
+  decoded p50/p90/p99 over the last 512 frames, decode time, frames painted = decoded, decode
+  errors, keyframe requests, video path / transport / render tier 1. `client_stats: false` turns
+  it off.
+- **Keyframe requests** repeat every 250 ms while it waits for a keyframe (it used to ask once:
+  r6 `live-hold-forced` lost its first keyframe, asked once inside the host's keyframe gate,
+  decoded 0 of 718 frames and was marked valid).
+- **Jitter buffer.** The assembler emitted a frame at its marker and treated any sequence gap as
+  a loss, so NACK repair could never complete a frame and every late retransmission also broke the
+  frame it landed in. It now holds packets by sequence number, completes a frame from its
+  retransmissions, gives up on a hole after 300 ms, and counts out-of-order, too-late and
+  duplicate packets; the run reports the first keyframe's packets, missing-at-emit, recovered,
+  first-to-last-packet time and whether it decoded.
+- **Validity.** A run that decoded fewer than 80 % of the frames it received in the window (zero
+  included) is INVALID, with the reason.
+
+Measured (M1, r7 code, `live-hold-forced` ×6, `tune_on: perf_hold_inflight`; on AC power, not on
+battery as in r6): the first keyframe (754 KB, 636 packets) arrived complete in 6/6 runs, first to
+last packet 20–159 ms, nothing missing; 6/6 decoded every frame received (680–721). One run (r5)
+saw 63 out-of-order packets, 1 frame completed by NACK repair and 1 given up after 300 ms, while
+the host counted 18,681 NACKs received — far more NACKs than packets missing; not yet explained.
+One run was INVALID for a capture shortfall (563 of 720 presented frames captured), not for decode.
+
+## HOLD-PUSH-GUARD r7 (amends HOLD-PUSH-GUARD) — the encoder guard judged pushes against one frame interval, not against the no-push alternative — `VERIFIED` against the simulation / real hardware by the lead
+
+**Evidence** (lead, r6 browser matrix; Intel host, Chrome on the M1): noise 1080p60 suspended at "submit→emit median 19.3 ms ≥
+90 % of 16.6 ms" although the no-push value on that Mac is 21–23 ms — capture→paint p50 34.6 ms
+(r5, pushing) → 46.8 ms (r6, suspended); V20/V22 flipped four times in 30 s; an idle desktop
+(3.5 fresh frames/s) was judged on a 60-frame window reaching back to session start.
+
+**Change** (`HoldPush::guard_emitted`). `L0` = the median submit→emit of real frames released by the
+next real frame with nothing pushed behind them (probing or suspended), last 60, refreshed whenever
+the loop is not pushing; before 8 exist, interval + push→emit estimate, else 1.3 × interval. The
+window is real non-keyframe frames emitted in the last 2 s, at least 30, else no judgement.
+Suspend only when the with-push median has been ≥ 0.9 × `L0` for 1 s; a judgement under 0.8 × `L0`
+clears that; in between nothing changes (so "for 1 s" was not continuous: one judgement over, time in
+the band and one more suspended — replaced in r8, see HOLD-PUSH-GUARD r8). In-flight-cap exit and back-off unchanged. Unit tests:
+15 and 19 ms vs `L0` 23 stay; 25 suspends (once, after 1 s); values oscillating around the line make
+at most one transition; a 3.5 fps window is never judged; the `L0` fallback; serialised-cost
+simulation at 8 ms/frame (busy but still helping) stays immediate for 60 s, and at 12 ms/frame
+(saturated) still suspends within 2 s.
+
+**Churn, measured** (M1, r7 code, bench `live` `churn`, one host process per group, same device
+token): 60 joins cycling 1280x720 → 1920x1080 → 800x600 → 2560x1440 → 1920x1080 (3 s each, 0.75 s
+apart): 60/60 ok, 0 failures, 0 wrong sizes, 0 overlaps, session-reported size = actual in every
+join, POST → first RTP p50 588 / p90 763 / max 1599 ms (the first join), active displays 1 → 1.
+Control, 20 × 1920x1080: 20/20, p50 556 / p90 630 / max 1599 ms. **Open:** fds grow ~1 per join
+(17 → 79 over 60, 17 → 39 over 20) and threads +6–7 in that process; the in-process client's
+peer connections live in the same process, so whether it is the host or the test client is not
+yet separated.
+
+## HOLD-PUSH-GUARD r8 (amends r7) — `L0` without the frame interval in it, sampled while pushing; continuous sustain; clients that cannot measure paint — `VERIFIED` against the simulation / real hardware by the lead
+
+Review findings on r7, all confirmed in the code. (R1) `L0` was the no-push submit→emit, which on a
+holding encoder *is* the frame interval plus a little: a session starting in a learned immediate mode
+had none (and its estimate could not be exceeded), and one measured at 120 fps was wrong at 30.
+Now the sample is `work` = emission − max(releasing submit, previous emission) of an unpushed real
+frame, the interval-independent part; `L0 = current median interval + median(work)` (last 15). It
+is kept per (encoder id, size) for the process, and while pushing one real frame per 5 s of steady
+motion is left unpushed to refresh it (pushed after all if motion stopped behind it). No sample, no
+judgement. (R2) the sustain is cleared by any judgement below 0.9 × `L0`, by the absence of one, and by
+300 ms without one. (R3) a STATS frame with transport tier 0 or p50 0 (the `<video>` path) is no
+evidence: it neither keeps immediate mode eligible nor makes a baseline. (r9: a v1 page has no tier byte and
+parsed as 0, so r8 wrongly barred it; its video path decides now. The pipe stage's modelled client sent
+tier 0 too, so r8's pipe stage never pushed: bench only.) (R4) only Holding /
+NotHolding evidence changes the learned mode; the back-off survives an encoder rebuild, and a new
+session on the same encoder and size continues it if the last one ended under 5 minutes ago (it is
+keyed by encoder and size, not by join, so a second device's session shares it). (R8) judged every 8th
+frame on fixed arrays, no allocation.
+
+(R10) **Up to and including r7 the client guard has never fired in a real browser** — in r6 the encoder
+guard always got there first, and in r7 `W20` (Intel host, noise, worker 8 ms slower a frame) it stayed
+immediate for 30 s at arrival→paint p50 24.8 ms against 11.7 without pushes (capture→paint 74.9 against
+53.8): the session had gone immediate before a 512-frame baseline existed and the fallback bound was 1.5
+intervals = 25 ms. The fallback is now 1.2 intervals, judged once a quarter of what the page's p50 covers
+was painted while pushing. (r9 also suspended a client painting < 0.9 of the frames sent; **removed in
+r10**: the counters are read up to a second apart, and a modelled client that painted every frame read as
+129 of 166 on bursty content. W20 painted 0.944 and never needed it.) Test:
+the W20 numbers suspend in 3–5 s with reason `client` and ≤ 6 times in five minutes; 11.4 ms with every
+frame painted never does. Whether it now fires in a real browser is the lead's run.
+
+## QP-GOVERNOR r8 — noise that starts mid-session; the ceiling above 1080p — `VERIFIED` (unit tests; M1 pipe stage below) / 4K ceiling `UNVERIFIED` in a browser
+
+(R5) When noise began while the window was already near `C`, `observe()` tripped first with +1/+2 and
+its 500 ms cooldown also held the fast path back. The fast path now obeys only its own cooldown; a
+windowed raise is sized by the larger of the window's rate and the median of the newest five real
+frames; the window restarts at every raise, so it does not judge the new QP by the old QP's bytes;
+repeats and hold pushes are skipped (they broke the run of big frames). Found on the way: the fast
+path multiplied by the nominal fps, so big frames at 10 fps counted as 60 — it now uses their real
+spacing. (R8) `steps` / `above_ns` carry over an encoder rebuild. (R9) the "only incompressible content
+ever reaches it" claim was 1080p arithmetic: at 4K60 QP 15 the recording's worst second scales to
+~108 Mbps, over the old 80 Mbps bound. The bounds are now 40 / 160 Mbps: 1080p60 unchanged at 49.8,
+1080p120 80 → 99.5, 1440p60 80 → 88.5, 4K60 80 → 160.
+
+## PERF-HOLD r8 — `VERIFIED` (unit tests)
+
+Off when `NSProcessInfo.thermalState` is serious or worse (re-read once a second with the rest; a
+forced hold stays forced), and the session's first decision is made by the hold's own thread: `begin()`
+no longer reads IOKit / ObjC on the encode thread.
+
+## MAC-DISPLAY-ATTACH (r8, amends MAC-DISPLAY-ORIGIN) — readings that were not yet about this display; a join failed because WindowServer missed one display — `VERIFIED` (M1) / Intel 10.15 by the lead
+
+**Defects** (lead, r7). 10.15: every display of a process gets the same id, and 7 ms after a create
+CoreGraphics still answered for the removed predecessor (1920x1080), so a correct 800x600 display was
+"corrected": an 11.5 s join, 1 in 60. macOS 26: one display never came online and the join was a 500, 1
+in ~120.
+
+**Change** (`virtual_display.rs`). (1) **Freshness:** nothing is corrected until the readings are shown
+to be this display's: its serial — ours, encoding device and size — reads back, or its Add event
+arrived, or its id was never used before in this process. The events alone do not do: on macOS 26.7.1
+no Add/Remove callback reaches the bench host at all (`callbacks=` in the timeline). A
+predecessor with the same serial has the same size, where a stale reading changes nothing. Online but
+never shown fresh in 0.8 s: used as it is, nothing corrected. A wrong size must also read wrong for
+150 ms. (2) **Retry:** not online within 3 s → destroyed and created once more under a salted
+identity, then the error. (3) **Bounds:** `applySettings`, the mode switch, the arrangement transaction,
+create and teardown run on a thread of their own and are not waited for past their limit (the call
+itself cannot be cancelled; corrections are skipped while one is still out); one attempt ≤ 4 s.
+Teardown drops the handle outside the registry lock. (4) `created_geometry` reports a display already
+at its size, so the server no longer sets its mode a second time. (5) One
+`[display] attach timeline` line per attempt, one `removed in` line per removal. Tests: freshness on a
+reused id; a blocking call is not waited for; ignored live test of the retry (recovers in 4.0 s, gives up
+in 7.2 s, forced offline). The 8 s of the 11.5 s join that no log line covered is **not** identified: it
+needs the timeline from a 10.15 run.
+
+## LIVE-CLIENT r8 — why the bench client NACKed tens of thousands of packets — see the measurements
+
+webrtc-rs's client drops an SRTP packet more than 64 behind the newest as a replay (its default
+window), so a burst lost from a 600-packet keyframe could not be repaired; its NACK generator re-asks for
+every still-missing packet every 100 ms, so ~650 such packets read as 78,000 NACKs in 12 s. The live
+client now has an 8 MiB receive buffer (effective size reported), an 8192-packet replay window, a receive
+task that only timestamps, and a reassembly thread; it reports unique missing, never arrived and NACK
+requests. `rcvbuf_bytes: 0` / `srtp_window: 0` restore either default.
+
+## MAC-DISPLAY-STALE (r8–r10) — a host process that stops seeing its own displays — **unexplained**; the main run-loop pump is opt-in and unproven
+
+In 2 of 9 local browser sessions (r7) a join failed because `serve` read its new display as 0x0 for good, twice
+in a row, while an outside process saw each display online for the same 8 s. So the host process's own view was
+stuck, not WindowServer, and a retry in that process cannot help. A reproduction (fresh processes, 3 displays each, main
+thread parked 8 s first) failed 15 of 36 with main blocked and 0 of 144 with main running its run loop; repeated with
+the screen unlocked it failed 0 of 24 in every arm, and 18 idle-then-join cycles and 72 windowless joins showed no
+difference either. With main blocked no reconfiguration callback ever arrives; with it running they do. Whether
+the first batch depended on a locked screen was not recorded. `SE_MAIN_PUMP=1` runs the main run loop in
+`serve`; off by default. A failed attempt logs the process's view and says when no notification ever reached it.
+
+## LIVE-CLIENT r10 — the bench live child hung at 1440p and left its window on the user's screen — bench only, `VERIFIED` (four identical stacks)
+
+Main sat in an unbounded join of the decode thread, which sat in VideoToolbox (a FigSemaphore that never fires). Which
+call is not known: r10 hands the result over before closing the decoder and 2 of 6 1440p runs still got none in 3 s (invalid,
+no hang, no window), so it is stuck before the close. Measured: 1440p 1 of 3 with the pump off, 3 of 3 on, 1080p 0 of 6; in r9 5 of 6, and the
+window, half way through its close animation, was moved to the main screen when the display went (about six minutes
+in all). The result is now handed over before the decoder is closed and waited for 3 s at most (bounds it, does not fix it); the window is
+transparent, closed without animation and confirmed off screen before the leave; a guard samples and exits the child 8 s
+into teardown or past the run's expected length. No host code has a decoder. Why VideoToolbox does not return is not known.
+`remove_all_displays` dropped displays while holding the registry lock the termination handler takes; fixed, with a test that
+fails on the old order (not connected to the hang).
+
+## SCREENS-GUARD — creating or removing a virtual display must not move the user's own screens — `VERIFIED` once on the M1 against the saved entry that caused it (r11), and quiet over 160 further joins / `UNVERIFIED` elsewhere
+
+**Defect (reported by the user on the M1, 2026-11-23).** The built-in display kept changing
+resolution for hours while the tests ran. macOS keeps a saved configuration per *set of connected
+displays*. One set (the built-in plus one of our test displays, `bench live` at 1920x1080) was
+saved with the built-in at 1440x900 (default scaling) where every other set, 48 of 49, has the
+user's 1680x1050, so each time that test display came and went the built-in flipped. The change
+happened at 16:08 during an r7 test run, between its first and second join, and no display
+configuration call of ours was logged in that run; what wrote it is **not established** (our
+setup, macOS, or a manual change). What our code could do is write such a set: `fix_arrangement`
+and the bench's `teach_origin_left` committed `CGConfigureOption::Permanently`, which saves every
+connected display, not only the one being moved. Before r7 nothing in our code did.
+
+**Change** (`macos_utils/virtual_display.rs`).
+- `fix_arrangement`, `teach_origin_left` and the investigation helper now commit `ForSession`
+  only. The identity per device and size, not the permanent write, is what keeps the arrangement
+  valid (10 of 10 live runs), so nothing is lost.
+- **Guard:** before every create, resize and remove, the modes of every online display that is not
+  ours (by registry and by our vendor/product) are read; for 4 s afterwards a screen whose mode
+  differs is put back with `CGConfigureDisplayWithDisplayMode` for the session, at most twice per
+  operation, and the log says so. It never touches a screen that was not there before, or one
+  whose mode moved later (that is the user's own change). `SE_SCREENS_GUARD=0` turns it off.
+- The bench's test client name changed (`bench live` → `bench live v2`) so the saved set above is
+  never used again on the development Mac.
+
+**Proof (M1, independent watchdog at 0.5 s).** Device name `bench live` at 1920x1080, the very entry:
+r10 (no guard) moved the built-in display 1680x1050 → 1440x900 at connect and it stayed until the display left 14 s
+later; r11 moved it the same way and put it back within about a second, with the display still connected. Then 160
+joins with the new identity: built-in at 1680x1050 throughout.
+
+**Tests.** `only_a_screen_that_moved_is_put_back` (a moved built-in, an unplugged screen, a new one,
+a refresh-rate change). **Not verified:** anywhere but this M1, that no identity pollutes a set again,
+and a process whose CoreGraphics view is stuck (MAC-DISPLAY-STALE), where the guard reads stale
+modes and does nothing.
+
+## SESSION-FD-LEAK — a session that ends gives back its socket, tasks and peer connection — `VERIFIED` on both Macs / `COMPILE-CHECKED` on Windows
+
+**Defect.** Every join left one UDP socket open for the life of the host, on both Macs, whether the page
+closed cleanly or was killed (r7: 0 → 30 sockets over 30 joins on the M1, 1 → 31 on the Intel Mac; memory
++2–3 MB a join). Older than this campaign: the per-viewer RTP writer held a sender of the frame channel it was
+reading, through its `KeyframeRequester`, so the channel could not close while the writer lived and the
+writer could not leave until it closed. It kept an `Arc` of the peer connection, and the DTLS transport kept
+the ICE candidate pairs and their sockets.
+
+**Change** (`streamer/webrtc_session.rs`). The writer is told to stop (`writer_stop`); the peer connection
+and the media socket live in one `Transport` that closes them exactly once, in a task of its own, also on
+drop (a dropped `RTCPeerConnection` closes nothing, so an aborted `POST /whep` left one up); and a close waits
+for ICE gathering to end, because webrtc-ice 0.17.1 gives a late candidate a receive loop on an already
+closed agent that nothing stops.
+
+**Tests.** `streamer/test/session_leak.rs`, five, counting what the kernel, tokio and `Arc` report. The
+loopback ICE candidates they need are `cfg!(test)` only: in r9 and r10 they were on for loopback-bound
+streamers too, so the bench's transport and answer → RTP numbers from those two builds ran over `lo0` and
+are not comparable with any other build. Browser runs were not affected.
+
+**On hardware.** Real browser, 30 joins (25 clean, 5 killed): M1 r10 0 sockets left; Intel r11 1 at every
+checkpoint (the same as before the first join). Bench churn, 160 joins each: 0 left on r9, r10 and r11.
+
+**Not verified / open.** Windows (type-checked only). Memory on the Intel host still grows about 0.8 MB per
+join (r7: 2.8; M1: 0.14), unexplained. An aborted `POST /whep` can still leave the *display* up (by reading).

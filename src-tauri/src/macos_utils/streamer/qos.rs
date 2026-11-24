@@ -48,16 +48,20 @@ fn report(what: &str, rc: i32, seen: &AtomicBool) {
     teprintln!("[qos] {what} failed (rc={rc}); this thread runs at the default priority");
 }
 
-pub fn pin_current_thread_user_interactive() {
+/// Returns the call's status (0 = applied), for callers that record it.
+pub fn pin_current_thread_user_interactive() -> i32 {
     static SEEN: AtomicBool = AtomicBool::new(false);
     let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
     report("pthread_set_qos_class_self_np(USER_INTERACTIVE)", rc, &SEEN);
+    rc
 }
 
-pub fn pin_current_thread_user_initiated() {
+/// Returns the call's status (0 = applied), for callers that record it.
+pub fn pin_current_thread_user_initiated() -> i32 {
     static SEEN: AtomicBool = AtomicBool::new(false);
     let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) };
     report("pthread_set_qos_class_self_np(USER_INITIATED)", rc, &SEEN);
+    rc
 }
 
 /// The share of the period the encode thread reserves as guaranteed CPU.
@@ -73,17 +77,28 @@ const COMPUTATION_FRACTION: f64 = 0.75;
 ///
 /// `preemptible` stays true: a non-preemptible thread that overruns its computation can wedge
 /// the machine, and nothing here is worth that.
-pub fn pin_current_thread_time_constraint(period_ns: u64) {
+pub fn pin_current_thread_time_constraint(period_ns: u64) -> i32 {
+    let computation_ns = (period_ns as f64 * COMPUTATION_FRACTION) as u64;
+    pin_current_thread_time_constraint_with(period_ns, computation_ns, period_ns)
+}
+
+/// [`pin_current_thread_time_constraint`] with every parameter chosen by the caller (the
+/// `SE_TUNE_ON` candidates use it). Returns the `kern_return_t` (0 = applied); a zero period
+/// does nothing and returns -1.
+pub fn pin_current_thread_time_constraint_with(
+    period_ns: u64,
+    computation_ns: u64,
+    constraint_ns: u64,
+) -> i32 {
     static SEEN: AtomicBool = AtomicBool::new(false);
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if period_ns == 0 {
-        return;
+        return -1;
     }
-    let computation_ns = (period_ns as f64 * COMPUTATION_FRACTION) as u64;
     let mut data = thread_time_constraint_policy_data_t {
         period: ns_to_mach_ticks(period_ns),
-        computation: ns_to_mach_ticks(computation_ns),
-        constraint: ns_to_mach_ticks(period_ns),
+        computation: ns_to_mach_ticks(computation_ns.max(1)),
+        constraint: ns_to_mach_ticks(constraint_ns.max(computation_ns).max(1)),
         preemptible: 1,
     };
     let rc = unsafe {
@@ -107,6 +122,20 @@ pub fn pin_current_thread_time_constraint(period_ns: u64) {
             );
         }
     }
+    rc
+}
+
+/// The calling thread's time-constraint policy as the kernel reports it, in ns:
+/// `(period, computation, constraint, preemptible)`.
+pub fn current_time_constraint_ns() -> Option<(u64, u64, u64, bool)> {
+    read_time_constraint().map(|d| {
+        (
+            mach_ticks_to_ns(d.period),
+            mach_ticks_to_ns(d.computation),
+            mach_ticks_to_ns(d.constraint),
+            d.preemptible != 0,
+        )
+    })
 }
 
 /// Read the policy back rather than trusting the write. `thread_policy_get` can return the
@@ -138,7 +167,7 @@ const HOT_THREAD_IMPORTANCE: c_int = 63;
 ///
 /// Only meaningful for a timeshare thread — a deadline thread's priority comes from its
 /// reservation — so this is for the drain thread, not the encode thread.
-pub fn raise_current_thread_precedence() {
+pub fn raise_current_thread_precedence() -> i32 {
     static SEEN: AtomicBool = AtomicBool::new(false);
     let mut data = thread_precedence_policy_data_t {
         importance: HOT_THREAD_IMPORTANCE,
@@ -152,6 +181,7 @@ pub fn raise_current_thread_precedence() {
         )
     };
     report("thread_policy_set(PRECEDENCE)", rc, &SEEN);
+    rc
 }
 
 /// Ask the scheduler to keep the capture/encode threads in one cache affinity set.
@@ -159,7 +189,7 @@ pub fn raise_current_thread_precedence() {
 /// Intel-only: `THREAD_AFFINITY_POLICY` is documented as unimplemented on Apple silicon, where
 /// it returns `KERN_NOT_SUPPORTED` rather than doing nothing quietly.
 #[cfg(target_arch = "x86_64")]
-pub fn pin_current_thread_encode_affinity() {
+pub fn pin_current_thread_encode_affinity() -> i32 {
     use mach2::thread_policy::{
         thread_affinity_policy_data_t, THREAD_AFFINITY_POLICY, THREAD_AFFINITY_POLICY_COUNT,
     };
@@ -177,7 +207,11 @@ pub fn pin_current_thread_encode_affinity() {
         )
     };
     report("thread_policy_set(AFFINITY)", rc, &SEEN);
+    rc
 }
 
+/// No affinity API on Apple silicon; reported as `KERN_NOT_SUPPORTED` (46) without a call.
 #[cfg(not(target_arch = "x86_64"))]
-pub fn pin_current_thread_encode_affinity() {}
+pub fn pin_current_thread_encode_affinity() -> i32 {
+    46
+}
